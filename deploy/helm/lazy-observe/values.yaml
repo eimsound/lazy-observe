@@ -70,6 +70,36 @@ secret:
     s3AccessKey: ""
     s3SecretKey: ""
 
+# Platform encryption key (server: security.secret_key_file). It seals
+# sensitive metadata such as the AI provider API key and derives internal
+# tokens, so every replica must read the same key and it must outlive pods.
+# The chart mounts it read-only at /etc/lazy-observe-key/secret.key; it is
+# never passed through environment variables.
+encryptionKey:
+  # Secret you manage (kubectl, Sealed Secrets, External Secrets). The value is
+  # 32 random bytes as standard base64, padded or not; a trailing newline is
+  # fine. Example:
+  #   kubectl create secret generic lazy-observe-encryption-key \
+  #     --from-literal=secret.key="$(openssl rand -base64 32)"
+  # Required for Argo CD, `helm template | kubectl apply`, or any renderer
+  # without cluster access (see autoGenerate). Back the value up: losing it
+  # makes stored secrets unrecoverable.
+  existingSecret: ""
+  # Key inside the Secret (existing or generated) that holds the value.
+  key: secret.key
+  # Without existingSecret, create <fullname>-encryption-key on first install.
+  # `helm upgrade` reuses the stored value through `lookup`, and the Secret
+  # carries helm.sh/resource-policy: keep so `helm uninstall` leaves it behind
+  # (a reinstall with the same release name and namespace adopts it again).
+  # `lookup` sees no cluster under `helm template`, client-side `--dry-run`,
+  # or Argo CD, so those renders contain a new random key every time: use
+  # existingSecret there. Flux helm-controller installs with cluster access.
+  # Set false to require existingSecret: rendering then fails when
+  # standalone-ha runs more than one replica (replicaCount > 1 or HPA).
+  # allinone with persistence keeps the key in its PVC data_dir unless
+  # existingSecret is set.
+  autoGenerate: true
+
 process:
   startupTimeout: 20s
   shutdownTimeout: 15s

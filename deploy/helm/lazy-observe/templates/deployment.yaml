@@ -90,6 +90,11 @@ spec:
               readOnly: true
             - name: data
               mountPath: /data
+            {{- if include "lazy-observe.encryptionKey.mounted" . }}
+            - name: encryption-key
+              mountPath: {{ include "lazy-observe.encryptionKey.mountPath" . }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -101,6 +106,17 @@ spec:
         {{- else }}
         - name: data
           emptyDir: {}
+        {{- end }}
+        {{- if include "lazy-observe.encryptionKey.mounted" . }}
+        - name: encryption-key
+          secret:
+            secretName: {{ include "lazy-observe.encryptionKey.secretName" . }}
+            # 0444: Secret files are root-owned and the image runs as the
+            # distroless nonroot uid 65532; the tmpfs is private to this pod.
+            defaultMode: 0444
+            items:
+              - key: {{ .Values.encryptionKey.key }}
+                path: secret.key
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{ toYaml . | nindent 8 }}

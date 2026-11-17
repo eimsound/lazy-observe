@@ -1,6 +1,7 @@
 package secret
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,6 +135,61 @@ func TestLoadRejectsMalformedKeyFile(t *testing.T) {
 	}
 	if _, err := LoadOrCreate(path); err == nil {
 		t.Fatal("LoadOrCreate accepted a malformed key file")
+	}
+}
+
+// TestLoadAcceptsProvisionedKeyEncodings covers key files that operators
+// provision themselves (Kubernetes Secret, `openssl rand -base64 32`, echo):
+// padded or unpadded standard base64 with surrounding whitespace must load the
+// same key, and a read-only file must never be rewritten.
+func TestLoadAcceptsProvisionedKeyEncodings(t *testing.T) {
+	want := [keyBytes]byte{}
+	for i := range want {
+		want[i] = byte(i*7 + 1)
+	}
+	unpadded := base64.RawStdEncoding.EncodeToString(want[:])
+	padded := base64.StdEncoding.EncodeToString(want[:])
+	cases := map[string]string{
+		"unpadded":                unpadded,
+		"unpadded with newline":   unpadded + "\n",
+		"padded":                  padded,
+		"padded with newline":     padded + "\n",
+		"padded with CRLF":        padded + "\r\n",
+		"surrounding whitespace":  "  " + padded + " \n",
+		"wrapped across two rows": padded[:20] + "\n" + padded[20:] + "\n",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "secret.key")
+			if err := os.WriteFile(path, []byte(content), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			box, err := LoadOrCreate(path)
+			if err != nil {
+				t.Fatalf("LoadOrCreate(%q): %v", content, err)
+			}
+			if box.key != want {
+				t.Fatalf("LoadOrCreate(%q) loaded a different key", content)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != content {
+				t.Fatalf("LoadOrCreate rewrote a provisioned key file: %q", got)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsWrongLengthPaddedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secret.key")
+	short := base64.StdEncoding.EncodeToString(make([]byte, 16)) + "\n"
+	if err := os.WriteFile(path, []byte(short), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreate(path); err == nil {
+		t.Fatal("LoadOrCreate accepted a 16-byte key")
 	}
 }
 

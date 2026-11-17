@@ -73,7 +73,9 @@ type Security struct {
 	// SecretKeyFile is the platform encryption key file used to seal sensitive
 	// values in the metadata database (BYO LLM API keys, future secrets). On
 	// first startup a fresh 256-bit key is generated and persisted with mode
-	// 0600. Empty uses <data_dir>/secret.key. HA replicas must share one file.
+	// 0600. Empty uses <data_dir>/secret.key. HA replicas must share one file;
+	// an existing file (for example a read-only Kubernetes Secret mount with
+	// `openssl rand -base64 32` output) is only read, never rewritten.
 	SecretKeyFile string `yaml:"secret_key_file"`
 }
 
