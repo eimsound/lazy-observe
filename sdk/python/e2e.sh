@@ -8,14 +8,18 @@ EXAMPLE_PORT=${LO_E2E_EXAMPLE_PORT:-43520}
 EXAMPLE_URL="http://127.0.0.1:$EXAMPLE_PORT"
 PYTHON=${LO_E2E_PYTHON:-"$SDK_DIR/.venv/bin/python"}
 
-# SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端
-if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ]; then
-	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端\n' >&2
+# journey 需要手动对着一个运行中的 lazy-observe 平台执行，mise 和 CI 都不调用本脚本。
+#   LO_E2E_PLATFORM_URL    平台地址
+#   LO_E2E_TOKEN           默认项目的项目 API Token（lo_…），只用来拼 DSN 做摄取
+#   LO_E2E_ADMIN_PASSWORD  admin 密码；所有读请求都用登录得到的会话 Cookie 加
+#                          X-LO-Project: default（ADR 0010：项目 Token 只能摄取，读路由返回 403）
+if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ] || [ -z "${LO_E2E_ADMIN_PASSWORD:-}" ]; then
+	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL、LO_E2E_TOKEN（lo_ 摄取 Token）与 LO_E2E_ADMIN_PASSWORD（读请求用 admin 会话）指向运行中的 lazy-observe 平台\n' >&2
 	exit 1
 fi
 PLATFORM_URL=${LO_E2E_PLATFORM_URL}
 TOKEN=${LO_E2E_TOKEN}
-ADMIN_PASSWORD=${LO_E2E_ADMIN_PASSWORD:-}
+ADMIN_PASSWORD=${LO_E2E_ADMIN_PASSWORD}
 
 # Profiling (pprof sampling) is not implemented in the Python SDK; see
 # sdk/docs/sdk/python.md (Python runtime has no pprof sampler on 3.12+).
@@ -116,14 +120,14 @@ llm_span_ok=0
 i=0
 while [ "$i" -lt 60 ]; do
 	curl -fsS -G "$PLATFORM_URL/api/v1/query_range" \
-		-H "Authorization: Bearer $TOKEN" \
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" \
 		--data-urlencode 'query={__name__="http.server.request.duration_bucket"}' \
 		--data-urlencode "start=$START" --data-urlencode "end=$((START + 600))" --data-urlencode 'step=1s' \
 		-o "$WORK/metrics.json" || true
 	if jq -e '.data.result | length > 0' "$WORK/metrics.json" >/dev/null 2>&1; then metric_ok=1; fi
 
 	curl -fsS -G "$PLATFORM_URL/api/v1/series" \
-		-H "Authorization: Bearer $TOKEN" \
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" \
 		--data-urlencode 'match[]={__name__=~"http.*|process.runtime.*"}' \
 		-o "$WORK/metric-series.json" || true
 	if jq -e '
@@ -137,7 +141,7 @@ while [ "$i" -lt 60 ]; do
 		"$WORK/metric-series.json" >/dev/null 2>&1; then metric_contract_ok=1; fi
 
 	curl -fsS -G "$PLATFORM_URL/api/v1/logs/query" \
-		-H "Authorization: Bearer $TOKEN" --data-urlencode 'query=_msg:="fast request handled"' \
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" --data-urlencode 'query=_msg:="fast request handled"' \
 		-o "$WORK/logs.jsonl" || true
 	if grep -q 'service.name' "$WORK/logs.jsonl" 2>/dev/null; then log_ok=1; fi
 
@@ -149,18 +153,18 @@ while [ "$i" -lt 60 ]; do
 		"$WORK/issues.json" >/dev/null 2>&1; then issue_ok=1; fi
 
 	curl -sS "$PLATFORM_URL/api/traces/$BOOM_TRACE" \
-		-H "Authorization: Bearer $TOKEN" -o "$WORK/boom-trace.json" || true
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/boom-trace.json" || true
 	if jq -e --arg id "$BOOM_TRACE" '.data[0].traceID == $id' "$WORK/boom-trace.json" >/dev/null 2>&1; then trace_ok=1; fi
 
 	curl -sS "$PLATFORM_URL/api/traces/$DB_TRACE" \
-		-H "Authorization: Bearer $TOKEN" -o "$WORK/db-trace.json" || true
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/db-trace.json" || true
 	if jq -e --arg id "$DB_TRACE" '
 		.data[0].traceID == $id and
 		([.data[0].spans[]?.operationName] | index("DB query") != null)' \
 		"$WORK/db-trace.json" >/dev/null 2>&1; then db_span_ok=1; fi
 
 	curl -sS "$PLATFORM_URL/api/traces/$LLM_TRACE" \
-		-H "Authorization: Bearer $TOKEN" -o "$WORK/llm-trace.json" || true
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/llm-trace.json" || true
 	if jq -e --arg id "$LLM_TRACE" '
 		.data[0].traceID == $id and
 		([.data[0].spans[]?.operationName] | index("chat openai") != null) and

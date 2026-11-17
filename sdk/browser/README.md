@@ -127,14 +127,29 @@ function Route({ pathname }: { pathname: string }) {
 mise exec -- pnpm install
 mise exec -- pnpm build
 mise exec -- pnpm test
-./e2e.sh
+LO_E2E_PLATFORM_URL=http://127.0.0.1:3100 \
+LO_E2E_TOKEN=lo_... \
+LO_E2E_ADMIN_PASSWORD=... \
+  mise exec -- ./e2e.sh
 ```
 
-`./e2e.sh` starts an isolated real platform plus both Vite examples, then uses
-Chromium to verify cross-origin error, Web Vitals and Replay ingest, W3C trace
-propagation, React ErrorBoundary capture, and platform-side query persistence.
-The repository-level `mise run e2e` runs this alongside the real Go and Node SDK
-example suites.
+`./e2e.sh` is a manual journey: neither `mise` nor CI runs it (`mise run sdk-browser`
+and the CI SDK job only run unit tests). Run it yourself against an already running
+lazy-observe platform. It builds and starts the Go Fiber and Node Express examples
+plus both Vite examples, then uses Chromium to verify cross-origin error, Web Vitals
+and Replay ingest, W3C trace propagation, React ErrorBoundary capture, and
+platform-side query persistence.
+
+- `LO_E2E_PLATFORM_URL`: base URL of the running platform.
+- `LO_E2E_TOKEN`: the `default` project's API token (`lo_…`). It only builds the
+  ingest DSN; project tokens are ingest-only (ADR 0010) and get `403` on read routes.
+- `LO_E2E_ADMIN_PASSWORD`: the `admin` password. Every read in the journey uses the
+  admin session cookie plus `X-LO-Project: default`.
+
+On a fresh data directory the platform logs the bootstrap admin password and the
+`default` project token once on first start. The script also runs
+`playwright install --with-deps`, which installs system packages through the OS
+package manager.
 
 See `examples/vanilla` and `examples/react` for Vite demos that can report to a
 local gateway.

@@ -62,6 +62,8 @@ function requiredEnv(name: string): string {
   return value;
 }
 
+// Project API tokens are ingest-only (ADR 0010): the token only builds the DSN,
+// and every read rides on this session cookie plus X-LO-Project.
 async function login(request: APIRequestContext): Promise<void> {
   const response = await request.post(`${platformURL}/api/auth/login`, {
     data: { username: "admin", password },
@@ -146,7 +148,7 @@ test("error investigation journey uses production source maps, Trace, and Logs",
   let trace: JaegerTrace | undefined;
   await expect.poll(async () => {
     const response = await request.get(`${platformURL}/api/traces/${traceID}`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "X-LO-Project": "default" },
     });
     if (!response.ok()) return [];
     const body = await response.json() as { data?: JaegerTrace[] };
@@ -166,7 +168,7 @@ test("error investigation journey uses production source maps, Trace, and Logs",
 
   await expect.poll(async () => {
     const response = await request.get(`${platformURL}/api/v1/logs/query`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "X-LO-Project": "default" },
       params: { query: `_msg:="performance workload complete"`, limit: 50 },
     });
     return response.ok() ? await response.text() : "";

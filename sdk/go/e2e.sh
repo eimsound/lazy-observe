@@ -10,14 +10,18 @@ LLM_PORT=${LO_E2E_LLM_PORT:-43330}
 EXAMPLE_URL="http://127.0.0.1:$EXAMPLE_PORT"
 LLM_URL="http://127.0.0.1:$LLM_PORT"
 
-# SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端
-if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ]; then
-	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端\n' >&2
+# journey 需要手动对着一个运行中的 lazy-observe 平台执行，mise 和 CI 都不调用本脚本。
+#   LO_E2E_PLATFORM_URL    平台地址
+#   LO_E2E_TOKEN           默认项目的项目 API Token（lo_…），只用来拼 DSN 做摄取
+#   LO_E2E_ADMIN_PASSWORD  admin 密码；所有读请求都用登录得到的会话 Cookie 加
+#                          X-LO-Project: default（ADR 0010：项目 Token 只能摄取，读路由返回 403）
+if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ] || [ -z "${LO_E2E_ADMIN_PASSWORD:-}" ]; then
+	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL、LO_E2E_TOKEN（lo_ 摄取 Token）与 LO_E2E_ADMIN_PASSWORD（读请求用 admin 会话）指向运行中的 lazy-observe 平台\n' >&2
 	exit 1
 fi
 PLATFORM_URL=${LO_E2E_PLATFORM_URL}
 TOKEN=${LO_E2E_TOKEN}
-ADMIN_PASSWORD=${LO_E2E_ADMIN_PASSWORD:-}
+ADMIN_PASSWORD=${LO_E2E_ADMIN_PASSWORD}
 
 cleanup() {
 	if [ -n "$EXAMPLE_PID" ]; then
@@ -136,7 +140,7 @@ sleep 70
 profile_ok=0
 i=0
 while [ "$i" -lt 30 ]; do
-	curl -fsS -G "$PLATFORM_URL/api/profiles" -H "Authorization: Bearer $TOKEN" \
+	curl -fsS -G "$PLATFORM_URL/api/profiles" -b "$WORK/session.cookie" -H "X-LO-Project: default" \
 		--data-urlencode 'service=lazy-observe-fiber-example' -o "$WORK/profiles.json" || true
 	if jq -e '[.profiles[].type] | index("cpu") != null and index("heap") != null and index("goroutine") != null' "$WORK/profiles.json" >/dev/null 2>&1; then
 		profile_ok=1
@@ -152,12 +156,12 @@ test "$profile_ok" = 1 || {
 }
 
 curl -fsS -G "$PLATFORM_URL/api/profiles/flamegraph" \
-	-H "Authorization: Bearer $TOKEN" --data-urlencode 'service=lazy-observe-fiber-example' \
+	-b "$WORK/session.cookie" -H "X-LO-Project: default" --data-urlencode 'service=lazy-observe-fiber-example' \
 	--data-urlencode 'type=cpu' -o "$WORK/flamegraph.json"
 jq -e '.. | objects | select(.name? == "main.cpuWork")' "$WORK/flamegraph.json" >/dev/null
 
 PROFILE_ID=$(jq -r '[.profiles[] | select(.type == "cpu")] | sort_by(.id) | .[0].id' "$WORK/profiles.json")
-curl -fsS "$PLATFORM_URL/api/profiles/$PROFILE_ID/raw" -H "Authorization: Bearer $TOKEN" -o "$WORK/profile.pb.gz"
+curl -fsS "$PLATFORM_URL/api/profiles/$PROFILE_ID/raw" -b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/profile.pb.gz"
 go tool pprof -top "$WORK/profile.pb.gz" >"$WORK/pprof-top.txt"
 grep -q 'main.cpuWork' "$WORK/pprof-top.txt"
 
@@ -181,7 +185,7 @@ sleep 12
 kill -TERM "$EXAMPLE_PID"
 wait "$EXAMPLE_PID"
 EXAMPLE_PID=
-curl -fsS -G "$PLATFORM_URL/api/profiles" -H "Authorization: Bearer $TOKEN" \
+curl -fsS -G "$PLATFORM_URL/api/profiles" -b "$WORK/session.cookie" -H "X-LO-Project: default" \
 	--data-urlencode 'service=lazy-observe-fiber-example' -o "$WORK/profiles-disabled.json"
 test "$(jq '[.profiles[] | select(.service == "lazy-observe-fiber-example")] | length' "$WORK/profiles-disabled.json")" = "$PROFILE_COUNT"
 
@@ -197,14 +201,14 @@ llm_content_ok=0
 i=0
 while [ "$i" -lt 60 ]; do
 	curl -fsS -G "$PLATFORM_URL/api/v1/query_range" \
-		-H "Authorization: Bearer $TOKEN" \
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" \
 		--data-urlencode 'query={__name__="http.server.request.duration_bucket"}' \
 		--data-urlencode "start=$START" --data-urlencode "end=$END" --data-urlencode 'step=1s' \
 		-o "$WORK/metrics.json" || true
 	if jq -e '.data.result | length > 0' "$WORK/metrics.json" >/dev/null 2>&1; then metric_ok=1; fi
 
 	curl -fsS -G "$PLATFORM_URL/api/v1/series" \
-		-H "Authorization: Bearer $TOKEN" \
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" \
 		--data-urlencode 'match[]={__name__=~"http.*|process.runtime.*"}' \
 		-o "$WORK/metric-series.json" || true
 	if jq -e '
@@ -219,7 +223,7 @@ while [ "$i" -lt 60 ]; do
 		"$WORK/metric-series.json" >/dev/null 2>&1; then metric_contract_ok=1; fi
 
 	curl -fsS -G "$PLATFORM_URL/api/v1/logs/query" \
-		-H "Authorization: Bearer $TOKEN" --data-urlencode 'query=_msg:="panic recovered"' \
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" --data-urlencode 'query=_msg:="panic recovered"' \
 		-o "$WORK/logs.jsonl" || true
 	if grep -q "$TRACE_ID" "$WORK/logs.jsonl" 2>/dev/null; then log_ok=1; fi
 
@@ -231,11 +235,11 @@ while [ "$i" -lt 60 ]; do
 		"$WORK/issues.json" >/dev/null 2>&1; then issue_ok=1; fi
 
 	curl -sS "$PLATFORM_URL/api/traces/$TRACE_ID" \
-		-H "Authorization: Bearer $TOKEN" -o "$WORK/trace.json" || true
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/trace.json" || true
 	if jq -e --arg id "$TRACE_ID" '.data[0].traceID == $id' "$WORK/trace.json" >/dev/null 2>&1; then trace_ok=1; fi
 
 	curl -sS "$PLATFORM_URL/api/traces/$ORDER_TRACE" \
-		-H "Authorization: Bearer $TOKEN" -o "$WORK/order-trace.json" || true
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/order-trace.json" || true
 	if jq -e --arg id "$ORDER_TRACE" '
 		.data[0].traceID == $id and
 		([.data[0].spans[]?.operationName] | index("GET /trace/:orderID") != null) and
@@ -245,7 +249,7 @@ while [ "$i" -lt 60 ]; do
 		"$WORK/order-trace.json" >/dev/null 2>&1; then order_trace_ok=1; fi
 
 	curl -fsS -G "$PLATFORM_URL/api/v1/performance/endpoints" \
-		-H "Authorization: Bearer $TOKEN" \
+		-b "$WORK/session.cookie" -H "X-LO-Project: default" \
 		--data-urlencode "start=$START" --data-urlencode "end=$END" --data-urlencode 'step=1' \
 		-o "$WORK/performance.json" || true
 	if jq -e '
@@ -255,7 +259,7 @@ while [ "$i" -lt 60 ]; do
 		(endpoint("/performance/error").error_rate == 1)' \
 		"$WORK/performance.json" >/dev/null 2>&1; then performance_ok=1; fi
 
-	curl -sS "$PLATFORM_URL/api/traces/$LLM_STREAM_TRACE" -H "Authorization: Bearer $TOKEN" -o "$WORK/llm-stream-trace.json" || true
+	curl -sS "$PLATFORM_URL/api/traces/$LLM_STREAM_TRACE" -b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/llm-stream-trace.json" || true
 	if jq -e '
 		def vals($key): [.data[0].spans[]? | select(.operationName == "chat openai") | .tags[]? | select(.key == $key) | .value];
 		(vals("gen_ai.system")[0] == "openai") and
@@ -266,7 +270,7 @@ while [ "$i" -lt 60 ]; do
 		((vals("gen_ai.usage.output_tokens")[0] | tostring) == "4") and
 		(vals("gen_ai.prompt") | length == 0) and (vals("gen_ai.completion") | length == 0)' "$WORK/llm-stream-trace.json" >/dev/null 2>&1; then llm_stream_ok=1; fi
 
-	curl -sS "$PLATFORM_URL/api/traces/$LLM_CONTENT_TRACE" -H "Authorization: Bearer $TOKEN" -o "$WORK/llm-content-trace.json" || true
+	curl -sS "$PLATFORM_URL/api/traces/$LLM_CONTENT_TRACE" -b "$WORK/session.cookie" -H "X-LO-Project: default" -o "$WORK/llm-content-trace.json" || true
 	if jq -e '
 		def vals($key): [.data[0].spans[]? | select(.operationName == "chat openai") | .tags[]? | select(.key == $key) | .value];
 		(vals("gen_ai.system")[0] == "openai") and
