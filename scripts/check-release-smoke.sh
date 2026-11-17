@@ -344,33 +344,43 @@ done <"$web_assets"
 # Exercise the exact embedded artifact's bootstrap, authentication, ingest,
 # tenant routing, storage writes, and query paths. A healthy homepage alone is
 # not sufficient evidence that the zero-configuration data plane works.
-credentials=$("$python_command" - "$log" <<'PY'
+# Zero-config bootstrap writes the generated admin password to
+# <data_dir>/initial-admin-password (0600) and logs only that path. The
+# password goes straight from that file into a 0600 login body, never argv.
+credentials=$("$python_command" - "$log" "$run_dir" "$work/login.json" <<'PY'
+import json
 import pathlib
 import re
+import stat
 import sys
 
 log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-passwords = re.findall(r"created bootstrap admin[^\n]*?password=(\S+)", log)
+run_dir = pathlib.Path(sys.argv[2])
+login_path = pathlib.Path(sys.argv[3])
+written = re.findall(r"initial admin password written[^\n]*?path=(\S+)", log)
+if len(written) != 1:
+    raise SystemExit("expected exactly one initial admin password path in the log")
+password_path = (run_dir / written[0]).resolve()
+if password_path != (run_dir / "data" / "initial-admin-password").resolve():
+    raise SystemExit("initial admin password was not written under the default data_dir")
+mode = stat.S_IMODE(password_path.stat().st_mode)
+if mode != 0o600:
+    raise SystemExit(f"initial admin password file mode is {mode:o}, want 600")
+password = password_path.read_text(encoding="utf-8").strip()
+if len(password) < 8:
+    raise SystemExit("initial admin password file is empty or too short")
+if password in log or re.search(r"(?<![\w])password=", log):
+    raise SystemExit("server log contains the bootstrap admin password")
 tokens = re.findall(r"created default project[^\n]*?project_api_token=(\S+)", log)
-if len(passwords) != 1 or len(tokens) != 1:
-    raise SystemExit("expected exactly one bootstrap password and project API token")
-print(passwords[0])
+if len(tokens) != 1 or tokens[0] == password:
+    raise SystemExit("expected exactly one default project API token")
+login_path.write_text(json.dumps({"username": "admin", "password": password}, separators=(",", ":")), encoding="utf-8")
+login_path.chmod(0o600)
 print(tokens[0])
 PY
-) || fail "could not extract the one-time bootstrap credentials from the release log"
-bootstrap_password=${credentials%%$'\n'*}
-project_api_token=${credentials#*$'\n'}
-[[ -n $bootstrap_password && -n $project_api_token && $bootstrap_password != "$project_api_token" ]] || fail "invalid bootstrap credentials"
-
-printf '%s' "$bootstrap_password" | "$python_command" -c '
-import json
-import pathlib
-import sys
-path = pathlib.Path(sys.argv[1])
-password = sys.stdin.read()
-path.write_text(json.dumps({"username": "admin", "password": password}, separators=(",", ":")), encoding="utf-8")
-path.chmod(0o600)
-' "$work/login.json"
+) || fail "could not read the one-time bootstrap credentials"
+project_api_token=$credentials
+[[ -n $project_api_token ]] || fail "invalid bootstrap credentials"
 printf '%s' "$project_api_token" | "$python_command" -c '
 import pathlib
 import sys
@@ -526,7 +536,7 @@ PY
   sleep 0.5
 done
 (( data_ready == 1 )) || fail "embedded metrics, logs, and traces did not all round-trip within 60 seconds"
-unset bootstrap_password project_api_token credentials
+unset project_api_token credentials
 
 if ! "$python_command" - "$log" "$run_dir" "$server_pid" "$children_file" <<'PY'
 import os

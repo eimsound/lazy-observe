@@ -21,7 +21,11 @@ func TestCleanerDeletesOnlyExpiredReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if _, err := store.Bootstrap(ctx, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+	if _, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	); err != nil {
 		t.Fatal(err)
 	}
 	project, err := store.ProjectBySlug(ctx, "default")

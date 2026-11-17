@@ -415,6 +415,35 @@ func TestConfigExampleParses(t *testing.T) {
 	}
 }
 
+func TestAdminPasswordFileFileAndEnvironment(t *testing.T) {
+	if Defaults().Security.AdminPasswordFile != "" {
+		t.Fatal("admin password file default must be empty (generated password fallback)")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "security:\n  admin_password_file: /run/secrets/file-admin\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.AdminPasswordFile != "/run/secrets/file-admin" {
+		t.Fatalf("file admin_password_file = %q", cfg.Security.AdminPasswordFile)
+	}
+	env := map[string]string{"LO_SECURITY_ADMIN_PASSWORD_FILE": "/run/secrets/env-admin"}
+	cfg, _, err = Load(
+		[]string{"--config", path},
+		func(key string) (string, bool) { value, ok := env[key]; return value, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.AdminPasswordFile != "/run/secrets/env-admin" {
+		t.Fatalf("env admin_password_file = %q", cfg.Security.AdminPasswordFile)
+	}
+}
+
 func TestMetaDBURLPrecedenceAndValidation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(

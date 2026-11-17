@@ -85,12 +85,13 @@ func TestBootstrapIdempotentOnSingleBaseline(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	if _, err := store.Bootstrap(ctx, logger); err != nil {
+	admin := BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), InitialAdminPasswordFileName)}
+	if _, err := store.Bootstrap(ctx, logger, admin); err != nil {
 		t.Fatal(err)
 	}
 	first := logs.String()
 	if !strings.Contains(first, "created bootstrap admin") {
-		t.Fatalf("first bootstrap did not log admin credentials: %s", first)
+		t.Fatalf("first bootstrap did not log admin creation: %s", first)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -100,11 +101,11 @@ func TestBootstrapIdempotentOnSingleBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs.Reset()
-	if _, err := store.Bootstrap(ctx, logger); err != nil {
+	if _, err := store.Bootstrap(ctx, logger, admin); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(logs.String(), "created bootstrap admin") {
-		t.Fatalf("second bootstrap repeated admin credentials: %s", logs.String())
+		t.Fatalf("second bootstrap repeated admin creation: %s", logs.String())
 	}
 	users, err := store.ListUsers(ctx)
 	if err != nil || len(users) != 1 || users[0].Username != "admin" {

@@ -300,7 +300,11 @@ func profileTestApp(t *testing.T) (interface {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	defaultToken, err := store.Bootstrap(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defaultToken, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

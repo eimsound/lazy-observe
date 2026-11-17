@@ -117,6 +117,14 @@ security:
   tls_cert: ""
   tls_key: ""
   secret_key_file: ""
+  # First admin password, read only while the admin account does not exist.
+  # Surrounding whitespace is ignored; at least 8 characters are required.
+  # Empty generates a random password and writes it (mode 0600) to
+  # <data_dir>/initial-admin-password on the replica that creates the admin;
+  # the log only records that path, never the password. Multi-replica (HA)
+  # deployments should set this file, because the generated file exists on one
+  # replica only and is lost with an ephemeral data_dir.
+  admin_password_file: ""
 
 # BYO LLM integration is configured exclusively by administrators from the web
 # UI (Settings > AI): enable the switch and provide provider (openai, anthropic,
@@ -137,5 +145,5 @@ security:
 # LO_PROCESS_RESTART_INITIAL, LO_PROCESS_RESTART_MAX, LO_PROCESS_DRAIN_TIMEOUT,
 # LO_PROCESS_COMPONENT_PORT_OFFSET, LO_ALERT_STORM_THRESHOLD.
 # Self-monitoring fields: LO_SELF_MONITORING_ENABLED and LO_SELF_MONITORING_PROFILING.
-# Security fields: LO_SECRET_KEY_FILE.
+# Security fields: LO_SECRET_KEY_FILE, LO_SECURITY_ADMIN_PASSWORD_FILE.
 # Only canonical names are accepted; short compatibility aliases are not supported.

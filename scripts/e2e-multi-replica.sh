@@ -331,6 +331,12 @@ PIDS="$PIDS $!"
 
 CGO_ENABLED=0 go build -o "$WORK/e2e-otlp-payload" ./scripts/e2e-otlp-payload
 
+# HA deployments provide the first admin password: a generated one would only
+# land in the bootstrap winner's data_dir. Both replicas read the same 0600 file.
+ADMIN_PASSWORD_FILE="$WORK/admin-password"
+(umask 077 && python3 -c 'import secrets; print(secrets.token_urlsafe(24))' >"$ADMIN_PASSWORD_FILE")
+PASSWORD=$(cat "$ADMIN_PASSWORD_FILE")
+
 write_config() {
   file=$1 listen=$2 logs_url=$3 metrics_ingest_url=$4 offset=$5
   cat >"$file" <<EOF
@@ -373,6 +379,8 @@ process:
   component_port_offset: $offset
 self_monitoring:
   enabled: false
+security:
+  admin_password_file: "$ADMIN_PASSWORD_FILE"
 EOF
 }
 write_config "$WORK/replica-a.yaml" 127.0.0.1:23101 http://127.0.0.1:29091 "http://$VMINSERT_1_HOST:8480" 0
@@ -433,12 +441,23 @@ wait_ready http://127.0.0.1:23101
 wait_ready http://127.0.0.1:23102
 echo "PASS: both application replicas started concurrently against a blank PostgreSQL database"
 
-PASSWORD=$(sed -n 's/.*created bootstrap admin.*password=\([^ ]*\).*/\1/p' "$WORK/a.log" "$WORK/b.log" | head -1)
 TOKEN=$(sed -n 's/.*created default project.*project_api_token=\([^ ]*\).*/\1/p' "$WORK/a.log" "$WORK/b.log" | head -1)
 if [ -z "$PASSWORD" ] || [ -z "$TOKEN" ]; then
   echo "FAIL: failed to read bootstrap credentials" >&2
   exit 1
 fi
+ADMIN_CREATIONS=$(cat "$WORK/a.log" "$WORK/b.log" | grep -c 'created bootstrap admin.*password_source=admin_password_file' || true)
+if [ "$ADMIN_CREATIONS" != 1 ]; then
+  echo "FAIL: exactly one replica must create the admin from admin_password_file (got $ADMIN_CREATIONS)" >&2
+  exit 1
+fi
+if grep -Fq -- "$PASSWORD" "$WORK/a.log" "$WORK/b.log" ||
+  grep -q 'initial admin password written' "$WORK/a.log" "$WORK/b.log" ||
+  [ -e "$WORK/replica-a-data/initial-admin-password" ] || [ -e "$WORK/replica-b-data/initial-admin-password" ]; then
+  echo "FAIL: admin_password_file bootstrap logged the password or generated another one" >&2
+  exit 1
+fi
+echo "PASS: admin bootstrapped once from admin_password_file without logging the password"
 
 curl -fsS -c "$WORK/cookies" -H 'Content-Type: application/json' -d "{\"username\":\"admin\",\"password\":\"$PASSWORD\"}" http://127.0.0.1:23101/api/auth/login >/dev/null
 curl -fsS -b "$WORK/cookies" http://127.0.0.1:23102/api/auth/me >/dev/null

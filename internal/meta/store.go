@@ -1066,23 +1066,26 @@ func (s *Store) acquireBootstrapCoordination(ctx context.Context) (func() error,
 	}, nil
 }
 
-func (s *Store) Bootstrap(ctx context.Context, logger *slog.Logger) (token string, err error) {
+// Bootstrap idempotently creates the first admin and the default project. The
+// admin password never reaches the logs: it comes from admin.PasswordFile, or
+// is generated and written to admin.GeneratedPasswordFile (mode 0600). An
+// existing admin is left untouched. The default project API token is
+// ingest-only (ADR 0010) and is still logged once so first ingest works.
+func (s *Store) Bootstrap(
+	ctx context.Context,
+	logger *slog.Logger,
+	admin BootstrapAdmin,
+) (token string, err error) {
+	if err := admin.validate(); err != nil {
+		return "", err
+	}
 	release, err := s.acquireBootstrapCoordination(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer func() { err = errors.Join(err, release()) }()
-	if _, err := s.client.User.Query().Where(user.UsernameEQ("admin")).Only(ctx); IsNotFound(err) {
-		password, genErr := randomPassword()
-		if genErr != nil {
-			return "", genErr
-		}
-		if _, createErr := s.CreateUser(ctx, "admin", password, string(user.RoleAdmin)); createErr != nil {
-			return "", fmt.Errorf("create bootstrap admin: %w", createErr)
-		}
-		logger.Info("created bootstrap admin", "username", "admin", "password", password)
-	} else if err != nil {
-		return "", fmt.Errorf("find bootstrap admin: %w", err)
+	if err := s.ensureBootstrapAdmin(ctx, logger, admin); err != nil {
+		return "", err
 	}
 	p, err := s.client.Project.Query().Where(project.SlugEQ("default")).Only(ctx)
 	if IsNotFound(err) {
@@ -1150,6 +1153,60 @@ func (s *Store) BootstrapSelfMonitoring(
 		return ProjectInfo{}, "", fmt.Errorf("create self-monitoring project API token: %w", err)
 	}
 	return info, derived, nil
+}
+
+func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, admin BootstrapAdmin) error {
+	_, err := s.client.User.Query().Where(user.UsernameEQ("admin")).Only(ctx)
+	if err == nil {
+		return nil
+	}
+	if !IsNotFound(err) {
+		return fmt.Errorf("find bootstrap admin: %w", err)
+	}
+	host := bootstrapHost()
+	if admin.PasswordFile != "" {
+		password, err := readAdminPasswordFile(admin.PasswordFile)
+		if err != nil {
+			return fmt.Errorf("create bootstrap admin: %w", err)
+		}
+		if _, err := s.CreateUser(ctx, "admin", password, string(user.RoleAdmin)); err != nil {
+			return fmt.Errorf("create bootstrap admin: %w", err)
+		}
+		logger.Info(
+			"created bootstrap admin",
+			"username", "admin",
+			"password_source", "admin_password_file",
+			"password_file", admin.PasswordFile,
+			"host", host,
+		)
+		return nil
+	}
+	password, err := randomPassword()
+	if err != nil {
+		return err
+	}
+	// Persist before creating the account: a crash in between leaves a stale
+	// file that the next start overwrites, never an admin nobody can log in as.
+	if err := writeInitialAdminPassword(admin.GeneratedPasswordFile, password); err != nil {
+		return fmt.Errorf("create bootstrap admin: %w", err)
+	}
+	if _, err := s.CreateUser(ctx, "admin", password, string(user.RoleAdmin)); err != nil {
+		_ = os.Remove(admin.GeneratedPasswordFile)
+		return fmt.Errorf("create bootstrap admin: %w", err)
+	}
+	logger.Info(
+		"created bootstrap admin",
+		"username", "admin",
+		"password_source", "generated",
+		"host", host,
+	)
+	logger.Info(
+		"initial admin password written",
+		"username", "admin",
+		"path", admin.GeneratedPasswordFile,
+		"host", host,
+	)
+	return nil
 }
 
 func randomToken() (string, error) {

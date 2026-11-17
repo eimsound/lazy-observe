@@ -111,7 +111,7 @@ func openServerMetadata(
 	if err != nil {
 		return nil, err
 	}
-	if _, err := store.Bootstrap(ctx, logger); err != nil {
+	if _, err := store.Bootstrap(ctx, logger, bootstrapAdmin(cfg)); err != nil {
 		return nil, fmt.Errorf("bootstrap metadata: %w", err)
 	}
 	selfProject, selfToken, err := store.BootstrapSelfMonitoring(
@@ -128,6 +128,22 @@ func openServerMetadata(
 		selfProject: selfProject,
 		selfToken:   selfToken,
 	}, nil
+}
+
+// bootstrapAdmin uses the deployer-provided password file when configured;
+// otherwise a generated first password lands in <data_dir>/initial-admin-password.
+// Only the replica that wins the bootstrap lock writes that file, so HA
+// deployments should provide security.admin_password_file instead.
+func bootstrapAdmin(cfg appconfig.Config) meta.BootstrapAdmin {
+	if cfg.Security.AdminPasswordFile != "" {
+		return meta.BootstrapAdmin{PasswordFile: cfg.Security.AdminPasswordFile}
+	}
+	path := filepath.Join(cfg.DataDir, meta.InitialAdminPasswordFileName)
+	if absolute, err := filepath.Abs(path); err == nil {
+		// The log line must point the operator at the file without guessing the cwd.
+		path = absolute
+	}
+	return meta.BootstrapAdmin{GeneratedPasswordFile: path}
 }
 
 func openBlobStore(cfg appconfig.Config) (blob.Store, error) {
