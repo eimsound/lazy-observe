@@ -1,0 +1,159 @@
+# Dependabot 版本更新。安全更新由仓库设置里的 Dependabot alerts / security updates 触发，不受 cooldown 约束。
+#
+# 约定：每周一次；每个条目把 minor + patch 合成一个 PR，major 单独开；cooldown 7 天，
+# 新版本发布满 7 天才提，避开发布后几小时内被投毒撤回的版本。
+# 覆盖面由 scripts/check-github-workflows.sh 校验：每个 go.mod、pnpm-lock.yaml、pyproject.toml、Dockerfile
+# 所在目录都必须有对应条目。
+#
+# Dependabot 管不到、需要手工更新的固定点：
+#   - entc.mod / entc.sum（Ent 代码生成用的备用 modfile，Dependabot 只认 go.mod）；
+#   - mise.toml 里的工具版本（含 govulncheck）、scripts/ci-setup-mise.sh 的 go-ci 工具清单；
+#   - workflow 里 setup-buildx-action 的 BuildKit 镜像（driver-opts，带 digest）；
+#   - scripts/check-image-vulns.sh 的 Trivy 版本与 sha256、存储二进制与 e2e 容器镜像。
+version: 2
+updates:
+  # SHA 固定的 action：Dependabot 同时改 40 位 SHA 和行尾的 `# vX.Y.Z` 注释。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      github-actions-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    ignore:
+      # 同仓模块，经 replace => ./sdk/go 引用，require 里的版本号没有意义。
+      - dependency-name: github.com/eimsound/lazy-observe/sdk/go
+    groups:
+      # Ent 运行时单独成 PR：合并前要把 entc.mod 里的生成器升到同一版本并重新生成。
+      ent:
+        patterns: ["entgo.io/*"]
+      # OpenTelemetry 各模块必须同批升级（otelslog 与 otel/log、semconv schema 版本互相绑定）。
+      opentelemetry:
+        patterns: ["go.opentelemetry.io/*"]
+        update-types: [minor, patch]
+      gomod-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: gomod
+    directory: /sdk/go
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      opentelemetry:
+        patterns: ["go.opentelemetry.io/*"]
+        update-types: [minor, patch]
+      gomod-minor-patch:
+        update-types: [minor, patch]
+
+  # 三个 JS 工程都用 pnpm（packageManager: pnpm@10.33.0，提交了 pnpm-lock.yaml）；Dependabot 的 npm 生态处理 pnpm 锁文件。
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /sdk/node
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /sdk/browser
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # Python SDK 是库：pyproject.toml 里的 >= 下限是对使用方的兼容承诺，不因为有新版就抬高。
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    versioning-strategy: increase-if-necessary
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      pip-minor-patch:
+        update-types: [minor, patch]
+
+  # Dockerfile 的 FROM（含 digest 时 Dependabot 连 digest 一起更新）。
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]

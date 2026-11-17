@@ -1,7 +1,7 @@
 min_version = "2025.8.4"
 
 [tools]
-go = "1.26.5"
+go = "1.26.11"
 node = "24.18.0"
 pnpm = "10.33.0"
 jq = "1.8.2"
@@ -453,6 +453,24 @@ description = "Allow only Apache-2.0, MIT, and BSD licenses in the production Go
 depends = ["ent-generate"]
 tools."go:github.com/google/go-licenses/v2" = "2.0.1"
 run = "bash scripts/check-go-licenses.sh"
+
+[tasks.vulncheck]
+description = "Report reachable known vulnerabilities in the server module and the sdk/go module (govulncheck)"
+depends = ["ent-generate"]
+# 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
+# 漏洞库在运行时从 vuln.go.dev 拉取，所以结果会随新公告变化。
+tools."go:golang.org/x/vuln/cmd/govulncheck" = "1.9.0"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+export CGO_ENABLED=0
+status=0
+for module in . sdk/go; do
+  printf '== govulncheck %s\n' "$module"
+  (cd "$module" && govulncheck ./...) || status=1
+done
+exit "$status"
+'''
 
 [tasks.third-party-notices]
 description = "Regenerate third_party/go/THIRD_PARTY_NOTICES.txt from the linked Go dependency graph"

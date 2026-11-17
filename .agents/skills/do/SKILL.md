@@ -86,7 +86,7 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 | HA、多副本、存储集群 | PR CI 的 HA E2E job 已按改动面跑 `mise run e2e-ha`（只含功能断言）；本地可选（需 Docker，很慢），想在推之前先拿结果时再跑 |
 | `web/` | `mise run web`（含 typecheck、build、playwright、JS 许可证；慢） |
 | `sdk/`（客户端 SDK） | 按语言：`mise run sdk-go`、`mise run sdk-node`、`mise run sdk-browser`、`mise run sdk-python`；`sdk/go` 另跑 Go 代码那行；协议面改动同 PR 更新 `docs/version-matrix.md` |
-| 依赖、许可证 | `mise run license-check`、`mise run mod-tidy-check` |
+| 依赖、许可证、漏洞 | `mise run license-check`、`mise run mod-tidy-check`、`mise run vulncheck` |
 | 构建、嵌入、产物大小 | `mise run dist-cross`、`mise run gate-release-artifacts` |
 | 发布配置、tag | `mise run release-prerequisites-test`、`mise run release-publish-check` |
 | Helm | `mise run helm-lint`、`mise run helm-template-test` |
@@ -113,12 +113,13 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | `go.mod`/`go.sum` | 同上 + meta-pg |
 | `scripts/e2e-multi-replica.sh` 及其辅助程序、`bench/performance-gates.json`、`scripts/download-storage-bins.sh` | HA E2E（另加各自原有的 job） |
 | 打包链路 | 零配置产物冒烟 + 原生 arm64 构建与冒烟 |
+| `.github/dependabot.yml`、`.trivyignore.yaml` | 只跑 Go 检查（workflow-check 校验它们） |
 | `.github/**`、`mise.toml`、`scripts/ci-*`、`Dockerfile*` | 全量 |
 
 | 触发 | workflow | 跑什么 |
 | --- | --- | --- |
 | PR、push 到 `main`、`integration/**` | `ci.yml` | 上表按改动面挑出的 job，由 `ci-ok` 汇总 |
-| `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、性能门禁，全过才出包 |
+| `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、镜像漏洞扫描（Trivy，有修复的 CRITICAL/HIGH 即失败）、性能门禁，全过才出包 |
 | 手动 | `bench.yml` | 依次跑 `bench`（30 秒摄入基准 + 基线门禁）、`perf-release`（双架构产物门禁 + 零配置 release smoke）、`perf-ha`（`e2e-ha` 全部 HA 断言 + 查询 P95 与弱扩展门禁）、`perf-results-check` |
 
 切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。分组规则由 `mise run ci-changes-test` 钉住，改分组时同步改测试。

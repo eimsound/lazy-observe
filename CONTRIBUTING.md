@@ -8,7 +8,7 @@ Read [AGENTS.md](AGENTS.md), [requirements](docs/requirements.md), the [architec
 
 Hard constraints:
 
-- Go 1.26 with the exact module directive currently at 1.26.5.
+- Go 1.26 with the exact module directive currently at 1.26.11.
 - `CGO_ENABLED=0` for Linux on amd64/arm64.
 - Node.js 24 and pnpm 10.33.0 for CI-equivalent web/SDK work.
 - No AGPL or GPL dependencies. New dependencies must use Apache-2.0, MIT, or BSD-family licenses.
@@ -46,6 +46,7 @@ mise run web
 | `mise run migration-check` | Validate the paired SQLite/PostgreSQL single baselines |
 | `mise run ent-generate-check` | Regenerate Ent clients and prove automatic migration code and root-module drift stay absent |
 | `mise run license-check` | Check all four production Go package graphs against the Apache-2.0/MIT/BSD allowlist |
+| `mise run vulncheck` | Run pinned `govulncheck` over the server module and `sdk/go`; fails on reachable known vulnerabilities |
 | `mise run storage-bins` | Download and verify the four platform storage binaries |
 | `mise run e2e` | Build, download storage, run opt-in Gateway, recovery, and restart E2E |
 | `mise run e2e-ha` | Run the required Docker gate for real signal clusters, S3, and multi-replica coordination |
@@ -128,12 +129,13 @@ business job.
 | `go.mod`, `go.sum` | Same as above plus PostgreSQL metadata tests |
 | `scripts/e2e-multi-replica.sh` and its helpers, `bench/performance-gates.json`, `scripts/download-storage-bins.sh` | Adds HA E2E |
 | Packaging chain | Zero-config artifact smoke plus native arm64 build and smoke |
+| `.github/dependabot.yml`, `.trivyignore.yaml` | Go checks only (`workflow-check` validates them) |
 | `.github/**`, `mise.toml`, `scripts/ci-*`, `Dockerfile*` | Everything |
 
 | Trigger | Workflow | Scope |
 | --- | --- | --- |
 | Pull request, push to `main` or `integration/**` | `ci.yml` | Change-scoped jobs above, aggregated by `ci-ok` |
-| `v*` tag or manual release dispatch | `release.yml` | amd64/arm64 container smoke and the performance gates, all before archives are built |
+| `v*` tag or manual release dispatch | `release.yml` | amd64/arm64 container smoke, a Trivy image scan that fails on fixable CRITICAL/HIGH vulnerabilities, and the performance gates, all before archives are built |
 | Manual dispatch | `bench.yml` | Performance gates on demand |
 
 Performance gates are noisy on shared runners, so they run only on manual

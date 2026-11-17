@@ -1,5 +1,5 @@
 module github.com/eimsound/lazy-observe
 
-go 1.26.5
+go 1.26.11
 
 require entgo.io/ent v0.14.6

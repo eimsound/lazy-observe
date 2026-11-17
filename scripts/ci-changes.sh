@@ -96,6 +96,11 @@ classify() {
   *.md | docs/* | LICENSE | NOTICE | .agents/* | skills-lock.json | .air.toml | .github/ISSUE_TEMPLATE/*)
     return
     ;;
+  # Dependabot 配置只被 GitHub 的 Dependabot 服务读取，不改变任何 job 的行为；.trivyignore.yaml 只在
+  # release.yml 的镜像扫描里生效。两者的格式与覆盖面都由 go job 里的 workflow-check 校验，所以只跑 go。
+  .github/dependabot.yml | .trivyignore.yaml)
+    set_flags go
+    ;;
   # CI 自身、工具链与镜像：全量。
   .github/* | mise.toml | scripts/ci-* | Dockerfile*)
     set_all

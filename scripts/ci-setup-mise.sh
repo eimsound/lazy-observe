@@ -48,6 +48,7 @@ else
       golangci-lint@2.12.2
       go:github.com/golangci/golines@0.15.0
       go:github.com/google/go-licenses/v2@2.0.1
+      go:golang.org/x/vuln/cmd/govulncheck@1.9.0
       helm@3.21.3
     )
     ;;
