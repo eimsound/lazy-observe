@@ -83,7 +83,7 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 | Ent schema 或基线 SQL | `mise run migration-check`、`mise run ent-generate-check`、`mise run test-meta-pg` |
 | 网关路由、API 契约、e2e 脚本 | `mise run e2e-contract-check`、`mise run e2e`（慢） |
 | 重启、持久接管、恢复 | `mise run e2e-restart`（慢） |
-| HA、多副本、存储集群 | `mise run e2e-ha`（很慢） |
+| HA、多副本、存储集群 | PR CI 的 HA E2E job 已按改动面跑 `mise run e2e-ha`（只含功能断言）；本地可选（需 Docker，很慢），想在推之前先拿结果时再跑 |
 | `web/` | `mise run web`（含 typecheck、build、playwright、JS 许可证；慢） |
 | `sdk/`（客户端 SDK） | 按语言：`mise run sdk-go`、`mise run sdk-node`、`mise run sdk-browser`、`mise run sdk-python`；`sdk/go` 另跑 Go 代码那行；协议面改动同 PR 更新 `docs/version-matrix.md` |
 | 依赖、许可证 | `mise run license-check`、`mise run mod-tidy-check` |
@@ -106,11 +106,12 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | --- | --- |
 | `*.md`、`docs/**`、`LICENSE`、`.agents/**` | 不跑业务 job，`ci-ok` 直接绿 |
 | `sdk/node/**`、`sdk/browser/**`、`sdk/python/**` | 对应语言的 SDK job |
-| `sdk/go/**` | Go SDK job + 服务端 Go 检查、构建、e2e |
+| `sdk/go/**` | Go SDK job + 服务端 Go 检查、构建、e2e、HA E2E |
 | `web/**` | web |
 | `internal/db/**`、`internal/meta/**` | 另加 PG 元数据测试 |
-| `cmd/**`、`internal/**` | Go 检查、构建、e2e、e2e-restart |
+| `cmd/**`、`internal/**` | Go 检查、构建、e2e、e2e-restart、HA E2E |
 | `go.mod`/`go.sum` | 同上 + meta-pg |
+| `scripts/e2e-multi-replica.sh` 及其辅助程序、`bench/performance-gates.json`、`scripts/download-storage-bins.sh` | HA E2E（另加各自原有的 job） |
 | 打包链路 | 零配置产物冒烟 + 原生 arm64 构建与冒烟 |
 | `.github/**`、`mise.toml`、`scripts/ci-*`、`Dockerfile*` | 全量 |
 

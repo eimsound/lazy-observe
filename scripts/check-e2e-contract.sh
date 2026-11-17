@@ -81,6 +81,26 @@ done
 rg -Fq 'arch: [amd64, arm64]' "$release" || \
   fail 'release workflow lacks the amd64/arm64 container smoke matrix'
 
+# 多副本 HA 功能门禁按改动面跟 PR 跑：ci.yml 的 e2e-ha job 由 ha 标志控制、先确认 Docker 可用，
+# 只跑功能断言；性能部分（LO_E2E_PERF_GATES / perf-ha）不进 PR。
+ha_task=$(sed -n '/^\[tasks\.e2e-ha\]$/,/^\[tasks\.perf-ha\]$/p' mise.toml)
+[[ $ha_task == *'bash scripts/e2e-multi-replica.sh'* ]] || fail 'mise e2e-ha must run scripts/e2e-multi-replica.sh'
+[[ $ha_task != *LO_E2E_PERF_GATES* ]] || fail 'mise e2e-ha must stay a functional gate without LO_E2E_PERF_GATES'
+ha_job=$(awk '$0 == "  e2e-ha:" { on = 1; next } on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } on { print }' "$ci")
+[[ -n $ha_job ]] || fail 'push/PR CI lacks the e2e-ha job'
+[[ $ha_job == *"if: needs.changes.outputs.ha == 'true'"* ]] || fail 'ci.yml e2e-ha must gate on the ha change flag'
+[[ $ha_job == *'bash scripts/ci-setup-docker.sh'* ]] || fail 'ci.yml e2e-ha must verify Docker access first'
+[[ $ha_job == *'- run: mise run e2e-ha'* ]] || fail 'ci.yml e2e-ha must run mise run e2e-ha'
+[[ $ha_job != *LO_E2E_PERF_GATES* ]] || fail 'ci.yml e2e-ha must not enable the HA performance gates'
+for path in scripts/e2e-multi-replica.sh go.mod internal/meta/store.go cmd/lazy-observe/main.go; do
+  # 先收齐输出再匹配：pipefail 下 grep -q 提前退出会让 ci-changes.sh 收到 SIGPIPE（141）。
+  flags_out=$(printf '%s\n' "$path" | bash "$changes_script" --stdin 2>/dev/null)
+  [[ $'\n'$flags_out$'\n' == *$'\n'ha=true$'\n'* ]] || fail "HA E2E does not trigger on $path"
+done
+if rg -n 'mise run (perf-ha|perf-release|bench|performance-gates)' "$ci"; then
+  fail 'push/PR CI must not run the performance gates'
+fi
+
 # 性能门禁不跟 PR 跑：必须挡在发版链路上（archive 之前），bench.yml 只留手动入口。
 for task in 'mise run bench' 'mise run perf-release' 'mise run perf-ha' 'mise run perf-results-check'; do
   rg -Fq "$task" "$release" || fail "release workflow lacks performance gate: $task"

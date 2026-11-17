@@ -3,7 +3,8 @@ name: CI
 # 增量 CI：changes 作业按改动面输出布尔标志（scripts/ci-changes.sh），各业务 job 按标志
 # 决定跑还是跳过；最后的 ci-ok 汇总 job 是唯一的 required check，被跳过的 job 算通过。
 # 纯文档改动所有业务 job 跳过。动到打包链路时 arm64 构建与冒烟进入 build 矩阵，
-# 发版前 release.yml 再对两个架构兜底。
+# 发版前 release.yml 再对两个架构兜底。服务端改动另跑多副本 HA 功能门禁（e2e-ha）；
+# 性能门禁（perf-ha、perf-release、bench）不进 PR，只在 bench.yml 手动和 release.yml 发版前跑。
 #
 # 所有 job 直接跑在 GitHub 托管 runner 上，工具由 scripts/ci-setup-mise.sh 安装，mise 目录按 job 缓存。
 #
@@ -36,6 +37,7 @@ jobs:
       go: ${{ steps.detect.outputs.go }}
       build: ${{ steps.detect.outputs.build }}
       e2e: ${{ steps.detect.outputs.e2e }}
+      ha: ${{ steps.detect.outputs.ha }}
       web: ${{ steps.detect.outputs.web }}
       meta_pg: ${{ steps.detect.outputs.meta_pg }}
       arm64: ${{ steps.detect.outputs.arm64 }}
@@ -268,6 +270,47 @@ jobs:
           restore-keys: storage-native-${{ runner.os }}-${{ runner.arch }}-
       - run: mise run e2e-restart
 
+  # 多副本 HA 功能门禁：双副本网关 + VM 集群（含一个 vmstorage 掉线）、VLogs/VTraces 分角色、
+  # SeaweedFS S3、Postgres 告警租约与 Outbox、Valkey 会话。只跑功能断言（不设 LO_E2E_PERF_GATES），
+  # 性能部分留给 bench.yml / release.yml 的 perf-ha。依赖缺失时脚本以 77 退出，在 CI 里算失败。
+  e2e-ha:
+    name: HA E2E (multi-replica)
+    needs: changes
+    if: needs.changes.outputs.ha == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify Docker access
+        run: bash scripts/ci-setup-docker.sh
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-e2e-ha-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-e2e-ha-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore Go cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/storage-bin/.archives
+          key: storage-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.storage }}
+          restore-keys: storage-native-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run e2e-ha
+
   web:
     name: Web typecheck and build
     needs: changes
@@ -446,6 +489,7 @@ jobs:
       - artifact-smoke
       - e2e
       - e2e-restart
+      - e2e-ha
       - web
       - meta-pg
       - sdk-go
