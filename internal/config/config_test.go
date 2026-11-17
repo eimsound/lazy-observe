@@ -301,6 +301,26 @@ func TestAIKeyFileDefaultAndLegacyAISectionRejected(t *testing.T) {
 	}
 }
 
+// The Helm chart renders a security block that only sets secret_key_file; the
+// other security defaults must survive that partial section.
+func TestSecretKeyFileFromPartialSecuritySection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "security:\n  secret_key_file: \"/etc/lazy-observe-key/secret.key\"\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.SecretKeyFile != "/etc/lazy-observe-key/secret.key" {
+		t.Fatalf("secret_key_file = %q", cfg.Security.SecretKeyFile)
+	}
+	if !cfg.Security.CSRF || cfg.Security.AuditRetention != Defaults().Security.AuditRetention {
+		t.Fatalf("partial security section dropped defaults: %+v", cfg.Security)
+	}
+}
+
 func TestVMClusterValidation(t *testing.T) {
 	cfg := Defaults()
 	cfg.Storage.Metrics.Cluster = true

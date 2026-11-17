@@ -6,6 +6,10 @@
 // (mode 0600) and is read once into memory for the process lifetime; it is
 // never re-read per operation. HA deployments must share the same key file
 // (or mount it read-only) so every replica can decrypt the same values.
+//
+// The file holds 32 bytes as standard base64, padded or unpadded; surrounding
+// whitespace and line breaks are ignored, so `openssl rand -base64 32` output
+// works as a provisioned key. An existing file is only read, never rewritten.
 package secret
 
 import (
@@ -20,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // keyBytes is the AES-256 key length.
@@ -55,17 +60,25 @@ func LoadOrCreate(path string) (*Box, error) {
 	}
 }
 
+// boxFromRaw decodes a key file. Generated files hold unpadded standard
+// base64; operator-provisioned files (Kubernetes Secret, `openssl rand -base64
+// 32`) may also be padded and carry whitespace or line breaks, all of which
+// are ignored.
 func boxFromRaw(raw []byte) (*Box, error) {
-	decoded := make([]byte, base64.RawStdEncoding.DecodedLen(len(raw)))
-	n, err := base64.RawStdEncoding.Decode(decoded, raw)
+	encoded := strings.Join(strings.Fields(string(raw)), "")
+	encoding := base64.RawStdEncoding
+	if strings.HasSuffix(encoded, "=") {
+		encoding = base64.StdEncoding
+	}
+	decoded, err := encoding.DecodeString(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("decode encryption key file: %w", err)
 	}
-	if n != keyBytes {
-		return nil, fmt.Errorf("encryption key file must contain %d bytes, got %d", keyBytes, n)
+	if len(decoded) != keyBytes {
+		return nil, fmt.Errorf("encryption key file must contain %d bytes, got %d", keyBytes, len(decoded))
 	}
 	var box Box
-	copy(box.key[:], decoded[:n])
+	copy(box.key[:], decoded)
 	return &box, nil
 }
 
