@@ -1,0 +1,25 @@
+{
+  "name": "@lazy-observe/react",
+  "version": "0.1.0",
+  "description": "React adapter for @lazy-observe/browser",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs"}},
+  "files": ["dist", "README.md", "LICENSE"],
+  "sideEffects": false,
+  "scripts": {"build": "tsup", "test": "vitest run", "typecheck": "tsc --noEmit"},
+  "dependencies": {"@lazy-observe/browser": "workspace:*"},
+  "peerDependencies": {"react": ">=18"},
+  "devDependencies": {
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "jsdom": "^26.1.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tsup": "^8.5.0"
+  }
+}

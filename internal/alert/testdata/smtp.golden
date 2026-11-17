@@ -1,0 +1,26 @@
+From: alerts@example.com
+To: ops@example.com
+Subject: [FIRING] alpha / DiskFull
+Content-Type: text/plain; charset=UTF-8
+
+{
+  "project": "alpha",
+  "rule": "DiskFull",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "DiskFull",
+        "instance": "node-1",
+        "project_id": "alpha"
+      },
+      "annotations": {
+        "summary": "disk full"
+      },
+      "startsAt": "2026-07-17T01:02:03Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "abc"
+    }
+  ]
+}

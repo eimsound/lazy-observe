@@ -1,0 +1,8 @@
+{
+  "name": "@lazy-observe/example-vanilla",
+  "private": true,
+  "type": "module",
+  "scripts": {"build":"vite build","dev":"vite --host 127.0.0.1"},
+  "dependencies": {"@lazy-observe/browser":"workspace:*"},
+  "devDependencies": {"typescript":"^5.9.0","vite":"^7.0.0"}
+}

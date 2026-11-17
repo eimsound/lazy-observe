@@ -1,0 +1,913 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useSearch } from "@tanstack/react-router";
+import {
+  AlertCircle,
+  BarChart3,
+  Copy,
+  Database,
+  History,
+  Info,
+  ListFilter,
+  Loader2,
+  Play,
+  Plus,
+  Search,
+  Settings2,
+  Table2,
+  Trash2,
+  WandSparkles,
+  X,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+import {
+  prettifyPromQL,
+  queryInstantDetailed,
+  queryRangeDetailed,
+  queryServerClock,
+} from "@/lib/api/metrics";
+import { ApiError } from "@/lib/api/client";
+import type {
+  MetricTableResult,
+  MetricsQueryEnvelope,
+  TimeSeries,
+} from "@/lib/api/types";
+import { getProjectSlug, IS_MOCK } from "@/lib/settings";
+import dayjs, { dayjsLocale } from "@/lib/dayjs";
+import {
+  clearMetricsHistory,
+  dateParts,
+  effectiveMetricsStep,
+  formatPrometheusDuration,
+  getMetricsHistory,
+  METRICS_RANGE_PRESETS,
+  metricsLabelColumns,
+  metricsRangeSeconds,
+  parsePrometheusDuration,
+  pushMetricsHistory,
+  resolveMetricsRange,
+  type MetricsGraphMode,
+  type MetricsHistoryEntry,
+  type MetricsQueryTab,
+  type MetricsRange,
+  type MetricsResolution,
+  type MetricsTableMode,
+  type MetricsTimeFormat,
+} from "@/lib/metrics-query";
+import { PageActions, PageContainer } from "@/components/layout/page";
+import { TimeSeriesChart } from "@/components/charts/time-series-chart";
+import { MetricsExplorer } from "@/components/metrics/metrics-explorer";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
+import { PrometheusQueryControls } from "@/components/metrics/prometheus-query-controls";
+import { PromQLEditor, type PromQLEditorHandle } from "@/components/metrics/promql-editor";
+import { MetricsTimeRangePicker } from "@/components/metrics/metrics-time-range-picker";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
+import type { MetricsEvidenceSearch } from "./trace-evidence-links";
+import { queryViewState } from "./query-view-state";
+
+interface QueryPanelState {
+  id: string;
+  query: string;
+  activeTab: MetricsQueryTab;
+  range: MetricsRange;
+  resolution: MetricsResolution;
+  graphMode: MetricsGraphMode;
+  tableMode: MetricsTableMode;
+  timeFormat: MetricsTimeFormat;
+  yAxisZero: boolean;
+}
+
+interface ExecutedQuery {
+  query: string;
+  runId: number;
+}
+
+const DEFAULT_RANGE = METRICS_RANGE_PRESETS.find((item) => item.presetId === "1h") ?? METRICS_RANGE_PRESETS[0];
+const LOCAL_TIME_KEY = "lo-metrics-use-local-time";
+
+function newPanel(id: string, query = ""): QueryPanelState {
+  return {
+    id,
+    query,
+    activeTab: "table",
+    range: DEFAULT_RANGE,
+    resolution: { type: "auto", density: "medium" },
+    graphMode: "lines",
+    tableMode: "labels",
+    timeFormat: "readable",
+    yAxisZero: false,
+  };
+}
+
+function initialLocalTime() {
+  try {
+    const stored = localStorage.getItem(LOCAL_TIME_KEY);
+    return stored === null ? true : stored !== "false";
+  } catch {
+    return true;
+  }
+}
+
+interface InitialMetricsState {
+  panels: QueryPanelState[];
+  executed: Record<string, ExecutedQuery>;
+}
+
+function initialMetricsState(
+  fallbackQuery = "",
+  evidenceWindow?: { start: number; end: number },
+): InitialMetricsState {
+  const params = new URLSearchParams(window.location.search);
+  const indices = [...new Set([...params.keys()].flatMap((key) => {
+    const match = /^g(\d+)\./.exec(key);
+    return match ? [Number(match[1])] : [];
+  }))].sort((left, right) => left - right);
+  const panels: QueryPanelState[] = [];
+  const executed: Record<string, ExecutedQuery> = {};
+  for (const index of indices) {
+    const panel = newPanel(`query-${panels.length + 1}`, params.get(`g${index}.expr`) ?? "");
+    const tab = params.get(`g${index}.tab`);
+    if (tab === "graph" || tab === "table") panel.activeTab = tab;
+    const rangeSeconds = parsePrometheusDuration(params.get(`g${index}.range_input`) ?? "");
+    const endInput = params.get(`g${index}.end_input`);
+    const endMs = endInput ? dayjs(endInput).valueOf() : Number.NaN;
+    if (rangeSeconds !== null) {
+      panel.range = Number.isFinite(endMs)
+        ? { mode: "absolute", startMs: endMs - rangeSeconds * 1000, endMs }
+        : { mode: "relative", presetId: formatPrometheusDuration(rangeSeconds), seconds: rangeSeconds };
+    }
+    const resType = params.get(`g${index}.res_type`);
+    if (resType === "auto") {
+      const density = params.get(`g${index}.res_density`);
+      if (density === "low" || density === "medium" || density === "high") {
+        panel.resolution = { type: "auto", density };
+      }
+    } else if (resType === "fixed" || resType === "custom") {
+      const step = Number(params.get(`g${index}.res_step`));
+      if (Number.isFinite(step) && step >= 1) panel.resolution = { type: resType, step };
+    }
+    panel.graphMode = params.get(`g${index}.display_mode`) === "stacked" ? "stacked" : "lines";
+    panel.tableMode = params.get(`g${index}.table_mode`) === "series" ? "series" : "labels";
+    panel.timeFormat = params.get(`g${index}.time_format`) === "timestamp"
+      ? "timestamp"
+      : "readable";
+    panel.yAxisZero = params.get(`g${index}.y_axis_min`) === "0";
+    panels.push(panel);
+    const query = panel.query.trim();
+    if (query && params.has(`g${index}.expr`)) {
+      executed[panel.id] = { query, runId: panels.length };
+    }
+  }
+  if (panels.length > 0) return { panels, executed };
+  const panel = newPanel("query-1", fallbackQuery);
+  if (evidenceWindow) {
+    panel.range = {
+      mode: "absolute",
+      startMs: evidenceWindow.start * 1_000,
+      endMs: evidenceWindow.end * 1_000,
+    };
+  }
+  return { panels: [panel], executed };
+}
+
+function syncPanelsToURL(panels: QueryPanelState[]) {
+  const url = new URL(window.location.href);
+  for (const key of [...url.searchParams.keys()]) {
+    if (/^g\d+\./.test(key) || key === "q" || key === "run") url.searchParams.delete(key);
+  }
+  panels.forEach((panel, index) => {
+    const prefix = `g${index}.`;
+    const setOptional = (key: string, value: string | undefined) => {
+      if (value === undefined || value === "") url.searchParams.delete(key);
+      else url.searchParams.set(key, value);
+    };
+    const rangeSeconds = metricsRangeSeconds(panel.range);
+    const defaultRange = panel.range.mode === "relative" && rangeSeconds === DEFAULT_RANGE.seconds;
+    setOptional(prefix + "expr", panel.query.trim() ? panel.query : undefined);
+    setOptional(prefix + "tab", panel.activeTab === "table" ? undefined : panel.activeTab);
+    setOptional(
+      prefix + "range_input",
+      defaultRange ? undefined : formatPrometheusDuration(rangeSeconds),
+    );
+    if (panel.range.mode === "absolute" && panel.range.endMs !== undefined) {
+      url.searchParams.set(prefix + "end_input", dayjs(panel.range.endMs).toISOString());
+    }
+    if (panel.resolution.type === "auto" && panel.resolution.density !== "medium") {
+      url.searchParams.set(prefix + "res_type", "auto");
+      url.searchParams.set(prefix + "res_density", panel.resolution.density);
+    } else if (panel.resolution.type !== "auto") {
+      url.searchParams.set(prefix + "res_type", panel.resolution.type);
+      url.searchParams.set(prefix + "res_step", String(panel.resolution.step));
+    }
+    setOptional(prefix + "display_mode", panel.graphMode === "lines" ? undefined : panel.graphMode);
+    setOptional(prefix + "table_mode", panel.tableMode === "labels" ? undefined : panel.tableMode);
+    setOptional(
+      prefix + "time_format",
+      panel.timeFormat === "readable" ? undefined : panel.timeFormat,
+    );
+    if (panel.yAxisZero) url.searchParams.set(prefix + "y_axis_min", "0");
+  });
+  window.history.replaceState(window.history.state, "", url);
+}
+
+export function MetricsPage() {
+  const { t } = useTranslation();
+  const search = useSearch({ strict: false }) as MetricsEvidenceSearch;
+  const initial = useRef<InitialMetricsState | null>(null);
+  if (!initial.current) {
+    initial.current = initialMetricsState(
+      search.q,
+      search.start !== undefined && search.end !== undefined
+        ? { start: search.start, end: search.end }
+        : undefined,
+    );
+  }
+  const [panels, setPanels] = useState<QueryPanelState[]>(initial.current.panels);
+  const nextPanelId = useRef(initial.current.panels.length + 1);
+  const nextRunId = useRef(initial.current.panels.length + 1);
+  const project = getProjectSlug();
+  const [localTime, setLocalTime] = useState(initialLocalTime);
+  const [executed, setExecuted] = useState<Record<string, ExecutedQuery>>(initial.current.executed);
+  const [history, setHistory] = useState<MetricsHistoryEntry[]>(() => getMetricsHistory(project));
+  const [prettifying, setPrettifying] = useState<Record<string, boolean>>({});
+  const [editorErrors, setEditorErrors] = useState<Record<string, string>>({});
+
+  useEffect(() => setHistory(getMetricsHistory(project)), [project]);
+  useEffect(() => syncPanelsToURL(panels), [panels]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_TIME_KEY, String(localTime));
+    } catch {
+      // Keep the in-memory preference when browser storage is unavailable.
+    }
+  }, [localTime]);
+
+  function updatePanel(id: string, patch: Partial<QueryPanelState>) {
+    setPanels((current) => current.map((panel) => panel.id === id ? { ...panel, ...patch } : panel));
+  }
+
+  function execute(id: string) {
+    const panel = panels.find((item) => item.id === id);
+    if (!panel?.query.trim()) return;
+    setExecuted((current) => ({
+      ...current,
+      [id]: { query: panel.query.trim(), runId: nextRunId.current++ },
+    }));
+    setHistory(pushMetricsHistory(project, [panel.query]));
+  }
+
+  // A deep link (?q=…&run=1) executes the first panel once, on arrival.
+  const executeRef = useRef(execute);
+  executeRef.current = execute;
+  const deepLinkHandled = useRef(false);
+  useEffect(() => {
+    if (deepLinkHandled.current) return;
+    deepLinkHandled.current = true;
+    if (search.q && search.run === "1") executeRef.current("query-1");
+  }, [search.q, search.run]);
+
+  function addPanel(afterId?: string, duplicate?: QueryPanelState) {
+    const id = `query-${nextPanelId.current++}`;
+    const panel = duplicate ? { ...duplicate, id } : newPanel(id);
+    setPanels((current) => {
+      if (!afterId) return [...current, panel];
+      const index = current.findIndex((item) => item.id === afterId);
+      return index < 0 ? [...current, panel] : [...current.slice(0, index + 1), panel, ...current.slice(index + 1)];
+    });
+  }
+
+  function removePanel(id: string) {
+    if (panels.length === 1) return;
+    setPanels((current) => current.filter((panel) => panel.id !== id));
+    setExecuted((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+  }
+
+  async function prettify(id: string) {
+    const panel = panels.find((item) => item.id === id);
+    if (!panel?.query.trim()) return;
+    setPrettifying((current) => ({ ...current, [id]: true }));
+    setEditorErrors((current) => ({ ...current, [id]: "" }));
+    try {
+      updatePanel(id, { query: await prettifyPromQL(panel.query.trim()) });
+    } catch (error) {
+      setEditorErrors((current) => ({
+        ...current,
+        [id]: error instanceof Error ? error.message : t("metrics.prettifyFailed"),
+      }));
+    } finally {
+      setPrettifying((current) => ({ ...current, [id]: false }));
+    }
+  }
+
+  const serverTime = useQuery({
+    queryKey: ["metrics-server-time", project],
+    enabled: !IS_MOCK,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    retry: false,
+    queryFn: ({ signal }) => queryServerClock(signal),
+  });
+  const driftSeconds = serverTime.data?.driftSeconds ?? 0;
+
+  return (
+    <PageContainer>
+      {IS_MOCK && (
+        <PageActions>
+          <Badge variant="secondary" className="gap-1.5"><Database className="size-3" />{t("metrics.mockBadge")}</Badge>
+        </PageActions>
+      )}
+
+      {search.evidence === "contextual" && (
+        <div
+          className="mb-4 flex items-start gap-2 rounded-md border border-border bg-muted/40 p-3 text-sm"
+          role="note"
+        >
+          <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+          <div>
+            <div className="font-medium">{t("traces.contextualEvidence")}</div>
+            <p className="text-xs text-muted-foreground">{t("traces.contextualEvidenceHint")}</p>
+          </div>
+        </div>
+      )}
+
+      {driftSeconds > 30 && (
+        <div className="mb-4 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+          <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <div><div className="font-medium">{t("metrics.serverTimeDrift")}</div><p className="text-xs text-muted-foreground">{t("metrics.serverTimeDriftDesc", { seconds: Math.round(driftSeconds) })}</p></div>
+        </div>
+      )}
+
+      <div className="space-y-6">
+        {panels.map((panel) => (
+          <QueryCard
+            key={panel.id}
+            panel={panel}
+            executed={executed[panel.id]}
+            history={history}
+            localTime={localTime}
+            canRemove={panels.length > 1}
+            prettifying={prettifying[panel.id]}
+            editorError={editorErrors[panel.id]}
+            onChange={(patch) => updatePanel(panel.id, patch)}
+            onExecute={() => execute(panel.id)}
+            onRetry={() => setExecuted((current) => current[panel.id]
+              ? { ...current, [panel.id]: { ...current[panel.id], runId: nextRunId.current++ } }
+              : current)}
+            onPrettify={() => void prettify(panel.id)}
+            onDuplicate={() => addPanel(panel.id, panel)}
+            onRemove={() => removePanel(panel.id)}
+            onLocalTimeChange={setLocalTime}
+            onClearHistory={() => setHistory(clearMetricsHistory(project))}
+          />
+        ))}
+        <div className="flex justify-end">
+          <Button variant="outline" onClick={() => addPanel()} disabled={panels.length >= 10}><Plus />{t("metrics.addPanel")}</Button>
+        </div>
+      </div>
+    </PageContainer>
+  );
+}
+
+function QueryCard({
+  panel,
+  executed,
+  history,
+  localTime,
+  canRemove,
+  prettifying,
+  editorError,
+  onChange,
+  onExecute,
+  onRetry,
+  onPrettify,
+  onDuplicate,
+  onRemove,
+  onLocalTimeChange,
+  onClearHistory,
+}: {
+  panel: QueryPanelState;
+  executed?: ExecutedQuery;
+  history: MetricsHistoryEntry[];
+  localTime: boolean;
+  canRemove: boolean;
+  prettifying?: boolean;
+  editorError?: string;
+  onChange: (patch: Partial<QueryPanelState>) => void;
+  onExecute: () => void;
+  onRetry: () => void;
+  onPrettify: () => void;
+  onDuplicate: () => void;
+  onRemove: () => void;
+  onLocalTimeChange: (enabled: boolean) => void;
+  onClearHistory: () => void;
+}) {
+  const { t } = useTranslation();
+  const editorRef = useRef<PromQLEditorHandle>(null);
+  const [explorerOpen, setExplorerOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const resolvedRange = resolveMetricsRange(panel.range);
+
+  return (
+    <Card className="overflow-visible">
+      <CardContent className="flex flex-col gap-4 p-4">
+        <div className="flex items-start gap-2">
+          <PromQLEditor
+            ref={editorRef}
+            id={`${panel.id}-promql`}
+            value={panel.query}
+            range={resolvedRange}
+            onChange={(query) => onChange({ query })}
+            onRun={onExecute}
+            actions={(
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-9"
+                disabled={!panel.query.trim() || prettifying}
+                aria-label={t("metrics.prettify")}
+                title={t("metrics.prettify")}
+                onClick={onPrettify}
+              >
+                {prettifying ? <Loader2 className="animate-spin" /> : <WandSparkles />}
+              </Button>
+            )}
+          />
+          <Button className="shrink-0" disabled={!panel.query.trim()} onClick={onExecute}><Play />{t("metrics.run")}</Button>
+          <Button
+            variant="outline"
+            size="icon"
+            className="shrink-0"
+            disabled={!canRemove}
+            aria-label={t("metrics.removePanel")}
+            title={t("metrics.removePanel")}
+            onClick={onRemove}
+          >
+            <X />
+          </Button>
+        </div>
+        {editorError && <p className="text-xs text-destructive">{editorError}</p>}
+
+        <Tabs
+          className="flex flex-col gap-4"
+          value={panel.activeTab}
+          onValueChange={(value) => onChange({ activeTab: value as MetricsQueryTab })}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <TabsList className="h-9">
+              <TabsTrigger value="table" className="gap-2"><Table2 className="size-4" />{t("metrics.table")}</TabsTrigger>
+              <TabsTrigger value="graph" className="gap-2"><BarChart3 className="size-4" />{t("metrics.graph")}</TabsTrigger>
+            </TabsList>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="icon"
+                className="size-9"
+                aria-label={t("metrics.duplicateQuery")}
+                title={t("metrics.duplicateQuery")}
+                onClick={onDuplicate}
+              >
+                <Copy />
+              </Button>
+              <Button variant="outline" size="sm" className="h-9" onClick={() => setHistoryOpen(true)}>
+                <History />{t("metrics.history")}
+              </Button>
+              <Button variant="outline" size="sm" className="h-9" onClick={() => setExplorerOpen(true)}>
+                <ListFilter />{t("metrics.exploreMetrics")}
+              </Button>
+            </div>
+          </div>
+          <TabsContent value="table" className="mt-0 flex flex-col gap-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <MetricsTimeRangePicker value={panel.range} localTime={localTime} onChange={(range) => onChange({ range })} onLocalTimeChange={onLocalTimeChange} />
+              <MetricsTableSettings
+                mode={panel.tableMode}
+                timeFormat={panel.timeFormat}
+                onModeChange={(tableMode) => onChange({ tableMode })}
+                onTimeFormatChange={(timeFormat) => onChange({ timeFormat })}
+              />
+            </div>
+            <QueryResult
+              panel={panel}
+              executed={executed}
+              localTime={localTime}
+              onRetry={onRetry}
+            />
+          </TabsContent>
+          <TabsContent value="graph" className="mt-0 flex flex-col gap-4">
+            <PrometheusQueryControls
+              range={panel.range}
+              resolution={panel.resolution}
+              graphMode={panel.graphMode}
+              tableMode={panel.tableMode}
+              yAxisZero={panel.yAxisZero}
+              localTime={localTime}
+              onRangeChange={(range) => onChange({ range })}
+              onResolutionChange={(resolution) => onChange({ resolution })}
+              onGraphModeChange={(graphMode) => onChange({ graphMode })}
+              onTableModeChange={(tableMode) => onChange({ tableMode })}
+              onYAxisZeroChange={(yAxisZero) => onChange({ yAxisZero })}
+              onLocalTimeChange={onLocalTimeChange}
+            />
+            <QueryResult
+              panel={panel}
+              executed={executed}
+              localTime={localTime}
+              onRetry={onRetry}
+            />
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+
+      <MetricsExplorer
+        open={explorerOpen}
+        range={resolvedRange}
+        onOpenChange={setExplorerOpen}
+        onInsert={(selector) => editorRef.current?.insertText(selector)}
+      />
+      <QueryHistoryDialog
+        open={historyOpen}
+        history={history}
+        localTime={localTime}
+        onOpenChange={setHistoryOpen}
+        onPick={(query) => onChange({ query })}
+        onClear={onClearHistory}
+      />
+    </Card>
+  );
+}
+
+function QueryResult({ panel, executed, localTime, onRetry }: {
+  panel: QueryPanelState;
+  executed?: ExecutedQuery;
+  localTime: boolean;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  const range = resolveMetricsRange(panel.range);
+  const step = effectiveMetricsStep(panel.resolution, range.end - range.start);
+  const graph = useQuery<MetricsQueryEnvelope<TimeSeries[]>, ApiError>({
+    queryKey: ["metrics-panel", panel.id, "graph", executed?.query, range.start, range.end, step, executed?.runId],
+    enabled: panel.activeTab === "graph" && Boolean(executed),
+    retry: false,
+    placeholderData: (previous) => previous,
+    queryFn: ({ signal }) => queryRangeDetailed({ query: executed!.query, ...range, step }, signal),
+  });
+  const table = useQuery<MetricsQueryEnvelope<MetricTableResult>, ApiError>({
+    queryKey: ["metrics-panel", panel.id, "table", executed?.query, range.end, executed?.runId],
+    enabled: panel.activeTab === "table" && Boolean(executed),
+    retry: false,
+    placeholderData: (previous) => previous,
+    queryFn: ({ signal }) => queryInstantDetailed(executed!.query, range.end, signal),
+  });
+  const result = panel.activeTab === "table" ? table : graph;
+  const count = panel.activeTab === "table"
+    ? table.data?.data.rows.length ?? 0
+    : graph.data?.data.length ?? 0;
+  const viewState = queryViewState({
+    hasData: result.data !== undefined,
+    isLoading: result.isLoading,
+    isError: result.isError,
+    isEmpty: count === 0,
+  });
+
+  if (!executed) return <ResultMessage icon={<Search />} title={t("metrics.initialTitle")} desc={t("metrics.initialDesc")} />;
+  if (viewState === "pending") return <div className="space-y-2"><Skeleton className="h-8 w-full" /><Skeleton className="h-[320px] w-full" /></div>;
+  if (viewState === "error") {
+    return <ResultMessage icon={<AlertCircle className="text-destructive" />} title={t("metrics.errorTitle")} desc={t("common.queryErrorDesc")} action={<Button variant="outline" size="sm" onClick={onRetry}>{t("common.retry")}</Button>} />;
+  }
+  if (!result.data) return <ResultMessage icon={<Database />} title={t("metrics.emptyTitle")} desc={t("metrics.emptyDesc")} />;
+
+  return (
+    <>
+      {viewState === "stale" && (
+        <QueryStaleNotice isRetrying={result.isFetching} onRetry={onRetry} />
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span>{t("metrics.loadStats", { duration: result.data.durationMs.toFixed(0), count })}</span>
+        {result.isFetching && <span className="inline-flex items-center gap-1"><Loader2 className="size-3 animate-spin" />{t("metrics.loading")}</span>}
+      </div>
+      <QueryNotices warnings={result.data.warnings} infos={result.data.infos} />
+      {panel.activeTab === "table"
+        ? table.data!.data.rows.length > 0
+          ? (
+            <MetricsTable
+              result={table.data!.data}
+              localTime={localTime}
+              mode={panel.tableMode}
+              timeFormat={panel.timeFormat}
+            />
+          )
+          : <ResultMessage icon={<Database />} title={t("metrics.emptyTitle")} desc={t("metrics.emptyDesc")} />
+        : graph.data!.data.length > 0
+          ? (
+            <TimeSeriesChart
+              series={graph.data!.data}
+              useUTC={!localTime}
+              stacked={panel.graphMode === "stacked"}
+              yAxisMin={panel.yAxisZero ? 0 : null}
+              tableMode={panel.tableMode}
+              timeWindow={{
+                startMs: range.start * 1_000,
+                endMs: range.end * 1_000,
+              }}
+              height={520}
+            />
+          )
+          : <ResultMessage icon={<Database />} title={t("metrics.emptyTitle")} desc={t("metrics.emptyDesc")} />}
+    </>
+  );
+}
+
+function QueryNotices({ warnings, infos }: { warnings: string[]; infos: string[] }) {
+  const { t } = useTranslation();
+  if (warnings.length === 0 && infos.length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-2">
+      {warnings.map((warning, index) => <div key={`warning-${index}`} className="flex gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-2 text-xs"><AlertCircle className="size-4 shrink-0 text-destructive" /><div><strong>{t("metrics.queryWarning")}</strong><p className="text-muted-foreground">{warning}</p></div></div>)}
+      {infos.map((info, index) => <div key={`info-${index}`} className="flex gap-2 rounded-md border border-border bg-muted/30 p-2 text-xs"><Info className="size-4 shrink-0" /><div><strong>{t("metrics.queryInfo")}</strong><p className="text-muted-foreground">{info}</p></div></div>)}
+    </div>
+  );
+}
+
+function MetricsTableSettings({
+  mode,
+  timeFormat,
+  onModeChange,
+  onTimeFormatChange,
+}: {
+  mode: MetricsTableMode;
+  timeFormat: MetricsTimeFormat;
+  onModeChange: (mode: MetricsTableMode) => void;
+  onTimeFormatChange: (format: MetricsTimeFormat) => void;
+}) {
+  const { t } = useTranslation();
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          size="icon"
+          className="size-9"
+          aria-label={t("metrics.tableSettings")}
+        >
+          <Settings2 />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        className="w-max max-w-[calc(100vw-2rem)] space-y-4"
+      >
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">
+            {t("metrics.columnMode")}
+          </p>
+          <div className="inline-flex rounded-md border border-input bg-background p-0.5">
+            <Button
+              variant={mode === "labels" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-7 px-2.5"
+              onClick={() => onModeChange("labels")}
+            >
+              {t("metrics.labelColumns")}
+            </Button>
+            <Button
+              variant={mode === "series" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-7 px-2.5"
+              onClick={() => onModeChange("series")}
+            >
+              {t("metrics.seriesColumns")}
+            </Button>
+          </div>
+        </div>
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">
+            {t("metrics.timeFormat")}
+          </p>
+          <div className="inline-flex rounded-md border border-input bg-background p-0.5">
+            <Button
+              variant={timeFormat === "readable" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-7 px-2.5"
+              onClick={() => onTimeFormatChange("readable")}
+            >
+              {t("metrics.readableTime")}
+            </Button>
+            <Button
+              variant={timeFormat === "timestamp" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-7 px-2.5"
+              onClick={() => onTimeFormatChange("timestamp")}
+            >
+              {t("metrics.timestamp")}
+            </Button>
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function MetricsTable({
+  result,
+  localTime,
+  mode,
+  timeFormat,
+}: {
+  result: MetricTableResult;
+  localTime: boolean;
+  mode: MetricsTableMode;
+  timeFormat: MetricsTimeFormat;
+}) {
+  const { t, i18n } = useTranslation();
+  const [showAll, setShowAll] = useState(false);
+  const limit = 10_000;
+  const rows = showAll ? result.rows : result.rows.slice(0, limit);
+  const labelNames = useMemo(() => metricsLabelColumns(result.rows), [result.rows]);
+
+  return (
+    <div className="space-y-2">
+      {!showAll && result.rows.length > limit && (
+        <div className="flex items-center justify-between rounded-md border border-border bg-muted/30 p-2 text-xs">
+          <span>{t("metrics.limitedResults", { shown: limit, total: result.rows.length })}</span>
+          <Button variant="link" size="sm" onClick={() => setShowAll(true)}>{t("metrics.showAll")}</Button>
+        </div>
+      )}
+      <div className="select-text overflow-auto rounded-md border border-border">
+        <table className="w-full min-w-max table-auto text-left text-sm">
+          <thead className="sticky top-0 z-10 border-b border-border bg-muted/95 text-xs text-muted-foreground backdrop-blur">
+            {mode === "series" ? (
+              <tr>
+                <th className="px-3 py-2 font-medium">
+                  {t("metrics.fullMetric", { count: result.rows.length })}
+                </th>
+                <th className="px-3 py-2 text-right font-medium">{t("metrics.samples")}</th>
+              </tr>
+            ) : (
+              <tr>
+                <th className="min-w-40 max-w-80 px-3 py-2 font-medium">
+                  {t("metrics.metricName")}
+                </th>
+                {labelNames.map((name) => (
+                  <th key={name} className="min-w-40 max-w-80 break-all px-3 py-2 font-mono font-medium">
+                    {name}
+                  </th>
+                ))}
+                <th className="whitespace-nowrap px-3 py-2 text-right font-medium">
+                  {t("metrics.value")}
+                </th>
+                <th className="whitespace-nowrap px-3 py-2 text-right font-medium">
+                  {t(timeFormat === "timestamp" ? "metrics.timestamp" : "metrics.readableTime")}
+                </th>
+              </tr>
+            )}
+          </thead>
+          <tbody>
+            {rows.map((row, rowIndex) => (
+              <tr key={`${row.name}-${rowIndex}`} className="border-b border-border/60 last:border-0 hover:bg-muted/40">
+                {mode === "series" ? (
+                  <>
+                    <td className="max-w-2xl break-all px-3 py-2 align-top font-mono text-xs">
+                      {row.name}
+                    </td>
+                    <td className="px-3 py-2 text-right align-top font-mono text-xs">
+                      {row.values.map((sample, sampleIndex) => {
+                        const readable = formatMetricSampleTime(
+                          sample.timestamp,
+                          localTime,
+                          i18n.language,
+                        );
+                        const timestamp = Math.floor(sample.timestamp / 1000);
+                        return (
+                          <div key={`${sample.timestamp}-${sampleIndex}`}>
+                            <span>{sample.raw}</span>{" "}
+                            <span
+                              className="text-muted-foreground"
+                              title={timeFormat === "readable" ? String(timestamp) : readable}
+                            >
+                              @ {timeFormat === "readable" ? readable : timestamp}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </td>
+                  </>
+                ) : (
+                  <>
+                    <td className="min-w-40 max-w-80 px-3 py-2 align-top font-mono text-xs">
+                      <span
+                        className="block break-all leading-5"
+                        title={row.labels.__name__ ?? row.name}
+                      >
+                        {row.labels.__name__ ?? row.name}
+                      </span>
+                    </td>
+                    {labelNames.map((name) => (
+                      <td key={name} className="min-w-40 max-w-80 px-3 py-2 align-top font-mono text-xs">
+                        {row.labels[name] === undefined
+                          ? <span className="text-muted-foreground">—</span>
+                          : (
+                              <span
+                                className="block break-all leading-5"
+                                title={row.labels[name]}
+                              >
+                                {row.labels[name]}
+                              </span>
+                            )}
+                      </td>
+                    ))}
+                    <td className="whitespace-nowrap px-3 py-2 text-right align-top font-mono text-xs">
+                      {row.values.map((sample, sampleIndex) => (
+                        <div key={`${sample.timestamp}-${sampleIndex}`}>{sample.raw}</div>
+                      ))}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 text-right align-top font-mono text-xs">
+                      {row.values.map((sample, sampleIndex) => {
+                        const readable = formatMetricSampleTime(
+                          sample.timestamp,
+                          localTime,
+                          i18n.language,
+                        );
+                        const timestamp = Math.floor(sample.timestamp / 1000);
+                        return (
+                          <div
+                            key={`${sample.timestamp}-${sampleIndex}`}
+                            title={timeFormat === "readable" ? String(timestamp) : readable}
+                          >
+                            {timeFormat === "readable" ? readable : timestamp}
+                          </div>
+                        );
+                      })}
+                    </td>
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function formatMetricSampleTime(ms: number, localTime: boolean, language: string): string {
+  const value = localTime ? dayjs(ms) : dayjs.utc(ms);
+  return value.locale(dayjsLocale(language)).format("L LTS");
+}
+
+function QueryHistoryDialog({ open, history, localTime, onOpenChange, onPick, onClear }: {
+  open: boolean;
+  history: MetricsHistoryEntry[];
+  localTime: boolean;
+  onOpenChange: (open: boolean) => void;
+  onPick: (query: string) => void;
+  onClear: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader><DialogTitle>{t("metrics.history")}</DialogTitle><DialogDescription>{t("metrics.historyProjectScoped")}</DialogDescription></DialogHeader>
+        <div className="flex justify-end">{history.length > 0 && <Button variant="ghost" size="sm" onClick={onClear}><Trash2 />{t("metrics.clearHistory")}</Button>}</div>
+        {history.length === 0 ? <p className="py-12 text-center text-sm text-muted-foreground">{t("metrics.historyEmpty")}</p> : (
+          <div className="max-h-[60vh] overflow-auto rounded-md border border-border">
+            {history.map((entry) => {
+              const at = entry.at ? dateParts(entry.at, localTime) : null;
+              return <button key={`${entry.query}-${entry.at}`} type="button" className="block w-full border-b border-border px-3 py-2 text-left last:border-0 hover:bg-muted" onClick={() => { onPick(entry.query); onOpenChange(false); }}><code className="block break-all text-xs">{entry.query}</code>{at && <span className="mt-1 block text-[10px] text-muted-foreground">{at.date} {at.time}</span>}</button>;
+            })}
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ResultMessage({ icon, title, desc, action }: { icon: React.ReactNode; title: string; desc: string; action?: React.ReactNode }) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-2 py-14 text-center">
+      <div className={cn("flex size-10 items-center justify-center rounded-full bg-muted text-muted-foreground [&>svg]:size-5")}>{icon}</div>
+      <div className="text-sm font-medium">{title}</div>
+      <p className="max-w-lg break-words text-xs text-muted-foreground">{desc}</p>
+      {action}
+    </div>
+  );
+}

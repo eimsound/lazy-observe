@@ -1,0 +1,26 @@
+{
+  "head": {
+    "callFrame": { "functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1 },
+    "selfSize": 0,
+    "id": 1,
+    "children": [
+      {
+        "callFrame": { "functionName": "allocateExample", "scriptId": "13", "url": "file:///app/heap.js", "lineNumber": 19, "columnNumber": 1 },
+        "selfSize": 4096,
+        "id": 2,
+        "children": [
+          {
+            "callFrame": { "functionName": "makeBuffer", "scriptId": "13", "url": "file:///app/heap.js", "lineNumber": 24, "columnNumber": 3 },
+            "selfSize": 2048,
+            "id": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  "samples": [
+    { "size": 4096, "nodeId": 2, "ordinal": 1 },
+    { "size": 2048, "nodeId": 3, "ordinal": 2 }
+  ]
+}

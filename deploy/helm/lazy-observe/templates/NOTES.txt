@@ -1,0 +1,22 @@
+lazy-observe {{ .Chart.AppVersion }} is installed in {{ .Values.mode }} mode.
+
+{{- if eq .Values.mode "standalone-ha" }}
+Before the pods start, create Secret {{ include "lazy-observe.secretName" . }} with at least:
+  kubectl create secret generic {{ include "lazy-observe.secretName" . }} \
+    --from-literal={{ .Values.secret.keys.postgresURL }}='postgres://...' \
+    --from-literal={{ .Values.secret.keys.redisPassword }}='...' \
+    --from-literal={{ .Values.secret.keys.s3AccessKey }}='...' \
+    --from-literal={{ .Values.secret.keys.s3SecretKey }}='...'
+All replicas share PostgreSQL, Redis, S3, VictoriaMetrics, VictoriaLogs, and VictoriaTraces.
+Use values-standalone-ha-cluster.yaml as the clustered-storage reference:
+  - metrics queryURL targets vmselect and ingestURL targets vminsert;
+  - logs.url routes /insert/* to vlinsert and /select/* to vlselect;
+  - traces.url routes /insert/* to vtinsert and /select/* to vtselect.
+{{- else }}
+This mode runs exactly one replica with embedded storage and a {{ .Values.persistence.size }} PVC.
+{{- end }}
+
+Probe status:
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl port-forward service/{{ include "lazy-observe.fullname" . }} 3100:{{ .Values.service.port }}
+  curl http://127.0.0.1:3100/healthz

@@ -1,0 +1,51 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - depguard
+    - errcheck
+    - govet
+    - staticcheck
+  settings:
+    depguard:
+      rules:
+        # ADR 0004: the generated Ent client and schema packages stay behind
+        # the metadata persistence seam.
+        ent-behind-metadata-seam:
+          files:
+            - $all
+            - "!**/internal/meta/**"
+            - "!**/internal/db/**"
+            - "!$test"
+          deny:
+            - pkg: github.com/eimsound/lazy-observe/internal/db/ent
+              desc: use internal/meta behavior; Ent stays behind the metadata seam (ADR 0004)
+  exclusions:
+    rules:
+      # Existing tests intentionally use best-effort cleanup after assertions.
+      - path: _test\.go
+        linters:
+          - errcheck
+      # PoC shutdown paths are not production code.
+      - path: ^poc/
+        linters:
+          - errcheck
+      # Production cleanup and diagnostic writes are also best effort; primary
+      # operation errors remain covered by errcheck.
+      - text: Error return value of `.*(Close|Remove|Shutdown|Fprintf|Rollback)`
+        linters:
+          - errcheck
+      # QF is a style-only staticcheck category.
+      - text: QF1001
+        linters:
+          - staticcheck
+      # Known pre-CI unused assignments; keep all other SA checks enabled.
+      - path: ^internal/gateway/profile_api_test\.go
+        text: SA4006
+        linters:
+          - staticcheck
+      - path: ^internal/meta/store\.go
+        text: SA4006
+        linters:
+          - staticcheck

@@ -1,0 +1,16 @@
+{
+  "name": "lazy-observe-node-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "test": "pnpm --filter @lazy-observe/node test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "licenses": "pnpm licenses list --prod --json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

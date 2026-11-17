@@ -1,0 +1,7 @@
+apiVersion: v2
+name: lazy-observe
+description: Kubernetes delivery for the lazy-observe observability platform
+type: application
+version: 0.1.0
+appVersion: "latest"
+

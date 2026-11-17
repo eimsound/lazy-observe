@@ -1,0 +1,30 @@
+#:schema https://json.schemastore.org/any.json
+
+root = "."
+tmp_dir = ".cache/air"
+
+[build]
+  bin = "./.cache/air/lazy-observe"
+  cmd = "bash scripts/generate-ent.sh && CGO_ENABLED=0 go build -trimpath -o ./.cache/air/lazy-observe ./cmd/lazy-observe"
+  delay = 400
+  entrypoint = ["./scripts/run-dev-backend.sh"]
+  exclude_dir = [".cache", "bench", "bin", "data", "internal/db/ent", "poc", "sdk/browser", "sdk/node", "web"]
+  exclude_regex = ["_test\\.go"]
+  exclude_unchanged = true
+  include_dir = ["cmd", "internal", "sdk/go"]
+  include_ext = ["go", "sql"]
+  include_file = ["go.mod", "go.sum", "scripts/run-dev-backend.sh"]
+  kill_delay = "20s"
+  log = "build-errors.log"
+  send_interrupt = false
+  stop_on_error = false
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = true
+
+[screen]
+  clear_on_rebuild = false
+  keep_scroll = true

@@ -1,0 +1,70 @@
+version: 2
+
+project_name: lazy-observe
+
+before:
+  hooks:
+    - env -u GITHUB_TOKEN -u GH_TOKEN -u GORELEASER_FORCE_TOKEN PATH={{ .Env.HOME }}/.local/bin:{{ .Env.PATH }} VERSION={{ .Version }} COMMIT={{ .FullCommit }} DATE={{ .Date }} mise run dist-cross
+    # Gate these exact prebuilt bytes before goreleaser-prebuilt.sh imports them.
+    - env -u GITHUB_TOKEN -u GH_TOKEN -u GORELEASER_FORCE_TOKEN PATH={{ .Env.HOME }}/.local/bin:{{ .Env.PATH }} mise run gate-release-artifacts
+
+builds:
+  - id: lazy-observe
+    main: ./cmd/lazy-observe
+    binary: lazy-observe
+    tool: ./scripts/goreleaser-prebuilt.sh
+    command: build
+    env:
+      - CGO_ENABLED=0
+    targets:
+      - linux_amd64_v1
+      - linux_arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.Version={{ .Version }}
+      - -X main.Commit={{ .FullCommit }}
+      - -X main.Date={{ .Date }}
+
+archives:
+  - id: release
+    ids:
+      - lazy-observe
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - src: README.md
+      - src: LICENSE
+      # Third-party notices: linked Go modules, bundled web assets, and the
+      # embedded Apache-2.0 VictoriaMetrics/VictoriaLogs/VictoriaTraces binaries.
+      - src: third_party/go/THIRD_PARTY_NOTICES.txt
+      - src: third_party/victoria/SOURCES.txt
+      - src: third_party/victoria/*/LICENSE
+      - src: web/THIRD_PARTY_LICENSES.md
+        dst: third_party/web
+        strip_parent: true
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  # Snapshot validation must not depend on legacy/non-SemVer repository tags.
+  version_template: "0.0.0-SNAPSHOT-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+release:
+  draft: false
+  prerelease: auto
+  github:
+    owner: eimsound
+    name: lazy-observe

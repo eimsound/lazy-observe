@@ -1,0 +1,79 @@
+name: SDK release
+
+# SDK 按各自 tag 前缀单独发版（见 sdk/scripts/sdk-publish.sh）：
+#   sdk/go/vX.Y.Z      Go module（tag 即发布，再请 proxy.golang.org 拉取一次）
+#   sdk-node-vX.Y.Z    npm @lazy-observe/node（需要 NPM_TOKEN secret）
+#   sdk-browser-vX.Y.Z npm @lazy-observe/browser、react、bundler-plugin（需要 NPM_TOKEN）
+#   sdk-python-vX.Y.Z  PyPI lazyobserve（PyPI trusted publishing，environment: pypi）
+# workflow_dispatch 只做 dry run：校验版本、构建、测试，不发布任何东西。
+on:
+  push:
+    tags:
+      - "sdk/go/v*"
+      - "sdk-node-v*"
+      - "sdk-browser-v*"
+      - "sdk-python-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "SDK tag to dry-run, e.g. sdk-node-v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    if: "!startsWith(github.event_name == 'push' && github.ref_name || inputs.tag, 'sdk-python-v')"
+    runs-on: ubuntu-24.04
+    env:
+      SDK_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      PUBLISH_FLAG: ${{ github.event_name == 'push' && '--publish' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: "!startsWith(env.SDK_TAG, 'sdk/go/v')"
+        with:
+          registry-url: https://registry.npmjs.org
+      - name: Verify, build, and (on tag push) publish
+        # PUBLISH_FLAG is intentionally unquoted: empty means dry run.
+        run: mise exec -- bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  python:
+    name: Release ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    if: startsWith(github.event_name == 'push' && github.ref_name || inputs.tag, 'sdk-python-v')
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      # PyPI trusted publishing exchanges this OIDC token for an upload token.
+      id-token: write
+    env:
+      SDK_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      PUBLISH_FLAG: ${{ github.event_name == 'push' && '--publish' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Verify and build
+        # PUBLISH_FLAG is intentionally unquoted: empty means dry run.
+        run: bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
+        env:
+          PYTHON: python
+      - name: Upload Python distribution to PyPI
+        if: github.event_name == 'push'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: sdk/python/dist

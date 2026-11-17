@@ -1,0 +1,77 @@
+name: Bug report
+about: Report reproducible incorrect behavior
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting a bug. Remove secrets, ingest tokens, passwords, and private telemetry from all output.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Milestone tag, commit SHA, or build identifier.
+      placeholder: m5 / b1c891e / dev
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment mode
+      options:
+        - Zero-config release binary (All-in-One)
+        - All-in-One with custom configuration
+        - Standalone with external services
+        - Kubernetes/Helm all-in-one
+        - Kubernetes/Helm standalone-ha
+        - Development build from source
+        - Other deployment
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, architecture, Go/Node version when relevant.
+      placeholder: Linux arm64, Go 1.26.5
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest numbered sequence that reproduces the problem.
+      placeholder: |
+        1. Start with ...
+        2. Send ...
+        3. Open ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+      description: Include relevant sanitized logs, status codes, and screenshots.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Sanitized configuration
+      description: Remove credentials and tokens. Include storage backend and metadata database choices.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed all secrets and private telemetry.
+          required: true

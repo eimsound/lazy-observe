@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>lazy-observe</title>
+    <script>
+      // Pre-paint theme bootstrap: avoids a flash of the wrong theme before React mounts.
+      // Mirrors the persistence keys used by the ThemeProvider.
+      (function () {
+        try {
+          var mode = localStorage.getItem("lo-theme-mode") || "system";
+          var resolved =
+            mode === "system"
+              ? window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light"
+              : mode;
+          var root = document.documentElement;
+          root.classList.toggle("dark", resolved === "dark");
+          var palette = localStorage.getItem("lo-theme-palette");
+          if (palette) root.setAttribute("data-palette", palette);
+          var radius = localStorage.getItem("lo-theme-radius");
+          if (radius) root.style.setProperty("--radius", radius);
+          var font = localStorage.getItem("lo-theme-font");
+          if (font) root.style.setProperty("--font-scale", font);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

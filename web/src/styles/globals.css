@@ -1,0 +1,326 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * ─────────────────────────────────────────────────────────────────────────
+ *  lazy-observe theme system — single source of truth for ALL visual params.
+ *
+ *  RULES (any new page MUST follow — see web/README.md §Theme):
+ *   1. Never hardcode a color / radius. Consume the semantic tokens below via
+ *      Tailwind utilities (bg-background, text-muted-foreground, rounded-lg…)
+ *      or var(--token) directly.
+ *   2. Charts (uPlot) read the SAME variables at runtime — see
+ *      components/charts/use-chart-theme.ts. Add chart series colors as
+ *      --chart-N, never a bespoke hex inside a chart component.
+ *   3. Light/dark is a `.dark` class on <html>. Palettes are a
+ *      `[data-palette]` attribute. Radius is the inline --radius variable.
+ *      All three are set by ThemeProvider (+ the pre-paint script in index.html).
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+
+@custom-variant dark (&:is(.dark *));
+
+/* Map semantic CSS variables -> Tailwind theme tokens so utilities resolve. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* Log-severity semantics (fixed meaning, palette-independent). */
+  --color-level-error: var(--level-error);
+  --color-level-warn: var(--level-warn);
+  --color-level-info: var(--level-info);
+  --color-level-debug: var(--level-debug);
+  --color-level-trace: var(--level-trace);
+
+  /* Web-Vitals rating semantics (good / needs-improvement / poor). */
+  --color-vital-good: var(--vital-good);
+  --color-vital-ni: var(--vital-ni);
+  --color-vital-poor: var(--vital-poor);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* ── Base palette (neutral). Light. ── */
+:root {
+  --radius: 0.5rem;
+  /* Root font-size scale (font-size tier). Overridden inline on <html>. */
+  --font-scale: 1;
+
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+
+  /* Log severity (light). */
+  --level-error: oklch(0.577 0.245 27.325);
+  --level-warn: oklch(0.705 0.16 70);
+  --level-info: oklch(0.6 0.15 250);
+  --level-debug: oklch(0.62 0.03 260);
+  --level-trace: oklch(0.606 0.2 300);
+
+  /* Web-Vitals rating (light). */
+  --vital-good: oklch(0.6 0.145 163);
+  --vital-ni: oklch(0.705 0.16 70);
+  --vital-poor: oklch(0.577 0.245 27.325);
+}
+
+/* ── Base palette. Dark. ── */
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+
+  /* Log severity (dark — a touch brighter for contrast on dark surfaces). */
+  --level-error: oklch(0.704 0.191 22.216);
+  --level-warn: oklch(0.8 0.155 75);
+  --level-info: oklch(0.7 0.15 250);
+  --level-debug: oklch(0.72 0.03 260);
+  --level-trace: oklch(0.7 0.19 300);
+
+  /* Web-Vitals rating (dark). */
+  --vital-good: oklch(0.696 0.17 162.48);
+  --vital-ni: oklch(0.8 0.155 75);
+  --vital-poor: oklch(0.704 0.191 22.216);
+}
+
+/*
+ * ── Preset palettes ──
+ * A palette only overrides the accent/brand + chart series. Everything else
+ * inherits from the base neutral tokens above, in both light and dark. This is
+ * why "custom theme = override a CSS variable set, no rebuild" (requirements §6).
+ */
+
+/* blue */
+[data-palette="blue"] {
+  --primary: oklch(0.546 0.215 262.881);
+  --primary-foreground: oklch(0.985 0 0);
+  --ring: oklch(0.546 0.215 262.881);
+  --chart-1: oklch(0.546 0.215 262.881);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.696 0.17 162.48);
+  --chart-4: oklch(0.769 0.188 70.08);
+  --chart-5: oklch(0.627 0.265 303.9);
+}
+.dark[data-palette="blue"] {
+  --primary: oklch(0.623 0.214 259.815);
+  --primary-foreground: oklch(0.145 0 0);
+  --ring: oklch(0.623 0.214 259.815);
+  --chart-1: oklch(0.623 0.214 259.815);
+}
+
+/* violet */
+[data-palette="violet"] {
+  --primary: oklch(0.541 0.281 293.009);
+  --primary-foreground: oklch(0.985 0 0);
+  --ring: oklch(0.541 0.281 293.009);
+  --chart-1: oklch(0.541 0.281 293.009);
+  --chart-2: oklch(0.627 0.265 303.9);
+  --chart-3: oklch(0.546 0.215 262.881);
+  --chart-4: oklch(0.696 0.17 162.48);
+  --chart-5: oklch(0.769 0.188 70.08);
+}
+.dark[data-palette="violet"] {
+  --primary: oklch(0.606 0.25 292.717);
+  --primary-foreground: oklch(0.145 0 0);
+  --ring: oklch(0.606 0.25 292.717);
+  --chart-1: oklch(0.606 0.25 292.717);
+}
+
+/* emerald */
+[data-palette="emerald"] {
+  --primary: oklch(0.596 0.145 163.225);
+  --primary-foreground: oklch(0.985 0 0);
+  --ring: oklch(0.596 0.145 163.225);
+  --chart-1: oklch(0.596 0.145 163.225);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.546 0.215 262.881);
+  --chart-4: oklch(0.769 0.188 70.08);
+  --chart-5: oklch(0.646 0.222 41.116);
+}
+.dark[data-palette="emerald"] {
+  --primary: oklch(0.696 0.17 162.48);
+  --primary-foreground: oklch(0.145 0 0);
+  --ring: oklch(0.696 0.17 162.48);
+  --chart-1: oklch(0.696 0.17 162.48);
+}
+
+/*
+ * Added palettes (rose / amber / cyan). Authored in OKLCH for perceptually-even
+ * lightness; each light block is paired with a slightly brighter dark variant so
+ * contrast holds on dark surfaces. Chart series rotate hues around the brand hue.
+ */
+
+/* rose */
+[data-palette="rose"] {
+  --primary: oklch(0.586 0.222 17.585);
+  --primary-foreground: oklch(0.985 0 0);
+  --ring: oklch(0.586 0.222 17.585);
+  --chart-1: oklch(0.586 0.222 17.585);
+  --chart-2: oklch(0.646 0.222 41.116);
+  --chart-3: oklch(0.541 0.281 293.009);
+  --chart-4: oklch(0.6 0.118 184.704);
+  --chart-5: oklch(0.769 0.188 70.08);
+}
+.dark[data-palette="rose"] {
+  --primary: oklch(0.645 0.246 16.439);
+  --primary-foreground: oklch(0.145 0 0);
+  --ring: oklch(0.645 0.246 16.439);
+  --chart-1: oklch(0.645 0.246 16.439);
+}
+
+/* amber */
+[data-palette="amber"] {
+  --primary: oklch(0.666 0.169 58.318);
+  --primary-foreground: oklch(0.205 0 0);
+  --ring: oklch(0.666 0.169 58.318);
+  --chart-1: oklch(0.666 0.169 58.318);
+  --chart-2: oklch(0.769 0.188 70.08);
+  --chart-3: oklch(0.6 0.145 163.225);
+  --chart-4: oklch(0.546 0.215 262.881);
+  --chart-5: oklch(0.646 0.222 41.116);
+}
+.dark[data-palette="amber"] {
+  --primary: oklch(0.769 0.188 70.08);
+  --primary-foreground: oklch(0.145 0 0);
+  --ring: oklch(0.769 0.188 70.08);
+  --chart-1: oklch(0.828 0.189 84.429);
+}
+
+/* cyan */
+[data-palette="cyan"] {
+  --primary: oklch(0.585 0.122 221.723);
+  --primary-foreground: oklch(0.985 0 0);
+  --ring: oklch(0.585 0.122 221.723);
+  --chart-1: oklch(0.585 0.122 221.723);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.546 0.215 262.881);
+  --chart-4: oklch(0.769 0.188 70.08);
+  --chart-5: oklch(0.627 0.265 303.9);
+}
+.dark[data-palette="cyan"] {
+  --primary: oklch(0.715 0.143 215.221);
+  --primary-foreground: oklch(0.145 0 0);
+  --ring: oklch(0.715 0.143 215.221);
+  --chart-1: oklch(0.715 0.143 215.221);
+}
+
+/*
+ * ── Session-replay surface (.lo-rrweb) ──
+ * We drive rrweb's Replayer engine directly and build our own themed controller
+ * (see components/replay/replay-player.tsx), so there is no third-party player
+ * chrome to re-skin. `.lo-rrweb` just hosts the scaled recording; the recorded
+ * page itself lives in an isolated iframe. rrweb's own stylesheet only styles
+ * the replay cursor/wrapper, which sits on our themed card surface.
+ */
+.lo-rrweb .replayer-wrapper {
+  background: var(--card);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  /* Font-size tier: scale the root font-size so every rem-based size follows. */
+  html {
+    font-size: calc(100% * var(--font-scale, 1));
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-feature-settings:
+      "rlig" 1,
+      "calt" 1;
+  }
+  /* Thin, theme-aware scrollbars. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+}

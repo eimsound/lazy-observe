@@ -1,0 +1,22 @@
+Embedded VictoriaMetrics components
+===================================
+
+lazy-observe release archives and container images embed unmodified upstream
+release binaries of the components below and run them as separate child
+processes (aggregation, not a derivative work). Pinned versions and archive
+checksums live in scripts/download-storage-bins.sh; keep this file and the
+license copies in sync when those pins change.
+
+The upstream release archives contain only the binaries, so the license text
+is copied from the source repository at the matching tag. None of these
+repositories carries a NOTICE file at the pinned tag.
+
+Component        Version    Binaries                     License     Source of LICENSE
+VictoriaMetrics  v1.147.0   victoria-metrics-prod,       Apache-2.0  https://raw.githubusercontent.com/VictoriaMetrics/VictoriaMetrics/v1.147.0/LICENSE
+                            vmagent-prod (vmutils)
+VictoriaLogs     v1.52.0    victoria-logs-prod           Apache-2.0  https://raw.githubusercontent.com/VictoriaMetrics/VictoriaLogs/v1.52.0/LICENSE
+VictoriaTraces   v0.9.4     victoria-traces-prod         Apache-2.0  https://raw.githubusercontent.com/VictoriaMetrics/VictoriaTraces/v0.9.4/LICENSE
+
+Upstream source code: https://github.com/VictoriaMetrics/VictoriaMetrics,
+https://github.com/VictoriaMetrics/VictoriaLogs,
+https://github.com/VictoriaMetrics/VictoriaTraces

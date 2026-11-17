@@ -1,0 +1,471 @@
+name: CI
+
+# 增量 CI：changes 作业按改动面输出布尔标志（scripts/ci-changes.sh），各业务 job 按标志
+# 决定跑还是跳过；最后的 ci-ok 汇总 job 是唯一的 required check，被跳过的 job 算通过。
+# 纯文档改动所有业务 job 跳过。动到打包链路时 arm64 构建与冒烟进入 build 矩阵，
+# 发版前 release.yml 再对两个架构兜底。
+#
+# 所有 job 直接跑在 GitHub 托管 runner 上，工具由 scripts/ci-setup-mise.sh 安装，mise 目录按 job 缓存。
+#
+# 切片分支只靠 pull_request 跑一遍；push 只留给合并后的 main 和 integration 分支。
+on:
+  push:
+    branches:
+      - main
+      - "integration/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# mise 在 job 中途按需安装 task 工具时也要带 token，否则 GitHub API 匿名限流会让安装 403。
+env:
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  changes:
+    name: Detect change surface
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      go: ${{ steps.detect.outputs.go }}
+      build: ${{ steps.detect.outputs.build }}
+      e2e: ${{ steps.detect.outputs.e2e }}
+      web: ${{ steps.detect.outputs.web }}
+      meta_pg: ${{ steps.detect.outputs.meta_pg }}
+      arm64: ${{ steps.detect.outputs.arm64 }}
+      sdk_go: ${{ steps.detect.outputs.sdk_go }}
+      sdk_node: ${{ steps.detect.outputs.sdk_node }}
+      sdk_browser: ${{ steps.detect.outputs.sdk_browser }}
+      sdk_python: ${{ steps.detect.outputs.sdk_python }}
+      build_matrix: ${{ steps.detect.outputs.build_matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Detect change surface
+        id: detect
+        run: bash scripts/ci-changes.sh
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_BEFORE_SHA: ${{ github.event.before }}
+
+  go:
+    name: Go, licenses, Helm
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-go-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MISE_CI_PROFILE: go-ci
+      - name: Restore Go cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run workflow-check
+      - run: mise run install-check
+      - run: mise run release-prerequisites-test
+      - run: mise run migration-check
+      - run: mise run ent-generate-check
+      - run: mise run license-check
+      - run: mise run fmt-check
+      - run: mise run mod-tidy-check
+      - run: mise run lint
+      - run: mise run vet
+      - run: mise run test
+      - run: mise run helm-lint
+      - run: mise run helm-template-test
+
+  go-cross:
+    name: Go build (linux/${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-go-cross-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore Go cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.pnpm-web }}
+          restore-keys: pnpm-web-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build real embedded artifact
+        run: mise run dist
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          BINARY: .cache/build/linux-${{ matrix.arch }}/lazy-observe
+      - name: Record embedded artifact evidence
+        run: mise x go -- bash scripts/check-embedded-artifact.sh ".cache/build/linux-${{ matrix.arch }}/lazy-observe" "linux/${{ matrix.arch }}"
+        env:
+          LO_ARTIFACT_EVIDENCE: .cache/artifact-evidence/linux-${{ matrix.arch }}.json
+
+  artifact-smoke:
+    name: Zero-config artifact smoke (linux/${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify Docker access
+        run: bash scripts/ci-setup-docker.sh
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build loadable zero-config artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          docker buildx build \
+            --platform "linux/${{ matrix.arch }}" \
+            --load \
+            --provenance=false \
+            --sbom=false \
+            --secret "id=github_token,env=GITHUB_TOKEN" \
+            --tag "lazy-observe:ci-${{ matrix.arch }}" \
+            .
+      - name: Smoke real embedded artifact
+        run: bash scripts/check-container-smoke.sh "lazy-observe:ci-${{ matrix.arch }}" "linux/${{ matrix.arch }}"
+
+  # 网关 e2e 大多在等固定观察窗口（自监控 70s、静默告警 50s 等），串行要 6 分钟以上，
+  # 所以按测试分到并行分片；check-e2e-contract.sh 校验分片的并集正好是全集。
+  e2e:
+    name: Gateway E2E (${{ matrix.shard }})
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: storage
+            gateway_tests: "StorageGateway"
+          - shard: self-monitoring
+            gateway_tests: "SelfMonitoringDisabled"
+          - shard: alerts-scrape-tls
+            gateway_tests: "LogsAlert|ScrapeManagement|NativeTLSLoopback"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-e2e-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-e2e-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore Go cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/storage-bin/.archives
+          key: storage-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.storage }}
+          restore-keys: storage-native-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run e2e
+        env:
+          LO_E2E_GATEWAY_TESTS: ${{ matrix.gateway_tests }}
+
+  e2e-restart:
+    name: Gateway same-data-dir restart fixture
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-e2e-restart-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-e2e-restart-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore Go cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/storage-bin/.archives
+          key: storage-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.storage }}
+          restore-keys: storage-native-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run e2e-restart
+
+  web:
+    name: Web typecheck and build
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-web-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-web-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.pnpm-web }}
+          restore-keys: pnpm-web-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run web
+
+  meta-pg:
+    name: PostgreSQL metadata tests
+    needs: changes
+    if: needs.changes.outputs.meta_pg == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-meta-pg-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
+          restore-keys: mise-meta-pg-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MISE_CI_PROFILE: meta-pg
+      - name: Restore Go cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-meta-pg-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: go-meta-pg-${{ runner.os }}-${{ runner.arch }}-
+      - name: Run PostgreSQL tests when migrations exist
+        run: mise run --skip-tools test-meta-pg
+
+  sdk-go:
+    name: Go SDK (build, vet, test)
+    needs: changes
+    if: needs.changes.outputs.sdk_go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-sdk-go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-sdk-go-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore Go cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: go-sdk-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run sdk-go
+
+  sdk-node:
+    name: Node SDK (install, build, typecheck, test, licenses)
+    needs: changes
+    if: needs.changes.outputs.sdk_node == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-sdk-node-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-sdk-node-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-sdk-node-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'sdk/node/pnpm-lock.yaml') }}
+          restore-keys: pnpm-sdk-node-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run sdk-node
+
+  sdk-browser:
+    name: Browser SDK (install, build, typecheck, test, licenses)
+    needs: changes
+    if: needs.changes.outputs.sdk_browser == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-sdk-browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-sdk-browser-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Restore pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-sdk-browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'sdk/browser/pnpm-lock.yaml') }}
+          restore-keys: pnpm-sdk-browser-${{ runner.os }}-${{ runner.arch }}-
+      - run: mise run sdk-browser
+
+  sdk-python:
+    name: Python SDK (install, pytest)
+    needs: changes
+    if: needs.changes.outputs.sdk_python == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore mise cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-sdk-python-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-sdk-python-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MISE_CI_PROFILE: sdk-python
+      - run: mise run sdk-python
+
+  # 唯一的 required check。被跳过的 job 算通过；任一 job 失败或被取消则失败。
+  ci-ok:
+    # check 名必须就是 ci-ok：分支保护按这个名字匹配 required check。
+    name: ci-ok
+    if: always()
+    needs:
+      - changes
+      - go
+      - go-cross
+      - artifact-smoke
+      - e2e
+      - e2e-restart
+      - web
+      - meta-pg
+      - sdk-go
+      - sdk-node
+      - sdk-browser
+      - sdk-python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed or be skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          printf 'job results: %s\n' "$RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+            success | skipped) ;;
+            *)
+              printf 'a required job ended with %s\n' "$result" >&2
+              exit 1
+              ;;
+            esac
+          done

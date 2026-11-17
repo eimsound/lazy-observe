@@ -1,0 +1,1 @@
+{"card":{"elements":[{"tag":"div","text":{"content":"[FIRING] alpha / DiskFull\n{\"alertname\":\"DiskFull\",\"instance\":\"node-1\",\"project_id\":\"alpha\"}","tag":"lark_md"}}],"header":{"title":{"content":"[FIRING] alpha / DiskFull","tag":"plain_text"}}},"msg_type":"interactive"}

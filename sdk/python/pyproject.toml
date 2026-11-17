@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lazyobserve"
+version = "0.1.0"
+description = "lazy-observe Python SDK: explicit Django/DRF client instrumentation for the lazy-observe observability platform."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "lazy-observe" }]
+keywords = ["observability", "django", "drf", "opentelemetry", "sentry"]
+dependencies = [
+    "opentelemetry-api>=1.24",
+    "opentelemetry-sdk>=1.24",
+    "opentelemetry-exporter-otlp-proto-http>=1.24",
+    "httpcore>=1.0",
+    "httpx>=0.24",
+]
+
+[project.optional-dependencies]
+django = [
+    "Django>=4.2",
+    "djangorestframework>=3.14",
+]
+test = [
+    "pytest>=8",
+    "Django>=4.2",
+    "djangorestframework>=3.14",
+]
+
+[tool.setuptools.packages.find]
+include = ["lazyobserve*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+DJANGO_SETTINGS_MODULE = "tests.django_settings"

@@ -1,0 +1,11 @@
+{
+  "name": "lazy-observe-express-example",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "tsc", "start": "node dist/main.js", "typecheck": "pnpm --filter @lazy-observe/node build && tsc --noEmit" },
+  "dependencies": {
+    "@lazy-observe/node": "workspace:*",
+    "express": "^5.0.0"
+  },
+  "devDependencies": { "@types/express": "^5.0.0" }
+}

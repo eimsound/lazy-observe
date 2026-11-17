@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "duration_seconds": 30.00009212,
+  "concurrency": 4,
+  "batch_size": 200,
+  "metric_samples": 30501800,
+  "log_records": 25176400,
+  "samples_per_second": 1016723.5446475688,
+  "logs_per_second": 839210.7563968373,
+  "p99_gateway_latency_ms": 0.998,
+  "max_rss_bytes": 105951232,
+  "requests_failed": 0,
+  "gate_passed": true
+}

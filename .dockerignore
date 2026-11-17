@@ -1,0 +1,19 @@
+.git
+.github
+.cache
+bin
+dist
+data
+**/node_modules
+# Only the Go SDK module is part of the server build (go.mod replace ./sdk/go).
+sdk/node
+sdk/browser
+sdk/python
+sdk/scripts
+**/dist
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep
+internal/embed/bins/assets/*/*
+!internal/embed/bins/assets/*/.gitkeep
+*.log
+.DS_Store

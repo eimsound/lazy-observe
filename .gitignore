@@ -1,0 +1,43 @@
+# binaries & data
+/bin/
+/dist/
+/data/
+/.cache/
+/lazy-observe
+/.pnpm-store/
+/internal/db/ent/
+/internal/db/.ent.tmp.*/
+/internal/db/.ent.previous.*/
+*.out
+bench/results/
+poc/**/bin/
+poc/**/data/
+# frontend
+node_modules/
+web/dist/
+web/playwright-report/
+web/test-results/
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep
+internal/embed/bins/assets/*/*
+!internal/embed/bins/assets/*/.gitkeep
+# misc
+AGENTS.override.md
+AGENTS.local.md
+/.playwright-cli/
+/.zed/
+/output/
+.DS_Store
+._*
+*.log
+
+# sdk
+sdk/**/dist/
+sdk/**/test-results/
+sdk/**/coverage/
+sdk/**/.pytest_cache/
+sdk/python/.venv/
+sdk/python/**/__pycache__/
+sdk/python/*.egg-info/
+
+sdk/python/examples/django/db.sqlite3

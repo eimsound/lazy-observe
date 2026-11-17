@@ -1,0 +1,128 @@
+import { apiGet, API_ROOT, IS_MOCK } from "./client";
+import {
+  normalizeProfileListResponse,
+  normalizeProfileServicesResponse,
+  type ProfileListResponseDTO,
+  type ProfileRecord,
+  type ProfileServicesResponseDTO,
+  type ProfileType,
+} from "./profile-contract";
+import dayjs from "../dayjs.ts";
+
+// Mock data is only for VITE_MOCK builds; load it lazily so it never ships with real chunks.
+const loadMockProfiles = () => import("./mock-profiles");
+
+export { PROFILE_TYPES } from "./profile-contract";
+export type {
+  ProfileListResponseDTO,
+  ProfileRecord,
+  ProfileRecordDTO,
+  ProfileServicesResponseDTO,
+  ProfileType,
+} from "./profile-contract";
+
+/**
+ * Continuous-profiling API (B9). The backend exposes pprof-derived profiles and
+ * a pre-aggregated flamegraph tree. These endpoints live under /api (not
+ * /api/v1) per the B9 contract. VITE_MOCK serves a deterministic offline
+ * generator so the flamegraph page renders with no backend.
+ *
+ *   GET /api/profiles/services                                 -> { services: string[] }
+ *   GET /api/profiles?service=&type=&start=&end=               -> { profiles: ProfileRecordDTO[] }
+ *   GET /api/profiles/flamegraph?service=&type=&start=&end=    -> FlameNode (tree)
+ *   GET /api/profiles/:id/raw                                  -> pprof download
+ */
+
+/**
+ * Recursive flamegraph tree. `value` is the aggregated sample count for the
+ * subtree (the root's value == the profile total); children partition it. A
+ * node may carry `truncated` when the backend clipped its subtree for size.
+ */
+export interface FlameNode {
+  name: string;
+  value: number;
+  children?: FlameNode[];
+  truncated?: boolean;
+}
+
+export interface ProfileQuery {
+  service: string;
+  type: ProfileType;
+  /** Epoch seconds. */
+  start: number;
+  /** Epoch seconds. */
+  end: number;
+}
+
+function profileQueryParams(q: ProfileQuery) {
+  return {
+    service: q.service,
+    type: q.type,
+    start: dayjs.unix(q.start).toISOString(),
+    end: dayjs.unix(q.end).toISOString(),
+  };
+}
+
+export async function getProfileServices(signal?: AbortSignal): Promise<string[]> {
+  if (IS_MOCK) return (await loadMockProfiles()).mockProfileServices();
+  const response = await apiGet<ProfileServicesResponseDTO>("/profiles/services", {
+    base: API_ROOT,
+    signal,
+  });
+  return normalizeProfileServicesResponse(response);
+}
+
+export async function listProfiles(
+  q: ProfileQuery,
+  signal?: AbortSignal,
+): Promise<ProfileRecord[]> {
+  if (IS_MOCK) return (await loadMockProfiles()).mockListProfiles(q);
+  const response = await apiGet<ProfileListResponseDTO>("/profiles", {
+    base: API_ROOT,
+    params: profileQueryParams(q),
+    signal,
+  });
+  return normalizeProfileListResponse(response);
+}
+
+export async function getFlamegraph(
+  q: ProfileQuery,
+  signal?: AbortSignal,
+): Promise<FlameNode> {
+  if (IS_MOCK) return (await loadMockProfiles()).mockFlamegraph(q);
+  return apiGet<FlameNode>("/profiles/flamegraph", {
+    base: API_ROOT,
+    params: profileQueryParams(q),
+    signal,
+  });
+}
+
+/**
+ * Href for downloading a profile's raw pprof blob. In mock mode this is a
+ * self-contained data: URL (there is no server); against a real backend it's
+ * the `/api/profiles/:id/raw` endpoint (served same-origin, auth via cookie).
+ */
+export function profileRawHref(rec: ProfileRecord): string {
+  if (IS_MOCK) {
+    const body = `# mock pprof profile\nservice: ${rec.service}\ntype: ${rec.type}\nid: ${rec.id}\n` +
+      "(This is a placeholder produced by VITE_MOCK; a real backend returns a gzipped pprof blob.)\n";
+    return `data:text/plain;charset=utf-8,${encodeURIComponent(body)}`;
+  }
+  return `${API_ROOT}/profiles/${encodeURIComponent(rec.id)}/raw`;
+}
+
+/** Total sample count of a flamegraph tree (the root value). */
+export function flameTotal(tree: FlameNode): number {
+  return tree.value;
+}
+
+/** True when any node in the tree was clipped by the backend. */
+export function hasTruncated(tree: FlameNode): boolean {
+  if (tree.truncated) return true;
+  return (tree.children ?? []).some(hasTruncated);
+}
+
+/** Total node count (for the header stat). */
+export function countNodes(tree: FlameNode): number {
+  return 1 + (tree.children ?? []).reduce((s, c) => s + countNodes(c), 0);
+}

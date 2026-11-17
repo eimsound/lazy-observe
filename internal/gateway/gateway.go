@@ -1,0 +1,1364 @@
+package gateway
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"mime"
+	"net/http"
+	"net/url"
+	"path"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/eimsound/lazy-observe/internal/account"
+	"github.com/eimsound/lazy-observe/internal/ai"
+	"github.com/eimsound/lazy-observe/internal/alert"
+	"github.com/eimsound/lazy-observe/internal/blob"
+	"github.com/eimsound/lazy-observe/internal/embed"
+	"github.com/eimsound/lazy-observe/internal/errortrack"
+	"github.com/eimsound/lazy-observe/internal/llmcost"
+	"github.com/eimsound/lazy-observe/internal/management"
+	observemcp "github.com/eimsound/lazy-observe/internal/mcp"
+	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/scrape"
+	"github.com/eimsound/lazy-observe/internal/secret"
+	"github.com/eimsound/lazy-observe/internal/state"
+	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
+	"github.com/eimsound/lazy-observe/internal/webui"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpadaptor"
+	"go.opentelemetry.io/otel/metric"
+)
+
+const projectLocal = "lazy-observe.project"
+const userLocal = "lazy-observe.user"
+const tokenCacheTTL = 30 * time.Second
+
+// maxDecodedRequestBody bounds every request body after Content-Encoding is
+// removed. It equals the compressed BodyLimit so compression never raises the
+// amount of memory one request may claim.
+const maxDecodedRequestBody = 52 << 20
+
+const (
+	defaultReadTimeout = 60 * time.Second
+	defaultIdleTimeout = 120 * time.Second
+)
+
+const (
+	defaultProxyMaxIdleConnections        = 256
+	defaultProxyMaxIdleConnectionsPerHost = 128
+)
+
+type TokenStore interface {
+	AuthenticateProjectAPIToken(context.Context, string) (meta.ProjectInfo, error)
+	Revision() uint64
+}
+
+type HealthChecker interface {
+	Health(context.Context) map[string]error
+}
+
+type ManagementStore interface {
+	ProjectBySlug(context.Context, string) (meta.ProjectInfo, error)
+	GetProject(context.Context, int) (*meta.Project, error)
+	RecordAudit(context.Context, meta.AuditRecord) error
+	ListAudit(context.Context, meta.AuditListOptions) ([]meta.AuditRecord, error)
+}
+
+type IssueStore interface {
+	ListIssues(context.Context, int, meta.IssueListOptions) ([]meta.IssueView, error)
+	CountIssues(context.Context, int, meta.IssueListOptions) (int, error)
+	GetIssue(context.Context, int, int) (meta.IssueView, error)
+	IssueIDForErrorEvent(context.Context, int, string) (int, bool, error)
+	SetIssueStatus(context.Context, int, int, string, time.Time) (meta.IssueView, error)
+	SetIssuesStatus(context.Context, int, []int, string, time.Time) (int, error)
+	SaveIssueAnalysis(context.Context, int, int, map[string]any, time.Time) (meta.IssueView, error)
+}
+
+// ErrorIntake is the durable error Inbox as the gateway uses it: it accepts
+// browser error batches and reports capacity for health and readiness.
+type ErrorIntake interface {
+	errortrack.Accepter
+	errortrack.InboxMonitor
+}
+
+// NotificationStore lists and requeues a project's notification history.
+type NotificationStore interface {
+	ListNotificationOutbox(context.Context, meta.NotificationOutboxListOptions) ([]meta.NotificationOutboxView, error)
+	RequeueNotification(context.Context, int64, int) (bool, error)
+}
+
+type SourceMapStore interface {
+	UpsertSourceMapArtifact(context.Context, int, string, string, int64, string, time.Time) error
+	SourceMapArtifacts(context.Context, int, string) ([]*meta.SourceMapArtifact, error)
+	ListSourceMapReleases(context.Context, int, int) ([]meta.SourceMapRelease, error)
+	DeleteSourceMapArtifacts(context.Context, int, string) error
+}
+
+type Config struct {
+	// InstanceID identifies one running gateway process to authenticated
+	// operational probes. Empty generates a fresh 128-bit value in New.
+	InstanceID              string
+	Tokens                  TokenStore
+	Store                   ManagementStore
+	Account                 account.Behavior
+	Limits                  state.Limiter
+	Management              *management.Manager
+	Health                  HealthChecker
+	Readiness               HealthChecker
+	Client                  *http.Client
+	Metrics                 string
+	Logs                    string
+	Traces                  string
+	Storage                 storagepkg.SignalBackend
+	Now                     func() time.Time
+	Alerts                  *alert.Service
+	Issues                  IssueStore
+	ErrorTracker            ErrorIntake
+	Notifications           NotificationStore
+	Replays                 ReplayStore
+	Blobs                   blob.Store
+	SourceMaps              SourceMapStore
+	Profiles                ProfileStore
+	Scrapes                 *scrape.Service
+	ScrapeUnavailableReason string
+	MCPBaseURL              string
+	AIEnabled               bool
+	AIProvider              string
+	AIModel                 string
+	AIClient                ai.Client
+	// AISettingsStore switches the gateway into dynamic AI management: the
+	// admin API reads/writes the persisted row and hot-swaps the client.
+	// When nil, the static AIEnabled/AIProvider/AIModel/AIClient fields above
+	// define the runtime state (used by focused tests and embedders).
+	AISettingsStore AISettingsStore
+	// AISecretBox seals/opens the stored BYO API key (dynamic mode only).
+	AISecretBox *secret.Box
+	// AIBuildClient constructs the provider client; defaults to ai.New.
+	AIBuildClient func(ai.Config) (ai.Client, error)
+	// AITimeout bounds provider calls; defaults to 60s when unset.
+	AITimeout           time.Duration
+	LLMPricing          *llmcost.Table
+	WebUI               fs.FS
+	DisableWebUI        bool
+	Instrumentation     fiber.Handler
+	SelfMonitoringToken string
+	Logger              *slog.Logger
+	// MeterProvider receives the gateway's own operational metrics. Nil uses a
+	// no-op provider.
+	MeterProvider metric.MeterProvider
+	// RequireCSRF enables the double-submit CSRF token check for
+	// session-authenticated mutating requests. Production wiring enables it.
+	RequireCSRF bool
+	// ReadTimeout bounds reading one request (headers and body); IdleTimeout
+	// bounds keep-alive waits. Zero selects the defaults. There is deliberately
+	// no write timeout: log tail is a long-lived streaming response.
+	ReadTimeout time.Duration
+	IdleTimeout time.Duration
+	// SecureSessionCookie marks the session and CSRF cookies with the Secure
+	// attribute. Enable only when TLS terminates in front of the gateway.
+	SecureSessionCookie bool
+}
+
+type Gateway struct {
+	app                     *fiber.App
+	instanceID              string
+	auth                    *Authenticator
+	store                   ManagementStore
+	account                 account.Behavior
+	limits                  state.Limiter
+	management              *management.Manager
+	health                  HealthChecker
+	readiness               HealthChecker
+	ready                   bool
+	readyMu                 sync.RWMutex
+	drainOnce               sync.Once
+	client                  *http.Client
+	now                     func() time.Time
+	alerts                  *alert.Service
+	issues                  IssueStore
+	errorTracker            ErrorIntake
+	notifications           NotificationStore
+	replays                 ReplayStore
+	blobs                   blob.Store
+	sourceMaps              SourceMapStore
+	profiles                ProfileStore
+	scrapes                 *scrape.Service
+	storage                 storagepkg.SignalBackend
+	scrapeUnavailableReason string
+	mcpBaseURL              string
+	ai                      *aiManager
+	aiAssistant             *assistantService
+	issueAI                 *issueAIService
+	llmPricing              *llmcost.Table
+	webUI                   fs.FS
+	instrumentation         fiber.Handler
+	selfMonitoringToken     string
+	logger                  *slog.Logger
+	meterProvider           metric.MeterProvider
+	replayLocks             [64]sync.Mutex
+	requireCSRF             bool
+	secureSessionCookie     bool
+}
+
+func New(cfg Config) *Gateway {
+	if cfg.Account == nil {
+		panic("gateway: account behavior is required")
+	}
+	if cfg.InstanceID == "" {
+		value := make([]byte, 16)
+		if _, err := rand.Read(value); err != nil {
+			panic("gateway: generate instance id: " + err.Error())
+		}
+		cfg.InstanceID = "loi_" + base64.RawURLEncoding.EncodeToString(value)
+	}
+	if cfg.Client == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		// The platform gateway is an HTTP proxy. net/http's default of two idle
+		// connections per host forces connection churn under normal OTLP batch
+		// concurrency and prevents replicas from scaling independently.
+		transport.MaxIdleConns = defaultProxyMaxIdleConnections
+		transport.MaxIdleConnsPerHost = defaultProxyMaxIdleConnectionsPerHost
+		cfg.Client = &http.Client{Transport: transport}
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.Limits == nil {
+		cfg.Limits = state.NewMemoryLimiterWithClock(cfg.Now)
+	}
+	if cfg.Metrics == "" {
+		cfg.Metrics = "http://" + embed.MetricsAddr
+	}
+	if cfg.Logs == "" {
+		cfg.Logs = "http://" + embed.LogsAddr
+	}
+	if cfg.Traces == "" {
+		cfg.Traces = "http://" + embed.TracesAddr
+	}
+	if cfg.Storage == nil {
+		// Metrics/Logs/Traces are kept as a compatibility constructor surface for
+		// focused gateway tests and embedders. Production startup passes the
+		// validated backend explicitly, so every handler still consumes the same
+		// storage interface.
+		backend, err := storagepkg.New(
+			storagepkg.MetricsVM,
+			cfg.Metrics,
+			cfg.Metrics,
+			cfg.Logs,
+			cfg.Traces,
+			cfg.Client,
+		)
+		if err != nil {
+			panic("gateway: invalid storage endpoints: " + err.Error())
+		}
+		cfg.Storage = backend
+	}
+	if cfg.LLMPricing == nil {
+		cfg.LLMPricing = llmcost.Default()
+	}
+	if cfg.DisableWebUI {
+		cfg.WebUI = nil
+	} else if cfg.WebUI == nil {
+		cfg.WebUI, _ = webui.FS()
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = defaultReadTimeout
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaultIdleTimeout
+	}
+	g := &Gateway{
+		app: fiber.New(fiber.Config{
+			DisableStartupMessage: true,
+			BodyLimit:             maxDecodedRequestBody,
+			ReadTimeout:           cfg.ReadTimeout,
+			IdleTimeout:           cfg.IdleTimeout,
+		}),
+		instanceID: cfg.InstanceID,
+		auth: NewAuthenticator(
+			cfg.Tokens,
+		),
+		store:                   cfg.Store,
+		account:                 cfg.Account,
+		limits:                  cfg.Limits,
+		management:              cfg.Management,
+		health:                  cfg.Health,
+		readiness:               cfg.Readiness,
+		client:                  cfg.Client,
+		now:                     cfg.Now,
+		alerts:                  cfg.Alerts,
+		issues:                  cfg.Issues,
+		replays:                 cfg.Replays,
+		blobs:                   cfg.Blobs,
+		sourceMaps:              cfg.SourceMaps,
+		profiles:                cfg.Profiles,
+		scrapes:                 cfg.Scrapes,
+		storage:                 cfg.Storage,
+		scrapeUnavailableReason: cfg.ScrapeUnavailableReason,
+		mcpBaseURL:              cfg.MCPBaseURL,
+		llmPricing:              cfg.LLMPricing,
+		webUI:                   cfg.WebUI,
+		instrumentation:         cfg.Instrumentation,
+		selfMonitoringToken:     cfg.SelfMonitoringToken,
+		logger:                  cfg.Logger,
+		meterProvider:           cfg.MeterProvider,
+		requireCSRF:             cfg.RequireCSRF,
+		secureSessionCookie:     cfg.SecureSessionCookie,
+	}
+	if cfg.AISettingsStore != nil {
+		// Dynamic mode: the admin UI manages the persisted AI configuration.
+		g.ai = newAIManager(
+			cfg.AISettingsStore,
+			cfg.AISecretBox,
+			cfg.AIBuildClient,
+			cfg.AITimeout,
+			cfg.Now,
+			cfg.Logger,
+		)
+		g.ai.loadFromStore(context.Background())
+	} else {
+		// Static mode: constructor-provided AI state (tests, embedders).
+		g.ai = newAIManager(nil, nil, cfg.AIBuildClient, cfg.AITimeout, cfg.Now, cfg.Logger)
+		g.ai.current = aiSnapshot{
+			enabled:   cfg.AIEnabled,
+			provider:  cfg.AIProvider,
+			model:     cfg.AIModel,
+			maxTokens: aiDefaultMaxTokens,
+			hasKey:    cfg.AIClient != nil,
+			client:    cfg.AIClient,
+		}
+	}
+	g.aiAssistant = newAssistantService(g)
+	g.issueAI = newIssueAIService(g)
+	g.errorTracker = cfg.ErrorTracker
+	g.notifications = cfg.Notifications
+	g.routes()
+	return g
+}
+
+func (g *Gateway) App() *fiber.App { return g.app }
+
+// AttachErrorTracker completes composition before the listener starts. The
+// Gateway owns only the HTTP acceptance seam; the composition root owns the
+// durable module and its metadata, VLogs, and symbolication adapters.
+func (g *Gateway) AttachErrorTracker(tracker ErrorIntake) error {
+	if tracker == nil {
+		return errors.New("gateway: error tracker is required")
+	}
+	if g.errorTracker != nil {
+		return errors.New("gateway: error tracker is already configured")
+	}
+	g.errorTracker = tracker
+	return nil
+}
+
+func (g *Gateway) Listen(addr string) error { return g.app.Listen(addr) }
+
+// MarkReady opens the readiness gate after startup initialization and metadata
+// migrations have completed. New gateways deliberately start unready.
+func (g *Gateway) MarkReady() {
+	g.readyMu.Lock()
+	g.ready = true
+	g.readyMu.Unlock()
+}
+
+// BeginDrain immediately removes the replica from service discovery. It is
+// idempotent so signal and error paths can safely converge on it.
+func (g *Gateway) BeginDrain() {
+	g.drainOnce.Do(func() {
+		g.readyMu.Lock()
+		g.ready = false
+		g.readyMu.Unlock()
+	})
+}
+
+// Drain stops accepting requests, waits for in-flight handlers, and only then
+// flushes the Issue batch. The supplied context bounds the whole operation.
+func (g *Gateway) Drain(ctx context.Context) error {
+	g.BeginDrain()
+	shutdownErr := g.app.ShutdownWithContext(ctx)
+	var errorTrackErr error
+	if g.errorTracker != nil {
+		errorTrackErr = g.errorTracker.Close(ctx)
+	}
+	var aiErr error
+	if g.issueAI != nil {
+		aiErr = g.issueAI.Close(ctx)
+	}
+	return errors.Join(shutdownErr, errorTrackErr, aiErr)
+}
+
+func (g *Gateway) Shutdown() error {
+	return g.Drain(context.Background())
+}
+
+// routes registers handlers in the exact order Fiber must match them:
+// cross-cutting middleware and probes first, the SPA fallback last.
+func (g *Gateway) routes() {
+	g.registerMiddlewareAndProbes()
+	g.registerPlatformRoutes()
+	g.registerAuthRoutes()
+	g.registerTelemetryRoutes()
+	g.registerSessionAPI()
+	g.app.Use(g.serveWebUI)
+}
+
+// registerMiddlewareAndProbes installs panic recovery, bounded request
+// decoding, the kubelet probes, and optional self-instrumentation.
+func (g *Gateway) registerMiddlewareAndProbes() {
+	// A handler panic answers 500 for that request instead of killing the
+	// process (and every in-flight request with it).
+	g.app.Use(recover.New(recover.Config{
+		EnableStackTrace: true,
+		StackTraceHandler: func(c *fiber.Ctx, value any) {
+			g.logger.Error(
+				"gateway handler panic",
+				"method", c.Method(), "path", c.Path(), "panic", fmt.Sprint(value),
+				"stack", string(debug.Stack()),
+			)
+		},
+	}))
+	// Bound content-coding expansion before any route can read the body.
+	g.app.Use(boundedRequestDecoding)
+	// Register kubelet probes before optional instrumentation. In particular,
+	// /livez must not depend on telemetry middleware or any external service.
+	g.app.Get("/livez", g.livez)
+	g.app.Get("/readyz", g.readyz)
+	if g.instrumentation != nil {
+		g.app.Use(func(c *fiber.Ctx) error {
+			// OTLP exports are never observed, and the private token is a second
+			// marker for any future internal endpoint. Either condition prevents
+			// self-generated telemetry from recursively producing more telemetry.
+			if strings.HasPrefix(c.Path(), "/v1/") ||
+				(g.selfMonitoringToken != "" && bearerCredential(c) == g.selfMonitoringToken) {
+				return c.Next()
+			}
+			return g.instrumentation(c)
+		})
+	}
+}
+
+// registerPlatformRoutes serves health, system diagnostics, and MCP.
+func (g *Gateway) registerPlatformRoutes() {
+	g.app.Get("/healthz", g.healthz)
+	g.app.Get("/api/system/info", g.queryRequired, g.systemInfo)
+	g.app.Get("/api/system/error-inbox", g.userRequired, g.adminRequired, g.errorInboxDiagnostics)
+	baseURL := g.mcpBaseURL
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:3100"
+	}
+	mcpHandler := fasthttpadaptor.NewFastHTTPHandler(observemcp.NewHTTPHandler(baseURL, nil))
+	g.app.All("/mcp", g.mcpRequired, func(c *fiber.Ctx) error {
+		mcpHandler(c.Context())
+		return nil
+	})
+}
+
+// registerAuthRoutes serves login and the current user's own account.
+func (g *Gateway) registerAuthRoutes() {
+	g.app.Post("/api/auth/login", g.login)
+	g.app.Get("/api/auth/me", g.userRequired, g.me)
+	// Login is the only cookie-less mutation here; every other /api/auth
+	// mutation rides on the session cookie and needs the CSRF double-submit.
+	g.app.Post("/api/auth/logout", g.sessionRequired, g.csrfRequired, g.logout)
+	g.app.Get("/api/auth/tokens", g.sessionRequired, g.listCurrentUserTokens)
+	g.app.Post("/api/auth/tokens", g.sessionRequired, g.csrfRequired, g.createCurrentUserToken)
+	g.app.Delete("/api/auth/tokens/:tokenID", g.sessionRequired, g.csrfRequired, g.revokeCurrentUserToken)
+	g.app.Post("/api/auth/password", g.sessionRequired, g.csrfRequired, g.changePassword)
+	g.app.Put("/api/auth/me", g.sessionRequired, g.csrfRequired, g.updateMe)
+	g.app.Get("/api/auth/sessions", g.sessionRequired, g.listMySessions)
+	g.app.Delete("/api/auth/sessions/:id", g.sessionRequired, g.csrfRequired, g.deleteMySession)
+	g.app.Get("/api/audit", g.userRequired, g.adminRequired, g.listAudit)
+}
+
+// registerTelemetryRoutes serves ingest (project tokens) and the project-scoped
+// read API (sessions or user tokens via queryRequired).
+func (g *Gateway) registerTelemetryRoutes() {
+	g.app.Post("/v1/metrics", g.auth.Middleware, g.metricsIngest)
+	g.app.Post("/api/v1/write", g.auth.Middleware, g.metricsRemoteWrite)
+	g.app.Post(
+		"/v1/logs",
+		g.auth.Middleware,
+		g.tenantProxy(g.storage.LogsBase(), "/insert/opentelemetry/v1/logs"),
+	)
+	g.browserIngestRoute(
+		"/v1/traces",
+		g.tenantProxy(g.storage.TracesBase(), "/insert/opentelemetry/v1/traces"),
+	)
+	g.browserIngestRoute("/api/events/errors", g.errorsIngest)
+	g.browserIngestRoute("/api/events/vitals", g.vitalsIngest)
+	g.browserIngestRoute("/api/events/diagnostics", g.sdkDiagnosticsIngest)
+	g.app.Post("/api/releases/:release/sourcemaps", g.auth.Middleware, g.uploadSourceMaps)
+	g.app.Get("/api/releases", g.queryRequired, g.listSourceMapReleases)
+	g.browserIngestRoute("/api/replay/segments", g.replayIngest)
+	g.app.Post("/api/profiles", g.auth.Middleware, g.profileIngest)
+	g.app.Get("/api/profiles/services", g.queryRequired, g.listProfileServices)
+	g.app.Get("/api/profiles/flamegraph", g.queryRequired, g.profileFlamegraph)
+	g.app.Get("/api/profiles/:id/raw", g.queryRequired, g.rawProfile)
+	g.app.Get("/api/profiles", g.queryRequired, g.listProfiles)
+	g.app.Get("/api/replay/sessions", g.queryRequired, g.listReplaySessions)
+	g.app.Get("/api/replay/sessions/:session_id", g.queryRequired, g.getReplaySession)
+	g.app.Get("/api/replay/sessions/:session_id/segments/:seq", g.queryRequired, g.getReplaySegment)
+	for _, path := range []string{
+		"/api/v1/query", "/api/v1/query_range", "/api/v1/series", "/api/v1/labels",
+		"/api/v1/label/:name/values",
+	} {
+		g.app.All(path, g.queryRequired, g.metricsQuery)
+	}
+	g.app.Get("/api/v1/prettify-query", g.queryRequired, g.metricsPrettify)
+	for _, route := range []struct {
+		apiPath      string
+		upstreamPath string
+	}{
+		{"/api/v1/logs/query", "/select/logsql/query"},
+		{"/api/v1/logs/hits", "/select/logsql/hits"},
+		{"/api/v1/logs/stats_query_range", "/select/logsql/stats_query_range"},
+		{"/api/v1/logs/query_time_range", "/select/logsql/query_time_range"},
+		{"/api/v1/logs/field_names", "/select/logsql/field_names"},
+		{"/api/v1/logs/field_values", "/select/logsql/field_values"},
+		{"/api/v1/logs/stream_field_names", "/select/logsql/stream_field_names"},
+		{"/api/v1/logs/stream_field_values", "/select/logsql/stream_field_values"},
+		{"/api/v1/logs/tail", "/select/logsql/tail"},
+	} {
+		g.app.All(
+			route.apiPath,
+			g.queryRequired,
+			g.tenantProxy(g.storage.LogsBase(), route.upstreamPath),
+		)
+	}
+	g.app.Get(
+		"/api/traces/services",
+		g.queryRequired,
+		g.tenantProxy(g.storage.TracesBase(), "/select/jaeger/api/services"),
+	)
+	g.app.Get("/api/traces/services/:svc/operations", g.queryRequired, func(c *fiber.Ctx) error {
+		return g.tenantProxy(
+			g.storage.TracesBase(),
+			"/select/jaeger/api/services/"+url.PathEscape(c.Params("svc"))+"/operations",
+		)(
+			c,
+		)
+	})
+	g.app.Get("/api/traces/search", g.queryRequired, g.traceSearch)
+	g.app.Get("/api/traces/:traceID", g.queryRequired, func(c *fiber.Ctx) error {
+		return g.tenantProxy(
+			g.storage.TracesBase(),
+			"/select/jaeger/api/traces/"+url.PathEscape(c.Params("traceID")),
+		)(
+			c,
+		)
+	})
+	g.app.Get("/api/llm/summary", g.queryRequired, g.llmSummary)
+	g.app.Get("/api/llm/calls", g.queryRequired, g.llmCalls)
+	g.app.Get("/api/llm/timeseries", g.queryRequired, g.llmTimeseries)
+	g.app.Get("/api/v1/performance/endpoints", g.queryRequired, g.performanceEndpoints)
+	// Token-authenticated, read-only query aliases used by MCP. They deliberately
+	// reuse the same handlers as the UI and therefore retain project isolation.
+	g.app.Get("/api/v1/issues", g.queryRequired, g.listIssues)
+	g.app.Get("/api/v1/issues/:id", g.queryRequired, g.getIssue)
+	g.app.Get("/api/v1/alerts", g.queryRequired, g.listAlerts)
+	g.app.Get("/api/v1/hosts", g.queryRequired, g.hosts)
+}
+
+// registerSessionAPI serves the web UI's management API under /api, behind a
+// user credential and the CSRF check.
+func (g *Gateway) registerSessionAPI() {
+	api := g.app.Group("/api", g.userRequired, g.csrfRequired)
+	api.Get("/ai/status", g.aiStatus)
+	api.Post("/ai/test", g.adminRequired, g.aiTest)
+	api.Get("/ai/settings", g.adminRequired, g.aiSettingsGet)
+	api.Put("/ai/settings", g.adminRequired, g.aiSettingsPut)
+	api.Post("/ai/assistant/query", g.loadSessionProject, g.aiAssistantQuery)
+	api.Post("/ai/assistant/explain", g.aiAssistantExplain)
+	api.Get("/projects", g.listProjects)
+	api.Get("/projects/:id", g.getProject)
+	api.Get("/projects/:id/alert-config", g.getProjectAlertConfig)
+	api.Put("/projects/:id/alert-config", g.memberRequired, g.putProjectAlertConfig)
+	api.Post("/projects", g.adminRequired, g.createProject)
+	api.Patch("/projects/:id", g.adminRequired, g.updateProject)
+	api.Put("/projects/:id", g.adminRequired, g.updateProject)
+	api.Delete("/projects/:id", g.adminRequired, g.deleteProject)
+	api.Get("/projects/:id/tokens", g.listProjectAPITokens)
+	api.Post("/projects/:id/tokens", g.adminRequired, g.createProjectAPIToken)
+	api.Delete("/projects/:id/tokens/:tokenID", g.adminRequired, g.revokeProjectAPIToken)
+	api.Get("/users", g.adminRequired, g.listUsers)
+	api.Get("/users/:id", g.adminRequired, g.getUser)
+	api.Post("/users", g.adminRequired, g.createUser)
+	api.Patch("/users/:id", g.adminRequired, g.updateUser)
+	api.Put("/users/:id", g.adminRequired, g.updateUser)
+	api.Delete("/users/:id", g.adminRequired, g.deleteUser)
+	api.Get("/alert-rules", g.memberRequired, g.listAlertRules)
+	api.Post("/alert-rules", g.memberRequired, g.createAlertRule)
+	api.Patch("/alert-rules/:id", g.memberRequired, g.updateAlertRule)
+	api.Put("/alert-rules/:id", g.memberRequired, g.updateAlertRule)
+	api.Delete("/alert-rules/:id", g.memberRequired, g.deleteAlertRule)
+	api.Get("/notifications", g.loadSessionProject, g.memberRequired, g.listNotifications)
+	api.Post("/notifications/:id/retry", g.loadSessionProject, g.memberRequired, g.requeueNotification)
+	api.Get("/channels", g.adminRequired, g.listChannels)
+	api.Post("/channels", g.adminRequired, g.createChannel)
+	api.Patch("/channels/:id", g.adminRequired, g.updateChannel)
+	api.Put("/channels/:id", g.adminRequired, g.updateChannel)
+	api.Delete("/channels/:id", g.adminRequired, g.deleteChannel)
+	api.Post("/channels/:id/test", g.adminRequired, g.testChannel)
+	api.Get("/silences", g.memberRequired, g.listSilences)
+	api.Post("/silences", g.memberRequired, g.createSilence)
+	api.Patch("/silences/:id", g.memberRequired, g.updateSilence)
+	api.Put("/silences/:id", g.memberRequired, g.updateSilence)
+	api.Delete("/silences/:id", g.memberRequired, g.deleteSilence)
+	api.Get("/inhibition-rules", g.memberRequired, g.listInhibitionRules)
+	api.Post("/inhibition-rules", g.memberRequired, g.createInhibitionRule)
+	api.Patch("/inhibition-rules/:id", g.memberRequired, g.updateInhibitionRule)
+	api.Put("/inhibition-rules/:id", g.memberRequired, g.updateInhibitionRule)
+	api.Delete("/inhibition-rules/:id", g.memberRequired, g.deleteInhibitionRule)
+	api.Get("/alerts", g.listAlerts)
+	api.Get("/scrape-targets", g.listScrapeTargets)
+	api.Post("/scrape-targets", g.memberRequired, g.createScrapeTarget)
+	api.Get("/scrape-targets/:id", g.getScrapeTarget)
+	api.Patch("/scrape-targets/:id", g.memberRequired, g.updateScrapeTarget)
+	api.Put("/scrape-targets/:id", g.memberRequired, g.updateScrapeTarget)
+	api.Delete("/scrape-targets/:id", g.memberRequired, g.deleteScrapeTarget)
+	api.Get("/scrape-targets/:id/health", g.scrapeTargetHealth)
+	api.Get("/hosts", g.hosts)
+	api.Get("/issues", g.loadSessionProject, g.listIssues)
+	api.Get("/issues/:id", g.loadSessionProject, g.getIssue)
+	api.Get("/issues/:id/ai-analysis", g.loadSessionProject, g.getIssueAIAnalysis)
+	api.Post(
+		"/issues/:id/ai-analysis",
+		g.loadSessionProject,
+		g.memberRequired,
+		g.postIssueAIAnalysis,
+	)
+	api.Patch("/issues/:id", g.loadSessionProject, g.memberRequired, g.patchIssue)
+	api.Post("/issues/batch", g.loadSessionProject, g.memberRequired, g.batchUpdateIssues)
+	api.Get("/issues/:id/events/:event_id", g.loadSessionProject, g.getIssueEvent)
+	api.Delete(
+		"/releases/:release/sourcemaps",
+		g.loadSessionProject,
+		g.adminRequired,
+		g.deleteSourceMaps,
+	)
+}
+
+func (g *Gateway) browserIngestRoute(path string, handler fiber.Handler) {
+	g.app.Options(path, browserIngestCORS)
+	g.app.Post(path, browserIngestCORS, g.auth.Middleware, handler)
+}
+
+func (g *Gateway) serveWebUI(c *fiber.Ctx) error {
+	if g.webUI == nil || (c.Method() != fiber.MethodGet && c.Method() != fiber.MethodHead) {
+		return c.SendStatus(fiber.StatusNotFound)
+	}
+	requestPath := c.Path()
+	for _, prefix := range []string{"/api", "/v1", "/mcp", "/healthz", "/livez", "/readyz", "/select"} {
+		if requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/") {
+			return c.SendStatus(fiber.StatusNotFound)
+		}
+	}
+	name := strings.TrimPrefix(path.Clean("/"+requestPath), "/")
+	if name == "." || name == "" {
+		name = "index.html"
+	}
+	data, err := fs.ReadFile(g.webUI, name)
+	if err != nil {
+		if path.Ext(name) != "" {
+			return c.SendStatus(fiber.StatusNotFound)
+		}
+		name = "index.html"
+		data, err = fs.ReadFile(g.webUI, name)
+		if err != nil {
+			return c.SendStatus(fiber.StatusNotFound)
+		}
+	}
+	contentType := mime.TypeByExtension(path.Ext(name))
+	if contentType == "" {
+		contentType = http.DetectContentType(data)
+	}
+	c.Set(fiber.HeaderContentType, contentType)
+	if c.Method() == fiber.MethodHead {
+		return c.SendStatus(fiber.StatusOK)
+	}
+	return c.Send(data)
+}
+
+// mcpRequired authenticates MCP with a user API token and the project selected
+// by X-LO-Project. MCP only exposes reads, so project (ingest) tokens are
+// refused like on every other query route.
+func (g *Gateway) mcpRequired(c *fiber.Ctx) error {
+	token := bearerCredential(c)
+	if token == "" {
+		return unauthorizedResponse(c)
+	}
+	if !strings.HasPrefix(token, "lou_") {
+		return ingestOnlyToken(c)
+	}
+	return g.queryRequired(c)
+}
+
+// ingestOnlyToken rejects a project API token on a read route. Project tokens
+// are embedded in browser pages and SDK configuration, so they are ingest-only.
+func ingestOnlyToken(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+		"code":  "ingest_only_token",
+		"error": "project API tokens can only ingest telemetry; use a session or a user API token to query",
+	})
+}
+
+func unauthorizedResponse(c *fiber.Ctx) error {
+	_ = unauthorized(c)
+	return nil
+}
+
+func (g *Gateway) loadSessionProject(c *fiber.Ctx) error {
+	slug := projectSlug(c)
+	p, err := g.store.ProjectBySlug(c.UserContext(), slug)
+	if err != nil {
+		_ = unauthorized(c)
+		return nil
+	}
+	c.Locals(projectLocal, p)
+	return c.Next()
+}
+
+func (g *Gateway) traceSearch(c *fiber.Ctx) error {
+	return g.proxy(c, g.storage.TracesBase(), "/select/jaeger/api/traces", proxyOptions{
+		projectID: currentProject(c).ID,
+		allowedParams: map[string]bool{
+			"service":     true,
+			"operation":   true,
+			"start":       true,
+			"end":         true,
+			"limit":       true,
+			"minDuration": true,
+			"tags":        true,
+		},
+	})
+}
+
+func (g *Gateway) healthz(c *fiber.Ctx) error {
+	status := fiber.StatusOK
+	components := map[string]string{"gateway": "ok"}
+	if g.health != nil {
+		for name, err := range g.health.Health(c.UserContext()) {
+			if err != nil {
+				status = fiber.StatusServiceUnavailable
+				components[name] = err.Error()
+			} else {
+				components[name] = "ok"
+			}
+		}
+	}
+	if g.errorTracker != nil {
+		diagnostics, err := g.errorTracker.Diagnostics(c.UserContext())
+		if err != nil {
+			status = fiber.StatusServiceUnavailable
+			components["error_inbox"] = "diagnostics unavailable"
+		} else {
+			components["error_inbox"] = fmt.Sprintf(
+				"active_items=%d active_bytes=%d",
+				diagnostics.ActiveItems,
+				diagnostics.ActiveBytes,
+			)
+		}
+	}
+	return c.Status(status).
+		JSON(fiber.Map{"status": map[bool]string{true: "ok", false: "degraded"}[status == fiber.StatusOK], "components": components})
+}
+
+func (g *Gateway) livez(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"status": "ok"})
+}
+
+func (g *Gateway) readyz(c *fiber.Ctx) error {
+	g.readyMu.RLock()
+	ready := g.ready
+	g.readyMu.RUnlock()
+	components := map[string]string{"initialization": "ok"}
+	if !ready {
+		components["initialization"] = "not ready or draining"
+		return c.Status(fiber.StatusServiceUnavailable).
+			JSON(fiber.Map{"status": "not_ready", "components": components})
+	}
+	checker := g.readiness
+	if checker == nil {
+		checker = g.health
+	}
+	if checker != nil {
+		for name, err := range checker.Health(c.UserContext()) {
+			if err != nil {
+				components[name] = err.Error()
+				ready = false
+			} else {
+				components[name] = "ok"
+			}
+		}
+	}
+	if g.errorTracker != nil {
+		if err := g.errorTracker.Readiness(c.UserContext()); err != nil {
+			components["error_inbox"] = err.Error()
+			ready = false
+		} else {
+			components["error_inbox"] = "ok"
+		}
+	}
+	status := fiber.StatusOK
+	if !ready {
+		status = fiber.StatusServiceUnavailable
+	}
+	return c.Status(status).
+		JSON(fiber.Map{"status": map[bool]string{true: "ready", false: "not_ready"}[ready], "components": components})
+}
+
+func (g *Gateway) metricsIngest(c *fiber.Ctx) error {
+	return g.metricsWrite(c, "/opentelemetry/v1/metrics", true)
+}
+
+func (g *Gateway) metricsRemoteWrite(c *fiber.Ctx) error {
+	if !g.storage.MetricsIngestEnabled() {
+		return c.Status(fiber.StatusNotImplemented).
+			JSON(fiber.Map{"error": "metrics ingest is disabled: storage.metrics.ingest_url is not configured"})
+	}
+	if strings.Contains(
+		strings.ToLower(c.Get(fiber.HeaderContentType)),
+		"io.prometheus.write.v2.request",
+	) ||
+		strings.HasPrefix(strings.TrimSpace(c.Get("X-Prometheus-Remote-Write-Version")), "2.") {
+		return fiber.NewError(
+			fiber.StatusUnsupportedMediaType,
+			"Prometheus remote-write 2.0 is not supported; use prometheus.WriteRequest",
+		)
+	}
+	body, err := storagepkg.InjectRemoteWriteProject(c.Body(), currentProject(c).Slug, maxDecodedRequestBody)
+	if errors.Is(err, storagepkg.ErrRemoteWriteTooLarge) {
+		return fiber.NewError(
+			fiber.StatusRequestEntityTooLarge,
+			"Prometheus remote-write request exceeds decoded size limit",
+		)
+	}
+	if err != nil {
+		return fiber.NewError(
+			fiber.StatusBadRequest,
+			"invalid Prometheus remote-write request: "+err.Error(),
+		)
+	}
+	c.Request().SetBody(body)
+	c.Request().Header.SetContentType("application/x-protobuf")
+	c.Request().Header.Set("Content-Encoding", "snappy")
+	c.Request().Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	return g.metricsWrite(c, "/prometheus/api/v1/write", false)
+}
+
+func (g *Gateway) metricsWrite(c *fiber.Ctx, path string, addProjectQuery bool) error {
+	if !g.storage.MetricsIngestEnabled() {
+		return c.Status(fiber.StatusNotImplemented).
+			JSON(fiber.Map{"error": "metrics ingest is disabled: storage.metrics.ingest_url is not configured"})
+	}
+	p := currentProject(c)
+	base := g.storage.MetricsIngestBase()
+	if !g.storage.MetricsClustered() {
+		path = strings.TrimPrefix(path, "/prometheus")
+	}
+	opts := proxyOptions{reservedParams: true}
+	if addProjectQuery {
+		opts.addQuery = url.Values{"extra_label": []string{"project_id=" + p.Slug}}
+	}
+	return g.proxy(c, base, path, opts)
+}
+
+func (g *Gateway) metricsQuery(c *fiber.Ctx) error {
+	p := currentProject(c)
+	return g.proxy(c, g.storage.MetricsQueryBase(), c.Path(), proxyOptions{metricsProject: p.Slug})
+}
+
+// metricsPrettify exposes VictoriaMetrics' parser-backed formatter without
+// opening a data-read path. It is still project-authenticated, but only the
+// query parameter is forwarded; storage isolation parameters and arbitrary
+// client-supplied options are deliberately discarded.
+func (g *Gateway) metricsPrettify(c *fiber.Ctx) error {
+	return g.proxy(c, g.storage.MetricsQueryBase(), "/prettify-query", proxyOptions{
+		allowedParams: map[string]bool{"query": true},
+	})
+}
+
+func (g *Gateway) tenantProxy(base, path string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		p := currentProject(c)
+		return g.proxy(c, base, path, proxyOptions{projectID: p.ID})
+	}
+}
+
+type proxyOptions struct {
+	reservedParams bool
+	addQuery       url.Values
+	projectID      int
+	allowedParams  map[string]bool
+	metricsProject string
+}
+
+func (g *Gateway) proxy(c *fiber.Ctx, base, path string, opts proxyOptions) error {
+	query, err := url.ParseQuery(string(c.Context().QueryArgs().QueryString()))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid query parameters")
+	}
+	if opts.reservedParams || opts.metricsProject != "" {
+		stripReserved(query)
+	}
+	if opts.metricsProject != "" {
+		defaultMatcher := path != "/api/v1/query" && path != "/api/v1/query_range"
+		if err := g.applyMetricsIsolation(query, opts.metricsProject, defaultMatcher); err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+err.Error())
+		}
+	}
+	if opts.allowedParams != nil {
+		for key := range query {
+			if !opts.allowedParams[key] {
+				query.Del(key)
+			}
+		}
+	}
+	for key, values := range opts.addQuery {
+		query.Del(key)
+		for _, value := range values {
+			query.Add(key, value)
+		}
+	}
+	body := append([]byte(nil), c.Body()...)
+	contentType := string(c.Request().Header.ContentType())
+	if (opts.reservedParams || opts.metricsProject != "") &&
+		strings.HasPrefix(contentType, fiber.MIMEApplicationForm) {
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid form body")
+		}
+		stripReserved(form)
+		if opts.metricsProject != "" {
+			if g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
+				if err := injectPromValues(form, opts.metricsProject); err != nil {
+					return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+err.Error())
+				}
+			}
+		}
+		body = []byte(form.Encode())
+	}
+	target := strings.TrimRight(base, "/") + path
+	if encoded := query.Encode(); encoded != "" {
+		target += "?" + encoded
+	}
+	req, err := http.NewRequestWithContext(
+		c.UserContext(),
+		c.Method(),
+		target,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	copyRequestHeaders(req.Header, &c.Request().Header)
+	if opts.projectID != 0 {
+		g.storage.SetTenantHeaders(req.Header, opts.projectID)
+	}
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadGateway, err.Error())
+	}
+	for key, values := range resp.Header {
+		if isHopByHop(key) {
+			continue
+		}
+		// Fiber installs a default text/plain Content-Type before a streaming
+		// response is proxied. Replace each upstream header field instead of
+		// comma-appending it to that default; Content-Type is a singleton field,
+		// and a combined value is not a valid media type.
+		c.Response().Header.Del(key)
+		for _, value := range values {
+			c.Response().Header.Add(key, value)
+		}
+	}
+	c.Status(resp.StatusCode)
+	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		defer resp.Body.Close()
+		var dst io.Writer = w
+		if path == "/select/logsql/tail" {
+			dst = flushingWriter{writer: w}
+		}
+		_, _ = io.Copy(dst, resp.Body)
+	})
+	return nil
+}
+
+type flushingWriter struct {
+	writer *bufio.Writer
+}
+
+func (w flushingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+	return n, w.writer.Flush()
+}
+
+func injectPromValues(values url.Values, project string) error {
+	for _, key := range []string{"query", "match[]"} {
+		original := values[key]
+		if len(original) == 0 {
+			continue
+		}
+		injected := make([]string, len(original))
+		for i, value := range original {
+			var err error
+			injected[i], err = storagepkg.InjectPromQL(value, project)
+			if err != nil {
+				return err
+			}
+		}
+		values[key] = injected
+	}
+	return nil
+}
+
+func (g *Gateway) applyMetricsIsolation(
+	values url.Values,
+	project string,
+	defaultMatcher bool,
+) error {
+	stripReserved(values)
+	if g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
+		if err := injectPromValues(values, project); err != nil {
+			return err
+		}
+		if defaultMatcher && len(values["match[]"]) == 0 {
+			values.Set("match[]", fmt.Sprintf(`{project_id=%q}`, project))
+		}
+		return nil
+	}
+	values.Set("extra_filters[]", fmt.Sprintf(`{project_id=%q}`, project))
+	return nil
+}
+
+func stripReserved(values url.Values) {
+	values.Del("extra_filters")
+	values.Del("extra_filters[]")
+	values.Del("extra_label")
+}
+
+func copyRequestHeaders(dst http.Header, src *fasthttp.RequestHeader) {
+	src.VisitAll(func(key, value []byte) {
+		name := string(key)
+		if isHopByHop(name) || strings.EqualFold(name, "Content-Length") ||
+			strings.EqualFold(name, "AccountID") ||
+			strings.EqualFold(name, "ProjectID") ||
+			strings.EqualFold(name, "Host") ||
+			strings.EqualFold(name, "X-LO-Project") ||
+			strings.EqualFold(name, "Authorization") ||
+			strings.EqualFold(name, "Cookie") {
+			return
+		}
+		dst.Add(name, string(value))
+	})
+}
+
+func (g *Gateway) queryRequired(c *fiber.Ctx) error {
+	if token := bearerCredential(c); strings.HasPrefix(token, "lou_") {
+		u, err := g.loadUserAPIToken(c, token)
+		if err != nil {
+			if errors.Is(err, errResponseWritten) {
+				return nil
+			}
+			return err
+		}
+		c.Locals(userLocal, u)
+		return g.loadQueryProject(c)
+	}
+	if hasTokenCredential(c) {
+		return ingestOnlyToken(c)
+	}
+	if err := g.loadSession(c); err != nil {
+		_ = unauthorized(c)
+		return nil
+	}
+	return g.loadQueryProject(c)
+}
+
+func (g *Gateway) loadQueryProject(c *fiber.Ctx) error {
+	slug := strings.TrimSpace(c.Get("X-LO-Project"))
+	if slug == "" {
+		slug = "default"
+	}
+	if g.store == nil {
+		_ = unauthorized(c)
+		return nil
+	}
+	p, err := g.store.ProjectBySlug(c.UserContext(), slug)
+	if err != nil {
+		_ = unauthorized(c)
+		return nil
+	}
+	c.Locals(projectLocal, p)
+	return c.Next()
+}
+
+func hasTokenCredential(c *fiber.Ctx) bool {
+	return bearerCredential(c) != ""
+}
+
+func bearerCredential(c *fiber.Ctx) string {
+	authorization := strings.TrimSpace(c.Get("Authorization"))
+	scheme, token, ok := strings.Cut(authorization, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	token = strings.TrimSpace(token)
+	if token == "" || strings.ContainsAny(token, " \t") {
+		return ""
+	}
+	return token
+}
+
+func (g *Gateway) sessionRequired(c *fiber.Ctx) error {
+	if strings.TrimSpace(c.Cookies("lo_session")) == "" {
+		_ = unauthorized(c)
+		return nil
+	}
+	if err := g.loadSession(c); err != nil {
+		if account.Code(err) == account.CodeUnavailable {
+			_ = c.Status(fiber.StatusServiceUnavailable).
+				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
+			return nil
+		}
+		_ = unauthorized(c)
+		return nil
+	}
+	return c.Next()
+}
+
+func (g *Gateway) userRequired(c *fiber.Ctx) error {
+	if token := bearerCredential(c); token != "" {
+		if !strings.HasPrefix(token, "lou_") {
+			_ = unauthorized(c)
+			return nil
+		}
+		u, err := g.loadUserAPIToken(c, token)
+		if err != nil {
+			if errors.Is(err, errResponseWritten) {
+				return nil
+			}
+			return err
+		}
+		c.Locals(userLocal, u)
+		return c.Next()
+	}
+	return g.sessionRequired(c)
+}
+
+func (g *Gateway) loadUserAPIToken(c *fiber.Ctx, token string) (meta.UserInfo, error) {
+	u, err := g.account.AuthenticateUserToken(c.UserContext(), token)
+	if err != nil {
+		if account.Code(err) == account.CodeInvalidCredentials {
+			return meta.UserInfo{}, unauthorized(c)
+		}
+		_ = c.Status(fiber.StatusServiceUnavailable).
+			JSON(fiber.Map{"error": "authentication temporarily unavailable"})
+		return meta.UserInfo{}, errResponseWritten
+	}
+	return accountUserInfo(u), nil
+}
+
+func (g *Gateway) loadSession(c *fiber.Ctx) error {
+	token := strings.TrimSpace(c.Cookies("lo_session"))
+	if token == "" {
+		return fmt.Errorf("session cookie missing")
+	}
+	u, err := g.account.AuthenticateSession(c.UserContext(), token)
+	if err != nil {
+		return err
+	}
+	c.Locals(userLocal, accountUserInfo(u))
+	return nil
+}
+
+func accountUserInfo(user account.User) meta.UserInfo {
+	return meta.UserInfo{
+		ID: user.ID, Username: user.Username, Role: user.Role, DisplayName: user.DisplayName, Email: user.Email,
+		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt,
+	}
+}
+
+func accountUser(user meta.UserInfo) account.User {
+	return account.User{
+		ID: user.ID, Username: user.Username, Role: user.Role, DisplayName: user.DisplayName, Email: user.Email,
+		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt,
+	}
+}
+
+func (g *Gateway) adminRequired(c *fiber.Ctx) error {
+	u, _ := c.Locals(userLocal).(meta.UserInfo)
+	if u.Role != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+	}
+	return c.Next()
+}
+
+func (g *Gateway) memberRequired(c *fiber.Ctx) error {
+	u, _ := c.Locals(userLocal).(meta.UserInfo)
+	if u.Role == "viewer" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+	}
+	return c.Next()
+}
+
+// errResponseWritten marks auth failures whose HTTP response has already been
+// written. Callers stop the handler chain without returning the error to
+// Fiber's error handler (which would rewrite the status to 500).
+var errResponseWritten = errors.New("authentication response already written")
+
+func unauthorized(c *fiber.Ctx) error {
+	_ = c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	return errResponseWritten
+}
+
+func isHopByHop(name string) bool {
+	switch strings.ToLower(name) {
+	case "connection",
+		"proxy-connection",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"te",
+		"trailer",
+		"transfer-encoding",
+		"upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func currentProject(c *fiber.Ctx) meta.ProjectInfo {
+	p, _ := c.Locals(projectLocal).(meta.ProjectInfo)
+	return p
+}
+
+type cachedProject struct {
+	project   meta.ProjectInfo
+	expiresAt time.Time
+}
+
+var errAuthenticationRevisionChanged = errors.New("authentication store revision changed")
+
+type authenticationCall struct {
+	done     chan struct{}
+	revision uint64
+	project  meta.ProjectInfo
+	err      error
+}
+
+type Authenticator struct {
+	store    TokenStore
+	mu       sync.RWMutex
+	cache    map[string]cachedProject
+	inflight map[string]*authenticationCall
+	revision uint64
+}
+
+func NewAuthenticator(store TokenStore) *Authenticator {
+	return &Authenticator{
+		store:    store,
+		cache:    make(map[string]cachedProject),
+		inflight: make(map[string]*authenticationCall),
+	}
+}
+
+func (a *Authenticator) Middleware(c *fiber.Ctx) error {
+	token := bearerCredential(c)
+	if token == "" || a.store == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	p, err := a.authenticate(c.UserContext(), token)
+	if err != nil {
+		if !errors.Is(err, meta.ErrInvalidProjectAPIToken) && !meta.IsNotFound(err) {
+			return c.Status(fiber.StatusServiceUnavailable).
+				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
+		}
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	c.Locals(projectLocal, p)
+	return c.Next()
+}
+
+func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.ProjectInfo, error) {
+	for {
+		a.mu.Lock()
+		revision := a.store.Revision()
+		if revision != a.revision {
+			clear(a.cache)
+			a.revision = revision
+		}
+		if cached, ok := a.cache[token]; ok && time.Now().Before(cached.expiresAt) {
+			a.mu.Unlock()
+			return cached.project, nil
+		}
+		delete(a.cache, token)
+		if call, ok := a.inflight[token]; ok {
+			done := call.done
+			a.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return meta.ProjectInfo{}, ctx.Err()
+			case <-done:
+			}
+			if errors.Is(call.err, errAuthenticationRevisionChanged) {
+				continue
+			}
+			return call.project, call.err
+		}
+
+		call := &authenticationCall{done: make(chan struct{}), revision: revision}
+		a.inflight[token] = call
+		a.mu.Unlock()
+
+		project, authErr := a.store.AuthenticateProjectAPIToken(ctx, token)
+		a.mu.Lock()
+		latestRevision := a.store.Revision()
+		if latestRevision != a.revision {
+			clear(a.cache)
+			a.revision = latestRevision
+		}
+		if latestRevision != call.revision {
+			call.err = errAuthenticationRevisionChanged
+		} else {
+			call.project, call.err = project, authErr
+			if authErr == nil {
+				a.cache[token] = cachedProject{
+					project:   project,
+					expiresAt: time.Now().Add(tokenCacheTTL),
+				}
+			}
+		}
+		if a.inflight[token] == call {
+			delete(a.inflight, token)
+		}
+		close(call.done)
+		a.mu.Unlock()
+
+		if errors.Is(call.err, errAuthenticationRevisionChanged) {
+			continue
+		}
+		return call.project, call.err
+	}
+}

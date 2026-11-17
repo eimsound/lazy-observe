@@ -1,0 +1,1 @@
+{"markdown":{"text":"[FIRING] alpha / DiskFull\n{\"alertname\":\"DiskFull\",\"instance\":\"node-1\",\"project_id\":\"alpha\"}","title":"[FIRING] alpha / DiskFull"},"msgtype":"markdown"}

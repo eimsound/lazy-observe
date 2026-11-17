@@ -1,0 +1,507 @@
+min_version = "2025.8.4"
+
+[tools]
+go = "1.26.5"
+node = "24.18.0"
+pnpm = "10.33.0"
+jq = "1.8.2"
+actionlint = "1.7.12"
+rg = "14.1.1"
+air = "1.67.1"
+"go:github.com/golangci/golines" = "0.15.0"
+
+[tasks.ent-generate]
+description = "Generate the ignored Ent client into internal/db/ent"
+run = "bash scripts/generate-ent.sh"
+
+[tasks.dev-storage]
+description = "Download and verify the current platform's development storage binaries"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+platform="$(go env GOOS)-$(go env GOARCH)"
+LO_STORAGE_BIN_DIR="$PWD/.cache/storage-bin/$platform" \
+  bash scripts/download-storage-bins.sh
+'''
+
+[tasks.dev-backend]
+description = "Run the Go gateway and VM suite with Air live reload"
+depends = ["dev-storage", "ent-generate"]
+run = "air -c .air.toml"
+
+[tasks.dev-web]
+description = "Run the Vite web UI with hot module replacement"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+cd web
+pnpm install --frozen-lockfile
+pnpm dev --host "${LO_DEV_WEB_HOST:-0.0.0.0}"
+'''
+
+[tasks.dev]
+description = "Run the hot-reloading web UI, Go gateway, and VM suite"
+run = "bash scripts/dev.sh"
+
+[tasks.build-binary]
+description = "Build the lazy-observe gateway"
+depends = ["ent-generate"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+goos=${GOOS:-$(go env GOOS)}
+goarch=${GOARCH:-$(go env GOARCH)}
+binary=${BINARY:-bin/lazy-observe}
+version=${VERSION:-dev}
+commit=${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || printf none)}
+date=${DATE:-unknown}
+ldflags=${LDFLAGS:--s -w -X main.Version=$version -X main.Commit=$commit -X main.Date=$date}
+
+mkdir -p "$(dirname "$binary")"
+CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+  go build -trimpath -ldflags "$ldflags" -o "$binary" ./cmd/lazy-observe
+'''
+
+[tasks.web-assets]
+description = "Build and stage the embedded web UI"
+run = [
+  "cd web && CI=true pnpm install --frozen-lockfile && pnpm build",
+  "bash scripts/prepare-web-assets.sh",
+]
+
+[tasks.embedded-storage]
+description = "Prepare embedded storage binaries for the selected platform"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+GOOS=${GOOS:-$(go env GOOS)} GOARCH=${GOARCH:-$(go env GOARCH)} \
+  bash scripts/prepare-embedded-storage.sh
+'''
+
+[tasks.build]
+description = "Build the web UI and gateway"
+depends = ["web-assets"]
+run = "mise run build-binary"
+
+[tasks.dist]
+description = "Build a release binary with embedded web and storage assets"
+depends = ["web-assets", "embedded-storage"]
+run = "mise run build-binary"
+
+[tasks.dist-cross]
+description = "Build release binaries for linux and amd64/arm64"
+depends = ["web-assets"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+for platform in linux-amd64 linux-arm64; do
+  goos=${platform%-*}
+  goarch=${platform#*-}
+  case "$goarch" in
+    amd64)
+      GOOS="$goos" GOARCH="$goarch" GOAMD64=v1 mise run embedded-storage
+      GOOS="$goos" GOARCH="$goarch" GOAMD64=v1 BINARY="bin/lazy-observe-$platform" mise run build-binary
+      LO_ARTIFACT_EVIDENCE=".cache/artifact-evidence/$platform.json" \
+        bash scripts/check-embedded-artifact.sh "bin/lazy-observe-$platform" "$platform"
+      ;;
+    arm64)
+      GOOS="$goos" GOARCH="$goarch" GOARM64=v8.0 mise run embedded-storage
+      GOOS="$goos" GOARCH="$goarch" GOARM64=v8.0 BINARY="bin/lazy-observe-$platform" mise run build-binary
+      LO_ARTIFACT_EVIDENCE=".cache/artifact-evidence/$platform.json" \
+        bash scripts/check-embedded-artifact.sh "bin/lazy-observe-$platform" "$platform"
+      ;;
+  esac
+done
+'''
+
+[tasks.test]
+description = "Run Go tests without CGO"
+depends = ["ent-generate"]
+run = "CGO_ENABLED=0 go test ./..."
+
+[tasks.vet]
+description = "Run go vet without CGO"
+depends = ["ent-generate"]
+run = "CGO_ENABLED=0 go vet ./..."
+
+[tasks.fmt-check]
+description = "Verify tracked non-generated Go sources use the project golines format"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+unformatted=$(
+  while IFS= read -r -d '' file; do
+    [[ -f $file ]] || continue
+    golines -m 120 --chain-split-dots --ignore-generated -l "$file"
+  done < <(git ls-files -z -- '*.go')
+)
+if [[ -n $unformatted ]]; then
+  printf 'golines -m 120 --chain-split-dots is required for:\n%s\n' "$unformatted" >&2
+  exit 1
+fi
+'''
+
+[tasks.mod-tidy-check]
+description = "Verify root module manifest is tidy"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+CGO_ENABLED=0 go mod tidy -diff
+'''
+
+[tasks.lint]
+description = "Run golangci-lint v2.12.2 and the alert lease clock check"
+depends = ["ent-generate", "alert-lease-clock-check"]
+tools."golangci-lint" = "2.12.2"
+run = "golangci-lint run ./..."
+
+[tasks.alert-lease-clock-check]
+description = "Verify alert lease and membership queries read the clock through alertClockSQL"
+run = "CGO_ENABLED=0 go run ./scripts/check-alert-lease-clock internal/meta"
+
+[tasks.storage-bins]
+description = "Download and verify pinned storage binaries"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+LO_STORAGE_BIN_DIR=${STORAGE_BIN_DIR:-$PWD/.cache/storage-bin} \
+  bash scripts/download-storage-bins.sh
+'''
+
+[tasks.e2e]
+description = "Run complete server-side Gateway E2E coverage plus recovery and restart evidence"
+depends = ["build", "storage-bins"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+BINARY=${BINARY:-bin/lazy-observe} \
+STORAGE_BIN_DIR=${STORAGE_BIN_DIR:-$PWD/.cache/storage-bin} \
+  bash scripts/e2e.sh
+'''
+
+[tasks.e2e-restart]
+description = "Run same-data-dir graceful, forced, pending-work, and managed-child restart gates"
+depends = ["build", "storage-bins"]
+run = "bash scripts/e2e-restart.sh"
+
+[tasks.e2e-contract-check]
+description = "Statically verify E2E coverage and cross-platform delivery evidence"
+run = "bash scripts/check-e2e-contract.sh"
+
+[tasks.e2e-ha]
+description = "Run the required VM/VLogs/VTraces cluster and S3 multi-replica HA gate"
+depends = ["build-binary", "storage-bins"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+binary=${BINARY:-bin/lazy-observe}
+storage=${STORAGE_BIN_DIR:-$PWD/.cache/storage-bin}
+case "$binary" in /*) binary_path=$binary ;; *) binary_path=$PWD/$binary ;; esac
+case "$storage" in /*) storage_path=$storage ;; *) storage_path=$PWD/$storage ;; esac
+LO_E2E_BINARY="$binary_path" LO_E2E_STORAGE_BIN_DIR="$storage_path" \
+  bash scripts/e2e-multi-replica.sh
+'''
+
+[tasks.perf-ha]
+description = "Run controlled query P95 and capacity-controlled weak-scaling gates in the real HA fixture"
+depends = ["build-binary", "storage-bins"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+binary=${BINARY:-bin/lazy-observe}
+storage=${STORAGE_BIN_DIR:-$PWD/.cache/storage-bin}
+output=${LO_PERF_OUTPUT_DIR:-bench/results}
+case "$binary" in /*) binary_path=$binary ;; *) binary_path=$PWD/$binary ;; esac
+case "$storage" in /*) storage_path=$storage ;; *) storage_path=$PWD/$storage ;; esac
+LO_E2E_PERF_GATES=1 LO_PERF_OUTPUT_DIR="$output" \
+LO_E2E_BINARY="$binary_path" LO_E2E_STORAGE_BIN_DIR="$storage_path" \
+  bash scripts/e2e-multi-replica.sh
+'''
+
+[tasks.helm-lint]
+description = "Lint the Helm chart"
+tools.helm = "3.21.3"
+run = '${HELM:-helm} lint deploy/helm/lazy-observe'
+
+[tasks.helm-template-test]
+description = "Validate rendered Helm templates"
+tools.helm = "3.21.3"
+run = "bash scripts/helm-template-test.sh"
+
+[tasks.workflow-check]
+description = "Statically validate GitHub Actions workflows without a runner"
+tools.actionlint = "1.7.12"
+tools.rg = "14.1.1"
+run = [
+  "bash scripts/check-github-workflows.sh",
+  "bash scripts/check-e2e-contract.sh",
+  "bash scripts/ci-changes-test.sh",
+]
+
+[tasks.ci-changes-test]
+description = "Test the incremental CI change-surface grouping rules"
+run = "bash scripts/ci-changes-test.sh"
+
+[tasks.sdk-go]
+description = "Build, vet, and test the Go SDK module (sdk/go)"
+dir = "sdk/go"
+env = { CGO_ENABLED = "0" }
+run = ["go build ./...", "go vet ./...", "go test ./..."]
+
+[tasks.sdk-node]
+description = "Install, build, typecheck, test, and license-check the Node SDK workspace"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+export CI=true
+(cd sdk/node && pnpm install --frozen-lockfile && pnpm build && pnpm typecheck && pnpm test)
+bash scripts/check-js-licenses.sh sdk/node
+'''
+
+[tasks.sdk-browser]
+description = "Install, build, typecheck, unit-test, and license-check the Browser SDK workspace"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+export CI=true
+(cd sdk/browser && pnpm install --frozen-lockfile && pnpm build && pnpm typecheck && pnpm test)
+bash scripts/check-js-licenses.sh sdk/browser
+'''
+
+[tasks.sdk-python]
+description = "Install the Python SDK with test extras into sdk/python/.venv and run pytest"
+tools.python = "3.13.5"
+dir = "sdk/python"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+python -m venv .venv
+.venv/bin/python -m pip install --quiet --upgrade pip
+.venv/bin/python -m pip install --quiet -e ".[test]"
+.venv/bin/python -m pytest -q tests
+'''
+
+[tasks.install-check]
+description = "Validate installer platform, checksum, extraction, and mode contracts"
+run = "bash scripts/check-install.sh"
+
+[tasks.release-prerequisites-test]
+description = "Test snapshot and publish prerequisite enforcement"
+run = "bash scripts/check-release-prerequisites-test.sh"
+
+[tasks.bench]
+description = "Run the ingest benchmark and optional baseline gate"
+depends = ["build-binary", "storage-bins"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+binary=${BINARY:-bin/lazy-observe}
+storage=${STORAGE_BIN_DIR:-$PWD/.cache/storage-bin}
+args=()
+if [[ -n ${BENCH_BASELINE:-} ]]; then
+  args+=(--baseline "$BENCH_BASELINE")
+fi
+CGO_ENABLED=0 go run ./cmd/ingest-bench \
+  --binary "$binary" --storage-bin-dir "$storage" \
+  --duration "${BENCH_DURATION:-30s}" \
+  --concurrency "${BENCH_CONCURRENCY:-4}" \
+  --batch-size "${BENCH_BATCH_SIZE:-200}" \
+  --output "${BENCH_OUTPUT:-bench/result.json}" \
+  "${args[@]}"
+'''
+
+[tasks.gate-release-artifacts]
+description = "Gate existing linux embedded binaries and smoke the native zero-config artifact"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+output=${LO_PERF_OUTPUT_DIR:-bench/results}
+mkdir -p "$output"
+bash scripts/check-goreleaser-adapter.sh
+for platform in linux-amd64 linux-arm64; do
+  CGO_ENABLED=0 go run ./cmd/perf-gate release-size \
+    --config bench/performance-gates.json \
+    --binary "bin/lazy-observe-$platform" --platform "$platform" \
+    --output "$output/release-$platform.json"
+done
+native="$(go env GOOS)-$(go env GOARCH)"
+case "$native" in linux-amd64|linux-arm64) ;; *)
+  printf 'SKIP: native zero-config smoke is unsupported on %s\n' "$native" >&2
+  exit 77
+esac
+max_rss=$(jq -er '.release.max_idle_rss_bytes | select(type == "number" and . > 0 and floor == .)' bench/performance-gates.json)
+LO_RELEASE_BINARY="bin/lazy-observe-$native" \
+LO_RELEASE_MAX_RSS_BYTES="$max_rss" \
+LO_RELEASE_SMOKE_OUTPUT="$output/release-smoke-$native.json" \
+  bash scripts/check-release-smoke.sh
+'''
+
+[tasks.perf-release]
+description = "Build and gate both embedded release binaries, then smoke the native zero-config artifact"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+mise run dist-cross
+mise run gate-release-artifacts
+'''
+
+[tasks.performance-gates]
+description = "Run all required release, query, and HA scaling performance gates sequentially"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+mise run perf-release
+mise run perf-ha
+'''
+
+[tasks.perf-results-check]
+description = "Verify every performance gate emitted a passing result artifact"
+run = "bash scripts/check-performance-results.sh"
+
+[tasks.web]
+description = "Install, lint, test, build with typechecking, and run headless browser smoke tests for the web UI"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+export CI=true
+cd web
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm test
+pnpm build
+pnpm exec playwright install --with-deps --only-shell chromium
+pnpm test:e2e
+cd ..
+bash scripts/check-js-licenses.sh web
+'''
+
+[tasks.test-meta-pg]
+description = "Run PostgreSQL metadata tests against the current baseline"
+depends = ["ent-generate"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -d internal/meta/migrations/postgres ]]; then
+  LO_TEST_PG=1 CGO_ENABLED=0 go test ./internal/meta -count=1
+else
+  printf 'Skipping PostgreSQL tests: internal/meta/migrations/postgres does not exist.\n'
+fi
+'''
+
+[tasks.migration-check]
+description = "Validate the paired pre-release database baselines"
+depends = ["ent-generate"]
+run = '''
+bash scripts/check-migrations.sh
+CGO_ENABLED=0 go test ./internal/meta -run '^TestSingleBaselineSetsMatch$' -count=1
+'''
+
+[tasks.ent-generate-check]
+description = "Verify ignored Ent generation is atomic, deterministic, and migration-free"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+before_modules=$(sha256sum go.mod go.sum entc.mod entc.sum)
+if [[ -n $(git ls-files internal/db/ent) ]]; then
+  printf 'internal/db/ent must not contain tracked files\n' >&2
+  exit 1
+fi
+bash scripts/generate-ent.sh
+git check-ignore -q internal/db/ent/client.go || {
+  printf 'internal/db/ent must remain ignored\n' >&2
+  exit 1
+}
+generated_before=$(find internal/db/ent -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
+failure_log=$(mktemp)
+trap 'rm -f "$failure_log"' EXIT
+set +e
+LO_ENTGEN_TEST_FAIL_AFTER_PREPARE=1 bash scripts/generate-ent.sh >"$failure_log" 2>&1
+failure_status=$?
+set -e
+generated_after_failure=$(find internal/db/ent -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
+if [[ "$failure_status" == 0 || "$generated_before" != "$generated_after_failure" ]]; then
+  cat "$failure_log" >&2
+  printf 'failed Ent generation modified the last complete client\n' >&2
+  exit 1
+fi
+go generate ./internal/db
+if [[ -d internal/db/ent/migrate || -d internal/db/ent/enttest ]]; then
+  printf 'Ent generation recreated an automatic migration package\n' >&2
+  exit 1
+fi
+after_modules=$(sha256sum go.mod go.sum entc.mod entc.sum)
+if [[ "$before_modules" != "$after_modules" ]]; then
+  printf 'Ent generation modified a Go module manifest\n' >&2
+  exit 1
+fi
+generated_after=$(find internal/db/ent -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
+if [[ "$generated_before" != "$generated_after" ]]; then
+  printf 'Ent generation is not deterministic\n' >&2
+  exit 1
+fi
+rm -f "$failure_log"
+trap - EXIT
+'''
+
+[tasks.license-check]
+description = "Allow only Apache-2.0, MIT, and BSD licenses in the production Go package graph"
+depends = ["ent-generate"]
+tools."go:github.com/google/go-licenses/v2" = "2.0.1"
+run = "bash scripts/check-go-licenses.sh"
+
+[tasks.third-party-notices]
+description = "Regenerate third_party/go/THIRD_PARTY_NOTICES.txt from the linked Go dependency graph"
+depends = ["ent-generate"]
+tools."go:github.com/google/go-licenses/v2" = "2.0.1"
+run = "bash scripts/third-party-notices.sh"
+
+[tasks.snapshot]
+description = "Build a local GoReleaser snapshot"
+depends = ["ent-generate"]
+tools.goreleaser = "2.17.0"
+run = "goreleaser release --snapshot --clean"
+
+[tasks.release-snapshot-check]
+description = "Validate no-publish snapshot configuration"
+tools.goreleaser = "2.17.0"
+run = "bash scripts/check-release-prerequisites.sh --snapshot"
+
+[tasks.release-publish-check]
+description = "Validate tag, license, credentials, and release configuration"
+tools.goreleaser = "2.17.0"
+run = "bash scripts/check-release-prerequisites.sh"
+
+[tasks.release]
+description = "Publish a GoReleaser release from an exact v* tag"
+tools.goreleaser = "2.17.0"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+bash scripts/check-release-prerequisites.sh
+# 单仓里 SDK tag（sdk/go/v*、sdk-*-v*）可能和服务端 tag 落在同一提交或成为「最近 tag」；
+# 显式告诉 GoReleaser 当前与上一个服务端 v* tag，避免它选中 SDK tag。
+tag=$(git tag --points-at HEAD -l 'v*' | head -n1)
+if [[ -z $tag ]]; then
+  printf 'release requires HEAD to have an exact v* tag\n' >&2
+  exit 1
+fi
+export GORELEASER_CURRENT_TAG=$tag
+previous=$(git tag -l 'v*' --sort=-v:refname | awk -v cur="$tag" 'seen { print; exit } $0 == cur { seen = 1 }')
+if [[ -n $previous ]]; then
+  export GORELEASER_PREVIOUS_TAG=$previous
+fi
+env -u GITHUB_TOKEN -u GH_TOKEN -u GORELEASER_FORCE_TOKEN \
+  mise run ent-generate-check
+env -u GITHUB_TOKEN -u GH_TOKEN -u GORELEASER_FORCE_TOKEN \
+  mise run license-check
+env -u GITHUB_TOKEN -u GH_TOKEN -u GORELEASER_FORCE_TOKEN \
+  bash scripts/check-migrations.sh
+env -u GITHUB_TOKEN -u GH_TOKEN -u GORELEASER_FORCE_TOKEN \
+  CGO_ENABLED=0 go test ./internal/meta -run '^TestSingleBaselineSetsMatch$' -count=1
+goreleaser release --clean
+'''

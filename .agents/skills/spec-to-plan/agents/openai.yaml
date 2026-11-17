@@ -1,0 +1,4 @@
+interface:
+  display_name: "规格转实施计划"
+  short_description: "将已确认规格转成基于仓库事实的 Tracer Bullet TDD 实施计划"
+  default_prompt: "使用 $spec-to-plan 将这份已确认规格转换为基于仓库事实的实施计划。"

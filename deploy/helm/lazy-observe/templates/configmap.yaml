@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lazy-observe.fullname" . }}
+  labels:
+    {{- include "lazy-observe.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    listen: ":3100"
+    data_dir: /data
+    standalone: {{ eq .Values.mode "standalone-ha" }}
+    meta:
+      db_url: ""
+      migration_lock_timeout: {{ .Values.meta.migrationLockTimeout }}
+    redis:
+      enabled: {{ eq .Values.mode "standalone-ha" }}
+      addr: {{ .Values.external.redis.addr | quote }}
+      password: ""
+      db: {{ .Values.external.redis.db }}
+      key_prefix: {{ .Values.external.redis.keyPrefix | quote }}
+    storage:
+      metrics:
+        kind: {{ .Values.external.metrics.kind | quote }}
+        cluster: {{ .Values.external.metrics.cluster }}
+        tenant_account_id: {{ .Values.external.metrics.tenantAccountID | quote }}
+        query_url: {{ if eq .Values.mode "standalone-ha" }}{{ required "external.metrics.queryURL is required in standalone-ha mode" .Values.external.metrics.queryURL | quote }}{{ else }}""{{ end }}
+        ingest_url: {{ if eq .Values.mode "standalone-ha" }}{{ .Values.external.metrics.ingestURL | quote }}{{ else }}""{{ end }}
+      logs:
+        url: {{ if eq .Values.mode "standalone-ha" }}{{ required "external.logs.url is required in standalone-ha mode" .Values.external.logs.url | quote }}{{ else }}""{{ end }}
+      traces:
+        url: {{ if eq .Values.mode "standalone-ha" }}{{ required "external.traces.url is required in standalone-ha mode" .Values.external.traces.url | quote }}{{ else }}""{{ end }}
+    blob:
+      backend: {{ if eq .Values.mode "standalone-ha" }}s3{{ else }}local{{ end }}
+      s3:
+        bucket: {{ .Values.external.s3.bucket | quote }}
+        region: {{ .Values.external.s3.region | quote }}
+        endpoint: {{ .Values.external.s3.endpoint | quote }}
+        access_key: ""
+        secret_key: ""
+    process:
+      startup_timeout: {{ .Values.process.startupTimeout }}
+      shutdown_timeout: {{ .Values.process.shutdownTimeout }}
+      drain_timeout: {{ .Values.process.drainTimeout }}
+    self_monitoring:
+      enabled: true
+      profiling: false

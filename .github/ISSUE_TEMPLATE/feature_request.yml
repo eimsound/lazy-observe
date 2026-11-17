@@ -1,0 +1,53 @@
+name: Feature request
+about: Propose a scoped product or engineering improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user problem and who encounters it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful outcome, not only an implementation.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Gateway and storage
+        - Web UI
+        - Go SDK
+        - Node SDK
+        - Browser or React SDK
+        - Alerting
+        - Deployment and operations
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Compatibility or security constraints
+      description: Note deployment mode, project isolation, privacy, or migration implications.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the implementation plan.
+          required: true
+        - label: This request does not depend on introducing an AGPL or GPL dependency.
+          required: true

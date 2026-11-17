@@ -1,0 +1,141 @@
+# lazy-observe server configuration. Precedence: flags > LO_* environment > this file > defaults.
+listen: ":3100"
+data_dir: "./data"
+# Production defaults to serving the embedded UI. The repository development
+# launcher overrides this to false because Vite owns the development UI.
+serve_web_ui: true
+
+# Metadata defaults to SQLite at data_dir/meta/lazy-observe.db when empty.
+# Use sqlite://path/to/meta.db to choose another SQLite file, or a PostgreSQL URL
+# such as postgres://user:password@db.example.com:5432/lazy_observe?sslmode=require.
+meta:
+  db_url: ""
+  # PostgreSQL only. Other application instances remain unready while one
+  # instance migrates; startup fails when this bounded wait expires.
+  migration_lock_timeout: 60s
+
+# Shared sessions and rate limits. Alert evaluation ownership and notification
+# delivery coordination use the metadata database in every topology.
+redis:
+  enabled: false
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  key_prefix: "lazy-observe"
+
+# All-in-one is the default. Set standalone: true (or pass --standalone) to use external storage.
+standalone: false
+# Development/offline override containing victoria-metrics-prod, victoria-logs-prod,
+# victoria-traces-prod, and vmagent-prod. Keep this empty for release
+# builds: the gateway verifies the embedded manifest and extracts the required binaries.
+# Standalone uses vmagent-prod only when ingest_url is configured.
+storage_bin_dir: ""
+
+storage:
+  metrics:
+    # vm uses VictoriaMetrics extra_filters; prometheus uses server-side PromQL AST injection.
+    kind: vm
+    # VM cluster mode expects raw vmselect/vminsert roots below and constructs
+    # /select/<accountID>/prometheus/ and /insert/<accountID>/ paths. accountID is
+    # one platform-level storage tenant; per-project isolation still uses trusted
+    # project_id write labels and query extra_filters inside that tenant.
+    cluster: false
+    tenant_account_id: "" # Required when cluster is true; unsigned 32-bit integer, e.g. "7".
+    # Required in standalone. vmsingle/Prometheus base URL, or vmselect root in cluster mode.
+    query_url: ""
+    # Optional in ordinary standalone, required in cluster mode. vmsingle base URL,
+    # or vminsert root in cluster mode. Empty disables metrics ingestion and scraping.
+    ingest_url: ""
+  logs:
+    # Required in standalone. For VictoriaLogs cluster, point this at a vmauth/LB
+    # that routes /insert/* to vlinsert and /select/* to vlselect.
+    url: ""
+  traces:
+    # Required in standalone. For VictoriaTraces cluster, point this at a vmauth/LB
+    # that routes /insert/* to vtinsert and /select/* to vtselect.
+    url: ""
+
+# Global retention by signal. In standalone mode metrics/logs/traces are owned by
+# external storage and these three values are ignored; platform-owned data is still cleaned.
+retention:
+  metrics: 90d
+  logs: 14d
+  traces: 7d
+  replay: 3d
+  sourcemaps: 90d
+  alert_events: 30d
+  profiles: 7d
+  # Delete resolved/ignored issues after 90 days without a new event.
+  issues_closed: true
+
+# Replay, source-map, and profiling blob storage.
+blob:
+  backend: local # local or s3
+  s3:
+    bucket: ""
+    region: us-east-1
+    endpoint: "" # Optional S3-compatible endpoint, for example Apache-2.0 SeaweedFS.
+    access_key: ""
+    secret_key: ""
+
+alert:
+  storm_threshold: 10
+  group_wait: 30s
+  repeat_interval: 4h
+
+# Durable error work is rejected with 503 + Retry-After when either capacity
+# limit is reached. Readiness degrades at the lower thresholds; accepted work
+# is never evicted. Processing always uses the fixed 20-attempt, 1s-to-5m policy.
+error_inbox:
+  max_items: 100000
+  max_bytes: 1073741824 # 1 GiB
+  readiness_items: 80000
+  readiness_bytes: 838860800 # 800 MiB
+
+process:
+  startup_timeout: 20s
+  shutdown_timeout: 15s
+  restart_initial: 1s
+  restart_max: 1m
+  drain_timeout: 20s
+  # Non-zero only for local multi-process isolation tests.
+  component_port_offset: 0
+
+# Observe the platform through its own Go SDK. Profiling stays off by default
+# because lazy-observe is a long-running platform process.
+self_monitoring:
+  enabled: true
+  profiling: false
+
+# Platform encryption key file. Seals sensitive values in the metadata database
+# (e.g. the BYO LLM API key entered in the admin UI). On first startup a fresh
+# 256-bit key is generated and persisted with mode 0600. Empty uses
+# <data_dir>/secret.key. HA replicas must share the same key file.
+security:
+  # Set both paths to enable native HTTPS; leave both empty for plain HTTP or
+  # when TLS terminates at a trusted reverse proxy.
+  tls_cert: ""
+  tls_key: ""
+  secret_key_file: ""
+
+# BYO LLM integration is configured exclusively by administrators from the web
+# UI (Settings > AI): enable the switch and provide provider (openai, anthropic,
+# deepseek, ollama), optional base_url, model, and the API key. The key is
+# encrypted with the platform key above and never returned to the browser. AI
+# defaults to disabled and an unavailable provider never blocks core
+# ingest/query behavior. There is no ai: section in this file anymore.
+
+# Environment names use LO_ and upper-case field paths. Common examples:
+# LO_LISTEN, LO_DATA_DIR, LO_META_DB_URL, LO_META_MIGRATION_LOCK_TIMEOUT,
+# LO_STANDALONE, LO_STORAGE_BIN_DIR,
+# LO_REDIS_ENABLED, LO_REDIS_ADDR, LO_REDIS_PASSWORD, LO_REDIS_DB, LO_REDIS_KEY_PREFIX,
+# LO_STORAGE_METRICS_KIND, LO_STORAGE_METRICS_QUERY_URL, LO_STORAGE_METRICS_INGEST_URL,
+# LO_STORAGE_METRICS_CLUSTER, LO_STORAGE_METRICS_TENANT_ACCOUNT_ID,
+# LO_STORAGE_LOGS_URL, LO_STORAGE_TRACES_URL, LO_BLOB_BACKEND, LO_BLOB_S3_BUCKET,
+# LO_RETENTION_METRICS, LO_RETENTION_REPLAY, LO_RETENTION_SOURCEMAPS,
+# LO_RETENTION_ALERT_EVENTS, LO_RETENTION_PROFILES, LO_RETENTION_ISSUES_CLOSED,
+# LO_PROCESS_RESTART_INITIAL, LO_PROCESS_RESTART_MAX, LO_PROCESS_DRAIN_TIMEOUT,
+# LO_PROCESS_COMPONENT_PORT_OFFSET, LO_ALERT_STORM_THRESHOLD.
+# Self-monitoring fields: LO_SELF_MONITORING_ENABLED and LO_SELF_MONITORING_PROFILING.
+# Security fields: LO_SECRET_KEY_FILE.
+# Only canonical names are accepted; short compatibility aliases are not supported.

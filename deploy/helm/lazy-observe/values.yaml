@@ -1,0 +1,108 @@
+mode: standalone-ha
+replicaCount: 2
+
+image:
+  repository: ghcr.io/eimsound/lazy-observe
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+meta:
+  migrationLockTimeout: 60s
+
+service:
+  type: ClusterIP
+  port: 3100
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: lazy-observe.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+external:
+  postgres:
+    url: "postgres://lazy_observe:change-me@postgresql:5432/lazy_observe?sslmode=require"
+  redis:
+    addr: "redis:6379"
+    db: 0
+    keyPrefix: lazy-observe
+  s3:
+    bucket: lazy-observe
+    region: us-east-1
+    endpoint: ""
+  metrics:
+    kind: vm
+    # Set cluster=true when queryURL points to vmselect and ingestURL points to
+    # vminsert. tenantAccountID becomes the platform-level VM account.
+    cluster: false
+    tenantAccountID: "0"
+    queryURL: "http://victoria-metrics:8428"
+    ingestURL: "http://victoria-metrics:8428"
+  logs:
+    # For a split cluster this URL must be a path-aware vmauth/Service that
+    # routes /insert/* to vlinsert and /select/* to vlselect.
+    url: "http://victoria-logs:9428"
+  traces:
+    # For a split cluster this URL must be a path-aware vmauth/Service that
+    # routes /insert/* to vtinsert and /select/* to vtselect.
+    url: "http://victoria-traces:10428"
+
+secret:
+  # Set existingSecret in production. It must contain the keys named below.
+  existingSecret: ""
+  keys:
+    postgresURL: postgres-url
+    redisPassword: redis-password
+    s3AccessKey: s3-access-key
+    s3SecretKey: s3-secret-key
+  create: false
+  values:
+    postgresURL: ""
+    redisPassword: ""
+    s3AccessKey: ""
+    s3SecretKey: ""
+
+process:
+  startupTimeout: 20s
+  shutdownTimeout: 15s
+  drainTimeout: 20s
+  preStopDelay: 5s
+terminationGracePeriodSeconds: 45
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+hpa:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+persistence:
+  enabled: true
+  accessModes: [ReadWriteOnce]
+  size: 20Gi
+  storageClass: ""
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

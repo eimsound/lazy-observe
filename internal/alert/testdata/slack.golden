@@ -1,0 +1,1 @@
+{"blocks":[{"text":{"text":"*[FIRING] alpha / DiskFull*\n[FIRING] alpha / DiskFull\n{\"alertname\":\"DiskFull\",\"instance\":\"node-1\",\"project_id\":\"alpha\"}","type":"mrkdwn"},"type":"section"}],"text":"[FIRING] alpha / DiskFull"}

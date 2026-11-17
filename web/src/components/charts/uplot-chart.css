@@ -1,0 +1,65 @@
+.lazy-uplot {
+  min-width: 0;
+}
+
+.lazy-uplot > .uplot {
+  font-family: inherit;
+}
+
+.lazy-uplot-tooltip {
+  position: fixed;
+  z-index: 2147483647;
+  display: none;
+  max-width: min(32rem, calc(100vw - 1rem));
+  max-height: min(26rem, calc(100vh - 1rem));
+  overflow: auto;
+  pointer-events: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 8px 24px color-mix(in oklch, var(--foreground) 14%, transparent);
+  font-size: 0.75rem;
+}
+
+.lazy-uplot-tooltip[data-pinned="true"] {
+  pointer-events: auto;
+  user-select: text;
+}
+
+.lazy-uplot-tooltip-time {
+  position: sticky;
+  top: 0;
+  padding: 0.5rem 0.625rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--popover);
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.lazy-uplot-tooltip-series {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: start;
+  padding: 0.375rem 0.625rem;
+}
+
+.lazy-uplot-tooltip-marker {
+  width: 0.75rem;
+  height: 0.1875rem;
+  margin-top: 0.4rem;
+  border-radius: 9999px;
+}
+
+.lazy-uplot-tooltip-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted-foreground);
+}
+
+.lazy-uplot-tooltip-value {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
