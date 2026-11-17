@@ -18,14 +18,18 @@ GO_URL="http://127.0.0.1:$GO_PORT"
 NODE_URL="http://127.0.0.1:$NODE_PORT"
 ERROR_JOURNEY_RELEASE=browser-error-journey-v1
 
-# SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端
-if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ]; then
-	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端\n' >&2
+# journey 需要手动对着一个运行中的 lazy-observe 平台执行，mise 和 CI 都不调用本脚本。
+#   LO_E2E_PLATFORM_URL    平台地址
+#   LO_E2E_TOKEN           默认项目的项目 API Token（lo_…），只用来拼 DSN 做摄取
+#   LO_E2E_ADMIN_PASSWORD  admin 密码；所有读请求都用登录得到的会话 Cookie 加
+#                          X-LO-Project: default（ADR 0010：项目 Token 只能摄取，读路由返回 403）
+if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ] || [ -z "${LO_E2E_ADMIN_PASSWORD:-}" ]; then
+	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL、LO_E2E_TOKEN（lo_ 摄取 Token）与 LO_E2E_ADMIN_PASSWORD（读请求用 admin 会话）指向运行中的 lazy-observe 平台\n' >&2
 	exit 1
 fi
 PLATFORM_URL=${LO_E2E_PLATFORM_URL}
 TOKEN=${LO_E2E_TOKEN}
-PASSWORD=${LO_E2E_ADMIN_PASSWORD:-}
+PASSWORD=${LO_E2E_ADMIN_PASSWORD}
 
 cleanup() {
 	if [ -n "$CPU_LOAD_PID" ]; then

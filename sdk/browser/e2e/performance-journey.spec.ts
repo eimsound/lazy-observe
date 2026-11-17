@@ -3,7 +3,6 @@ import { expect, test, type APIRequestContext, type Page } from "@playwright/tes
 const platformURL = requiredEnv("LO_E2E_PLATFORM_URL");
 const goURL = requiredEnv("LO_E2E_GO_URL");
 const nodeURL = requiredEnv("LO_E2E_NODE_URL");
-const token = requiredEnv("LO_E2E_TOKEN");
 const password = requiredEnv("LO_E2E_ADMIN_PASSWORD");
 
 interface EndpointStat {
@@ -37,6 +36,8 @@ function requiredEnv(name: string): string {
   return value;
 }
 
+// Project API tokens are ingest-only (ADR 0010); every read below rides on
+// this session cookie plus X-LO-Project.
 async function loginAPI(request: APIRequestContext): Promise<void> {
   const response = await request.post(`${platformURL}/api/auth/login`, {
     data: { username: "admin", password },
@@ -62,7 +63,7 @@ async function performanceContract(request: APIRequestContext): Promise<Endpoint
   await expect.poll(async () => {
     const end = Date.now();
     const response = await request.get(`${platformURL}/api/v1/performance/endpoints`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "X-LO-Project": "default" },
       params: {
         start: new Date(end - 60 * 60 * 1_000).toISOString(),
         end: new Date(end).toISOString(),
@@ -94,7 +95,7 @@ async function waitForTraceAtP95(
 ): Promise<void> {
   await expect.poll(async () => {
     const result = await request.get(`${platformURL}/api/traces/search`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "X-LO-Project": "default" },
       params: {
         service: endpoint.service,
         operation: `${endpoint.method} ${endpoint.route}`,
@@ -117,7 +118,7 @@ async function waitForProfileTypes(
 ): Promise<void> {
   await expect.poll(async () => {
     const response = await request.get(`${platformURL}/api/profiles`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "X-LO-Project": "default" },
       params: { service },
     });
     if (!response.ok()) return [];
@@ -132,7 +133,7 @@ async function flamegraph(
   type: ProfileRecord["type"],
 ): Promise<FlameNode> {
   const response = await request.get(`${platformURL}/api/profiles/flamegraph`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { "X-LO-Project": "default" },
     params: { service, type },
   });
   expect(response.ok()).toBeTruthy();

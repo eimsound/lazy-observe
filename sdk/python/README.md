@@ -67,5 +67,20 @@ See the `examples/django/` project for a runnable Django + DRF app, and
 uv venv --python 3.11 .venv
 uv pip install -e ".[test]"
 .venv/bin/python -m pytest tests/
-./e2e.sh   # requires a built platform (or LO_E2E_PLATFORM_URL/LO_E2E_TOKEN)
+LO_E2E_PLATFORM_URL=http://127.0.0.1:3100 \
+LO_E2E_TOKEN=lo_... \
+LO_E2E_ADMIN_PASSWORD=... \
+  ./e2e.sh
 ```
+
+`./e2e.sh` is a manual journey: neither `mise` nor CI runs it (`mise run sdk-python`
+and the CI SDK job only run pytest). Run it yourself against an already running
+lazy-observe platform:
+
+- `LO_E2E_PLATFORM_URL`: base URL of the running platform.
+- `LO_E2E_TOKEN`: the `default` project's API token (`lo_…`). It only builds the
+  ingest DSN; project tokens are ingest-only (ADR 0010) and get `403` on read routes.
+- `LO_E2E_ADMIN_PASSWORD`: the `admin` password. Every read in the journey uses the
+  admin session cookie plus `X-LO-Project: default`.
+- `LO_E2E_PYTHON` (optional): interpreter with the `[test]` extras installed;
+  defaults to `.venv/bin/python`.

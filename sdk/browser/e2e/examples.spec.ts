@@ -50,6 +50,8 @@ async function waitForSignal(
   return signal!;
 }
 
+// Project API tokens are ingest-only (ADR 0010): the token only builds the DSN,
+// and every read rides on this session cookie plus X-LO-Project.
 async function login(request: APIRequestContext): Promise<void> {
   const response = await request.post(`${platformURL}/api/auth/login`, {
     data: { username: "admin", password },
@@ -99,7 +101,7 @@ test("vanilla example sends errors, Web Vitals, Replay, and trace context", asyn
 
   await expect.poll(async () => {
     const response = await request.get(`${platformURL}/api/replay/sessions?has_error=true`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "X-LO-Project": "default" },
     });
     return response.ok() ? JSON.stringify(await response.json()) : "";
   }).toContain(sessionID);
@@ -107,7 +109,7 @@ test("vanilla example sends errors, Web Vitals, Replay, and trace context", asyn
   const selector = `{__name__=~"web_vitals_(lcp|inp|cls|ttfb|fcp)",page="/"}`;
   await expect.poll(async () => {
     const response = await request.get(`${platformURL}/api/v1/query`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "X-LO-Project": "default" },
       params: { query: selector },
     });
     if (!response.ok()) return 0;

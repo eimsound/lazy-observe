@@ -13,14 +13,18 @@ EXAMPLE_URL="http://127.0.0.1:$EXAMPLE_PORT"
 DISABLED_URL="http://127.0.0.1:$DISABLED_PORT"
 LLM_URL="http://127.0.0.1:$LLM_PORT"
 
-# SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端
-if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ]; then
-	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL 与 LO_E2E_TOKEN 指向的 lazy-observe 服务端\n' >&2
+# journey 需要手动对着一个运行中的 lazy-observe 平台执行，mise 和 CI 都不调用本脚本。
+#   LO_E2E_PLATFORM_URL    平台地址
+#   LO_E2E_TOKEN           默认项目的项目 API Token（lo_…），只用来拼 DSN 做摄取
+#   LO_E2E_ADMIN_PASSWORD  admin 密码；所有读请求都用登录得到的会话 Cookie 加
+#                          X-LO-Project: default（ADR 0010：项目 Token 只能摄取，读路由返回 403）
+if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ] || [ -z "${LO_E2E_ADMIN_PASSWORD:-}" ]; then
+	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL、LO_E2E_TOKEN（lo_ 摄取 Token）与 LO_E2E_ADMIN_PASSWORD（读请求用 admin 会话）指向运行中的 lazy-observe 平台\n' >&2
 	exit 1
 fi
 PLATFORM_URL=${LO_E2E_PLATFORM_URL}
 TOKEN=${LO_E2E_TOKEN}
-PASSWORD=${LO_E2E_ADMIN_PASSWORD:-}
+PASSWORD=${LO_E2E_ADMIN_PASSWORD}
 
 cleanup() {
 	if [ -n "$EXAMPLE_PID" ]; then
@@ -83,6 +87,13 @@ wait_http() {
 printf 'building Node SDK...\n'
 (cd "$SDK_DIR" && pnpm install --frozen-lockfile && pnpm build)
 
+# 读请求在 profile 断言就开始了，先登录拿会话 Cookie。
+jq -n --arg username admin --arg password "$PASSWORD" \
+	'{username: $username, password: $password}' >"$WORK/login.json"
+curl -fsS -c "$WORK/cookies" \
+	-H "Content-Type: application/json" \
+	--data-binary "@$WORK/login.json" "$PLATFORM_URL/api/auth/login" >/dev/null
+
 printf 'starting instrumented Express example...\n'
 env PORT="$LLM_PORT" node "$SDK_DIR/examples/express/dist/fake-llm.js" >"$WORK/fake-llm.log" 2>&1 &
 LLM_PID=$!
@@ -109,7 +120,7 @@ curl -fsS -H "traceparent: 00-$LLM_STREAM_TRACE-5555555555555555-01" "$EXAMPLE_U
 printf 'keeping example alive for two profiling cycles (at least 70s)...\n'
 sleep 72
 
-curl -fsS -H "Authorization: Bearer $TOKEN" -G "$PLATFORM_URL/api/profiles" --data-urlencode 'service=node-express-example' -o "$WORK/profiles.json"
+curl -fsS -b "$WORK/cookies" -H "X-LO-Project: default" -G "$PLATFORM_URL/api/profiles" --data-urlencode 'service=node-express-example' -o "$WORK/profiles.json"
 CPU_ID=$(jq -r '.profiles | map(select(.service == "node-express-example" and .type == "cpu")) | first | .id // empty' "$WORK/profiles.json")
 HEAP_ID=$(jq -r '.profiles | map(select(.service == "node-express-example" and .type == "heap")) | first | .id // empty' "$WORK/profiles.json")
 test -n "$CPU_ID" || {
@@ -123,14 +134,14 @@ test -n "$HEAP_ID" || {
 	exit 1
 }
 
-curl -fsS -H "Authorization: Bearer $TOKEN" -G "$PLATFORM_URL/api/profiles/flamegraph" \
+curl -fsS -b "$WORK/cookies" -H "X-LO-Project: default" -G "$PLATFORM_URL/api/profiles/flamegraph" \
 	--data-urlencode 'service=node-express-example' --data-urlencode 'type=cpu' -o "$WORK/flamegraph.json"
 jq -e '.. | objects | select(.name? == "profileExampleWork")' "$WORK/flamegraph.json" >/dev/null || {
 	printf 'CPU flamegraph example function assertion failed\n' >&2
 	cat "$WORK/flamegraph.json" >&2
 	exit 1
 }
-curl -fsS -H "Authorization: Bearer $TOKEN" "$PLATFORM_URL/api/profiles/$CPU_ID/raw" -o "$WORK/cpu.pb.gz"
+curl -fsS -b "$WORK/cookies" -H "X-LO-Project: default" "$PLATFORM_URL/api/profiles/$CPU_ID/raw" -o "$WORK/cpu.pb.gz"
 go tool pprof -top "$WORK/cpu.pb.gz" >"$WORK/pprof-top.txt" 2>&1 || {
 	cat "$WORK/pprof-top.txt" >&2
 	exit 1
@@ -152,7 +163,7 @@ wait_http "$DISABLED_URL/" || {
 LLM_CONTENT_TRACE=66666666666666666666666666666666
 curl -fsS -H "traceparent: 00-$LLM_CONTENT_TRACE-6666666666666666-01" "$DISABLED_URL/llm" >/dev/null
 sleep 12
-curl -fsS -H "Authorization: Bearer $TOKEN" -G "$PLATFORM_URL/api/profiles" --data-urlencode 'service=node-express-disabled' -o "$WORK/disabled-profiles.json"
+curl -fsS -b "$WORK/cookies" -H "X-LO-Project: default" -G "$PLATFORM_URL/api/profiles" --data-urlencode 'service=node-express-disabled' -o "$WORK/disabled-profiles.json"
 jq -e '.profiles | length == 0' "$WORK/disabled-profiles.json" >/dev/null || {
 	printf 'profiling:false negative assertion failed\n' >&2
 	cat "$WORK/disabled-profiles.json" >&2
@@ -162,8 +173,6 @@ kill -TERM "$DISABLED_PID"
 wait "$DISABLED_PID"
 DISABLED_PID=
 
-curl -fsS -c "$WORK/cookies" -H 'Content-Type: application/json' -d "{\"username\":\"admin\",\"password\":\"$PASSWORD\"}" "$PLATFORM_URL/api/auth/login" -o "$WORK/login.json"
-
 metric_ok=0
 log_ok=0
 trace_ok=0
@@ -172,20 +181,20 @@ llm_stream_ok=0
 llm_content_ok=0
 i=0
 while [ "$i" -lt 80 ]; do
-	curl -fsS -G "$PLATFORM_URL/api/v1/query_range" -H "Authorization: Bearer $TOKEN" \
+	curl -fsS -G "$PLATFORM_URL/api/v1/query_range" -b "$WORK/cookies" -H "X-LO-Project: default" \
 		--data-urlencode 'query={__name__="http.server.request.duration_bucket"}' --data-urlencode "start=$START" --data-urlencode "end=$END" --data-urlencode 'step=1s' -o "$WORK/metrics.json" || true
 	if jq -e '.data.result | length > 0' "$WORK/metrics.json" >/dev/null 2>&1; then metric_ok=1; fi
 
-	curl -fsS -G "$PLATFORM_URL/api/v1/logs/query" -H "Authorization: Bearer $TOKEN" --data-urlencode 'query=_msg:="about to throw example error"' -o "$WORK/logs.jsonl" || true
+	curl -fsS -G "$PLATFORM_URL/api/v1/logs/query" -b "$WORK/cookies" -H "X-LO-Project: default" --data-urlencode 'query=_msg:="about to throw example error"' -o "$WORK/logs.jsonl" || true
 	if grep -q "$TRACE_ID" "$WORK/logs.jsonl" 2>/dev/null; then log_ok=1; fi
 
-	curl -sS "$PLATFORM_URL/api/traces/$TRACE_ID" -H "Authorization: Bearer $TOKEN" -o "$WORK/trace.json" || true
+	curl -sS "$PLATFORM_URL/api/traces/$TRACE_ID" -b "$WORK/cookies" -H "X-LO-Project: default" -o "$WORK/trace.json" || true
 	if jq -e --arg trace "$TRACE_ID" --arg parent "$PARENT_ID" '.data[0].traceID == $trace and any(.data[0].spans[]?; any(.references[]?; .spanID == $parent and .traceID == $trace))' "$WORK/trace.json" >/dev/null 2>&1; then trace_ok=1; fi
 
 	curl -fsS -b "$WORK/cookies" -H 'X-LO-Project: default' "$PLATFORM_URL/api/issues" -o "$WORK/issues.json" || true
 	if jq -e '(.issues // .) | any(.[]?; .title == "Error: example route failed")' "$WORK/issues.json" >/dev/null 2>&1; then issue_ok=1; fi
 
-	curl -sS "$PLATFORM_URL/api/traces/$LLM_STREAM_TRACE" -H "Authorization: Bearer $TOKEN" -o "$WORK/llm-stream-trace.json" || true
+	curl -sS "$PLATFORM_URL/api/traces/$LLM_STREAM_TRACE" -b "$WORK/cookies" -H "X-LO-Project: default" -o "$WORK/llm-stream-trace.json" || true
 	if jq -e '
 		def vals($key): [.data[0].spans[]? | select(.operationName == "chat openai") | .tags[]? | select(.key == $key) | .value];
 		(vals("gen_ai.system")[0] == "openai") and
@@ -196,7 +205,7 @@ while [ "$i" -lt 80 ]; do
 		((vals("gen_ai.usage.output_tokens")[0] | tostring) == "4") and
 		(vals("gen_ai.prompt") | length == 0) and (vals("gen_ai.completion") | length == 0)' "$WORK/llm-stream-trace.json" >/dev/null 2>&1; then llm_stream_ok=1; fi
 
-	curl -sS "$PLATFORM_URL/api/traces/$LLM_CONTENT_TRACE" -H "Authorization: Bearer $TOKEN" -o "$WORK/llm-content-trace.json" || true
+	curl -sS "$PLATFORM_URL/api/traces/$LLM_CONTENT_TRACE" -b "$WORK/cookies" -H "X-LO-Project: default" -o "$WORK/llm-content-trace.json" || true
 	if jq -e '
 		def vals($key): [.data[0].spans[]? | select(.operationName == "chat openai") | .tags[]? | select(.key == $key) | .value];
 		(vals("gen_ai.system")[0] == "openai") and
