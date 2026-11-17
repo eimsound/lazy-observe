@@ -6,7 +6,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 script="$root/scripts/ci-changes.sh"
-flags=(go build e2e web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python)
 all="${flags[*]}"
 failures=0
 
@@ -43,26 +43,39 @@ expect '' ''
 expect 'sdk/node/packages/node/src/index.ts' 'sdk_node'
 expect 'sdk/browser/packages/react/package.json' 'sdk_browser'
 expect 'sdk/python/lazyobserve/client.py' 'sdk_python'
-expect 'sdk/go/delivery.go' 'sdk_go go build e2e'
+expect 'sdk/go/delivery.go' 'sdk_go go build e2e ha'
 expect 'sdk/scripts/sdk-publish.sh' 'sdk_go sdk_node sdk_browser sdk_python'
 
 # 前端：web + 嵌入前端的 amd64 构建。
 expect 'web/src/App.tsx' 'web build'
 
-# 服务端。
-expect 'internal/gateway/router.go' 'go build e2e'
-expect 'cmd/lazy-observe/main.go' 'go build e2e'
-expect 'internal/meta/store.go' 'go build e2e meta_pg'
-expect 'internal/db/schema/rule.go' 'go build e2e meta_pg'
+# 服务端：Go 代码同时打开多副本 HA 功能门禁。
+expect 'internal/gateway/router.go' 'go build e2e ha'
+expect 'cmd/lazy-observe/main.go' 'go build e2e ha'
+expect 'internal/meta/store.go' 'go build e2e ha meta_pg'
+expect 'internal/db/schema/rule.go' 'go build e2e ha meta_pg'
+expect 'tools/entgen/main.go' 'go build e2e ha meta_pg'
 expect 'scripts/e2e-restart.sh' 'go e2e'
+expect 'scripts/e2e.sh' 'go e2e'
 expect 'deploy/helm/lazy-observe/values.yaml' 'go'
+expect 'config.example.yaml' 'go'
+
+# HA 门禁自身、它现场编译的辅助程序、读取的预算与存储二进制下载。
+expect 'scripts/e2e-multi-replica.sh' 'go e2e ha'
+expect 'scripts/e2e-path-router/main.go' 'go e2e ha'
+expect 'scripts/e2e-otlp-payload/main.go' 'go e2e ha'
+expect 'scripts/e2e-otlp-sink/main.go' 'go e2e ha'
+expect 'bench/performance-gates.json' 'go ha'
+expect 'bench/baseline.json' 'go'
 expect 'scripts/install.sh' 'go'
 expect '.gitignore' 'go'
 expect 'scripts/check-js-licenses.sh' 'web sdk_node sdk_browser'
 
 # 打包链路：加 arm64。
-expect 'go.mod' 'go build e2e meta_pg arm64'
-expect 'internal/embed/bins/bins_linux_amd64.go' 'go build e2e arm64'
+expect 'go.mod' 'go build e2e ha meta_pg arm64'
+expect 'go.sum' 'go build e2e ha meta_pg arm64'
+expect 'internal/embed/bins/bins_linux_amd64.go' 'go build e2e ha arm64'
+expect 'scripts/download-storage-bins.sh' 'go build e2e ha arm64'
 expect 'scripts/prepare-web-assets.sh' 'go build e2e arm64'
 expect '.goreleaser.yaml' 'go build arm64'
 expect_matrix 'go.mod' '[{"arch":"amd64","runner":"ubuntu-24.04"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]'
@@ -74,6 +87,12 @@ expect 'mise.toml' "$all"
 expect 'scripts/ci-changes.sh' "$all"
 expect 'Dockerfile' "$all"
 expect 'Makefile' "$all"
+
+# 不打开 HA 门禁的改动面：前端、非 Go SDK、文档、Helm。
+expect 'web/src/App.tsx,sdk/node/packages/node/src/index.ts,sdk/browser/packages/react/package.json' \
+  'web build sdk_node sdk_browser'
+expect 'docs/deployment.md,deploy/helm/lazy-observe/templates/deployment.yaml,sdk/python/lazyobserve/client.py' \
+  'go sdk_python'
 
 # 组合：取并集。
 expect 'README.md,sdk/python/pyproject.toml,web/package.json' 'sdk_python web build'
@@ -89,7 +108,7 @@ done
 
 # 没有可用 base 的事件按全量处理。
 got=$(cd "$root" && CI_EVENT_NAME=workflow_dispatch GITHUB_OUTPUT='' bash "$script" 2>/dev/null)
-grep -qx 'sdk_python=true' <<<"$got" || {
+grep -qx 'sdk_python=true' <<<"$got" && grep -qx 'ha=true' <<<"$got" || {
   printf 'FAIL [workflow_dispatch] expected full run\n' >&2
   failures=$((failures + 1))
 }

@@ -18,7 +18,21 @@ set -euo pipefail
 # 本地测试：`printf '%s\n' a.go b.md | bash scripts/ci-changes.sh --stdin`，
 # 标志写到 stdout（以及 $GITHUB_OUTPUT，若设置）。见 scripts/ci-changes-test.sh。
 
-flags=(go build e2e web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python)
+
+# ha：多副本 HA 功能门禁（mise run e2e-ha → scripts/e2e-multi-replica.sh，只做功能断言，
+# 不含 perf-ha 的性能部分）。它跑的是 build-binary 产出的服务端二进制、外置的 storage-bins
+# 和 Docker 里钉死版本的 VM 集群 / S3 / Postgres / Valkey，所以只在下面这些输入变化时打开：
+#   - 服务端 Go 代码与依赖：cmd/**、internal/**、go.mod/go.sum，以及经 replace 编进二进制的
+#     sdk/go/**、ent 生成链路（entc.*、tools/entgen/**、scripts/generate-ent.sh）；
+#   - 门禁本身：scripts/e2e-multi-replica.sh 和它现场编译的 scripts/e2e-{path-router,otlp-payload,otlp-sink}/**；
+#   - 门禁读取的预算：bench/performance-gates.json（副本 GOMAXPROCS、trace 夹具规模）；
+#   - 存储二进制下载：scripts/download-storage-bins.sh；
+#   - 全量路径（.github/**、mise.toml、scripts/ci-*、Dockerfile*、未分类路径）。
+# 刻意不打开的：web/**（build-binary 不构建前端，HA 断言不走 UI）、deploy/**、config.example.yaml
+#（门禁不读 Helm chart 或示例配置，Helm 由 go job 的 helm-lint/helm-template-test 覆盖）、
+# scripts/e2e.sh / e2e-restart.sh 等单副本 e2e 脚本、非 Go 的 SDK 与纯文档。
+# 与 e2e 不完全同范围，所以单列一个标志。
 
 # 打包链路：动到这些路径时额外跑 arm64 构建与冒烟（以及 amd64 构建与冒烟）。
 # scripts/check-e2e-contract.sh 校验这份列表。
@@ -88,7 +102,7 @@ classify() {
     ;;
   # 服务端经 replace 把 sdk/go 编进二进制（自监控链路），所以也要跑构建与 e2e。
   sdk/go/*)
-    set_flags sdk_go go build e2e
+    set_flags sdk_go go build e2e ha
     ;;
   sdk/node/*)
     set_flags sdk_node
@@ -106,17 +120,28 @@ classify() {
     set_flags web build
     ;;
   internal/db/* | internal/meta/* | entc.mod | entc.sum | tools/entgen/* | scripts/generate-ent.sh)
-    set_flags go build e2e meta_pg
+    set_flags go build e2e ha meta_pg
     ;;
   # 依赖升级可能动到 pgx / embedded-postgres，PG 元数据测试一起跑。
   go.mod | go.sum)
-    set_flags go build e2e meta_pg
+    set_flags go build e2e ha meta_pg
     ;;
   cmd/* | internal/*)
-    set_flags go build e2e
+    set_flags go build e2e ha
     ;;
-  scripts/e2e* | scripts/download-storage-bins.sh | scripts/prepare-web-assets.sh)
+  # HA 门禁脚本与它现场编译的辅助程序；也保留单副本 e2e 原有的触发。
+  scripts/e2e-multi-replica.sh | scripts/e2e-path-router/* | scripts/e2e-otlp-payload/* | scripts/e2e-otlp-sink/*)
+    set_flags go e2e ha
+    ;;
+  scripts/download-storage-bins.sh)
+    set_flags go e2e ha
+    ;;
+  scripts/e2e* | scripts/prepare-web-assets.sh)
     set_flags go e2e
+    ;;
+  # HA 门禁读取副本 GOMAXPROCS 与 trace 夹具规模。
+  bench/performance-gates.json)
+    set_flags go ha
     ;;
   # JS 许可证检查被 web 与两个 JS SDK job 共用。
   scripts/check-js-licenses.sh)

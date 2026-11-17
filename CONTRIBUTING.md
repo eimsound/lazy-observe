@@ -87,9 +87,12 @@ mise run e2e
 
 This starts real pinned Victoria components. The root orchestrator supplies the explicit `LO_E2E_*` paths to each fixture; normally contributors should not set them manually.
 
-Run `mise run e2e-ha` for changes to clustering, shared state, S3, probes, or
-shutdown. It requires a working Docker daemon. Exit 77 means the prerequisite
-was absent and must be reported as `SKIP`, never PASS.
+`mise run e2e-ha` is the multi-replica HA functional gate (clustering, shared
+state, S3, probes, shutdown). Pull request CI runs it as the `HA E2E
+(multi-replica)` job whenever server code or the gate's inputs change, so a
+local run is optional; run it before pushing when you want the result early.
+It requires a working Docker daemon. Exit 77 means the prerequisite was absent
+and must be reported as `SKIP`, never PASS.
 
 ### Release and performance gates
 
@@ -118,11 +121,12 @@ business job.
 | --- | --- |
 | `*.md`, `docs/**`, `LICENSE`, `.agents/**` | None |
 | `sdk/node/**`, `sdk/browser/**`, `sdk/python/**` | The matching SDK job |
-| `sdk/go/**` | Go SDK job plus the gateway Go checks, build, and E2E (the server links `sdk/go` through `replace`) |
+| `sdk/go/**` | Go SDK job plus the gateway Go checks, build, E2E, and HA E2E (the server links `sdk/go` through `replace`) |
 | `web/**` | Web |
 | `internal/db/**`, `internal/meta/**` | Adds PostgreSQL metadata tests |
-| `cmd/**`, `internal/**` | Go checks, build, E2E, restart |
+| `cmd/**`, `internal/**` | Go checks, build, E2E, restart, HA E2E |
 | `go.mod`, `go.sum` | Same as above plus PostgreSQL metadata tests |
+| `scripts/e2e-multi-replica.sh` and its helpers, `bench/performance-gates.json`, `scripts/download-storage-bins.sh` | Adds HA E2E |
 | Packaging chain | Zero-config artifact smoke plus native arm64 build and smoke |
 | `.github/**`, `mise.toml`, `scripts/ci-*`, `Dockerfile*` | Everything |
 
@@ -133,7 +137,8 @@ business job.
 | Manual dispatch | `bench.yml` | Performance gates on demand |
 
 Performance gates are noisy on shared runners, so they run only on manual
-dispatch and before a release. Run them locally when your change is
+dispatch and before a release; the PR job runs only the functional HA
+assertions of `e2e-ha`, never `perf-ha`. Run them locally when your change is
 performance-sensitive. `mise run ci-changes-test` pins the path grouping; update
 it together with the detector.
 
