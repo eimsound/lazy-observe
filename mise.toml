@@ -485,13 +485,16 @@ set -euo pipefail
 bash scripts/check-release-prerequisites.sh
 # 单仓里 SDK tag（sdk/go/v*、sdk-*-v*）可能和服务端 tag 落在同一提交或成为「最近 tag」；
 # 显式告诉 GoReleaser 当前与上一个服务端 v* tag，避免它选中 SDK tag。
-tag=$(git tag --points-at HEAD -l 'v*' | head -n1)
+# 先收齐 git 输出再处理：pipefail 下 | head、| awk exit 提前退出会让 git 收到 SIGPIPE（141）。
+head_tags=$(git tag --points-at HEAD -l 'v*')
+tag=${head_tags%%$'\n'*}
 if [[ -z $tag ]]; then
   printf 'release requires HEAD to have an exact v* tag\n' >&2
   exit 1
 fi
 export GORELEASER_CURRENT_TAG=$tag
-previous=$(git tag -l 'v*' --sort=-v:refname | awk -v cur="$tag" 'seen { print; exit } $0 == cur { seen = 1 }')
+server_tags=$(git tag -l 'v*' --sort=-v:refname)
+previous=$(awk -v cur="$tag" 'seen { print; exit } $0 == cur { seen = 1 }' <<<"$server_tags")
 if [[ -n $previous ]]; then
   export GORELEASER_PREVIOUS_TAG=$previous
 fi

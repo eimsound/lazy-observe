@@ -107,9 +107,11 @@ ci_ok=$(sed -n '/^  ci-ok:$/,$p' "$ci")
 [[ $ci_ok == *'if: always()'* ]] || fail "$ci: ci-ok must run with if: always()"
 mapfile -t ci_ok_needs < <(sed -n '/^  ci-ok:$/,$p' "$ci" | sed -n '/^    needs:$/,/^    [a-z-]*:/p' |
   sed -n 's/^      - \([A-Za-z0-9_-]*\)$/\1/p')
+# 先收齐再匹配：pipefail 下 printf | grep -q 会在 grep 提前退出时让 printf 收到 SIGPIPE（141），门禁偶发变红。
+ci_ok_needs_list=$(printf '%s\n' "${ci_ok_needs[@]}")
 for job in "${ci_jobs[@]}"; do
   [[ $job == ci-ok ]] && continue
-  printf '%s\n' "${ci_ok_needs[@]}" | grep -qx -- "$job" || fail "$ci: ci-ok must need job $job"
+  [[ $'\n'$ci_ok_needs_list$'\n' == *$'\n'"$job"$'\n'* ]] || fail "$ci: ci-ok must need job $job"
   if [[ $job != changes ]]; then
     job_block=$(awk -v job="$job" '
       $0 == "  " job ":" { on = 1; next }
