@@ -145,4 +145,77 @@ assert_render_fails 'HPA without a key source must fail rendering' 'encryptionKe
 "$HELM" template test "$CHART" --set replicaCount=1 --set encryptionKey.autoGenerate=false >"$WORK/single-no-key.yaml"
 assert_not_contains "$WORK/single-no-key.yaml" 'secret_key_file' 'a single replica without a key source falls back to data_dir'
 
+# First admin password: replicas must read one Secret through
+# security.admin_password_file. A generated password would otherwise land only
+# in the bootstrap winner's emptyDir data_dir and be lost with that pod.
+ADMIN_PATH=/etc/lazy-observe-admin/admin-password
+"$HELM" template test "$CHART" --set adminPassword.existingSecret=lo-admin \
+  --set adminPassword.key=password >"$WORK/admin-existing.yaml"
+for rendered in "$WORK/standalone.yaml" "$WORK/cluster.yaml" "$WORK/admin-existing.yaml" "$WORK/allinone.yaml" \
+  "$WORK/allinone-ephemeral.yaml"; do
+  assert_contains "$rendered" "admin_password_file: \"$ADMIN_PATH\"" 'admin_password_file must point at the mounted admin password'
+  assert_contains "$rendered" 'mountPath: /etc/lazy-observe-admin$' 'the admin password Secret must be mounted into the pod'
+  assert_contains "$rendered" 'path: admin-password$' 'the admin password must be projected as admin-password'
+  assert_not_contains "$rendered" 'LO_SECURITY_ADMIN_PASSWORD' 'the admin password must not be passed through environment variables'
+done
+
+assert_contains "$WORK/standalone.yaml" 'secretName: test-lazy-observe-admin-password$' 'replicas must mount the chart-managed admin password Secret'
+admin_generated=$(awk '/^kind: Secret$/ { in_secret = 1 } /^---/ { in_secret = 0 } in_secret && /^  admin-password: / { gsub(/"/, "", $2); print $2 }' "$WORK/standalone.yaml")
+if [ -z "$admin_generated" ]; then
+  echo "FAIL: chart-generated admin password Secret must carry data.admin-password" >&2
+  exit 1
+fi
+if ! printf '%s' "$admin_generated" | base64 -d | grep -Eq '^[A-Za-z0-9]{32}$'; then
+  echo "FAIL: generated admin password must be 32 alphanumeric characters without a newline" >&2
+  exit 1
+fi
+admin_secret=$(awk '/^kind: Secret$/ { in_secret = 1 } /^---/ { in_secret = 0 } in_secret' "$WORK/standalone.yaml" | grep -c 'admin-password:' || true)
+[ "$admin_secret" = 1 ] || { echo "FAIL: expected exactly one generated admin password Secret entry" >&2; exit 1; }
+
+assert_contains "$WORK/admin-existing.yaml" 'secretName: lo-admin$' 'adminPassword.existingSecret must be mounted'
+assert_contains "$WORK/admin-existing.yaml" 'key: password$' 'adminPassword.key must select the Secret key'
+assert_not_contains "$WORK/admin-existing.yaml" 'test-lazy-observe-admin-password' 'existingSecret must suppress the chart-generated admin password Secret'
+
+# allinone also defaults to a readable Secret: the distroless image has no shell
+# to read <data_dir>/initial-admin-password from inside the pod.
+assert_contains "$WORK/allinone.yaml" 'secretName: test-lazy-observe-admin-password$' 'allinone must mount the chart-managed admin password Secret'
+
+assert_render_fails 'multi-replica without an admin password source must fail rendering' 'adminPassword' \
+  --set adminPassword.autoGenerate=false
+assert_render_fails 'HPA without an admin password source must fail rendering' 'adminPassword' \
+  --set replicaCount=1 --set hpa.enabled=true --set adminPassword.autoGenerate=false
+"$HELM" template test "$CHART" --set replicaCount=1 --set adminPassword.autoGenerate=false >"$WORK/single-no-admin.yaml"
+assert_not_contains "$WORK/single-no-admin.yaml" 'admin_password_file' 'a single replica without an admin Secret falls back to data_dir'
+"$HELM" template test "$CHART" --set mode=allinone --set adminPassword.autoGenerate=false >"$WORK/allinone-no-admin.yaml"
+assert_not_contains "$WORK/allinone-no-admin.yaml" 'admin_password_file' 'allinone without an admin Secret falls back to data_dir'
+
+# NOTES must tell the operator how to read the password back. `helm template`
+# never renders NOTES.txt and `helm install --dry-run` needs a cluster, so a
+# scratch copy of the chart wraps NOTES in a define and emits it base64-encoded.
+NOTES_CHART="$WORK/notes-chart/lazy-observe"
+mkdir -p "$WORK/notes-chart"
+cp -R "$CHART" "$NOTES_CHART"
+{
+  printf '{{- define "test.notes" -}}\n'
+  cat "$NOTES_CHART/templates/NOTES.txt"
+  printf '\n{{- end -}}\n'
+} >"$NOTES_CHART/templates/_test_notes.tpl"
+rm "$NOTES_CHART/templates/NOTES.txt"
+printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: test-notes\ndata:\n  notes: {{ include "test.notes" . | b64enc }}\n' \
+  >"$NOTES_CHART/templates/test-notes.yaml"
+render_notes() {
+  output=$1
+  shift
+  "$HELM" template test "$NOTES_CHART" --show-only templates/test-notes.yaml "$@" |
+    sed -n 's/^  notes: //p' | base64 -d >"$output"
+}
+render_notes "$WORK/notes-generated.txt"
+assert_contains "$WORK/notes-generated.txt" \
+  "kubectl get secret test-lazy-observe-admin-password -n default -o jsonpath='\\{\\.data\\.admin-password\\}' \\| base64 -d" \
+  'NOTES must show how to read the generated admin password'
+render_notes "$WORK/notes-existing.txt" --set adminPassword.existingSecret=lo-admin
+assert_contains "$WORK/notes-existing.txt" 'key admin-password of your Secret lo-admin' 'NOTES must name the provided admin password Secret'
+render_notes "$WORK/notes-datadir.txt" --set mode=allinone --set adminPassword.autoGenerate=false
+assert_contains "$WORK/notes-datadir.txt" '/data/initial-admin-password' 'NOTES must show where the server writes the initial admin password'
+
 echo "PASS: Helm templates satisfy standalone-ha, clustered HA, and allinone assertions"

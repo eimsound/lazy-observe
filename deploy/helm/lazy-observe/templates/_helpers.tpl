@@ -50,4 +50,39 @@ datadir
 {{- define "lazy-observe.encryptionKey.mountPath" -}}
 /etc/lazy-observe-key
 {{- end }}
+{{- /*
+Where the first admin password (security.admin_password_file) comes from:
+  existing  - adminPassword.existingSecret, mounted read-only;
+  generated - chart-managed <fullname>-admin-password Secret, mounted read-only;
+  datadir   - server generates <data_dir>/initial-admin-password (0600) and
+              forces a change on first login (only when autoGenerate=false and
+              a single replica runs).
+Unlike the encryption key, allinone also defaults to a Secret: a person has to
+read this value, and the distroless image has no shell to `cat` a file in the
+pod. standalone-ha with more than one replica (or HPA) and no Secret fails
+rendering: the generated file would only exist in the bootstrap winner's
+emptyDir.
+*/ -}}
+{{- define "lazy-observe.adminPassword.source" -}}
+{{- $scaled := and .Values.hpa.enabled (gt (int .Values.hpa.maxReplicas) 1) -}}
+{{- $multi := and (eq .Values.mode "standalone-ha") (or (gt (int .Values.replicaCount) 1) $scaled) -}}
+{{- if .Values.adminPassword.existingSecret -}}
+existing
+{{- else if .Values.adminPassword.autoGenerate -}}
+generated
+{{- else if $multi -}}
+{{- fail "adminPassword: standalone-ha with more than one replica (replicaCount > 1 or hpa.enabled) needs one shared first admin password; set adminPassword.existingSecret to a Secret you manage, or set adminPassword.autoGenerate=true" -}}
+{{- else -}}
+datadir
+{{- end -}}
+{{- end }}
+{{- define "lazy-observe.adminPassword.mounted" -}}
+{{- if ne (include "lazy-observe.adminPassword.source" .) "datadir" }}true{{ end -}}
+{{- end }}
+{{- define "lazy-observe.adminPassword.secretName" -}}
+{{- default (printf "%s-admin-password" (include "lazy-observe.fullname" .)) .Values.adminPassword.existingSecret }}
+{{- end }}
+{{- define "lazy-observe.adminPassword.mountPath" -}}
+/etc/lazy-observe-admin
+{{- end }}
 

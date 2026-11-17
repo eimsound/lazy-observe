@@ -100,6 +100,37 @@ encryptionKey:
   # existingSecret is set.
   autoGenerate: true
 
+# First admin password (server: security.admin_password_file). It is read only
+# while the admin account does not exist yet; later password changes happen in
+# the UI and never touch this Secret. The chart mounts it read-only at
+# /etc/lazy-observe-admin/admin-password; it is never passed through
+# environment variables. Without a Secret the server generates a random
+# password, writes it to <data_dir>/initial-admin-password (0600) on the one
+# replica that creates the admin, and forces a change on first login.
+adminPassword:
+  # Secret you manage. The value needs at least 8 characters; surrounding
+  # whitespace and a trailing newline are ignored. Example:
+  #   kubectl create secret generic lazy-observe-admin-password \
+  #     --from-literal=admin-password="$(openssl rand -base64 24)"
+  # A password you provide is treated as chosen by you and is not forced to
+  # change on first login.
+  existingSecret: ""
+  # Key inside the Secret (existing or generated) that holds the value.
+  key: admin-password
+  # Without existingSecret, create <fullname>-admin-password (32 random
+  # alphanumeric characters) on first install so every replica reads the same
+  # password and it survives pod restarts; read it back with the command in
+  # NOTES. Same lookup/keep rules as encryptionKey.autoGenerate: `helm
+  # template`, client-side `--dry-run`, and Argo CD render a new value every
+  # time, so use existingSecret there. Anyone allowed to read Secrets in the
+  # namespace can read this password until you change it in the UI.
+  # Set false to require existingSecret: rendering then fails when
+  # standalone-ha runs more than one replica (replicaCount > 1 or HPA). A
+  # single replica then falls back to the server-generated
+  # <data_dir>/initial-admin-password file; the distroless image has no shell,
+  # so reading it needs `kubectl debug` (see NOTES).
+  autoGenerate: true
+
 process:
   startupTimeout: 20s
   shutdownTimeout: 15s

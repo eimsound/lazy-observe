@@ -95,6 +95,11 @@ spec:
               mountPath: {{ include "lazy-observe.encryptionKey.mountPath" . }}
               readOnly: true
             {{- end }}
+            {{- if include "lazy-observe.adminPassword.mounted" . }}
+            - name: admin-password
+              mountPath: {{ include "lazy-observe.adminPassword.mountPath" . }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -117,6 +122,17 @@ spec:
             items:
               - key: {{ .Values.encryptionKey.key }}
                 path: secret.key
+        {{- end }}
+        {{- if include "lazy-observe.adminPassword.mounted" . }}
+        - name: admin-password
+          secret:
+            secretName: {{ include "lazy-observe.adminPassword.secretName" . }}
+            # Same 0444 reasoning as the encryption key: root-owned Secret
+            # files, nonroot uid 65532, pod-private tmpfs.
+            defaultMode: 0444
+            items:
+              - key: {{ .Values.adminPassword.key }}
+                path: admin-password
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{ toYaml . | nindent 8 }}
