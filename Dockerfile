@@ -1,5 +1,7 @@
-# syntax=docker/dockerfile:1.7
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS builder
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# Every base image is pinned to its multi-platform index digest (the tag is kept
+# for readers); bump tag and digest together.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -41,7 +43,7 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
     mise run --skip-tools dist && \
     mkdir -p /out/data
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 COPY --from=builder --chown=65532:65532 /out/lazy-observe /usr/local/bin/lazy-observe
 COPY --from=builder --chown=65532:65532 /out/data /data
 COPY LICENSE /usr/share/doc/lazy-observe/LICENSE

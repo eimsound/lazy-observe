@@ -4,17 +4,26 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BINARY=${LO_E2E_BINARY:-"$ROOT/bin/lazy-observe"}
 BIN_DIR=${LO_E2E_STORAGE_BIN_DIR:-"$ROOT/.cache/storage-bin"}
-VM_VERSION=${LO_E2E_VM_VERSION:-v1.147.0-cluster}
-VMSTORAGE_IMAGE=${LO_E2E_VMSTORAGE_IMAGE:-"victoriametrics/vmstorage:$VM_VERSION"}
-VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-"victoriametrics/vminsert:$VM_VERSION"}
-VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-"victoriametrics/vmselect:$VM_VERSION"}
+# Every default image is name:tag@sha256:<multi-platform index digest>; the tag
+# is for readers, the digest is what Docker pulls. Bump tag and digest together.
+# Overrides (LO_E2E_*_IMAGE) should be pinned the same way.
+#
+# VictoriaMetrics ships no Debian variant; the -scratch builds carry only the
+# static binary and CA bundle (same entrypoint and ports as the Alpine default).
+# They are pulled from quay.io, VictoriaMetrics' second official registry, whose
+# -cluster digests are identical to Docker Hub's.
+VMSTORAGE_IMAGE=${LO_E2E_VMSTORAGE_IMAGE:-quay.io/victoriametrics/vmstorage:v1.147.0-cluster-scratch@sha256:36fe603968639fd81f1a310965803b06c89178b1eebeef7670d7e949ae26f353}
+VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-quay.io/victoriametrics/vminsert:v1.147.0-cluster-scratch@sha256:7a737181e381c0dd281349a42bc995bb1d4daecca736fa849604b8bd2ea3fa02}
+VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-quay.io/victoriametrics/vmselect:v1.147.0-cluster-scratch@sha256:293302fd3687358bb9e22bb411ef7c2e6802a05c3554c2e9605b50fca61828a0}
 # SeaweedFS is Apache-2.0 and provides a real S3-compatible API without adding
-# a copyleft test dependency. Keep the image tag pinned for repeatable gates.
-SEAWEED_IMAGE=${LO_E2E_SEAWEED_IMAGE:-chrislusf/seaweedfs:4.29}
+# a copyleft test dependency. Upstream only publishes Alpine-based images, so
+# this one stays Alpine; the digest pin keeps the gate repeatable.
+SEAWEED_IMAGE=${LO_E2E_SEAWEED_IMAGE:-chrislusf/seaweedfs:4.29@sha256:d47c7ee99fcb951351d7194915f4e3a5ea604a8e8871183d713907dec4fb9bf5}
 # Valkey is Redis-protocol compatible and BSD-3-Clause. Keep both the version
 # and multi-platform manifest digest fixed so this gate cannot drift to a
 # differently licensed Redis release through a floating image tag.
-VALKEY_IMAGE=${LO_E2E_VALKEY_IMAGE:-valkey/valkey:8.1.3-alpine@sha256:d827e7f7552cdee40cc7482dbae9da020f42bc47669af6f71182a4ef76a22773}
+VALKEY_IMAGE=${LO_E2E_VALKEY_IMAGE:-valkey/valkey:8.1.11-trixie@sha256:8f836008e0986c36adf50da714c7060cf689dbb335f61fe077939d90fa650809}
+POSTGRES_IMAGE=${LO_E2E_POSTGRES_IMAGE:-postgres:16.16-trixie@sha256:dd2bf3ce2dc83a81674cf7f217fcfd8a5009a4b325dda5b843bfee82a06cff6f}
 
 # 网络：脚本自建一个 Docker bridge 网络，依赖容器之间用容器名互访；lazy-observe replica
 # 是主机上的本地进程，经容器在该网络上的 IP 访问它们（Linux 主机可直接路由到 bridge
@@ -201,7 +210,7 @@ post_payload() {
 }
 
 docker network create "$NETWORK" >/dev/null
-docker run -d --name "$PG_NAME" --network "$NETWORK" -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=lazy_observe postgres:16-alpine >/dev/null
+docker run -d --name "$PG_NAME" --network "$NETWORK" -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=lazy_observe "$POSTGRES_IMAGE" >/dev/null
 docker run -d --name "$REDIS_NAME" --network "$NETWORK" "$VALKEY_IMAGE" >/dev/null
 docker run -d --name "$S3_NAME" --network "$NETWORK" \
   --tmpfs /data:rw,size=512m \
