@@ -41,9 +41,16 @@ data:
       startup_timeout: {{ .Values.process.startupTimeout }}
       shutdown_timeout: {{ .Values.process.shutdownTimeout }}
       drain_timeout: {{ .Values.process.drainTimeout }}
-    {{- if include "lazy-observe.encryptionKey.mounted" . }}
+    {{- $keyMounted := include "lazy-observe.encryptionKey.mounted" . }}
+    {{- $adminMounted := include "lazy-observe.adminPassword.mounted" . }}
+    {{- if or $keyMounted $adminMounted }}
     security:
+      {{- if $keyMounted }}
       secret_key_file: {{ printf "%s/secret.key" (include "lazy-observe.encryptionKey.mountPath" .) | quote }}
+      {{- end }}
+      {{- if $adminMounted }}
+      admin_password_file: {{ printf "%s/admin-password" (include "lazy-observe.adminPassword.mountPath" .) | quote }}
+      {{- end }}
     {{- end }}
     self_monitoring:
       enabled: true
