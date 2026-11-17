@@ -57,6 +57,16 @@ http(s)://<host>/p/<project-slug>@<token>
 凭据，但**只通过 `Authorization: Bearer <token>` 请求头发送**，不得把完整 DSN 作为
 请求明文。
 
+项目 API Token 只能摄取（ADR 0010）：SDK DSN 里的 Token 只用于 §2.1 列出的摄取
+端点。所有读路由（含 `/mcp`、`/api/system/info`）收到项目 Token 时返回 `403`，
+响应体 `code` 为 `ingest_only_token`；读操作只接受会话 Cookie，或用户 API Token
+（`lou_...`）加 `X-LO-Project` 请求头选择项目。
+
+MCP（`lazy-observe mcp --dsn`）的 DSN 形状与上面相同，但 `<token>` 必须是
+`lou_...` 前缀的用户 API Token（在 Web UI「设置 → 个人 API Token」创建）；
+`<project-slug>` 通过 `X-LO-Project` 请求头发送。`lazy-observe mcp` 在启动时拒绝
+非 `lou_` 的 Token，不会等到第一次工具调用才收到 `403`。
+
 ### 2.3 协议版本变更规则
 
 - **向后不兼容的变更**（端点路径/语义、请求或响应字段删除或语义变化、鉴权方式
