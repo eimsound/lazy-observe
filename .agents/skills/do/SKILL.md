@@ -17,6 +17,17 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 拿到这两件后，把匹配到的流程步骤逐字抄进 todo list，再动手。跳过的步骤留在列表里，写一行 `skip: <理由>`。悄悄少做一步是不允许的。
 
+### 开工前置检查
+
+动第一个文件前跑两条命令，结果记进 todo list：
+
+1. `gh auth status`。失败时，只读的 CI 查询改用公开 API，例如
+   `curl -fsS "https://api.github.com/repos/eimsound/lazy-observe/actions/runs?branch=main&per_page=1"`；
+   要开 PR、触发 workflow、合并时，停下来请负责人登录。不要做到一半才发现。
+2. `git status --short`。有不属于本任务的未提交改动时，切片一律在 worktree 里基于 base 开工
+   （`git worktree add <dir> -b slice/<topic>-<n> <base>`，代替「提交、推送与合入」第 1 步的 `git switch`），不碰这些改动。
+   切片要改的文件和这些改动重叠时，先问负责人；等负责人提交后，再基于新的 base 开分支。
+
 ## 路由
 
 | 情境 | 流程 | 主 skill | 产物 |
@@ -107,9 +118,19 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | --- | --- | --- |
 | PR、push 到 `main`、`integration/**` | `ci.yml` | 上表按改动面挑出的 job，由 `ci-ok` 汇总 |
 | `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、性能门禁，全过才出包 |
-| 手动 | `bench.yml` | 按需跑性能门禁 |
+| 手动 | `bench.yml` | 依次跑 `bench`（30 秒摄入基准 + 基线门禁）、`perf-release`（双架构产物门禁 + 零配置 release smoke）、`perf-ha`（`e2e-ha` 全部 HA 断言 + 查询 P95 与弱扩展门禁）、`perf-results-check` |
 
 切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。分组规则由 `mise run ci-changes-test` 钉住，改分组时同步改测试。
+
+只补验证、不改代码时（确认基线、补跑门禁、发版前复核），上面「本地必须跑」不适用：重门禁优先走 CI 手动入口，只有 CI 没有对应入口时才在本地跑。
+
+| 要补的门禁 | 手动入口 |
+| --- | --- |
+| `bench`、`perf-release`（含 `check-release-smoke.sh`）、`perf-ha`（含 `e2e-ha`）、`perf-results-check`；`performance-gates` = `perf-release` + `perf-ha` | `bench.yml` |
+| 双架构容器冒烟、性能门禁、snapshot 归档 | `release.yml`（手动只出 snapshot，不发布） |
+| `ci.yml` 业务 job（e2e、e2e-restart、meta-pg、web、SDK 等） | `ci.yml`（手动触发即全量） |
+
+触发：`gh workflow run bench.yml --ref <branch>`，再用 `gh run list --workflow bench.yml --event workflow_dispatch --limit 1` 取 run id，`gh run watch <id>`。`gh` 未登录时，请负责人在 GitHub 网页 Actions → 对应 workflow → Run workflow 手动触发。
 
 ## AFK 契约
 
@@ -126,11 +147,14 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 - 删数据、改 `docs/requirements.md`、动根 `LICENSE`；
 - 调外部付费服务、发通知给人；
 - 同一门禁连续失败两次以上，且原因不明；
-- 需要新增依赖（先过许可证 allowlist：只允许 Apache-2.0/MIT/BSD，禁 AGPL/GPL）。
+- 需要新增依赖（先过许可证 allowlist：只允许 Apache-2.0/MIT/BSD，禁 AGPL/GPL）；
+- 改宿主机全局环境：docker 镜像改 tag 或换拉取来源、全局安装工具、改 DNS 或代理、改 shell 配置。拉镜像或装工具失败时停下报告，不要自行绕路。
 
 可以自己往前走的：本地改代码、本地跑门禁、写测试、更新 `CHANGELOG.md`、本地 commit、按下一节推自己的切片分支、开 PR、等 CI、CI 绿后合并该 PR。
 
 `/skill:implement-spec` 会开 worktree 和 integration branch。每个 implementer 必须基于 integration branch 开工，收尾前把 integration branch 的 tip 合回自己的分支。并行实现线程之间不共享工作树。
+
+编排者只分派和验收，不自己跑切片的门禁。subagent 汇报的「通过」「已修复」，先抽查它贴的命令输出或 CI 日志再采信；拿不出证据就当没跑。subagent 遇到上面「必须停下来等人」的情况，先回报编排者，由编排者问负责人。
 
 ## 提交、推送与合入
 
