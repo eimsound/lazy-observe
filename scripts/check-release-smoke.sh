@@ -404,6 +404,8 @@ import sys
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 if payload.get("user", {}).get("username") != "admin" and payload.get("username") != "admin":
     raise SystemExit("authenticated user is not admin")
+if payload.get("must_change_password") is not True:
+    raise SystemExit("generated bootstrap admin is not forced to change its password")
 PY
 
 # Project API tokens are ingest-only; every read below uses a user API token
@@ -424,6 +426,39 @@ path = pathlib.Path(sys.argv[2])
 path.write_text("X-CSRF-Token: " + value + "\n", encoding="utf-8")
 path.chmod(0o600)
 PY
+
+# The generated password must be replaced before any other API works.
+blocked_status=$(curl --silent --show-error --max-time 5 -b "$work/cookies" \
+  --output "$work/blocked.json" --write-out '%{http_code}' \
+  http://127.0.0.1:3100/api/auth/tokens) || fail "password-change gate request failed"
+[[ $blocked_status == 403 ]] && grep -Fq '"password_change_required"' "$work/blocked.json" || \
+  fail "flagged bootstrap admin reached /api/auth/tokens (HTTP $blocked_status)"
+"$python_command" - "$work/login.json" "$work/password-change.json" <<'PY' || fail "could not prepare the password change"
+import json
+import pathlib
+import secrets
+import sys
+
+current = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["password"]
+path = pathlib.Path(sys.argv[2])
+body = {"current_password": current, "new_password": secrets.token_urlsafe(24)}
+path.write_text(json.dumps(body, separators=(",", ":")), encoding="utf-8")
+path.chmod(0o600)
+PY
+curl --fail --silent --show-error --max-time 10 -b "$work/cookies" -H @"$work/csrf.header" \
+  -H 'Content-Type: application/json' --data-binary @"$work/password-change.json" \
+  http://127.0.0.1:3100/api/auth/password >/dev/null || fail "bootstrap admin could not change the initial password"
+curl --fail --silent --show-error --max-time 5 -b "$work/cookies" \
+  http://127.0.0.1:3100/api/auth/me >"$work/auth-me.json" || fail "session lost after the password change"
+"$python_command" - "$work/auth-me.json" <<'PY' || fail "password change did not clear must_change_password"
+import json
+import pathlib
+import sys
+
+if json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")).get("must_change_password") is not False:
+    raise SystemExit("must_change_password still set")
+PY
+
 curl --fail --silent --show-error --max-time 5 -b "$work/cookies" -H @"$work/csrf.header" \
   -H 'Content-Type: application/json' --data-binary '{"name":"release-smoke-read"}' \
   http://127.0.0.1:3100/api/auth/tokens | "$python_command" -c '

@@ -17,7 +17,7 @@ const AuthenticatedAppLayout = lazyRouteComponent(
  */
 export function AppLayout() {
   const { t } = useTranslation();
-  const { status } = useAuth();
+  const { status, user } = useAuth();
   const { pathname, searchStr } = useRouterState({
     select: (s) => ({ pathname: s.location.pathname, searchStr: s.location.searchStr }),
   });
@@ -39,6 +39,15 @@ export function AppLayout() {
     if (pathname === "/login") return null;
     const redirect = pathname + (searchStr ?? "");
     return <Navigate to="/login" search={{ redirect }} replace />;
+  }
+
+  if (user?.must_change_password) {
+    // The backend refuses everything else with 403 password_change_required
+    // until the generated initial password is replaced. Same transient-match
+    // guard as the login redirect above.
+    if (pathname === "/change-password") return null;
+    const redirect = pathname + (searchStr ?? "");
+    return <Navigate to="/change-password" search={{ redirect }} replace />;
   }
 
   return <AuthenticatedAppLayout />;

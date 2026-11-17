@@ -27,7 +27,8 @@ CREATE TABLE users (
     display_name TEXT NULL,
     email TEXT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL,
-    last_login_at TIMESTAMPTZ NULL
+    last_login_at TIMESTAMPTZ NULL,
+    must_change_password BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE user_api_tokens (

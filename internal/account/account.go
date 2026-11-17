@@ -39,6 +39,7 @@ const (
 	CodePasswordTooShort       ErrorCode = "password_too_short"
 	CodeInvalidCurrentPassword ErrorCode = "invalid_current_password"
 	CodeInvalidEmail           ErrorCode = "invalid_email"
+	CodePasswordChangeRequired ErrorCode = "password_change_required"
 )
 
 type Error struct {
@@ -98,6 +99,9 @@ type User struct {
 	Email       string     `json:"email,omitempty"`
 	CreatedAt   time.Time  `json:"created_at,omitempty"`
 	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
+	// MustChangePassword limits the user to reading the current user, changing
+	// the own password, and logout until the password is changed.
+	MustChangePassword bool `json:"must_change_password"`
 }
 
 type Token struct {
@@ -529,7 +533,7 @@ func userFacts(action string, user User, targetType string) AuditFacts {
 func userFromMeta(user meta.UserInfo) User {
 	return User{
 		ID: user.ID, Username: user.Username, Role: user.Role, DisplayName: user.DisplayName, Email: user.Email,
-		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt,
+		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt, MustChangePassword: user.MustChangePassword,
 	}
 }
 

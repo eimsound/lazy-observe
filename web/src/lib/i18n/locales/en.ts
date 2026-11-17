@@ -299,6 +299,9 @@ export const en: typeof zh = {
     saved: "Saved",
   },
   password: {
+    requiredTitle: "Change the initial password",
+    requiredDescription:
+      "This password was generated on first startup. Change it to continue using lazy-observe.",
     title: "Password",
     description: "Use a strong password that is unique to this platform.",
     current: "Current password",

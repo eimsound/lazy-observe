@@ -13,6 +13,10 @@ import {
 } from "@/routes/trace-evidence-links";
 
 const LoginPage = lazyRouteComponent(() => import("@/routes/login-page"), "LoginPage");
+const ChangePasswordPage = lazyRouteComponent(
+  () => import("@/routes/change-password-page"),
+  "ChangePasswordPage",
+);
 const OverviewPage = lazyRouteComponent(() => import("@/routes/overview-page"), "OverviewPage");
 const MetricsPage = lazyRouteComponent(() => import("@/routes/metrics-page"), "MetricsPage");
 const LogsPage = lazyRouteComponent(() => import("@/routes/logs-page"), "LogsPage");
@@ -158,6 +162,17 @@ export const loginRoute = createRoute({
     redirect: typeof search.redirect === "string" ? search.redirect : undefined,
   }),
   component: LoginPage,
+});
+
+// Forced first-login password change. Standalone like /login: the app shell
+// would otherwise issue API calls the backend refuses until the change.
+export const changePasswordRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/change-password",
+  validateSearch: (search: Record<string, unknown>): { redirect?: string } => ({
+    redirect: typeof search.redirect === "string" ? search.redirect : undefined,
+  }),
+  component: ChangePasswordPage,
 });
 
 // Pathless layout route: the authenticated shell wraps all app pages.
@@ -332,6 +347,7 @@ const settingsRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([
   loginRoute,
+  changePasswordRoute,
   appRoute.addChildren([
     overviewRoute,
     metricsRoute,

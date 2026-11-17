@@ -130,7 +130,10 @@ func (g *Gateway) login(c *fiber.Ctx) error {
 	c.Cookie(g.buildSessionCookie(result.Token, result.ExpiresAt))
 	g.auditAccountFacts(c, result.Facts)
 	u := result.User
-	return c.JSON(fiber.Map{"username": u.Username, "role": u.Role, "display_name": u.DisplayName, "email": u.Email})
+	return c.JSON(fiber.Map{
+		"username": u.Username, "role": u.Role, "display_name": u.DisplayName, "email": u.Email,
+		"must_change_password": u.MustChangePassword,
+	})
 }
 
 func (g *Gateway) loginServiceUnavailable(c *fiber.Ctx, stage string, err error) error {
@@ -170,6 +173,7 @@ func (g *Gateway) me(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"id": full.ID, "username": full.Username, "role": full.Role,
 		"display_name": full.DisplayName, "email": full.Email, "last_login_at": full.LastLoginAt,
+		"must_change_password": full.MustChangePassword,
 	})
 }
 

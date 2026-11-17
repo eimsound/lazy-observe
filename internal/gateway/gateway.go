@@ -1104,7 +1104,9 @@ func (g *Gateway) queryRequired(c *fiber.Ctx) error {
 		return ingestOnlyToken(c)
 	}
 	if err := g.loadSession(c); err != nil {
-		_ = unauthorized(c)
+		if !errors.Is(err, errResponseWritten) {
+			_ = unauthorized(c)
+		}
 		return nil
 	}
 	return g.loadQueryProject(c)
@@ -1151,6 +1153,9 @@ func (g *Gateway) sessionRequired(c *fiber.Ctx) error {
 		return nil
 	}
 	if err := g.loadSession(c); err != nil {
+		if errors.Is(err, errResponseWritten) {
+			return nil
+		}
 		if account.Code(err) == account.CodeUnavailable {
 			_ = c.Status(fiber.StatusServiceUnavailable).
 				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
@@ -1192,6 +1197,9 @@ func (g *Gateway) loadUserAPIToken(c *fiber.Ctx, token string) (meta.UserInfo, e
 			JSON(fiber.Map{"error": "authentication temporarily unavailable"})
 		return meta.UserInfo{}, errResponseWritten
 	}
+	if passwordChangeBlocks(c, u) {
+		return meta.UserInfo{}, errResponseWritten
+	}
 	return accountUserInfo(u), nil
 }
 
@@ -1204,21 +1212,51 @@ func (g *Gateway) loadSession(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	if passwordChangeBlocks(c, u) {
+		return errResponseWritten
+	}
 	c.Locals(userLocal, accountUserInfo(u))
 	return nil
+}
+
+// passwordChangeRoutes are the only routes a user flagged with
+// must_change_password may reach, whether through a session or a user API
+// token: read the current user, change the own password, and log out.
+var passwordChangeRoutes = map[string]struct{}{
+	fiber.MethodGet + " /api/auth/me":        {},
+	fiber.MethodPost + " /api/auth/password": {},
+	fiber.MethodPost + " /api/auth/logout":   {},
+}
+
+// passwordChangeBlocks writes 403 password_change_required and reports true
+// when a flagged user calls anything outside passwordChangeRoutes. The flag is
+// read from metadata on every request (ADR 0006), so a password change takes
+// effect immediately for every session adapter and replica.
+func passwordChangeBlocks(c *fiber.Ctx, user account.User) bool {
+	if !user.MustChangePassword {
+		return false
+	}
+	if _, allowed := passwordChangeRoutes[c.Method()+" "+c.Route().Path]; allowed {
+		return false
+	}
+	_ = c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+		"code":  string(account.CodePasswordChangeRequired),
+		"error": "change the initial password before using the API",
+	})
+	return true
 }
 
 func accountUserInfo(user account.User) meta.UserInfo {
 	return meta.UserInfo{
 		ID: user.ID, Username: user.Username, Role: user.Role, DisplayName: user.DisplayName, Email: user.Email,
-		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt,
+		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt, MustChangePassword: user.MustChangePassword,
 	}
 }
 
 func accountUser(user meta.UserInfo) account.User {
 	return account.User{
 		ID: user.ID, Username: user.Username, Role: user.Role, DisplayName: user.DisplayName, Email: user.Email,
-		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt,
+		CreatedAt: user.CreatedAt, LastLoginAt: user.LastLoginAt, MustChangePassword: user.MustChangePassword,
 	}
 }
 

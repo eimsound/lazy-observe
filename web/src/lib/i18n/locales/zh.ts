@@ -303,6 +303,8 @@ export const zh = {
     mismatch: "两次输入的密码不一致",
     changed: "密码已修改，其他会话已退出登录。",
     submit: "修改密码",
+    requiredTitle: "请先修改初始密码",
+    requiredDescription: "当前密码是首次启动时自动生成的。修改后才能继续使用 lazy-observe。",
   },
   sessions: {
     title: "会话",

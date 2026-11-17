@@ -22,6 +22,9 @@ func (User) Fields() []ent.Field {
 		field.String("email").Optional().Unique(),
 		field.Time("created_at").Default(time.Now).Immutable(),
 		field.Time("last_login_at").Optional(),
+		// MustChangePassword blocks every API except reading the current user,
+		// changing the own password, and logout until the password is changed.
+		field.Bool("must_change_password").Default(false),
 	}
 }
 
