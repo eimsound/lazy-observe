@@ -19,6 +19,12 @@ export interface User {
   display_name?: string;
   email?: string;
   last_login_at?: string | null;
+  /**
+   * Set for the generated bootstrap admin password: the backend answers every
+   * API except /auth/me, /auth/password and /auth/logout with 403
+   * `password_change_required` until the password is changed.
+   */
+  must_change_password?: boolean;
 }
 
 export interface SessionInfo {
@@ -119,6 +125,8 @@ export async function updateMe(profile: ProfileUpdate): Promise<User> {
 export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
   if (IS_MOCK) {
     if (!currentPassword || !newPassword) throw new ApiError("invalid request", 400);
+    const user = readMockSession();
+    if (user?.must_change_password) writeMockSession({ ...user, must_change_password: false });
     return delay(undefined, 200);
   }
   await apiSend<void>(

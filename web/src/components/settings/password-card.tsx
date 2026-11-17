@@ -8,7 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-export function PasswordCard() {
+export function PasswordCard({ onChanged }: { onChanged?: () => void | Promise<void> } = {}) {
   const { t } = useTranslation();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -25,6 +25,7 @@ export function PasswordCard() {
       setError(null);
       setDone(true);
       setTimeout(() => setDone(false), 2500);
+      void onChanged?.();
     },
     onError: (cause) => setError((cause as Error).message),
   });

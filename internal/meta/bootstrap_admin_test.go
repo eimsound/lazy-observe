@@ -121,8 +121,18 @@ func TestBootstrapWritesGeneratedAdminPasswordFileWithoutLoggingIt(t *testing.T)
 	if len(password) < minBootstrapAdminPasswordLength {
 		t.Fatalf("generated password length = %d", len(password))
 	}
-	if _, err := store.AuthenticateCredentials(ctx, "admin", password); err != nil {
+	admin, err := store.AuthenticateCredentials(ctx, "admin", password)
+	if err != nil {
 		t.Fatalf("generated password from the file does not authenticate admin: %v", err)
+	}
+	if !admin.MustChangePassword {
+		t.Fatal("generated bootstrap admin must be forced to change the password")
+	}
+	if err := store.ChangePassword(ctx, admin.ID, password, "operator-chosen-password"); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.GetUser(ctx, admin.ID); err != nil || changed.MustChangePassword {
+		t.Fatalf("own password change must clear the flag: user=%#v err=%v", changed, err)
 	}
 
 	logs := records()
@@ -151,8 +161,12 @@ func TestBootstrapUsesProvidedAdminPasswordFile(t *testing.T) {
 	if _, err := store.Bootstrap(ctx, logger, BootstrapAdmin{PasswordFile: passwordFile}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AuthenticateCredentials(ctx, "admin", provided); err != nil {
+	admin, err := store.AuthenticateCredentials(ctx, "admin", provided)
+	if err != nil {
 		t.Fatalf("provided password does not authenticate admin: %v", err)
+	}
+	if admin.MustChangePassword {
+		t.Fatal("a deployer-provided admin password must not be forced to change")
 	}
 	if _, err := os.Stat(generated); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("provided password must not produce a generated file: %v", err)

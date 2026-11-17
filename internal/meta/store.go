@@ -64,6 +64,9 @@ type UserInfo struct {
 	Email       string     `json:"email,omitempty"`
 	CreatedAt   time.Time  `json:"created_at,omitempty"`
 	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
+	// MustChangePassword is set for the generated bootstrap admin password and
+	// cleared by the user's own password change.
+	MustChangePassword bool `json:"must_change_password"`
 }
 
 // ManagedUserCreate contains every account and profile field committed by one
@@ -911,7 +914,7 @@ func (s *Store) ChangePassword(ctx context.Context, userID int, currentPassword,
 	if err != nil {
 		return err
 	}
-	return s.client.User.UpdateOneID(userID).SetPasswordHash(hash).Exec(ctx)
+	return s.client.User.UpdateOneID(userID).SetPasswordHash(hash).SetMustChangePassword(false).Exec(ctx)
 }
 
 // UpdateUserProfile updates display name and email. A non-nil pointer sets
@@ -1169,7 +1172,8 @@ func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, a
 		if err != nil {
 			return fmt.Errorf("create bootstrap admin: %w", err)
 		}
-		if _, err := s.CreateUser(ctx, "admin", password, string(user.RoleAdmin)); err != nil {
+		// The deployer chose this password, so it is not forced to change.
+		if err := s.createBootstrapAdmin(ctx, password, false); err != nil {
 			return fmt.Errorf("create bootstrap admin: %w", err)
 		}
 		logger.Info(
@@ -1190,7 +1194,9 @@ func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, a
 	if err := writeInitialAdminPassword(admin.GeneratedPasswordFile, password); err != nil {
 		return fmt.Errorf("create bootstrap admin: %w", err)
 	}
-	if _, err := s.CreateUser(ctx, "admin", password, string(user.RoleAdmin)); err != nil {
+	// The generated password sits in a file on disk, so the first login must
+	// replace it before anything else is allowed.
+	if err := s.createBootstrapAdmin(ctx, password, true); err != nil {
 		_ = os.Remove(admin.GeneratedPasswordFile)
 		return fmt.Errorf("create bootstrap admin: %w", err)
 	}
@@ -1207,6 +1213,19 @@ func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, a
 		"host", host,
 	)
 	return nil
+}
+
+func (s *Store) createBootstrapAdmin(ctx context.Context, password string, mustChangePassword bool) error {
+	hash, err := HashPassword(password)
+	if err != nil {
+		return err
+	}
+	return s.client.User.Create().
+		SetUsername("admin").
+		SetPasswordHash(hash).
+		SetRole(user.RoleAdmin).
+		SetMustChangePassword(mustChangePassword).
+		Exec(ctx)
 }
 
 func randomToken() (string, error) {
@@ -1230,7 +1249,10 @@ func randomPassword() (string, error) {
 }
 
 func userInfo(u *User) UserInfo {
-	info := UserInfo{ID: u.ID, Username: u.Username, Role: string(u.Role), CreatedAt: u.CreatedAt}
+	info := UserInfo{
+		ID: u.ID, Username: u.Username, Role: string(u.Role), CreatedAt: u.CreatedAt,
+		MustChangePassword: u.MustChangePassword,
+	}
 	if u.DisplayName != "" {
 		info.DisplayName = u.DisplayName
 	}
