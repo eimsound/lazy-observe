@@ -6,7 +6,7 @@
 
 - 源规格：[Issue AI 持久分析 PRD](../specs/issue-ai-analysis.md)
 - 架构决策：[ADR 0009](../adr/0009-run-issue-ai-as-durable-jobs.md)
-- 领域词汇：[GLOSSARY.md](../../GLOSSARY.md)
+- 领域词汇：[GLOSSARY.md](../GLOSSARY.md)
 - 前置能力：核心可观测性闭环预生产质量轮（计划已完成，存于私有归档）产出的持久 Issue 生命周期事实、稳定错误身份和跨信号关联。
 - 最终状态：自动和手工 Issue AI 意图都进入可恢复的持久任务；HTTP 触发不等待模型；固定上下文、准确调用记录、预算、租约、接管纪元、取消、流式历史和权限可通过公开接口验证；AI 成败不影响 Issue、告警或错误摄取。
 - 范围外：把 Issue AI 纳入核心预生产质量验收、Standalone 独立 Worker、多应用副本容量语义、MCP、写工具、货币成本、任务级 token 汇总、WebSocket、旧同步接口或旧发布前数据库兼容路径。
@@ -145,7 +145,7 @@
 - [ ] `mise run workflow-check`
 - [ ] `git diff --check`
 - [ ] `git status --short internal/db/ent` 无输出。
-- [ ] 确认未修改 `docs/requirements.md`，没有发布前旧 schema/API 兼容 adapter、fallback 或 alias。
+- [ ] 确认未修改 `.agents/docs/requirements.md`，没有发布前旧 schema/API 兼容 adapter、fallback 或 alias。
 - [ ] 逐项核对 Issue AI 源规格的用户故事、设置、上下文、持久执行、UI、测试和范围外决策，每项至少由一个公开契约或真实产品断言覆盖。
 - [ ] 确认核心预生产质量 Spec、Plan 和门禁在全局 AI 禁用时仍然完整，不引用 Issue AI 成功作为验收条件。
 

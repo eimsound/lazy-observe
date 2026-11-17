@@ -144,7 +144,7 @@ available:
   three-replica profile.
 
 See [Deployment](docs/deployment.md) for both setups and
-[Architecture](docs/architecture.md) for process and security details.
+[Architecture](.agents/docs/architecture.md) for process and security details.
 
 ## Development
 
@@ -163,10 +163,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, checks, and pull request rules
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
+- [Architecture](.agents/docs/architecture.md)
 - [Deployment](docs/deployment.md)
 - [SDK and server compatibility](docs/version-matrix.md)
-- [Architecture decision records](docs/adr/)
+- [Architecture decision records](.agents/docs/adr/)
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 

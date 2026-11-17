@@ -267,7 +267,7 @@ The PDB is enabled by default with `minAvailable: 1`. Tune the HPA minimum and
 PDB together so voluntary disruption cannot remove all ready replicas. Ingress
 is opt-in under `ingress.*`.
 
-[ADR 0001](adr/0001-nightingale-style-alert-engine.md) defines the implemented
+[ADR 0001](../.agents/docs/adr/0001-nightingale-style-alert-engine.md) defines the implemented
 single-owner alert engine. Every application replica hosts an evaluator
 candidate, while rendezvous assignment and a PostgreSQL lease/fencing epoch
 allow only one candidate to commit each rule's state and Outbox work. Gateway
@@ -323,7 +323,7 @@ database without racing seed records or credentials.
 The project is pre-release. SQLite and PostgreSQL each have one mutable
 `001_baseline.sql`; after an incompatible schema change, recreate the
 development database. Existing databases created by earlier commits are not a
-supported upgrade source. See [ADR 0003](adr/0003-pre-release-single-database-baseline.md).
+supported upgrade source. See [ADR 0003](../.agents/docs/adr/0003-pre-release-single-database-baseline.md).
 
 ## S3-compatible blob storage
 

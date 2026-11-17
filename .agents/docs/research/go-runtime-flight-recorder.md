@@ -151,5 +151,5 @@ Go Execution Tracer Overhaul 是 Flight Recorder 所依赖的 Go runtime 基础�
 - [Go proposal #63185: runtime/trace flight recording](https://github.com/golang/go/issues/63185)
 - [Execution tracer overhaul design #60773](https://github.com/golang/proposal/blob/master/design/60773-execution-tracer-overhaul.md)
 - [Go Blog: Flight Recorder in Go 1.25](https://go.dev/blog/flight-recorder)
-- [Go SDK 文档](../sdk/go.md)（SDK 源码位于本仓库 `sdk/go`）
+- [Go SDK 文档](../../../docs/sdk/go.md)（SDK 源码位于本仓库 `sdk/go`）
 - [项目需求基线](../requirements.md)

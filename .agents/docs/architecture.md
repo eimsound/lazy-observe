@@ -228,4 +228,4 @@ The Logs React adapter executes finite query plans through React Query, connects
 - **AI:** an optional provider-neutral chat client supports OpenAI, Anthropic, and native Ollama protocols. Implemented features include connectivity checks, natural-language MetricsQL/LogsQL generation, bounded query execution and explanation, asynchronous new-Issue analysis, and project-scoped GenAI token/cost/call aggregation. AI remains disabled by default and outside mandatory ingest/query paths.
 - **Release and performance gates:** release builds cover Linux on amd64/arm64 with CGO disabled. Local mise gates validate embedded payloads and zero-configuration startup, query P95, Go SDK middleware overhead, and real multi-replica scaling. GitHub Actions workflows consume the same entry points on GitHub-hosted runners; CI runs only the jobs whose surface a change touches, and CI, performance, and release runs are reported independently.
 
-See [Deployment](deployment.md) for concrete configuration and operational boundaries.
+See [Deployment](../../docs/deployment.md) for concrete configuration and operational boundaries.

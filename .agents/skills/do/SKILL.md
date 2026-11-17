@@ -32,15 +32,15 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 | 情境 | 流程 | 主 skill | 产物 |
 | --- | --- | --- | --- |
-| 新行为、跨层改动、一个会话能做完 | feature | `/skill:spec-to-plan` → `/skill:implement` | `docs/plans/<topic>.md` |
+| 新行为、跨层改动、一个会话能做完 | feature | `/skill:spec-to-plan` → `/skill:implement` | `.agents/docs/plans/<topic>.md` |
 | 多票、跨会话、可并行 | feature-multi | `/skill:to-spec` → `/skill:to-tickets` → `/skill:implement-spec` | GitHub issue + integration branch |
 | 报错、回归、flaky 测试 | bug-fix | `/skill:diagnosing-bugs` | 回归测试 + 证据 |
 | 只读问题（"这块怎么工作"） | investigate | 直接查代码，不改 | 回答 + 文件行号 |
 | 行为不变的整形 | refactor | `/skill:tdd` 保护接缝 | 全绿 diff |
 | 发布、tag、容器、门面 | release | `/skill:wizard` 处理凭据 | `CHANGELOG.md` + tag |
-| 文档、README、调研归档 | docs | 直接改 | 对应 md |
-| 长时间无人值守 | afk-run | `/skill:chief-of-staff` + `/skill:implement-spec` | `docs/afk/<goal>/` |
-| 方向没定、要拍板 | 先 `/skill:grill-with-docs`，再回本文件 | ADR | `docs/adr/` |
+| 文档、README、调研归档 | docs | 直接改 | 按读者选目录：用户文档放 `docs/`，AI/规划放 `.agents/docs/`（见 `AGENTS.md`） |
+| 长时间无人值守 | afk-run | `/skill:chief-of-staff` + `/skill:implement-spec` | `.agents/docs/afk/<goal>/` |
+| 方向没定、要拍板 | 先 `/skill:grill-with-docs`，再回本文件 | ADR | `.agents/docs/adr/` |
 | 巨大且看不清全貌 | `/skill:wayfinder`，清完雾再回本文件 | 决策票 | GitHub issue |
 
 `/skill:to-spec` 和 `/skill:to-tickets` 产出的票已经带 `ready-for-agent`，不要再 triage。
@@ -50,8 +50,8 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 ### feature
 
-1. 读 `docs/requirements.md` 对应小节、相关 ADR、`GLOSSARY.md` 术语。不要改 `requirements.md`。
-2. `/skill:spec-to-plan` 产出计划，落到 `docs/plans/<topic>.md`；计划里必须有仓库证据、两条备选路线、Tracer Bullet 切片、每切片的 red/green 命令。
+1. 读 `.agents/docs/requirements.md` 对应小节、相关 ADR、`.agents/docs/GLOSSARY.md` 术语。不要改 `requirements.md`。
+2. `/skill:spec-to-plan` 产出计划，落到 `.agents/docs/plans/<topic>.md`；计划里必须有仓库证据、两条备选路线、Tracer Bullet 切片、每切片的 red/green 命令。
 3. `/skill:implement`：每个切片先写失败测试，再最小实现，跑门禁，在计划里勾选并贴证据（命令 + 结论）。
 4. 收尾：`/skill:code-review`（Standards 对照 `AGENTS.md`，Spec 对照计划）→ 更新 `CHANGELOG.md` → `/skill:retro`。
 
@@ -140,13 +140,13 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 
 1. **可判定的退出谓词**：一条命令，例如 `mise run test` 或 `mise run e2e`。它现在要么红（bug-fix），要么绿（feature 的基线），不能是"看起来差不多"。
 2. **有界范围**：一个 plan 文件或一张票，写清 in scope / out of scope。
-3. **可审计的记忆**：长任务用 `/skill:chief-of-staff`，记忆放 `docs/afk/<goal>/`（`index.md` + 每页一件事）。每条结论带日期；涉及代码的结论带 commit。短任务把执行日志追加到 `docs/plans/<topic>.md` 的 `## 执行日志`，每条一行：`<时间> <命令> → <结论>`。不进日志的动作视为没发生。
+3. **可审计的记忆**：长任务用 `/skill:chief-of-staff`，记忆放 `.agents/docs/afk/<goal>/`（`index.md` + 每页一件事）。每条结论带日期；涉及代码的结论带 commit。短任务把执行日志追加到 `.agents/docs/plans/<topic>.md` 的 `## 执行日志`，每条一行：`<时间> <命令> → <结论>`。不进日志的动作视为没发生。
 
 必须停下来等人的情况：
 
 - 打 tag、发 release、推容器镜像；
 - 直接往 `main` 或 integration branch 推；对共享分支强推；
-- 删数据、改 `docs/requirements.md`、动根 `LICENSE`；
+- 删数据、改 `.agents/docs/requirements.md`、动根 `LICENSE`；
 - 调外部付费服务、发通知给人；
 - 同一门禁连续失败两次以上，且原因不明；
 - 需要新增依赖（先过许可证 allowlist：只允许 Apache-2.0/MIT/BSD，禁 AGPL/GPL）；
