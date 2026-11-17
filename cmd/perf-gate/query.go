@@ -82,7 +82,7 @@ func runQueryGate(args []string) error {
 	baseURL := flags.String("base-url", "", "live lazy-observe replica URL")
 	tokenEnv := flags.String(
 		"token-env",
-		"LO_PERF_TOKEN",
+		"LO_PERF_QUERY_TOKEN",
 		"environment variable containing a user API token (lou_...) used for every read; project tokens are ingest-only",
 	)
 	project := flags.String("project", defaultReadProject, "project slug sent as "+projectHeader+" on every read")
