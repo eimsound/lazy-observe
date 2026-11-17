@@ -795,8 +795,8 @@ PY
     QUERY_OUTPUT=""
     SCALE_OUTPUT=""
   fi
-  # perf-gate query only reads: LO_PERF_TOKEN carries the user API token there.
-  LO_PERF_TOKEN="$READ_TOKEN" "$WORK/perf-gate" query \
+  # perf-gate query only reads, so it takes the user API token from LO_PERF_QUERY_TOKEN.
+  LO_PERF_QUERY_TOKEN="$READ_TOKEN" "$WORK/perf-gate" query \
     --config "$ROOT/bench/performance-gates.json" \
     --base-url http://127.0.0.1:23102 --project "$PROJECT_TWO_SLUG" \
     --issue-id "$PERF_ISSUE_ID" --log-marker "$PERF_LOG_MARKER" \

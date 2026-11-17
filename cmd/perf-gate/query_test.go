@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -429,5 +430,27 @@ func TestLoadReadCredentialRequiresUserTokenAndProject(t *testing.T) {
 	auth, err := loadReadCredential("LO_PERF_TEST_READ", " team-a ")
 	if err != nil || auth.token != "lou_user_secret" || auth.project != "team-a" {
 		t.Fatalf("auth=%#v err=%v", auth, err)
+	}
+}
+
+// ADR 0010: perf-gate query only reads, so by default it must take the user API
+// token from LO_PERF_QUERY_TOKEN, the same variable scale uses for reads.
+// LO_PERF_TOKEN holds the project ingest token and must not be consulted.
+func TestRunQueryGateDefaultsToQueryTokenEnv(t *testing.T) {
+	args := []string{
+		"--config", filepath.Join("..", "..", "bench", "performance-gates.json"),
+		"--base-url", "http://127.0.0.1:1",
+	}
+	t.Setenv("LO_PERF_TOKEN", testIngestToken)
+	t.Setenv("LO_PERF_QUERY_TOKEN", "")
+	err := runQueryGate(args)
+	if err == nil || !strings.Contains(err.Error(), "LO_PERF_QUERY_TOKEN is empty") {
+		t.Fatalf("missing query token error = %v", err)
+	}
+	t.Setenv("LO_PERF_TOKEN", "")
+	t.Setenv("LO_PERF_QUERY_TOKEN", testReadAuth.token)
+	err = runQueryGate(args)
+	if err == nil || !strings.Contains(err.Error(), "issue-id") {
+		t.Fatalf("user token in LO_PERF_QUERY_TOKEN was not accepted; err = %v", err)
 	}
 }
