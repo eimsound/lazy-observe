@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -36,6 +37,18 @@ func TestProjectTokenCannotQuery(t *testing.T) {
 		{http.MethodGet, "/api/profiles"},
 		{http.MethodGet, "/api/system/info"},
 		{http.MethodPost, "/mcp"},
+		// Session API group (userRequired): reads must refuse project tokens
+		// with the same 403 ingest_only_token as the telemetry query routes.
+		{http.MethodGet, "/api/issues"},
+		{http.MethodGet, "/api/issues/1"},
+		{http.MethodGet, "/api/issues/1/events/1"},
+		{http.MethodGet, "/api/alerts"},
+		{http.MethodGet, "/api/hosts"},
+		{http.MethodGet, "/api/scrape-targets"},
+		{http.MethodGet, "/api/projects"},
+		{http.MethodGet, "/api/auth/me"},
+		{http.MethodGet, "/api/audit"},
+		{http.MethodGet, "/api/system/error-inbox"},
 	} {
 		t.Run(test.method+" "+test.target, func(t *testing.T) {
 			req := httptest.NewRequest(test.method, test.target, bytes.NewReader(nil))
@@ -44,8 +57,18 @@ func TestProjectTokenCannotQuery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			body := readBody(resp)
 			if resp.StatusCode != http.StatusForbidden {
-				t.Fatalf("status=%d want=403 body=%s", resp.StatusCode, readBody(resp))
+				t.Fatalf("status=%d want=403 body=%s", resp.StatusCode, body)
+			}
+			var payload struct {
+				Code string `json:"code"`
+			}
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("decode body %q: %v", body, err)
+			}
+			if payload.Code != "ingest_only_token" {
+				t.Fatalf("code=%q want=ingest_only_token body=%s", payload.Code, body)
 			}
 		})
 	}

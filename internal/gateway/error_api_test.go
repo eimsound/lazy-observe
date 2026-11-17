@@ -527,7 +527,7 @@ func TestErrorTrackingLifecycleRawEventsIsolationAndVitals(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/api/issues", nil)
 	req.Header.Set("Authorization", "Bearer "+token1)
 	resp, err = app.Test(req)
-	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+	if err != nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("token issue read status=%d err=%v", resp.StatusCode, err)
 	}
 	resp.Body.Close()
