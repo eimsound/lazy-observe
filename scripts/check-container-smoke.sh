@@ -24,7 +24,9 @@ trap cleanup EXIT HUP INT TERM
 cid=$(docker run -d --name "$container" --publish 127.0.0.1::3100 --platform "$platform" \
   "$image" --listen 0.0.0.0:3100)
 
-host_port=$(docker port "$cid" 3100/tcp | sed -n 's/^127\.0\.0\.1://p' | head -n1)
+# 先收齐再取第一条：pipefail 下 | head -n1 提前退出会让上游收到 SIGPIPE（141）。
+published=$(docker port "$cid" 3100/tcp)
+host_port=$(sed -n '/^127\.0\.0\.1:/{s///p;q;}' <<<"$published")
 if [[ -z $host_port ]]; then
   printf 'could not resolve the published port for %s\n' "$container" >&2
   exit 1
