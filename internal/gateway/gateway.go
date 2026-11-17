@@ -1150,8 +1150,9 @@ func (g *Gateway) sessionRequired(c *fiber.Ctx) error {
 func (g *Gateway) userRequired(c *fiber.Ctx) error {
 	if token := bearerCredential(c); token != "" {
 		if !strings.HasPrefix(token, "lou_") {
-			_ = unauthorized(c)
-			return nil
+			// ADR 0010: project API tokens are ingest-only; refuse them on the
+			// session API exactly like on the telemetry query routes.
+			return ingestOnlyToken(c)
 		}
 		u, err := g.loadUserAPIToken(c, token)
 		if err != nil {

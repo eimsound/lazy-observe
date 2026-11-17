@@ -90,7 +90,7 @@ func TestProjectAPITokenCannotAuthenticateUserAPI(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/projects", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := app.Test(req)
-	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+	if err != nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("project bearer status=%d err=%v", resp.StatusCode, err)
 	}
 }
