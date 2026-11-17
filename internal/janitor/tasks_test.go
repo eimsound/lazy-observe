@@ -24,7 +24,11 @@ func openTestStore(t *testing.T) (*meta.Store, meta.ProjectInfo) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	if _, err := store.Bootstrap(ctx, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+	if _, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	); err != nil {
 		t.Fatal(err)
 	}
 	project, err := store.ProjectBySlug(ctx, "default")

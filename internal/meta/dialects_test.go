@@ -286,12 +286,19 @@ func TestPostgresConcurrentBootstrap(t *testing.T) {
 	}
 	start := make(chan struct{})
 	results := make(chan result, 2)
-	for _, store := range []*Store{storeA, storeB} {
-		go func(store *Store) {
+	// Each replica has its own data_dir; only the bootstrap winner may write
+	// the generated password file into it.
+	passwordFiles := []string{
+		filepath.Join(t.TempDir(), InitialAdminPasswordFileName),
+		filepath.Join(t.TempDir(), InitialAdminPasswordFileName),
+	}
+	for index, store := range []*Store{storeA, storeB} {
+		go func(store *Store, passwordFile string) {
 			<-start
 			var output bytes.Buffer
 			logger := slog.New(slog.NewTextHandler(&output, nil))
-			if _, err := store.Bootstrap(context.Background(), logger); err != nil {
+			admin := BootstrapAdmin{GeneratedPasswordFile: passwordFile}
+			if _, err := store.Bootstrap(context.Background(), logger, admin); err != nil {
 				results <- result{err: err}
 				return
 			}
@@ -300,7 +307,7 @@ func TestPostgresConcurrentBootstrap(t *testing.T) {
 				"lo_test-self-monitoring-derived-token-value",
 			)
 			results <- result{selfProject: project, selfToken: token, logs: output.String(), err: err}
-		}(store)
+		}(store, passwordFiles[index])
 	}
 	close(start)
 	first, second := <-results, <-results
@@ -320,8 +327,25 @@ func TestPostgresConcurrentBootstrap(t *testing.T) {
 	}
 	combinedLogs := first.logs + second.logs
 	if strings.Count(combinedLogs, "created bootstrap admin") != 1 ||
+		strings.Count(combinedLogs, "initial admin password written") != 1 ||
 		strings.Count(combinedLogs, "created default project") != 1 {
 		t.Fatalf("bootstrap creation logs were not single-winner:\n%s", combinedLogs)
+	}
+	written := 0
+	for _, passwordFile := range passwordFiles {
+		password, err := os.ReadFile(passwordFile)
+		switch {
+		case err == nil:
+			written++
+			if strings.Contains(combinedLogs, strings.TrimSpace(string(password))) {
+				t.Fatal("bootstrap logs contain the generated admin password")
+			}
+		case !errors.Is(err, os.ErrNotExist):
+			t.Fatal(err)
+		}
+	}
+	if written != 1 {
+		t.Fatalf("generated admin password files = %d, want exactly the bootstrap winner's", written)
 	}
 
 	for query, want := range map[string]int{

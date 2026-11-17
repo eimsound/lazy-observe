@@ -77,6 +77,12 @@ type Security struct {
 	// an existing file (for example a read-only Kubernetes Secret mount with
 	// `openssl rand -base64 32` output) is only read, never rewritten.
 	SecretKeyFile string `yaml:"secret_key_file"`
+	// AdminPasswordFile supplies the first admin password when the admin
+	// account does not exist yet; surrounding whitespace is ignored and at
+	// least 8 characters are required. Empty generates a random password and
+	// writes it to <data_dir>/initial-admin-password (mode 0600) on the replica
+	// that creates the admin. HA deployments should set this.
+	AdminPasswordFile string `yaml:"admin_password_file"`
 }
 
 // SelfMonitoring controls the platform's use of its own Go SDK.
@@ -435,6 +441,8 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		"LO_REDIS_ADDR":       &c.Redis.Addr,
 		"LO_REDIS_PASSWORD":   &c.Redis.Password,
 		"LO_REDIS_KEY_PREFIX": &c.Redis.KeyPrefix,
+		// A path, not the secret: the password itself never travels via env.
+		"LO_SECURITY_ADMIN_PASSWORD_FILE": &c.Security.AdminPasswordFile,
 	}
 	for name, dst := range stringsMap {
 		if v, ok := lookup(name); ok {
