@@ -69,6 +69,10 @@ expect 'bench/performance-gates.json' 'go ha'
 expect 'bench/baseline.json' 'go'
 expect 'scripts/install.sh' 'go'
 expect '.gitignore' 'go'
+# Dependabot 配置与镜像扫描例外清单只影响 GitHub 服务和 release.yml，由 go job 的 workflow-check 校验。
+expect '.github/dependabot.yml' 'go'
+expect '.trivyignore.yaml' 'go'
+expect 'scripts/check-image-vulns.sh' 'go'
 expect 'scripts/check-js-licenses.sh' 'web sdk_node sdk_browser'
 
 # 打包链路：加 arm64。

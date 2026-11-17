@@ -96,6 +96,8 @@ jobs:
       - run: mise run migration-check
       - run: mise run ent-generate-check
       - run: mise run license-check
+      # 服务端模块与 sdk/go 的可达漏洞；漏洞库运行时从 vuln.go.dev 拉取，新公告可能让无关 PR 变红。
+      - run: mise run vulncheck
       - run: mise run fmt-check
       - run: mise run mod-tidy-check
       - run: mise run lint
@@ -169,6 +171,9 @@ jobs:
       - name: Verify Docker access
         run: bash scripts/ci-setup-docker.sh
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          # 不用默认的 moby/buildkit:buildx-stable-1：按具体版本 + 多架构 index digest 固定。
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - name: Build loadable zero-config artifact
         env:
           GITHUB_TOKEN: ${{ github.token }}

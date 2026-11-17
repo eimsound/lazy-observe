@@ -56,6 +56,146 @@ if [[ -n $unpinned_actions ]]; then
   fail 'workflow actions must use an allow-listed owner/name, a full commit SHA, and an exact version comment'
 fi
 
+# 供应链：任何 uses: 都必须按 40 位提交 SHA 固定（docker:// 按 sha256 digest），只有本仓 ./ 路径例外。
+# 与上面的白名单检查互补：覆盖 .github 下所有 YAML 与任意位置的 composite action（action.yml），
+# 也覆盖流式写法（- { uses: ... }）、reusable workflow 与 docker:// 引用。
+unpinned_uses() {
+  local file n line ref
+  # 任何形如 uses: 的键都要检查；解析不出引用的行同样算失败。
+  local key_re='(^|[^A-Za-z0-9_-])["'\'']?uses["'\'']?[[:space:]]*:'
+  local ref_re='^[[:space:]]*(-[[:space:]]+)?(\{[[:space:]]*)?["'\'']?uses["'\'']?[[:space:]]*:[[:space:]]*["'\'']?([^"'\''[:space:],}#]+)'
+  local comment_re='^[[:space:]]*#'
+  for file in "$@"; do
+    n=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      n=$((n + 1))
+      [[ $line =~ $key_re ]] || continue
+      [[ $line =~ $comment_re ]] && continue
+      if [[ $line =~ $ref_re ]]; then
+        ref=${BASH_REMATCH[3]}
+        case $ref in
+        ./*) continue ;;
+        docker://*) [[ $ref =~ @sha256:[0-9a-f]{64}$ ]] && continue ;;
+        *) [[ $ref =~ ^[^@]+@[0-9a-f]{40}$ ]] && continue ;;
+        esac
+      fi
+      printf '%s:%s: %s\n' "$file" "$n" "$line"
+    done <"$file"
+  done
+  return 0
+}
+pin_fixture=$(mktemp -d)
+cat >"$pin_fixture/bad.yml" <<'EOF'
+      - uses: actions/checkout@v4
+      - { uses: actions/setup-go@v5 }
+        uses: "docker://alpine:3.20"
+    uses: eimsound/shared/.github/workflows/ci.yml@main
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9a
+EOF
+cat >"$pin_fixture/good.yml" <<'EOF'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - { uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 }
+      - uses: ./.github/actions/local
+        uses: docker://alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      # - uses: actions/checkout@v4
+          causes: not-a-uses-key
+EOF
+pin_bad=$(unpinned_uses "$pin_fixture/bad.yml")
+pin_good=$(unpinned_uses "$pin_fixture/good.yml")
+rm -rf "$pin_fixture"
+pin_bad_count=$(grep -c . <<<"$pin_bad" || true)
+[[ $pin_bad_count -eq 5 ]] || fail "SHA pin self-test: expected 5 rejected refs, got: $pin_bad"
+[[ -z $pin_good ]] || fail "SHA pin self-test: pinned refs were rejected: $pin_good"
+mapfile -t pin_files < <(git ls-files --cached --others --exclude-standard -- \
+  '.github/*.yml' '.github/*.yaml' 'action.yml' 'action.yaml' '*/action.yml' '*/action.yaml' | sort -u)
+unpinned=$(unpinned_uses "${workflows[@]}" "${pin_files[@]}" | sort -u)
+if [[ -n $unpinned ]]; then
+  printf '%s\n' "$unpinned" >&2
+  fail 'every uses: must pin a full 40-character commit SHA (docker:// must pin a sha256 digest)'
+fi
+
+# setup-buildx-action 默认拉未固定的 moby/buildkit:buildx-stable-1；每处都要用 driver-opts 钉具体版本 + digest。
+buildkit_pin_re='^[[:space:]]+driver-opts:[[:space:]]*image=moby/buildkit:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}[[:space:]]*$'
+unpinned_buildkit=$(for file in "${workflows[@]}"; do
+  n=0 pending=
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    if [[ $line =~ uses:[[:space:]]+docker/setup-buildx-action@ ]]; then
+      if [[ -n $pending ]]; then printf '%s\n' "$pending"; fi
+      pending="$file:$n"
+    elif [[ -n $pending ]]; then
+      if [[ $line =~ $buildkit_pin_re ]]; then
+        pending=
+      elif [[ $line =~ ^[[:space:]]*-[[:space:]] || $line =~ ^[^[:space:]#] ]]; then
+        printf '%s\n' "$pending"
+        pending=
+      fi
+    fi
+  done <"$file"
+  if [[ -n $pending ]]; then printf '%s\n' "$pending"; fi
+done)
+if [[ -n $unpinned_buildkit ]]; then
+  printf '%s\n' "$unpinned_buildkit" >&2
+  fail 'docker/setup-buildx-action must set driver-opts: image=moby/buildkit:vX.Y.Z@sha256:<index digest>'
+fi
+
+# 发版前的镜像漏洞扫描必须挡在发布之前：container-check 跑扫描，archive 依赖 container-check。
+release_wf=.github/workflows/release.yml
+if [[ -f $release_wf ]]; then
+  container_check=$(awk '$0 == "  container-check:" { on = 1; next } on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } on { print }' "$release_wf")
+  [[ $container_check == *'run: bash scripts/check-image-vulns.sh lazy-observe:preflight-'* ]] ||
+    fail "$release_wf: container-check must scan the preflight image with scripts/check-image-vulns.sh"
+  archive_job=$(awk '$0 == "  archive:" { on = 1; next } on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } on { print }' "$release_wf")
+  [[ $archive_job == *'needs: [container-check, '* ]] ||
+    fail "$release_wf: archive must need container-check so the image scan blocks publishing"
+fi
+
+# 镜像扫描例外清单：每条都要有理由和到期日，过期条目由 Trivy 自动失效。
+trivyignore=.trivyignore.yaml
+[[ -f $trivyignore ]] || fail "$trivyignore is missing"
+bad_ignores=$(awk '
+  function flush() { if (id != "" && !(statement && expiry)) print id; id = ""; statement = 0; expiry = 0 }
+  /^[[:space:]]*#/ { next }
+  /^[[:space:]]*-[[:space:]]+id:/ { flush(); id = $0; sub(/^.*id:[[:space:]]*/, "", id); next }
+  /^[[:space:]]+statement:[[:space:]]*[^[:space:]]/ { statement = 1 }
+  /^[[:space:]]+expired_at:[[:space:]]*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]*$/ { expiry = 1 }
+  /^[^[:space:]-]/ { flush() }
+  END { flush() }
+' "$trivyignore")
+if [[ -n $bad_ignores ]]; then
+  printf '%s\n' "$bad_ignores" >&2
+  fail "$trivyignore entries must carry a statement and an expired_at date (YYYY-MM-DD)"
+fi
+
+# Dependabot 覆盖面：每个依赖清单所在目录都要有对应生态的条目。
+dependabot=.github/dependabot.yml
+[[ -f $dependabot ]] || fail "$dependabot is missing"
+dependabot_entries=$(awk '
+  /^[[:space:]]*-[[:space:]]+package-ecosystem:/ { eco = $NF; gsub(/["'\'']/, "", eco) }
+  /^[[:space:]]+directory:/ { dir = $NF; gsub(/["'\'']/, "", dir); print eco " " dir }
+' "$dependabot")
+expected_entries=$(
+  printf 'github-actions /\n'
+  git ls-files --cached --others --exclude-standard -- '*go.mod' '*pnpm-lock.yaml' '*pyproject.toml' '*Dockerfile' |
+    while IFS= read -r manifest; do
+      case ${manifest##*/} in
+      go.mod) eco=gomod ;;
+      pnpm-lock.yaml) eco=npm ;;
+      pyproject.toml) eco=pip ;;
+      Dockerfile) eco=docker ;;
+      *) continue ;;
+      esac
+      dir=${manifest%/*}
+      [[ $dir == "$manifest" ]] && dir=
+      printf '%s /%s\n' "$eco" "$dir"
+    done
+)
+missing_dependabot=$(comm -23 <(sort -u <<<"$expected_entries") <(sort -u <<<"$dependabot_entries"))
+if [[ -n $missing_dependabot ]]; then
+  printf '%s\n' "$missing_dependabot" >&2
+  fail "$dependabot must cover every manifest directory listed above"
+fi
+
 # upload/download-artifact v3 在 GitHub 上已停用。
 old_artifacts=$(grep -En 'uses:[[:space:]]+actions/(upload|download)-artifact@[0-9a-f]{40}[[:space:]]+#[[:space:]]+v[0-3]\.' \
   "${workflows[@]}" || true)

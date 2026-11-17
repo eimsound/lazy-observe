@@ -1,0 +1,17 @@
+# 镜像漏洞扫描（scripts/check-image-vulns.sh）的例外清单。
+#
+# 只在确认是误报、或漏洞代码路径在本产品里不可达时才加条目；能升级修掉的不要加。
+# 每条必须同时带：
+#   - id：CVE / GHSA / GO-* 编号；
+#   - statement：为什么可以忽略（不可达的理由、上游 issue 链接、谁确认的）；
+#   - expired_at：到期日（YYYY-MM-DD），最长 90 天。到期后 Trivy 不再忽略，发版会重新被挡住，届时复查。
+# 可选 paths / purls 收窄到具体文件或包。scripts/check-github-workflows.sh 校验必填字段。
+#
+# 示例：
+# vulnerabilities:
+#   - id: CVE-2099-0001
+#     statement: 只在 xxx 构建标签下编译，产物不含；见 https://github.com/eimsound/lazy-observe/issues/NNN
+#     expired_at: 2099-03-31
+#     purls:
+#       - pkg:golang/example.com/mod@v1.2.3
+vulnerabilities: []
