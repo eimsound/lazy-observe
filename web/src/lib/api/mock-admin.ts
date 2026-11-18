@@ -24,7 +24,7 @@ export const mockProjects: Project[] = [
 export const mockTokens: Record<string, ProjectAPIToken[]> = {
   prj_default: [
     { id: "tok_a1", name: "ingest-primary", prefix: "lo_prod_9f2a", created_at: ago(60 * 24 * 20), last_used_at: ago(4), revoked: false },
-    { id: "tok_a2", name: "grafana-readonly", prefix: "lo_prod_3b7c", created_at: ago(60 * 24 * 8), last_used_at: ago(120), revoked: false },
+    { id: "tok_a2", name: "ingest-otelcol", prefix: "lo_prod_3b7c", created_at: ago(60 * 24 * 8), last_used_at: ago(120), revoked: false },
   ],
   prj_staging: [
     { id: "tok_b1", name: "ci-pipeline", prefix: "lo_stg_5d1e", created_at: ago(60 * 24 * 6), last_used_at: null, revoked: false },

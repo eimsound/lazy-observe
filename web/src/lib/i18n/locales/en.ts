@@ -21,6 +21,7 @@ export const en: typeof zh = {
     search: "Search",
     copy: "Copy",
     copied: "Copied",
+    copyFailed: "Clipboard access failed. Copy the text manually.",
     clear: "Clear",
     apply: "Apply",
     all: "All",
@@ -339,7 +340,8 @@ export const en: typeof zh = {
   },
   userTokens: {
     title: "Personal API tokens",
-    description: "Authenticate scripts and CLI requests as your user with Authorization: Bearer. Secrets are shown once.",
+    description:
+      "Read as your user from the query API, MCP and Grafana with Authorization: Bearer plus X-LO-Project. Secrets are shown once; telemetry writes use a project API token instead.",
     name: "Name",
     namePlaceholder: "e.g. local CLI",
     prefix: "Prefix",
@@ -354,6 +356,17 @@ export const en: typeof zh = {
     revoke: "Revoke token",
     revokeConfirm: "Revoke token “{{name}}”?",
     revokeDescription: "Requests using this token will be rejected immediately.",
+    usageTitle: "Use it for reads",
+    mcpLabel: "MCP proxy command",
+    mcpHint:
+      "The DSN keeps the SDK shape; the slug ({{slug}}) travels as X-LO-Project. The command refuses a project token.",
+    grafanaTitle: "Grafana Prometheus data source",
+    grafanaUrlLabel: "Data source URL",
+    grafanaUrlHint:
+      "Query endpoints sit directly under the gateway root, with no path prefix. Replace the host when Grafana reaches the gateway on an internal address.",
+    grafanaHeadersLabel: "Custom HTTP headers",
+    grafanaHeadersHint:
+      "Grafana's Prometheus data source has no bearer field, so add both headers as custom HTTP headers; one data source serves one project.",
   },
   assistant: {
     title: "AI assistant",
@@ -811,6 +824,12 @@ export const en: typeof zh = {
       "Copy and store it now. For security, the token value is shown only once.",
     tokenValue: "API token value",
     copyWarning: "You won't be able to view the full token again after closing.",
+    ingestOnlyTitle: "Ingest only",
+    ingestOnlyDesc:
+      "Project API tokens can only send telemetry (SDK, OTel exporters, remote write). Any query, MCP or Grafana request that presents one is rejected with 403 ingest_only_token; reads need a personal API token plus X-LO-Project.",
+    dsnLabel: "SDK DSN (ingest only)",
+    dsnHint:
+      "Use this DSN in lazy-observe SDKs; OTel exporters and remote write send the token as Authorization: Bearer <token> instead. Never present a project token to a read route.",
   },
   notifications: {
     filterStatus: "Filter by status",

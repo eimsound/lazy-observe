@@ -20,6 +20,7 @@ export const zh = {
     search: "搜索",
     copy: "复制",
     copied: "已复制",
+    copyFailed: "无法访问剪贴板，请手动复制。",
     clear: "清空",
     apply: "应用",
     all: "全部",
@@ -333,7 +334,7 @@ export const zh = {
   },
   userTokens: {
     title: "个人 API Token",
-    description: "供脚本和 CLI 通过 Authorization: Bearer 以当前用户身份调用 API；密钥仅展示一次。",
+    description: "以当前用户身份读取数据：查询 API、MCP 与 Grafana 用 Authorization: Bearer 加 X-LO-Project；密钥仅展示一次，上报遥测请改用项目 API Token。",
     name: "名称",
     namePlaceholder: "例如：本地 CLI",
     prefix: "前缀",
@@ -348,6 +349,14 @@ export const zh = {
     revoke: "撤销 Token",
     revokeConfirm: "撤销 Token“{{name}}”？",
     revokeDescription: "使用该 Token 的请求将立即被拒绝。",
+    usageTitle: "读取端用法",
+    mcpLabel: "MCP 代理命令",
+    mcpHint: "DSN 保持 SDK 形状，slug（{{slug}}）通过 X-LO-Project 发送；该命令会拒绝项目 Token。",
+    grafanaTitle: "Grafana Prometheus 数据源",
+    grafanaUrlLabel: "数据源 URL",
+    grafanaUrlHint: "查询端点直接挂在网关根路径下，不加路径前缀；Grafana 若走集群内网地址，把主机部分换成网关的内网地址。",
+    grafanaHeadersLabel: "自定义请求头",
+    grafanaHeadersHint: "Grafana 的 Prometheus 数据源没有 Bearer 字段，两个请求头都按自定义 HTTP 头填写；一个数据源服务一个项目。",
   },
   assistant: {
     title: "AI 助手",
@@ -800,6 +809,11 @@ export const zh = {
     createdDesc: "请立即复制并妥善保存。出于安全考虑，令牌值只会显示这一次。",
     tokenValue: "API Token 值",
     copyWarning: "关闭后将无法再次查看完整令牌。",
+    ingestOnlyTitle: "仅摄取（ingest only）",
+    ingestOnlyDesc:
+      "项目 API Token 只能上报遥测（SDK、OTel exporter、remote write）。用它访问查询、MCP 或 Grafana 一律返回 403 ingest_only_token，读取请使用个人 API Token 并带上 X-LO-Project。",
+    dsnLabel: "SDK DSN（仅摄取）",
+    dsnHint: "lazy-observe SDK 使用这个 DSN；OTel exporter 与 remote write 改用 Authorization: Bearer <token> 请求头。不要用它读数据。",
   },
   notifications: {
     filterStatus: "按状态筛选",
