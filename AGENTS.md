@@ -34,10 +34,12 @@
 Start non-trivial work through `.agents/skills/do/SKILL.md`: it routes a one-line goal to one
 flow, names the skills that flow uses, and fixes the gates and commit rules. Do not pick a workflow
 skill from its description alone when `do` covers the situation.
+When the owner wants the main thread to only talk and orchestrate while sub-threads do the work,
+follow `.agents/skills/main/SKILL.md` on top of `do`.
 
 ### Upstream skills
 
-Every skill under `.agents/skills/` except `do` and `spec-to-plan` is an unmodified copy from
+Every skill under `.agents/skills/` except `do`, `main` and `spec-to-plan` is an unmodified copy from
 `mattpocock/skills` (MIT, see `.agents/skills/LICENSE-mattpocock-skills`), pinned in `skills-lock.json`. Do not edit them in place: `npx skills@latest update`
 overwrites them. Put repo-specific rules in `do` or this file. This repo is already configured
 (`docs/agents/`), so ignore any prompt to run `/setup-matt-pocock-skills`.
