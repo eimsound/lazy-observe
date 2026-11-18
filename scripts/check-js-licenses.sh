@@ -45,6 +45,8 @@ const allowed = new Set([
   "BSD-3-Clause",
   "0BSD",
   "ISC",
+  // Permissive public-domain dedication; ships alongside MIT (e.g. isbot via @tanstack/react-router).
+  "Unlicense",
 ]);
 
 const fail = (message) => {
