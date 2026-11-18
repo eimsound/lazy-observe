@@ -98,3 +98,19 @@ def test_close_is_idempotent():
     queue.close(timeout=2.0)
     queue.close(timeout=2.0)
     assert not queue.enqueue("b")  # closed: enqueue rejected
+
+
+def test_record_drop_counts_and_warns():
+    drops = []
+    queue = DeliveryQueue(
+        send=lambda batch, _t: None,
+        capacity=2,
+        batch_size=1,
+        flush_interval=0.01,
+        max_attempts=1,
+        warn=lambda reason, err, count: drops.append((reason, err, count)),
+    )
+    queue.record_drop("rejected", None, 2)
+    assert queue.dropped() == 2
+    assert drops == [("rejected", None, 2)]
+    queue.close(timeout=2.0)
