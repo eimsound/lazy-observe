@@ -31,5 +31,5 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {"unplugin": "^2.3.10"},
-  "devDependencies": {"tsup": "^8.5.0"}
+  "devDependencies": {"tsup": "^9.0.0"}
 }
