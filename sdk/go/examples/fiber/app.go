@@ -97,7 +97,9 @@ func (s *exampleServer) database(c *fiber.Ctx) error {
 // span, and a log correlated to the same trace.
 func (s *exampleServer) orderTrace(c *fiber.Ctx) error {
 	requestCtx := c.UserContext()
-	orderID := c.Params("orderID")
+	// Params borrows Fiber's request buffer; the span attribute and log record
+	// below outlive the request, so keep an owned copy.
+	orderID := strings.Clone(c.Params("orderID"))
 
 	_, validate := s.tracer.Start(requestCtx, "validate order",
 		trace.WithAttributes(attribute.String("example.order.id", orderID)),
