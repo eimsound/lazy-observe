@@ -1,11 +1,11 @@
 import { SpanStatusCode } from "@opentelemetry/api";
-import { InMemorySpanExporter, NodeTracerProvider, SimpleSpanProcessor, type ReadableSpan } from "@opentelemetry/sdk-trace-node";
+import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider, type ReadableSpan } from "@opentelemetry/sdk-trace";
 import { describe, expect, it } from "vitest";
 import { createWrappedLLMFetch, detectLLMSystem } from "../src/llm.js";
 
 function harness(captureContent: boolean, implementation: typeof fetch) {
   const exporter = new InMemorySpanExporter();
-  const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+  const provider = new TracerProvider({ spanProcessors: [new SimpleSpanProcessor({ exporter })] });
   const wrapped = createWrappedLLMFetch(provider.getTracer("test/llm"), captureContent, implementation);
   return { exporter, provider, wrapped };
 }
