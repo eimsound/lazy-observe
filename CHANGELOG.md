@@ -105,6 +105,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The web UI now labels project API tokens as ingest-only and shows the SDK
   DSN to copy, and gives personal user API tokens copyable `mcp --dsn`
   commands plus Grafana Prometheus data-source URL and header snippets (#54).
+- Added `lazy-observe admin reset-password`, which replaces an account password
+  directly in the metadata database without the current one. The target
+  defaults to `admin`; a generated password is offered only for `admin` while
+  `security.admin_password_file` is unset, is written atomically to
+  `<data_dir>/initial-admin-password` in mode 0600 with only the path printed,
+  and forces a change at the next login, while `--password-file` follows the
+  rules of `security.admin_password_file` and forces nothing. Every other
+  account, and every deployment that sets `security.admin_password_file`
+  (which includes `standalone-ha`), needs `--password-file`. The command
+  revokes every session of the account, clears the Redis-backed login lockout
+  when `redis.enabled` is set, writes an `auth.password_reset` audit event with
+  actor `cli`, and exits non-zero when the account does not exist. After the
+  admin replaces a bootstrap-generated password, the gateway deletes that file;
+  a file named by `security.admin_password_file` is never removed (#56).
+- `POST /api/events/diagnostics` now treats an unknown `signal` or `reason`
+  the way Web Vitals treats an unknown metric name: the entry is skipped, the
+  known measurements in the same batch are written, and the response reports
+  `{accepted, rejected}` instead of `{accepted}`. The server now knows the
+  `vitals` signal and the `server_rejected` reason; structural errors (bad
+  measurement ID or timestamp, empty `signal` / `reason`, missing or over-long
+  `service`, non-positive `dropped` or above 1e9) still answer `422` for the
+  whole batch, and an empty or fully skipped batch no longer sends an empty
+  write upstream (#59).
+- The browser SDK reports a dropped Web Vital to `/api/events/diagnostics`
+  instead of discarding it silently: a failed vitals POST increments
+  `droppedTelemetry`, emits one local `console.warn`, and is reported with
+  `signal: vitals` and `reason: server_rejected` for a 4xx, or
+  `retry_exhausted` for a network error, a 5xx, 408, or 429 (#59, #61).
+- Added `lazy-observe admin reset-key-fingerprint`, the explicit exit for a
+  changed platform encryption key: it reads the existing key file (a missing
+  file is an error, it never creates one), replaces the recorded fingerprint,
+  prints the old and the new value, and records a
+  `security.key_fingerprint_reset` audit event with actor `cli`. Running it
+  with the same key prints `already recorded` and changes nothing (#60).
 
 ### Security
 
@@ -155,6 +189,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `/api/system/error-inbox`, answer them with `403 ingest_only_token`
   instead of `401 unauthorized`, and reads need a session or a user API token
   (`lou_…`) plus `X-LO-Project` (#6).
+- **Breaking:** the platform encryption key (`security.secret_key_file`) is
+  recorded in the metadata database and enforced at startup: the first start
+  stores 128 bits of HMAC-SHA256 over a fixed label in the single-row
+  `platform_key_fingerprints` table and logs the key file path with that
+  fingerprint, and every later start compares the key it loaded with it. A
+  mismatch aborts the start before the gateway, storage, or bootstrap runs,
+  exits non-zero, and prints the key file path, both fingerprints, the likely
+  cause, and the recovery step, so a regenerated Secret or a replica holding
+  its own key no longer runs with AI silently disabled and a re-derived
+  self-monitoring token, and a deployment that renders a new key per rollout
+  (for example `helm template` or Argo CD with
+  `encryptionKey.autoGenerate=true`) fails to start instead of losing sealed
+  values. Recover by restoring the original key; when it is gone, stop every
+  replica and record the current one with
+  `lazy-observe admin reset-key-fingerprint`, which re-seals nothing — the AI
+  provider API key has to be entered again (#60).
+- **Breaking:** `standalone-ha` now always requires a shared platform
+  encryption key — `encryptionKey.existingSecret`, or the chart-managed Secret
+  with `encryptionKey.autoGenerate=true` — and the chart refuses to render the
+  profile at any replica count, including one, when neither is set. Its
+  `/data` is an emptyDir while the metadata database is external, so a key
+  generated in the pod dies with it and the replacement pod is refused for the
+  fingerprint mismatch. `allinone` with persistence keeps its data-directory
+  key, and `allinone` without a PVC loses key and database together (#60).
+- The metadata baseline gained `platform_key_fingerprints`, so a metadata
+  database (SQLite file or PostgreSQL database) created by an earlier commit
+  refuses to start with `metadata migration 1 checksum mismatch`; recreate it
+  while keeping the same key file, and the first start records the current
+  fingerprint (single-baseline policy) (#60).
+- A browser SDK that sends the new `vitals` signal or `server_rejected` reason
+  to an older server loses the whole diagnostics batch: that server answers
+  `422`, the SDK retries within the queue's attempt budget, then counts the
+  whole batch in `droppedTelemetry` and warns once locally, without throwing
+  into the page. On this server only the unknown entries are skipped (#61).
 - Fixed metrics, logs, and traces storage to the Victoria family (ADR 0013).
   Standalone mode connects to external VictoriaMetrics, VictoriaLogs, and
   VictoriaTraces; Loki/LogQL and Tempo/TraceQL adapters are out of scope, and
@@ -353,6 +421,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   own platform encryption key, so one replica (or a restarted pod) can decrypt
   sealed settings such as the AI provider API key that another replica wrote
   (#3).
+- Web Vitals ingest no longer rejects a whole batch because one metric name is
+  unknown to this server: the entry is skipped, the known metrics in the batch
+  are written, the response reports `{accepted, rejected}` instead of
+  `{accepted}`, and one warning per request names the skipped values
+  (truncated, at most five distinct names plus an overflow count), while a
+  missing `page`, an empty name, or an invalid timestamp still answers `422`
+  for the whole batch. A batch with nothing left to write no longer sends an
+  empty write upstream (#55).
+- A failed `admin reset-password` no longer leaves a password that never took
+  effect in the generated `<data_dir>/initial-admin-password`: a file that
+  existed before the run is restored byte for byte in mode 0600, a file the
+  run created is removed, and a failure after the new password was stored
+  keeps the new file, which is the only copy that works. A pre-existing file
+  above 4 KiB is refused instead of overwritten, a failed restore names the
+  path and asks for a rerun, and the CLI audit event now also records the
+  target user ID and role (#58).
+- The browser SDK counts a 408 or 429 answer to a Web Vital as
+  `retry_exhausted` rather than `server_rejected`, because the same payload
+  may be accepted later; 400, 404, and 422 remain `server_rejected` (#61).
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
