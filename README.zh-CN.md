@@ -97,10 +97,10 @@ SDK 不会在服务端修改任何模块，每个集成都要在代码里显式�
 
 默认部署把所有组件放在一个进程组里运行。另有两种部署方式：
 
-- Standalone 模式。网关连接你自己运维的 VictoriaMetrics、VictoriaLogs 和 VictoriaTraces。指标查询也可以接任何 Prometheus 兼容 API。目前不支持 Loki 和 Tempo。
+- Standalone 模式。网关连接你自己运维的 VictoriaMetrics、VictoriaLogs 和 VictoriaTraces。信号存储固定为 Victoria 系，按设计不支持 Loki 和 Tempo（ADR 0013）。
 - 高可用。多个网关副本共享 PostgreSQL、Redis 和 S3 兼容存储。每条告警规则同一时间只由一个副本评估，由数据库里的租约决定是哪一个。Helm chart 里带有三副本配置。
 
-两种方式的部署说明见 [部署文档](docs/deployment.md)，进程和安全边界的细节见 [架构文档](docs/architecture.md)。
+两种方式的部署说明见 [部署文档](docs/deployment.md)，进程和安全边界的细节见 [架构文档](.agents/docs/architecture.md)。
 
 ## 开发
 
@@ -115,10 +115,10 @@ mise run dev
 
 ## 文档
 
-- [架构](docs/architecture.md)
+- [架构](.agents/docs/architecture.md)
 - [部署](docs/deployment.md)
 - [SDK 与服务端兼容性](docs/version-matrix.md)
-- [架构决策记录](docs/adr/)
+- [架构决策记录](.agents/docs/adr/)
 - [贡献指南](CONTRIBUTING.md)
 - [变更日志](CHANGELOG.md)
 

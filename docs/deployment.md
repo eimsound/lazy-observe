@@ -89,7 +89,7 @@ Precedence is command-line flags, then `LO_*` environment variables, then YAML, 
 | `standalone` | `false` | Use external signal storage |
 | `storage_bin_dir` | empty | Optional development override; empty uses verified embedded Victoria binaries |
 | `meta.db_url` | empty | Empty uses `data_dir/meta/lazy-observe.db`; otherwise `sqlite://...`, `postgres://...`, or `postgresql://...` |
-| `storage.metrics.kind` | `vm` | `vm` or `prometheus`; controls query isolation strategy |
+| `storage.metrics.kind` | `vm` | `vm` (supported) or `prometheus` (generic Prometheus-compatible API, not officially supported); controls query isolation strategy |
 | `storage.metrics.cluster` | `false` | Use VictoriaMetrics cluster vmselect/vminsert paths; requires standalone mode and `kind: vm` |
 | `storage.metrics.tenant_account_id` | empty | Platform-level unsigned VictoriaMetrics account ID; required when cluster mode is enabled |
 | `storage.metrics.query_url` | empty | Required in standalone; base for Prometheus-compatible queries |
@@ -149,8 +149,8 @@ Standalone still runs the gateway, in-process alert engine, metadata database, b
 standalone: true
 storage:
   metrics:
-    kind: prometheus
-    query_url: "http://prometheus:9090"
+    kind: vm
+    query_url: "http://victoria-metrics:8428"
     ingest_url: "http://victoria-metrics:8428"
   logs:
     url: "http://victoria-logs:9428"
@@ -162,9 +162,11 @@ Release archives already embed the verified `vmagent-prod` payload, so the
 minimal standalone configuration leaves `storage_bin_dir` empty. If a
 development/offline override is explicitly configured, that directory must
 contain `vmagent-prod` when `ingest_url` is present. Without `ingest_url`, metric OTLP ingest and scrape management
-are disabled. The query URL may be VictoriaMetrics or a Prometheus-compatible
-API. Logs and traces currently require VictoriaLogs and VictoriaTraces
-semantics; Loki and Tempo adapters are not implemented.
+are disabled. External signal storage must be the Victoria family
+(VictoriaMetrics, VictoriaLogs, VictoriaTraces); Loki and Tempo are not
+supported by design ([ADR 0013](../.agents/docs/adr/0013-signal-storage-is-victoria-only.md)).
+`kind: prometheus` still routes queries to a generic Prometheus-compatible API,
+but it is not officially supported or covered by release verification.
 
 The supervisor never starts, signals, or restarts the configured external
 metrics, logs, or traces services. If lazy-observe starts the optional vmagent,
@@ -267,7 +269,7 @@ The PDB is enabled by default with `minAvailable: 1`. Tune the HPA minimum and
 PDB together so voluntary disruption cannot remove all ready replicas. Ingress
 is opt-in under `ingress.*`.
 
-[ADR 0001](adr/0001-nightingale-style-alert-engine.md) defines the implemented
+[ADR 0001](../.agents/docs/adr/0001-nightingale-style-alert-engine.md) defines the implemented
 single-owner alert engine. Every application replica hosts an evaluator
 candidate, while rendezvous assignment and a PostgreSQL lease/fencing epoch
 allow only one candidate to commit each rule's state and Outbox work. Gateway
@@ -323,7 +325,7 @@ database without racing seed records or credentials.
 The project is pre-release. SQLite and PostgreSQL each have one mutable
 `001_baseline.sql`; after an incompatible schema change, recreate the
 development database. Existing databases created by earlier commits are not a
-supported upgrade source. See [ADR 0003](adr/0003-pre-release-single-database-baseline.md).
+supported upgrade source. See [ADR 0003](../.agents/docs/adr/0003-pre-release-single-database-baseline.md).
 
 ## S3-compatible blob storage
 

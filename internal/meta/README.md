@@ -32,7 +32,7 @@ The opt-in suite uses `embedded-postgres`, migrates isolated real PostgreSQL dat
 
 ## Pre-release baseline contract
 
-[ADR 0003](../../docs/adr/0003-pre-release-single-database-baseline.md)
+[ADR 0003](../../.agents/docs/adr/0003-pre-release-single-database-baseline.md)
 defines the current policy. There is no supported database upgrade path during
 initial development. Schema changes are folded into both `001_baseline.sql`
 files and existing development databases must be recreated.
@@ -79,8 +79,8 @@ over one shared writable database, not a requirement for PostgreSQL database
 replicas and not a rolling schema-upgrade promise.
 
 The accepted decisions are recorded in
-[ADR 0001](../../docs/adr/0001-nightingale-style-alert-engine.md) and
-[ADR 0003](../../docs/adr/0003-pre-release-single-database-baseline.md).
+[ADR 0001](../../.agents/docs/adr/0001-nightingale-style-alert-engine.md) and
+[ADR 0003](../../.agents/docs/adr/0003-pre-release-single-database-baseline.md).
 
 Before the first supported release, an incompatible schema change requires
 recreating the development database. A later release decision will freeze the

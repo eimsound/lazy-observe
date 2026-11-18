@@ -33,7 +33,7 @@ status: accepted
 5. 将明确的规则分组切换到原生引擎。每组规则只能有一个通知权威；必须先启用租约与隔离，再禁用对应的 `vmalert` 规则。回滚时反向切换所有权，绝不能双发。
 6. 只有所有规则组都通过故障转移、Redis 丢失、进程终止和通知重试门禁后，才能删除 `vmalert`、其嵌入产物、内部 webhook 兼容路径。All-in-One 与高可用 Helm 角色必须在同一个版本中同步更新。
 
-N3 版本先把步骤 1 实现为纯 [`ownership`](../../internal/alert/ownership) 包。它验证当前 `(project_id, signal, rule_id)` 领域键，使用稳定成员 ID 和带领域分隔的 Rendezvous 哈希，并通过黄金测试和成员迁移测试固定分配契约。该包刻意不包含数据库或运行时集成，因此在后续带隔离租约的阶段完成前，`vmalert` 行为保持不变。
+N3 版本先把步骤 1 实现为纯 [`ownership`](../../../internal/alert/ownership) 包。它验证当前 `(project_id, signal, rule_id)` 领域键，使用稳定成员 ID 和带领域分隔的 Rendezvous 哈希，并通过黄金测试和成员迁移测试固定分配契约。该包刻意不包含数据库或运行时集成，因此在后续带隔离租约的阶段完成前，`vmalert` 行为保持不变。
 
 持久协调基础提供活跃成员心跳、基于数据库时间的过期、原子的逐规则租约获取/续租、租约过期或所有者变化后单调递增的纪元，以及受当前未过期纪元保护的 pending/firing/recovered 状态写入。PostgreSQL 测试覆盖候选者并发和过期所有者拒绝；在当时的历史阶段，还没有评估器使用这些表。
 
@@ -58,4 +58,4 @@ N5b 版本完成到 `native` 评估的迁移。API 与 Ent schema 不再接受 `
 - Nightingale 在 [`alert/naming/heartbeat.go`](https://github.com/ccfos/nightingale/blob/6bc533764a7a0f85d85b324790c1c78224f7acde/alert/naming/heartbeat.go#L70-L191) 中记录引擎心跳、把 30 秒内出现的实例视为活跃，并在成员变化时重建哈希环。
 - 它的评估和通知流水线分别位于 [`alert/eval`](https://github.com/ccfos/nightingale/tree/6bc533764a7a0f85d85b324790c1c78224f7acde/alert/eval) 与 [`alert/dispatch`](https://github.com/ccfos/nightingale/tree/6bc533764a7a0f85d85b324790c1c78224f7acde/alert/dispatch)。
 - Nightingale 会恢复当前 firing 事件，但事件队列仍保存在进程内，参见 [`alert/process/process.go`](https://github.com/ccfos/nightingale/blob/6bc533764a7a0f85d85b324790c1c78224f7acde/alert/process/process.go#L560-L604) 与 [`alert/queue/queue.go`](https://github.com/ccfos/nightingale/blob/6bc533764a7a0f85d85b324790c1c78224f7acde/alert/queue/queue.go#L10-L17)；上文的持久状态/发件箱要求是 lazy-observe 的加固措施。
-- 当前 lazy-observe 规则所有权键以 [`AlertRule`](../../internal/db/schema/alertrule.go) 为依据；它包含 `project_id`、`signal` 和 Ent 规则 ID，但没有数据源 ID。
+- 当前 lazy-observe 规则所有权键以 [`AlertRule`](../../../internal/db/schema/alertrule.go) 为依据；它包含 `project_id`、`signal` 和 Ent 规则 ID，但没有数据源 ID。

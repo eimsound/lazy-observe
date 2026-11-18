@@ -62,6 +62,6 @@ N1 兼容版本实现了阶段 1，且没有增加迁移文件：PostgreSQL 启�
 - Grafana 在 SQLStore 初始化期间执行待处理迁移，并在错误时停止，参见 [`sqlstore.go`](https://github.com/grafana/grafana/blob/5342253d0a4b144ab825c8ce055c7cff22fb105e/pkg/services/sqlstore/sqlstore.go#L67-L89)。
 - 其 PostgreSQL 路径在 [`migrator.go`](https://github.com/grafana/grafana/blob/5342253d0a4b144ab825c8ce055c7cff22fb105e/pkg/services/sqlstore/migrator/migrator.go#L198-L255) 与 [`postgres_dialect.go`](https://github.com/grafana/grafana/blob/5342253d0a4b144ab825c8ce055c7cff22fb105e/pkg/services/sqlstore/migrator/postgres_dialect.go#L297-L348) 中用 advisory-lock 生命周期包裹迁移执行。
 - Grafana 官方运维指南要求升级前备份数据库：[备份 Grafana](https://grafana.com/docs/grafana/latest/administration/back-up-grafana/)。
-- lazy-observe 当前未协调的迁移路径是 [`runMigrations`](../../internal/meta/store.go)；Helm [`startupProbe`](../../deploy/helm/lazy-observe/templates/deployment.yaml) 定义了实现必须保留的外层启动预算。
+- lazy-observe 当前未协调的迁移路径是 [`runMigrations`](../../../internal/meta/store.go)；Helm [`startupProbe`](../../../deploy/helm/lazy-observe/templates/deployment.yaml) 定义了实现必须保留的外层启动预算。
 
 Grafana 当前 PostgreSQL 实现只尝试一次非阻塞的 `pg_try_advisory_lock`，尽管存在超时设置；本文规定的有界等待是 lazy-observe 的加固措施，不是对 Grafana 行为的描述。
