@@ -16,8 +16,8 @@ lazy-observe 还没有发布过正式版本。想试用的话，请按下面的�
 - 性能剖析。为 Go 的 CPU、heap、goroutine 剖析和 Node 的 CPU、heap 剖析生成火焰图。
 - 告警。告警规则用 PromQL 或 LogsQL 编写，通知可以发到 Webhook、飞书、钉钉、企业微信或 Slack。分组、去重、静默、抑制和按渠道限流可以减少重复通知。
 - AI 分析。管理员配置好大模型服务后，lazy-observe 会结合相关的日志、链路和版本信息分析每个新 Issue。它也会统计你的应用调用大模型时的 token 用量和费用。
-- MCP。AI 助手可以通过只读的 MCP 端点读取项目数据。
-- 基础设施。vmagent 负责抓取 Prometheus exporter。需要仪表盘时，把 Grafana 或 Perses 接到 Prometheus 兼容的查询 API 上。
+- MCP。AI 助手可以通过只读的 MCP 端点读取项目数据。MCP 读取要以用户身份鉴权：用 `lou_...` 用户 API token 加 `X-LO-Project` 请求头，`lo_...` 项目 API token 不能读。
+- 基础设施。vmagent 负责抓取 Prometheus exporter。需要仪表盘时，把 Grafana 或 Perses 接到 Prometheus 兼容的查询 API 上，用用户 API token 加 `X-LO-Project` 请求头鉴权。
 
 ## 快速开始
 
@@ -33,7 +33,7 @@ mise run dist
 
 `mise run dist` 会构建 Web 界面，下载并校验存储程序，再把它们一起嵌入 `bin/lazy-observe`。
 
-服务启动时会打印 `admin` 用户的随机密码和默认项目的 API token，请保存好。然后打开 <http://localhost:3100>，用 `admin` 登录。
+首次启动时，服务会把 `admin` 用户的随机密码写入 `<data_dir>/initial-admin-password`（权限 0600），日志里只记这个路径；同时为默认项目打印一次摄取用的 API token。读完该文件后打开 <http://localhost:3100>，用 `admin` 登录；登录后必须先改掉这个随机密码才能做别的事。想自己指定初始密码，就设置 `security.admin_password_file`（见[部署文档](docs/deployment.md)），这样给出的密码不会被强制修改。
 
 ### 从 Go 应用上报数据
 
@@ -45,7 +45,7 @@ app.Use(lo.Fiber())
 slog.SetDefault(lo.Slog())
 ```
 
-把 `TOKEN` 换成服务启动时打印的 `lo_...` token。
+把 `TOKEN` 换成服务启动时打印的 `lo_...` token。项目 token 只能上报数据；在界面、MCP 或 Grafana 里读同一个项目，要用用户 API token（`lou_...`），见[部署文档](docs/deployment.md)的 Query API, MCP, and Grafana 一节。
 
 不想写代码的话，可以直接运行仓库里的示例应用：
 

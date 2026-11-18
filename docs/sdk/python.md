@@ -54,7 +54,7 @@ lo.shutdown(timeout=10.0)
 
 | Field | Default | Behavior |
 | --- | --- | --- |
-| `dsn` | required | Gateway, project, and project API token |
+| `dsn` | required | Gateway, project, and project API token. The token is a `lo_...` project API token and can only ingest: read routes answer it with `403 ingest_only_token`, so querying needs a `lou_...` user API token plus the `X-LO-Project` header ([deployment guide](../deployment.md#query-api-mcp-and-grafana)) |
 | `service_name` | executable basename | OTel `service.name` and log field |
 | `metrics`, `logs`, `traces` | all enabled | Signal matrix below |
 | `sample_rate` | `1` | Parent-based head sampling; `(0, 1]` |

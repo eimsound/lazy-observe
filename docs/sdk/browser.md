@@ -31,7 +31,7 @@ Call `await client.close()` when the owning application is torn down. A second `
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `dsn` | required | `<origin>/p/<project>@<token>` |
+| `dsn` | required | `<origin>/p/<project>@<token>`. The token is a `lo_...` project API token that ships inside the public page, so any visitor can read it: it can only ingest, and read routes answer it with `403 ingest_only_token`. Querying needs a `lou_...` user API token plus the `X-LO-Project` header ([deployment guide](../deployment.md#query-api-mcp-and-grafana)) |
 | `errors` | true | Window error and unhandled rejection capture |
 | `vitals` | true | LCP, CLS, INP, TTFB, FCP |
 | `fetchTracing` | true | Patch fetch and XHR; object form controls patching/allowlist |

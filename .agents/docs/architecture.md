@@ -153,7 +153,11 @@ Local blob keys are rooted under the configured data directory and partitioned b
 
 ### API tokens and sessions
 
-- The first boot creates `admin` with a random password and logs it once.
+- The first boot creates `admin` with a random password written to
+  `<data_dir>/initial-admin-password` (mode 0600, logged only as a path) unless
+  `security.admin_password_file` supplies one; a generated password must be
+  replaced at the first sign-in (`must_change_password`), a deployer-provided one
+  is kept as given.
 - The first boot also creates the `default` project and a random `lo_...` project API token, logged once.
 - Project API tokens authenticate telemetry ingest only; they are embedded in browser pages and SDK configuration and never authorize reads (ADR 0010). Admins create, list, and revoke them through `/api/projects/:id/tokens`. SDKs encode the project and token in a DSN for configuration, but send the token only through `Authorization: Bearer <token>`.
 - User API tokens use the `lou_...` prefix and authenticate API calls through `Authorization: Bearer <token>` with the issuing user's current RBAC role. They can select a query project with `X-LO-Project`, but cannot ingest telemetry. Users create, list, and revoke their own tokens through `/api/auth/tokens` or Settings; the secret is returned only on creation.
@@ -207,7 +211,7 @@ cross-store compensation. No decision about these deferred controls is implied h
 
 ### RBAC
 
-The implemented roles are `admin`, `member`, and `viewer`. Administrative project, project-token, user, and channel changes require admin. Alert and scrape configuration changes require member or admin. User API tokens retain the issuing user's current role; project API tokens grant only their project's ingest and query boundary.
+The implemented roles are `admin`, `member`, and `viewer`. Administrative project, project-token, user, and channel changes require admin. Alert and scrape configuration changes require member or admin. User API tokens retain the issuing user's current role; project API tokens are ingest-only ([ADR 0010](adr/0010-project-api-tokens-are-ingest-only.md)), so every read route, including `/mcp` and `/api/system/info`, answers them with `403` and `code: ingest_only_token`. Reads use a session cookie or a user API token plus the `X-LO-Project` header.
 
 This is a single-team system with projects as data partitions, not an application-level multi-tenant control plane. Strong tenant separation between unrelated organizations should use separate instances.
 

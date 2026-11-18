@@ -34,7 +34,7 @@ await lo.shutdown({ timeoutMs: 10_000 });
 
 | Field | Default | Meaning |
 |---|---|---|
-| `dsn` | required | `http(s)://host:port/p/<slug>@<token>`; the token is sent as `Authorization: Bearer <token>` |
+| `dsn` | required | `http(s)://host:port/p/<slug>@<token>`; the token is sent as `Authorization: Bearer <token>`. The token is a project API token (`lo_...`) and can only ingest: every read route answers it with `403 ingest_only_token`, so querying needs a user API token (`lou_...`) plus `X-LO-Project` ([deployment guide](https://github.com/eimsound/lazy-observe/blob/main/docs/deployment.md#query-api-mcp-and-grafana)) |
 | `serviceName` | `process.title` | OTel `service.name` and logger field |
 | `serviceVersion` | unset | OTel `service.version` |
 | `metrics`, `logs`, `traces` | `true` each | Independent signal switches |

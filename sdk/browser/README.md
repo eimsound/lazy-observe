@@ -146,7 +146,8 @@ platform-side query persistence.
 - `LO_E2E_ADMIN_PASSWORD`: the `admin` password. Every read in the journey uses the
   admin session cookie plus `X-LO-Project: default`.
 
-On a fresh data directory the platform logs the bootstrap admin password and the
+On a fresh data directory the platform writes the bootstrap admin password to
+`<data_dir>/initial-admin-password` (mode 0600) and logs only that path, plus the
 `default` project token once on first start. The script also runs
 `playwright install --with-deps`, which installs system packages through the OS
 package manager.

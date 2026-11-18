@@ -43,9 +43,11 @@ mise run dist
 platform's verified storage manifest and executables. Leave `storage_bin_dir`
 empty (the default) so the gateway extracts those payloads under `data_dir/bin`.
 The gateway listens on `:3100`. Storage children listen on fixed loopback ports
-and must not be exposed. The first run logs a generated admin password and
-default-project API token. Capture that output securely: they are not
-printed again after bootstrap.
+and must not be exposed. The first start that creates the `admin` account writes
+a generated password to `<data_dir>/initial-admin-password` (mode 0600) and logs
+only that path; the first sign-in must replace it before anything else works.
+The same startup logs the default project's ingest API token once. The generated
+password is never logged, and neither secret is printed again after bootstrap.
 
 Each managed child has an isolated restart loop. Killing one storage child does
 not change the gateway PID or stop the other signal stores; health and readiness
@@ -133,6 +135,67 @@ Precedence is command-line flags, then `LO_*` environment variables, then YAML, 
 | `process.drain_timeout` | `20s` | Gateway in-flight request and Issue-batch drain deadline |
 | `process.component_port_offset` | `0` | Managed child port offset for local isolation tests; leave zero in normal deployments |
 
+### First admin password
+
+The `admin` account is created while no user named `admin` exists, that is, on
+the first start against an empty metadata database (the `default` project is
+created at the same point if it is missing). A deleted `admin` user is therefore
+recreated with a new first password.
+
+- `security.admin_password_file` (environment name `LO_SECURITY_ADMIN_PASSWORD_FILE`)
+  names a file holding the password to use. Surrounding whitespace and a trailing
+  newline are ignored, and at least 8 characters are required. A password supplied
+  this way counts as chosen by the operator and is not forced to change.
+- Without that field the server generates a random password, writes it to
+  `<data_dir>/initial-admin-password` with mode 0600 before the account exists,
+  and logs the absolute path instead of the password. The generated password must
+  be replaced at the first sign-in: a user flagged `must_change_password` can only
+  read `/api/auth/me`, change the password, or log out, and every other route
+  answers `403 password_change_required`.
+
+Multi-replica deployments must set `security.admin_password_file` (or the Helm
+`adminPassword` Secret): the generated file exists only on the replica that won
+the bootstrap lock, and its `data_dir` is usually an emptyDir. A later start that
+finds an existing `admin` account writes no password file and keeps the current
+password.
+
+### Platform encryption key
+
+`security.secret_key_file` (environment name `LO_SECURITY_SECRET_KEY_FILE`)
+names the file holding the platform's 256-bit AES-256-GCM key; the variable
+carries a path, never the key material. It seals sensitive metadata values: the
+AI provider API key entered in **Settings > AI** is stored encrypted and never
+returned to the browser. It also derives the built-in self-monitoring project
+token instead of storing that credential recoverably.
+
+The file holds 32 random bytes as standard base64, padded or not; surrounding
+whitespace and line breaks are ignored, so `openssl rand -base64 32` output can
+be provisioned as-is. Empty uses `<data_dir>/secret.key`: the first start
+generates a fresh key and writes it with mode 0600, an existing file is only
+read and never rewritten, and the key is held in memory for the process
+lifetime.
+
+Every replica that shares a metadata database must read the same key. A value
+sealed by one replica is unreadable for a replica holding a different key: with
+a mismatched key the stored AI configuration fails to load, AI stays disabled,
+and the gateway logs the decryption error instead of sending unauthenticated
+requests. The Helm chart therefore mounts one Secret read-only at
+`/etc/lazy-observe-key/secret.key` — `encryptionKey.existingSecret`, or the
+chart-managed `<fullname>-encryption-key` when `encryptionKey.autoGenerate` is
+true — and refuses to render a `standalone-ha` release that runs more than one
+replica without a shared Secret. The `allinone` profile with persistence keeps
+the key inside the PVC's `data_dir`.
+
+Back up the key with the same care as the database. A lost key makes the sealed
+values unrecoverable: the affected AI API key has to be entered again, which
+re-seals it under the current key. Key rotation is not supported in this
+pre-release — nothing re-seals existing ciphertext, so a new key means lost
+sealed values rather than transparent re-encryption. A different key also
+derives a different self-monitoring token; the derived token is re-created at
+the next start. The previous derived credential is not revoked: it stays in
+metadata and remains a valid ingest credential for the self-monitoring project,
+so revoke it from that project's token list if it must stop working.
+
 ### Optional AI access layer
 
 AI is disabled by default and is configured exclusively by administrators in **Settings > AI**. Provider settings and the API key are stored in metadata; the key is sealed with `security.secret_key_file` and is never returned to the browser. There is no `ai:` server YAML section or `LO_AI_*` environment interface.
@@ -197,6 +260,87 @@ paths and the gateway replaces incoming `AccountID`/`ProjectID` headers with
 the authenticated project tenant on both writes and reads.
 
 External storage owns metrics/logs/traces retention in standalone mode. Platform retention still applies to replay, source maps, alert events, profiles, and closed Issues.
+
+## Query API, MCP, and Grafana
+
+Every read is authenticated as a user, never as a project. A project API token
+(`lo_...`) can only send telemetry: any read route that receives one answers
+`403` with `code: ingest_only_token`, because SDK DSNs are embedded in public
+browser pages (ADR 0010). This includes `/mcp` and `/api/system/info`.
+
+A read uses one of two credentials:
+
+- the browser session cookie, or
+- a user API token (`lou_...`) as `Authorization: Bearer ...`, with the project
+  selected by `X-LO-Project: <slug>`. Without that header the gateway serves the
+  `default` project.
+
+Create a user API token in **Settings > Personal API tokens**; the value is
+shown once. The HTTP equivalent is `POST /api/auth/tokens` with a session
+cookie and the `X-CSRF-Token` double-submit header. A user API token keeps the
+issuing user's current role, so an admin's token can reach admin-only routes.
+
+### Prometheus-compatible queries
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET`/`POST /api/v1/query` | Instant PromQL/MetricsQL query |
+| `GET`/`POST /api/v1/query_range` | Range query |
+| `GET`/`POST /api/v1/series` | Series metadata |
+| `GET`/`POST /api/v1/labels` | Label names |
+| `GET`/`POST /api/v1/label/<name>/values` | Label values |
+
+The gateway adds the authenticated project's `project_id` filter to every one
+of these queries and drops client-supplied isolation parameters, so one project
+cannot read another project's metrics. Writes stay on the ingest side:
+`/api/v1/write` is Prometheus remote write and keeps using a project token.
+
+```sh
+curl -fsS -G http://localhost:3100/api/v1/query \
+  -H 'Authorization: Bearer lou_...' \
+  -H 'X-LO-Project: default' \
+  --data-urlencode 'query=up'
+```
+
+LogsQL, trace, Replay, Issue, alert, and performance reads live under `/api`
+(such as `/api/v1/logs/query`, `/api/traces/search`, `/api/v1/issues`) and use
+the same credential pair; they are not part of the Prometheus data source surface.
+
+### Grafana
+
+Add a Prometheus data source whose URL is the gateway root, for example
+`http://lazy-observe:3100`; the query endpoints sit directly under it, with no
+path prefix. Grafana's Prometheus data source has no bearer-token field, so send
+both headers as custom HTTP headers:
+
+- `Authorization: Bearer lou_...`
+- `X-LO-Project: <slug>`
+
+When provisioning, Grafana stores custom header names under
+`jsonData.httpHeaderNameN` and their values under `secureJsonData.httpHeaderValueN`
+(a Grafana-side convention documented in
+[Grafana provisioning](https://grafana.com/docs/grafana/latest/administration/provisioning/)),
+which keeps the token out of the provisioned file's plain text.
+The `X-LO-Project` value is fixed per data source, so one data source serves one
+project. Grafana features that call other Prometheus endpoints — metadata,
+exemplars, and rules — have no registered gateway route and answer `404`; the
+endpoints in the table above are the supported surface.
+
+### MCP
+
+`lazy-observe mcp` runs a project-scoped stdio proxy for MCP clients:
+
+```sh
+lazy-observe mcp --dsn 'http://localhost:3100/p/default@lou_...'
+```
+
+The DSN keeps the SDK shape (`/p/<slug>@<token>`) with two differences: `<token>`
+must be a user API token, which the command rejects at startup instead of
+failing on the first tool call, and `<slug>` is sent as the `X-LO-Project`
+header. The check is a prefix check only, so a revoked `lou_...` token still
+starts the proxy and fails later. `/mcp` itself refuses a `lo_...` token with
+`403 ingest_only_token`. The exposed tools are read-only and include bounded
+Replay metadata; raw Replay events and URL queries are not exposed.
 
 ## Kubernetes with Helm
 
@@ -281,20 +425,36 @@ Validate both modes before applying changes:
 ```sh
 mise run helm-lint
 mise run helm-template-test
-mise run e2e-ha
 ```
 
-`e2e-ha` is a required local Docker gate, not a mock: it exercises a
-replicated VictoriaMetrics cluster (including a vmstorage loss), split
-VictoriaLogs/VictoriaTraces roles with bidirectional tenant isolation, an
-Apache-2.0 SeaweedFS S3 endpoint for cross-replica Replay access, shared
-PostgreSQL alert state and notification Outbox, Redis sessions and rate limits,
-fenced alert ownership, readiness, and drain.
-Missing Docker prerequisites return `77`/`SKIP`, which is not a pass.
+Pull request CI runs both Helm tasks in the `go` job, which starts whenever the
+diff touches the server, chart, or script surface, so they do not have to be a
+local prerequisite (`.github/workflows/ci.yml` selects jobs from the change
+surface computed by `scripts/ci-changes.sh`).
+
+The multi-replica HA gate is a separate job (`e2e-ha`) gated on the `ha` flag of
+that same classifier. The flag follows server code (`cmd/**`, `internal/**`,
+`go.mod`, `go.sum`, `sdk/go/**`), the HA gate script and the helpers it compiles,
+`scripts/download-storage-bins.sh`, and `bench/performance-gates.json`;
+`scripts/ci-changes.sh` is the authoritative list, and it also covers the Ent
+generation chain (`entc.*`, `tools/entgen/**`, `scripts/generate-ent.sh`) and
+full-run paths such as `.github/**`, `mise.toml`, `scripts/ci-*`, and
+`Dockerfile*`. A chart-only change under `deploy/**` does not set it, so run
+`mise run e2e-ha` locally when you change the chart and care about multi-replica
+behavior. The gate is not a mock: it exercises a replicated VictoriaMetrics
+cluster (including a vmstorage loss), split VictoriaLogs/VictoriaTraces roles
+with bidirectional tenant isolation, an Apache-2.0 SeaweedFS S3 endpoint for
+cross-replica Replay access, shared PostgreSQL alert state and notification
+Outbox, Redis sessions and rate limits, fenced alert ownership, readiness, and
+drain. Docker is required; missing Docker prerequisites return `77`/`SKIP`,
+which CI treats as a failure and which is never a pass.
 
 The principal values surfaces are `mode`, `replicaCount`, `image.*`,
 `external.{postgres,redis,s3,metrics,logs,traces}`, `secret.*`, `resources`,
-`hpa.*`, `podDisruptionBudget.*`, `persistence.*`, `ingress.*`, and `process.*`.
+`hpa.*`, `podDisruptionBudget.*`, `persistence.*`, `ingress.*`, `process.*`,
+`encryptionKey.*` (the shared platform key behind `security.secret_key_file`),
+and `adminPassword.*` (the first admin password behind
+`security.admin_password_file`).
 
 ## PostgreSQL metadata
 
@@ -394,11 +554,22 @@ mandatory precondition of either packaging path, not a separate optional
 check. Pushing a `v*` tag runs `.github/workflows/release.yml`, which creates
 Linux amd64/arm64 archives and checksums as a GitHub Release, and pushes the
 amd64/arm64 container image to `ghcr.io/eimsound/lazy-observe`. Before archives
-are built, that workflow requires the amd64/arm64 container smoke and the full
-performance gates (`bench`, `perf-release`, `perf-ha`, `perf-results-check`) to
-pass. Pull request CI does not run the performance gates; they are noisy on
-shared runners and run only on manual dispatch (`bench.yml`) and before a
-release.
+are built, that workflow requires the dual-architecture container smoke
+(including the Trivy scan that fails on fixable CRITICAL/HIGH vulnerabilities)
+and the full performance gates (`bench`, `perf-release`, `perf-ha`,
+`perf-results-check`) to pass; the same workflow can be dispatched manually to
+rerun those gates without publishing. Pull request CI does not run the
+performance gates; they are noisy on shared runners and run only on manual
+dispatch (`bench.yml`) and before a release.
+
+Pull request CI is incremental: a `changes` job classifies the diff and only the
+jobs whose surface it touches run. `ci-ok` aggregates every job — skipped counts
+as passed — and is the one check to require in branch protection; the repository
+does not currently enforce a required check. Pure documentation changes (`*.md`, `docs/**`,
+`.agents/**`, `LICENSE`) run no business job, while server changes additionally
+run the `e2e-ha` functional HA gate and `internal/**`/`cmd/**` changes run the
+single-replica `e2e` and `e2e-restart` jobs. Change detection is contract-tested
+by `mise run ci-changes-test`.
 
 All workflows run on GitHub-hosted runners (`ubuntu-24.04` and the native
 `ubuntu-24.04-arm`). The public repository deliberately registers no

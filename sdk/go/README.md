@@ -22,7 +22,7 @@ defer lo.Shutdown(ctx)
 
 | Field | Default | Meaning |
 |---|---|---|
-| `DSN` | required | `http(s)://host:port/p/<slug>@<token>`; token is sent only as `Authorization: Bearer <token>` |
+| `DSN` | required | `http(s)://host:port/p/<slug>@<token>`; token is sent only as `Authorization: Bearer <token>`. The token is a project API token (`lo_...`) and can only ingest: every read route answers it with `403 ingest_only_token`, so querying needs a user API token (`lou_...`) plus `X-LO-Project` ([deployment guide](https://github.com/eimsound/lazy-observe/blob/main/docs/deployment.md#query-api-mcp-and-grafana)) |
 | `ServiceName` | executable basename | OTel `service.name` and every `slog` record |
 | `Metrics`, `Logs`, `Traces` | all enabled | Signal matrix described below |
 | `SampleRate` | `1.0` | Parent-based head sampling ratio; zero means “unset” and resolves to `1.0`, while explicit effective values are `(0, 1]` |
