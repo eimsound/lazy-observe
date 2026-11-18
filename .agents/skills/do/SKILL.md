@@ -96,6 +96,8 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 规则：门禁失败就停，先修失败，不要继续下一个切片。`CGO_ENABLED=0` 是硬约束，任何需要 CGO 的方案直接否决。`internal/db/ent` 不跟踪、不手改、不用 golines 格式化。
 
+`mise run test-meta-pg` 从外网 Maven Central 取 Postgres 归档（`LO_TEST_PG_CACHE`，默认 `$HOME/.cache/embedded-postgres`；命中缓存就不联网，CI 也用 actions/cache 缓存同一目录）。缓存未命中又碰上 Maven Central 对共享出口 IP 限流时会失败，测试会把归档 URL 的真实 HTTP 状态码一起打出来（库本身只报 `no version found matching 18.3.0`），看到 403/429/5xx 重跑即可，不要去改测试。
+
 ### 本地必跑 `mise run e2e-ha` 的改动面
 
 `mise run e2e-ha` 启两个副本，共享同一个元数据库（PostgreSQL）、Valkey、S3（SeaweedFS）和平台密钥。下面这些改动面只要碰了，

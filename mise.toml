@@ -394,10 +394,14 @@ bash scripts/check-js-licenses.sh web
 [tasks.test-meta-pg]
 description = "Run PostgreSQL metadata tests against the current baseline"
 depends = ["ent-generate"]
+# embedded-postgres 现场从 Maven Central 下载 Postgres 归档（18.3.0，约 15 MB），默认缓存路径
+# 保持稳定，避免每次运行都重新下载；CI 用 actions/cache 缓存同一目录。
+# 命中缓存时不会有任何下载，设置 LO_TEST_PG_CACHE 到别处即换一个缓存目录。
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ -d internal/meta/migrations/postgres ]]; then
+  export LO_TEST_PG_CACHE=${LO_TEST_PG_CACHE:-$HOME/.cache/embedded-postgres}
   LO_TEST_PG=1 CGO_ENABLED=0 go test ./internal/meta -count=1
 else
   printf 'Skipping PostgreSQL tests: internal/meta/migrations/postgres does not exist.\n'
