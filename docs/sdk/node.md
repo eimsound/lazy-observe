@@ -48,7 +48,7 @@ await lo.shutdown();
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `dsn` | required | `<origin>/p/<project>@<token>` |
+| `dsn` | required | `<origin>/p/<project>@<token>`. The token is a `lo_...` project API token and can only ingest: read routes answer it with `403 ingest_only_token`, so querying needs a `lou_...` user API token plus the `X-LO-Project` header ([deployment guide](../deployment.md#query-api-mcp-and-grafana)) |
 | `serviceName` | `process.title` | OTel service name and logger field |
 | `serviceVersion` | unset | OTel service version |
 | `metrics`, `logs`, `traces` | true independently | Enable or disable each signal |

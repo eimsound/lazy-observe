@@ -45,11 +45,11 @@ mise run web
 | `mise run test-meta-pg` | Run metadata tests against the embedded PostgreSQL baseline |
 | `mise run migration-check` | Validate the paired SQLite/PostgreSQL single baselines |
 | `mise run ent-generate-check` | Regenerate Ent clients and prove automatic migration code and root-module drift stay absent |
-| `mise run license-check` | Check all four production Go package graphs against the Apache-2.0/MIT/BSD allowlist |
+| `mise run license-check` | Check the production Go package graphs against the Apache-2.0/MIT/BSD allowlist: `./cmd/lazy-observe` for linux/amd64 and linux/arm64, plus the separate `sdk/go` module |
 | `mise run vulncheck` | Run pinned `govulncheck` over the server module and `sdk/go`; fails on reachable known vulnerabilities |
 | `mise run storage-bins` | Download and verify the four platform storage binaries |
 | `mise run e2e` | Build, download storage, run opt-in Gateway, recovery, and restart E2E |
-| `mise run e2e-ha` | Run the required Docker gate for real signal clusters, S3, and multi-replica coordination |
+| `mise run e2e-ha` | Run the multi-replica HA gate locally (real signal clusters, S3, fenced alert ownership); Docker is required. PR CI runs it for server code (`cmd/**`, `internal/**`, `go.mod`, `go.sum`, `sdk/go/**`), the HA gate script and the helpers it compiles, `scripts/download-storage-bins.sh`, and `bench/performance-gates.json`; `scripts/ci-changes.sh` is the authoritative list (it also covers the Ent generation chain and full-run paths such as `.github/**`, `mise.toml`, `Dockerfile*`), and chart-only changes do not trigger it |
 | `mise run perf-release` | Gate all four embedded release sizes and smoke-test the native zero-config artifact |
 | `mise run perf-ha` | Gate exact medium-corpus query P95 and capacity-controlled per-replica weak scaling against a validating sink, with real-storage mirrored readback |
 | `mise run performance-gates` | Run the release, query, and HA scaling gates sequentially |

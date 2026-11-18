@@ -78,7 +78,7 @@ row := db.QueryRowContext(c.UserContext(), "SELECT status FROM orders WHERE id =
 
 | Field | Default | Behavior |
 | --- | --- | --- |
-| `DSN` | required | Gateway, project, and project API token |
+| `DSN` | required | Gateway, project, and project API token. The token is a `lo_...` project API token and can only ingest: read routes answer it with `403 ingest_only_token`, so querying needs a `lou_...` user API token plus the `X-LO-Project` header ([deployment guide](../deployment.md#query-api-mcp-and-grafana)) |
 | `ServiceName` | executable basename | OTel `service.name` and slog field |
 | `Metrics`, `Logs`, `Traces` | all enabled when all are false | Once any is true, the three booleans form an explicit enabled set |
 | `SampleRate` | `1` | Parent-based head sampling; zero means “unset” and resolves to `1`, while explicit effective values are `(0, 1]` |

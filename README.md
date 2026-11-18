@@ -35,8 +35,11 @@ shown in the quick start. It runs on Linux, on amd64 and arm64.
   each new issue with its related logs, traces, and release. It also reports
   token usage and cost for the LLM calls your own applications make.
 - MCP. AI assistants can read project data through a read-only MCP endpoint.
+  MCP reads authenticate as a user with a `lou_...` user API token and the
+  `X-LO-Project` header; a `lo_...` project API token cannot read.
 - Infrastructure. vmagent scrapes Prometheus exporters. For dashboards, connect
-  Grafana or Perses to the Prometheus-compatible query API.
+  Grafana or Perses to the Prometheus-compatible query API with a user API token
+  and the `X-LO-Project` header.
 
 ## Quick start
 
@@ -55,9 +58,13 @@ mise run dist
 `mise run dist` builds the web UI, downloads and verifies the storage programs,
 and embeds both into `bin/lazy-observe`.
 
-On start, the server prints a generated password for the `admin` user and an
-API token for the default project. Save both. Then open
-<http://localhost:3100> and sign in as `admin`.
+On the first start the server writes a generated password for the `admin` user
+to `<data_dir>/initial-admin-password` (mode 0600) and logs that path, and it
+logs an ingest API token once for the default project. Read the file, then open
+<http://localhost:3100> and sign in as `admin`; the first sign-in must replace
+the generated password before anything else works. To choose the first password
+yourself, set `security.admin_password_file` (see
+[Deployment](docs/deployment.md)); such a password is kept as given.
 
 ### Send data from a Go application
 
@@ -69,7 +76,10 @@ app.Use(lo.Fiber())
 slog.SetDefault(lo.Slog())
 ```
 
-Replace `TOKEN` with the `lo_...` token that the server printed.
+Replace `TOKEN` with the `lo_...` token that the server printed. That project
+token can only send data: reading the same project in the UI, over MCP, or from
+Grafana needs a user API token (`lou_...`), as described in
+[Query API, MCP, and Grafana](docs/deployment.md#query-api-mcp-and-grafana).
 
 To see data without writing code, run the example application in this
 repository:

@@ -78,7 +78,7 @@ _避免使用_：日志页面、仪表盘、已保存查询
 _避免使用_：仪表盘、指标探索器
 
 **外部仪表盘（External dashboard）**：
-由 Grafana 或 Perses 等外部工具自由编排、以 MetricsQL/PromQL 面板构成的监控视图；本产品只提供 Prometheus 兼容查询接口和项目级 token，不内置看板编排。
+由 Grafana 或 Perses 等外部工具自由编排、以 MetricsQL/PromQL 面板构成的监控视图；本产品只提供 Prometheus 兼容查询接口，查询用用户 API Token（`lou_…`）加 `X-LO-Project` 请求头选择项目（项目 API Token 只能摄取，见 ADR 0010），不内置看板编排。
 _避免使用_：应用性能、指标探索器
 
 **因果证据链接（Causal evidence link）**：
