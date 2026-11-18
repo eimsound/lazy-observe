@@ -21,6 +21,14 @@ var httpServerRequestDurationBucketsSeconds = []float64{
 }
 
 // Fiber returns explicit Fiber v2 HTTP server instrumentation.
+//
+// Without fiber.Config.Immutable, Fiber's request accessors (Method, Path,
+// Hostname, Get, Route fallbacks, ...) return strings that borrow pooled request
+// buffers which the next request overwrites. Every such value that outlives the
+// handler (span attributes exported in batches, metric attributes used as
+// aggregation keys, error-event tags, log records, propagated trace state) is
+// copied with strings.Clone at the point it is read, so the middleware is
+// correct regardless of the application's Immutable setting.
 func (c *Client) Fiber() fiber.Handler {
 	meter := c.meter.Meter(instrumentationName + "/fiber")
 	duration, _ := meter.Float64Histogram(
@@ -38,14 +46,14 @@ func (c *Client) Fiber() fiber.Handler {
 
 	return func(fc *fiber.Ctx) (returnErr error) {
 		start := time.Now()
-		method := fc.Method()
-		path := fc.Path()
+		method := strings.Clone(fc.Method())
+		path := strings.Clone(fc.Path())
 		parent := c.propagator.Extract(fc.UserContext(), fiberHeaderCarrier{ctx: fc})
 		spanAttrs := []attribute.KeyValue{
 			attribute.String("http.request.method", method),
 			attribute.String("url.scheme", requestScheme(fc)),
 			attribute.String("url.path", path),
-			attribute.String("server.address", fc.Hostname()),
+			attribute.String("server.address", strings.Clone(fc.Hostname())),
 			attribute.String(
 				"network.protocol.version",
 				strings.TrimPrefix(string(fc.Request().Header.Protocol()), "HTTP/"),
@@ -63,7 +71,9 @@ func (c *Client) Fiber() fiber.Handler {
 			status := fc.Response().StatusCode()
 			route := path
 			if fc.Route() != nil && fc.Route().Path != "" {
-				route = fc.Route().Path
+				// Registered route paths are app-owned, but Route() falls back to the
+				// borrowed request path when no route is set; clone either way.
+				route = strings.Clone(fc.Route().Path)
 			}
 			panicked := false
 			if recovered := recover(); recovered != nil {
@@ -134,6 +144,8 @@ func fiberErrorTags(method, route string, status int) map[string]string {
 	}
 }
 
+// fiberRequestURL builds a fresh string by concatenation, so it never aliases the
+// request buffers it reads from.
 func fiberRequestURL(c *fiber.Ctx) string {
 	return requestScheme(c) + "://" + c.Hostname() + c.Path()
 }
@@ -143,14 +155,16 @@ func requestScheme(c *fiber.Ctx) string {
 		return "https"
 	}
 	if forwarded := c.Get(fiber.HeaderXForwardedProto); forwarded != "" {
-		return forwarded
+		return strings.Clone(forwarded)
 	}
 	return "http"
 }
 
 type fiberHeaderCarrier struct{ ctx *fiber.Ctx }
 
-func (c fiberHeaderCarrier) Get(key string) string { return c.ctx.Get(key) }
+// Get copies the header: propagators keep parsed values (for example
+// tracestate members) in the span context, which is exported after the request.
+func (c fiberHeaderCarrier) Get(key string) string { return strings.Clone(c.ctx.Get(key)) }
 
 func (c fiberHeaderCarrier) Set(key, value string) { c.ctx.Set(key, value) }
 

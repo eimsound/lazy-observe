@@ -47,6 +47,14 @@ Go `bool` has no “unset” value, so signal switches use a compact matrix rule
 - Metrics-enabled clients also report goroutines, heap allocation, and GC count.
 - Profiling collects a 10-second CPU window every 60 seconds by default (10s/60s duty cycle), followed by heap and goroutine snapshots, and queues gzip pprof payloads with a stable upload ID. Go pprof itself typically adds about 1–5% overhead while CPU sampling is active.
 
+### Fiber request buffers and `Immutable`
+
+Fiber v2 without `fiber.Config{Immutable: true}` returns strings from `c.Method()`, `c.Path()`, `c.Hostname()`, `c.Get()`, `c.Params()`, and similar accessors that borrow pooled request buffers; the next request overwrites them in place. `lo.Fiber()` copies every request value it keeps past the handler (span attributes and name, metric attributes, error-event tags, panic log fields, incoming `traceparent`/`tracestate`) at the moment it reads it, so its telemetry is correct whether or not your app enables `Immutable`. You do not need to turn on `Immutable` for the SDK.
+
+Your own handlers still follow Fiber's rule: if you put a request value into a span attribute, metric attribute, log record, map, or goroutine, copy it first, for example `strings.Clone(c.Params("id"))`.
+
+**Fixed:** earlier versions of `lo.Fiber()` kept the borrowed strings, so in apps without `Immutable` the exported `http.request.method`, `url.path`, `server.address`, `url.scheme`, trace state, metric attributes, and error tags could show another request's values once Fiber reused the buffer.
+
 The SDK never calls `otel.SetTracerProvider`, `otel.SetMeterProvider`, `slog.SetDefault`, or registers drivers in `init`; applications opt into every integration explicitly.
 
 ## Error reporting
