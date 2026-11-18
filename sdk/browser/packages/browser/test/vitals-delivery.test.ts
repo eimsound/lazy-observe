@@ -76,6 +76,8 @@ it("counts a 4xx vitals refusal and reports it as server_rejected without throwi
 it.each([
   ["network error", async () => { throw new TypeError("Failed to fetch"); }],
   ["5xx", async () => new Response(null, { status: 503 })],
+  ["408", async () => new Response(null, { status: 408 })],
+  ["429", async () => new Response(null, { status: 429 })],
 ])("counts a vitals %s as an exhausted attempt without throwing", async (_name, vitalsResponse) => {
   const fetcher = vi.fn(async (input: RequestInfo | URL) => (
     String(input).endsWith("/api/events/vitals")
@@ -103,6 +105,24 @@ it.each([
       dropped: 1,
     }],
   });
+  await client.close();
+});
+
+it.each([400, 404, 422])("treats a %s vitals refusal as server_rejected", async (status) => {
+  const fetcher = vi.fn(async (input: RequestInfo | URL) => (
+    String(input).endsWith("/api/events/vitals")
+      ? new Response(null, { status })
+      : new Response(null, { status: 204 })
+  ));
+  const { client, warning } = startClient(fetcher as unknown as typeof fetch);
+
+  webVitalCallbacks[0](metric());
+
+  await vi.waitFor(() => expect(client.diagnostics().droppedTelemetry).toBe(1));
+  expect(warning).toHaveBeenCalledWith(
+    "[lazy-observe] vitals telemetry dropped",
+    expect.objectContaining({ reason: "server_rejected", count: 1 }),
+  );
   await client.close();
 });
 

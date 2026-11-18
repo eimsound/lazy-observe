@@ -90,14 +90,18 @@ enqueue never waits for the network. A full queue drops new telemetry, and a
 failed batch (including a drained Replay segment) remains resident until its
 finite retry budget is exhausted. Web Vitals skip the queues and are posted once
 per metric; a failed upload is counted and reported like a queue drop, with
-reason `server_rejected` for a 4xx and `retry_exhausted` for a network error or
-5xx (single attempt). Each drop emits a local `console.warn`.
+reason `server_rejected` for a 4xx refusal (408 and 429 are transient and report
+`retry_exhausted`) and `retry_exhausted` for a network error or 5xx (single
+attempt). Each drop emits a local `console.warn`.
 
 `client.diagnostics().droppedTelemetry` returns the page-local total. Drop
 measurements use stable IDs and are sent to the dedicated SDK diagnostic ingest,
 which writes `lazy_observe_sdk_dropped_telemetry`; they are not disguised as Web
 Vitals. Diagnostic queue failure is counted locally without recursively creating
-another diagnostic.
+another diagnostic: a `422` from an older server rejects the whole batch
+(including the measurements it does know) and, after that queue's retry budget is
+exhausted, the batch is dropped as a `diagnostic` / `retry_exhausted` drop whose
+count is the batch size.
 
 `pagehide` calls `flush()` with Fetch `keepalive` as best effort only. It does
 not claim durable or guaranteed unload delivery. `close()` drains finite retry

@@ -71,11 +71,13 @@ Errors, spans, replay segments, and drop diagnostics use bounded in-memory queue
 | `reason` | Meaning |
 | --- | --- |
 | `queue_full` | A bounded queue was full and the new telemetry was dropped |
-| `retry_exhausted` | The finite delivery budget ran out. Vitals are sent once, so a network error or 5xx reports this reason |
+| `retry_exhausted` | The finite delivery budget ran out. Vitals are sent once, so a network error, 5xx, 408, or 429 reports this reason |
 | `shutdown_budget` | Telemetry was enqueued after `close()` |
-| `server_rejected` | Ingest answered 4xx; the payload will never be accepted as-is, so it is not retried |
+| `server_rejected` | Ingest answered 4xx (except 408 and 429, which are transient); the payload will never be accepted as-is, so it is not retried |
 
-The reported `signal` is `error`, `trace`, `vitals`, `replay`, or `diagnostic`. A failed diagnostics upload is counted locally and never reported recursively. Older servers that reject an unknown `signal` or `reason` answer the whole diagnostics batch with `422`; the drop stays counted locally and nothing is thrown.
+The reported `signal` is `error`, `trace`, `vitals`, `replay`, or `diagnostic`. A failed diagnostics upload is counted locally and never reported recursively.
+
+Older servers that reject an unknown `signal` or `reason` answer the whole diagnostics batch with `422`, so the loss is not limited to the new value: the measurements the server does know (for example `error` / `queue_full`) are rejected with it. That batch stays queued and is re-posted on the diagnostic queue's finite delivery budget with backoff; when the budget runs out the whole batch is dropped, `droppedTelemetry` grows by the batch size, and the loss is recorded as a `diagnostic` / `retry_exhausted` drop — locally only, so it cannot recurse. The SDK still degrades silently: one `console.warn`, nothing thrown.
 
 ## Fetch and XHR tracing
 
