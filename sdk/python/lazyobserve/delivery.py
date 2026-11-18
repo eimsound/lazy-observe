@@ -98,6 +98,16 @@ class DeliveryQueue(Generic[T]):
         with self._drop_lock:
             return self._dropped
 
+    def record_drop(
+        self, reason: str, err: Optional[BaseException] = None, count: int = 1
+    ) -> None:
+        """Count a caller-side drop and emit the queue's warn callback.
+
+        Used when the sender deliberately discards an item (for example a 4xx
+        rejection) without treating it as a retryable failure.
+        """
+        self._record_drop(reason, err, count)
+
     # -- internals ----------------------------------------------------------
 
     def _record_drop(self, reason: str, err: Optional[BaseException], count: int) -> None:
