@@ -10,7 +10,7 @@ Hard constraints:
 
 - Go 1.26 with the exact module directive currently at 1.26.11.
 - `CGO_ENABLED=0` for Linux on amd64/arm64.
-- Node.js 24 and pnpm 10.33.0 for CI-equivalent web/SDK work.
+- Node.js 26 (LTS, pinned in `mise.toml`) and pnpm 10.33.0 for CI-equivalent web/SDK work.
 - No AGPL or GPL dependencies. New dependencies must use Apache-2.0, MIT, or BSD-family licenses.
 - PoCs belong under `poc/<topic>/` with a `FINDINGS.md`; production code belongs under `cmd/` and `internal/`; client SDKs belong under `sdk/{go,node,browser,python}`.
 

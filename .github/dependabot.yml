@@ -87,6 +87,11 @@ updates:
       default-days: 7
     commit-message:
       prefix: chore
+    ignore:
+      # @types/node 的主版本跟随运行时 Node 主版本（mise.toml 的 node，当前 26）：类型超前于运行时会让
+      # typecheck 放过运行时不存在的 API。升级 mise.toml 的 node 主版本时同步改这里的上界。
+      - dependency-name: "@types/node"
+        versions: [">=27.0.0"]
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
@@ -103,6 +108,11 @@ updates:
       default-days: 7
     commit-message:
       prefix: chore
+    ignore:
+      # @types/node 的主版本跟随运行时 Node 主版本（mise.toml 的 node，当前 26）：类型超前于运行时会让
+      # typecheck 放过运行时不存在的 API。升级 mise.toml 的 node 主版本时同步改这里的上界。
+      - dependency-name: "@types/node"
+        versions: [">=27.0.0"]
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
@@ -119,6 +129,11 @@ updates:
       default-days: 7
     commit-message:
       prefix: chore
+    ignore:
+      # @types/node 的主版本跟随运行时 Node 主版本（mise.toml 的 node，当前 26）：类型超前于运行时会让
+      # typecheck 放过运行时不存在的 API。升级 mise.toml 的 node 主版本时同步改这里的上界。
+      - dependency-name: "@types/node"
+        versions: [">=27.0.0"]
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
