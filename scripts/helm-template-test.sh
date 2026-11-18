@@ -22,7 +22,8 @@ assert_contains() {
   file=$1
   pattern=$2
   message=$3
-  if ! grep -Eq "$pattern" "$file"; then
+  # `--` so a pattern may start with a dash (e.g. the flag name it asserts on).
+  if ! grep -Eq -- "$pattern" "$file"; then
     echo "FAIL: $message" >&2
     exit 1
   fi
@@ -32,7 +33,7 @@ assert_not_contains() {
   file=$1
   pattern=$2
   message=$3
-  if grep -Eq "$pattern" "$file"; then
+  if grep -Eq -- "$pattern" "$file"; then
     echo "FAIL: $message" >&2
     exit 1
   fi
@@ -241,4 +242,97 @@ assert_contains "$WORK/notes-existing.txt" 'key admin-password of your Secret lo
 render_notes "$WORK/notes-datadir.txt" --set mode=allinone --set adminPassword.autoGenerate=false
 assert_contains "$WORK/notes-datadir.txt" '/data/initial-admin-password' 'NOTES must show where the server writes the initial admin password'
 
+# Container image reference. Without a digest the chart keeps the historical
+# <repository>:<tag> form (the tag falls back to Chart.AppVersion). With a digest
+# the digest decides which bytes run, and the tag - when also set - stays in the
+# reference for readability, the same shape the pinned third-party images use in
+# scripts/e2e-multi-replica.sh. A malformed digest must fail rendering instead of
+# silently downgrading the deployment to a mutable tag.
+IMAGE_REPO='ghcr\.io/eimsound/lazy-observe'
+DIGEST=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+"$HELM" template test "$CHART" >"$WORK/image-default.yaml"
+assert_contains "$WORK/image-default.yaml" "image: \"${IMAGE_REPO}:latest\"$" \
+  'without image.tag or image.digest the chart falls back to Chart.AppVersion'
+"$HELM" template test "$CHART" --set image.tag=1.2.3 >"$WORK/image-tag.yaml"
+assert_contains "$WORK/image-tag.yaml" "image: \"${IMAGE_REPO}:1\\.2\\.3\"$" \
+  'image.tag must be used while image.digest is empty'
+"$HELM" template test "$CHART" --set image.digest="$DIGEST" >"$WORK/image-digest.yaml"
+assert_contains "$WORK/image-digest.yaml" "image: \"${IMAGE_REPO}@$DIGEST\"$" \
+  'image.digest alone must render repository@digest without inventing a tag'
+assert_not_contains "$WORK/image-digest.yaml" 'lazy-observe:latest' \
+  'a digest-only reference must not keep the mutable default tag'
+"$HELM" template test "$CHART" --set image.tag=1.2.3 --set image.digest="$DIGEST" \
+  >"$WORK/image-tag-digest.yaml"
+assert_contains "$WORK/image-tag-digest.yaml" "image: \"${IMAGE_REPO}:1\\.2\\.3@$DIGEST\"$" \
+  'image.tag plus image.digest must render repository:tag@digest'
+
+# 数值型 tag：values 里写 `tag: 0.1` 会被 YAML 解析成 float，`--set image.tag=2` 会被解析成
+# int64，直接 printf %s 会输出 Go 的格式错误串（%!s(float64=0.1)），渲染出 InvalidImageName
+# 而 helm 不报错。release 本就发 {{major}}.{{minor}} 形式的 tag，所以 tag 必须先 toString。
+cat >"$WORK/image-numeric-values.yaml" <<'YAML'
+image:
+  tag: 0.1
+YAML
+"$HELM" template test "$CHART" -f "$WORK/image-numeric-values.yaml" >"$WORK/image-numeric.yaml"
+assert_contains "$WORK/image-numeric.yaml" "image: \"${IMAGE_REPO}:0\\.1\"$" \
+  'a numeric YAML image.tag must render as a plain version string'
+assert_not_contains "$WORK/image-numeric.yaml" '%!s' \
+  'a numeric image.tag must not leak Go formatting verbs into the image reference'
+"$HELM" template test "$CHART" --set image.tag=2 --set image.digest="$DIGEST" \
+  >"$WORK/image-int-digest.yaml"
+assert_contains "$WORK/image-int-digest.yaml" "image: \"${IMAGE_REPO}:2@$DIGEST\"$" \
+  'an integer --set image.tag must render as a plain version string alongside a digest'
+assert_not_contains "$WORK/image-int-digest.yaml" '%!s' \
+  'an integer image.tag must not leak Go formatting verbs into the image reference'
+
+assert_render_fails 'a truncated digest must fail rendering' 'image.digest must be "sha256:"' \
+  --set image.digest=sha256:abc
+assert_render_fails 'an uppercase digest must fail rendering' 'image.digest must be "sha256:"' \
+  --set image.digest=sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef
+assert_render_fails 'a non-sha256 digest must fail rendering' 'image.digest must be "sha256:"' \
+  --set image.digest=sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+# The chart is not packaged or published: the release workflow renders the
+# digest it just pushed into a values fragment and attaches it to the GitHub
+# Release (helm-values-lazy-observe-<version>.yaml). Render that fragment with
+# fake inputs and feed it back into the chart, so the renderer and the template
+# cannot drift apart.
+RENDER_VALUES="$ROOT/scripts/render-helm-release-values.sh"
+if [ ! -x "$RENDER_VALUES" ]; then
+  echo "FAIL: scripts/render-helm-release-values.sh must exist and be executable" >&2
+  exit 1
+fi
+bash "$RENDER_VALUES" --tag 1.2.3 --digest "$DIGEST" --output "$WORK/helm-values.yaml"
+assert_contains "$WORK/helm-values.yaml" '^  repository: "ghcr\.io/eimsound/lazy-observe"$' \
+  'the release values fragment must name the default image repository'
+assert_contains "$WORK/helm-values.yaml" '^  tag: "1\.2\.3"$' \
+  'the release values fragment must carry the released version as image.tag'
+assert_contains "$WORK/helm-values.yaml" "^  digest: \"$DIGEST\"$" \
+  'the release values fragment must pin the pushed digest'
+"$HELM" template test "$CHART" -f "$WORK/helm-values.yaml" >"$WORK/image-release-values.yaml"
+assert_contains "$WORK/image-release-values.yaml" "image: \"${IMAGE_REPO}:1\\.2\\.3@$DIGEST\"$" \
+  'the release values fragment must render the published digest'
+if bash "$RENDER_VALUES" --tag 1.2.3 --digest sha256:abc >"$WORK/render-fail.yaml" \
+  2>"$WORK/render-fail.err"; then
+  echo "FAIL: the release values renderer must reject a malformed digest" >&2
+  exit 1
+fi
+assert_contains "$WORK/render-fail.err" 'sha256:' 'the renderer error must name the expected digest shape'
+if [ -s "$WORK/render-fail.yaml" ]; then
+  echo "FAIL: the release values renderer must not emit output for a malformed digest" >&2
+  exit 1
+fi
+# 仓库名会被拼进镜像引用，拼错（大写、多余的分隔符）在 Kubernetes 里只是 InvalidImageName，
+# 所以在生成阶段就拦下来。
+for bad_repository in 'ghcr.io/Eimsound/lazy-observe' '/lazy-observe' 'lazy-observe/'; do
+  if bash "$RENDER_VALUES" --repository "$bad_repository" --tag 1.2.3 --digest "$DIGEST" \
+    >"$WORK/render-repo.yaml" 2>"$WORK/render-repo.err"; then
+    echo "FAIL: the release values renderer must reject repository '$bad_repository'" >&2
+    exit 1
+  fi
+  assert_contains "$WORK/render-repo.err" '--repository must be a lowercase' \
+    'the renderer error must name the rejected --repository value'
+done
+
 echo "PASS: Helm templates satisfy standalone-ha, clustered HA, and allinone assertions"
+echo "PASS: Helm image references honour image.digest and the release values fragment"

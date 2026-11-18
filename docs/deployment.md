@@ -549,6 +549,47 @@ helm upgrade --install lazy-observe deploy/helm/lazy-observe \
   --set persistence.size=50Gi
 ```
 
+### Pinning the gateway image by digest
+
+`image.digest` takes a registry digest: `sha256:` plus 64 lowercase hex
+characters. When it is set the chart renders `<repository>:<tag>@<digest>`, or
+`<repository>@<digest>` when `image.tag` is empty. The digest, not the tag,
+selects the bytes that run; a malformed digest fails rendering instead of
+silently downgrading the Deployment to a mutable tag:
+
+```sh
+helm upgrade --install lazy-observe deploy/helm/lazy-observe \
+  --namespace lazy-observe \
+  --set secret.existingSecret=lazy-observe \
+  --set image.tag=0.1.0 \
+  --set image.digest=sha256:...
+```
+
+Do not copy that digest by hand when you can avoid it. Every server release
+attaches `helm-values-lazy-observe-<version>.yaml` to its GitHub Release; the
+file is rendered from the digest `docker/build-push-action` returned after
+pushing the multi-architecture image to `ghcr.io/eimsound/lazy-observe`, so it
+pins exactly the bytes that release built:
+
+```sh
+gh release download v0.1.0 --pattern 'helm-values-lazy-observe-*.yaml'
+helm upgrade --install lazy-observe deploy/helm/lazy-observe \
+  --namespace lazy-observe \
+  -f deploy/helm/lazy-observe/values-standalone-ha-cluster.yaml \
+  -f helm-values-lazy-observe-0.1.0.yaml
+```
+
+Always write `image.tag` as a quoted string (`tag: "0.1"`). Unquoted, YAML reads
+`0.1` as a number and a trailing zero disappears (`0.10` becomes `0.1`); the
+chart stringifies numeric tags so they still render, but the version in the file
+stops matching the tag you meant.
+
+The chart is neither packaged nor published as a tgz or OCI artifact; it is
+consumed from the repository checkout under `deploy/helm/lazy-observe`. That is
+why the release flow never writes the digest back into the checked-in
+`values.yaml`: a pinned digest in the repository would always lag one release
+behind, and backfilling it would need a commit on `main` from a publishing run.
+
 `standalone-ha` needs a platform encryption key Secret —
 `encryptionKey.existingSecret`, or the chart-generated one with the default
 `encryptionKey.autoGenerate=true`. The chart refuses to render a
@@ -607,7 +648,8 @@ Outbox, Redis sessions and rate limits, fenced alert ownership, readiness, and
 drain. Docker is required; missing Docker prerequisites return `77`/`SKIP`,
 which CI treats as a failure and which is never a pass.
 
-The principal values surfaces are `mode`, `replicaCount`, `image.*`,
+The principal values surfaces are `mode`, `replicaCount`,
+`image.{repository,tag,digest,pullPolicy}`,
 `external.{postgres,redis,s3,metrics,logs,traces}`, `secret.*`, `resources`,
 `hpa.*`, `podDisruptionBudget.*`, `persistence.*`, `ingress.*`, `process.*`,
 `encryptionKey.*` (the shared platform key behind `security.secret_key_file`),
@@ -711,7 +753,11 @@ tag. The embedded-payload and zero-configuration smoke gate is therefore a
 mandatory precondition of either packaging path, not a separate optional
 check. Pushing a `v*` tag runs `.github/workflows/release.yml`, which creates
 Linux amd64/arm64 archives and checksums as a GitHub Release, and pushes the
-amd64/arm64 container image to `ghcr.io/eimsound/lazy-observe`. Before archives
+amd64/arm64 container image to `ghcr.io/eimsound/lazy-observe`. After that push
+it also attaches `helm-values-lazy-observe-<version>.yaml` — the digest of the
+image it just published, rendered by `scripts/render-helm-release-values.sh` —
+to the same Release, so a Helm deployment can pin the released image without
+hand-copying a digest. Before archives
 are built, that workflow requires the dual-architecture container smoke
 (including the Trivy scan that fails on fixable CRITICAL/HIGH vulnerabilities)
 and the full performance gates (`bench`, `perf-release`, `perf-ha`,

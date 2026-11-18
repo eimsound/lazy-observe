@@ -161,15 +161,88 @@ if [[ -n $unpinned_buildkit ]]; then
   fail 'docker/setup-buildx-action must set driver-opts: image=moby/buildkit:vX.Y.Z@sha256:<index digest>'
 fi
 
+# 按 job 名截取 workflow 里的 job 块（$1 文件，$2 job 名）。下面的断言必须按 job 定位：
+# 否则「docker job 里写了 contents: write」这种检查会因为别的 job 满足而误判通过。
+release_job() {
+  awk -v header="  $2:" '$0 == header { on = 1; next } on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } on { print }' "$1"
+}
+
+# 定位器自测：只用一段假 workflow 证明截取确实按 job 边界停下来。
+job_fixture=$(mktemp)
+cat >"$job_fixture" <<'JOBFIXTURE'
+jobs:
+  docker:
+    permissions:
+      contents: read
+  helm-values:
+    needs: docker
+    permissions:
+      contents: write
+  other:
+    steps:
+      - run: echo other
+JOBFIXTURE
+locator_docker=$(release_job "$job_fixture" docker)
+locator_values=$(release_job "$job_fixture" helm-values)
+locator_missing=$(release_job "$job_fixture" missing)
+rm -f "$job_fixture"
+[[ $locator_docker == *'contents: read'* ]] || fail 'job locator self-test: docker block not found'
+[[ $locator_docker != *'contents: write'* ]] || fail 'job locator self-test: docker block ran into helm-values'
+[[ $locator_values == *'contents: write'* ]] || fail 'job locator self-test: helm-values block not found'
+[[ $locator_values != *'echo other'* ]] || fail 'job locator self-test: helm-values block ran into other'
+[[ -z $locator_missing ]] || fail 'job locator self-test: unknown job returned text'
+
 # 发版前的镜像漏洞扫描必须挡在发布之前：container-check 跑扫描，archive 依赖 container-check。
 release_wf=.github/workflows/release.yml
 if [[ -f $release_wf ]]; then
-  container_check=$(awk '$0 == "  container-check:" { on = 1; next } on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } on { print }' "$release_wf")
+  container_check=$(release_job "$release_wf" container-check)
   [[ $container_check == *'run: bash scripts/check-image-vulns.sh lazy-observe:preflight-'* ]] ||
     fail "$release_wf: container-check must scan the preflight image with scripts/check-image-vulns.sh"
-  archive_job=$(awk '$0 == "  archive:" { on = 1; next } on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } on { print }' "$release_wf")
+  archive_job=$(release_job "$release_wf" archive)
   [[ $archive_job == *'needs: [container-check, '* ]] ||
     fail "$release_wf: archive must need container-check so the image scan blocks publishing"
+
+  # chart 不单独发布（没有 helm package/push），发版产物里带的是 digest 固定的 Helm values 片段。
+  # 自家镜像的 digest 只有 docker/build-push-action 推完镜像才存在，所以回填落在 docker 之后的
+  # helm-values job：由 scripts/render-helm-release-values.sh 生成、作为 Release 资产上传。
+  # 该 job 单独存在是为了最小权限：docker job 会把 GITHUB_TOKEN 当 BuildKit secret 挂进构建，
+  # 不能同时持有写仓库的权限。发版流程不能在本地真跑，这些静态断言是它唯一的门禁。
+  docker_job=$(release_job "$release_wf" docker)
+  helm_values_job=$(release_job "$release_wf" helm-values)
+  [[ -n $helm_values_job ]] ||
+    fail "$release_wf: missing a helm-values job that attaches the digest-pinned Helm values"
+
+  # docker：只读，且把 digest 与版本号经 outputs 交出去。
+  [[ $docker_job == *'contents: read'* ]] ||
+    fail "$release_wf: docker must stay contents: read (it mounts the token into the build)"
+  [[ $docker_job != *'contents: write'* ]] ||
+    fail "$release_wf: docker must not hold contents: write; attach release assets from helm-values"
+  [[ $docker_job == *'digest: ${{ steps.build.outputs.digest }}'* ]] ||
+    fail "$release_wf: docker must expose steps.build.outputs.digest as a job output"
+  [[ $docker_job == *'version: ${{ steps.build-meta.outputs.version }}'* ]] ||
+    fail "$release_wf: docker must expose steps.build-meta.outputs.version as a job output"
+  [[ $docker_job != *'gh release upload'* ]] ||
+    fail "$release_wf: docker must not upload release assets; helm-values owns that step"
+
+  # helm-values：只拿 contents: write，只在 tag 推送时跑，消费 docker 的 outputs。
+  [[ $helm_values_job == *'needs: docker'* ]] ||
+    fail "$release_wf: helm-values must need docker so the digest exists before it runs"
+  [[ $helm_values_job == *"if: github.event_name == 'push'"* ]] ||
+    fail "$release_wf: helm-values must only run on tag pushes (workflow_dispatch publishes nothing)"
+  [[ $helm_values_job == *'contents: write'* ]] ||
+    fail "$release_wf: helm-values needs contents: write to attach the Helm values asset"
+  [[ $helm_values_job == *'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}'* ]] ||
+    fail "$release_wf: helm-values must authenticate gh with the job token"
+  [[ $helm_values_job == *'needs.docker.outputs.digest'* ]] ||
+    fail "$release_wf: helm-values must pin the digest docker published"
+  [[ $helm_values_job == *'bash scripts/render-helm-release-values.sh'* ]] ||
+    fail "$release_wf: helm-values must render the values fragment with scripts/render-helm-release-values.sh"
+  [[ $helm_values_job == *'gh release upload'* ]] ||
+    fail "$release_wf: helm-values must attach the digest-pinned Helm values to the release"
+  [[ $helm_values_job == *'--clobber'* ]] ||
+    fail "$release_wf: helm-values must pass --clobber so a re-run replaces the asset"
+  [[ $helm_values_job == *'--repo "$GITHUB_REPOSITORY"'* ]] ||
+    fail "$release_wf: helm-values must name the repository explicitly when uploading"
 fi
 
 # 镜像扫描例外清单：每条都要有理由和到期日，过期条目由 Trivy 自动失效。

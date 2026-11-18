@@ -14,6 +14,40 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/name: {{ include "lazy-observe.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+{{- /*
+Container image reference (server: image.*):
+  digest empty          - <repository>:<tag>, tag defaulting to Chart.AppVersion;
+  digest set, tag empty - <repository>@<digest>;
+  digest set, tag set   - <repository>:<tag>@<digest>, the form the pinned
+                          third-party images use in scripts/e2e-multi-replica.sh
+                          (the tag stays readable, the digest decides the bytes).
+The digest must be a canonical registry digest: "sha256:" plus 64 lowercase hex
+characters. A malformed value fails rendering instead of silently downgrading
+the deployment to a mutable tag.
+
+The tag goes through toString on purpose: YAML parses `tag: 0.1` as a float and
+`--set image.tag=2` as an int64, and printf %s on either emits Go's formatting
+error verb (%!s(float64=0.1)), which renders an InvalidImageName that helm
+reports as a successful render. Releases do publish {{major}}.{{minor}} tags, so
+this is a live failure mode, not a hypothetical one.
+*/ -}}
+{{- define "lazy-observe.image" -}}
+{{- $repository := required "image.repository must not be empty" .Values.image.repository -}}
+{{- $tag := toString (default .Chart.AppVersion .Values.image.tag) -}}
+{{- $digest := .Values.image.digest -}}
+{{- if $digest -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $digest) -}}
+{{- fail (printf "image.digest must be \"sha256:\" followed by 64 lowercase hex characters, got %q" $digest) -}}
+{{- end -}}
+{{- if .Values.image.tag -}}
+{{- printf "%s:%s@%s" $repository $tag $digest -}}
+{{- else -}}
+{{- printf "%s@%s" $repository $digest -}}
+{{- end -}}
+{{- else -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end -}}
+{{- end }}
 {{- define "lazy-observe.secretName" -}}
 {{- default (include "lazy-observe.fullname" .) .Values.secret.existingSecret }}
 {{- end }}
