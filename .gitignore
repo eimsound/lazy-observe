@@ -41,3 +41,6 @@ sdk/python/**/__pycache__/
 sdk/python/*.egg-info/
 
 sdk/python/examples/django/db.sqlite3
+
+# Claude Code 本机设置（个人权限放行规则等），不进仓库；共享设置用 .claude/settings.json
+.claude/settings.local.json
