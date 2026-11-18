@@ -156,7 +156,9 @@ CGO_ENABLED=0 go mod tidy -diff
 description = "Run golangci-lint v2.12.2 and the alert lease clock check"
 depends = ["ent-generate", "alert-lease-clock-check"]
 tools."golangci-lint" = "2.12.2"
-run = "golangci-lint run ./..."
+# --allow-serial-runners: 并行 worktree 共用一份全局锁，拿不到锁时排队等待而不是以
+# "parallel golangci-lint is running" 退出。只影响等锁行为，不影响检查结果。
+run = "golangci-lint run --allow-serial-runners ./..."
 
 [tasks.alert-lease-clock-check]
 description = "Verify alert lease and membership queries read the clock through alertClockSQL"
@@ -250,7 +252,13 @@ description = "Verify the Go SDK nested module (sdk/go) is tidy, then build, vet
 dir = "sdk/go"
 env = { CGO_ENABLED = "0" }
 tools."golangci-lint" = "2.12.2"
-run = ["go mod tidy -diff", "go build ./...", "go vet ./...", "golangci-lint run ./...", "go test ./..."]
+run = [
+  "go mod tidy -diff",
+  "go build ./...",
+  "go vet ./...",
+  "golangci-lint run --allow-serial-runners ./...",
+  "go test ./...",
+]
 
 [tasks.sdk-node]
 description = "Install, build, typecheck, test, and license-check the Node SDK workspace"
