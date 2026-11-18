@@ -379,7 +379,7 @@ jobs:
         run: mise run --skip-tools test-meta-pg
 
   sdk-go:
-    name: Go SDK (build, vet, test)
+    name: Go SDK (build, vet, lint, test)
     needs: changes
     if: needs.changes.outputs.sdk_go == 'true'
     runs-on: ubuntu-24.04

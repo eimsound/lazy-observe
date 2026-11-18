@@ -192,7 +192,7 @@ description = "Statically verify E2E coverage and cross-platform delivery eviden
 run = "bash scripts/check-e2e-contract.sh"
 
 [tasks.e2e-ha]
-description = "Run the required VM/VLogs/VTraces cluster and S3 multi-replica HA gate"
+description = "Run the VM/VLogs/VTraces cluster and S3 multi-replica HA gate locally (Docker required); PR CI runs it for server code changes"
 depends = ["build-binary", "storage-bins"]
 run = '''
 #!/usr/bin/env bash
@@ -246,11 +246,11 @@ description = "Test the incremental CI change-surface grouping rules"
 run = "bash scripts/ci-changes-test.sh"
 
 [tasks.sdk-go]
-description = "Build, vet, lint, and test the Go SDK nested module (sdk/go)"
+description = "Verify the Go SDK nested module (sdk/go) is tidy, then build, vet, lint, and test it"
 dir = "sdk/go"
 env = { CGO_ENABLED = "0" }
 tools."golangci-lint" = "2.12.2"
-run = ["go build ./...", "go vet ./...", "golangci-lint run ./...", "go test ./..."]
+run = ["go mod tidy -diff", "go build ./...", "go vet ./...", "golangci-lint run ./...", "go test ./..."]
 
 [tasks.sdk-node]
 description = "Install, build, typecheck, test, and license-check the Node SDK workspace"
