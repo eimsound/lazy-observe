@@ -27,7 +27,7 @@ spec:
       {{- end }}
       containers:
         - name: lazy-observe
-          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          image: {{ include "lazy-observe.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["server", "--config", "/etc/lazy-observe/config.yaml"]
           ports:

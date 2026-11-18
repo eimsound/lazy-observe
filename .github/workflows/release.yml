@@ -215,8 +215,14 @@ jobs:
     needs: archive
     runs-on: ubuntu-24.04
     permissions:
+      # 只读：这个 job 把 GITHUB_TOKEN 当作 BuildKit secret 挂进构建，构建期代码不应该拿到
+      # 写仓库的权限。回填 Release 资产交给下面的 helm-values job。
       contents: read
       packages: write
+    # digest 只有推完镜像才存在；helm-values job 通过 outputs 拿到它和版本号。
+    outputs:
+      version: ${{ steps.build-meta.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The builder stage runs on $BUILDPLATFORM and cross-compiles; the final
@@ -270,3 +276,36 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: docker buildx imagetools inspect "ghcr.io/eimsound/lazy-observe@$DIGEST"
+
+  # chart 本身不打包也不发布（仍在 deploy/helm/lazy-observe）；digest 只有推完镜像才存在，
+  # 且 GoReleaser 已在 archive job 建好 Release，所以回填的做法是把 digest 写成 values
+  # 片段挂到本次 Release 上，而不是把 digest 提交回 main（AFK 契约禁止直推 main，
+  # 提交回 main 也只会让 chart 永远指向上一个版本的镜像）。
+  # 单独开一个 job 而不是塞进 docker：那个 job 会把 GITHUB_TOKEN 当 BuildKit secret 挂进
+  # 构建，写权限只应该出现在这里。
+  helm-values:
+    name: Attach digest-pinned Helm values
+    if: github.event_name == 'push'
+    needs: docker
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # 生成脚本在仓库里（scripts/render-helm-release-values.sh），所以要 checkout。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Render digest-pinned Helm values
+        env:
+          IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+          IMAGE_TAG: ${{ needs.docker.outputs.version }}
+        run: |
+          bash scripts/render-helm-release-values.sh \
+            --repository ghcr.io/eimsound/lazy-observe \
+            --tag "$IMAGE_TAG" \
+            --digest "$IMAGE_DIGEST" \
+            --output "dist/helm-values-lazy-observe-$IMAGE_TAG.yaml"
+      - name: Attach digest-pinned Helm values to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          HELM_VALUES_FILE: dist/helm-values-lazy-observe-${{ needs.docker.outputs.version }}.yaml
+        run: gh release upload "$RELEASE_TAG" "$HELM_VALUES_FILE" --repo "$GITHUB_REPOSITORY" --clobber

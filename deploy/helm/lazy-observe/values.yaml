@@ -3,7 +3,17 @@ replicaCount: 2
 
 image:
   repository: ghcr.io/eimsound/lazy-observe
+  # Empty falls back to Chart.AppVersion ("latest" for the in-repo chart), so
+  # pin a released version instead of relying on the default.
   tag: ""
+  # Optional registry digest of the image: "sha256:" followed by 64 lowercase
+  # hex characters. When set, the container image is rendered as
+  # <repository>[:<tag>]@<digest>, so the digest - not the tag - selects the
+  # bytes that run; a malformed digest fails rendering instead of silently
+  # falling back to a mutable tag. Every GitHub Release of the server ships
+  # helm-values-lazy-observe-<version>.yaml with this field filled in from the
+  # image the release published (see docs/deployment.md).
+  digest: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 nameOverride: ""
