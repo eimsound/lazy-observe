@@ -113,7 +113,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and forces a change at the next login, while `--password-file` follows the
   rules of `security.admin_password_file` and forces nothing. Every other
   account, and every deployment that sets `security.admin_password_file`
-  (which includes `standalone-ha`), needs `--password-file`. The command
+  (which includes all HA deployments), needs `--password-file`. The command
   revokes every session of the account, clears the Redis-backed login lockout
   when `redis.enabled` is set, writes an `auth.password_reset` audit event with
   actor `cli`, and exits non-zero when the account does not exist. After the
@@ -208,11 +208,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Breaking:** `standalone-ha` now always requires a shared platform
   encryption key — `encryptionKey.existingSecret`, or the chart-managed Secret
   with `encryptionKey.autoGenerate=true` — and the chart refuses to render the
-  profile at any replica count, including one, when neither is set. Its
-  `/data` is an emptyDir while the metadata database is external, so a key
-  generated in the pod dies with it and the replacement pod is refused for the
-  fingerprint mismatch. `allinone` with persistence keeps its data-directory
-  key, and `allinone` without a PVC loses key and database together (#60).
+  profile at any replica count, including one, when neither is set. The
+  default `encryptionKey.autoGenerate=true` needs no action; only a release
+  that turns `autoGenerate` off and provides no `existingSecret` fails to
+  render. Its `/data` is an emptyDir while the metadata database is external,
+  so a key generated in the pod dies with it and the replacement pod is
+  refused for the fingerprint mismatch. `allinone` with persistence keeps its
+  data-directory key, and `allinone` without a PVC loses key and database
+  together (#60).
 - The metadata baseline gained `platform_key_fingerprints`, so a metadata
   database (SQLite file or PostgreSQL database) created by an earlier commit
   refuses to start with `metadata migration 1 checksum mismatch`; recreate it
@@ -272,6 +275,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   documentation-only changes run no business jobs; arm64 build and smoke run on
   pull requests that touch the packaging chain. Container images publish to
   `ghcr.io/eimsound/lazy-observe`.
+- CI and the Dockerfile builder stage now install mise from the pinned
+  `v2026.5.3` GitHub release with a sha256 check instead of piping the
+  unpinned `mise.run` installer, reading one `scripts/mise-release.env` for the
+  version and both architecture checksums, and `mise run workflow-check` now
+  rejects shell pipelines that can close early under `pipefail` (`grep -q`,
+  `head`) unless the line carries `# pipefail-ok: <reason>` (#62).
+- `mise run lint` and `mise run sdk-go` pass `--allow-serial-runners` to
+  `golangci-lint`, so a second lint in another worktree waits for the shared
+  lock instead of exiting with `parallel golangci-lint is running` (#64).
 - Made release archives consume the canonical root `LICENSE` file.
 - Made PostgreSQL the correctness boundary for multi-replica alert membership,
   per-rule leases/fencing, durable state, and notification Outbox work; Redis
