@@ -175,7 +175,7 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
 
 ### S2 采样器
 
-- [ ] 2. 3.15 进程内 CPU 采样器
+- [x] 2. 3.15 进程内 CPU 采样器
   - 交付：`lazyobserve/_sampler.py`：启动时用 `inspect.signature` 探测
     `profiling.sampling.sample.sample` 的 `pid`/`collector`/`all_threads`/`mode` 参数；
     签名不符或试采失败则不启用。采样线程对本进程 PID 调用
@@ -189,12 +189,50 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   - 涉及位置：新文件 `sdk/python/lazyobserve/_sampler.py`；只读调研文档
     `.agents/docs/research/python-315-sampling.md:35-49`。
   - Red：`sdk/python/tests/test_sampler.py` 用 fake `profiling.sampling` 模块断言
-    `mode`/`all_threads`/排除采样线程/连续失败自动停用；`test_sampler_unavailable.py`
-    在 3.9–3.14 上断言特性探测不导入私有模块、不采集。命令：`mise run sdk-python` 与
-    3.15 job 的同一 pytest 命令。
+    `mode`/`all_threads`/排除采样线程/连续失败自动停用；同一文件里「3.9–3.14 上特性探测
+    不导入私有模块、不采集」的断言按 `sys.version_info` skipif 分派（落地时合并成一个文件，
+    不再单独建 `test_sampler_unavailable.py`）。命令：`mise run sdk-python` 与 3.15 job 的
+    同一 pytest 命令。
   - Green：实现最小采样器与特性探测。
   - 验证：`mise run sdk-python`；3.15/3.15t job 里跑 `pytest tests/test_sampler.py`。
   - 验收：3.15 上能产出非空聚合栈；3.14 及更早只返回不可用原因；采样线程不出现在样本里。
+  - 落地偏差（实测，见执行日志）：
+    - 采样间隔不在 `sample()` 参数里，`SampleProfiler` 从
+      `collector.sample_interval_usec` 读取，所以 100 Hz 由自定义 collector 上的
+      `sample_interval_usec = 10_000` 表达。
+    - 帧元组的 `funcname` 实测就是 qualname（`Outer.method.<locals>.inner`），不需要额外
+      取 `co_qualname`。
+    - `ThreadInfo.thread_id` 是 OS 线程 id（`threading.get_native_id()`），不是
+      `threading.get_ident()`，排除采样线程按 native id 做。
+    - `SampleProfiler.sample` 会往 stdout 打统计行，采样器把
+      `profiling.sampling.sample` 模块级 `print` 换成 no-op，避免污染应用 stdout。
+    - GIL 构建上 `mode=cpu` 只能看到「此刻不在 Python 字节码里（已释放 GIL）且仍在 CPU 上」
+      的线程：采样线程持 GIL 采样，其它纯 Python 线程一律被判为非 CPU。free-threaded
+      3.15t 上无此限制。负责人已决定保持 `mode=cpu`（ADR 0014 修订：只在 Linux + 3.15t 且
+      GIL 已关闭时采样，GIL 构建不采样），不改 wall/all。
+    - 采样器是阻塞式窗口接口，不自己 sleep；退避以 `Sampler.backoff_seconds()` 暴露给
+      S3 的窗口循环（S2 没有循环）。
+  - ADR 0014 修订后的追加（已落地，见执行日志 2026-11-19）：
+    - 可用性三道门在试采和私有模块导入之前：`sys.platform == "linux"`、
+      `sysconfig.get_config_var("Py_GIL_DISABLED")` 为真、`sys._is_gil_enabled()` 为 False
+      （属性不存在或调用抛错都按「GIL 已启用」处理）。原因码 `not-linux`、`gil-build`、
+      `gil-enabled`；`<3.15` 仍先于它们判断。
+    - `Sampler.recheck_gil()` 只重读 GIL 状态，供 S3 每个窗口开始前调用；GIL 已启用就把采样器
+      永久置为停用（`reason()` 为 `gil-enabled`），不自行 warn，由 S3 打那一条 warning。
+      `collect_window` 本身不重查。
+    - 失败率停用：失败率 = `collect_failed_sample()` 次数 ÷（所有成功读取的尝试 +
+      失败次数），成功尝试按 `len(timestamps_us)` 计，空栈和采样线程自身也算成功尝试。
+      单个窗口的失败率 `> failure_rate_threshold`（`FAILURE_RATE_THRESHOLD = 0.2`，暂定，
+      `Sampler` 的构造参数，不是用户配置）就丢弃该窗口、停用采样器并 warn；
+      失败率经 `SamplingWindow.failure_rate` 与 `Sampler.last_failure_rate()` 暴露。
+      尝试数低于 `MIN_FAILURE_RATE_ATTEMPTS = 100`（100 Hz 下约 1 s）的窗口不做失败率判定，
+      照常返回、失败率照常暴露（审查补充：被截断的短窗口里一次失败就会超过 20%）。
+      连续 3 次窗口级失败（`sample()` 抛错、编码失败）规则不变；一个窗口 = `collect_window` +
+      `encode_window`，只有编码成功才清零连续失败计数（审查修复：原实现在 `collect_window` 成功时
+      清零，编码器持续失败时永远凑不满 3 次、每个窗口都 warn）。
+    - `WINDOW_SECONDS = 10.0`、`WINDOW_INTERVAL_SECONDS = 60.0`，与修订后的「每 60 s 采 10 s」
+      对齐；循环本身仍归 S3。
+    - `Sampler` 只供窗口循环单线程驱动，`recheck_gil`/`collect_window`/`encode_window` 不加锁。
 
 ### S3 公开 API 与生命周期
 
@@ -212,6 +250,10 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   - 阻塞于：S1、S2。
   - 开工前核对：Go SDK 的 shutdown 处理是否与决策 14 一致（`sdk/go` 的
     `profilingLoop` 在 `ctx.Done()` 后直接返回，S3 需要对齐或记录差异）。
+    S2 的 `collect_window` 是阻塞的一次 `sample()`，S2 不提供中途停止；「立即停采」可用 3.15.2
+    `SampleProfiler.sample` 每轮检查的 `collector.running`（`profiling/sampling/sample.py:157`，
+    为 False 即 break，随后照常 flush 已聚合的栈），由 S3 在 `_AggregatingCollector` 上加
+    `running` 并从 shutdown 线程置 False。探测时的 0.1 s 试采也应放在后台线程，不阻塞 `build_client`。
   - 涉及位置：`sdk/python/lazyobserve/config.py:37`、`client.py:231`、`client.py:269`。
   - Red：`test_config.py` 断言 `profiling` 默认 False；`test_profiling_lifecycle.py`
     用 fake 采样器与 fake 上传器断言：不可用时只 warning 一次、每 60 s 一个 10 s 窗口、
@@ -266,10 +308,23 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
 
 ## 未决事项
 
-- S2 的「连续失败 N 次自动停用」中 N 的取值：建议 3，S3 开工前由负责人确认。
+- ~~S2 的「连续失败 N 次自动停用」中 N 的取值~~：已定，N = 3
+  （`MAX_CONSECUTIVE_FAILURES`，负责人 2026-11 拍板）。
 - S3 是否需要同时输出 profiling 自身的 diagnostics 计数（`dropped_telemetry`）：
   建议复用 `record_telemetry_drop`，S3 时确认。
-- 失败率停用阈值：建议 20%，S3 开工前由负责人确认。
+- 失败率停用阈值：S2 已按建议值实现为 `FAILURE_RATE_THRESHOLD = 0.2`（`Sampler` 构造参数，
+  不是用户配置），**待定**：负责人尚未最终确认，S3 开工前再定；改值只动这个常量与对应测试。
+  另请一并确认「窗口内失败率」的口径：S2 按单个窗口内失败的采样尝试占比计，一个窗口超标就停用；
+  不对「窗口级失败、成功、失败、成功…」这种跨窗口间歇序列单独设规则。审查建议（S2 已按此落地，
+  负责人可推翻）：
+  - 短窗口加最小尝试数保护，`MIN_FAILURE_RATE_ATTEMPTS = 100`；正常 10 s 窗口约 1000 次尝试，
+    S3 只上传满 5 s 的窗口（约 500 次），保护只挡被截断的窗口和测试。
+  - 跨窗口间歇失败暂只靠「连续 3 次」：3.15.2 里单次尝试的
+    `RuntimeError`/`OSError`/`UnicodeDecodeError`/`MemoryError` 计入 `collect_failed_sample`，归失败率规则管；
+    窗口级失败只剩建 unwinder 失败（`SampleProfiler.__init__` 转成 `SystemExit`，权限类，持续性的）、
+    其它未预期异常和编码器 `TypeError`/`ValueError`，目前没有已知的间歇触发源；修好清零时机后，
+    持续失败的编码器也能被「连续 3 次」停掉。代价是每次窗口级失败都 warn 一条。若 S3 的 diagnostics
+    显示出现间歇的窗口级失败，再加「最近 M 个窗口失败 N 个」规则。
 - 是否像 Go 的 `ProfilingInterval` 那样把采样间隔开放给用户配置：S3 开工前确认。
 - greenlet 抓栈失败是否报给上游 CPython：由负责人决定，实现线程不自行提交。
 - 后续立项（不在本计划内）：sidecar 外部 attach（覆盖 GIL 构建）与墙钟剖析（新增 profile
@@ -303,3 +358,52 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   4xx 改为经 `DeliveryQueue.record_drop("rejected")` 计数；pytest 防漂移改为比较解压后字节。
   重跑 `mise run sdk-python` → 63 passed（exit 0）；
   `go test ./internal/gateway -run PythonPprof -count=1 -v` → exit 0（fixture 未改动）。
+- 2026-11-19 S2 实测（3.15.2 `-I` 探针脚本）：`sample` 签名
+  `(pid, collector, *, duration_sec=None, all_threads=False, realtime_stats=False, mode=0,
+  async_aware=None, native=False, gc=True, opcodes=False, blocking=False)`；
+  `constants.PROFILING_MODE_CPU = 1`；采样间隔取自
+  `collector.sample_interval_usec`（10_000 → 100 Hz，实测 1 s 采到 100 个样本）；
+  帧 = `(filename, LocationInfo, funcname, opcode)`，`funcname` 是 qualname；
+  `ThreadInfo.thread_id` == `threading.get_native_id()`。
+- 2026-11-19 S2 red：`mise run sdk-python` →
+  `ImportError: cannot import name '_sampler' from 'lazyobserve'`（1 error，exit 1）。
+- 2026-11-19 S2 green：实现 `_sampler.py` 后 `pytest -q tests` →
+  3.13 `88 passed, 3 skipped`（exit 0）；3.14 `88 passed, 3 skipped`；
+  3.15 `90 passed, 1 skipped`；3.15t `90 passed, 1 skipped`。
+- 2026-11-19 S2 门禁：`mise run sdk-python` → `88 passed, 3 skipped`（exit 0）；
+  `uv venv` + `uv pip install -e "sdk/python[test]"` 建 `/tmp/s2-py315`、`/tmp/s2-py315t`、
+  `/tmp/s2-py314`，各自 `python -m pytest -q tests` 全绿（见上一条）。未跑 3.9：本机
+  `uv python list` 只有 `<download available>`，未为此下载；改用
+  `ast.parse(..., feature_version=(3, 9))` 校验 `_sampler.py` 与 `test_sampler.py` 的 3.9 语法。
+- 2026-11-19 S2 稳定性：真实 3.15/3.15t 测试连跑 5 次 / 3 次均通过（采样窗口 2 s）。
+- 2026-11-19 S2 发现：GIL 构建上 `mode=cpu` 只采到采样线程自己——同进程纯 Python 线程在
+  采样瞬间都卡在 GIL 上，`status` 只有 `GIL_REQUESTED` 没有 `ON_CPU`，被
+  `skip_non_matching_threads` 过滤掉；只有处于 GIL-releasing C 调用中的线程可见。
+  3.15t（free-threaded）无此现象。已按决策 5 保留 `mode=cpu`；负责人已决定保持 `mode=cpu`
+  （ADR 0014 修订：只在 Linux + 3.15t 且 GIL 已关闭时采样），不再等待默认 mode 的决定。
+  这条记录当时的 hashlib 负载已在下面 2026-11-19 的追加里换成纯 Python 忙线程。
+- 2026-11-19 S2 追加（ADR 0014 修订）开工：从 `d30b98c` 切 `slice/python-profiling-s2` 并
+  rebase 到 `origin/main`（无冲突，得到 `b80a4e5`）；解释器与环境全部走 uv：
+  `uv python install 3.9 3.13`（3.15、3.15t 已在 uv 里），`uv venv --python <ver>` +
+  `uv pip install -e 'sdk/python[test]'` 建在 `~/.cache/lo-s2/py<ver>`，用各自的
+  `python -m pytest -q tests` 跑（`mise run sdk-python` 内部是 `python -m venv` + pip，按约束没有运行，
+  上面这组 uv 命令是它的等价替代）。
+- 2026-11-19 S2 追加 red：`~/.cache/lo-s2/py3.13/bin/python -m pytest -q tests/test_sampler.py -x` →
+  收集期 `AttributeError: module 'lazyobserve._sampler' has no attribute 'REASON_PLATFORM'`
+  （1 error，exit 非 0）。
+- 2026-11-19 S2 追加 green：实现三道门、`recheck_gil()`、失败率停用后，
+  `pytest -q tests` → 3.9.25 `104 passed, 5 skipped`；3.13.18 `104 passed, 5 skipped`；
+  3.15.2（GIL 构建）`104 passed, 5 skipped`；3.15.2t `106 passed, 3 skipped`，均 exit 0。
+  真实 3.15t 的纯 Python 忙线程测试连跑 5 次均通过；`PYTHON_GIL=1` 下 3.15t 的
+  「GIL 被重新启用」真实测试通过、采样类真实测试按预期 skip；真实 3.15 GIL 构建测试断言
+  `probe_sampler()` 返回 `gil-build` 且 `collect_window` 返回 `None`。
+- 2026-11-19 S2 审查：门禁顺序变异（把三道门挪到导入之后 / 试采之后，`-B` 无字节码缓存）→
+  `test_probe_refuses_before_importing_or_trial_sampling` 5 个参数分别在 `imported == []`、
+  `fake.calls == []` 处失败（各 6 failed），还原后 41 passed；真实 3.15t 连采 8 个 0.3 s 窗口，
+  `/proc/self/fd` 4 → 4、线程数 1 → 1；16 个忙进程（8 核）超订下真实测试连跑 5 次均通过。
+- 2026-11-19 S2 审查修复 red：新增「编码器持续失败跨窗口停用」「短窗口不判失败率」「最小尝试数起判」，
+  默认值断言改为 `WINDOW_SECONDS == 10.0` → `pytest -q tests/test_sampler.py` 5 failed, 39 passed。
+- 2026-11-19 S2 审查修复 green：清零移到 `encode_window` 成功、`MIN_FAILURE_RATE_ATTEMPTS = 100`、
+  `WINDOW_SECONDS = 10.0`/`WINDOW_INTERVAL_SECONDS = 60.0` 后，`python -B -m pytest -q tests` →
+  3.9.25 / 3.13.18 / 3.15.2 各 `107 passed, 5 skipped`，3.15.2t `109 passed, 3 skipped`；
+  `PYTHON_GIL=1` 的 3.15t `tests/test_sampler.py` `44 passed, 5 skipped`；真实 3.15t 测试连跑 5 次通过。
