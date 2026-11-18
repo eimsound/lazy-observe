@@ -6,7 +6,8 @@ export interface VitalPayload { name: VitalName; value: number; page: string; ti
 export type DiagnosticSignal = "error" | "trace" | "vitals" | "replay" | "diagnostic";
 /**
  * Why a telemetry signal was dropped. The first three describe the SDK's own bounded
- * delivery queues; `server_rejected` describes a 4xx ingest refusal.
+ * delivery queues; `server_rejected` describes a 4xx ingest refusal that retrying cannot fix
+ * (408 and 429 are transient and report `retry_exhausted` instead).
  */
 export type DiagnosticReason =
   | "queue_full"
@@ -31,9 +32,16 @@ export class TransportError extends Error {
   }
 }
 
-/** A 4xx means the server will never accept this payload as-is: retrying is pointless. */
+/**
+ * A 4xx (except 408 and 429) means the server will never accept this payload as-is: retrying the
+ * same body is pointless. 408 (request timeout) and 429 (rate limited) are transient — the same
+ * payload may well be accepted later — so they are treated like a network error instead.
+ */
 export function isServerRejection(error: unknown): boolean {
-  return error instanceof TransportError && error.status >= 400 && error.status < 500;
+  if (!(error instanceof TransportError)) return false;
+  const { status } = error;
+  if (status === 408 || status === 429) return false;
+  return status >= 400 && status < 500;
 }
 
 export class Transport {

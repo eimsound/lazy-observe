@@ -161,13 +161,17 @@ SDK 必须：
 服务端侧的现状：`POST /api/events/vitals`（指标名）与 `POST /api/events/diagnostics`
 （`signal` / `reason`）都实现了对未知枚举值的宽容。它们遇到本服务端不认识的值时不整批
 拒绝，而是跳过该条、在响应的 `rejected` 字段里计数，并写入同批的已知值（`accepted`
-计数）；旧服务端不会因为某个新枚举值就连带丢掉同一批里的已知值。
+计数）；实现了部分接受的服务端不会因为某个新枚举值就连带丢掉同一批里的已知值。
 
 **新 SDK 配旧服务端的代价**：browser SDK 的 `vitals` signal 与 `server_rejected`
 reason 是本轮新增的枚举值。尚未实现部分接受的旧服务端会把含这两个值的 diagnostics
-批整批 `422`，因此新 SDK 的 Web Vitals 失败诊断在旧服务端上会丢失；SDK 侧仍静默降级
-（`droppedTelemetry` 照常累加，不抛错、不影响业务），在新服务端上则只会跳过未知值并
-计数，同批已知诊断照常写入。
+批次**整批** `422`，后果不止是丢新增的那几条：同批里服务端本来认识的诊断（例如
+`error` signal / `queue_full` reason）也被一并拒绝。SDK 侧的处理是：该批留在
+`diagnostics` 队列里按有限重试预算（`maxAttempts`，指数退避）反复重投，预算耗尽后整批
+丢弃；丢弃时 `droppedTelemetry` 按该批条数累加，并记一条 signal 为 `diagnostic`、
+reason 为 `retry_exhausted` 的本地丢弃（该丢弃不再递归上报 diagnostics），全程只输出
+`console.warn`，不抛错、不影响业务。在新服务端上则只会跳过
+未知值并计数，同批已知诊断照常写入，`rejected > 0` 不是降级原因。
 
 无论哪个端点，结构性错误（缺 `page`、空指标名、非法时间戳、空 `signal` / `reason`、
 `service` 超长、`dropped` 非正）都按整批 `422` 处理，不做部分写入。
