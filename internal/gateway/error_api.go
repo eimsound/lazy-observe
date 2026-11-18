@@ -11,9 +11,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
@@ -108,10 +110,17 @@ func (g *Gateway) vitalsIngest(c *fiber.Ctx) error {
 	if err := json.Unmarshal(c.Body(), &body); err != nil || body.Vitals == nil {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid vitals batch"})
 	}
+	project := currentProject(c)
 	var samples strings.Builder
+	// Unknown metric names are a forward-compatibility signal (a newer SDK knows a
+	// vital this server does not), not a malformed batch: skip and count them so the
+	// known metrics in the same batch still land. Structural problems stay fatal for
+	// the whole batch, so nothing is written when any entry is malformed.
+	skippedNames := unknownVitalNames{names: make(map[string]struct{})}
+	skipped := 0
 	for i, vital := range body.Vitals {
 		name := strings.ToLower(strings.TrimSpace(vital.Name))
-		if !validVitalName(name) || vital.Page == "" {
+		if name == "" || vital.Page == "" {
 			return c.Status(http.StatusUnprocessableEntity).
 				JSON(fiber.Map{"error": fmt.Sprintf("invalid vital at index %d", i)})
 		}
@@ -120,20 +129,93 @@ func (g *Gateway) vitalsIngest(c *fiber.Ctx) error {
 			return c.Status(http.StatusUnprocessableEntity).
 				JSON(fiber.Map{"error": fmt.Sprintf("invalid vital timestamp at index %d", i)})
 		}
+		if !validVitalName(name) {
+			skippedNames.add(name)
+			skipped++
+			continue
+		}
 		fmt.Fprintf(
 			&samples,
 			"web_vitals_%s{project_id=%s,page=%s} %s %d\n",
 			name,
-			strconv.Quote(currentProject(c).Slug),
+			strconv.Quote(project.Slug),
 			strconv.Quote(vital.Page),
 			strconv.FormatFloat(vital.Value, 'g', -1, 64),
 			timestamp.UnixMilli(),
 		)
 	}
-	if err := g.importPrometheusSamples(c.UserContext(), samples.String()); err != nil {
-		return err
+	if skipped > 0 {
+		g.logger.Warn(
+			"vitals ingest skipped unknown metric names",
+			"project", project.Slug,
+			"accepted", len(body.Vitals)-skipped,
+			"rejected", skipped,
+			"names", skippedNames.String(),
+		)
 	}
-	return c.JSON(fiber.Map{"accepted": len(body.Vitals)})
+	if samples.Len() > 0 {
+		if err := g.importPrometheusSamples(c.UserContext(), samples.String()); err != nil {
+			return err
+		}
+	}
+	return c.JSON(fiber.Map{"accepted": len(body.Vitals) - skipped, "rejected": skipped})
+}
+
+const (
+	maxLoggedSkippedVitalNames = 5
+	maxSkippedVitalNameBytes   = 64
+)
+
+// unknownVitalNames keeps a bounded, de-duplicated sample of rejected vital names.
+// The ingest token ships inside browser DSNs, so this endpoint is effectively public:
+// without a length cap a single request inside the body limit could turn one warning
+// into a multi-megabyte log line. Names are therefore truncated before de-duplication
+// (so the cap cannot be bypassed by appending bytes) and only the first few distinct
+// names are retained. Log volume still grows with request volume; rate limiting the
+// warning is deliberately out of scope here.
+type unknownVitalNames struct {
+	names map[string]struct{}
+	// overflow counts skipped entries whose truncated name never made it into names; it
+	// is an entry count, not a distinct-name count, because names past the cap are no
+	// longer retained and cannot be de-duplicated.
+	overflow int
+}
+
+func (u *unknownVitalNames) add(name string) {
+	name = truncateVitalName(name)
+	if _, seen := u.names[name]; seen {
+		return
+	}
+	if len(u.names) >= maxLoggedSkippedVitalNames {
+		u.overflow++
+		return
+	}
+	u.names[name] = struct{}{}
+}
+
+func (u *unknownVitalNames) String() string {
+	ordered := make([]string, 0, len(u.names)+1)
+	for name := range u.names {
+		ordered = append(ordered, name)
+	}
+	sort.Strings(ordered)
+	if u.overflow > 0 {
+		ordered = append(ordered, fmt.Sprintf("+%d more", u.overflow))
+	}
+	return strings.Join(ordered, ",")
+}
+
+// truncateVitalName cuts on a rune boundary; slicing mid-sequence would log a
+// replacement character instead of the bytes the client sent.
+func truncateVitalName(name string) string {
+	if len(name) <= maxSkippedVitalNameBytes {
+		return name
+	}
+	cut := maxSkippedVitalNameBytes
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return name[:cut] + "…"
 }
 
 type sdkDiagnosticInput struct {

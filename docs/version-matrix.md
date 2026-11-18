@@ -39,7 +39,7 @@
 | OTLP / logs | `POST /v1/logs` | 由网关转发至 VictoriaLogs `insert/opentelemetry/v1/logs` |
 | OTLP / traces | `POST /v1/traces` | 由网关转发至 VictoriaTraces `insert/opentelemetry/v1/traces` |
 | 私有 ingest | `POST /api/events/errors` | 错误事件上报 |
-| 私有 ingest | `POST /api/events/vitals` | Web Vitals 上报 |
+| 私有 ingest | `POST /api/events/vitals` | Web Vitals 上报；未知指标名跳过并计数（§5），响应含 `rejected` |
 | 私有 ingest | `POST /api/events/diagnostics` | SDK 诊断信息上报 |
 | 私有 ingest | `POST /api/replay/segments` | 会话回放分段上报 |
 | 私有 ingest | `POST /api/profiles` | 持续剖析（pprof）上报 |
@@ -75,6 +75,10 @@ MCP（`lazy-observe mcp --dsn`）的 DSN 形状与上面相同，但 `<token>` �
   版本），随后才能发版。
 - 新增端点或新增可选响应字段视为向后兼容，在协议面清单中追加说明，不提升协议
   版本。
+- **新增请求侧枚举值**原则上属向后兼容：服务端跳过未知值并计数，同批的已知值
+  照常写入，不整批拒绝。**目前只有 `POST /api/events/vitals` 的指标名实现了这一点**：
+  其它私有 ingest 端点（例如 `/api/events/diagnostics` 的 `signal` / `reason`）
+  遇到未知枚举值仍整批返回 `422`，SDK 新增这类枚举值仍按 §5 静默降级。
 
 ## 3. 兼容矩阵
 
@@ -145,6 +149,18 @@ SDK 必须：
    业务行为；
 4. **向后兼容新服务端**：SDK 必须忽略响应中一切未知字段（向前兼容），仅解析自己
    认识的结构。
+
+服务端侧的现状：只有 `POST /api/events/vitals` 的指标名实现了对未知枚举值的宽容。
+它遇到本服务端不认识的指标名时不整批拒绝，而是跳过该条、在响应的 `rejected`
+字段里计数，并写入同批的已知指标（`accepted` 计数）；旧服务端不会因为某个新指标
+就连带丢掉同一批里的已知指标。
+
+其它私有 ingest 端点尚未实现这一点：`/api/events/diagnostics` 遇到未知的 `signal`
+或 `reason` 仍然整批返回 `422`。SDK 新增这类枚举值时仍按上面第 1 条静默降级，
+并把这类 `422` 当作降级原因上报。
+
+无论哪个端点，结构性错误（缺 `page`、空指标名、非法时间戳）都按整批 `422` 处理，
+不做部分写入。
 
 ## 6. GA 前路线图
 
