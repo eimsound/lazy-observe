@@ -82,6 +82,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added a project-scoped backend performance endpoint derived from real server spans, including p50/p95/p99 latency, throughput, error rate, time-series buckets, and explicit truncation metadata.
 - Added project-scoped LogsQL threshold rules alongside MetricsQL/PromQL rules, evaluated through the trusted project-isolated storage boundary.
 - Added default Go goroutine pprof snapshots alongside continuous CPU and heap profiles, completing the three required Go profiling signal types.
+- Added `security.admin_password_file` (`LO_SECURITY_ADMIN_PASSWORD_FILE`):
+  while no admin account exists, the first admin password is read from that
+  file (surrounding whitespace trimmed, at least 8 characters, otherwise
+  startup fails). Without it a random password is written atomically to
+  `<data_dir>/initial-admin-password` in mode 0600 on the replica that creates
+  the admin, and the log records only that path and the hostname, never the
+  password (#12).
+- Added `adminPassword.{existingSecret,key,autoGenerate}` to the Helm chart, so
+  the first admin password comes from a read-only Secret mount instead of the
+  ephemeral data directory. `autoGenerate` renders `<fullname>-admin-password`
+  (reused via `lookup` and kept across upgrades), rendering fails when
+  `autoGenerate` is off while `standalone-ha` runs more than one replica or
+  HPA, and the chart notes cover retrieving the password in each mode (#28).
+- Added `encryptionKey.{existingSecret,key,autoGenerate}` to the Helm chart:
+  the platform encryption key is mounted read-only and referenced through
+  `security.secret_key_file`, so every `standalone-ha` replica and restart
+  shares one key instead of each generating its own `secret.key`. The key
+  Secret is `lookup`-reused with `resource-policy: keep`, `allinone` on a PVC
+  keeps its data-directory key, and padded standard base64 key material (for
+  example `openssl rand -base64 32` output) is accepted as-is (#3).
+- The web UI now labels project API tokens as ingest-only and shows the SDK
+  DSN to copy, and gives personal user API tokens copyable `mcp --dsn`
+  commands plus Grafana Prometheus data-source URL and header snippets (#54).
 
 ### Security
 
@@ -103,9 +126,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The gateway recovers handler panics (500 instead of a process crash) and sets
   60s read / 120s idle timeouts; there is deliberately no write timeout so log
   tail streaming keeps working.
+- Authentication cache and in-flight keys no longer borrow fasthttp request
+  buffers: cache keys are `strings.Clone`d, Fiber runs with `Immutable: true`,
+  and the other values that outlive a request (AI settings snapshots, audit and
+  panic log fields, MCP handler credentials and project) are copied too. With
+  borrowed keys about 1 % of ingest requests were written into another project
+  and about 0.8 % of forged bearer tokens were accepted as a project that had
+  just been cached (#27).
+- The Go SDK Fiber middleware no longer borrows request buffers: method, path,
+  host, scheme, route, and propagated request headers are cloned before they
+  reach asynchronously exported spans, metric attribute keys, error tags,
+  panic logs, and tracestate, so telemetry cannot pick up a later request's
+  values when the application leaves `Immutable` off (#29).
+- The generated bootstrap admin password is no longer written to the log; it is
+  persisted in a 0600 file under the data directory or supplied by a
+  deployer-owned file (#12).
+- Logins that use a generated bootstrap password must change it first: until
+  then the session or user API token reaches only `GET /api/auth/me`, password
+  change, and logout, and every other route answers
+  `403 password_change_required`. The web UI redirects every application route
+  to `/change-password`, and `/api/auth/login` and `/api/auth/me` return
+  `must_change_password` (#18).
 
 ### Changed
 
+- **Breaking:** project API tokens (`lo_…`) can no longer read anything (ADR
+  0010). The `/api` session routes, including `/api/auth/me`, `/api/audit`,
+  and `/api/system/error-inbox`, answer them with `403 ingest_only_token`
+  instead of `401 unauthorized`, and reads need a session or a user API token
+  (`lou_…`) plus `X-LO-Project` (#6).
 - Fixed metrics, logs, and traces storage to the Victoria family (ADR 0013).
   Standalone mode connects to external VictoriaMetrics, VictoriaLogs, and
   VictoriaTraces; Loki/LogQL and Tempo/TraceQL adapters are out of scope, and
@@ -173,6 +222,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Hardened Linux amd64/arm64 release preparation by pinning the generic ISA baselines, gating the exact prebuilt bytes before GoReleaser imports them, and stripping forge credentials from delegated build tools.
 - Enforced paired single-baseline metadata schemas through a local mise task used by CI and the release entry point.
 - Replaced Make with version-pinned mise tasks across local development, automation, Docker builds, and project documentation.
+- The metadata baseline SQL changed again: `users` gained
+  `must_change_password`, so pre-release development databases must be rebuilt
+  (single-baseline policy) (#18).
+- `@lazy-observe/node` now requires Node >= 22.15 and ships OpenTelemetry JS
+  3.x (`@opentelemetry/sdk-trace` replaces `sdk-trace-node`, the OTLP proto
+  exporter is 0.301.1, `api-logs` is folded into `api`), with the span and log
+  processor constructors rewritten accordingly (#32).
+- The Go SDK now requires OpenTelemetry Go 1.45 (logs 0.21) and emits the
+  matching v1.43 semconv schema URL; with the old v1.41 URL, an application on
+  OTel Go 1.45 failed to create the client on a schema-URL conflict (#11).
+- The server builds with Go 1.26.11 and picks up the govulncheck-reported fixes
+  in grpc 1.83.2, x/net 0.62, brotli 1.2.7, and klauspost/compress 1.18.7; the
+  `sdk/go` manifest follows the same OpenTelemetry Go 1.45 upgrade (#11).
+- Container images build on Debian 13 (trixie) instead of Debian 12 (bookworm)
+  and run on `gcr.io/distroless/static-debian13:nonroot`, and the Dockerfile
+  frontend plus every base image are pinned to a multi-platform index digest.
+  The multi-replica test services drop their Alpine variants (VictoriaMetrics
+  uses the `-cluster-scratch` images); only the SeaweedFS fixture stays Alpine,
+  because upstream publishes it only that way (#4).
+- CI runs `govulncheck` (`mise run vulncheck`, covering the server module and
+  `sdk/go`) as a required gate, pins BuildKit to a multi-architecture digest,
+  scans the pre-release image with Trivy before the archive and image release,
+  rejects unpinned workflow references, and keeps Dependabot on every
+  dependency manifest (#11).
+- Pull requests that touch server Go code now run the multi-replica HA
+  functional gate (`mise run e2e-ha`); web, Helm, non-Go SDK, and documentation
+  changes do not open it, and the performance gates stay out of PR CI (#2).
+- The Go SDK nested module is verified tidy (`go mod tidy -diff`) and then
+  built, vetted, linted with `golangci-lint`, and tested by `mise run sdk-go`,
+  with the existing deprecated and unchecked-error uses fixed (#51, #53).
+- The browser SDK now depends on `web-vitals` ^6; the reported metric set
+  (LCP, CLS, INP, TTFB, FCP), the `name`/`rating` values, and the rating
+  thresholds are unchanged (#44).
+- Upgraded the shared toolchain and third-party dependencies: Node 26.13.1 LTS
+  and `@types/node` ^26 repo-wide (#31), Vite 8.3.8 in the browser SDK examples
+  (#43), `@tanstack/react-table` 9.3.1 with v8 sort parity preserved (#39),
+  `@tanstack/react-router` ^1.170.46 (the JS license allowlist now also accepts
+  Unlicense, needed by its SSR-only `isbot`; #40), react-i18next 18 (#47),
+  i18next 27 (#25), `lucide-react` 1.72 (#45), `tailwind-merge` 3.7 (#26),
+  `@vitejs/plugin-react` 5.2 (#46), and `tsup` 9 (#17), plus grouped
+  minor/patch bumps for GitHub Actions, the web workspace, and the SDK Go and
+  JS manifests (#13, #14, #15, #22).
 
 ### Removed
 
@@ -240,6 +331,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Aligned continuous-profile API envelopes and time/ID types with the flamegraph UI, and restored profile-to-trace navigation without exposing storage metadata.
 - Aligned the real Session Replay API with the web player contract, including event-time ranges, pagination totals, segment metadata, and rrweb custom error markers.
 - Ignored and filtered macOS AppleDouble `._*` sidecar files from database migrations and Vitest discovery, preventing JSON panics, invalid migration parsing, and binary test collection failures.
+- `LO_SECURITY_SECRET_KEY_FILE` now sets `security.secret_key_file`; the
+  example configuration documented `LO_SECRET_KEY_FILE`, which nothing
+  accepted, so the platform key file could only be configured in YAML (#50).
+- `lazy-observe mcp --dsn` validates the token at startup: a project token
+  (`lo_…`) or a legacy token is rejected with a message pointing at the
+  personal API token page instead of 403 on the first tool call, and `--help`
+  states that the DSN needs a user API token and sends the slug as
+  `X-LO-Project` (#7).
+- `perf-gate query` defaults `--token-env` to `LO_PERF_QUERY_TOKEN`, so
+  `LO_PERF_TOKEN` no longer means the ingest token in `scale` and the read
+  token in `query` (#8).
+- The browser and Python SDK READMEs no longer claim their journeys run under
+  `mise run e2e` or CI; they document the manual run against a running
+  platform, the required variables, and the session-cookie credentials reads
+  need (#9).
+- Workflow, container-smoke, and `mise run release` pipelines no longer report
+  spurious SIGPIPE failures under `pipefail`: commands that consume a
+  producer's output early now collect it first (#10).
+- Multi-replica `standalone-ha` deployments no longer give every replica its
+  own platform encryption key, so one replica (or a restarted pod) can decrypt
+  sealed settings such as the AI provider API key that another replica wrote
+  (#3).
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
