@@ -83,7 +83,7 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 | Ent schema 或基线 SQL | `mise run migration-check`、`mise run ent-generate-check`、`mise run test-meta-pg` |
 | 网关路由、API 契约、e2e 脚本 | `mise run e2e-contract-check`、`mise run e2e`（慢） |
 | 重启、持久接管、恢复 | `mise run e2e-restart`（慢） |
-| HA、多副本、存储集群 | PR CI 的 HA E2E job 已按改动面跑 `mise run e2e-ha`（只含功能断言）；本地可选（需 Docker，很慢），想在推之前先拿结果时再跑 |
+| HA、多副本、存储集群 | 命中下面「本地必跑 `mise run e2e-ha` 的改动面」时必跑（需 Docker，很慢）；其余可选（PR CI 的 HA E2E job 已按改动面跑，只含功能断言） |
 | `web/` | `mise run web`（含 typecheck、build、playwright、JS 许可证；慢） |
 | `sdk/`（客户端 SDK） | 按语言：`mise run sdk-go`、`mise run sdk-node`、`mise run sdk-browser`、`mise run sdk-python`；`sdk/go` 另跑 Go 代码那行；协议面改动同 PR 更新 `docs/version-matrix.md` |
 | 依赖、许可证、漏洞 | `mise run license-check`、`mise run mod-tidy-check`、`mise run vulncheck` |
@@ -96,11 +96,34 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 规则：门禁失败就停，先修失败，不要继续下一个切片。`CGO_ENABLED=0` 是硬约束，任何需要 CGO 的方案直接否决。`internal/db/ent` 不跟踪、不手改、不用 golines 格式化。
 
+### 本地必跑 `mise run e2e-ha` 的改动面
+
+`mise run e2e-ha` 启两个副本，共享同一个元数据库（PostgreSQL）、Valkey、S3（SeaweedFS）和平台密钥。下面这些改动面只要碰了，
+推之前本地必须跑一遍（需 Docker，很慢）：
+
+- 启动和 bootstrap 路径：`cmd/lazy-observe/**`（`openServerMetadata`、`bootstrapAdmin`）、`internal/meta/store.go` 的 `Bootstrap`/`BootstrapSelfMonitoring`、`internal/meta/bootstrap_admin.go`；
+- 平台密钥：`internal/secret/**`、`internal/config` 对 `security.secret_key_file` 的解析与校验；
+- 元数据库首次写入：`internal/meta/migrations/**`、新增的 schema、首写与并发首写（如 `INSERT ... ON CONFLICT`）；
+- 跨副本状态：会话（`internal/account/session.go`）、`internal/state/**`、成员与租约（`internal/meta/alert_engine*.go`、续期与 fencing）；
+- 恰好一次与去重：通知 outbox（`internal/meta/notification_outbox.go`、`internal/alert/outbox.go`）、告警评估所有权（`internal/alert/ownership/`、`internal/alert/rule_evaluator.go`）、Issue 聚合（`internal/meta/error_inbox.go`、`internal/errortrack/`）、replay 与 blob（`internal/blob/s3.go`、`internal/replay/`）。
+
+K1（PR #60，commit `3ce6c19`）就是反例：它让元数据库记录平台密钥指纹、启动时不一致即拒绝启动，本地没跑 e2e-ha，
+PR CI 的 HA E2E 红了——两个副本没有共享密钥，后启动的那个直接被拒绝启动。
+
+### 多 worktree 并行
+
+`mise run lint`、`mise run sdk-go` 里的 golangci-lint 带 `--allow-serial-runners`：撞上另一个 worktree 时排队等锁，不再报
+`parallel golangci-lint is running`；跨 worktree 不需要编排者排队，`go build`/`go test` 的缓存本身支持并发。
+默认缓存 `~/.cache/golangci-lint` 是所有 worktree 共用的，出现过「报出别的 worktree 的问题」的误报（没能复现出来）；
+再碰到就把 `GOLANGCI_LINT_CACHE=$(mktemp -d)` 加在 `mise run lint` 前面重跑，代价是冷启动约 20 秒。
+同一个 worktree 内 Go 门禁仍串行：`vet` → `test` → `lint` → `fmt-check` 一条一条跑，这几条都以 `ent-generate` 为依赖，
+并行会抢着 `mv` 同一个 `internal/db/ent`（`scripts/generate-ent.sh` 第 38–41 行）。
+
 CI 分层（CI 不替你跑的，改到对应改动面时本地必须跑）：
 
 CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04-arm`），公开仓不挂自建 runner。
 `ci.yml` 先由 `changes` 作业按改动路径分组，各业务 job 只在自己的改动面变化时运行，最后 `ci-ok` 汇总；
-`ci-ok` 是唯一的 required check，被跳过的 job 视为通过。
+`ci-ok` 是 `ci.yml` 汇总出来的唯一候选 required check，被跳过的 job 视为通过；分支保护里配了它才是真 required，没配时按「提交、推送与合入」第 5 步的第二条路径等 CI。
 
 | 改动路径 | 跑哪些 job |
 | --- | --- |
@@ -162,14 +185,35 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 
 一个切片 = 一个 commit = 一条分支 = 一个 PR。不要在一条分支上堆多个切片，也不要让一个 PR 混两个不相关的改动。
 
-查 CI 一律用 `gh`（`gh pr checks`、`gh run list`、`gh run view`）；仓库是 `eimsound/lazy-observe`，在 clone 内运行时 `gh` 自动推断。
+查 CI 一律用 `gh`（`gh pr checks`、`gh run list`、`gh run watch`、`gh run view`）；仓库是 `eimsound/lazy-observe`，在 clone 内运行时 `gh` 自动推断。
 
-0. 记基线：`gh run list --workflow ci.yml --branch <base> --event push --limit 1 --json databaseId,conclusion,headSha` 取最新 run；`conclusion` 为 `failure` 时用 `gh run view <id> --json jobs --jq '.jobs[] | select(.conclusion=="failure") | .name'` 抄下失败 job 名。base 本来就红时，这份名单是后面判定「是否新增失败」的基线。
+0. 记基线：`gh run list --workflow ci.yml --branch <base> --event push --status completed --limit 1 --json databaseId,conclusion,headSha` 取最近一次**已完成**的 push run。base 上可能有正在跑的 run，不加 `--status completed` 会拿到 `in_progress` 那条，`conclusion` 为空、基线作废。`conclusion` 为 `failure` 时用 `gh run view <id> --json jobs --jq '.jobs[] | select(.conclusion=="failure") | .name'` 抄下失败 job 名。base 本来就红时，这份名单是后面判定「是否新增失败」的基线。
 1. 切分支：`git switch -c slice/<topic>-<n> <base>`。`base` 默认 `main`；feature-multi 里是 integration branch。
 2. 一个切片只留一个 commit，信息用 `fix:` / `feat:` / `chore:` + 中文。CI 修复用 `git commit --amend` 折叠回这个 commit，不新增提交。
 3. 本地门禁先全绿（按验证矩阵那张表），再推：`git push -u origin slice/<topic>-<n>`。只推自己的切片分支；`--force-with-lease` 只允许用在自己的切片分支上，禁止 `--force`。
 4. 开 PR：`gh pr create --head slice/<topic>-<n> --base <base> --title "<标题>" --body-file -`（body 用 heredoc）。body 按 `/skill:pr` 的形状写：一张能说明改动的最小视觉材料、改前改后的证据、单向门还是双向门的判断。
-5. 等 CI：切片分支没有 push run，只看 PR run。用 `gh pr checks <number> --watch --interval 30 --required` 等 required check（`ci-ok`）；需要逐 job 结果时用 `gh pr checks <number> --json name,state,bucket`。全部通过就是绿；`ci-ok` 失败时用 `gh run view <run-id> --json jobs` 列出失败 job，与第 0 步的基线比对：全部是既有失败就算通过，出现基线外的新失败才转第 6 步。上限 30 分钟；超时就停下报告，不要盲等。
+5. 等 CI：切片分支没有 push run，只看 PR run。先按 required check 等：`gh pr checks <number> --watch --interval 30 --required`。
+   它以 `no required checks reported` 退出，说明分支保护里没有配 required check（`gh api repos/eimsound/lazy-observe/rules/branches/main --jq '[.[].type]'`
+   里看不到 `required_status_checks`），改成盯这次 push 自己的 run：
+
+   ```bash
+   head=$(git rev-parse HEAD)
+   for _ in $(seq 20); do   # 新 run 登记最多等 5 分钟
+     run_id=$(gh run list --workflow ci.yml --event pull_request --branch slice/<topic>-<n> \
+       --commit "$head" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+     [[ -n $run_id ]] && break
+     sleep 15
+   done
+   [[ -n $run_id ]] || { echo "no PR run for $head"; exit 1; }
+   gh run watch "$run_id" --interval 30 --exit-status   # 非零 = run 结论不是 success
+   gh run view "$run_id" --json conclusion,jobs --jq '.conclusion, (.jobs[] | "\(.conclusion)\t\(.name)")'
+   ```
+
+   `--commit "$head"` 是这儿的关键：`--amend` 重推后只按 `--branch` 取第一条，可能拿到上一个 commit 的 run，它被取消或带着旧结论，
+   两种都会被误当成这一次的结果。`// empty` 挡住「列表为空时 jq 返回 `null`」那种情况。
+   负责人把 `ci-ok` 配成 required 之后，`--required` 那条直接可用，本节不用改。
+
+   逐 job 结果用 `gh pr checks <number> --json name,state,bucket`。全部通过就是绿；`ci-ok` 失败时用 `gh run view <run-id> --json jobs` 列出失败 job，与第 0 步的基线比对：全部是既有失败就算通过，出现基线外的新失败才转第 6 步。上限 30 分钟；超时就停下报告，不要盲等。
 6. CI 红：`gh run view <run-id> --log-failed` 看失败步骤（run id 来自 `gh pr checks` 的链接或 `gh run list --branch slice/<topic>-<n>`），修完 `git commit --amend` 后 `git push --force-with-lease`，回到第 5 步。同一个 PR 连续两次红且原因不明，停下。
 7. 绿了才合并：`gh pr merge <number> --rebase --delete-branch`（一个切片一个 commit，不改写历史）；仓库不允许 rebase merge 时改用 `--squash`。合并后切回 `base`，`git pull --ff-only`，并 `git branch -D slice/<topic>-<n>` 删掉本地分支。
 8. 合并后在 `base` 上确认一次 CI：`gh run list --workflow ci.yml --branch <base> --event push --limit 1 --json databaseId,headSha,status,conclusion` 的 `headSha` 应等于合并后的 tip；用 `gh run watch <id>` 等它结束，再用 `gh run view <id> --json jobs` 的失败 job 比对第 0 步基线。出现基线外的新失败 job 就停下、不要继续下一个切片，并在报告里写明是哪个 job。
