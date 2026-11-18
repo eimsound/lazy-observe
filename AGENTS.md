@@ -6,7 +6,8 @@
   - `docs/` 只放面向用户的文档，读者是部署者、运维和 SDK 接入方，例如部署、SDK 接入、版本与协议兼容矩阵。
   - `.agents/docs/` 放 AI 工作流、规划和开发决策，包括需求基线、架构、ADR、术语表、plan、spec、调研、
     skill 配置和 AFK 记忆。索引见 `.agents/docs/index.md`。
-- PoC/spike 代码位于 `poc/<topic>/` 下，并带 FINDINGS.md；生产代码在 `cmd/` 和 `internal/` 下。
+- PoC/spike 代码放在本地 `poc/<topic>/`（已被 git 忽略，不提交）；
+  需要保留的结论写进 `.agents/docs/research/<topic>.md` 再提交。生产代码在 `cmd/` 和 `internal/` 下。
 - 客户端 SDK 在 `sdk/{go,node,browser,python}` 下（约定见 `sdk/AGENTS.md`）；Go SDK 是嵌套模块，
   根 `go.mod` 以 `replace => ./sdk/go` 引用。协议面（端点、字段、DSN、鉴权）改动与 `docs/version-matrix.md`
   在同一个 PR 里修改。

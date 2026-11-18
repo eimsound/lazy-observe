@@ -138,7 +138,7 @@ Go Execution Tracer Overhaul 是 Flight Recorder 所依赖的 Go runtime 基础�
 
 只有完成以下工作后，才应考虑把方案转为规格或 ADR：
 
-1. 在 `poc/go-flight-recorder/` 建立带 `FINDINGS.md` 的 PoC。
+1. 在本地 `poc/go-flight-recorder/` 做 PoC（不提交），结论写进 `.agents/docs/research/`。
 2. 测量关闭、仅运行 recorder、触发快照三种状态的吞吐、P50/P95/P99 延迟、CPU 和 RSS 差异。
 3. 验证慢请求、锁竞争、GC pause、网络等待和 goroutine 泄漏是否能得到可行动的诊断信息。
 4. 验证 Flight Recorder 与现有 pprof 周期采集并行时是否冲突或产生不可接受的开销。
