@@ -441,7 +441,8 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		"LO_REDIS_ADDR":       &c.Redis.Addr,
 		"LO_REDIS_PASSWORD":   &c.Redis.Password,
 		"LO_REDIS_KEY_PREFIX": &c.Redis.KeyPrefix,
-		// A path, not the secret: the password itself never travels via env.
+		// Paths, not the secrets: the key material itself never travels via env.
+		"LO_SECURITY_SECRET_KEY_FILE":     &c.Security.SecretKeyFile,
 		"LO_SECURITY_ADMIN_PASSWORD_FILE": &c.Security.AdminPasswordFile,
 	}
 	for name, dst := range stringsMap {
