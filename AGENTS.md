@@ -6,7 +6,10 @@
 - 客户端 SDK 在 `sdk/{go,node,browser,python}` 下（约定见 `sdk/AGENTS.md`）；Go SDK 是嵌套模块，
   根 `go.mod` 以 `replace => ./sdk/go` 引用。协议面（端点、字段、DSN、鉴权）改动与 `docs/version-matrix.md`
   在同一个 PR 里修改。
-- 禁止引入 AGPL/GPL 的生产或运行时依赖。仅允许 Apache-2.0/MIT/BSD。
+- 禁止引入 AGPL/GPL 的生产或运行时依赖。生产依赖的许可证白名单以检查脚本为准：
+  Go 侧（`scripts/check-go-licenses.sh`，服务端与 `sdk/go`）只允许 Apache-2.0、MIT、BSD-2-Clause、BSD-3-Clause；
+  JS 侧（`scripts/check-js-licenses.sh`，`web`、`sdk/node`、`sdk/browser`）在此之外还允许 ISC、0BSD、Unlicense
+  （宽松许可证，可与 MIT 一起分发）。白名单外的许可证先改本条和对应脚本，再引入依赖。
   Air GPL-3.0 是唯一接受的例外：它是由 mise 管理的本地开发 CLI，
   不得链接进 Go 代码或打包进任何产品产物。
 - 如实汇报：列出你运行的每条命令及其真实结果。不要声称某项检查通过却没有实际运行。
