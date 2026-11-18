@@ -18,9 +18,11 @@ ENV PATH=/root/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
 ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY
 WORKDIR /src
 
+# libatomic1: the official Node 26 binaries mise installs link libatomic.so.1,
+# which trixie-slim does not ship.
 # hadolint ignore=DL3008
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl git gzip tar && \
+    apt-get install -y --no-install-recommends ca-certificates curl git gzip libatomic1 tar && \
     rm -rf /var/lib/apt/lists/* && \
     curl https://mise.run | MISE_VERSION=v2026.5.3 MISE_INSTALL_PATH=/usr/local/bin/mise sh
 COPY mise.toml ./
