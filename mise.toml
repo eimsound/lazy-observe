@@ -246,10 +246,11 @@ description = "Test the incremental CI change-surface grouping rules"
 run = "bash scripts/ci-changes-test.sh"
 
 [tasks.sdk-go]
-description = "Build, vet, and test the Go SDK module (sdk/go)"
+description = "Build, vet, lint, and test the Go SDK nested module (sdk/go)"
 dir = "sdk/go"
 env = { CGO_ENABLED = "0" }
-run = ["go build ./...", "go vet ./...", "go test ./..."]
+tools."golangci-lint" = "2.12.2"
+run = ["go build ./...", "go vet ./...", "golangci-lint run ./...", "go test ./..."]
 
 [tasks.sdk-node]
 description = "Install, build, typecheck, test, and license-check the Node SDK workspace"

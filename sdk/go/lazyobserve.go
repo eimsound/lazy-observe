@@ -32,6 +32,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 const instrumentationName = "github.com/eimsound/lazy-observe/sdk/go"
@@ -258,7 +259,7 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 		)
 		c.tracer = c.traceSDK
 	} else {
-		c.tracer = trace.NewNoopTracerProvider()
+		c.tracer = tracenoop.NewTracerProvider()
 	}
 
 	var otelHandler slog.Handler
@@ -317,7 +318,7 @@ func degraded(cfg Config, err error) *Client {
 		cfg:        cfg,
 		initErr:    err,
 		meter:      metricnoop.NewMeterProvider(),
-		tracer:     trace.NewNoopTracerProvider(),
+		tracer:     tracenoop.NewTracerProvider(),
 		logger:     slog.New(h),
 		propagator: propagation.TraceContext{},
 	}

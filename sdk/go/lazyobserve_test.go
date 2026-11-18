@@ -19,6 +19,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 func TestSignalMatrix(t *testing.T) {
@@ -81,7 +82,7 @@ func TestFiberUsesHTTPServerDurationBuckets(t *testing.T) {
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
 	client := &Client{
-		cfg: Config{ServiceName: "duration-bucket-test"}, meter: provider, tracer: trace.NewNoopTracerProvider(),
+		cfg: Config{ServiceName: "duration-bucket-test"}, meter: provider, tracer: tracenoop.NewTracerProvider(),
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), propagator: propagation.TraceContext{},
 	}
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
