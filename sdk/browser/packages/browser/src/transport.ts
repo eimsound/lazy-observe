@@ -3,8 +3,17 @@ import type { ParsedDsn } from "./dsn";
 import type { RecordedSpan, SpanAttribute } from "./trace";
 
 export interface VitalPayload { name: VitalName; value: number; page: string; timestamp: string }
-export type DiagnosticSignal = "error" | "trace" | "replay" | "diagnostic";
-export type DiagnosticReason = "queue_full" | "retry_exhausted" | "shutdown_budget";
+export type DiagnosticSignal = "error" | "trace" | "vitals" | "replay" | "diagnostic";
+/**
+ * Why a telemetry signal was dropped. The first three describe the SDK's own bounded
+ * delivery queues; `server_rejected` describes a 4xx ingest refusal.
+ */
+export type DiagnosticReason =
+  | "queue_full"
+  | "retry_exhausted"
+  | "shutdown_budget"
+  | "server_rejected";
+
 export interface DiagnosticMeasurement {
   measurement_id: string;
   timestamp: string;
@@ -12,6 +21,19 @@ export interface DiagnosticMeasurement {
   signal: DiagnosticSignal;
   reason: DiagnosticReason;
   dropped: number;
+}
+
+/** A non-2xx ingest response, so callers can tell a refusal from a network failure. */
+export class TransportError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "TransportError";
+  }
+}
+
+/** A 4xx means the server will never accept this payload as-is: retrying is pointless. */
+export function isServerRejection(error: unknown): boolean {
+  return error instanceof TransportError && error.status >= 400 && error.status < 500;
 }
 
 export class Transport {
@@ -24,7 +46,7 @@ export class Transport {
       body,
       keepalive
     });
-    if (!response.ok) throw new Error(`lazy-observe transport returned ${response.status}`);
+    if (!response.ok) throw new TransportError(response.status, `lazy-observe transport returned ${response.status}`);
   }
   errors(events: ErrorEventPayload[], keepalive = false): Promise<void> {
     return this.post("/api/events/errors", JSON.stringify({ events }), { "Content-Type": "application/json" }, keepalive);

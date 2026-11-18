@@ -88,7 +88,10 @@ Errors, browser spans, Replay segments, and SDK drop diagnostics use separate
 bounded in-memory queues. Capacity includes the batch currently being exported;
 enqueue never waits for the network. A full queue drops new telemetry, and a
 failed batch (including a drained Replay segment) remains resident until its
-finite retry budget is exhausted. Each drop emits a local `console.warn`.
+finite retry budget is exhausted. Web Vitals skip the queues and are posted once
+per metric; a failed upload is counted and reported like a queue drop, with
+reason `server_rejected` for a 4xx and `retry_exhausted` for a network error or
+5xx (single attempt). Each drop emits a local `console.warn`.
 
 `client.diagnostics().droppedTelemetry` returns the page-local total. Drop
 measurements use stable IDs and are sent to the dedicated SDK diagnostic ingest,

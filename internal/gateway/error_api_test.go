@@ -590,17 +590,17 @@ func TestErrorTrackingLifecycleRawEventsIsolationAndVitals(t *testing.T) {
 	}
 }
 
-type vitalsTestSetup struct {
+type metricIngestSetup struct {
 	gateway *Gateway
 	token   string
 	storage *errorStorage
 	logs    *strings.Builder
 }
 
-// newVitalsTestGateway wires a gateway whose metrics upstream records the Prometheus
-// payload, so vitals tests can assert both on the HTTP response and on what actually
-// reached storage.
-func newVitalsTestGateway(t *testing.T, slug string) vitalsTestSetup {
+// newMetricIngestGateway wires a gateway whose metrics upstream records the Prometheus
+// payload, so vitals and SDK diagnostics tests can assert both on the HTTP response and
+// on what actually reached storage.
+func newMetricIngestGateway(t *testing.T, slug string) metricIngestSetup {
 	t.Helper()
 	store := testStore(t)
 	ctx := context.Background()
@@ -621,16 +621,26 @@ func newVitalsTestGateway(t *testing.T, slug string) vitalsTestSetup {
 		Logger: slog.New(slog.NewTextHandler(logs, nil)),
 	})
 	t.Cleanup(func() { _ = gw.Shutdown() })
-	return vitalsTestSetup{gateway: gw, token: token, storage: storage, logs: logs}
+	return metricIngestSetup{gateway: gw, token: token, storage: storage, logs: logs}
 }
 
-func (s vitalsTestSetup) post(t *testing.T, vitals []any) (int, []byte) {
+func (s metricIngestSetup) postVitals(t *testing.T, vitals []any) (int, []byte) {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"vitals": vitals})
+	return s.postJSON(t, "/api/events/vitals", map[string]any{"vitals": vitals})
+}
+
+func (s metricIngestSetup) postDiagnostics(t *testing.T, measurements []any) (int, []byte) {
+	t.Helper()
+	return s.postJSON(t, "/api/events/diagnostics", map[string]any{"measurements": measurements})
+}
+
+func (s metricIngestSetup) postJSON(t *testing.T, path string, body map[string]any) (int, []byte) {
+	t.Helper()
+	encoded, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodPost, "/api/events/vitals", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+s.token)
 	response, err := s.gateway.App().Test(request)
@@ -642,7 +652,7 @@ func (s vitalsTestSetup) post(t *testing.T, vitals []any) (int, []byte) {
 	return response.StatusCode, payload
 }
 
-func (s vitalsTestSetup) samples() string {
+func (s metricIngestSetup) samples() string {
 	s.storage.mu.Lock()
 	defer s.storage.mu.Unlock()
 	return s.storage.metricSamples
@@ -650,7 +660,7 @@ func (s vitalsTestSetup) samples() string {
 
 // importCount separates "imported an empty payload" from "did not call the metrics
 // upstream at all", which samples() cannot tell apart because it only concatenates.
-func (s vitalsTestSetup) importCount() int {
+func (s metricIngestSetup) importCount() int {
 	s.storage.mu.Lock()
 	defer s.storage.mu.Unlock()
 	return s.storage.metricImports
@@ -663,10 +673,10 @@ func vitalPayload(name string, value float64, page string, at time.Time) map[str
 }
 
 func TestVitalsIngestAcceptsKnownMetricsAndSkipsUnknownNames(t *testing.T) {
-	setup := newVitalsTestGateway(t, "vitals-partial")
+	setup := newMetricIngestGateway(t, "vitals-partial")
 	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
 
-	status, payload := setup.post(t, []any{
+	status, payload := setup.postVitals(t, []any{
 		vitalPayload("LCP", 123.4, "/checkout", at),
 		vitalPayload("LOAF", 42, "/checkout", at),
 	})
@@ -702,10 +712,10 @@ func TestVitalsIngestAcceptsKnownMetricsAndSkipsUnknownNames(t *testing.T) {
 }
 
 func TestVitalsIngestAllUnknownNamesWritesNothing(t *testing.T) {
-	setup := newVitalsTestGateway(t, "vitals-all-unknown")
+	setup := newMetricIngestGateway(t, "vitals-all-unknown")
 	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
 
-	status, payload := setup.post(t, []any{
+	status, payload := setup.postVitals(t, []any{
 		vitalPayload("LOAF", 42, "/checkout", at),
 		vitalPayload("INP_Experimental", 7, "/checkout", at),
 	})
@@ -735,9 +745,9 @@ func TestVitalsIngestAllUnknownNamesWritesNothing(t *testing.T) {
 }
 
 func TestVitalsIngestEmptyBatchWritesNothing(t *testing.T) {
-	setup := newVitalsTestGateway(t, "vitals-empty")
+	setup := newMetricIngestGateway(t, "vitals-empty")
 
-	status, payload := setup.post(t, []any{})
+	status, payload := setup.postVitals(t, []any{})
 	if status != http.StatusOK {
 		t.Fatalf("status=%d body=%s", status, payload)
 	}
@@ -760,14 +770,14 @@ func TestVitalsIngestEmptyBatchWritesNothing(t *testing.T) {
 }
 
 func TestVitalsIngestBoundsUnknownNameLogging(t *testing.T) {
-	setup := newVitalsTestGateway(t, "vitals-flood")
+	setup := newMetricIngestGateway(t, "vitals-flood")
 	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
 	// "指" is three bytes, so a 64-byte cut lands mid-rune at 63 bytes and must be
 	// backed up to 21 whole runes.
 	longName := strings.Repeat("指", 2000)
 	wantPrefix := strings.Repeat("指", 21) + "…"
 
-	status, payload := setup.post(t, []any{
+	status, payload := setup.postVitals(t, []any{
 		vitalPayload(longName, 1, "/checkout", at),
 		vitalPayload(longName+"a", 1, "/checkout", at),
 		vitalPayload(longName+"b", 1, "/checkout", at),
@@ -799,14 +809,14 @@ func TestVitalsIngestBoundsUnknownNameLogging(t *testing.T) {
 }
 
 func TestVitalsIngestSummarizesOverflowingUnknownNames(t *testing.T) {
-	setup := newVitalsTestGateway(t, "vitals-overflow")
+	setup := newMetricIngestGateway(t, "vitals-overflow")
 	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
 	var vitals []any
 	for _, name := range []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg"} {
 		vitals = append(vitals, vitalPayload(name, 1, "/checkout", at))
 	}
 
-	status, payload := setup.post(t, vitals)
+	status, payload := setup.postVitals(t, vitals)
 	if status != http.StatusOK {
 		t.Fatalf("status=%d body=%s", status, payload)
 	}
@@ -856,8 +866,8 @@ func TestVitalsIngestKeepsStructuralErrorsAsWholeBatchRejection(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			setup := newVitalsTestGateway(t, "vitals-structural")
-			status, payload := setup.post(t, []any{
+			setup := newMetricIngestGateway(t, "vitals-structural")
+			status, payload := setup.postVitals(t, []any{
 				vitalPayload("LCP", 1, "/checkout", at),
 				tc.vital,
 			})
@@ -882,10 +892,10 @@ func TestVitalsIngestKeepsStructuralErrorsAsWholeBatchRejection(t *testing.T) {
 }
 
 func TestVitalsIngestIsCaseInsensitive(t *testing.T) {
-	setup := newVitalsTestGateway(t, "vitals-case")
+	setup := newMetricIngestGateway(t, "vitals-case")
 	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
 
-	status, payload := setup.post(t, []any{
+	status, payload := setup.postVitals(t, []any{
 		vitalPayload("FcP", 1, "/checkout", at),
 		vitalPayload(" fcp ", 2, "/checkout", at),
 	})
@@ -898,97 +908,280 @@ func TestVitalsIngestIsCaseInsensitive(t *testing.T) {
 	}
 }
 
-func TestSDKDiagnosticsIngestWritesLowCardinalityCounter(t *testing.T) {
-	store := testStore(t)
-	project, err := store.CreateProject(context.Background(), "Browser diagnostics", "browser-diagnostics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	token, err := store.CreateProjectAPIToken(context.Background(), project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	storage := &errorStorage{}
-	upstream := httptest.NewServer(storage)
-	t.Cleanup(upstream.Close)
-	gateway := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Metrics: upstream.URL})
-	t.Cleanup(func() { _ = gateway.Shutdown() })
-
-	timestamp := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
-	body, err := json.Marshal(map[string]any{"measurements": []any{map[string]any{
+func diagnosticPayload(signal, reason string, dropped int, at time.Time) map[string]any {
+	return map[string]any{
 		"measurement_id": "0123456789abcdef0123456789abcdef",
-		"timestamp":      timestamp.Format(time.RFC3339Nano),
+		"timestamp":      at.Format(time.RFC3339Nano),
 		"service":        "checkout-browser",
-		"signal":         "replay",
-		"reason":         "retry_exhausted",
-		"dropped":        3,
-	}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := httptest.NewRequest(http.MethodPost, "/api/events/diagnostics", bytes.NewReader(body))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer "+token)
-	response, err := gateway.App().Test(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(response.Body)
-		t.Fatalf("diagnostics status=%d body=%s", response.StatusCode, responseBody)
-	}
-
-	storage.mu.Lock()
-	samples := storage.metricSamples
-	storage.mu.Unlock()
-	want := `lazy_observe_sdk_dropped_telemetry{project_id="browser-diagnostics",service_name="checkout-browser",` +
-		`sdk_language="browser",signal="replay",reason="retry_exhausted"} 3 1787488496789`
-	if !strings.Contains(samples, want) {
-		t.Fatalf("samples=%q want substring=%q", samples, want)
+		"signal":         signal,
+		"reason":         reason,
+		"dropped":        dropped,
 	}
 }
 
-func TestSDKDiagnosticsIngestRejectsHighCardinalityLabels(t *testing.T) {
-	store := testStore(t)
-	project, err := store.CreateProject(context.Background(), "Browser diagnostics", "browser-diagnostics-invalid")
-	if err != nil {
-		t.Fatal(err)
+func withDiagnosticField(base map[string]any, key string, value any) map[string]any {
+	changed := make(map[string]any, len(base))
+	for k, v := range base {
+		changed[k] = v
 	}
-	token, err := store.CreateProjectAPIToken(context.Background(), project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	storage := httptest.NewServer(&errorStorage{})
-	t.Cleanup(storage.Close)
-	gateway := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Metrics: storage.URL})
-	t.Cleanup(func() { _ = gateway.Shutdown() })
+	changed[key] = value
+	return changed
+}
 
-	for _, invalid := range []map[string]any{
+func TestSDKDiagnosticsIngestWritesLowCardinalityCounter(t *testing.T) {
+	setup := newMetricIngestGateway(t, "browser-diagnostics")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	status, payload := setup.postDiagnostics(t, []any{
+		diagnosticPayload("replay", "retry_exhausted", 3, at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 1 || result.Rejected != 0 {
+		t.Fatalf("response=%s want accepted=1 rejected=0", payload)
+	}
+	want := `lazy_observe_sdk_dropped_telemetry{project_id="browser-diagnostics",` +
+		`service_name="checkout-browser",sdk_language="browser",signal="replay",` +
+		`reason="retry_exhausted"} 3 1787488496789`
+	if samples := setup.samples(); !strings.Contains(samples, want) {
+		t.Fatalf("samples=%q want substring=%q", samples, want)
+	}
+	if logged := setup.logs.String(); logged != "" {
+		t.Fatalf("clean batch logged: %q", logged)
+	}
+}
+
+func TestSDKDiagnosticsIngestSkipsUnknownEnumsAndCountsRejected(t *testing.T) {
+	setup := newMetricIngestGateway(t, "browser-diagnostics-partial")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	status, payload := setup.postDiagnostics(t, []any{
+		diagnosticPayload("error", "queue_full", 1, at),
+		// Values a newer SDK adds are accepted by this server, not rejected.
+		diagnosticPayload("vitals", "server_rejected", 2, at),
+		diagnosticPayload("profile", "queue_full", 4, at),
+		diagnosticPayload("replay", "future_reason", 8, at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 2 || result.Rejected != 2 {
+		t.Fatalf("response=%s want accepted=2 rejected=2", payload)
+	}
+
+	samples := setup.samples()
+	for _, want := range []string{
+		`signal="error",reason="queue_full"} 1 `,
+		`signal="vitals",reason="server_rejected"} 2 `,
+	} {
+		if !strings.Contains(samples, want) {
+			t.Fatalf("samples=%q want substring=%q", samples, want)
+		}
+	}
+	for _, unwanted := range []string{"profile", "future_reason"} {
+		if strings.Contains(samples, unwanted) {
+			t.Fatalf("unknown enum value reached storage: %q", samples)
+		}
+	}
+	logged := setup.logs.String()
+	if !strings.Contains(logged, "profile") || !strings.Contains(logged, "future_reason") ||
+		!strings.Contains(logged, "browser-diagnostics-partial") {
+		t.Fatalf("warn log missing project and skipped values: %q", logged)
+	}
+	if imports := setup.importCount(); imports != 1 {
+		t.Fatalf("metrics imports=%d want 1", imports)
+	}
+}
+
+func TestSDKDiagnosticsIngestAllUnknownEnumsWritesNothing(t *testing.T) {
+	setup := newMetricIngestGateway(t, "browser-diagnostics-unknown")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	status, payload := setup.postDiagnostics(t, []any{
+		diagnosticPayload("profile", "queue_full", 1, at),
+		diagnosticPayload("replay", "future_reason", 2, at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 0 || result.Rejected != 2 {
+		t.Fatalf("response=%s want accepted=0 rejected=2", payload)
+	}
+	if samples := setup.samples(); samples != "" {
+		t.Fatalf("fully rejected batch reached storage: %q", samples)
+	}
+	if imports := setup.importCount(); imports != 0 {
+		t.Fatalf("metrics imports=%d want 0: a fully rejected batch must not POST to the upstream", imports)
+	}
+	logged := setup.logs.String()
+	if !strings.Contains(logged, "profile") || !strings.Contains(logged, "future_reason") {
+		t.Fatalf("warn log missing skipped values: %q", logged)
+	}
+}
+
+func TestSDKDiagnosticsIngestEmptyBatchWritesNothing(t *testing.T) {
+	setup := newMetricIngestGateway(t, "browser-diagnostics-empty")
+
+	status, payload := setup.postDiagnostics(t, []any{})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 0 || result.Rejected != 0 {
+		t.Fatalf("response=%s want accepted=0 rejected=0", payload)
+	}
+	if imports := setup.importCount(); imports != 0 {
+		t.Fatalf("metrics imports=%d want 0: an empty batch must not POST to the upstream", imports)
+	}
+	if logged := setup.logs.String(); logged != "" {
+		t.Fatalf("empty batch logged: %q", logged)
+	}
+}
+
+func TestSDKDiagnosticsIngestBoundsUnknownEnumLogging(t *testing.T) {
+	setup := newMetricIngestGateway(t, "browser-diagnostics-flood")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+	// "指" is three bytes, so a 64-byte cut lands mid-rune at 63 bytes and must be
+	// backed up to 21 whole runes.
+	longSignal := strings.Repeat("指", 2000)
+	wantPrefix := strings.Repeat("指", 21) + "…"
+
+	status, payload := setup.postDiagnostics(t, []any{
+		diagnosticPayload(longSignal, "queue_full", 1, at),
+		diagnosticPayload(longSignal+"a", "queue_full", 1, at),
+		diagnosticPayload(longSignal+"b", "queue_full", 1, at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 0 || result.Rejected != 3 {
+		t.Fatalf("response=%s want accepted=0 rejected=3", payload)
+	}
+	logged := setup.logs.String()
+	if strings.Count(logged, wantPrefix) != 1 {
+		t.Fatalf("log=%q want exactly one truncated value %q (de-duplicated after truncation)",
+			logged, wantPrefix)
+	}
+	if strings.Contains(logged, strings.Repeat("指", 30)) {
+		t.Fatalf("log kept an untruncated value: %q", logged)
+	}
+	if len(logged) > 1024 {
+		t.Fatalf("log line=%d bytes, want a bounded warning: %q", len(logged), logged)
+	}
+}
+
+func TestSDKDiagnosticsIngestSummarizesOverflowingUnknownEnums(t *testing.T) {
+	setup := newMetricIngestGateway(t, "browser-diagnostics-overflow")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+	var measurements []any
+	for _, signal := range []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg"} {
+		measurements = append(measurements, diagnosticPayload(signal, "queue_full", 1, at))
+	}
+
+	status, payload := setup.postDiagnostics(t, measurements)
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	logged := setup.logs.String()
+	// Sorted so the warning is deterministic, capped at five values, remainder counted.
+	if !strings.Contains(logged, "aaa,bbb,ccc,ddd,eee,+2 more") {
+		t.Fatalf("log=%q want sorted cap with overflow count", logged)
+	}
+	if strings.Contains(logged, "fff") || strings.Contains(logged, "ggg") {
+		t.Fatalf("log=%q kept values beyond the cap", logged)
+	}
+}
+
+func TestSDKDiagnosticsIngestKeepsStructuralErrorsAsWholeBatchRejection(t *testing.T) {
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+	valid := diagnosticPayload("replay", "queue_full", 1, at)
+	for _, tc := range []struct {
+		name        string
+		measurement map[string]any
+	}{
+		{name: "missing measurement id", measurement: withDiagnosticField(valid, "measurement_id", "")},
+		{name: "malformed measurement id", measurement: withDiagnosticField(valid, "measurement_id", "not-stable")},
+		{name: "invalid timestamp", measurement: withDiagnosticField(valid, "timestamp", "yesterday")},
+		{name: "missing timestamp", measurement: withDiagnosticField(valid, "timestamp", nil)},
+		{name: "empty service", measurement: withDiagnosticField(valid, "service", "")},
+		{name: "blank service", measurement: withDiagnosticField(valid, "service", "  ")},
 		{
-			"measurement_id": "not-stable", "timestamp": time.Now().UTC(), "service": "browser",
-			"signal": "replay", "reason": "queue_full", "dropped": 1,
+			name:        "service over 128 bytes",
+			measurement: withDiagnosticField(valid, "service", strings.Repeat("s", 129)),
 		},
+		{name: "missing signal", measurement: withDiagnosticField(valid, "signal", "")},
+		{name: "missing reason", measurement: withDiagnosticField(valid, "reason", "")},
+		{name: "zero dropped", measurement: withDiagnosticField(valid, "dropped", 0)},
+		{name: "negative dropped", measurement: withDiagnosticField(valid, "dropped", -1)},
+		{name: "dropped over cap", measurement: withDiagnosticField(valid, "dropped", 1_000_000_001)},
 		{
-			"measurement_id": "0123456789abcdef0123456789abcdef", "timestamp": time.Now().UTC(),
-			"service": "browser", "signal": "session-123", "reason": "queue_full", "dropped": 1,
+			// Structural validity is a property of the batch: an unknown enum value is
+			// skipped, but a malformed entry still rejects the whole request.
+			name: "unknown signal with invalid timestamp",
+			measurement: withDiagnosticField(
+				withDiagnosticField(valid, "signal", "profile"),
+				"timestamp",
+				"yesterday",
+			),
 		},
 	} {
-		body, marshalErr := json.Marshal(map[string]any{"measurements": []any{invalid}})
-		if marshalErr != nil {
-			t.Fatal(marshalErr)
-		}
-		request := httptest.NewRequest(http.MethodPost, "/api/events/diagnostics", bytes.NewReader(body))
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Authorization", "Bearer "+token)
-		response, requestErr := gateway.App().Test(request)
-		if requestErr != nil {
-			t.Fatal(requestErr)
-		}
-		response.Body.Close()
-		if response.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("invalid=%#v status=%d", invalid, response.StatusCode)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			setup := newMetricIngestGateway(t, "browser-diagnostics-structural")
+			status, payload := setup.postDiagnostics(t, []any{valid, tc.measurement})
+			if status != http.StatusUnprocessableEntity {
+				t.Fatalf("status=%d body=%s", status, payload)
+			}
+			var rejection struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(payload, &rejection); err != nil {
+				t.Fatalf("decode response: %v body=%s", err, payload)
+			}
+			if want := "invalid SDK diagnostic at index 1"; rejection.Error != want {
+				t.Fatalf("error=%q want=%q", rejection.Error, want)
+			}
+			if samples := setup.samples(); samples != "" {
+				t.Fatalf("rejected batch reached storage: %q", samples)
+			}
+			if imports := setup.importCount(); imports != 0 {
+				t.Fatalf("metrics imports=%d want 0 for a rejected batch", imports)
+			}
+		})
 	}
 }
 
