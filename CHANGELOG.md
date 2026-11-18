@@ -106,6 +106,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Fixed metrics, logs, and traces storage to the Victoria family (ADR 0013).
+  Standalone mode connects to external VictoriaMetrics, VictoriaLogs, and
+  VictoriaTraces; Loki/LogQL and Tempo/TraceQL adapters are out of scope, and
+  the generic Prometheus-compatible query mode (`storage.metrics.kind:
+  prometheus`) is kept but no longer officially supported.
 - MCP (HTTP and `lazy-observe mcp --dsn`) authenticates with a user API token;
   the DSN keeps the `/p/<slug>@<token>` shape and the slug is sent as
   `X-LO-Project`. `perf-gate scale` takes the ingest token from `LO_PERF_TOKEN`

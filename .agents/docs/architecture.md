@@ -31,6 +31,11 @@ immutable v1.0 requirements baseline:
   accepts each event before returning success; workers resume across restarts,
   derive VictoriaLogs and Issue state idempotently, and expose backlog, retry,
   rejection, and terminal-failure diagnostics.
+- [ADR 0013](adr/0013-signal-storage-is-victoria-only.md) fixes metrics, logs,
+  and traces storage to the Victoria family. Standalone means external Victoria
+  storage; the requirements' Grafana-family compatibility (Loki/LogQL,
+  Tempo/TraceQL adapters) is out of scope, and generic Prometheus-compatible
+  query endpoints are no longer officially supported.
 
 ## Accepted but not implemented
 
@@ -220,7 +225,7 @@ The Logs React adapter executes finite query plans through React Query, connects
 
 ## Extension points and current limits
 
-- **Standalone:** implemented through `storage.SignalBackend` for Prometheus-compatible or VM metrics queries, optional external metrics writes, VictoriaLogs, and VictoriaTraces. Loki/LogQL and Tempo/TraceQL adapters remain separate follow-up work and are not part of the first standalone compatibility scope.
+- **Standalone:** implemented through `storage.SignalBackend` for external VictoriaMetrics queries and optional writes, VictoriaLogs, and VictoriaTraces. Signal storage is fixed to the Victoria family ([ADR 0013](adr/0013-signal-storage-is-victoria-only.md)): Loki/LogQL and Tempo/TraceQL adapters are out of scope, and the generic Prometheus-compatible query mode (`kind: prometheus`) remains in code but is not officially supported.
 - **PostgreSQL:** implemented as an optional metadata backend and required for multi-replica metadata and alert-engine coordination. Durable error Inbox claims, rule membership, leases, fencing, state, and notification Outbox correctness live in PostgreSQL. Redis supplies shared sessions and rate limits.
 - **S3:** implemented for replay, source-map, and profile blobs. Metadata remains SQLite or PostgreSQL.
 - **MCP:** `/mcp` exposes project-scoped read-only observability tools over HTTP, including bounded Replay metadata; `lazy-observe mcp --dsn ...` provides a stdio proxy for MCP clients. Raw Replay events and URL queries are not exposed.

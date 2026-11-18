@@ -136,8 +136,8 @@ The default setup runs everything in one process group. Two other setups are
 available:
 
 - Standalone mode. The gateway connects to VictoriaMetrics, VictoriaLogs, and
-  VictoriaTraces that you run yourself. Metric queries also work against any
-  Prometheus-compatible API. Loki and Tempo are not supported.
+  VictoriaTraces that you run yourself. Signal storage is always the Victoria
+  family; Loki and Tempo are not supported by design (ADR 0013).
 - High availability. Several gateway replicas share PostgreSQL, Redis, and
   S3-compatible storage. Exactly one replica at a time evaluates each alert
   rule, chosen through a lease in the database. The Helm chart includes a
