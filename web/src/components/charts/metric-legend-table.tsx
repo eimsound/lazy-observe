@@ -1,7 +1,6 @@
 import { useMemo, type MouseEvent } from "react";
-import { type ColumnDef } from "@tanstack/react-table";
 import { useTranslation } from "react-i18next";
-import { DataTable } from "@/components/ui/data-table";
+import { DataTable, type DataTableColumnDef } from "@/components/ui/data-table";
 import type { TimeSeries } from "@/lib/api/types";
 import {
   metricsLabelColumns,
@@ -89,11 +88,11 @@ export function MetricLegendTable({
     [colors, series],
   );
   const labelNames = useMemo(() => metricsLabelColumns(series), [series]);
-  const columns = useMemo<ColumnDef<MetricLegendRow>[]>(() => {
+  const columns = useMemo<DataTableColumnDef<MetricLegendRow>[]>(() => {
     const statColumn = (
       key: "avg" | "max" | "min" | "last" | "sum",
       label: string,
-    ): ColumnDef<MetricLegendRow> => ({
+    ): DataTableColumnDef<MetricLegendRow> => ({
       accessorKey: key,
       header: label,
       size: 96,
@@ -105,7 +104,7 @@ export function MetricLegendTable({
       ),
     });
 
-    const identityColumn: ColumnDef<MetricLegendRow> = tableMode === "series"
+    const identityColumn: DataTableColumnDef<MetricLegendRow> = tableMode === "series"
       ? {
         accessorKey: "metric",
         header: t("metrics.fullMetric", { count: series.length }),
@@ -139,7 +138,7 @@ export function MetricLegendTable({
           </div>
         ),
       };
-    const labelColumns: ColumnDef<MetricLegendRow>[] = tableMode === "labels"
+    const labelColumns: DataTableColumnDef<MetricLegendRow>[] = tableMode === "labels"
       ? labelNames.map((name) => ({
         id: `label:${name}`,
         accessorFn: (row) => row.labels[name],
