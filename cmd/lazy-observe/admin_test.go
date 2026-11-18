@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -78,6 +79,30 @@ func runAdminReset(t *testing.T, args ...string) (string, error) {
 	return output.String(), err
 }
 
+// failingReset replaces account.ResetPassword with a failure at stage. The CLI
+// only learns about a failed session revocation or hash write through this
+// return value, so the test can reach both error paths without a broken
+// metadata database.
+func failingReset(stage string, onFail func()) resetPasswordFunc {
+	return func(
+		context.Context, account.PasswordResetStore, account.Sessions, string, string, bool,
+	) (meta.UserInfo, error) {
+		if onFail != nil {
+			onFail()
+		}
+		return meta.UserInfo{}, &account.Error{
+			Code: account.CodeUnavailable, Stage: stage, Cause: errors.New("injected failure"),
+		}
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func openResetResultStore(t *testing.T, dbPath string) *meta.Store {
 	t.Helper()
 	store, err := meta.OpenStore(context.Background(), dbPath)
@@ -86,6 +111,152 @@ func openResetResultStore(t *testing.T, dbPath string) *meta.Store {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+// A generated password replaces the file before it is stored. When the reset
+// fails first (the session revocation or the hash write), the file must come
+// back byte for byte: it is the operator's only working credential.
+func TestAdminResetPasswordRestoresReplacedFileWhenResetFails(t *testing.T) {
+	const previousContent = "bootstrap-admin-password\n"
+	for _, stage := range []string{"session_revoke", "reset_password"} {
+		t.Run(stage, func(t *testing.T) {
+			dataDir, dbPath, _ := adminResetFixture(t)
+			generatedPath := filepath.Join(dataDir, meta.InitialAdminPasswordFileName)
+			writeFile(t, generatedPath, previousContent)
+
+			cfg := appconfig.Defaults()
+			cfg.DataDir = dataDir
+			var output bytes.Buffer
+			err := runAdminResetPassword(&output, &output, cfg, "admin", "", failingReset(stage, nil))
+			if err == nil {
+				t.Fatal("reset reported success")
+			}
+			if strings.Contains(output.String(), "bootstrap-admin-password") {
+				t.Fatalf("output leaked the previous password: %q", output.String())
+			}
+
+			raw, readErr := os.ReadFile(generatedPath)
+			if readErr != nil {
+				t.Fatalf("initial admin password file disappeared: %v", readErr)
+			}
+			if string(raw) != previousContent {
+				t.Fatalf("file content = %q, want the previous password restored", raw)
+			}
+			info, statErr := os.Stat(generatedPath)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("restored file mode = %o, want 600", info.Mode().Perm())
+			}
+
+			// Nothing was stored, so the old credential still works.
+			store := openResetResultStore(t, dbPath)
+			if _, authErr := store.AuthenticateCredentials(
+				context.Background(), "admin", "old-admin-password",
+			); authErr != nil {
+				t.Fatalf("a failed reset changed the admin password: %v", authErr)
+			}
+		})
+	}
+}
+
+// A file this run created is removed again when the reset fails, as before.
+func TestAdminResetPasswordRemovesFileItCreatedWhenResetFails(t *testing.T) {
+	dataDir, _, _ := adminResetFixture(t)
+	cfg := appconfig.Defaults()
+	cfg.DataDir = dataDir
+	var output bytes.Buffer
+	if err := runAdminResetPassword(
+		&output, &output, cfg, "admin", "", failingReset("session_revoke", nil),
+	); err == nil {
+		t.Fatal("reset reported success")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, meta.InitialAdminPasswordFileName)); !os.IsNotExist(err) {
+		t.Fatalf("a failed reset left its generated file behind: %v", err)
+	}
+}
+
+// The second session revocation happens after the hash is stored, so the new
+// password already works: the file must keep it instead of rolling back.
+func TestAdminResetPasswordKeepsNewFileWhenSessionRevokeAfterResetFails(t *testing.T) {
+	dataDir, _, adminID := adminResetFixture(t)
+	generatedPath := filepath.Join(dataDir, meta.InitialAdminPasswordFileName)
+	const previousContent = "bootstrap-admin-password\n"
+	writeFile(t, generatedPath, previousContent)
+
+	reset := func(
+		context.Context, account.PasswordResetStore, account.Sessions, string, string, bool,
+	) (meta.UserInfo, error) {
+		return meta.UserInfo{ID: adminID, Username: "admin", Role: "admin"}, &account.Error{
+			Code:  account.CodeUnavailable,
+			Stage: account.StageSessionRevokeAfterReset,
+			Cause: errors.New("injected failure"),
+		}
+	}
+	cfg := appconfig.Defaults()
+	cfg.DataDir = dataDir
+	var output bytes.Buffer
+	err := runAdminResetPassword(&output, &output, cfg, "admin", "", reset)
+	if err == nil {
+		t.Fatal("reset reported success")
+	}
+	if !strings.Contains(err.Error(), "rerun") {
+		t.Fatalf("error = %v, want a rerun hint", err)
+	}
+	if !strings.Contains(output.String(), generatedPath) {
+		t.Fatalf("output %q does not name the file that holds the working password", output.String())
+	}
+	raw, readErr := os.ReadFile(generatedPath)
+	if readErr != nil {
+		t.Fatalf("the applied password file disappeared: %v", readErr)
+	}
+	if string(raw) == previousContent {
+		t.Fatal("the applied password file was rolled back to a password nothing accepts")
+	}
+	if strings.Contains(output.String(), strings.TrimSpace(string(raw))) {
+		t.Fatalf("output leaked the new password: %q", output.String())
+	}
+	info, statErr := os.Stat(generatedPath)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("password file mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+// When the old content cannot be put back, the operator must learn that the
+// file no longer holds a working password and that a rerun fixes it.
+func TestAdminResetPasswordReportsUnrestorableOverwrite(t *testing.T) {
+	dataDir, _, _ := adminResetFixture(t)
+	generatedPath := filepath.Join(dataDir, meta.InitialAdminPasswordFileName)
+	writeFile(t, generatedPath, "bootstrap-admin-password\n")
+
+	blockRestore := func() {
+		// A directory at the path makes the atomic rename back fail.
+		if err := os.Remove(generatedPath); err != nil {
+			t.Fatalf("remove generated file: %v", err)
+		}
+		if err := os.Mkdir(generatedPath, 0o700); err != nil {
+			t.Fatalf("replace generated file with a directory: %v", err)
+		}
+	}
+	cfg := appconfig.Defaults()
+	cfg.DataDir = dataDir
+	var output bytes.Buffer
+	err := runAdminResetPassword(
+		&output, &output, cfg, "admin", "", failingReset("session_revoke", blockRestore),
+	)
+	if err == nil {
+		t.Fatal("reset reported success")
+	}
+	if !strings.Contains(err.Error(), "never took effect") || !strings.Contains(err.Error(), generatedPath) {
+		t.Fatalf("error = %v, want it to name %s and say the password never took effect", err, generatedPath)
+	}
+	if strings.Contains(err.Error(), "bootstrap-admin-password") {
+		t.Fatalf("error leaked the previous password: %v", err)
+	}
 }
 
 func TestAdminResetPasswordGeneratesInitialPasswordFile(t *testing.T) {
@@ -213,6 +384,20 @@ func TestAdminResetPasswordRejectsUnknownUser(t *testing.T) {
 	store := openResetResultStore(t, dbPath)
 	if _, err := store.AuthenticateCredentials(context.Background(), "admin", "old-admin-password"); err != nil {
 		t.Fatalf("a failed reset changed the admin password: %v", err)
+	}
+	// There is no account to point at, so the audit event keeps its target
+	// empty instead of naming the user that was typed in by mistake.
+	events, listErr := store.ListAudit(context.Background(), meta.AuditListOptions{
+		Action: "auth.password_reset", Limit: 10,
+	})
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(events))
+	}
+	if events[0].Success || events[0].TargetID != 0 || events[0].TargetRole != "" {
+		t.Fatalf("not_found audit target = %#v, want success=false and no target", events[0])
 	}
 }
 
@@ -357,7 +542,7 @@ func TestAdminResetPasswordClearsRedisLoginLockout(t *testing.T) {
 // Password resets from the CLI are audited like the HTTP ones, with no session
 // to identify the operator.
 func TestAdminResetPasswordRecordsAuditEvent(t *testing.T) {
-	dataDir, dbPath, _ := adminResetFixture(t)
+	dataDir, dbPath, adminID := adminResetFixture(t)
 	if _, err := runAdminReset(t, "--data-dir", dataDir); err != nil {
 		t.Fatalf("reset password: %v", err)
 	}
@@ -377,6 +562,15 @@ func TestAdminResetPasswordRecordsAuditEvent(t *testing.T) {
 	}
 	if event.FailureReason != "" {
 		t.Fatalf("successful reset audit failure reason = %q", event.FailureReason)
+	}
+	// The HTTP password paths identify the target the same way.
+	if event.TargetID != adminID || event.TargetRole != "admin" {
+		t.Fatalf(
+			"audit target = id %d role %q, want id %d role admin",
+			event.TargetID,
+			event.TargetRole,
+			adminID,
+		)
 	}
 }
 

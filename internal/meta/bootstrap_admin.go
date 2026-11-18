@@ -64,9 +64,11 @@ func ReadAdminPasswordFile(path string) (string, error) {
 	return password, nil
 }
 
-// writeInitialAdminPassword atomically persists a generated password with mode
-// 0600: readers either see no file or the complete password.
-func writeInitialAdminPassword(path, password string) (err error) {
+// WriteInitialAdminPasswordFile atomically persists content with mode 0600:
+// readers either see no file or the complete bytes. It backs both a freshly
+// generated password and the restore of a file a failed reset overwrote, which
+// must come back byte for byte, newline included.
+func WriteInitialAdminPasswordFile(path string, content []byte) (err error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create initial admin password directory: %w", err)
@@ -84,7 +86,7 @@ func writeInitialAdminPassword(path, password string) (err error) {
 	if err := tmp.Chmod(0o600); err != nil {
 		return fmt.Errorf("restrict initial admin password file: %w", err)
 	}
-	if _, err := tmp.WriteString(password + "\n"); err != nil {
+	if _, err := tmp.Write(content); err != nil {
 		return fmt.Errorf("write initial admin password file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
@@ -97,6 +99,10 @@ func writeInitialAdminPassword(path, password string) (err error) {
 		return fmt.Errorf("persist initial admin password file: %w", err)
 	}
 	return nil
+}
+
+func writeInitialAdminPassword(path, password string) error {
+	return WriteInitialAdminPasswordFile(path, []byte(password+"\n"))
 }
 
 // GenerateInitialAdminPassword writes a fresh random password to path (mode
