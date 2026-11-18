@@ -94,10 +94,13 @@ encryptionKey:
   # `lookup` sees no cluster under `helm template`, client-side `--dry-run`,
   # or Argo CD, so those renders contain a new random key every time: use
   # existingSecret there. Flux helm-controller installs with cluster access.
-  # Set false to require existingSecret: rendering then fails when
-  # standalone-ha runs more than one replica (replicaCount > 1 or HPA).
-  # allinone with persistence keeps the key in its PVC data_dir unless
-  # existingSecret is set.
+  # Set false to require existingSecret: standalone-ha then always fails
+  # rendering, even with one replica, because /data is an emptyDir while the
+  # metadata database is external - a key generated there dies with the pod and
+  # the next pod is refused for a fingerprint mismatch. allinone with
+  # persistence keeps the key in its PVC data_dir unless existingSecret is set;
+  # allinone without a PVC loses key and database together, so it may fall back
+  # to data_dir.
   autoGenerate: true
 
 # First admin password (server: security.admin_password_file). It is read only

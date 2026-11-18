@@ -33,9 +33,7 @@ Platform encryption key (seals stored secrets such as the AI API key):
 {{- else if eq .Values.mode "allinone" }}
   Stored as /data/secret.key on the PVC; it survives restarts as long as the PVC does.
 {{- else }}
-  WARNING: no Secret is configured, so the pod keeps the key in its emptyDir data_dir and
-  generates a new one after every restart. Set encryptionKey.existingSecret or
-  encryptionKey.autoGenerate=true.
+{{- fail "encryptionKey: this mode cannot keep a key in data_dir; set encryptionKey.existingSecret or encryptionKey.autoGenerate=true" }}
 {{- end }}
 
 {{- $adminSource := include "lazy-observe.adminPassword.source" . }}

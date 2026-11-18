@@ -12,6 +12,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/account"
 	appconfig "github.com/eimsound/lazy-observe/internal/config"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/secret"
 	"github.com/spf13/cobra"
 )
 
@@ -32,7 +33,7 @@ func newAdminCommand() *cobra.Command {
 			return command.Help()
 		},
 	}
-	command.AddCommand(newAdminResetPasswordCommand())
+	command.AddCommand(newAdminResetPasswordCommand(), newAdminResetKeyFingerprintCommand())
 	return command
 }
 
@@ -313,5 +314,131 @@ func recordResetAudit(
 	}
 	if err := store.RecordAudit(ctx, record); err != nil {
 		_, _ = fmt.Fprintf(errOut, "warning: record password reset audit event: %v\n", err)
+	}
+}
+
+// newAdminResetKeyFingerprintCommand is the only way past a platform key
+// mismatch. Startup never rotates the recorded fingerprint on its own: an
+// operator confirms the rotation here, accepting that values sealed with the
+// previous key can no longer be decrypted.
+func newAdminResetKeyFingerprintCommand() *cobra.Command {
+	configFlags := newConfigFlagSet("admin-reset-key-fingerprint")
+	command := &cobra.Command{
+		Use:   "reset-key-fingerprint",
+		Short: "Record the configured platform encryption key as the new fingerprint",
+		Long: "Record the fingerprint of the configured platform encryption key (security.secret_key_file)\n" +
+			"in the metadata database, replacing the recorded one. Run this only to confirm an intentional\n" +
+			"rotation: values sealed with the previous key, including the AI provider API key, can no longer\n" +
+			"be decrypted and have to be entered again. Stop every replica before rotating: a running replica\n" +
+			"keeps sealing with the key it loaded at startup. The key file must already exist and is only\n" +
+			"read, never created or rewritten.",
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			cfg, _, err := appconfig.LoadFlagSet(configFlags, os.LookupEnv)
+			if err != nil {
+				return fmt.Errorf("load configuration: %w", err)
+			}
+			return runAdminResetKeyFingerprint(command.OutOrStdout(), command.ErrOrStderr(), cfg)
+		},
+	}
+	command.Flags().AddFlagSet(configFlags)
+	return command
+}
+
+func runAdminResetKeyFingerprint(out, errOut io.Writer, cfg appconfig.Config) error {
+	ctx, cancel := context.WithTimeout(context.Background(), adminResetPasswordTimeout)
+	defer cancel()
+
+	// secret.Load never creates a key: a mistyped path or a Secret that was not
+	// mounted must fail here instead of recording a fingerprint that no real
+	// replica can match.
+	keyFile := secretKeyFile(cfg)
+	box, err := secret.Load(keyFile)
+	if err != nil {
+		return fmt.Errorf(
+			"load platform encryption key: %w (mount the key file the server reads via "+
+				"security.secret_key_file and retry; this command never creates a key)",
+			err,
+		)
+	}
+	store, err := openMetadataStore(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("open metadata store: %w", err)
+	}
+	defer store.Close()
+
+	previous, hadPrevious, err := store.RecordedPlatformKeyFingerprint(ctx)
+	if err != nil {
+		recordPlatformKeyResetAudit(ctx, store, errOut, box.Fingerprint(), false, "read_failed")
+		return fmt.Errorf("read recorded platform key fingerprint: %w", err)
+	}
+	previousText := "none"
+	if hadPrevious {
+		previousText = previous.Fingerprint
+	}
+	if hadPrevious && previous.Fingerprint == box.Fingerprint() {
+		_, err := fmt.Fprintf(
+			out,
+			"platform encryption key fingerprint already recorded for %s: %s; nothing to do\n"+
+				"stop every replica before rotating a key: a running replica keeps sealing with the key it "+
+				"loaded at startup\n",
+			keyFile,
+			box.Fingerprint(),
+		)
+		return err
+	}
+	recorded, err := store.ReplacePlatformKeyFingerprint(ctx, box.Fingerprint())
+	if err != nil {
+		recordPlatformKeyResetAudit(ctx, store, errOut, box.Fingerprint(), false, "replace_failed")
+		return fmt.Errorf("record platform key fingerprint: %w", err)
+	}
+	recordPlatformKeyResetAudit(ctx, store, errOut, recorded.Fingerprint, true, "")
+	if !hadPrevious {
+		// Nothing was sealed under a previous key, so the rotation warning
+		// would only confuse an operator recording the first fingerprint.
+		_, err = fmt.Fprintf(
+			out,
+			"platform encryption key fingerprint recorded for %s: %s (first record)\n",
+			keyFile,
+			recorded.Fingerprint,
+		)
+		return err
+	}
+	_, err = fmt.Fprintf(
+		out,
+		"platform encryption key fingerprint recorded for %s: %s (previous %s)\n"+
+			"values sealed with the previous key can no longer be decrypted; re-enter the AI provider API key "+
+			"in Settings > AI\n",
+		keyFile,
+		recorded.Fingerprint,
+		previousText,
+	)
+	return err
+}
+
+// recordPlatformKeyResetAudit writes the rotation audit event. changed_fields
+// follows the audit convention of comma-joined field names, so it only names
+// the field; the audit row keeps the new fingerprint in target_name. There is
+// no column for the value that was replaced, so the previous fingerprint is
+// deliberately not stored here (it is printed to the operator instead).
+func recordPlatformKeyResetAudit(
+	ctx context.Context,
+	store *meta.Store,
+	errOut io.Writer,
+	fingerprint string,
+	success bool,
+	failureReason string,
+) {
+	record := meta.AuditRecord{
+		Action:        "security.key_fingerprint_reset",
+		ActorUsername: cliAuditActor,
+		TargetType:    "platform_key",
+		TargetName:    fingerprint,
+		ChangedFields: "fingerprint",
+		Success:       success,
+		FailureReason: failureReason,
+	}
+	if err := store.RecordAudit(ctx, record); err != nil {
+		_, _ = fmt.Fprintf(errOut, "warning: record platform key fingerprint audit event: %v\n", err)
 	}
 }
