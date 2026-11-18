@@ -776,6 +776,16 @@ func (s *Store) GetUser(ctx context.Context, id int) (UserInfo, error) {
 	return userInfo(u), nil
 }
 
+// UserByUsername resolves one account by name. IsNotFound reports an unknown
+// user, which operator-facing tools turn into a clear diagnostic.
+func (s *Store) UserByUsername(ctx context.Context, username string) (UserInfo, error) {
+	u, err := s.client.User.Query().Where(user.UsernameEQ(username)).Only(ctx)
+	if err != nil {
+		return UserInfo{}, err
+	}
+	return userInfo(u), nil
+}
+
 func (s *Store) CreateUser(ctx context.Context, username, password, role string) (UserInfo, error) {
 	hash, err := HashPassword(password)
 	if err != nil {
@@ -915,6 +925,17 @@ func (s *Store) ChangePassword(ctx context.Context, userID int, currentPassword,
 		return err
 	}
 	return s.client.User.UpdateOneID(userID).SetPasswordHash(hash).SetMustChangePassword(false).Exec(ctx)
+}
+
+// SetPasswordHash stores an already hashed password and sets the forced-change
+// flag explicitly. It backs operator-facing resets such as `lazy-observe admin
+// reset-password`: those callers hash first, revoke sessions next, and only then
+// write the hash, so they cannot use a password-accepting helper.
+func (s *Store) SetPasswordHash(ctx context.Context, userID int, hash string, mustChangePassword bool) error {
+	return s.client.User.UpdateOneID(userID).
+		SetPasswordHash(hash).
+		SetMustChangePassword(mustChangePassword).
+		Exec(ctx)
 }
 
 // UpdateUserProfile updates display name and email. A non-nil pointer sets
@@ -1159,7 +1180,7 @@ func (s *Store) BootstrapSelfMonitoring(
 }
 
 func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, admin BootstrapAdmin) error {
-	_, err := s.client.User.Query().Where(user.UsernameEQ("admin")).Only(ctx)
+	_, err := s.client.User.Query().Where(user.UsernameEQ(BootstrapAdminUsername)).Only(ctx)
 	if err == nil {
 		return nil
 	}
@@ -1168,7 +1189,7 @@ func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, a
 	}
 	host := bootstrapHost()
 	if admin.PasswordFile != "" {
-		password, err := readAdminPasswordFile(admin.PasswordFile)
+		password, err := ReadAdminPasswordFile(admin.PasswordFile)
 		if err != nil {
 			return fmt.Errorf("create bootstrap admin: %w", err)
 		}
@@ -1178,7 +1199,7 @@ func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, a
 		}
 		logger.Info(
 			"created bootstrap admin",
-			"username", "admin",
+			"username", BootstrapAdminUsername,
 			"password_source", "admin_password_file",
 			"password_file", admin.PasswordFile,
 			"host", host,
@@ -1202,13 +1223,13 @@ func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, a
 	}
 	logger.Info(
 		"created bootstrap admin",
-		"username", "admin",
+		"username", BootstrapAdminUsername,
 		"password_source", "generated",
 		"host", host,
 	)
 	logger.Info(
 		"initial admin password written",
-		"username", "admin",
+		"username", BootstrapAdminUsername,
 		"path", admin.GeneratedPasswordFile,
 		"host", host,
 	)
@@ -1221,7 +1242,7 @@ func (s *Store) createBootstrapAdmin(ctx context.Context, password string, mustC
 		return err
 	}
 	return s.client.User.Create().
-		SetUsername("admin").
+		SetUsername(BootstrapAdminUsername).
 		SetPasswordHash(hash).
 		SetRole(user.RoleAdmin).
 		SetMustChangePassword(mustChangePassword).

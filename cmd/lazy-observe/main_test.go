@@ -70,7 +70,12 @@ func TestRootCommandHelpAndVersion(t *testing.T) {
 		args []string
 		want []string
 	}{
-		{name: "help", args: []string{"--help"}, want: []string{"Available Commands:", "server", "doctor", "mcp"}},
+		{name: "help", args: []string{"--help"}, want: []string{"Available Commands:", "server", "admin", "doctor", "mcp"}},
+		{
+			name: "admin reset-password flags",
+			args: []string{"admin", "reset-password", "--help"},
+			want: []string{"--config", "--username", "--password-file", "initial-admin-password"},
+		},
 		{name: "server flags", args: []string{"server", "--help"}, want: []string{"--config", "--meta-db-url", "--self-monitoring", "--serve-web-ui"}},
 		{name: "version", args: []string{"--version"}, want: []string{"dev", "commit none", "built unknown"}},
 	} {

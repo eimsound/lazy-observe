@@ -13,6 +13,10 @@ import (
 // one. It mirrors Jenkins' initialAdminPassword.
 const InitialAdminPasswordFileName = "initial-admin-password"
 
+// BootstrapAdminUsername is the account created on an empty metadata database
+// and the default target of `lazy-observe admin reset-password`.
+const BootstrapAdminUsername = "admin"
+
 // minBootstrapAdminPasswordLength matches the account and management password
 // policy (8 characters) so a deployer-provided password could also have been
 // set through the UI.
@@ -36,10 +40,12 @@ func (a BootstrapAdmin) validate() error {
 	return nil
 }
 
-// readAdminPasswordFile reads a deployer-provided password. Only surrounding
+// ReadAdminPasswordFile reads a deployer-provided password. Only surrounding
 // whitespace is trimmed: Kubernetes Secrets and `echo` output usually end with
-// a newline, while inner spaces may be part of the password.
-func readAdminPasswordFile(path string) (string, error) {
+// a newline, while inner spaces may be part of the password. Both bootstrap and
+// `lazy-observe admin reset-password` use it so the two paths accept exactly
+// the same passwords.
+func ReadAdminPasswordFile(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read admin password file %s: %w", path, err)
@@ -91,6 +97,20 @@ func writeInitialAdminPassword(path, password string) (err error) {
 		return fmt.Errorf("persist initial admin password file: %w", err)
 	}
 	return nil
+}
+
+// GenerateInitialAdminPassword writes a fresh random password to path (mode
+// 0600, written atomically) and returns it so the caller can hash it. The
+// plaintext only ever leaves this function to the account row and the file.
+func GenerateInitialAdminPassword(path string) (string, error) {
+	password, err := randomPassword()
+	if err != nil {
+		return "", err
+	}
+	if err := writeInitialAdminPassword(path, password); err != nil {
+		return "", err
+	}
+	return password, nil
 }
 
 func bootstrapHost() string {

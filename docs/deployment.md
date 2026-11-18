@@ -159,6 +159,44 @@ the bootstrap lock, and its `data_dir` is usually an emptyDir. A later start tha
 finds an existing `admin` account writes no password file and keeps the current
 password.
 
+To replace the password of an existing account without knowing the current one,
+run the CLI with the server's configuration and metadata database:
+
+```bash
+lazy-observe admin reset-password --config /etc/lazy-observe/config.yaml
+lazy-observe admin reset-password --username operator --password-file /run/secrets/operator-password
+```
+
+The target defaults to `admin`; `--username` selects another account. Only the
+`admin` account can use a generated password, and only while
+`security.admin_password_file` is unset. A generated password is written to
+`<data_dir>/initial-admin-password` with mode 0600, only the path is printed, and
+the account is flagged `must_change_password` — the same semantics as a
+generated first password. When that file already exists the command prints
+`replacing existing <path>` before overwriting it, without showing its contents.
+Every other account, and every deployment that sets
+`security.admin_password_file` (which includes all HA deployments), must pass
+`--password-file`; the command refuses to generate a password instead of
+touching a deployer-owned file. A file passed with `--password-file` follows the
+`security.admin_password_file` rules (surrounding whitespace ignored, at least 8
+characters) and does not force a change. The command talks to the metadata
+database directly, revokes every session of the account (with `redis.enabled`
+it uses the same Redis as the replicas, so pass `redis.*` too), and exits
+non-zero when the account does not exist. It also writes an
+`auth.password_reset` audit event with actor `cli`.
+
+With `redis.enabled` the command also clears the Redis-backed login lockout of
+that account, so the new password works after repeated failed sign-ins. A
+single-process deployment keeps the lockout counter in the gateway's memory,
+which the CLI cannot reach: restart the gateway if that account is locked out.
+
+Once the admin replaces a generated password through the UI or
+`POST /api/auth/password`, the gateway deletes `<data_dir>/initial-admin-password`.
+Only a real removal failure is logged as a warning; an already absent file is
+silent so repeated password changes stay quiet, and neither case fails the
+change. A file named by `security.admin_password_file` is never deleted, so the
+shared password of an HA deployment survives an admin password change.
+
 ### Platform encryption key
 
 `security.secret_key_file` (environment name `LO_SECURITY_SECRET_KEY_FILE`)
