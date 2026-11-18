@@ -149,7 +149,7 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 - 删数据、改 `docs/requirements.md`、动根 `LICENSE`；
 - 调外部付费服务、发通知给人；
 - 同一门禁连续失败两次以上，且原因不明；
-- 需要新增依赖（先过许可证 allowlist：Go 侧 Apache-2.0/MIT/BSD，JS 侧另加 ISC/0BSD/Unlicense，以 `AGENTS.md` 为准；禁 AGPL/GPL）；
+- 需要新增依赖（先过许可证 allowlist：Go 侧 Apache-2.0/MIT/BSD，JS 侧另加 ISC/0BSD/Unlicense；MPL-2.0 仅限开发/构建期工具（如 lightningcss）；以 `AGENTS.md` 为准；禁 AGPL/GPL）；
 - 改宿主机全局环境：docker 镜像改 tag 或换拉取来源、全局安装工具、改 DNS 或代理、改 shell 配置。拉镜像或装工具失败时停下报告，不要自行绕路。
 
 可以自己往前走的：本地改代码、本地跑门禁、写测试、更新 `CHANGELOG.md`、本地 commit、按下一节推自己的切片分支、开 PR、等 CI、CI 绿后合并该 PR。
