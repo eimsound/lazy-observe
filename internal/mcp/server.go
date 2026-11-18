@@ -436,7 +436,11 @@ func registerProfileTools(server *sdkmcp.Server, api *APIClient) {
 
 func NewHTTPHandler(baseURL string, client *http.Client) http.Handler {
 	return sdkmcp.NewStreamableHTTPHandler(func(req *http.Request) *sdkmcp.Server {
-		authorization := strings.TrimSpace(req.Header.Get("Authorization"))
+		// The gateway mounts this handler through fasthttpadaptor, whose
+		// net/http header values borrow fasthttp's reusable request buffer even
+		// when Fiber runs Immutable. The API client keeps the credential and
+		// project for every tool call, so it must own copies of them.
+		authorization := strings.Clone(strings.TrimSpace(req.Header.Get("Authorization")))
 		scheme, token, _ := strings.Cut(authorization, " ")
 		if !strings.EqualFold(scheme, "Bearer") {
 			token = ""
@@ -446,7 +450,7 @@ func NewHTTPHandler(baseURL string, client *http.Client) http.Handler {
 			// Authentication middleware rejects missing credentials before this.
 			api = &APIClient{BaseURL: baseURL, Token: "invalid", HTTP: client}
 		}
-		api.Project = strings.TrimSpace(req.Header.Get("X-LO-Project"))
+		api.Project = strings.Clone(strings.TrimSpace(req.Header.Get("X-LO-Project")))
 		return NewServer(api)
 	}, &sdkmcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
 }

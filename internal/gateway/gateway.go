@@ -213,6 +213,24 @@ type Gateway struct {
 	secureSessionCookie     bool
 }
 
+func newFiberApp(readTimeout, idleTimeout time.Duration) *fiber.App {
+	return fiber.New(fiber.Config{
+		// Immutable makes Ctx.Get, Params, Query, Cookies, FormValue, Path,
+		// Method, BodyParser fields and friends return owned copies instead of
+		// borrowing fasthttp's request buffers, which are reused by the next
+		// request. Borrowed strings once leaked into the project token cache:
+		// a cached key silently became a later request's token, so another
+		// project's token, or one never issued, authenticated as the cached
+		// project. Handlers still copy values they keep beyond a request; this
+		// setting is the default-safe backstop for the ones that slip through.
+		Immutable:             true,
+		DisableStartupMessage: true,
+		BodyLimit:             maxDecodedRequestBody,
+		ReadTimeout:           readTimeout,
+		IdleTimeout:           idleTimeout,
+	})
+}
+
 func New(cfg Config) *Gateway {
 	if cfg.Account == nil {
 		panic("gateway: account behavior is required")
@@ -284,12 +302,7 @@ func New(cfg Config) *Gateway {
 		cfg.IdleTimeout = defaultIdleTimeout
 	}
 	g := &Gateway{
-		app: fiber.New(fiber.Config{
-			DisableStartupMessage: true,
-			BodyLimit:             maxDecodedRequestBody,
-			ReadTimeout:           cfg.ReadTimeout,
-			IdleTimeout:           cfg.IdleTimeout,
-		}),
+		app:        newFiberApp(cfg.ReadTimeout, cfg.IdleTimeout),
 		instanceID: cfg.InstanceID,
 		auth: NewAuthenticator(
 			cfg.Tokens,
@@ -427,9 +440,11 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 	g.app.Use(recover.New(recover.Config{
 		EnableStackTrace: true,
 		StackTraceHandler: func(c *fiber.Ctx, value any) {
+			// g.logger may export asynchronously; never hand it borrowed
+			// request memory.
 			g.logger.Error(
 				"gateway handler panic",
-				"method", c.Method(), "path", c.Path(), "panic", fmt.Sprint(value),
+				"method", strings.Clone(c.Method()), "path", strings.Clone(c.Path()), "panic", fmt.Sprint(value),
 				"stack", string(debug.Stack()),
 			)
 		},
@@ -1329,11 +1344,19 @@ func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.Pr
 			return call.project, call.err
 		}
 
+		// The caller's token may borrow Fiber's reusable request buffer, which
+		// the next request on the same context overwrites. A borrowed map key
+		// would then silently become another request's token: a different
+		// project's token, or one that was never issued, would match this
+		// entry and authenticate as this project. Store only an owned copy.
+		// Lookups above may use the borrowed value; only stored keys must own
+		// their bytes.
+		key := strings.Clone(token)
 		call := &authenticationCall{done: make(chan struct{}), revision: revision}
-		a.inflight[token] = call
+		a.inflight[key] = call
 		a.mu.Unlock()
 
-		project, authErr := a.store.AuthenticateProjectAPIToken(ctx, token)
+		project, authErr := a.store.AuthenticateProjectAPIToken(ctx, key)
 		a.mu.Lock()
 		latestRevision := a.store.Revision()
 		if latestRevision != a.revision {
@@ -1345,14 +1368,14 @@ func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.Pr
 		} else {
 			call.project, call.err = project, authErr
 			if authErr == nil {
-				a.cache[token] = cachedProject{
+				a.cache[key] = cachedProject{
 					project:   project,
 					expiresAt: time.Now().Add(tokenCacheTTL),
 				}
 			}
 		}
-		if a.inflight[token] == call {
-			delete(a.inflight, token)
+		if a.inflight[key] == call {
+			delete(a.inflight, key)
 		}
 		close(call.done)
 		a.mu.Unlock()

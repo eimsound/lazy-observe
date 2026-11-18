@@ -220,6 +220,9 @@ func (g *Gateway) aiSettingsPut(c *fiber.Ctx) error {
 	}
 
 	// Merge with the persisted row: absent fields keep their stored values.
+	// The merged values outlive this request in the running snapshot and AI
+	// client, so copy them: BodyParser fills form-encoded fields with strings
+	// that borrow Fiber's reusable request buffer.
 	stored, ok, err := m.store.GetAISettings(c.UserContext())
 	if err != nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "read AI settings failed"})
@@ -232,13 +235,13 @@ func (g *Gateway) aiSettingsPut(c *fiber.Ctx) error {
 		next.Enabled = *body.Enabled
 	}
 	if body.Provider != nil {
-		next.Provider = strings.TrimSpace(*body.Provider)
+		next.Provider = strings.Clone(strings.TrimSpace(*body.Provider))
 	}
 	if body.BaseURL != nil {
-		next.BaseURL = strings.TrimSpace(*body.BaseURL)
+		next.BaseURL = strings.Clone(strings.TrimSpace(*body.BaseURL))
 	}
 	if body.Model != nil {
-		next.Model = strings.TrimSpace(*body.Model)
+		next.Model = strings.Clone(strings.TrimSpace(*body.Model))
 	}
 	if body.MaxTokens != nil {
 		next.MaxTokens = *body.MaxTokens

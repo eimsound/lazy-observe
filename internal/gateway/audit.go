@@ -28,6 +28,27 @@ type auditEvent struct {
 	FailureReason string
 }
 
+// owned copies the strings callers may take from the request. Actor comes from
+// the authenticated user loaded from the metadata store and already owns its
+// strings.
+func (event auditEvent) owned() auditEvent {
+	event.Action = strings.Clone(event.Action)
+	event.ActorUsername = strings.Clone(event.ActorUsername)
+	event.TargetType = strings.Clone(event.TargetType)
+	event.TargetName = strings.Clone(event.TargetName)
+	event.TargetRole = strings.Clone(event.TargetRole)
+	event.ProjectSlug = strings.Clone(event.ProjectSlug)
+	event.FailureReason = strings.Clone(event.FailureReason)
+	if event.ChangedFields != nil {
+		fields := make([]string, len(event.ChangedFields))
+		for i, field := range event.ChangedFields {
+			fields[i] = strings.Clone(field)
+		}
+		event.ChangedFields = fields
+	}
+	return event
+}
+
 func (g *Gateway) auditManagementFacts(c *fiber.Ctx, facts management.AuditFacts) {
 	g.auditManagement(c, auditEvent{
 		Action:        facts.Action,
@@ -61,6 +82,11 @@ func (g *Gateway) auditAccountFacts(c *fiber.Ctx, facts account.AuditFacts) {
 // arbitrary request bodies, credentials, token values, error messages, or
 // provider configuration through this API.
 func (g *Gateway) auditManagement(c *fiber.Ctx, event auditEvent) {
+	// g.logger can be the self-monitoring OpenTelemetry handler, which batches
+	// records and exports them after this request returns. Request-derived
+	// strings (form-encoded BodyParser fields, Method, Path) may borrow Fiber's
+	// reusable request buffer, so the record must only hold owned copies.
+	event = event.owned()
 	actor := event.Actor
 	if actor.ID == 0 && actor.Username == "" {
 		actor, _ = c.Locals(userLocal).(meta.UserInfo)
@@ -78,8 +104,8 @@ func (g *Gateway) auditManagement(c *fiber.Ctx, event auditEvent) {
 		"actor_username", actor.Username,
 		"target_type", event.TargetType,
 		"success", event.Success,
-		"http_method", c.Method(),
-		"http_path", c.Path(),
+		"http_method", strings.Clone(c.Method()),
+		"http_path", strings.Clone(c.Path()),
 	}
 	if actor.ID > 0 {
 		attrs = append(attrs, "actor_id", strconv.Itoa(actor.ID))
