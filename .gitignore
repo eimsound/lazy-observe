@@ -10,8 +10,8 @@
 /internal/db/.ent.previous.*/
 *.out
 bench/results/
-poc/**/bin/
-poc/**/data/
+# PoC/spike 是临时代码，只放本地，结论写进 .agents/docs/research/<topic>.md 再提交
+/poc/
 # frontend
 node_modules/
 web/dist/

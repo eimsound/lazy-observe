@@ -12,7 +12,7 @@ Hard constraints:
 - `CGO_ENABLED=0` for Linux on amd64/arm64.
 - Node.js 26 (LTS, pinned in `mise.toml`) and pnpm 10.33.0 for CI-equivalent web/SDK work.
 - No AGPL or GPL dependencies. Production Go dependencies must use Apache-2.0, MIT, or BSD-2/3-Clause licenses (`scripts/check-go-licenses.sh`); production JavaScript dependencies may additionally use ISC, 0BSD, or Unlicense, permissive licenses that ship alongside MIT (`scripts/check-js-licenses.sh`).
-- PoCs belong under `poc/<topic>/` with a `FINDINGS.md`; production code belongs under `cmd/` and `internal/`; client SDKs belong under `sdk/{go,node,browser,python}`.
+- PoCs are local-only scratch code under `poc/<topic>/` (git-ignored, never committed); findings worth keeping go into `.agents/docs/research/<topic>.md`. Production code belongs under `cmd/` and `internal/`; client SDKs belong under `sdk/{go,node,browser,python}`.
 
 ## Development setup
 
