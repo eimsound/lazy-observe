@@ -119,6 +119,33 @@ PoC 脚本只保存在本地分支 `spike/python-315-sampling`（提交 `a96fbb4
 - 旧版本平台把 bootstrap admin 密码打在日志里、不写 `<data_dir>/initial-admin-password` 文件；
   这一行为已在 PR #12（`4ccb3b6`）修复，与本 spike 的结论无关。
 
+## S2 实施期补充实测（2026-11-19，CPU 模式与 GIL）
+
+计划 S2 落地采样器时补测了这一轮 spike 没做的组合（`mode=cpu` + `all_threads=True`），
+结论会直接影响默认 mode 的选择，故记在这里。环境同上（3.15.2 与 3.15.2t，`-I`）。
+
+| 组合 | 纯 Python 忙线程 | GIL-releasing C 调用中的线程 | 采样线程自己 |
+| --- | --- | --- | --- |
+| 3.15.2（GIL）`mode=cpu` | 不出现在样本里 | 出现 | 出现（需自己排除） |
+| 3.15.2（GIL）`mode=wall`/`all` | 出现 | 出现 | 出现（需自己排除） |
+| 3.15.2t（free-threaded）`mode=cpu` | 出现 | 出现 | 出现（需自己排除） |
+
+原因：进程内采样线程在调用 `sample()` 期间持有 GIL，`_remote_debugging` 在这一刻读线程状态，
+其它 Python 线程的 `status` 只有 `THREAD_STATUS_GIL_REQUESTED`、没有 `THREAD_STATUS_ON_CPU`，
+于是被 `skip_non_matching_threads` 过滤掉；只有已经释放 GIL 的线程（C 扩展、IO）仍算「在 CPU 上」。
+`blocking=True` 不改变这一行为。`run`/`attach` 两条 CLI 路线不受影响：它们的采样器在另一个进程里。
+
+其它实测补充：
+
+- 采样间隔不在 `sample()` 参数里，`SampleProfiler` 从 `collector.sample_interval_usec` 读，
+  10_000 us 即 100 Hz（1 s 实测 100 个样本）。
+- 帧元组是 `(filename, LocationInfo, funcname, opcode)`，`funcname` 实测就是 qualname
+  （`Outer.method.<locals>.inner` 能区分同名方法）。
+- `ThreadInfo.thread_id` 是 OS 线程 id，等于 `threading.get_native_id()`，不是
+  `threading.get_ident()`。
+- `SampleProfiler.sample` 每次结束后用 `print` 往 stdout 打三行统计（外加漏采警告）；SDK 采样器
+  把 `profiling.sampling.sample` 模块的 `print` 换成 no-op 来消掉，不去动 `sys.stdout`。
+
 ## 风险与未知项
 
 - 路线 (a) 依赖未文档化的 API，CPython 小版本升级可能改签名或语义。
