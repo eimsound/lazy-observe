@@ -38,7 +38,7 @@ mise run web
 | `mise run dist` | Build the current-platform release binary with embedded Web and storage assets |
 | `mise run dist-cross` | Build embedded release binaries for Linux on amd64/arm64 |
 | `mise run fmt-check` | Verify tracked non-generated Go files use `golines -m 120 --chain-split-dots` |
-| `mise run mod-tidy-check` | Verify the root and Go SDK module manifests need no `go mod tidy` changes |
+| `mise run mod-tidy-check` / `mise run sdk-go` | Verify the root module and the separate `sdk/go` module manifests need no `go mod tidy` changes |
 | `mise run test` | Generate Ent, then run `CGO_ENABLED=0 go test ./...` |
 | `mise run vet` | Generate Ent, then run `CGO_ENABLED=0 go vet ./...` |
 | `mise run lint` | mise-managed golangci-lint `v2.12.2` |

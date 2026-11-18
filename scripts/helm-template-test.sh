@@ -101,7 +101,11 @@ for rendered in "$WORK/standalone.yaml" "$WORK/cluster.yaml" "$WORK/key-existing
   assert_contains "$rendered" 'mountPath: /etc/lazy-observe-key$' 'the shared key Secret must be mounted into the pod'
   assert_contains "$rendered" 'path: secret\.key$' 'the shared key must be projected as secret.key'
   assert_contains "$rendered" 'defaultMode: (0444|292)$' 'the key file must be read-only and readable by the nonroot uid'
-  assert_not_contains "$rendered" 'LO_SECURITY_SECRET_KEY' 'the platform key must not be exposed through environment variables'
+  # 把变量名当完整 token 匹配：后面不能再紧跟标识符字符，所以不会误中合法的
+  # LO_SECURITY_SECRET_KEY_FILE（值是文件路径），同时能拦住单引号、flow 风格、行尾注释、
+  # JSON、data + envFrom 等所有会把密钥名字当成整体词出现的写法。
+  assert_not_contains "$rendered" 'LO_SECURITY_SECRET_KEY([^A-Za-z0-9_]|$)' \
+    'the platform key must not be exposed through environment variables'
 done
 
 # Chart-generated key: one Secret shared by the whole Deployment, kept across
@@ -156,7 +160,9 @@ for rendered in "$WORK/standalone.yaml" "$WORK/cluster.yaml" "$WORK/admin-existi
   assert_contains "$rendered" "admin_password_file: \"$ADMIN_PATH\"" 'admin_password_file must point at the mounted admin password'
   assert_contains "$rendered" 'mountPath: /etc/lazy-observe-admin$' 'the admin password Secret must be mounted into the pod'
   assert_contains "$rendered" 'path: admin-password$' 'the admin password must be projected as admin-password'
-  assert_not_contains "$rendered" 'LO_SECURITY_ADMIN_PASSWORD' 'the admin password must not be passed through environment variables'
+  # 同上的 token 边界匹配：合法的 LO_SECURITY_ADMIN_PASSWORD_FILE 不再误报。
+  assert_not_contains "$rendered" 'LO_SECURITY_ADMIN_PASSWORD([^A-Za-z0-9_]|$)' \
+    'the admin password must not be passed through environment variables'
 done
 
 assert_contains "$WORK/standalone.yaml" 'secretName: test-lazy-observe-admin-password$' 'replicas must mount the chart-managed admin password Secret'
@@ -188,6 +194,17 @@ assert_render_fails 'HPA without an admin password source must fail rendering' '
 assert_not_contains "$WORK/single-no-admin.yaml" 'admin_password_file' 'a single replica without an admin Secret falls back to data_dir'
 "$HELM" template test "$CHART" --set mode=allinone --set adminPassword.autoGenerate=false >"$WORK/allinone-no-admin.yaml"
 assert_not_contains "$WORK/allinone-no-admin.yaml" 'admin_password_file' 'allinone without an admin Secret falls back to data_dir'
+
+# envFrom 是「把密钥本体当环境变量注入」最现实的一条路：密钥名字写在 ConfigMap/Secret 的
+# data 里，上面的 token 匹配依赖容器 env 里出现这个名字，envFrom 能把它整包注入。
+# 而 envFrom.prefix 还能在运行时拼出变量名，任何按名字匹配的断言都拦不住，所以只要 chart
+# 开始用 envFrom 就必须停下来重新审议密钥防护。当前 chart 只在 deployment.yaml 用 env:。
+for rendered in "$WORK/standalone.yaml" "$WORK/allinone.yaml" "$WORK/cluster.yaml" \
+  "$WORK/key-existing.yaml" "$WORK/allinone-ephemeral.yaml" "$WORK/admin-existing.yaml" \
+  "$WORK/single-no-key.yaml" "$WORK/single-no-admin.yaml" "$WORK/allinone-no-admin.yaml"; do
+  assert_not_contains "$rendered" '^[[:space:]]*envFrom:' \
+    'the chart must not inject key material with envFrom (rethink the key guards first)'
+done
 
 # NOTES must tell the operator how to read the password back. `helm template`
 # never renders NOTES.txt and `helm install --dry-run` needs a cluster, so a
