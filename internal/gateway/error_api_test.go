@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -29,6 +30,7 @@ type errorStorage struct {
 	mu            sync.Mutex
 	logs          map[string][]map[string]any
 	metricSamples string
+	metricImports int
 }
 
 func (s *errorStorage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +121,7 @@ func (s *errorStorage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
 		s.metricSamples += string(body)
+		s.metricImports++
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -583,6 +586,314 @@ func TestErrorTrackingLifecycleRawEventsIsolationAndVitals(t *testing.T) {
 	samples := storage.metricSamples
 	storage.mu.Unlock()
 	if !strings.Contains(samples, `web_vitals_lcp{project_id="default",page="/checkout?x=1"} 123.4`) {
+		t.Fatalf("samples=%q", samples)
+	}
+}
+
+type vitalsTestSetup struct {
+	gateway *Gateway
+	token   string
+	storage *errorStorage
+	logs    *strings.Builder
+}
+
+// newVitalsTestGateway wires a gateway whose metrics upstream records the Prometheus
+// payload, so vitals tests can assert both on the HTTP response and on what actually
+// reached storage.
+func newVitalsTestGateway(t *testing.T, slug string) vitalsTestSetup {
+	t.Helper()
+	store := testStore(t)
+	ctx := context.Background()
+	project, err := store.CreateProject(ctx, slug, slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := store.CreateProjectAPIToken(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &errorStorage{}
+	upstream := httptest.NewServer(storage)
+	t.Cleanup(upstream.Close)
+	logs := &strings.Builder{}
+	gw := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Metrics: upstream.URL,
+		Logger: slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+	return vitalsTestSetup{gateway: gw, token: token, storage: storage, logs: logs}
+}
+
+func (s vitalsTestSetup) post(t *testing.T, vitals []any) (int, []byte) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"vitals": vitals})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/events/vitals", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+s.token)
+	response, err := s.gateway.App().Test(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(response.Body)
+	return response.StatusCode, payload
+}
+
+func (s vitalsTestSetup) samples() string {
+	s.storage.mu.Lock()
+	defer s.storage.mu.Unlock()
+	return s.storage.metricSamples
+}
+
+// importCount separates "imported an empty payload" from "did not call the metrics
+// upstream at all", which samples() cannot tell apart because it only concatenates.
+func (s vitalsTestSetup) importCount() int {
+	s.storage.mu.Lock()
+	defer s.storage.mu.Unlock()
+	return s.storage.metricImports
+}
+
+func vitalPayload(name string, value float64, page string, at time.Time) map[string]any {
+	return map[string]any{
+		"name": name, "value": value, "page": page, "timestamp": at.Format(time.RFC3339Nano),
+	}
+}
+
+func TestVitalsIngestAcceptsKnownMetricsAndSkipsUnknownNames(t *testing.T) {
+	setup := newVitalsTestGateway(t, "vitals-partial")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	status, payload := setup.post(t, []any{
+		vitalPayload("LCP", 123.4, "/checkout", at),
+		vitalPayload("LOAF", 42, "/checkout", at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 1 || result.Rejected != 1 {
+		t.Fatalf("response=%s want accepted=1 rejected=1", payload)
+	}
+
+	samples := setup.samples()
+	want := `web_vitals_lcp{project_id="vitals-partial",page="/checkout"} 123.4 1787488496789`
+	if !strings.Contains(samples, want) {
+		t.Fatalf("samples=%q want substring=%q", samples, want)
+	}
+	if strings.Contains(strings.ToLower(samples), "loaf") {
+		t.Fatalf("unknown vital reached storage: %q", samples)
+	}
+	if logged := setup.logs.String(); !strings.Contains(logged, "loaf") ||
+		!strings.Contains(logged, "vitals-partial") {
+		t.Fatalf("missing warn log with project and skipped name: %q", logged)
+	}
+	if imports := setup.importCount(); imports != 1 {
+		t.Fatalf("metrics imports=%d want 1", imports)
+	}
+}
+
+func TestVitalsIngestAllUnknownNamesWritesNothing(t *testing.T) {
+	setup := newVitalsTestGateway(t, "vitals-all-unknown")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	status, payload := setup.post(t, []any{
+		vitalPayload("LOAF", 42, "/checkout", at),
+		vitalPayload("INP_Experimental", 7, "/checkout", at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 0 || result.Rejected != 2 {
+		t.Fatalf("response=%s want accepted=0 rejected=2", payload)
+	}
+	if samples := setup.samples(); samples != "" {
+		t.Fatalf("fully rejected batch reached storage: %q", samples)
+	}
+	if imports := setup.importCount(); imports != 0 {
+		t.Fatalf("metrics imports=%d want 0: a fully rejected batch must not POST to the upstream", imports)
+	}
+	logged := setup.logs.String()
+	if !strings.Contains(logged, "loaf") || !strings.Contains(logged, "inp_experimental") {
+		t.Fatalf("warn log missing skipped names: %q", logged)
+	}
+}
+
+func TestVitalsIngestEmptyBatchWritesNothing(t *testing.T) {
+	setup := newVitalsTestGateway(t, "vitals-empty")
+
+	status, payload := setup.post(t, []any{})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 0 || result.Rejected != 0 {
+		t.Fatalf("response=%s want accepted=0 rejected=0", payload)
+	}
+	if imports := setup.importCount(); imports != 0 {
+		t.Fatalf("metrics imports=%d want 0: an empty batch must not POST to the upstream", imports)
+	}
+	if logged := setup.logs.String(); logged != "" {
+		t.Fatalf("empty batch logged: %q", logged)
+	}
+}
+
+func TestVitalsIngestBoundsUnknownNameLogging(t *testing.T) {
+	setup := newVitalsTestGateway(t, "vitals-flood")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+	// "指" is three bytes, so a 64-byte cut lands mid-rune at 63 bytes and must be
+	// backed up to 21 whole runes.
+	longName := strings.Repeat("指", 2000)
+	wantPrefix := strings.Repeat("指", 21) + "…"
+
+	status, payload := setup.post(t, []any{
+		vitalPayload(longName, 1, "/checkout", at),
+		vitalPayload(longName+"a", 1, "/checkout", at),
+		vitalPayload(longName+"b", 1, "/checkout", at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Rejected int `json:"rejected"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, payload)
+	}
+	if result.Accepted != 0 || result.Rejected != 3 {
+		t.Fatalf("response=%s want accepted=0 rejected=3", payload)
+	}
+	logged := setup.logs.String()
+	if strings.Count(logged, wantPrefix) != 1 {
+		t.Fatalf("log=%q want exactly one truncated name %q (de-duplicated after truncation)",
+			logged, wantPrefix)
+	}
+	if strings.Contains(logged, strings.Repeat("指", 30)) {
+		t.Fatalf("log kept an untruncated name: %q", logged)
+	}
+	if len(logged) > 1024 {
+		t.Fatalf("log line=%d bytes, want a bounded warning: %q", len(logged), logged)
+	}
+}
+
+func TestVitalsIngestSummarizesOverflowingUnknownNames(t *testing.T) {
+	setup := newVitalsTestGateway(t, "vitals-overflow")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+	var vitals []any
+	for _, name := range []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg"} {
+		vitals = append(vitals, vitalPayload(name, 1, "/checkout", at))
+	}
+
+	status, payload := setup.post(t, vitals)
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	logged := setup.logs.String()
+	// Sorted so the warning is deterministic, capped at five names, remainder counted.
+	if !strings.Contains(logged, "aaa,bbb,ccc,ddd,eee,+2 more") {
+		t.Fatalf("log=%q want sorted cap with overflow count", logged)
+	}
+	if strings.Contains(logged, "fff") || strings.Contains(logged, "ggg") {
+		t.Fatalf("log=%q kept names beyond the cap", logged)
+	}
+}
+
+func TestVitalsIngestKeepsStructuralErrorsAsWholeBatchRejection(t *testing.T) {
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		vital   map[string]any
+		wantErr string
+	}{
+		{
+			name:    "empty page",
+			vital:   vitalPayload("LCP", 1, "", at),
+			wantErr: "invalid vital at index 0",
+		},
+		{
+			name:    "empty name",
+			vital:   vitalPayload("", 1, "/checkout", at),
+			wantErr: "invalid vital at index 0",
+		},
+		{
+			name:    "blank name",
+			vital:   vitalPayload("   ", 1, "/checkout", at),
+			wantErr: "invalid vital at index 0",
+		},
+		{
+			name:    "invalid timestamp",
+			vital:   map[string]any{"name": "LCP", "value": 1, "page": "/checkout", "timestamp": "yesterday"},
+			wantErr: "invalid vital timestamp at index 0",
+		},
+		{
+			// Structural validity is a property of the batch: an unknown name is
+			// skipped, but a malformed entry still rejects the request.
+			name:    "unknown name with invalid timestamp",
+			vital:   map[string]any{"name": "LOAF", "value": 1, "page": "/checkout", "timestamp": "yesterday"},
+			wantErr: "invalid vital timestamp at index 0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup := newVitalsTestGateway(t, "vitals-structural")
+			status, payload := setup.post(t, []any{
+				vitalPayload("LCP", 1, "/checkout", at),
+				tc.vital,
+			})
+			if status != http.StatusUnprocessableEntity {
+				t.Fatalf("status=%d body=%s", status, payload)
+			}
+			var rejection struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(payload, &rejection); err != nil {
+				t.Fatalf("decode response: %v body=%s", err, payload)
+			}
+			wantErr := strings.Replace(tc.wantErr, "index 0", "index 1", 1)
+			if rejection.Error != wantErr {
+				t.Fatalf("error=%q want=%q", rejection.Error, wantErr)
+			}
+			if samples := setup.samples(); samples != "" {
+				t.Fatalf("rejected batch reached storage: %q", samples)
+			}
+		})
+	}
+}
+
+func TestVitalsIngestIsCaseInsensitive(t *testing.T) {
+	setup := newVitalsTestGateway(t, "vitals-case")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	status, payload := setup.post(t, []any{
+		vitalPayload("FcP", 1, "/checkout", at),
+		vitalPayload(" fcp ", 2, "/checkout", at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	samples := setup.samples()
+	if strings.Count(samples, "web_vitals_fcp{") != 2 {
 		t.Fatalf("samples=%q", samples)
 	}
 }

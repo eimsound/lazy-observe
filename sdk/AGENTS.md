@@ -15,6 +15,11 @@ SDK 面向 lazy-observe 服务端上报遥测时必须遵守以下守则（与 `
    响应中出现未知字段 / 未知枚举值时，SDK 一律静默降级：丢弃该次负载，可重试
    场景（如回放分段、profile 分片）缓存后退避重试，并叠加 diagnostics 上报。
    **绝不向应用抛错、绝不中断业务线程、绝不改变上层业务行为。**
+   服务端一侧的现状见 `docs/version-matrix.md` §5：**只有** `/api/events/vitals`
+   的指标名实现了跳过未知值并在响应的 `rejected` 里计数（同批已知指标照常写入，
+   所以那里的 `rejected > 0` 不是降级原因）；其它私有 ingest 端点（如
+   `/api/events/diagnostics` 的 `signal` / `reason`）遇到未知枚举值仍整批 `422`，
+   仍按本条静默降级并上报 diagnostics。
 2. **向前兼容**：响应必须忽略一切未知字段，只解析自身认识的结构；新增服务端
    特性不得导致旧 SDK 报错。
 3. **协议/端点变更同 PR**：改动任何 protocol 面（端点路径、字段、DSN、鉴权方式）
