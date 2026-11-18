@@ -170,47 +170,54 @@ type Config struct {
 	// SecureSessionCookie marks the session and CSRF cookies with the Secure
 	// attribute. Enable only when TLS terminates in front of the gateway.
 	SecureSessionCookie bool
+	// InitialAdminPasswordFile names the bootstrap-generated first-admin
+	// password file. The file is removed once the admin replaces that password.
+	// Empty disables removal: cmd supplies it unless security.admin_password_file
+	// names that same file (by path or file identity), which is the
+	// deployer-owned case.
+	InitialAdminPasswordFile string
 }
 
 type Gateway struct {
-	app                     *fiber.App
-	instanceID              string
-	auth                    *Authenticator
-	store                   ManagementStore
-	account                 account.Behavior
-	limits                  state.Limiter
-	management              *management.Manager
-	health                  HealthChecker
-	readiness               HealthChecker
-	ready                   bool
-	readyMu                 sync.RWMutex
-	drainOnce               sync.Once
-	client                  *http.Client
-	now                     func() time.Time
-	alerts                  *alert.Service
-	issues                  IssueStore
-	errorTracker            ErrorIntake
-	notifications           NotificationStore
-	replays                 ReplayStore
-	blobs                   blob.Store
-	sourceMaps              SourceMapStore
-	profiles                ProfileStore
-	scrapes                 *scrape.Service
-	storage                 storagepkg.SignalBackend
-	scrapeUnavailableReason string
-	mcpBaseURL              string
-	ai                      *aiManager
-	aiAssistant             *assistantService
-	issueAI                 *issueAIService
-	llmPricing              *llmcost.Table
-	webUI                   fs.FS
-	instrumentation         fiber.Handler
-	selfMonitoringToken     string
-	logger                  *slog.Logger
-	meterProvider           metric.MeterProvider
-	replayLocks             [64]sync.Mutex
-	requireCSRF             bool
-	secureSessionCookie     bool
+	app                      *fiber.App
+	instanceID               string
+	auth                     *Authenticator
+	store                    ManagementStore
+	account                  account.Behavior
+	limits                   state.Limiter
+	management               *management.Manager
+	health                   HealthChecker
+	readiness                HealthChecker
+	ready                    bool
+	readyMu                  sync.RWMutex
+	drainOnce                sync.Once
+	client                   *http.Client
+	now                      func() time.Time
+	alerts                   *alert.Service
+	issues                   IssueStore
+	errorTracker             ErrorIntake
+	notifications            NotificationStore
+	replays                  ReplayStore
+	blobs                    blob.Store
+	sourceMaps               SourceMapStore
+	profiles                 ProfileStore
+	scrapes                  *scrape.Service
+	storage                  storagepkg.SignalBackend
+	scrapeUnavailableReason  string
+	mcpBaseURL               string
+	ai                       *aiManager
+	aiAssistant              *assistantService
+	issueAI                  *issueAIService
+	llmPricing               *llmcost.Table
+	webUI                    fs.FS
+	instrumentation          fiber.Handler
+	selfMonitoringToken      string
+	logger                   *slog.Logger
+	meterProvider            metric.MeterProvider
+	replayLocks              [64]sync.Mutex
+	requireCSRF              bool
+	secureSessionCookie      bool
+	initialAdminPasswordFile string
 }
 
 func newFiberApp(readTimeout, idleTimeout time.Duration) *fiber.App {
@@ -307,32 +314,33 @@ func New(cfg Config) *Gateway {
 		auth: NewAuthenticator(
 			cfg.Tokens,
 		),
-		store:                   cfg.Store,
-		account:                 cfg.Account,
-		limits:                  cfg.Limits,
-		management:              cfg.Management,
-		health:                  cfg.Health,
-		readiness:               cfg.Readiness,
-		client:                  cfg.Client,
-		now:                     cfg.Now,
-		alerts:                  cfg.Alerts,
-		issues:                  cfg.Issues,
-		replays:                 cfg.Replays,
-		blobs:                   cfg.Blobs,
-		sourceMaps:              cfg.SourceMaps,
-		profiles:                cfg.Profiles,
-		scrapes:                 cfg.Scrapes,
-		storage:                 cfg.Storage,
-		scrapeUnavailableReason: cfg.ScrapeUnavailableReason,
-		mcpBaseURL:              cfg.MCPBaseURL,
-		llmPricing:              cfg.LLMPricing,
-		webUI:                   cfg.WebUI,
-		instrumentation:         cfg.Instrumentation,
-		selfMonitoringToken:     cfg.SelfMonitoringToken,
-		logger:                  cfg.Logger,
-		meterProvider:           cfg.MeterProvider,
-		requireCSRF:             cfg.RequireCSRF,
-		secureSessionCookie:     cfg.SecureSessionCookie,
+		store:                    cfg.Store,
+		account:                  cfg.Account,
+		limits:                   cfg.Limits,
+		management:               cfg.Management,
+		health:                   cfg.Health,
+		readiness:                cfg.Readiness,
+		client:                   cfg.Client,
+		now:                      cfg.Now,
+		alerts:                   cfg.Alerts,
+		issues:                   cfg.Issues,
+		replays:                  cfg.Replays,
+		blobs:                    cfg.Blobs,
+		sourceMaps:               cfg.SourceMaps,
+		profiles:                 cfg.Profiles,
+		scrapes:                  cfg.Scrapes,
+		storage:                  cfg.Storage,
+		scrapeUnavailableReason:  cfg.ScrapeUnavailableReason,
+		mcpBaseURL:               cfg.MCPBaseURL,
+		llmPricing:               cfg.LLMPricing,
+		webUI:                    cfg.WebUI,
+		instrumentation:          cfg.Instrumentation,
+		selfMonitoringToken:      cfg.SelfMonitoringToken,
+		logger:                   cfg.Logger,
+		meterProvider:            cfg.MeterProvider,
+		requireCSRF:              cfg.RequireCSRF,
+		secureSessionCookie:      cfg.SecureSessionCookie,
+		initialAdminPasswordFile: cfg.InitialAdminPasswordFile,
 	}
 	if cfg.AISettingsStore != nil {
 		// Dynamic mode: the admin UI manages the persisted AI configuration.

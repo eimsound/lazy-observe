@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -89,14 +90,7 @@ func openServerMetadata(
 	logger *slog.Logger,
 	secretBox *secret.Box,
 ) (*serverMetadata, error) {
-	dbURL := cfg.Meta.DBURL
-	if dbURL == "" {
-		dbURL = filepath.Join(cfg.DataDir, "meta", "lazy-observe.db")
-	}
-	store, err := meta.OpenStoreWithOptions(ctx, dbURL, meta.OpenOptions{
-		MigrationLockTimeout: cfg.Meta.MigrationLockTimeout.Value(),
-		ApplicationVersion:   Version,
-	})
+	store, err := openMetadataStore(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +124,19 @@ func openServerMetadata(
 	}, nil
 }
 
+// openMetadataStore opens the metadata database the server uses, so CLI
+// subcommands operate on exactly the same rows without the HTTP API.
+func openMetadataStore(ctx context.Context, cfg appconfig.Config) (*meta.Store, error) {
+	dbURL := cfg.Meta.DBURL
+	if dbURL == "" {
+		dbURL = filepath.Join(cfg.DataDir, "meta", "lazy-observe.db")
+	}
+	return meta.OpenStoreWithOptions(ctx, dbURL, meta.OpenOptions{
+		MigrationLockTimeout: cfg.Meta.MigrationLockTimeout.Value(),
+		ApplicationVersion:   Version,
+	})
+}
+
 // bootstrapAdmin uses the deployer-provided password file when configured;
 // otherwise a generated first password lands in <data_dir>/initial-admin-password.
 // Only the replica that wins the bootstrap lock writes that file, so HA
@@ -138,12 +145,52 @@ func bootstrapAdmin(cfg appconfig.Config) meta.BootstrapAdmin {
 	if cfg.Security.AdminPasswordFile != "" {
 		return meta.BootstrapAdmin{PasswordFile: cfg.Security.AdminPasswordFile}
 	}
+	return meta.BootstrapAdmin{GeneratedPasswordFile: initialAdminPasswordPath(cfg)}
+}
+
+// initialAdminPasswordPath is the absolute generated-password path under the
+// data directory. Bootstrap and `admin reset-password` share it so the gateway
+// removes the very file either of them wrote.
+func initialAdminPasswordPath(cfg appconfig.Config) string {
 	path := filepath.Join(cfg.DataDir, meta.InitialAdminPasswordFileName)
 	if absolute, err := filepath.Abs(path); err == nil {
 		// The log line must point the operator at the file without guessing the cwd.
-		path = absolute
+		return absolute
 	}
-	return meta.BootstrapAdmin{GeneratedPasswordFile: path}
+	return path
+}
+
+// gatewayInitialAdminPasswordFile is the file the gateway removes after the
+// bootstrap admin changes a generated password, and the path the reset CLI may
+// write. It is empty when security.admin_password_file is the same file (by
+// path or by file identity): that file belongs to the deployer and must never
+// be removed. A deployer file at a different path does not suppress the
+// generated path, because the CLI can still create that file.
+func gatewayInitialAdminPasswordFile(cfg appconfig.Config) string {
+	generated := initialAdminPasswordPath(cfg)
+	if cfg.Security.AdminPasswordFile == "" || !sameFile(cfg.Security.AdminPasswordFile, generated) {
+		return generated
+	}
+	return ""
+}
+
+// sameFile compares two paths by file identity when both exist, so a symlink or
+// hard link to the protected file is recognised, and falls back to cleaned
+// absolute paths when either side is absent.
+func sameFile(first, second string) bool {
+	firstInfo, firstErr := os.Stat(first)
+	secondInfo, secondErr := os.Stat(second)
+	if firstErr == nil && secondErr == nil {
+		return os.SameFile(firstInfo, secondInfo)
+	}
+	return absoluteClean(first) == absoluteClean(second)
+}
+
+func absoluteClean(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		return filepath.Clean(absolute)
+	}
+	return filepath.Clean(path)
 }
 
 func openBlobStore(cfg appconfig.Config) (blob.Store, error) {

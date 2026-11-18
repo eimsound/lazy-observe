@@ -28,6 +28,7 @@ func newRootCommand() *cobra.Command {
 	}
 	command.AddCommand(
 		newServerCommand(),
+		newAdminCommand(),
 		newDoctorCommand(),
 		newMCPCommand(),
 		newPreStopCommand(),

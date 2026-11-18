@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -89,7 +91,33 @@ func (g *Gateway) changePassword(c *fiber.Ctx) error {
 	if err != nil {
 		return accountAPIError(c, err)
 	}
+	g.removeInitialAdminPasswordFile(u.Username)
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// removeInitialAdminPasswordFile deletes the bootstrap-generated first-admin
+// password file after the admin replaced that password: the plaintext is dead
+// and should not stay readable on disk. The field is empty when
+// security.admin_password_file names that same file (by path or identity), so a
+// deployer-owned file is never removed. An already absent file is a normal
+// repeat password change and stays silent; any other removal failure is logged
+// without failing the change.
+func (g *Gateway) removeInitialAdminPasswordFile(username string) {
+	path := g.initialAdminPasswordFile
+	if path == "" || username != meta.BootstrapAdminUsername {
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		g.logger.Warn(
+			"could not remove initial admin password file",
+			"path", path,
+			"username", username,
+			"err", err,
+		)
+	}
 }
 
 func (g *Gateway) updateMe(c *fiber.Ctx) error {
