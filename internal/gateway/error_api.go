@@ -116,7 +116,7 @@ func (g *Gateway) vitalsIngest(c *fiber.Ctx) error {
 	// vital this server does not), not a malformed batch: skip and count them so the
 	// known metrics in the same batch still land. Structural problems stay fatal for
 	// the whole batch, so nothing is written when any entry is malformed.
-	skippedNames := unknownVitalNames{names: make(map[string]struct{})}
+	skippedNames := newUnknownEnumValues()
 	skipped := 0
 	for i, vital := range body.Vitals {
 		name := strings.ToLower(strings.TrimSpace(vital.Name))
@@ -162,41 +162,46 @@ func (g *Gateway) vitalsIngest(c *fiber.Ctx) error {
 }
 
 const (
-	maxLoggedSkippedVitalNames = 5
-	maxSkippedVitalNameBytes   = 64
+	maxLoggedSkippedEnumValues = 5
+	maxSkippedEnumValueBytes   = 64
 )
 
-// unknownVitalNames keeps a bounded, de-duplicated sample of rejected vital names.
-// The ingest token ships inside browser DSNs, so this endpoint is effectively public:
-// without a length cap a single request inside the body limit could turn one warning
-// into a multi-megabyte log line. Names are therefore truncated before de-duplication
-// (so the cap cannot be bypassed by appending bytes) and only the first few distinct
-// names are retained. Log volume still grows with request volume; rate limiting the
-// warning is deliberately out of scope here.
-type unknownVitalNames struct {
-	names map[string]struct{}
-	// overflow counts skipped entries whose truncated name never made it into names; it
-	// is an entry count, not a distinct-name count, because names past the cap are no
+// unknownEnumValues keeps a bounded, de-duplicated sample of rejected enum values
+// (vital names, SDK diagnostic signals and reasons). Both private ingest endpoints are
+// effectively public because the ingest token ships inside browser DSNs: without a
+// length cap a single request inside the body limit could turn one warning into a
+// multi-megabyte log line. Values are therefore truncated before de-duplication (so the
+// cap cannot be bypassed by appending bytes) and only the first few distinct values are
+// retained. Log volume still grows with request volume; rate limiting the warning is
+// deliberately out of scope here.
+type unknownEnumValues struct {
+	values map[string]struct{}
+	// overflow counts skipped entries whose truncated value never made it into values; it
+	// is an entry count, not a distinct-value count, because values past the cap are no
 	// longer retained and cannot be de-duplicated.
 	overflow int
 }
 
-func (u *unknownVitalNames) add(name string) {
-	name = truncateVitalName(name)
-	if _, seen := u.names[name]; seen {
+func newUnknownEnumValues() *unknownEnumValues {
+	return &unknownEnumValues{values: make(map[string]struct{})}
+}
+
+func (u *unknownEnumValues) add(value string) {
+	value = truncateEnumValue(value)
+	if _, seen := u.values[value]; seen {
 		return
 	}
-	if len(u.names) >= maxLoggedSkippedVitalNames {
+	if len(u.values) >= maxLoggedSkippedEnumValues {
 		u.overflow++
 		return
 	}
-	u.names[name] = struct{}{}
+	u.values[value] = struct{}{}
 }
 
-func (u *unknownVitalNames) String() string {
-	ordered := make([]string, 0, len(u.names)+1)
-	for name := range u.names {
-		ordered = append(ordered, name)
+func (u *unknownEnumValues) String() string {
+	ordered := make([]string, 0, len(u.values)+1)
+	for value := range u.values {
+		ordered = append(ordered, value)
 	}
 	sort.Strings(ordered)
 	if u.overflow > 0 {
@@ -205,17 +210,17 @@ func (u *unknownVitalNames) String() string {
 	return strings.Join(ordered, ",")
 }
 
-// truncateVitalName cuts on a rune boundary; slicing mid-sequence would log a
+// truncateEnumValue cuts on a rune boundary; slicing mid-sequence would log a
 // replacement character instead of the bytes the client sent.
-func truncateVitalName(name string) string {
-	if len(name) <= maxSkippedVitalNameBytes {
-		return name
+func truncateEnumValue(value string) string {
+	if len(value) <= maxSkippedEnumValueBytes {
+		return value
 	}
-	cut := maxSkippedVitalNameBytes
-	for cut > 0 && !utf8.RuneStart(name[cut]) {
+	cut := maxSkippedEnumValueBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
 		cut--
 	}
-	return name[:cut] + "…"
+	return value[:cut] + "…"
 }
 
 type sdkDiagnosticInput struct {
@@ -238,7 +243,16 @@ func (g *Gateway) sdkDiagnosticsIngest(c *fiber.Ctx) error {
 	if err := json.Unmarshal(c.Body(), &body); err != nil || body.Measurements == nil || len(body.Measurements) > 100 {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid SDK diagnostics batch"})
 	}
+	project := currentProject(c)
 	var samples strings.Builder
+	// Unknown signal/reason values are a forward-compatibility signal (a newer SDK knows
+	// a diagnostic this server does not), not a malformed batch: skip and count them so
+	// the known measurements in the same batch still land. Structural problems (missing
+	// or malformed ids, timestamps, service names, counts, and empty signal/reason) stay
+	// fatal for the whole batch, so nothing is written when any entry is malformed.
+	skippedSignals := newUnknownEnumValues()
+	skippedReasons := newUnknownEnumValues()
+	skipped := 0
 	for i, measurement := range body.Measurements {
 		measurement.Service = strings.TrimSpace(measurement.Service)
 		measurement.Signal = strings.TrimSpace(measurement.Signal)
@@ -246,16 +260,29 @@ func (g *Gateway) sdkDiagnosticsIngest(c *fiber.Ctx) error {
 		timestamp, err := parseMetricTimestamp(measurement.Timestamp)
 		if err != nil || !validSDKMeasurementID(measurement.MeasurementID) ||
 			len(measurement.Service) == 0 || len(measurement.Service) > 128 ||
-			!validSDKDiagnosticSignal(measurement.Signal) || !validSDKDiagnosticReason(measurement.Reason) ||
+			measurement.Signal == "" || measurement.Reason == "" ||
 			measurement.Dropped <= 0 || measurement.Dropped > 1_000_000_000 {
 			return c.Status(http.StatusUnprocessableEntity).
 				JSON(fiber.Map{"error": fmt.Sprintf("invalid SDK diagnostic at index %d", i)})
+		}
+		unknown := false
+		if !validSDKDiagnosticSignal(measurement.Signal) {
+			skippedSignals.add(measurement.Signal)
+			unknown = true
+		}
+		if !validSDKDiagnosticReason(measurement.Reason) {
+			skippedReasons.add(measurement.Reason)
+			unknown = true
+		}
+		if unknown {
+			skipped++
+			continue
 		}
 		fmt.Fprintf(
 			&samples,
 			"lazy_observe_sdk_dropped_telemetry{project_id=%s,service_name=%s,"+
 				"sdk_language=\"browser\",signal=%s,reason=%s} %d %d\n",
-			strconv.Quote(currentProject(c).Slug),
+			strconv.Quote(project.Slug),
 			strconv.Quote(measurement.Service),
 			strconv.Quote(measurement.Signal),
 			strconv.Quote(measurement.Reason),
@@ -263,10 +290,25 @@ func (g *Gateway) sdkDiagnosticsIngest(c *fiber.Ctx) error {
 			timestamp.UnixMilli(),
 		)
 	}
-	if err := g.importPrometheusSamples(c.UserContext(), samples.String()); err != nil {
-		return err
+	if skipped > 0 {
+		g.logger.Warn(
+			"SDK diagnostics ingest skipped unknown enum values",
+			"project", project.Slug,
+			"accepted", len(body.Measurements)-skipped,
+			"rejected", skipped,
+			"signals", skippedSignals.String(),
+			"reasons", skippedReasons.String(),
+		)
 	}
-	return c.JSON(fiber.Map{"accepted": len(body.Measurements)})
+	if samples.Len() > 0 {
+		if err := g.importPrometheusSamples(c.UserContext(), samples.String()); err != nil {
+			return err
+		}
+	}
+	return c.JSON(fiber.Map{
+		"accepted": len(body.Measurements) - skipped,
+		"rejected": skipped,
+	})
 }
 
 func validSDKMeasurementID(value string) bool {
@@ -279,7 +321,7 @@ func validSDKMeasurementID(value string) bool {
 
 func validSDKDiagnosticSignal(value string) bool {
 	switch value {
-	case "error", "trace", "replay", "diagnostic":
+	case "error", "trace", "vitals", "replay", "diagnostic":
 		return true
 	}
 	return false
@@ -287,7 +329,9 @@ func validSDKDiagnosticSignal(value string) bool {
 
 func validSDKDiagnosticReason(value string) bool {
 	switch value {
-	case "queue_full", "retry_exhausted", "shutdown_budget":
+	// server_rejected is a 4xx refusal (the payload will never be accepted as-is),
+	// while the other three come from the SDK's bounded delivery queues.
+	case "queue_full", "retry_exhausted", "shutdown_budget", "server_rejected":
 		return true
 	}
 	return false

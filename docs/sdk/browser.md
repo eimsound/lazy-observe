@@ -64,6 +64,19 @@ const eventId = client.captureException(error, {
 
 The module-level `captureException()` targets the latest initialized client. `beforeSend` may return a changed event or `null`/`undefined` to drop it. Events carry browser/OS context, the current replay session, URL, and active SDK-created trace context when available.
 
+## Telemetry drop diagnostics
+
+Errors, spans, replay segments, and drop diagnostics use bounded in-memory queues. Web Vitals bypass those queues and are posted once per metric. No ingest failure is thrown into the page: every drop increments `client.diagnostics().droppedTelemetry`, emits one local `console.warn`, and is reported to `/api/events/diagnostics`.
+
+| `reason` | Meaning |
+| --- | --- |
+| `queue_full` | A bounded queue was full and the new telemetry was dropped |
+| `retry_exhausted` | The finite delivery budget ran out. Vitals are sent once, so a network error or 5xx reports this reason |
+| `shutdown_budget` | Telemetry was enqueued after `close()` |
+| `server_rejected` | Ingest answered 4xx; the payload will never be accepted as-is, so it is not retried |
+
+The reported `signal` is `error`, `trace`, `vitals`, `replay`, or `diagnostic`. A failed diagnostics upload is counted locally and never reported recursively. Older servers that reject an unknown `signal` or `reason` answer the whole diagnostics batch with `422`; the drop stays counted locally and nothing is thrown.
+
 ## Fetch and XHR tracing
 
 Same-origin requests are eligible by default. Add explicit cross-origin destinations and configure their CORS policy to allow `traceparent`:

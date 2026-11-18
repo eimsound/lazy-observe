@@ -1,5 +1,5 @@
 import { parseDsn } from "./dsn";
-import { DeliveryQueue, type DeliveryDrop } from "./delivery";
+import { DeliveryQueue } from "./delivery";
 import { MinuteRateLimiter } from "./rate-limit";
 import { ReplayController, replayDefaults, replayRequestMethod } from "./replay";
 import { parseStack } from "./stack";
@@ -13,8 +13,8 @@ import {
   unixNanoNow,
 } from "./trace";
 import type { RecordedSpan } from "./trace";
-import { Transport } from "./transport";
-import type { DiagnosticMeasurement, DiagnosticSignal } from "./transport";
+import { isServerRejection, Transport } from "./transport";
+import type { DiagnosticMeasurement, DiagnosticReason, DiagnosticSignal } from "./transport";
 import type {
   ActiveSpan,
   BrowserClient,
@@ -149,7 +149,14 @@ export class Client implements BrowserClient {
       );
       void this.replay.start().catch(() => { this.replay = undefined; });
     }
-    if (this.config.vitals !== false) startVitals(this.transport, () => this.currentPage, (sample) => this.replay?.vital(sample));
+    if (this.config.vitals !== false) {
+      startVitals(
+        this.transport,
+        () => this.currentPage,
+        (sample) => this.replay?.vital(sample),
+        (error) => this.recordVitalsFailure(error),
+      );
+    }
     if (this.config.fetchTracing !== false) {
       const autoPatch = typeof this.config.fetchTracing !== "object" || this.config.fetchTracing.autoPatch !== false;
       if (autoPatch) { this.patchFetch(); this.patchXhr(); }
@@ -366,7 +373,22 @@ export class Client implements BrowserClient {
     if (!this.closed) this.traceDelivery.enqueue(span);
   }
 
-  private recordTelemetryDrop(signal: DiagnosticSignal, drop: DeliveryDrop, exportDiagnostic = true): void {
+  private recordVitalsFailure(error: unknown): void {
+    // A 4xx is the server refusing this exact payload, so no retry can help. Everything
+    // else (network failure, 5xx, missing fetch) exhausts the single attempt a vital has,
+    // which is the same outcome the delivery queues report as retry_exhausted.
+    this.recordTelemetryDrop("vitals", {
+      reason: isServerRejection(error) ? "server_rejected" : "retry_exhausted",
+      count: 1,
+      error,
+    });
+  }
+
+  private recordTelemetryDrop(
+    signal: DiagnosticSignal,
+    drop: { reason: DiagnosticReason; count: number; error?: unknown },
+    exportDiagnostic = true,
+  ): void {
     this.droppedTelemetry += drop.count;
     console.warn(
       `[lazy-observe] ${signal} telemetry dropped`,

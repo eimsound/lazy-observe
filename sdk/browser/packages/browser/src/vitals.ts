@@ -6,6 +6,7 @@ export function startVitals(
   transport: Transport,
   page: () => string,
   onReplayVital?: (sample: ReplayVitalSample) => void,
+  onDeliveryFailure?: (error: unknown) => void,
 ): void {
   const report = (metric: Metric) => {
     const timestamp = Date.now();
@@ -20,7 +21,16 @@ export function startVitals(
       value: metric.value,
       page: page(),
       timestamp: new Date(timestamp).toISOString()
-    }]).catch(() => undefined);
+    }]).catch((error: unknown) => {
+      // Vitals bypass the delivery queue and are sent once, so this is the only place a
+      // failed POST is observable. The handler must never reach application code, and the
+      // outer try/catch keeps a throwing reporter from becoming an unhandled rejection.
+      try {
+        onDeliveryFailure?.(error);
+      } catch {
+        /* never break the page */
+      }
+    });
   };
   onLCP(report); onCLS(report); onINP(report); onTTFB(report); onFCP(report);
 }
