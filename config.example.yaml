@@ -145,5 +145,6 @@ security:
 # LO_PROCESS_RESTART_INITIAL, LO_PROCESS_RESTART_MAX, LO_PROCESS_DRAIN_TIMEOUT,
 # LO_PROCESS_COMPONENT_PORT_OFFSET, LO_ALERT_STORM_THRESHOLD.
 # Self-monitoring fields: LO_SELF_MONITORING_ENABLED and LO_SELF_MONITORING_PROFILING.
-# Security fields: LO_SECRET_KEY_FILE, LO_SECURITY_ADMIN_PASSWORD_FILE.
+# Security fields: LO_SECURITY_SECRET_KEY_FILE, LO_SECURITY_ADMIN_PASSWORD_FILE.
+# Both take a file path; the key material and the password never travel via env.
 # Only canonical names are accepted; short compatibility aliases are not supported.

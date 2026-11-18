@@ -415,6 +415,55 @@ func TestConfigExampleParses(t *testing.T) {
 	}
 }
 
+// config.example.yaml promises that only canonical LO_ names are accepted, so
+// every security file variable it lists must be wired into applyEnv. A name that
+// is not mapped leaves its field on the empty default, which this test catches.
+func TestConfigExampleSecurityFileEnvNamesAreMapped(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(line, "# Security fields:")
+		if !ok {
+			continue
+		}
+		for _, field := range strings.Split(rest, ",") {
+			name := strings.TrimSuffix(strings.TrimSpace(field), ".")
+			if strings.HasSuffix(name, "_FILE") {
+				names = append(names, name)
+			}
+		}
+	}
+	if len(names) == 0 {
+		t.Fatal("config.example.yaml documents no security file environment variable")
+	}
+	sentinel := "/run/secrets/from-env"
+	env := map[string]string{}
+	for _, name := range names {
+		env[name] = sentinel
+	}
+	cfg, _, err := Load(nil, func(key string) (string, bool) { value, ok := env[key]; return value, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		var got string
+		switch name {
+		case "LO_SECURITY_SECRET_KEY_FILE":
+			got = cfg.Security.SecretKeyFile
+		case "LO_SECURITY_ADMIN_PASSWORD_FILE":
+			got = cfg.Security.AdminPasswordFile
+		default:
+			t.Fatalf("config.example.yaml documents %s; teach this test which field it maps to", name)
+		}
+		if got != sentinel {
+			t.Fatalf("%s is documented in config.example.yaml but applyEnv does not map it", name)
+		}
+	}
+}
+
 func TestAdminPasswordFileFileAndEnvironment(t *testing.T) {
 	if Defaults().Security.AdminPasswordFile != "" {
 		t.Fatal("admin password file default must be empty (generated password fallback)")
@@ -441,6 +490,35 @@ func TestAdminPasswordFileFileAndEnvironment(t *testing.T) {
 	}
 	if cfg.Security.AdminPasswordFile != "/run/secrets/env-admin" {
 		t.Fatalf("env admin_password_file = %q", cfg.Security.AdminPasswordFile)
+	}
+}
+
+func TestSecretKeyFileFileAndEnvironment(t *testing.T) {
+	if Defaults().Security.SecretKeyFile != "" {
+		t.Fatal("secret key file default must be empty (data_dir/secret.key fallback)")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "security:\n  secret_key_file: /run/secrets/file-platform\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.SecretKeyFile != "/run/secrets/file-platform" {
+		t.Fatalf("file secret_key_file = %q", cfg.Security.SecretKeyFile)
+	}
+	env := map[string]string{"LO_SECURITY_SECRET_KEY_FILE": "/run/secrets/env-platform"}
+	cfg, _, err = Load(
+		[]string{"--config", path},
+		func(key string) (string, bool) { value, ok := env[key]; return value, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.SecretKeyFile != "/run/secrets/env-platform" {
+		t.Fatalf("env secret_key_file = %q", cfg.Security.SecretKeyFile)
 	}
 }
 
