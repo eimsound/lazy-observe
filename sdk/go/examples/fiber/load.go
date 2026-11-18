@@ -24,7 +24,9 @@ func runLoad(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *duration <= 0 || *concurrency <= 0 || *timeout <= 0 {
-		fmt.Fprintln(stderr, "duration, concurrency, and timeout must be greater than zero")
+		// Best-effort usage note: a failed write to stderr must not change the
+		// exit status the example already decided on.
+		_, _ = fmt.Fprintln(stderr, "duration, concurrency, and timeout must be greater than zero")
 		return 2
 	}
 
