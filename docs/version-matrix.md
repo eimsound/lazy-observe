@@ -90,6 +90,14 @@ MCP（`lazy-observe mcp --dsn`）的 DSN 形状与上面相同，但 `<token>` �
 - 本矩阵以本文档为准，随每次服务端 / SDK 发版持续更新；矩阵中未列出的组合
   （例如某个 SDK 发版后、服务端尚未重验证的中间态）在验证完成前一律视为未承诺。
 
+### 3.1 SDK 运行时要求
+
+SDK 运行时下限属于对外兼容面，变更与 SDK 代码在同一个 PR 里修改本节。
+
+| SDK | 运行时要求 | 依据 |
+| --- | --- | --- |
+| Node SDK（`@lazy-observe/node`） | Node.js `>=22.15`（`package.json` 的 `engines.node`） | OpenTelemetry JS 3.x / OTLP exporter 0.301.x 的 `engines.node` 均为 `>=22.15.0`；仓库开发与 CI 工具链为 Node 26.13.1 |
+
 ## 4. 维护规则（谁在什么时候改什么）
 
 ### 4.1 服务端发版

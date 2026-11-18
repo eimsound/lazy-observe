@@ -5,7 +5,7 @@
   "scripts": { "build": "tsc", "start": "node dist/main.js", "typecheck": "pnpm --filter @lazy-observe/node build && tsc --noEmit" },
   "dependencies": {
     "@lazy-observe/node": "workspace:*",
-    "express": "^5.0.0"
+    "express": "^5.3.0"
   },
   "devDependencies": { "@types/express": "^5.0.0" }
 }

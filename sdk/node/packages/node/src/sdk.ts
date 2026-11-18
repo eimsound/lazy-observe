@@ -1,6 +1,5 @@
 import process from "node:process";
-import { context, ProxyTracerProvider, ROOT_CONTEXT, SpanKind, SpanStatusCode, trace, type Attributes, type Context, type Span, type SpanContext } from "@opentelemetry/api";
-import { SeverityNumber, type AnyValueMap } from "@opentelemetry/api-logs";
+import { context, ProxyTracerProvider, ROOT_CONTEXT, SeverityNumber, SpanKind, SpanStatusCode, trace, type Attributes, type Context, type Span, type SpanContext } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
@@ -9,7 +8,7 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
 import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
-import { BatchSpanProcessor, NodeTracerProvider, ParentBasedSampler, TraceIdRatioBasedSampler } from "@opentelemetry/sdk-trace-node";
+import { BatchSpanProcessor, ParentBasedSampler, TracerProvider, TraceIdRatioBasedSampler } from "@opentelemetry/sdk-trace";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import pinoFactory, { type Logger as PinoLogger, type LoggerOptions as PinoOptions } from "pino";
 import TransportStream from "winston-transport";
@@ -120,8 +119,8 @@ function attributeValue(value: unknown): string | number | boolean | undefined {
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
-function attributes(record: Record<string, unknown>): AnyValueMap {
-  const result: AnyValueMap = {};
+function attributes(record: Record<string, unknown>): Attributes {
+  const result: Attributes = {};
   for (const [key, value] of Object.entries(record)) {
     const converted = attributeValue(value);
     if (converted !== undefined) result[key] = converted;
@@ -146,15 +145,16 @@ export function init(config: Config): LazyObserve {
   const contextManager = new AsyncLocalStorageContextManager().enable();
   const propagator = new W3CTraceContextPropagator();
 
-  let traceProvider: NodeTracerProvider | undefined;
+  let traceProvider: TracerProvider | undefined;
   if (signals.traces) {
-    traceProvider = new NodeTracerProvider({
+    traceProvider = new TracerProvider({
       resource,
       sampler: new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(sampleRate) }),
-      spanProcessors: [new BatchSpanProcessor(
-        new OTLPTraceExporter({ ...exporterOptions, url: `${dsn.endpoint}/v1/traces` }),
-        { maxQueueSize: OTEL_TRACE_QUEUE_SIZE, maxExportBatchSize: OTEL_TRACE_BATCH_SIZE },
-      )],
+      spanProcessors: [new BatchSpanProcessor({
+        exporter: new OTLPTraceExporter({ ...exporterOptions, url: `${dsn.endpoint}/v1/traces` }),
+        maxQueueSize: OTEL_TRACE_QUEUE_SIZE,
+        maxExportBatchSize: OTEL_TRACE_BATCH_SIZE,
+      })],
     });
   }
   const tracer = traceProvider?.getTracer(instrumentationName) ?? new ProxyTracerProvider().getTracer(instrumentationName);
@@ -177,14 +177,12 @@ export function init(config: Config): LazyObserve {
   if (signals.logs) {
     loggerProvider = new LoggerProvider({
       resource,
-      processors: [new BatchLogRecordProcessor(
-        new OTLPLogExporter({ ...exporterOptions, url: `${dsn.endpoint}/v1/logs` }),
-        {
-          scheduledDelayMillis: exportInterval,
-          maxQueueSize: OTEL_LOG_QUEUE_SIZE,
-          maxExportBatchSize: OTEL_LOG_BATCH_SIZE,
-        },
-      )],
+      processors: [new BatchLogRecordProcessor({
+        exporter: new OTLPLogExporter({ ...exporterOptions, url: `${dsn.endpoint}/v1/logs` }),
+        scheduledDelayMillis: exportInterval,
+        maxQueueSize: OTEL_LOG_QUEUE_SIZE,
+        maxExportBatchSize: OTEL_LOG_BATCH_SIZE,
+      })],
     });
   }
   const otelLogger = loggerProvider?.getLogger(instrumentationName);

@@ -2,6 +2,12 @@
 
 Explicit Express, Pino, and Winston instrumentation backed by manually assembled OpenTelemetry providers. Importing `@lazy-observe/node` installs no hooks, patches no modules, and changes no global provider; all runtime work starts in `init()`.
 
+## Requirements
+
+Node.js `>=22.15` (declared in `engines.node`). The SDK is built on OpenTelemetry JS 3.x (`@opentelemetry/api` 1.10, stable SDK packages 3.1, OTLP exporters 0.301), whose packages all require Node.js `>=22.15.0`. Node.js 20 and Node.js 22.0–22.14 are not supported.
+
+The SDK uses `@opentelemetry/api` 1.10 and its built-in Logs API; it no longer depends on `@opentelemetry/api-logs` or `@opentelemetry/sdk-trace-node`. The OTel 3.x trace SDK no longer reads `OTEL_BSP_*` environment variables as batch span processor fallbacks; sampling has always been configured only through `sampleRate`.
+
 ## Three-line setup
 
 ```ts
