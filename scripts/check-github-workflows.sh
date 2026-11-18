@@ -114,6 +114,28 @@ if [[ -n $unpinned ]]; then
   fail 'every uses: must pin a full 40-character commit SHA (docker:// must pin a sha256 digest)'
 fi
 
+# mise 引导：版本与两个架构的 sha256 只在 scripts/mise-release.env 维护，CI 脚本与 Dockerfile 都读它，
+# 避免两份常量漂移或退回不固定的安装脚本。
+mise_release=scripts/mise-release.env
+[[ -f $mise_release ]] || fail "$mise_release is missing"
+grep -Eq '^MISE_BOOTSTRAP_VERSION=v[0-9]+\.[0-9]+\.[0-9]+$' "$mise_release" ||
+  fail "$mise_release must pin MISE_BOOTSTRAP_VERSION=vX.Y.Z"
+for var in MISE_BOOTSTRAP_SHA256_AMD64 MISE_BOOTSTRAP_SHA256_ARM64; do
+  grep -Eq "^${var}=[0-9a-f]{64}$" "$mise_release" ||
+    fail "$mise_release must pin $var to a 64-character sha256"
+done
+for consumer in Dockerfile scripts/ci-setup-mise.sh; do
+  [[ -f $consumer ]] || fail "$consumer is missing"
+  grep -Fq 'mise-release.env' "$consumer" ||
+    fail "$consumer must read the pinned mise release from $mise_release"
+done
+unverified_mise=$(grep -Hn 'https://mise\.run' Dockerfile scripts/ci-setup-mise.sh |
+  grep -vE ':[0-9]+:[[:space:]]*#' || true)
+if [[ -n $unverified_mise ]]; then
+  printf '%s\n' "$unverified_mise" >&2
+  fail 'mise must be downloaded from the pinned GitHub release, not the mise.run installer'
+fi
+
 # setup-buildx-action 默认拉未固定的 moby/buildkit:buildx-stable-1；每处都要用 driver-opts 钉具体版本 + digest。
 buildkit_pin_re='^[[:space:]]+driver-opts:[[:space:]]*image=moby/buildkit:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}[[:space:]]*$'
 unpinned_buildkit=$(for file in "${workflows[@]}"; do

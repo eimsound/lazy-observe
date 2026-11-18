@@ -86,7 +86,7 @@ if [[ $mode == check ]]; then
   done
   if ! cmp -s "$work/notices.txt" "$output"; then
     printf '%s is stale; run: mise run third-party-notices\n' "$output" >&2
-    diff -u "$output" "$work/notices.txt" | head -40 >&2 || true
+    diff -u "$output" "$work/notices.txt" | head -40 >&2 || true # pipefail-ok: 只截取诊断输出，退出码由 || true 吸收
     exit 1
   fi
   printf 'PASS: %s matches the linked Go dependency graph\n' "$output"

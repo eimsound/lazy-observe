@@ -56,7 +56,7 @@ mise run web
 | `mise run web` | Frozen pnpm install, Node test runner, typecheck, and production build |
 | `mise run sdk-go` / `sdk-node` / `sdk-browser` / `sdk-python` | Build and test one client SDK under `sdk/` (frozen installs for the JS packages) |
 | `mise run helm-lint` / `mise run helm-template-test` | Lint and contract-test all-in-one and HA chart profiles |
-| `mise run workflow-check` | Statically validate GitHub Actions workflows without dispatching or executing them |
+| `mise run workflow-check` | Statically validate GitHub Actions workflows, reject shell pipelines that close early under `pipefail` (opt out with `# pipefail-ok: <reason>`), self-test the pinned mise bootstrap, and contract-test CI change grouping |
 | `mise run ci-changes-test` | Contract-test the CI change detector that decides which jobs a diff runs |
 
 When a test command changes, update `mise.toml` in the same change; mise tasks are CI entry points.
@@ -189,7 +189,7 @@ Before opening a GitHub pull request:
 - Update documentation and `config.example.yaml` when public behavior changes.
 - Check new dependency licenses.
 - Preserve unrelated work in a dirty worktree.
-- Run `mise run workflow-check` when workflows change, then report the
+- Run `mise run workflow-check` when workflows or shell scripts change, then report the
   pull request's `ci-ok` result separately from local results.
 
 Use the pull request template; do not mark a check as complete unless you ran it.

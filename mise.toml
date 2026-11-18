@@ -237,6 +237,8 @@ tools.actionlint = "1.7.12"
 tools.rg = "14.1.1"
 run = [
   "bash scripts/check-github-workflows.sh",
+  "bash scripts/check-pipefail-pipelines.sh",
+  "bash scripts/ci-setup-mise-test.sh",
   "bash scripts/check-e2e-contract.sh",
   "bash scripts/ci-changes-test.sh",
 ]

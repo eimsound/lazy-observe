@@ -10,18 +10,46 @@ if [[ -z ${GITHUB_TOKEN:-} ]]; then
   export AQUA_DISABLE_ATTESTATION=1
 fi
 
-# runner 上没有 mise 时从 mise.run 引导；本机已装 mise 时直接复用。
+# runner 上没有 mise 时，从 GitHub 的不可变 release 下载固定版本并校验 sha256；本机已装 mise 时直接复用。
+#
+# 版本与两个架构的 sha256 只在 scripts/mise-release.env 维护，Dockerfile 的 builder 阶段读同一份文件。
+# 升级时先 `gh release view -R jdx/mise <tag> --json assets` 确认资产名，再改那一个文件。
+# 不用上游安装脚本：它本身不固定、也不做校验。
 if command -v mise >/dev/null 2>&1; then
   mise_bin=$(command -v mise)
   printf 'mise already available at %s; skipping bootstrap\n' "$mise_bin"
 else
-  mise_version=${MISE_CI_VERSION:-v2026.5.3}
+  mise_release_env=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/mise-release.env
+  # shellcheck source=scripts/mise-release.env
+  . "$mise_release_env"
+
+  case "$(uname -m)" in
+  x86_64 | amd64)
+    mise_asset=mise-${MISE_BOOTSTRAP_VERSION}-linux-x64
+    mise_sha256=$MISE_BOOTSTRAP_SHA256_AMD64
+    ;;
+  aarch64 | arm64)
+    mise_asset=mise-${MISE_BOOTSTRAP_VERSION}-linux-arm64
+    mise_sha256=$MISE_BOOTSTRAP_SHA256_ARM64
+    ;;
+  *)
+    printf 'unsupported host architecture for the pinned mise: %s\n' "$(uname -m)" >&2
+    exit 1
+    ;;
+  esac
+
   install_dir=${HOME}/.local/bin
   mise_bin=${install_dir}/mise
 
   mkdir -p "$install_dir"
-  curl --proto '=https' --tlsv1.2 -fsSL https://mise.run |
-    MISE_VERSION="$mise_version" MISE_INSTALL_PATH="$mise_bin" sh
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$work/$mise_asset" \
+    "https://github.com/jdx/mise/releases/download/${MISE_BOOTSTRAP_VERSION}/${mise_asset}"
+  printf '%s  %s\n' "$mise_sha256" "$work/$mise_asset" | sha256sum --check --strict -
+  install -m 0755 "$work/$mise_asset" "$mise_bin"
+  rm -rf "$work"
+  trap - EXIT
 
   if [[ -z ${GITHUB_PATH:-} ]]; then
     printf 'GITHUB_PATH is not set; this setup script must run inside GitHub Actions\n' >&2

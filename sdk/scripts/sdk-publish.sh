@@ -62,7 +62,9 @@ printf '== SDK release ==\ntag: %s\nsdk: %s\nversion: %s\npublish: %s\n' \
 
 case $sdk in
   go)
-    module_path=$(sed -n 's/^module[[:space:]]*//p' sdk/go/go.mod | head -n1)
+    # 先收齐再取第一条：pipefail 下 sed | head 会在 head 提前退出时让 sed 收到 SIGPIPE（141）。
+    module_lines=$(sed -n 's/^module[[:space:]]*//p' sdk/go/go.mod)
+    module_path=${module_lines%%$'\n'*}
     [[ $module_path == github.com/eimsound/lazy-observe/sdk/go ]] || \
       fail "unexpected Go SDK module path: $module_path"
     (cd sdk/go && CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...)
@@ -92,7 +94,9 @@ case $sdk in
     done
     ;;
   python)
-    py_version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' sdk/python/pyproject.toml | head -n1)
+    # 同上：pyproject 里可能有多个 version 键，先收齐再取首行。
+    py_versions=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' sdk/python/pyproject.toml)
+    py_version=${py_versions%%$'\n'*}
     expect_version sdk/python/pyproject.toml "$py_version"
     python=${PYTHON:-python3}
     (
