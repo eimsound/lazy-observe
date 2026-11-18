@@ -415,3 +415,10 @@ CREATE TABLE ai_settings (
     updated_at TIMESTAMP NOT NULL,
     updated_by TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE platform_key_fingerprints (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    fingerprint TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);

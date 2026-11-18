@@ -2,6 +2,8 @@ package secret
 
 import (
 	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -198,4 +200,76 @@ func flippedChar(c byte) string {
 		return "b"
 	}
 	return "a"
+}
+
+// TestFingerprintIsStableAndOpaque pins the properties the metadata fingerprint
+// relies on: the value identifies one key across reloads and never contains the
+// key material itself.
+func TestFingerprintIsStableAndOpaque(t *testing.T) {
+	dir := t.TempDir()
+	first, err := LoadOrCreate(filepath.Join(dir, "a.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadOrCreate(filepath.Join(dir, "a.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := LoadOrCreate(filepath.Join(dir, "b.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprint := first.Fingerprint()
+	if got := reloaded.Fingerprint(); got != fingerprint {
+		t.Fatalf("fingerprint changed across reload: %q != %q", got, fingerprint)
+	}
+	if other.Fingerprint() == fingerprint {
+		t.Fatal("two different keys produced the same fingerprint")
+	}
+	if _, err := hex.DecodeString(fingerprint); err != nil {
+		t.Fatalf("fingerprint %q is not hexadecimal: %v", fingerprint, err)
+	}
+	if len(fingerprint) != 32 {
+		t.Fatalf("fingerprint length = %d, want 32 hex characters (128 bits)", len(fingerprint))
+	}
+	for _, encoding := range []string{
+		base64.StdEncoding.EncodeToString(first.key[:]),
+		base64.RawStdEncoding.EncodeToString(first.key[:]),
+		hex.EncodeToString(first.key[:]),
+	} {
+		if strings.Contains(fingerprint, encoding) {
+			t.Fatalf("fingerprint %q contains the key encoding %q", fingerprint, encoding)
+		}
+	}
+}
+
+// TestLoadNeverCreatesAKey pins the read-only contract the operator commands
+// rely on: a missing key file is an error, not a fresh key, so a typo cannot
+// silently replace the platform key.
+func TestLoadNeverCreatesAKey(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent.key")
+	box, err := Load(missing)
+	if err == nil {
+		t.Fatalf("Load returned a box for a missing file: %#v", box)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Fatalf("Load error does not name the path %s: %v", missing, err)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Load created the missing key file: stat error %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "secret.key")
+	created, err := LoadOrCreate(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load on an existing file: %v", err)
+	}
+	if loaded.key != created.key {
+		t.Fatal("Load read a different key than LoadOrCreate wrote")
+	}
 }

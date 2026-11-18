@@ -30,6 +30,15 @@ import (
 // keyBytes is the AES-256 key length.
 const keyBytes = 32
 
+// fingerprintLabel is the fixed HMAC message that separates the key fingerprint
+// from every other use of the platform key (see Derive).
+const fingerprintLabel = "lazy-observe/key-fingerprint/v1"
+
+// fingerprintBytes is how much of the HMAC digest the fingerprint keeps. 128
+// bits makes accidental collision impossible while leaking less of the digest
+// than the full 256 bits would.
+const fingerprintBytes = 16
+
 // nonceBytes is the standard GCM nonce size (12 bytes).
 const nonceBytes = 12
 
@@ -58,6 +67,17 @@ func LoadOrCreate(path string) (*Box, error) {
 	default:
 		return nil, fmt.Errorf("read encryption key file %s: %w", path, err)
 	}
+}
+
+// Load reads an existing key file without ever creating one. Operator commands
+// that must not change the platform key use it: a mistyped path or a Secret
+// that was not mounted is an error, never a fresh key.
+func Load(path string) (*Box, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read encryption key file %s: %w", path, err)
+	}
+	return boxFromRaw(raw)
 }
 
 // boxFromRaw decodes a key file. Generated files hold unpadded standard
@@ -140,6 +160,23 @@ func (b *Box) Decrypt(value string) (string, error) {
 		return "", fmt.Errorf("decrypt value: %w", err)
 	}
 	return string(plaintext), nil
+}
+
+// Fingerprint returns a stable identifier for the key: the first 16 bytes of
+// HMAC-SHA256(key, fixed label) as lowercase hex. The metadata database records
+// it so a swapped or per-replica-different key fails loudly at startup instead
+// of silently disabling every sealed value.
+//
+// The value reveals no key material: it is a one-way digest, and recovering a
+// 32-byte random key from 128 bits of an HMAC is infeasible. Like any
+// deterministic fingerprint it would let somebody who already holds the
+// database test a complete key guess, so it is truncated and never logged
+// together with key material. Two boxes built from the same key file produce
+// the same fingerprint; any other key produces a different one.
+func (b *Box) Fingerprint() string {
+	mac := hmac.New(sha256.New, b.key[:])
+	_, _ = mac.Write([]byte(fingerprintLabel))
+	return hex.EncodeToString(mac.Sum(nil)[:fingerprintBytes])
 }
 
 // Derive returns a stable 256-bit hex value bound to the platform key and

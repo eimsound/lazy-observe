@@ -29,11 +29,67 @@ func loadLLMPricing() (*llmcost.Table, error) {
 func loadSecretBox(cfg appconfig.Config) (*secret.Box, error) {
 	// The platform key protects sensitive metadata such as BYO LLM API keys.
 	// It is created on first startup and then held in memory.
-	keyFile := cfg.Security.SecretKeyFile
-	if keyFile == "" {
-		keyFile = filepath.Join(cfg.DataDir, "secret.key")
+	return secret.LoadOrCreate(secretKeyFile(cfg))
+}
+
+// secretKeyFile is the configured platform encryption key file; an empty
+// security.secret_key_file means the generated key inside the data directory.
+func secretKeyFile(cfg appconfig.Config) string {
+	if cfg.Security.SecretKeyFile != "" {
+		return cfg.Security.SecretKeyFile
 	}
-	return secret.LoadOrCreate(keyFile)
+	return filepath.Join(cfg.DataDir, "secret.key")
+}
+
+// ensurePlatformKeyFingerprint records the fingerprint of the configured
+// platform key on the first start and refuses to start when the key differs
+// from the recorded one. Without it a swapped key only surfaced at decrypt
+// time: the AI configuration failed to load, AI stayed disabled, and the
+// self-monitoring token was silently re-derived. Nothing rotates
+// automatically; `admin reset-key-fingerprint` is the explicit exit.
+func ensurePlatformKeyFingerprint(
+	ctx context.Context,
+	logger *slog.Logger,
+	store *meta.Store,
+	secretBox *secret.Box,
+	keyFile string,
+) error {
+	fingerprint := secretBox.Fingerprint()
+	recorded, created, err := store.EnsurePlatformKeyFingerprint(ctx, fingerprint)
+	if err != nil {
+		return fmt.Errorf("verify platform encryption key: %w", err)
+	}
+	if recorded.Fingerprint != fingerprint {
+		return fmt.Errorf(
+			"platform encryption key at %s does not match the fingerprint recorded in the metadata database "+
+				"(recorded %s, this key is %s). The key file was probably regenerated - for example a "+
+				"GitOps-managed Secret was recreated - or this replica does not share the key file with the "+
+				"others. Restore the original key file and restart. To confirm an intentional rotation, run "+
+				"`lazy-observe admin reset-key-fingerprint` with the same configuration first: values sealed "+
+				"with the previous key can no longer be decrypted and have to be entered again",
+			keyFile,
+			recorded.Fingerprint,
+			fingerprint,
+		)
+	}
+	if created {
+		logger.Info(
+			"recorded platform encryption key fingerprint",
+			"key_file",
+			keyFile,
+			"fingerprint",
+			fingerprint,
+		)
+		return nil
+	}
+	logger.Info(
+		"platform encryption key matches the recorded fingerprint",
+		"key_file",
+		keyFile,
+		"fingerprint",
+		fingerprint,
+	)
+	return nil
 }
 
 type serverSharedState struct {
@@ -100,6 +156,13 @@ func openServerMetadata(
 			_ = store.Close()
 		}
 	}()
+
+	// The fingerprint check runs before Bootstrap and before the self-monitoring
+	// token is derived from the key, so a swapped key stops the start while the
+	// recorded token is still untouched.
+	if err := ensurePlatformKeyFingerprint(ctx, logger, store, secretBox, secretKeyFile(cfg)); err != nil {
+		return nil, err
+	}
 
 	blobs, err := openBlobStore(cfg)
 	if err != nil {

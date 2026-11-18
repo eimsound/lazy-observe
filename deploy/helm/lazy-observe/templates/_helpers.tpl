@@ -21,22 +21,24 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 Where the platform encryption key (security.secret_key_file) comes from:
   existing  - encryptionKey.existingSecret, mounted read-only;
   generated - chart-managed <fullname>-encryption-key Secret, mounted read-only;
-  datadir   - server default <data_dir>/secret.key (allinone with a PVC, or a
-              single standalone replica that explicitly opted out of a Secret).
-standalone-ha with more than one replica (or HPA) and no Secret fails rendering:
-each pod would otherwise generate its own key in its emptyDir data_dir.
+  datadir   - server default <data_dir>/secret.key.
+standalone-ha always fails rendering when no Secret provides the key, even with
+replicaCount 1: its /data is an emptyDir while metadata lives in an external
+database, so a generated key dies with the pod and the next pod is refused
+because the key no longer matches the fingerprint recorded in metadata.
+allinone with a PVC keeps the key in data_dir because the database lives in the
+same volume; allinone without a PVC (allinone-ephemeral) loses the key and the
+database together, so it cannot produce that mismatch.
 */ -}}
 {{- define "lazy-observe.encryptionKey.source" -}}
-{{- $scaled := and .Values.hpa.enabled (gt (int .Values.hpa.maxReplicas) 1) -}}
-{{- $multi := and (eq .Values.mode "standalone-ha") (or (gt (int .Values.replicaCount) 1) $scaled) -}}
 {{- if .Values.encryptionKey.existingSecret -}}
 existing
 {{- else if and (eq .Values.mode "allinone") .Values.persistence.enabled -}}
 datadir
 {{- else if .Values.encryptionKey.autoGenerate -}}
 generated
-{{- else if $multi -}}
-{{- fail "encryptionKey: standalone-ha with more than one replica (replicaCount > 1 or hpa.enabled) needs one shared platform encryption key; set encryptionKey.existingSecret to a Secret you manage, or set encryptionKey.autoGenerate=true" -}}
+{{- else if eq .Values.mode "standalone-ha" -}}
+{{- fail "encryptionKey: standalone-ha keeps metadata outside the pod, so the platform encryption key has to outlive pods; a key generated in the per-pod emptyDir data_dir is lost when the pod is recreated and the server then refuses to start because the key no longer matches the fingerprint recorded in metadata; set encryptionKey.existingSecret to a Secret you manage, or set encryptionKey.autoGenerate=true" -}}
 {{- else -}}
 datadir
 {{- end -}}

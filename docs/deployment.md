@@ -208,31 +208,144 @@ token instead of storing that credential recoverably.
 
 The file holds 32 random bytes as standard base64, padded or not; surrounding
 whitespace and line breaks are ignored, so `openssl rand -base64 32` output can
-be provisioned as-is. Empty uses `<data_dir>/secret.key`: the first start
-generates a fresh key and writes it with mode 0600, an existing file is only
-read and never rewritten, and the key is held in memory for the process
-lifetime.
+be provisioned as-is. The bytes must come from a cryptographically secure
+random source, never from a passphrase or a KDF over one: a human-chosen key
+can be attacked with a dictionary, which would recover both the key behind the
+recorded fingerprint and every sealed value. Empty uses `<data_dir>/secret.key`:
+the first start generates a fresh key and writes it with mode 0600, an existing
+file is only read and never rewritten, and the key is held in memory for the
+process lifetime.
 
-Every replica that shares a metadata database must read the same key. A value
-sealed by one replica is unreadable for a replica holding a different key: with
-a mismatched key the stored AI configuration fails to load, AI stays disabled,
-and the gateway logs the decryption error instead of sending unauthenticated
-requests. The Helm chart therefore mounts one Secret read-only at
+Every replica that shares a metadata database must read the same key, and the
+server now enforces it. The first start records a fingerprint of the key — 128
+bits of HMAC-SHA256 over a fixed label, never key material — in the
+`platform_key_fingerprints` row of the metadata database and logs the key file
+path with that fingerprint. Each later started replica computes the fingerprint
+of the key it loaded and compares it with the recorded one: a match starts
+normally, a mismatch aborts the start before the gateway, storage, or bootstrap
+runs, exits non-zero, and prints the key file path, both fingerprints, the
+likely cause, and the recovery step. Concurrent first starts on an empty
+database record exactly one fingerprint: the insert is conditional, so every
+other replica reads that value and compares against it instead of overwriting
+it. This turns the previously silent failure — a regenerated Secret or a
+replica with its own key disabling AI and re-deriving the self-monitoring token
+— into a refused start.
+
+The fingerprint is a truncated one-way digest, so it never exposes the key; it
+is safe to include in tickets and logs. Keep in mind that anybody holding a
+database backup can still check a complete key candidate against it, which is
+why the key itself must stay 32 random bytes.
+
+The Helm chart therefore mounts one Secret read-only at
 `/etc/lazy-observe-key/secret.key` — `encryptionKey.existingSecret`, or the
 chart-managed `<fullname>-encryption-key` when `encryptionKey.autoGenerate` is
-true — and refuses to render a `standalone-ha` release that runs more than one
-replica without a shared Secret. The `allinone` profile with persistence keeps
-the key inside the PVC's `data_dir`.
+true. A `standalone-ha` release with neither refuses to render, at any replica
+count including one: its `/data` is an emptyDir while the metadata database is
+external, so a key generated in the pod would disappear when the pod is
+recreated and the replacement pod would be refused for the fingerprint
+mismatch — with no way back, because the original key is gone with the old pod.
+Set `encryptionKey.existingSecret`, or leave `encryptionKey.autoGenerate=true`.
+The `allinone` profile with persistence keeps the key inside the PVC's
+`data_dir`; `allinone` without a PVC keeps the key in the same emptyDir as its
+metadata database, so it loses both together and cannot hit this mismatch.
 
-Back up the key with the same care as the database. A lost key makes the sealed
-values unrecoverable: the affected AI API key has to be entered again, which
-re-seals it under the current key. Key rotation is not supported in this
-pre-release — nothing re-seals existing ciphertext, so a new key means lost
-sealed values rather than transparent re-encryption. A different key also
-derives a different self-monitoring token; the derived token is re-created at
-the next start. The previous derived credential is not revoked: it stays in
-metadata and remains a valid ingest credential for the self-monitoring project,
-so revoke it from that project's token list if it must stop working.
+A mismatch means the configured key differs from the key this deployment
+started with. Recovery has two paths:
+
+1. **Restore the original key** (normal case). Put the previous key file back —
+   for GitOps, the Secret content that the deployment used before — and
+   restart. Nothing has been re-encrypted, so every sealed value is readable
+   again.
+2. **Confirm an intentional rotation.** Only when the old key is genuinely gone
+   and you accept losing the sealed values, record the current key explicitly.
+   Rotation is a whole-deployment operation: a server only checks the
+   fingerprint at startup, so stop every replica first (scale to zero in
+   Kubernetes). A replica that stays up keeps sealing with the key it loaded
+   and writes values no other replica can read after the rotation.
+
+   ```sh
+   lazy-observe admin reset-key-fingerprint --config /etc/lazy-observe/config.yaml
+   ```
+
+   The command requires the key file to exist — it never creates or rewrites
+   one, so a mistyped path or an unmounted Secret fails instead of recording a
+   fingerprint no replica can match. It replaces the recorded fingerprint,
+   prints the previous and the new fingerprint, and records a
+   `security.key_fingerprint_reset` audit event with actor `cli`. Running it
+   again with the same key prints `already recorded` and changes nothing.
+   Nothing rotates automatically: the record only changes when an operator runs
+   this command. Start the replicas again with the new key afterwards.
+
+   In Kubernetes, run it in a Job that mounts the same configuration ConfigMap
+   and the same encryption key Secret as the Deployment. Use the same image and
+   tag as the Deployment — the rotation has to run the binary that reads the
+   same configuration layout:
+
+   ```yaml
+   apiVersion: batch/v1
+   kind: Job
+   metadata:
+     generateName: lazy-observe-key-rotation-
+   spec:
+     template:
+       spec:
+         restartPolicy: Never
+         containers:
+           - name: rotate
+             image: ghcr.io/eimsound/lazy-observe:<same tag as the Deployment>
+             args: ["admin", "reset-key-fingerprint", "--config", "/etc/lazy-observe/config.yaml"]
+             env:
+               - name: LO_META_DB_URL
+                 valueFrom:
+                   secretKeyRef:
+                     name: <release>-lazy-observe
+                     key: postgres-url
+             volumeMounts:
+               - name: config
+                 mountPath: /etc/lazy-observe
+                 readOnly: true
+               - name: encryption-key
+                 mountPath: /etc/lazy-observe-key
+                 readOnly: true
+         volumes:
+           - name: config
+             configMap:
+               name: <release>-lazy-observe
+           - name: encryption-key
+             secret:
+               secretName: <release>-lazy-observe-encryption-key
+               # Project the same key name and path as the Deployment. With
+               # encryptionKey.existingSecret, use that Secret's name instead;
+               # when encryptionKey.key is not the default `secret.key`, add
+               #   items: [{key: <encryptionKey.key>, path: secret.key}]
+               # so security.secret_key_file in the ConfigMap still resolves.
+               items:
+                 - key: secret.key
+                   path: secret.key
+   ```
+
+   `kubectl run` with the same `--env` and `--overrides` volume mounts works
+   too; the command has to reach the metadata database and read the key file.
+
+A rotation is not a transparent re-encryption — nothing re-seals existing
+ciphertext, so values sealed with the previous key stay unreadable. In practice
+the AI provider API key has to be entered again in **Settings > AI**, which
+re-seals it under the current key. A different key also derives a different
+self-monitoring token; the derived token is re-created at the next start. The
+previous derived credential is not revoked: it stays in metadata and remains a
+valid ingest credential for the self-monitoring project, so revoke it from that
+project's token list if it must stop working.
+
+Back up the key with the same care as the database: a lost key makes the sealed
+values unrecoverable. This release adds the `platform_key_fingerprints` table
+to the metadata baseline, so a metadata database (SQLite file or PostgreSQL
+database) created by an earlier commit refuses to start with
+`metadata migration 1 checksum mismatch`; the baseline marker is validated
+before the fingerprint check ever runs. Recreate the database for that build
+(a development database per
+[ADR 0003](../.agents/docs/adr/0003-pre-release-single-database-baseline.md))
+while keeping the same key file: the first start then records the current
+fingerprint, which is exactly the key the database is sealed with.
 
 ### Optional AI access layer
 
@@ -435,6 +548,13 @@ helm upgrade --install lazy-observe deploy/helm/lazy-observe \
   --set mode=allinone \
   --set persistence.size=50Gi
 ```
+
+`standalone-ha` needs a platform encryption key Secret —
+`encryptionKey.existingSecret`, or the chart-generated one with the default
+`encryptionKey.autoGenerate=true`. The chart refuses to render a
+`standalone-ha` release without one at any replica count, because the key must
+outlive the pods; `allinone` with a PVC keeps it in `data_dir` instead. See
+[Platform encryption key](#platform-encryption-key).
 
 `/livez` reports process liveness without probing dependencies. `/readyz`
 starts at 503, becomes 200 only after initialization/migrations and dependency

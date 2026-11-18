@@ -337,6 +337,14 @@ ADMIN_PASSWORD_FILE="$WORK/admin-password"
 (umask 077 && python3 -c 'import secrets; print(secrets.token_urlsafe(24))' >"$ADMIN_PASSWORD_FILE")
 PASSWORD=$(cat "$ADMIN_PASSWORD_FILE")
 
+# Replicas share one metadata database, so they must share one platform
+# encryption key. Each replica has its own data_dir; without this file every
+# replica would generate its own key and all but the concurrent-bootstrap
+# winner would be refused for a fingerprint mismatch. python3 is already a
+# required prerequisite for this script.
+SECRET_KEY_FILE="$WORK/secret.key"
+(umask 077 && python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())' >"$SECRET_KEY_FILE")
+
 write_config() {
   file=$1 listen=$2 logs_url=$3 metrics_ingest_url=$4 offset=$5
   cat >"$file" <<EOF
@@ -381,6 +389,7 @@ self_monitoring:
   enabled: false
 security:
   admin_password_file: "$ADMIN_PASSWORD_FILE"
+  secret_key_file: "$SECRET_KEY_FILE"
 EOF
 }
 write_config "$WORK/replica-a.yaml" 127.0.0.1:23101 http://127.0.0.1:29091 "http://$VMINSERT_1_HOST:8480" 0
@@ -425,6 +434,8 @@ process:
   component_port_offset: $offset
 self_monitoring:
   enabled: false
+security:
+  secret_key_file: "$SECRET_KEY_FILE"
 EOF
 }
 

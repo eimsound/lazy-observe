@@ -146,8 +146,14 @@ assert_render_fails 'multi-replica without a key source must fail rendering' 'en
   --set encryptionKey.autoGenerate=false
 assert_render_fails 'HPA without a key source must fail rendering' 'encryptionKey' \
   --set replicaCount=1 --set hpa.enabled=true --set encryptionKey.autoGenerate=false
-"$HELM" template test "$CHART" --set replicaCount=1 --set encryptionKey.autoGenerate=false >"$WORK/single-no-key.yaml"
-assert_not_contains "$WORK/single-no-key.yaml" 'secret_key_file' 'a single replica without a key source falls back to data_dir'
+# Even a single replica must not fall back to data_dir: standalone-ha runs its
+# metadata in an external database while /data is an emptyDir, so a key that
+# lives only in the pod is lost on recreation and the next pod is refused.
+assert_render_fails 'a single standalone-ha replica without a key source must fail rendering' \
+  'set encryptionKey.existingSecret' --set replicaCount=1 --set encryptionKey.autoGenerate=false
+assert_render_fails 'the standalone-ha key error must name the fingerprint consequence' \
+  'no longer matches the fingerprint recorded in metadata' \
+  --set replicaCount=1 --set encryptionKey.autoGenerate=false
 
 # First admin password: replicas must read one Secret through
 # security.admin_password_file. A generated password would otherwise land only
@@ -201,7 +207,7 @@ assert_not_contains "$WORK/allinone-no-admin.yaml" 'admin_password_file' 'allino
 # 开始用 envFrom 就必须停下来重新审议密钥防护。当前 chart 只在 deployment.yaml 用 env:。
 for rendered in "$WORK/standalone.yaml" "$WORK/allinone.yaml" "$WORK/cluster.yaml" \
   "$WORK/key-existing.yaml" "$WORK/allinone-ephemeral.yaml" "$WORK/admin-existing.yaml" \
-  "$WORK/single-no-key.yaml" "$WORK/single-no-admin.yaml" "$WORK/allinone-no-admin.yaml"; do
+  "$WORK/single-no-admin.yaml" "$WORK/allinone-no-admin.yaml"; do
   assert_not_contains "$rendered" '^[[:space:]]*envFrom:' \
     'the chart must not inject key material with envFrom (rethink the key guards first)'
 done
