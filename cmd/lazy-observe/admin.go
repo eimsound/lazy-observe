@@ -56,7 +56,14 @@ func newAdminResetPasswordCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load configuration: %w", err)
 			}
-			return runAdminResetPassword(command.OutOrStdout(), command.ErrOrStderr(), cfg, username, passwordFile)
+			return runAdminResetPassword(
+				command.OutOrStdout(),
+				command.ErrOrStderr(),
+				cfg,
+				username,
+				passwordFile,
+				account.ResetPassword,
+			)
 		},
 	}
 	command.Flags().StringVar(
@@ -77,12 +84,28 @@ type adminResetOutcome struct {
 	// generatedBefore is true when the generated path already held a file, so a
 	// failed reset must not remove it.
 	generatedBefore bool
+	// previousContent is that file's content, read before the new password
+	// overwrote it so a failure ahead of the hash write can put it back. It is
+	// plaintext and never leaves the process except through the file.
+	previousContent []byte
 }
+
+// resetPasswordFunc mirrors account.ResetPassword. It is a parameter rather
+// than a direct call so the CLI tests can fail the reset at a chosen stage: a
+// broken metadata store or session backend is not injectable from a test.
+type resetPasswordFunc func(
+	ctx context.Context,
+	metadata account.PasswordResetStore,
+	sessions account.Sessions,
+	username, newPassword string,
+	mustChangePassword bool,
+) (meta.UserInfo, error)
 
 func runAdminResetPassword(
 	out, errOut io.Writer,
 	cfg appconfig.Config,
 	username, passwordFile string,
+	resetPassword resetPasswordFunc,
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), adminResetPasswordTimeout)
 	defer cancel()
@@ -101,9 +124,10 @@ func runAdminResetPassword(
 		return fmt.Errorf("open shared session state: %w", err)
 	}
 	defer shared.Close()
-	if _, err := store.UserByUsername(ctx, username); err != nil {
+	target, err := store.UserByUsername(ctx, username)
+	if err != nil {
 		if meta.IsNotFound(err) {
-			recordResetAudit(ctx, store, errOut, username, false, "not_found")
+			recordResetAudit(ctx, store, errOut, username, meta.UserInfo{}, false, "not_found")
 			return fmt.Errorf("user %q does not exist", username)
 		}
 		return fmt.Errorf("find user %q: %w", username, err)
@@ -119,24 +143,33 @@ func runAdminResetPassword(
 	if cfg.Redis.Enabled {
 		sessions = account.NewStateSessions(shared.sessions)
 	}
-	reset, err := account.ResetPassword(
-		ctx, store, sessions, username, password, outcome.generatedPath != "",
-	)
+	reset, err := resetPassword(ctx, store, sessions, username, password, outcome.generatedPath != "")
 	if err != nil {
 		reason := "reset_failed"
 		if account.Stage(err) == account.StageSessionRevokeAfterReset {
 			// The new password is stored: keep the generated file, it is the
 			// only copy of credentials that now work.
 			reason = "session_revoke_failed"
-			recordResetAudit(ctx, store, errOut, username, false, reason)
+			recordResetAudit(ctx, store, errOut, username, target, false, reason)
 			printGeneratedPath(out, username, outcome.generatedPath)
 			return fmt.Errorf("password reset for %q; session revocation failed, rerun: %w", username, err)
 		}
 		if account.Code(err) == account.CodeNotFound {
 			reason = "not_found"
 		}
-		recordResetAudit(ctx, store, errOut, username, false, reason)
-		cleanupGeneratedPassword(outcome)
+		recordResetAudit(ctx, store, errOut, username, target, false, reason)
+		if restoreErr := restoreGeneratedPassword(outcome); restoreErr != nil {
+			// The operator has to know the file no longer holds a password that
+			// works, and that one more run replaces it.
+			return fmt.Errorf(
+				"reset password for %q: %w; %s now holds a password that never took effect and "+
+					"restoring the previous content failed: %v; rerun this command",
+				username,
+				err,
+				outcome.generatedPath,
+				restoreErr,
+			)
+		}
 		return fmt.Errorf("reset password for %q: %w", username, err)
 	}
 	// A reset exists to get past failed sign-ins, so the lockout counter must
@@ -146,7 +179,7 @@ func runAdminResetPassword(
 			_, _ = fmt.Fprintf(errOut, "warning: clear login lockout for %s: %v\n", username, err)
 		}
 	}
-	recordResetAudit(ctx, store, errOut, username, true, "")
+	recordResetAudit(ctx, store, errOut, username, target, true, "")
 	if outcome.generatedPath != "" {
 		printGeneratedPath(out, username, outcome.generatedPath)
 		return nil
@@ -183,7 +216,15 @@ func resetPasswordSource(
 	}
 	outcome.generatedPath = generatedPath
 	if _, err := os.Stat(generatedPath); err == nil {
+		// The new password replaces the file before it is stored, so remember
+		// the old bytes: a failure ahead of the hash write must leave the
+		// operator with the credential that still works.
+		previous, readErr := readPreviousGeneratedPassword(generatedPath)
+		if readErr != nil {
+			return "", readErr
+		}
 		outcome.generatedBefore = true
+		outcome.previousContent = previous
 		// Contents stay out of the output: only the operator who can read the
 		// file learns the password it held.
 		if _, err := fmt.Fprintf(out, "replacing existing %s\n", generatedPath); err != nil {
@@ -206,14 +247,46 @@ func printGeneratedPath(out io.Writer, username, path string) {
 	_, _ = fmt.Fprintf(out, "initial admin password for %s written to %s\n", username, path)
 }
 
-// cleanupGeneratedPassword removes the generated file only when this run
-// created it. A file that existed before is left in place: removing it would
-// destroy a credential the operator had before the failed reset.
-func cleanupGeneratedPassword(outcome adminResetOutcome) {
-	if outcome.generatedPath == "" || outcome.generatedBefore {
-		return
+// maxPreviousGeneratedPasswordBytes bounds the copy kept in memory of the file
+// a failed reset restores. The file only ever holds a password, so anything
+// larger is not something this CLI wrote and must not be silently replaced.
+const maxPreviousGeneratedPasswordBytes = 4 << 10
+
+// readPreviousGeneratedPassword copies the file that is about to be replaced.
+// Plaintext stays in memory and goes back only into the same path.
+func readPreviousGeneratedPassword(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
-	_ = os.Remove(outcome.generatedPath)
+	defer func() { _ = file.Close() }()
+	content, err := io.ReadAll(io.LimitReader(file, maxPreviousGeneratedPasswordBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(content) > maxPreviousGeneratedPasswordBytes {
+		return nil, fmt.Errorf(
+			"%s is larger than %d bytes, so it is not a generated password; refusing to overwrite it",
+			path,
+			maxPreviousGeneratedPasswordBytes,
+		)
+	}
+	return content, nil
+}
+
+// restoreGeneratedPassword undoes this run's write to the generated path. A
+// file that existed before is restored from the copy taken ahead of the
+// overwrite (a reset that failed before the hash write would otherwise leave a
+// password nothing accepts behind); a file this run created is removed.
+func restoreGeneratedPassword(outcome adminResetOutcome) error {
+	if outcome.generatedPath == "" {
+		return nil
+	}
+	if !outcome.generatedBefore {
+		_ = os.Remove(outcome.generatedPath)
+		return nil
+	}
+	return meta.WriteInitialAdminPasswordFile(outcome.generatedPath, outcome.previousContent)
 }
 
 func recordResetAudit(
@@ -221,6 +294,7 @@ func recordResetAudit(
 	store *meta.Store,
 	errOut io.Writer,
 	username string,
+	target meta.UserInfo,
 	success bool,
 	failureReason string,
 ) {
@@ -228,7 +302,11 @@ func recordResetAudit(
 		Action:        "auth.password_reset",
 		ActorUsername: cliAuditActor,
 		TargetType:    "user",
+		// The zero target means the account was not found: the HTTP password
+		// paths fill these from the same user row, and an unknown name has none.
+		TargetID:      target.ID,
 		TargetName:    username,
+		TargetRole:    target.Role,
 		ChangedFields: "password",
 		Success:       success,
 		FailureReason: failureReason,

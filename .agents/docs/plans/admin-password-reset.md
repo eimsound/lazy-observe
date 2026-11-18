@@ -237,3 +237,25 @@
 - 未改 Ent schema / 基线 SQL / 路由注册，`migration-check`、`ent-generate-check`、`test-meta-pg`、
   `e2e-contract-check` 不适用于本切片。
 
+
+## PR #56 审查后续（同一计划，切片 2）
+
+- S1 覆盖已有文件后失败，旧内容丢失：`resetPasswordSource` 在覆盖前用
+  `readPreviousGeneratedPassword` 读入旧内容（上限 4 KiB，超限拒绝覆盖）；
+  `restoreGeneratedPassword` 在哈希写入之前失败时用 `meta.WriteInitialAdminPasswordFile`
+  （新导出，`writeInitialAdminPassword` 改为调用它）原子写回原字节、0600；
+  写回也失败时错误信息说明「文件里是一个从未生效的密码，请重跑」。本次新建的文件仍在失败时删除。
+- S3 CLI 审计缺 target：`recordResetAudit` 接收 `meta.UserInfo`，填 `TargetID`/`TargetRole`
+  与 `userFacts` 一致；`not_found` 传零值，两个字段保持 null。
+- 故障注入：`runAdminResetPassword` 新增 `resetPasswordFunc` 参数（cobra 传
+  `account.ResetPassword`），测试用替身在 `session_revoke` / `reset_password` /
+  `StageSessionRevokeAfterReset` 三个阶段返回 `*account.Error`，仓库内原先没有故障注入接缝。
+- 2026-11-19 `CGO_ENABLED=0 go test ./cmd/lazy-observe/ -run TestAdminResetPassword`
+  → 红：`undefined: resetPasswordFunc`，`too many arguments in call to runAdminResetPassword`；
+  临时把 `restoreGeneratedPassword` 与 `TargetID`/`TargetRole` 改回旧行为后
+  `TestAdminResetPasswordRestoresReplacedFileWhenResetFails`、
+  `TestAdminResetPasswordReportsUnrestorableOverwrite`、
+  `TestAdminResetPasswordRecordsAuditEvent` 三条同时红（文件里是新生成的密码 / 错误信息不含
+  `never took effect` / `audit target = id 0 role ""`）；恢复实现后全绿。
+- 2026-11-19 `mise run vet` → exit 0；`mise run test` → 全部包 ok，exit 0；
+  `mise run fmt-check` → exit 0；`GOLANGCI_LINT_CACHE=$(mktemp -d) mise run lint` → `0 issues`，exit 0。
