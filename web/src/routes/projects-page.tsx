@@ -31,6 +31,8 @@ import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { SnippetBlock } from "@/components/common/snippet-block";
+import { projectDsn } from "@/lib/tokens/token-usage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -432,6 +434,12 @@ function TokensDialog({
           </DialogTitle>
         </DialogHeader>
 
+        {/* ADR 0010: a project API token is ingest-only; reads need a user token. */}
+        <div className="rounded-lg border border-border bg-muted/40 p-3 text-xs">
+          <p className="font-medium text-foreground">{t("projects.ingestOnlyTitle")}</p>
+          <p className="mt-1 text-muted-foreground">{t("projects.ingestOnlyDesc")}</p>
+        </div>
+
         {/* Freshly-created secret (shown once) */}
         {createdToken && (
           <div className="space-y-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
@@ -450,6 +458,11 @@ function TokensDialog({
               </Button>
             </div>
             <p className="text-[11px] text-muted-foreground">{t("projects.copyWarning")}</p>
+            <SnippetBlock
+              label={t("projects.dsnLabel")}
+              value={projectDsn(window.location.origin, project?.slug ?? "", createdToken.value)}
+              hint={t("projects.dsnHint")}
+            />
           </div>
         )}
 

@@ -192,7 +192,8 @@ Jaeger JSON 契约。检索页 `src/routes/traces-page.tsx`、详情页 `src/rou
 
 ## ★ 平台管理页
 
-- **项目（`routes/projects-page.tsx`，`/settings/projects`）**：项目列表 + 新建、重命名、删除（admin，内置自监控项目 `lazy-observe` 不可编辑/删除）；每项目「管理令牌」对话框——签发（token 值只在创建响应显示一次，含复制按钮与告警文案）、吊销（`ConfirmDialog` 确认）。
+- **项目（`routes/projects-page.tsx`，`/settings/projects`）**：项目列表 + 新建、重命名、删除（admin，内置自监控项目 `lazy-observe` 不可编辑/删除）；每项目「管理令牌」对话框——顶部标注「仅摄取（ingest only）」（ADR 0010：项目 Token 只上报遥测，查询/MCP/Grafana 用个人 Token），签发（token 值只在创建响应显示一次，含复制按钮与告警文案，并给出可复制的 DSN `<origin>/p/<slug>@<token>`）、吊销（`ConfirmDialog` 确认）。片段字符串由 `lib/tokens/token-usage.ts` 纯函数生成（`node --test` 覆盖）。
+- **设置页个人 Token（`components/settings/user-api-tokens-card.tsx`，`/settings`）**：签发后除 token 值外，给出可复制的 MCP 命令 `lazy-observe mcp --dsn '<origin>/p/<slug>@<lou_token>'`（slug 取当前项目，缺省 `default`）与 Grafana Prometheus 数据源要点（网关根 URL + `Authorization: Bearer …`、`X-LO-Project: <slug>` 两个自定义请求头），口径以 `docs/deployment.md` 为准。
 - **用户（`routes/users-page.tsx`，`/settings/users`，仅 admin）**：列表、新建（用户名/密码/角色）、行内改角色、删除；对「自己的账户」禁用改角色/删除。非 admin 直达时渲染「无访问权限」空态（侧栏该项也隐藏）。
 
 ## ★ 告警页组（A1 契约，侧栏「告警」分组）

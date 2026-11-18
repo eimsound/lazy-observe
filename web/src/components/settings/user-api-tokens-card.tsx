@@ -11,7 +11,15 @@ import {
 } from "@/lib/api/user-api-tokens";
 import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
+import { useProject } from "@/lib/project/project-provider";
+import {
+  grafanaDataSourceUrl,
+  grafanaHeaderBlock,
+  mcpCommand,
+  readProjectSlug,
+} from "@/lib/tokens/token-usage";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { SnippetBlock } from "@/components/common/snippet-block";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -23,6 +31,8 @@ const fmt = (iso: string) => formatDateTime(dayjs(iso).valueOf());
 export function UserAPITokensCard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { currentSlug } = useProject();
+  const origin = window.location.origin;
   const [name, setName] = useState("");
   const [created, setCreated] = useState<IssuedUserAPIToken | null>(null);
   const [copied, setCopied] = useState(false);
@@ -80,6 +90,29 @@ export function UserAPITokensCard() {
                 {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
                 {copied ? t("common.copied") : t("common.copy")}
               </Button>
+            </div>
+
+            {/* ADR 0010: a user API token is the read credential for MCP and Grafana. */}
+            <div className="space-y-3 border-t border-primary/20 pt-3">
+              <p className="text-xs font-medium">{t("userTokens.usageTitle")}</p>
+              <SnippetBlock
+                label={t("userTokens.mcpLabel")}
+                value={mcpCommand(origin, currentSlug, created.value)}
+                hint={t("userTokens.mcpHint", { slug: readProjectSlug(currentSlug) })}
+              />
+              <div className="space-y-2">
+                <p className="text-xs font-medium">{t("userTokens.grafanaTitle")}</p>
+                <SnippetBlock
+                  label={t("userTokens.grafanaUrlLabel")}
+                  value={grafanaDataSourceUrl(origin)}
+                  hint={t("userTokens.grafanaUrlHint")}
+                />
+                <SnippetBlock
+                  label={t("userTokens.grafanaHeadersLabel")}
+                  value={grafanaHeaderBlock(created.value, currentSlug)}
+                  hint={t("userTokens.grafanaHeadersHint")}
+                />
+              </div>
             </div>
           </div>
         )}
