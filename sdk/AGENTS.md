@@ -34,4 +34,4 @@ SDK 面向 lazy-observe 服务端上报遥测时必须遵守以下守则（与 `
   `mise run sdk-python`。CI 由根 `.github/workflows/ci.yml` 的 `changes` 作业按目录
   只跑改动到的语言包。
 - 所有脚本用 `bash`，命名小写连字符；新增脚本需 `sh -n` 通过。
-- 依赖许可证仅允许 Apache-2.0 / MIT / BSD；禁止引入 AGPL/GPL 运行时依赖。
+- 依赖许可证白名单见根 `AGENTS.md`（Go：Apache-2.0 / MIT / BSD；JS 另允许 ISC / 0BSD / Unlicense）；禁止引入 AGPL/GPL 运行时依赖。
