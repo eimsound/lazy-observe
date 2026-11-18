@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	alertpkg "github.com/eimsound/lazy-observe/internal/alert"
+	"github.com/eimsound/lazy-observe/internal/embeddedpg"
 	"github.com/eimsound/lazy-observe/internal/meta"
 )
 
@@ -1240,15 +1241,18 @@ func startEmbeddedPostgresE2E(t *testing.T) string {
 	port := uint32(listener.Addr().(*net.TCPAddr).Port)
 	_ = listener.Close()
 	root := t.TempDir()
+	// The downloaded archive goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
+	// CI can reuse it; runtime and data stay in the per-run temporary directory.
 	config := embeddedpostgres.DefaultConfig().Port(port).
 		Database("lazy_observe_e2e").
+		CachePath(embeddedpg.CachePath(filepath.Join(root, "cache"))).
 		RuntimePath(filepath.Join(root, "runtime")).
 		DataPath(filepath.Join(root, "data")).
 		StartTimeout(2 * time.Minute).
 		Logger(io.Discard)
 	postgres := embeddedpostgres.NewDatabase(config)
 	if err := postgres.Start(); err != nil {
-		t.Fatalf("start embedded postgres: %v", err)
+		t.Fatalf("start embedded postgres: %v (%s)", err, embeddedpg.DownloadProbe(embeddedpostgres.V18))
 	}
 	t.Cleanup(func() {
 		if err := postgres.Stop(); err != nil {

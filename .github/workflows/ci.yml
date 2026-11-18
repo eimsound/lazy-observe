@@ -375,6 +375,26 @@ jobs:
             ~/.cache/go-build
           key: go-meta-pg-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
           restore-keys: go-meta-pg-${{ runner.os }}-${{ runner.arch }}-
+      # embedded-postgres 从 Maven Central 下载 Postgres 归档；共享 runner 出口 IP 被限流时
+      # 下载会以 403/429/5xx 失败，库却只报 "no version found matching 18.3.0"。
+      # 把归档目录（mise 的 test-meta-pg 任务默认用 $HOME/.cache/embedded-postgres）缓存起来，
+      # 命中时不再联网。key 固定 runner os/arch、库版本（来自 go.mod）和归档版本 18.3.0
+      # （embedded-postgres 的 V18，即 DefaultConfig 的默认版本），升级库或换 PG 版本时一起改。
+      - name: Resolve embedded Postgres module version
+        id: embedded-pg
+        run: |
+          module=$(awk '$1 == "github.com/fergusstrange/embedded-postgres" { print $2 }' go.mod)
+          if [[ -z $module ]]; then
+            printf 'embedded-postgres is missing from go.mod\n' >&2
+            exit 1
+          fi
+          printf 'module=%s\n' "$module" >>"$GITHUB_OUTPUT"
+      - name: Restore embedded Postgres archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/embedded-postgres
+          key: embedded-pg-${{ runner.os }}-${{ runner.arch }}-18.3.0-${{ steps.embedded-pg.outputs.module }}
+          restore-keys: embedded-pg-${{ runner.os }}-${{ runner.arch }}-18.3.0-
       - name: Run PostgreSQL tests when migrations exist
         run: mise run --skip-tools test-meta-pg
 

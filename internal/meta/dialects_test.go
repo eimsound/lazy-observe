@@ -18,6 +18,8 @@ import (
 	"time"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+
+	"github.com/eimsound/lazy-observe/internal/embeddedpg"
 )
 
 var (
@@ -41,16 +43,23 @@ func TestMain(m *testing.M) {
 	}
 	port := uint32(listener.Addr().(*net.TCPAddr).Port)
 	_ = listener.Close()
+	// The downloaded archive goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
+	// CI can reuse it; runtime and data stay in the per-run temporary directory.
 	config := embeddedpostgres.DefaultConfig().
 		Port(port).
-		CachePath(filepath.Join(temp, "cache")).
+		CachePath(embeddedpg.CachePath(filepath.Join(temp, "cache"))).
 		RuntimePath(filepath.Join(temp, "runtime")).
 		DataPath(filepath.Join(temp, "data")).
 		StartTimeout(2 * time.Minute).
 		Logger(io.Discard)
 	postgres := embeddedpostgres.NewDatabase(config)
 	if err := postgres.Start(); err != nil {
-		fmt.Fprintln(os.Stderr, "start embedded postgres:", err)
+		fmt.Fprintf(
+			os.Stderr,
+			"start embedded postgres: %v (%s)\n",
+			err,
+			embeddedpg.DownloadProbe(embeddedpostgres.V18),
+		)
 		_ = os.RemoveAll(temp)
 		os.Exit(1)
 	}
