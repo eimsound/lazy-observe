@@ -5,7 +5,8 @@ This document describes the current main branch after the M1–M5 implementation
 ## Accepted architecture transitions
 
 Accepted decisions deliberately change implementation choices in the
-immutable v1.0 requirements baseline:
+v1.0 requirements baseline; [requirements.md](requirements.md) v1.1 writes
+them back and lists them in its revision log:
 
 - [ADR 0001](adr/0001-nightingale-style-alert-engine.md) replaces duplicate
   evaluation with a lazy-observe-owned, Nightingale-style single-owner
@@ -36,6 +37,11 @@ immutable v1.0 requirements baseline:
   storage; the requirements' Grafana-family compatibility (Loki/LogQL,
   Tempo/TraceQL adapters) is out of scope, and generic Prometheus-compatible
   query endpoints are no longer officially supported.
+- [ADR 0017](adr/0017-no-built-in-dashboards.md) removes the built-in
+  dashboards and host middleware views and does not ship dashboard templates.
+  Users build dashboards in Grafana or Perses against the Prometheus-compatible
+  query API; fixed product pages (overview, performance, hosts, LLM, profiling)
+  are not dashboards and stay.
 
 ## Accepted but not implemented
 

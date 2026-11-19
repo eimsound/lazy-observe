@@ -207,7 +207,7 @@ Jaeger JSON 契约。检索页 `src/routes/traces-page.tsx`、详情页 `src/rou
 - **渠道（`channels-page.tsx`，`/alerts/channels`）**：`/api/channels` CRUD + `POST /:id/test`。5 类型（webhook/feishu/dingtalk/wecom/email）各有 `CHANNEL_FIELDS` 配置字段描述符驱动的动态表单；测试发送按钮内联反馈成功/失败（mock：无有效接收地址 → 失败态）。
 - **共享**：`components/alerts/severity.tsx`（`SeverityBadge/StatusBadge/LabelChips`，severity 复用 `--level-*` 语义色）。
 
-## ★ 总览 Dashboard（`overview-page.tsx`，`/`）
+## ★ 总览（`overview-page.tsx`，`/`）
 
 预置响应式卡片网格（`grid-cols-1 md:2 lg:3`），全部复用既有图表组件与领域 API：请求速率 / P95 时延 / 错误率（各一张 `queryRange` 迷你 `TimeSeriesChart` + KPI 值）、活跃告警数（`listAlerts("firing")` + severity 分解 + 跳 `/alerts`）、日志量直方图（`logsHits` + `LogsHistogramChart`，跨 2 列）、最近 3 条未解决 Issues（`listIssues` 按 `last_seen` 排序，覆盖加载/空/错误态并可跳详情）。整块共享单一时间窗（`resolveRange("1h")`）。
 
@@ -293,7 +293,7 @@ Jaeger JSON 契约。检索页 `src/routes/traces-page.tsx`、详情页 `src/rou
 - **色板扩展到 7 套**（≥6）：在原 中性/蓝/紫/翠绿 上新增 **rose / amber / cyan**，全部 **OKLCH 手写**保持感知均匀、亮暗成对（`globals.css` 加 `[data-palette]` 块 + `.dark[data-palette]` 变体，`presets.ts#PALETTES` 加 swatch）——**零组件改动**，符合「自定义主题即覆盖 CSS 变量集」。
 - **持久化**：四轴全部 localStorage 持久化，`useTheme()` 单点修改并触发图表重上色。
 
-## ★ API / mock 扩展（基础设施 + 仪表盘 + 告警配置）
+## ★ API / mock 扩展（基础设施 + 告警配置）
 
 - **域文件**：`api/hosts.ts`（+ `usageRating/loadRating` 阈值分档）、`api/scrape-targets.ts`、`api/alert-config.ts`。
 - **mock 存储**：`api/mock-infra.ts`（静态 5 主机刻意覆盖 good/ni/poor 三档且含一台 down；抓取目标可变数组 + CRUD + 由 id 派生的 up/down/unknown 健康；按项目 id 存告警配置）。mock 的 `query_range` 对任意 expr 返回正弦数据，故主机详情图表可渲染。

@@ -1,7 +1,6 @@
 # lazy-observe — worker 约定
 
 - `CGO_ENABLED=0` 是硬约束（交叉编译 linux × amd64/arm64）。
-- `.agents/docs/requirements.md` 是需求基线，不要编辑。
 - 文档按读者选目录：`docs/` 给部署者、运维、SDK 接入方；`.agents/docs/` 给 AI 工作流、规划和开发决策（ADR、plan、spec、调研等）。
 - PoC/spike 放本地 `poc/<topic>/`（git 忽略，不提交）；要保留的结论写进 `.agents/docs/research/<topic>.md`。
 - 协议面（端点、字段、DSN、鉴权）改动与 `docs/version-matrix.md` 在同一个 PR 里改。

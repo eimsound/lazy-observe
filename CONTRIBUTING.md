@@ -4,7 +4,7 @@ Thanks for helping. The project is pre-release, and changes should preserve its 
 
 ## Before you start
 
-Read [AGENTS.md](AGENTS.md), [requirements](.agents/docs/requirements.md), the [architecture decision records](.agents/docs/adr/), and the [glossary](.agents/docs/GLOSSARY.md). `.agents/docs/requirements.md` is the product baseline and must not be edited as part of ordinary implementation work.
+Read [AGENTS.md](AGENTS.md), [requirements](.agents/docs/requirements.md), the [architecture decision records](.agents/docs/adr/), and the [glossary](.agents/docs/GLOSSARY.md).
 
 Hard constraints:
 

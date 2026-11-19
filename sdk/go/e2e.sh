@@ -333,7 +333,7 @@ test "$llm_content_ok" = 1 || {
 }
 
 printf 'PASS metrics: http.server.request.duration histogram queried through gateway query_range\n'
-printf 'PASS SDK metric contract: VictoriaMetrics names and service.name labels match default dashboards\n'
+printf 'PASS SDK metric contract: SDK metric names carry service.name and no instance label in VictoriaMetrics\n'
 printf 'PASS logs: panic log and trace_id queried through gateway\n'
 printf 'PASS issues: Fiber panic exported and aggregated through the real error-event gateway\n'
 printf 'PASS traces: same trace_id queried through gateway /api/traces route\n'
