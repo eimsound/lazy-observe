@@ -35,6 +35,7 @@ jobs:
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          MISE_CI_PROFILE: perf-gates
       - name: Restore Go cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

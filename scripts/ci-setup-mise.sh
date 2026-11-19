@@ -90,6 +90,11 @@ else
   sdk-journeys)
     ci_tools=(go node pnpm jq rg uv@0.13.7)
     ;;
+  # 性能门禁（bench.yml、release.yml 的 performance-gates）：base 的工具加 uv；
+  # check-release-smoke.sh 的内嵌校验脚本用 uv 管理的固定版本 Python 跑，不用系统 python3。
+  perf-gates)
+    ci_tools=(go node pnpm jq uv@0.13.7)
+    ;;
   release)
     ci_tools=(
       go node pnpm jq

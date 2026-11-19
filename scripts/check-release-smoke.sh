@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir=${BASH_SOURCE[0]%/*}
 root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
-python_command=${PYTHON:-python3}
+python_version=${LO_RELEASE_SMOKE_PYTHON_VERSION:-3.13}
 timeout_seconds=${LO_RELEASE_SMOKE_TIMEOUT:-120}
 shutdown_timeout_seconds=${LO_RELEASE_SMOKE_SHUTDOWN_TIMEOUT:-45}
 max_rss_bytes=${LO_RELEASE_MAX_RSS_BYTES:-524288000}
@@ -20,9 +20,23 @@ fail() {
   exit 1
 }
 
-for command in curl env go "$python_command" mkdir mktemp ps tail rm sleep; do
+for command in curl env go mkdir mktemp ps tail rm sleep; do
   command -v "$command" >/dev/null 2>&1 || skip "required command is unavailable: $command"
 done
+
+# 内嵌的校验脚本只用 Python 标准库。解释器一律由 uv 管理（固定版本），不用系统 python3、不用 pip，
+# 也不接受 PYTHON 覆盖。uv 缺失是失败而不是 SKIP：CI 里 SKIP 会让这道发版门禁悄悄放行。
+# --no-bin：不往 ~/.local/bin 放 python3.X，门禁不改宿主机 PATH 上的命令。
+command -v uv >/dev/null 2>&1 || fail "uv is required (managed Python $python_version); run through mise run gate-release-artifacts"
+uv python install --managed-python --no-bin "$python_version" >&2 ||
+  fail "uv could not install managed Python $python_version"
+python_root=$(uv python dir) || fail "uv could not report its managed Python directory"
+python_command=$(uv python find --managed-python "$python_version") ||
+  fail "uv could not locate managed Python $python_version"
+# 解释器必须在 uv 的托管目录里：版本请求写成路径等形式时，不能借 uv python find 落回系统 Python。
+[[ $python_command == "$python_root"/* ]] ||
+  fail "uv returned a Python outside its managed directory $python_root: $python_command"
+[[ -x $python_command ]] || fail "uv returned a non-executable Python path: $python_command"
 
 case $timeout_seconds in
   ''|*[!0-9]*) fail "LO_RELEASE_SMOKE_TIMEOUT must be a positive integer" ;;
