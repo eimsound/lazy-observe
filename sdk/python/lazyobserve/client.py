@@ -484,7 +484,7 @@ def build_client(config: Any, parsed: Any) -> Client:
         max_attempts=config.delivery.max_attempts,
         retry_initial=config.delivery.retry_initial,
         retry_max=config.delivery.retry_max,
-        warn=default_warn_factory(logger, "error"),
+        warn=default_warn_factory(logger, "error", client.record_telemetry_drop),
     )
     if config.profiling:
         # Experimental and optional: whatever goes wrong here must not degrade the
