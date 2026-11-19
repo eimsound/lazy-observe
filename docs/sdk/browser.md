@@ -166,16 +166,18 @@ Plugin options:
 | Option | Default | Behavior |
 | --- | --- | --- |
 | `dsn` | unset | Gateway DSN carrying a source map upload token (`los_…`), from a CI secret. Missing or empty: the build prints a warning, uploads nothing and succeeds |
-| `release` | seven-character Git SHA | Release key used for upload and symbolication |
+| `release` | seven-character Git SHA | Release key used for upload and symbolication. Only needed to upload: without a DSN a missing `.git` does not fail the build. With a DSN and no release and no Git checkout, `vite build` fails with `unable to infer release from git; set release explicitly` |
 | `upload` | true | Upload emitted `.map` files after build |
 | `stripSourceMaps` | false | Delete local `.map` files after successful upload |
 
 Vite defines `__LAZY_OBSERVE_RELEASE__`; pass the same value to browser initialization:
 
 ```ts
-declare const __LAZY_OBSERVE_RELEASE__: string;
+declare const __LAZY_OBSERVE_RELEASE__: string | undefined;
 init({ dsn, release: __LAZY_OBSERVE_RELEASE__ });
 ```
+
+If no release can be inferred and nothing needs one (no DSN, `upload: false`, or `vite dev`), `__LAZY_OBSERVE_RELEASE__` is defined as `undefined`, so events carry no release.
 
 ### Other bundlers and Next.js
 
@@ -183,7 +185,7 @@ init({ dsn, release: __LAZY_OBSERVE_RELEASE__ });
 lazy-observe-sourcemaps upload --dir <directory> [--dsn <dsn>] [--release <release>] [--strip]
 ```
 
-`--dsn` defaults to `$LO_DSN`; `--release` defaults to `$LO_RELEASE`, then the seven-character Git SHA. The browser SDK does not read the release from the build, so give the same release to `init({ release })`. Next.js 16 builds with Turbopack by default, so use the CLI there: set `productionBrowserSourceMaps: true` in `next.config` and run `lazy-observe-sourcemaps upload --dir .next/static --strip` as the `postbuild` script. The package README has the full example.
+`--dsn` defaults to `$LO_DSN`; `--release` defaults to `$LO_RELEASE`, then the seven-character Git SHA (with a DSN and no release and no Git checkout it exits 1; without a DSN it never infers one). The browser SDK does not read the release from the build, so give the same release to `init({ release })`. Next.js 16 builds with Turbopack by default, so use the CLI there: set `productionBrowserSourceMaps: true` in `next.config` and run `lazy-observe-sourcemaps upload --dir .next/static --strip` as the `postbuild` script. The package README has the full example.
 
 In CI, provide the upload-token DSN from a secret (as `LO_DSN`). Without a DSN, for example in a local build, the plugin and the CLI warn and skip the upload and still succeed. When a DSN is set and the upload fails, the Vite build fails and the CLI exits non-zero.
 

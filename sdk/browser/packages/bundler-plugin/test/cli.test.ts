@@ -3,17 +3,17 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { dsnFor, makeOutputDir, startServer } from "./helpers";
+import { dsnFor, makeNonGitDir, makeOutputDir, startServer } from "./helpers";
 
 // 测的是构建产物 dist/cli.js（mise 的 sdk-browser 任务先 build 再 test）。
 const cli = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/cli.js");
 
 interface Run { code: number; stdout: string; stderr: string }
-function run(args: string[], env: Record<string, string> = {}): Promise<Run> {
+function run(args: string[], env: Record<string, string> = {}, cwd?: string): Promise<Run> {
   return new Promise((resolve) => {
     // 不继承外层的 LO_DSN / LO_RELEASE，避免本机环境影响断言。
     const { LO_DSN: _dsn, LO_RELEASE: _release, ...base } = process.env;
-    execFile(process.execPath, [cli, ...args], { env: { ...base, ...env } }, (error, stdout, stderr) => {
+    execFile(process.execPath, [cli, ...args], { env: { ...base, ...env }, cwd }, (error, stdout, stderr) => {
       const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
       resolve({ code, stdout, stderr });
     });
@@ -62,6 +62,30 @@ describe("lazy-observe-sourcemaps upload", () => {
     expect(result.code).toBe(0);
     expect(result.stderr).toMatch(/no DSN configured/);
     expect(server.requests).toHaveLength(0);
+  });
+
+  describe("outside a git checkout without a release", () => {
+    async function noGitDir() {
+      const cwd = await makeNonGitDir();
+      cleanups.push(() => fs.rm(cwd, { recursive: true, force: true }));
+      return cwd;
+    }
+
+    it("still warns and exits 0 without a DSN", async () => {
+      const { dir } = await setup();
+      const result = await run(["upload", "--dir", dir], {}, await noGitDir());
+      expect(result.code).toBe(0);
+      expect(result.stderr).toMatch(/no DSN configured/);
+    });
+
+    it("exits 1 with a clear message when a DSN is set", async () => {
+      const { server, dir } = await setup();
+      const result = await run(["upload", "--dir", dir, "--dsn", dsnFor(server.origin)], {}, await noGitDir());
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/unable to infer release from git; set release explicitly/);
+      expect(result.stderr).not.toContain("secret-token");
+      expect(server.requests).toHaveLength(0);
+    });
   });
 
   it("treats an empty LO_DSN like a missing one", async () => {
