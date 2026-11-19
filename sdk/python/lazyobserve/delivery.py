@@ -246,6 +246,16 @@ class DeliveryQueue(Generic[T]):
         """Deliver a batch; returns True to continue, False to stop the worker."""
         err: Optional[BaseException] = None
         for attempt in range(self._max_attempts):
+            if self._cancel.is_set():
+                # Like Go's ``runCtx.Err()`` check before the first send: a spent budget
+                # (or a cancel landing as a retry delay ends) starts no new request. Only
+                # ``close`` sets the flag, and only once its budget is spent, so the error
+                # is that budget's ``TimeoutError`` (``close`` may read it as its result).
+                # The queued rest is ``close``'s to count: it calls ``_discard_queued``
+                # right after setting the flag, and this batch is no longer in the queue.
+                self._set_error(err or TimeoutError("delivery queue close timed out"))
+                self._record_drop("shutdown_budget", err, len(batch))
+                return False
             err = None
             try:
                 self._send(batch, None)
