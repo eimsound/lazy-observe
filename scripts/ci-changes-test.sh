@@ -36,6 +36,7 @@ expect_matrix() {
 # 纯文档：所有业务 job 跳过。
 expect 'README.md' ''
 expect 'docs/adr/0012-x.md,CHANGELOG.md,LICENSE,.agents/skills/do/SKILL.md' ''
+expect 'CLAUDE.md,sdk/CLAUDE.md,.claude/skills' ''
 expect 'sdk/node/README.md,docs/sdk/go.md,.github/ISSUE_TEMPLATE/bug_report.yml' ''
 expect '' ''
 

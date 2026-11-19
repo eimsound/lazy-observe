@@ -136,7 +136,7 @@ business job.
 
 | Changed paths | Jobs that run |
 | --- | --- |
-| `*.md`, `docs/**`, `LICENSE`, `.agents/**` | None |
+| `*.md`, `docs/**`, `LICENSE`, `.agents/**`, `.claude/**` | None |
 | `sdk/node/**`, `sdk/browser/**`, `sdk/python/**` | The matching SDK job |
 | `sdk/go/**` | Go SDK job plus the gateway Go checks, build, E2E, and HA E2E (the server links `sdk/go` through `replace`) |
 | `web/**` | Web |

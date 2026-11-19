@@ -103,7 +103,7 @@ classify() {
 
   case "$file" in
   # 纯文档与 agent 流程：不跑业务 job。
-  *.md | docs/* | LICENSE | NOTICE | .agents/* | skills-lock.json | .air.toml | .github/ISSUE_TEMPLATE/*)
+  *.md | docs/* | LICENSE | NOTICE | .agents/* | .claude/* | skills-lock.json | .air.toml | .github/ISSUE_TEMPLATE/*)
     return
     ;;
   # Dependabot 配置只被 GitHub 的 Dependabot 服务读取，不改变任何 job 的行为；.trivyignore.yaml 只在
