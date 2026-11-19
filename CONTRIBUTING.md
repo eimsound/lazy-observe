@@ -95,6 +95,22 @@ local run is optional; run it before pushing when you want the result early.
 It requires a working Docker daemon. Exit 77 means the prerequisite was absent
 and must be reported as `SKIP`, never PASS.
 
+### SDK journeys
+
+```sh
+mise run sdk-journeys
+```
+
+This builds the gateway with the embedded Web UI, then starts a real platform with a
+temporary data directory, free ports and a known admin password (provided through
+`security.admin_password_file`, so no forced password change), reads the default
+project's ingest token from the bootstrap log, and runs the Go, Node, Python and
+Browser SDK journeys (`sdk/*/e2e.sh`) against it in that order. A missing toolchain
+is an error, never a skip. `LO_SDK_JOURNEYS_ONLY=go,browser` runs a subset. The
+Browser journey installs Chromium with `playwright install` and adds `--with-deps`
+only when root or passwordless sudo is available. Pull request CI runs it as the
+`SDK journeys` job when SDK, server, or Web code changes.
+
 ### Release and performance gates
 
 ```sh
@@ -124,6 +140,7 @@ business job.
 | `sdk/node/**`, `sdk/browser/**`, `sdk/python/**` | The matching SDK job |
 | `sdk/go/**` | Go SDK job plus the gateway Go checks, build, E2E, and HA E2E (the server links `sdk/go` through `replace`) |
 | `web/**` | Web |
+| `sdk/**`, `web/**`, `cmd/**`, `internal/**`, `go.mod`, `go.sum`, `scripts/sdk-journeys.sh` | Adds SDK journeys |
 | `internal/db/**`, `internal/meta/**` | Adds PostgreSQL metadata tests |
 | `cmd/**`, `internal/**` | Go checks, build, E2E, restart, HA E2E |
 | `go.mod`, `go.sum` | Same as above plus PostgreSQL metadata tests |

@@ -18,7 +18,8 @@ GO_URL="http://127.0.0.1:$GO_PORT"
 NODE_URL="http://127.0.0.1:$NODE_PORT"
 ERROR_JOURNEY_RELEASE=browser-error-journey-v1
 
-# journey 需要手动对着一个运行中的 lazy-observe 平台执行，mise 和 CI 都不调用本脚本。
+# 标准入口是 `mise run sdk-journeys`（scripts/sdk-journeys.sh 起平台、准备下面三个变量并依次跑四个 journey，
+# CI 的 SDK journeys job 也跑它）。也可以手动对着一个运行中的 lazy-observe 平台单独执行本脚本，需要：
 #   LO_E2E_PLATFORM_URL    平台地址
 #   LO_E2E_TOKEN           默认项目的项目 API Token（lo_…），只用来拼 DSN 做摄取
 #   LO_E2E_ADMIN_PASSWORD  admin 密码；所有读请求都用登录得到的会话 Cookie 加
@@ -109,11 +110,18 @@ wait_http() {
 printf 'building SDK workspace and examples from this repo...\n'
 (cd "$SDK_DIR/../go" && CGO_ENABLED=0 go build -o "$WORK/fiber-example" ./examples/fiber)
 (cd "$SDK_DIR/../node" && pnpm install --frozen-lockfile && pnpm build)
+# --with-deps 要用 apt 装系统库，需要 root 或免密 sudo（CI runner 满足）；
+# 没有这个权限的开发机只装浏览器本身，系统库缺失时 Playwright 启动 Chromium 会如实报错。
+playwright_args="--only-shell chromium"
+if [ "$(id -u)" = 0 ] || sudo -n true >/dev/null 2>&1; then
+	playwright_args="--with-deps $playwright_args"
+fi
 (
 	cd "$SDK_DIR"
 	pnpm install --frozen-lockfile
 	pnpm build
-	pnpm exec playwright install --with-deps --only-shell chromium
+	# shellcheck disable=SC2086 # 有意按空白拆分参数
+	pnpm exec playwright install $playwright_args
 )
 
 

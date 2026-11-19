@@ -45,16 +45,23 @@ async function loginAPI(request: APIRequestContext): Promise<void> {
   expect(response.ok()).toBeTruthy();
 }
 
+// The Performance page has no heading of its own (list pages leave the title to the
+// sidebar and the breadcrumb), so "the page is rendered" is its tablist: the Web Vitals
+// tab is the default one and is always present, in both locales.
+function performanceReady(page: Page) {
+  return page.getByRole("tab", { name: "Web Vitals" });
+}
+
 async function loginUI(page: Page, target: string): Promise<void> {
   await page.goto(target);
   const loginHeading = page.getByRole("heading", { name: /Sign in|登录/ });
-  const targetHeading = page.getByRole("heading", { name: /Performance|性能/ });
-  await expect(loginHeading.or(targetHeading)).toBeVisible();
+  const targetReady = performanceReady(page);
+  await expect(loginHeading.or(targetReady)).toBeVisible();
   if (await loginHeading.isVisible()) {
     await page.getByLabel(/Username|用户名/).fill("admin");
     await page.getByLabel(/Password|密码/).fill(password);
     await page.getByRole("button", { name: /Sign in|登录/ }).click();
-    await expect(targetHeading).toBeVisible();
+    await expect(targetReady).toBeVisible();
   }
 }
 
@@ -185,7 +192,7 @@ test("performance investigation journey uses ranked endpoints and contextual evi
   expect((await flamegraph(request, "node-express-example", "heap")).value).toBeGreaterThan(0);
 
   await loginUI(page, `${platformURL}/performance`);
-  await expect(page.getByRole("heading", { name: /Performance|性能/ })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: /Breadcrumb|面包屑/ })).toContainText(/Performance|性能/);
   await expect(page.getByRole("button", { name: /Largest Contentful Paint|最大内容绘制/ })).toBeVisible();
   const endpointResponse = page.waitForResponse((response) => (
     new URL(response.url()).pathname === "/api/v1/performance/endpoints" && response.ok()

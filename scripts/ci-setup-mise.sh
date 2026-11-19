@@ -86,6 +86,10 @@ else
   sdk-python)
     ci_tools=(python@3.13.5)
     ;;
+  # SDK journeys：服务端构建（go、web 的 node/pnpm）、journey 的 jq/rg 与 sdk-python 任务的 Python。
+  sdk-journeys)
+    ci_tools=(go node pnpm jq rg python@3.13.5)
+    ;;
   release)
     ci_tools=(
       go node pnpm jq

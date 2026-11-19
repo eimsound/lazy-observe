@@ -295,6 +295,12 @@ python -m venv .venv
 .venv/bin/python -m pytest -q tests
 '''
 
+[tasks.sdk-journeys]
+description = "Start a real platform (temp data dir, free ports) and run the Go, Node, Python, and Browser SDK journeys against it"
+# build 带嵌入的前端（browser journey 要登录真实 UI）；sdk-python 准备 sdk/python/.venv。
+depends = ["build", "storage-bins", "sdk-python"]
+run = "bash scripts/sdk-journeys.sh"
+
 [tasks.install-check]
 description = "Validate installer platform, checksum, extraction, and mode contracts"
 run = "bash scripts/check-install.sh"
