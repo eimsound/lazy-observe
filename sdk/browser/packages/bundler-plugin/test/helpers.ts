@@ -40,3 +40,8 @@ export async function makeOutputDir(): Promise<string> {
 }
 
 export function dsnFor(origin: string): string { return `${origin}/p/default@secret-token`; }
+
+/** 一个不在任何 git 仓库里的空目录（模拟 Docker 构建排除了 .git），用来让 git 推断 release 失败。 */
+export async function makeNonGitDir(): Promise<string> {
+  return fs.mkdtemp(path.join(os.tmpdir(), "lazy-observe-nogit-"));
+}

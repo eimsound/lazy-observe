@@ -30,7 +30,12 @@ type GitRunner = (cwd: string) => string;
 export function inferRelease(explicit: string | undefined, cwd: string, runGit: GitRunner = defaultGitRunner): string {
   const configured = explicit?.trim();
   if (configured) return configured;
-  const sha = runGit(cwd).trim();
+  let sha = "";
+  try { sha = runGit(cwd).trim(); }
+  catch (error) {
+    // 没有 .git（例如 Docker 构建排除了它）或没装 git：给出可操作的报错，而不是 execFileSync 的 "Command failed"。
+    throw new Error("lazy-observe: unable to infer release from git; set release explicitly", { cause: error });
+  }
   if (!sha) throw new Error("lazy-observe: unable to infer release from git; set release explicitly");
   return sha.slice(0, 7);
 }

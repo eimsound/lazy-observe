@@ -9,6 +9,11 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((directory) =>
 
 describe("inferRelease", () => {
   it("prefers an explicit release", () => expect(inferRelease(" release-1 ", "/unused", () => { throw new Error("unexpected git"); })).toBe("release-1"));
+  it("turns a failing git into the clear 'set release explicitly' error", () => {
+    expect(() => inferRelease(undefined, "/repo", () => { throw new Error("Command failed: git rev-parse"); })).toThrow(
+      /unable to infer release from git; set release explicitly/
+    );
+  });
   it("uses the seven-character git sha", () => expect(inferRelease(undefined, "/repo", (cwd) => { expect(cwd).toBe("/repo"); return "1234567890abcdef\n"; })).toBe("1234567"));
 });
 

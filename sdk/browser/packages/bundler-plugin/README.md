@@ -25,12 +25,14 @@ export default defineConfig({
 });
 ```
 
-Options are `{ dsn, release, upload, stripSourceMaps }`. `release` defaults to the seven-character Git SHA, `upload` defaults to `true`, and `stripSourceMaps` defaults to `false`. The plugin uploads after `vite build` has written the bundle, and defines `__LAZY_OBSERVE_RELEASE__`; pass it to SDK initialization so events and source maps share one release:
+Options are `{ dsn, release, upload, stripSourceMaps }`. `release` defaults to the seven-character Git SHA of `HEAD`, `upload` defaults to `true`, and `stripSourceMaps` defaults to `false`. The plugin uploads after `vite build` has written the bundle, and defines `__LAZY_OBSERVE_RELEASE__`; pass it to SDK initialization so events and source maps share one release:
 
 ```ts
-declare const __LAZY_OBSERVE_RELEASE__: string;
+declare const __LAZY_OBSERVE_RELEASE__: string | undefined;
 init({ dsn, release: __LAZY_OBSERVE_RELEASE__ });
 ```
+
+The Git SHA is only needed to upload. Without a DSN, or with `upload: false`, a missing `.git` (for example a Docker build that excludes it) does not fail the build: `__LAZY_OBSERVE_RELEASE__` is then defined as `undefined`, which the browser SDK accepts (events carry no release). With a DSN and no `release` and no readable Git checkout, `vite build` fails before bundling with `unable to infer release from git; set release explicitly`: pass `release` (for example `release: process.env.RELEASE`). `vite dev` never fails on this.
 
 ## Other bundlers (webpack, Rollup, esbuild, Turbopack): CLI
 
@@ -38,7 +40,7 @@ init({ dsn, release: __LAZY_OBSERVE_RELEASE__ });
 lazy-observe-sourcemaps upload --dir <directory> [--dsn <dsn>] [--release <release>] [--strip]
 ```
 
-`--dsn` defaults to `$LO_DSN` and `--release` defaults to `$LO_RELEASE`, then to the seven-character Git SHA. `--strip` deletes the local `.map` files after a successful upload. Pass the same release to the browser SDK, because the SDK does not read it from the build. Pick a value in your build (for example `LO_RELEASE=$(git rev-parse --short=7 HEAD)`) and give it to both the CLI and the code that calls `init({ release })`.
+`--dsn` defaults to `$LO_DSN` and `--release` defaults to `$LO_RELEASE`, then to the seven-character Git SHA. Without a DSN the release is never inferred, so the CLI still warns and exits 0 in a directory without `.git`; with a DSN and no release and no Git checkout it exits 1 with `unable to infer release from git; set release explicitly`. `--strip` deletes the local `.map` files after a successful upload. Pass the same release to the browser SDK, because the SDK does not read it from the build. Pick a value in your build (for example `LO_RELEASE=$(git rev-parse --short=7 HEAD)`) and give it to both the CLI and the code that calls `init({ release })`.
 
 ### Next.js
 
@@ -74,7 +76,7 @@ npm and pnpm run `postbuild` automatically after `build`. Yarn 2 and newer do no
 
 ## Credentials and skipping
 
-The DSN contains the source map upload token (`los_…`), a secret. In CI, store it as a secret and expose it to the build step as `LO_DSN` (for example `env: { LO_DSN: ${{ secrets.LO_DSN }} }` in GitHub Actions); do not commit it or put it on a command line that CI logs. When you build locally without `LO_DSN`, the plugin and the CLI print a warning, upload nothing, and succeed, so local builds never need credentials.
+The DSN contains the source map upload token (`los_…`), a secret. In CI, store it as a secret and expose it to the build step as `LO_DSN` (for example `env: { LO_DSN: ${{ secrets.LO_DSN }} }` in GitHub Actions); do not commit it or put it on a command line that CI logs. When you build locally without `LO_DSN`, the plugin and the CLI print a warning, upload nothing, and succeed, so local builds never need credentials (or a Git checkout).
 
 If a DSN is set but the upload fails (bad DSN, rejected token, server unreachable, duplicate basenames), the Vite build fails and the CLI exits with status 1. Usage errors exit with 2.
 

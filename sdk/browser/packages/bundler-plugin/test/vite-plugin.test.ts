@@ -3,7 +3,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { vite } from "../src/index";
 import defaultExport from "../src/vite";
-import { dsnFor, makeOutputDir, startServer } from "./helpers";
+import { dsnFor, makeNonGitDir, makeOutputDir, startServer } from "./helpers";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { await Promise.all(cleanups.splice(0).map((cleanup) => cleanup())); });
@@ -51,6 +51,47 @@ describe("vite plugin", () => {
     const { dir } = await setup();
     const warnings = await build(vite({ dsn: "", release: "vite-1" }), dir);
     expect(warnings).toHaveLength(1);
+  });
+
+  describe("when the release cannot be inferred from git (no .git, no explicit release)", () => {
+    async function noGitRoot() {
+      const root = await makeNonGitDir();
+      cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
+      return root;
+    }
+
+    it("without a DSN: config and build succeed, warn once and define the release as undefined", async () => {
+      const root = await noGitRoot();
+      const plugin = vite({});
+      expect(plugin.config({ root })).toEqual({ define: { __LAZY_OBSERVE_RELEASE__: "undefined" } });
+      const warnings: string[] = [];
+      plugin.configResolved({ root, command: "build", build: { outDir: "dist" } });
+      await plugin.writeBundle.call({ warn: (message) => warnings.push(message) });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/no DSN/);
+    });
+
+    it("with a DSN: the build fails with a clear message that names the release option", async () => {
+      const root = await noGitRoot();
+      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@secret-token" });
+      expect(() => plugin.config({ root })).not.toThrow();
+      expect(() => plugin.configResolved({ root, command: "build", build: { outDir: "dist" } })).toThrow(
+        /unable to infer release.*set release explicitly/
+      );
+    });
+
+    it("with a DSN: serve does not fail, the release stays undefined", async () => {
+      const root = await noGitRoot();
+      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@secret-token" });
+      expect(plugin.config({ root })).toEqual({ define: { __LAZY_OBSERVE_RELEASE__: "undefined" } });
+      expect(() => plugin.configResolved({ root, command: "serve", build: { outDir: "dist" } })).not.toThrow();
+    });
+
+    it("with a DSN but upload: false: the build does not need a release", async () => {
+      const root = await noGitRoot();
+      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@secret-token", upload: false });
+      expect(() => plugin.configResolved({ root, command: "build", build: { outDir: "dist" } })).not.toThrow();
+    });
   });
 
   it("fails the build when the upload is rejected", async () => {
