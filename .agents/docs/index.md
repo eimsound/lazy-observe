@@ -12,5 +12,6 @@
 | [`plans/`](plans/) | `/skill:spec-to-plan` 产出的实现计划和执行日志 |
 | [`specs/`](specs/) | spec |
 | [`research/`](research/) | 调研归档；本地 PoC 的结论也写在这里（PoC 代码不提交） |
-| [`agents/`](agents/) | 上游 skill 的仓库配置：issue tracker、triage 标签、领域文档 |
+| [`licensing.md`](licensing.md) | 依赖许可证：白名单与检查范围、Air 与 MPL-2.0（`lightningcss`）两项开发期例外的边界和理由 |
+| [`agents/`](agents/) | 上游 skill 的仓库配置（issue tracker、triage 标签、领域文档）；`agents/skills.md` 是更新上游 skill 的步骤和本地 patch |
 | `afk/<goal>/` | `do` 的 afk-run 记忆，用到时再建 |

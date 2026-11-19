@@ -129,7 +129,7 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 
 | 改动路径 | 跑哪些 job |
 | --- | --- |
-| `*.md`、`docs/**`、`LICENSE`、`.agents/**` | 不跑业务 job，`ci-ok` 直接绿 |
+| `*.md`、`docs/**`、`LICENSE`、`.agents/**`、`.claude/**` | 不跑业务 job，`ci-ok` 直接绿 |
 | `sdk/node/**`、`sdk/browser/**`、`sdk/python/**` | 对应语言的 SDK job |
 | `sdk/go/**` | Go SDK job + 服务端 Go 检查、构建、e2e、HA E2E |
 | `web/**` | web |
