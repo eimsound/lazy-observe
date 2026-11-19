@@ -9,6 +9,7 @@ import logging
 import os
 import platform
 import resource
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -232,37 +233,86 @@ class Client:
     # -- lifecycle ----------------------------------------------------------
 
     def shutdown(self, timeout: float = 10.0) -> Optional[BaseException]:
-        """Flush all enabled signals and release SDK resources."""
+        """Flush all enabled signals and release SDK resources.
+
+        Like Go's ``Shutdown(ctx)``, every step draws on one deadline: error transport,
+        then profiling, then the OTel providers. A step that finds the budget spent is
+        still run (so it can drop what it holds and release its resources) and its
+        result is a ``TimeoutError``; shutdown never raises and never takes longer than
+        ``timeout``, whatever a step does (except while the interpreter is finalizing,
+        where no thread can be started and the steps run inline). Returns the first
+        error, if any.
+        """
         errs: List[BaseException] = []
         deadline = time.monotonic() + max(0.0, timeout)
-        if self.error_transport is not None:
-            result = self.error_transport.close(timeout)
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        def step(name: str, fn: Any) -> None:
+            result = _run_bounded(name, fn, remaining())
             if result:
                 errs.append(result)
+
+        if self.error_transport is not None:
+            transport = self.error_transport
+            step("error transport", lambda: transport.close(remaining()))
         if self.profiling is not None:
             # After the error queue (short, user-triggered) and before the OTel
             # providers, as in Go: a profiling window must not eat their budget.
-            try:
-                result = self.profiling.shutdown(max(0.0, deadline - time.monotonic()))
-            except Exception as exc:  # noqa: BLE001 - shutdown reports, it never raises
-                result = exc
-            if result:
-                errs.append(result)
+            profiling = self.profiling
+            step("profiling", lambda: profiling.shutdown(remaining()))
         for provider, name in (
             (self.logger_provider, "logs"),
             (self.tracer_provider, "traces"),
             (self.meter_provider, "metrics"),
         ):
-            if provider is None:
+            # A signal that is off holds None or an API no-op provider, which has no
+            # shutdown: nothing to stop.
+            stop = getattr(provider, "shutdown", None)
+            if not callable(stop):
                 continue
-            try:
-                provider.shutdown()
-            except Exception as exc:  # noqa: BLE001
-                errs.append(RuntimeError(f"{name} shutdown: {exc}"))
+            step(name, stop)
         return errs[0] if errs else None
 
     def __repr__(self) -> str:
         return f"<Client degraded={self.degraded} service={self.config.service_name!r}>"
+
+
+def _run_bounded(name: str, fn: Any, budget: float) -> Optional[BaseException]:
+    """Run one shutdown step on a daemon thread and wait at most ``budget`` for it.
+
+    Python has no ctx to cancel with, and not every step takes a timeout (the OTel
+    providers do not), so the wait is what enforces the shared deadline. A step that
+    outlives its budget is left to finish in the background; it cannot hold the
+    caller. Never raises.
+
+    While the interpreter is finalizing (``shutdown`` called from a ``__del__`` or a
+    finalizer at teardown) no thread can be started: 3.12+ raises, 3.9-3.11 block in
+    ``start()`` for good. The step then runs inline, unbounded, as it did before the
+    shared deadline existed. ``atexit`` handlers run before that and keep the bound.
+    """
+    outcome: List[Optional[BaseException]] = [None]
+
+    def target() -> None:
+        try:
+            outcome[0] = fn()
+        except Exception as exc:  # noqa: BLE001 - shutdown reports, it never raises
+            outcome[0] = RuntimeError(f"{name} shutdown: {exc}")
+
+    if sys.is_finalizing():
+        target()
+        return outcome[0]
+    thread = threading.Thread(target=target, name=f"lazyobserve-shutdown-{name}", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:  # can't start a thread (finalizing, or out of threads)
+        target()
+        return outcome[0]
+    thread.join(budget)
+    if thread.is_alive():
+        return TimeoutError(f"{name} shutdown: budget exhausted")
+    return outcome[0]
 
 
 def _now_rfc3339() -> str:
