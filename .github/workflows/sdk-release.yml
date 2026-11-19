@@ -64,14 +64,16 @@ jobs:
       PUBLISH_FLAG: ${{ github.event_name == 'push' && '--publish' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.13"
-      - name: Verify and build
-        # PUBLISH_FLAG is intentionally unquoted: empty means dry run.
-        run: bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
+      # 与 ci.yml 的 sdk-python job 同一套引导：uv 由 mise 提供，不用 setup-python 与 pip，
+      # 构建依赖受 sdk/python/pyproject.toml 的 [tool.uv] exclude-newer（7 天最小发布年龄）约束。
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
         env:
-          PYTHON: python
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MISE_CI_PROFILE: sdk-python
+      - name: Verify and build
+        # mise task 读 SDK_TAG / PUBLISH_FLAG（上面的 job env）；PUBLISH_FLAG 为空就是 dry run。
+        run: mise run sdk-python-release
       - name: Upload Python distribution to PyPI
         if: github.event_name == 'push'
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
