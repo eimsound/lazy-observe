@@ -202,6 +202,48 @@ if [[ -f $release_wf ]]; then
   [[ $archive_job == *'needs: [container-check, '* ]] ||
     fail "$release_wf: archive must need container-check so the image scan blocks publishing"
 
+  # 嵌入的 Victoria 二进制是 gzip 后 go:embed 的 payload，镜像扫描看不到；storage-bin-scan 单独扫原始二进制，
+  # archive 必须依赖它（docker 经 archive 传递依赖），否则这道门禁形同虚设。
+  storage_scan=$(release_job "$release_wf" storage-bin-scan)
+  # run 行必须整行精确匹配：后缀 `|| true` 之类会让扫描失败也不挡发版。
+  grep -Eq '^[[:space:]]+run:[[:space:]]+bash scripts/check-storage-bin-vulns\.sh[[:space:]]*$' <<<"$storage_scan" ||
+    fail "$release_wf: storage-bin-scan must run exactly 'bash scripts/check-storage-bin-vulns.sh'"
+  # 扫描 job 不能被吞掉失败，也不能被条件跳过：continue-on-error 会让失败的 job 对 archive 算成功。
+  [[ $storage_scan != *continue-on-error* ]] ||
+    fail "$release_wf: storage-bin-scan must not set continue-on-error (a failed scan would not block publishing)"
+  # job 级（4 空格）和 step 级（`- if:` 或 8 空格 `if:`）的 if: 都不允许：被条件跳过的扫描 step 照样让 job 变绿。
+  if grep -Eq '^[[:space:]]+(-[[:space:]]+)?if:' <<<"$storage_scan"; then
+    fail "$release_wf: storage-bin-scan must not be conditional (no job- or step-level if:)"
+  fi
+  # 扫描要调 GitHub API 查上游 release（check-pinned-releases.sh --latest-eligible），step 必须带 GH_TOKEN，
+  # 否则匿名 60 次/小时在共享 runner 出口上容易被限流，而限流会让扫描 fail-closed 把发版挡住。
+  grep -Eq '^[[:space:]]+GH_TOKEN:[[:space:]]+\$\{\{ github\.token \}\}[[:space:]]*$' <<<"$storage_scan" ||
+    fail "$release_wf: storage-bin-scan must pass GH_TOKEN: \${{ github.token }} to the scan step"
+  # 测试钩子只给离线测试用：release.yml 里出现它们，说明有人想替换下载步骤或伪造 release 数据来放行门禁。
+  hooks_in_release=$(grep -En 'LO_STORAGE_BIN_DOWNLOADER|LO_PINNED_RELEASES_(FIXTURE|NOW|ROOT)' "$release_wf" || true)
+  [[ -z $hooks_in_release ]] ||
+    fail "$release_wf must not set offline-test hooks: $hooks_in_release"
+  # archive 的 needs 必须是单行列表且包含 storage-bin-scan（精确到列表元素，不是子串）。
+  archive_needs=$(grep -E '^    needs:' <<<"$archive_job" || true)
+  [[ $(grep -c . <<<"$archive_needs") -eq 1 && $archive_needs == *'['*']'* ]] ||
+    fail "$release_wf: archive must declare a single flow-style needs: [...] list"
+  archive_needs=${archive_needs#*\[}
+  archive_needs=${archive_needs%%\]*}
+  [[ ",${archive_needs// /}," == *,storage-bin-scan,* ]] ||
+    fail "$release_wf: archive must need storage-bin-scan so the embedded-binary scan blocks publishing"
+  # Trivy 的版本与 sha256 只在 scripts/install-trivy.sh 维护，两个扫描脚本都必须经它安装，不得各自内联下载。
+  for scanner in scripts/check-image-vulns.sh scripts/check-storage-bin-vulns.sh; do
+    [[ -f $scanner ]] || fail "$scanner is missing"
+    grep -Fq 'scripts/install-trivy.sh' "$scanner" ||
+      fail "$scanner must install Trivy through scripts/install-trivy.sh"
+    unpinned_trivy=$(grep -n 'releases/download' "$scanner" || true)
+    [[ -z $unpinned_trivy ]] || fail "$scanner must not download Trivy itself: $unpinned_trivy"
+  done
+  grep -Eq '^trivy_version=[0-9]+\.[0-9]+\.[0-9]+$' scripts/install-trivy.sh ||
+    fail 'scripts/install-trivy.sh must pin trivy_version=X.Y.Z'
+  [[ $(grep -Ec '^[[:space:]]+sha256=[0-9a-f]{64}$' scripts/install-trivy.sh) -eq 2 ]] ||
+    fail 'scripts/install-trivy.sh must pin one sha256 per architecture (amd64, arm64)'
+
   # chart 不单独发布（没有 helm package/push），发版产物里带的是 digest 固定的 Helm values 片段。
   # 自家镜像的 digest 只有 docker/build-push-action 推完镜像才存在，所以回填落在 docker 之后的
   # helm-values job：由 scripts/render-helm-release-values.sh 生成、作为 Release 资产上传。

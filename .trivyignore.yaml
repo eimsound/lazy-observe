@@ -1,4 +1,5 @@
-# 镜像漏洞扫描（scripts/check-image-vulns.sh）的例外清单。
+# 漏洞扫描的例外清单，两个扫描共用：镜像扫描（scripts/check-image-vulns.sh）与嵌入的 Victoria 二进制扫描
+# （scripts/check-storage-bin-vulns.sh）。
 #
 # 只在确认是误报、或漏洞代码路径在本产品里不可达时才加条目；能升级修掉的不要加。
 # 每条必须同时带：

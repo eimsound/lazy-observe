@@ -173,6 +173,10 @@ LO_STORAGE_BIN_DIR=${STORAGE_BIN_DIR:-$PWD/.cache/storage-bin} \
   bash scripts/download-storage-bins.sh
 '''
 
+[tasks.storage-bin-vulns]
+description = "Trivy-scan the pinned Victoria binaries embedded in lazy-observe (linux amd64/arm64); fixable CRITICAL/HIGH fails"
+run = "bash scripts/check-storage-bin-vulns.sh"
+
 [tasks.e2e]
 description = "Run complete server-side Gateway E2E coverage plus recovery and restart evidence"
 depends = ["build", "storage-bins"]
@@ -244,6 +248,7 @@ run = [
   "bash scripts/check-e2e-contract.sh",
   "bash scripts/ci-changes-test.sh",
   "bash scripts/check-pinned-releases-test.sh",
+  "bash scripts/check-storage-bin-vulns-test.sh",
 ]
 
 [tasks.ci-changes-test]
