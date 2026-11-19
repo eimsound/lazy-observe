@@ -105,15 +105,23 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
     放在试采之前。
   - 暴露一个「窗口前重查」接口（只查 GIL 状态），供 S3 每个窗口开始前调用。
   - 失败分两级计数：
-    - 窗口级：`sample()` 连续 3 个窗口抛异常就停用，即现有的 `MAX_CONSECUTIVE_FAILURES = 3`；
-    - tick 级：统计窗口内 `collect_failed_sample()` 的次数，失败超过一半（50%）就停用。
+    - 窗口级：一个窗口 = collect（`sample()`）+ encode，任一步抛异常都算窗口失败；只有 encode
+      成功才把计数清零；连续 3 个失败窗口就停用（`MAX_CONSECUTIVE_FAILURES = 3`）。#94 已经这样实现。
+    - tick 级：统计窗口内 `collect_failed_sample()` 的次数，失败超过一半就停用
+      （`FAILURE_RATE_THRESHOLD = 0.5`，#94 里的 0.2 要改）。窗口内尝试次数（成功加失败）
+      不到 `MIN_FAILURE_RATE_ATTEMPTS = 100` 时不判断，保留 #94 的实现。
+    - 失败率以 `last_failure_rate()` 暴露给 S3，S2 本身不接 `record_telemetry_drop`。
+    - `recheck_gil()` 发现 GIL 已启用就永久停用；它自身不打 warning，带原因码的 warning 由 S3 打。
+    - 窗口长度和间隔在 S2 里保持常量（`WINDOW_SECONDS = 10.0`、`WINDOW_INTERVAL_SECONDS = 60.0`）；
+      面向用户的 `profiling_interval` 在 S3 实现。
   - 停用后在本进程内不再恢复，删掉 `backoff_seconds()` 的重试用途，退避只留给上传。
   - 失败 tick 数交给 S3，由 S3 计入 `record_telemetry_drop("profile", "sample_failed", n)`。
   - 不检测 greenlet（ADR 0014：用户自己打开、自己负责，只在文档里写明）。
   - Red：用 fake 模块分别断言：
     - GIL 构建、`_is_gil_enabled()` 为 True、非 Linux 时返回不可用原因码；
-    - 连续 3 个窗口抛异常时停用；
-    - 一个窗口内失败 tick 为 51% 时停用，49% 时不停用；
+    - 连续 3 个窗口失败（collect 抛异常，或 collect 成功但 encode 抛异常）时停用；collect 成功、
+      encode 失败不会把计数清零；
+    - 一个窗口内失败 tick 为 51% 时停用，49% 时不停用；尝试次数不到 100 时，即使 100% 失败也不停用；
     - 停用后不再开新窗口。
 
     真实 3.15t 测试改为纯 Python 忙线程负载（不再依赖释放 GIL 的 hashlib）；真实 3.15 GIL 测试
@@ -295,7 +303,8 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
 
 ## 未决事项
 
-- 已定（2026-11 grilling）：窗口级 N = 3；tick 失败率阈值 50%；失败 tick 复用
+- 已定（2026-11 grilling）：窗口级 N = 3（窗口 = collect + encode）；tick 失败率阈值 50%（窗口内
+  尝试次数不到 100 时不判断）；失败 tick 复用
   `record_telemetry_drop`、`Diagnostics` 不加字段；开放 `profiling_interval`；不检测 greenlet；
   不向 CPython 上游提交 issue 或草稿。
 - 后续立项（不在本计划内）：sidecar 外部 attach（覆盖 GIL 构建）与墙钟剖析（新增 profile
