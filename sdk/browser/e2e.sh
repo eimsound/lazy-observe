@@ -23,7 +23,8 @@ ERROR_JOURNEY_RELEASE=browser-error-journey-v1
 #   LO_E2E_PLATFORM_URL    平台地址
 #   LO_E2E_TOKEN           默认项目的项目 API Token（lo_…），只用来拼 DSN 做摄取
 #   LO_E2E_ADMIN_PASSWORD  admin 密码；所有读请求都用登录得到的会话 Cookie 加
-#                          X-LO-Project: default（ADR 0010：项目 Token 只能摄取，读路由返回 403）
+#                          X-LO-Project: default（ADR 0010：项目 Token 只能摄取，读路由返回 403）。
+#                          上传 Source Map 用的 los_ Token 也由脚本用这个会话通过管理 API 创建（ADR 0018）
 if [ -z "${LO_E2E_PLATFORM_URL:-}" ] || [ -z "${LO_E2E_TOKEN:-}" ] || [ -z "${LO_E2E_ADMIN_PASSWORD:-}" ]; then
 	printf 'SDK e2e 需要 LO_E2E_PLATFORM_URL、LO_E2E_TOKEN（lo_ 摄取 Token）与 LO_E2E_ADMIN_PASSWORD（读请求用 admin 会话）指向运行中的 lazy-observe 平台\n' >&2
 	exit 1
@@ -72,6 +73,7 @@ need go
 need node
 need pnpm
 need rg
+need jq
 
 assert_port_free() {
 	port=$1
@@ -170,10 +172,40 @@ done
 test "$(curl -sS -o /dev/null -w '%{http_code}' "$GO_URL/performance/error")" = 503
 test "$(curl -sS -o /dev/null -w '%{http_code}' "$NODE_URL/performance/error")" = 503
 
+# ADR 0018: 上传 Source Map 要用项目级的 los_ 上传 Token，项目 API Token（lo_）会得到 403。
+# 登录 admin，通过管理 API 为默认项目创建上传 Token；值只在创建响应里出现一次。
+printf 'creating a source map upload token through the management API...\n'
+JAR="$WORK/admin-cookies"
+jq -n --arg password "$PASSWORD" '{username: "admin", $password}' >"$WORK/login.json"
+curl -fsS --max-time 10 -c "$JAR" -H 'Content-Type: application/json' \
+	--data-binary @"$WORK/login.json" "$PLATFORM_URL/api/auth/login" >/dev/null
+CSRF=$(sed -n 's/.*[[:space:]]lo_csrf[[:space:]]*//p' "$JAR" | head -n 1)
+PROJECT_ID=$(curl -fsS --max-time 10 -b "$JAR" "$PLATFORM_URL/api/projects" |
+	jq -r '.[] | select(.slug == "default") | .id')
+test -n "$PROJECT_ID"
+UPLOAD_TOKEN=$(curl -fsS --max-time 10 -b "$JAR" -H "X-CSRF-Token: $CSRF" \
+	-H 'Content-Type: application/json' --data '{"name":"browser-e2e"}' \
+	"$PLATFORM_URL/api/projects/$PROJECT_ID/source-map-upload-tokens" | jq -r '.value')
+case "$UPLOAD_TOKEN" in
+los_*) ;;
+*)
+	printf 'management API did not issue a los_ source map upload token\n' >&2
+	exit 1
+	;;
+esac
+printf '{"version":3,"sources":[],"names":[],"mappings":""}' >"$WORK/probe.js.map"
+status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+	-H "Authorization: Bearer $TOKEN" -F "probe.js=@$WORK/probe.js.map;filename=probe.js.map" \
+	"$PLATFORM_URL/api/releases/rejected-by-project-token/sourcemaps")
+if [ "$status" != 403 ]; then
+	printf 'project API token upload returned %s, want 403 source_map_upload_token_required\n' "$status" >&2
+	exit 1
+fi
+
 printf 'building the production React fixture and uploading its source maps...\n'
 (
 	cd "$SDK_DIR"
-	LO_E2E_DSN="$PLATFORM_URL/p/default@$TOKEN" \
+	LO_E2E_DSN="$PLATFORM_URL/p/default@$UPLOAD_TOKEN" \
 		LO_E2E_RELEASE="$ERROR_JOURNEY_RELEASE" \
 		LO_E2E_STRIP_SOURCEMAPS=1 \
 		pnpm --filter @lazy-observe/example-react build

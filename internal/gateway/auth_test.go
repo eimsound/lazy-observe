@@ -125,6 +125,9 @@ func wireMetadataCapabilities(cfg *Config) {
 	if cfg.Notifications == nil {
 		cfg.Notifications = store
 	}
+	if cfg.UploadTokens == nil {
+		cfg.UploadTokens = store
+	}
 }
 
 func newMetadataTestGateway(store *meta.Store, cfg Config) *Gateway {

@@ -8,7 +8,7 @@ import (
 	"entgo.io/ent/schema/field"
 )
 
-// ProjectAPIToken authenticates telemetry ingest and queries for one project.
+// ProjectAPIToken authenticates telemetry ingest for one project (ADR 0010).
 type ProjectAPIToken struct {
 	ent.Schema
 }

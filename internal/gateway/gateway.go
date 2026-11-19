@@ -66,6 +66,13 @@ type TokenStore interface {
 	Revision() uint64
 }
 
+// UploadTokenStore resolves source map upload tokens (ADR 0018). It is separate
+// from TokenStore so ingest authentication can never resolve an upload token.
+type UploadTokenStore interface {
+	AuthenticateSourceMapUploadToken(context.Context, string) (meta.ProjectInfo, error)
+	Revision() uint64
+}
+
 type HealthChecker interface {
 	Health(context.Context) map[string]error
 }
@@ -112,6 +119,7 @@ type Config struct {
 	// operational probes. Empty generates a fresh 128-bit value in New.
 	InstanceID              string
 	Tokens                  TokenStore
+	UploadTokens            UploadTokenStore
 	Store                   ManagementStore
 	Account                 account.Behavior
 	Limits                  state.Limiter
@@ -182,6 +190,7 @@ type Gateway struct {
 	app                      *fiber.App
 	instanceID               string
 	auth                     *Authenticator
+	uploadAuth               *Authenticator
 	store                    ManagementStore
 	account                  account.Behavior
 	limits                   state.Limiter
@@ -314,6 +323,7 @@ func New(cfg Config) *Gateway {
 		auth: NewAuthenticator(
 			cfg.Tokens,
 		),
+		uploadAuth:               newUploadAuthenticator(cfg.UploadTokens),
 		store:                    cfg.Store,
 		account:                  cfg.Account,
 		limits:                   cfg.Limits,
@@ -527,7 +537,7 @@ func (g *Gateway) registerTelemetryRoutes() {
 	g.browserIngestRoute("/api/events/errors", g.errorsIngest)
 	g.browserIngestRoute("/api/events/vitals", g.vitalsIngest)
 	g.browserIngestRoute("/api/events/diagnostics", g.sdkDiagnosticsIngest)
-	g.app.Post("/api/releases/:release/sourcemaps", g.auth.Middleware, g.uploadSourceMaps)
+	g.app.Post("/api/releases/:release/sourcemaps", g.uploadAuth.UploadMiddleware, g.uploadSourceMaps)
 	g.app.Get("/api/releases", g.queryRequired, g.listSourceMapReleases)
 	g.browserIngestRoute("/api/replay/segments", g.replayIngest)
 	g.app.Post("/api/profiles", g.auth.Middleware, g.profileIngest)
@@ -620,6 +630,13 @@ func (g *Gateway) registerSessionAPI() {
 	api.Get("/projects/:id/tokens", g.listProjectAPITokens)
 	api.Post("/projects/:id/tokens", g.adminRequired, g.createProjectAPIToken)
 	api.Delete("/projects/:id/tokens/:tokenID", g.adminRequired, g.revokeProjectAPIToken)
+	api.Get("/projects/:id/source-map-upload-tokens", g.adminRequired, g.listSourceMapUploadTokens)
+	api.Post("/projects/:id/source-map-upload-tokens", g.adminRequired, g.createSourceMapUploadToken)
+	api.Delete(
+		"/projects/:id/source-map-upload-tokens/:tokenID",
+		g.adminRequired,
+		g.revokeSourceMapUploadToken,
+	)
 	api.Get("/users", g.adminRequired, g.listUsers)
 	api.Get("/users/:id", g.adminRequired, g.getUser)
 	api.Post("/users", g.adminRequired, g.createUser)
@@ -728,7 +745,7 @@ func (g *Gateway) mcpRequired(c *fiber.Ctx) error {
 		return unauthorizedResponse(c)
 	}
 	if !strings.HasPrefix(token, "lou_") {
-		return ingestOnlyToken(c)
+		return nonQueryToken(c, token)
 	}
 	return g.queryRequired(c)
 }
@@ -740,6 +757,34 @@ func ingestOnlyToken(c *fiber.Ctx) error {
 		"code":  "ingest_only_token",
 		"error": "project API tokens can only ingest telemetry; use a session or a user API token to query",
 	})
+}
+
+// uploadOnlyToken rejects a source map upload token anywhere but the upload route
+// (ADR 0018). It is confidential but narrowly scoped: it can neither ingest nor read.
+func uploadOnlyToken(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+		"code":  "upload_only_token",
+		"error": "source map upload tokens can only upload source maps to their project",
+	})
+}
+
+// sourceMapUploadTokenRequired rejects a credential that is not an upload token on
+// the upload route: the project API token is public (ADR 0010) and must not be
+// able to overwrite a release's source maps (ADR 0018).
+func sourceMapUploadTokenRequired(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+		"code":  "source_map_upload_token_required",
+		"error": "source map upload requires a source map upload token (los_...); create one in the project settings",
+	})
+}
+
+// nonQueryToken answers a bearer credential that cannot query: an upload token or a
+// project API token.
+func nonQueryToken(c *fiber.Ctx, token string) error {
+	if strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) {
+		return uploadOnlyToken(c)
+	}
+	return ingestOnlyToken(c)
 }
 
 func unauthorizedResponse(c *fiber.Ctx) error {
@@ -1117,8 +1162,8 @@ func (g *Gateway) queryRequired(c *fiber.Ctx) error {
 		c.Locals(userLocal, u)
 		return g.loadQueryProject(c)
 	}
-	if hasTokenCredential(c) {
-		return ingestOnlyToken(c)
+	if token := bearerCredential(c); token != "" {
+		return nonQueryToken(c, token)
 	}
 	if err := g.loadSession(c); err != nil {
 		if !errors.Is(err, errResponseWritten) {
@@ -1145,10 +1190,6 @@ func (g *Gateway) loadQueryProject(c *fiber.Ctx) error {
 	}
 	c.Locals(projectLocal, p)
 	return c.Next()
-}
-
-func hasTokenCredential(c *fiber.Ctx) bool {
-	return bearerCredential(c) != ""
 }
 
 func bearerCredential(c *fiber.Ctx) string {
@@ -1189,7 +1230,7 @@ func (g *Gateway) userRequired(c *fiber.Ctx) error {
 		if !strings.HasPrefix(token, "lou_") {
 			// ADR 0010: project API tokens are ingest-only; refuse them on the
 			// session API exactly like on the telemetry query routes.
-			return ingestOnlyToken(c)
+			return nonQueryToken(c, token)
 		}
 		u, err := g.loadUserAPIToken(c, token)
 		if err != nil {
@@ -1339,30 +1380,78 @@ type authenticationCall struct {
 	err      error
 }
 
+// Authenticator resolves a bearer credential to a project through one lookup. Two
+// instances exist: ingest (project API tokens) and source map upload (ADR 0018);
+// each only ever consults its own token table.
 type Authenticator struct {
-	store    TokenStore
-	mu       sync.RWMutex
-	cache    map[string]cachedProject
-	inflight map[string]*authenticationCall
-	revision uint64
+	revisionFn func() uint64
+	lookup     func(context.Context, string) (meta.ProjectInfo, error)
+	invalid    error
+	configured bool
+	mu         sync.RWMutex
+	cache      map[string]cachedProject
+	inflight   map[string]*authenticationCall
+	revision   uint64
 }
 
 func NewAuthenticator(store TokenStore) *Authenticator {
+	a := newAuthenticator()
+	if store != nil {
+		a.revisionFn = store.Revision
+		a.lookup = store.AuthenticateProjectAPIToken
+		a.invalid = meta.ErrInvalidProjectAPIToken
+		a.configured = true
+	}
+	return a
+}
+
+func newUploadAuthenticator(store UploadTokenStore) *Authenticator {
+	a := newAuthenticator()
+	if store != nil {
+		a.revisionFn = store.Revision
+		a.lookup = store.AuthenticateSourceMapUploadToken
+		a.invalid = meta.ErrInvalidSourceMapUploadToken
+		a.configured = true
+	}
+	return a
+}
+
+func newAuthenticator() *Authenticator {
 	return &Authenticator{
-		store:    store,
 		cache:    make(map[string]cachedProject),
 		inflight: make(map[string]*authenticationCall),
 	}
 }
 
+// Middleware authenticates ingest routes with a project API token. A source map
+// upload token is refused explicitly: it is a different credential kind.
 func (a *Authenticator) Middleware(c *fiber.Ctx) error {
 	token := bearerCredential(c)
-	if token == "" || a.store == nil {
+	if strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) {
+		return uploadOnlyToken(c)
+	}
+	return a.authenticateRequest(c, token)
+}
+
+// UploadMiddleware authenticates the source map upload route. Only a source map
+// upload token is accepted; project API tokens and user tokens get 403 with
+// source_map_upload_token_required, anything else 401.
+func (a *Authenticator) UploadMiddleware(c *fiber.Ctx) error {
+	token := bearerCredential(c)
+	if token != "" && !strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) &&
+		(strings.HasPrefix(token, "lo_") || strings.HasPrefix(token, "lou_")) {
+		return sourceMapUploadTokenRequired(c)
+	}
+	return a.authenticateRequest(c, token)
+}
+
+func (a *Authenticator) authenticateRequest(c *fiber.Ctx, token string) error {
+	if token == "" || !a.configured {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 	p, err := a.authenticate(c.UserContext(), token)
 	if err != nil {
-		if !errors.Is(err, meta.ErrInvalidProjectAPIToken) && !meta.IsNotFound(err) {
+		if !errors.Is(err, a.invalid) && !meta.IsNotFound(err) {
 			return c.Status(fiber.StatusServiceUnavailable).
 				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
 		}
@@ -1375,7 +1464,7 @@ func (a *Authenticator) Middleware(c *fiber.Ctx) error {
 func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.ProjectInfo, error) {
 	for {
 		a.mu.Lock()
-		revision := a.store.Revision()
+		revision := a.revisionFn()
 		if revision != a.revision {
 			clear(a.cache)
 			a.revision = revision
@@ -1411,9 +1500,9 @@ func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.Pr
 		a.inflight[key] = call
 		a.mu.Unlock()
 
-		project, authErr := a.store.AuthenticateProjectAPIToken(ctx, key)
+		project, authErr := a.lookup(ctx, key)
 		a.mu.Lock()
-		latestRevision := a.store.Revision()
+		latestRevision := a.revisionFn()
 		if latestRevision != a.revision {
 			clear(a.cache)
 			a.revision = latestRevision

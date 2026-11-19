@@ -4,6 +4,14 @@ Uploads emitted source maps to lazy-observe. It ships a Vite plugin and a `lazy-
 
 Use one or the other, never both: a Vite project uses the plugin and does not call the CLI.
 
+## DSN: use a source map upload token
+
+The `dsn` must carry a **source map upload token** (`los_…`), not the project API token (`lo_…`) that browsers use: the upload endpoint answers a project API token with `403 source_map_upload_token_required`. An upload token can only upload source maps to its own project; it cannot ingest or read anything.
+
+1. An admin (the global role that also manages project API tokens) creates the token in the web UI under **Settings → Projects → Manage tokens → Source map upload tokens**. The value is shown once, together with a ready-made DSN, `<origin>/p/<project>@los_…`.
+2. Put that DSN in a CI secret (for example `LO_DSN`) and expose it only to the build job. Never commit it and never ship it to the browser; anyone holding it can replace the project's source maps. Revoke it from the same dialog if it leaks.
+3. Keep the ordinary project DSN (`lo_…`) for `init({ dsn })` in the browser.
+
 ## Vite
 
 ```ts
@@ -66,7 +74,7 @@ npm and pnpm run `postbuild` automatically after `build`. Yarn 2 and newer do no
 
 ## Credentials and skipping
 
-The DSN contains the upload token. In CI, store it as a secret and expose it to the build step as `LO_DSN` (for example `env: { LO_DSN: ${{ secrets.LO_DSN }} }` in GitHub Actions); do not commit it or put it on a command line that CI logs. When you build locally without `LO_DSN`, the plugin and the CLI print a warning, upload nothing, and succeed, so local builds never need credentials.
+The DSN contains the source map upload token (`los_…`), a secret. In CI, store it as a secret and expose it to the build step as `LO_DSN` (for example `env: { LO_DSN: ${{ secrets.LO_DSN }} }` in GitHub Actions); do not commit it or put it on a command line that CI logs. When you build locally without `LO_DSN`, the plugin and the CLI print a warning, upload nothing, and succeed, so local builds never need credentials.
 
 If a DSN is set but the upload fails (bad DSN, rejected token, server unreachable, duplicate basenames), the Vite build fails and the CLI exits with status 1. Usage errors exit with 2.
 
@@ -82,4 +90,4 @@ It resolves with `{ uploaded, skipped?, release? }`, and rejects when the upload
 
 ## Wire format
 
-Each multipart field name is the emitted minified basename (`app.js`), and its body is the corresponding `app.js.map`, sent to `POST /api/releases/:release/sourcemaps` with `Authorization: Bearer <token>`. Basenames must be unique across the output tree because server lookup intentionally matches browser frame basenames.
+Each multipart field name is the emitted minified basename (`app.js`), and its body is the corresponding `app.js.map`, sent to `POST /api/releases/:release/sourcemaps` with `Authorization: Bearer <token>`, where `<token>` is the source map upload token. Basenames must be unique across the output tree because server lookup intentionally matches browser frame basenames.

@@ -460,6 +460,80 @@ func (g *Gateway) revokeProjectAPIToken(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
+func (g *Gateway) listSourceMapUploadTokens(c *fiber.Ctx) error {
+	id, ok := pathID(c, "id")
+	if !ok {
+		return nil
+	}
+	tokens, err := g.management.ListSourceMapUploadTokens(c.UserContext(), id)
+	if err != nil {
+		return managementAPIError(c, err)
+	}
+	response := make([]tokenResponse, 0, len(tokens))
+	for _, token := range tokens {
+		response = append(response, tokenJSON(token))
+	}
+	return c.JSON(response)
+}
+
+func (g *Gateway) createSourceMapUploadToken(c *fiber.Ctx) error {
+	id, ok := pathID(c, "id")
+	if !ok {
+		g.auditManagement(
+			c,
+			auditEvent{
+				Action:        "source_map_upload_token.create",
+				TargetType:    "source_map_upload_token",
+				Success:       false,
+				FailureReason: "invalid_project_id",
+			},
+		)
+		return nil
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	invalid := len(c.Body()) != 0 && c.BodyParser(&body) != nil
+	issued, facts, err := g.management.IssueSourceMapUploadToken(
+		c.UserContext(),
+		management.IssueSourceMapUploadTokenInput{ProjectID: id, Name: body.Name, Invalid: invalid},
+	)
+	g.auditManagementFacts(c, facts)
+	if err != nil {
+		return managementAPIError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(issuedTokenResponse{
+		tokenResponse: tokenJSON(issued.Token),
+		Value:         issued.Value,
+	})
+}
+
+func (g *Gateway) revokeSourceMapUploadToken(c *fiber.Ctx) error {
+	projectID, ok := pathID(c, "id")
+	if !ok {
+		g.auditManagement(
+			c,
+			auditEvent{
+				Action:        "source_map_upload_token.revoke",
+				TargetType:    "source_map_upload_token",
+				Success:       false,
+				FailureReason: "invalid_project_id",
+			},
+		)
+		return nil
+	}
+	tokenID, err := strconv.Atoi(c.Params("tokenID"))
+	if err != nil || tokenID <= 0 {
+		tokenID = 0
+	}
+	facts, err := g.management.RevokeSourceMapUploadToken(c.UserContext(), projectID, tokenID)
+	g.auditManagementFacts(c, facts)
+	if err != nil {
+		return managementAPIError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 func (g *Gateway) listUsers(c *fiber.Ctx) error {
 	users, err := g.management.ListUsers(c.UserContext())
 	if err != nil {

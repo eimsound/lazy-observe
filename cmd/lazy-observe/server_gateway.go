@@ -64,6 +64,7 @@ func startGateway(
 	gw := gateway.New(
 		gateway.Config{
 			Tokens:                   metadata.store,
+			UploadTokens:             metadata.store,
 			Store:                    metadata.store,
 			Account:                  accounts,
 			Management:               management.New(metadata.store),

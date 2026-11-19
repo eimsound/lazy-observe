@@ -30,6 +30,10 @@ export interface IssuedProjectAPIToken extends ProjectAPIToken {
   value: string;
 }
 
+/** ADR 0018: confidential, upload-only credential (`los_…`); same non-secret shape. */
+export type SourceMapUploadToken = ProjectAPIToken;
+export type IssuedSourceMapUploadToken = IssuedProjectAPIToken;
+
 function delay<T>(value: T, ms = 200): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(value), ms));
 }
@@ -91,6 +95,40 @@ export async function revokeProjectAPIToken(projectId: string, tokenId: string):
     return delay(undefined, 200);
   }
   await apiSend<void>("DELETE", `/projects/${projectId}/tokens/${tokenId}`, undefined, {
+    base: API_ROOT,
+  });
+}
+
+export async function listSourceMapUploadTokens(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<SourceMapUploadToken[]> {
+  if (IS_MOCK) return delay([...((await loadMockAdmin()).mockUploadTokens[projectId] ?? [])]);
+  return apiGet<SourceMapUploadToken[]>(`/projects/${projectId}/source-map-upload-tokens`, {
+    base: API_ROOT,
+    signal,
+  });
+}
+
+export async function createSourceMapUploadToken(
+  projectId: string,
+  name: string,
+): Promise<IssuedSourceMapUploadToken> {
+  if (IS_MOCK) return delay((await loadMockAdmin()).createMockUploadToken(projectId, name), 250);
+  return apiSend<IssuedSourceMapUploadToken>(
+    "POST",
+    `/projects/${projectId}/source-map-upload-tokens`,
+    { name },
+    { base: API_ROOT },
+  );
+}
+
+export async function revokeSourceMapUploadToken(projectId: string, tokenId: string): Promise<void> {
+  if (IS_MOCK) {
+    (await loadMockAdmin()).revokeMockUploadToken(projectId, tokenId);
+    return delay(undefined, 200);
+  }
+  await apiSend<void>("DELETE", `/projects/${projectId}/source-map-upload-tokens/${tokenId}`, undefined, {
     base: API_ROOT,
   });
 }

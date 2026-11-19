@@ -24,6 +24,7 @@ func (Project) Fields() []ent.Field {
 func (Project) Edges() []ent.Edge {
 	return []ent.Edge{
 		edge.To("api_tokens", ProjectAPIToken.Type),
+		edge.To("source_map_upload_tokens", SourceMapUploadToken.Type),
 		edge.To("alert_rules", AlertRule.Type),
 		edge.To("silences", Silence.Type),
 		edge.To("inhibition_rules", InhibitionRule.Type),

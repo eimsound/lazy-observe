@@ -1358,7 +1358,6 @@ func TestSourceMapUploadSymbolicationFingerprintFallbackAndIsolation(t *testing.
 	p1, _ := store.CreateProject(ctx, "Default", "default")
 	p2, _ := store.CreateProject(ctx, "P2", "p2")
 	token1, _ := store.CreateProjectAPIToken(ctx, p1.ID)
-	token2, _ := store.CreateProjectAPIToken(ctx, p2.ID)
 	cookie := sessionCookie(t, store, "source-map-admin", "password", "admin")
 	blobs, err := blob.NewLocal(t.TempDir())
 	if err != nil {
@@ -1376,9 +1375,11 @@ func TestSourceMapUploadSymbolicationFingerprintFallbackAndIsolation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	uploadSourceMapTest(t, app, token1, "release-a", "one.min.js", mapData, http.StatusCreated)
-	uploadSourceMapTest(t, app, token1, "release-b", "two.min.js", mapData, http.StatusCreated)
-	uploadSourceMapTest(t, app, token2, "p2-release", "private.min.js", mapData, http.StatusCreated)
+	upload1 := createUploadTokenTest(t, store, p1.ID)
+	upload2 := createUploadTokenTest(t, store, p2.ID)
+	uploadSourceMapTest(t, app, upload1, "release-a", "one.min.js", mapData, http.StatusCreated)
+	uploadSourceMapTest(t, app, upload1, "release-b", "two.min.js", mapData, http.StatusCreated)
+	uploadSourceMapTest(t, app, upload2, "p2-release", "private.min.js", mapData, http.StatusCreated)
 
 	jsEvent := func(id, release, filename, function string) map[string]any {
 		return map[string]any{
@@ -1486,7 +1487,10 @@ func TestAcceptedErrorPinsItsSourceMapRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	uploadSourceMapTest(t, gw.App(), token, "pinned-release", "app.min.js", mapData, http.StatusCreated)
+	uploadSourceMapTest(
+		t, gw.App(), createUploadTokenTest(t, store, project.ID), "pinned-release", "app.min.js", mapData,
+		http.StatusCreated,
+	)
 	line, column := 1, 37
 	postErrorsTest(t, gw.App(), token, []any{map[string]any{
 		"event_id": "pinned-event", "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
@@ -1595,7 +1599,10 @@ func TestAcceptedErrorDoesNotAdoptALaterSourceMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	uploadSourceMapTest(t, gw.App(), token, "uploaded-later", "app.min.js", mapData, http.StatusCreated)
+	uploadSourceMapTest(
+		t, gw.App(), createUploadTokenTest(t, store, project.ID), "uploaded-later", "app.min.js", mapData,
+		http.StatusCreated,
+	)
 	unavailable.Store(false)
 
 	issue := waitForIssueCountTest(t, gw.App(), cookie, project.Slug, 1)
@@ -1625,7 +1632,7 @@ func TestAcceptedErrorDoesNotAdoptALaterSourceMap(t *testing.T) {
 func TestSourceMapUploadRejectsMoreThanTwoHundredFiles(t *testing.T) {
 	store := testStore(t)
 	p, _ := store.CreateProject(context.Background(), "Default", "default")
-	token, _ := store.CreateProjectAPIToken(context.Background(), p.ID)
+	token := createUploadTokenTest(t, store, p.ID)
 	blobs, _ := blob.NewLocal(t.TempDir())
 	app := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Blobs: blobs}).App()
 	var body bytes.Buffer
