@@ -268,8 +268,8 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
     窗口编码遇到非法帧时捕获编码器的 `TypeError`/`ValueError`，不能让异常冒到
     业务线程或 shutdown 路径。
   - 阻塞于：S1、S2。
-  - 开工前核对：Go SDK 的 shutdown 处理是否与决策 14 一致（`sdk/go` 的
-    `profilingLoop` 在 `ctx.Done()` 后直接返回，S3 需要对齐或记录差异）。
+  - 开工前核对：Go SDK 的 shutdown 处理是否与决策 14 一致（开工时 `sdk/go` 的
+    `profilingLoop` 在 `ctx.Done()` 后直接返回，S3 需要对齐或记录差异；Go 已在切片 G1 对齐，见下）。
     S2 的 `collect_window` 是阻塞的一次 `sample()`，S2 不提供中途停止；「立即停采」可用 3.15.2
     `SampleProfiler.sample` 每轮检查的 `collector.running`（`profiling/sampling/sample.py:157`，
     为 False 即 break，随后照常 flush 已聚合的栈），由 S3 在 `_AggregatingCollector` 上加
@@ -332,8 +332,10 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
       join 超时后采样线程若晚一步入队，`DeliveryQueue` 记 `shutdown_budget` 丢弃。
     - **与 Go SDK shutdown 的对照（开工前核对的结论）**：顺序一致（error → profiling 停采 → profile 队列
       `close(ctx)` → provider），共用一个 ctx/deadline，幂等（`sync.Once`/`closed` 标志）。差异只有一处：
-      Go 的 `profilingLoop` 在 `ctx.Done()` 后 `StopCPUProfile`，**不论窗口已跑多久**都把部分窗口入队，
-      与决策 14（满 5 s 才上传、否则丢弃）不一致；Python 按决策 14 实现，Go 未改（范围外，需要的话单独立项）。
+      Go 的 `profilingLoop` 原先在 `ctx.Done()` 后 `StopCPUProfile`，**不论窗口已跑多久**都把部分窗口入队，
+      与决策 14（满 5 s 才上传、否则丢弃）不一致。**该差异已由 Go SDK 切片 G1 消除**：`collectCPUWindow` 在 CPU 窗口因
+      `ctx.Done()` 提前结束且 `end-start < 5s` 时丢弃（不入队、不计 `recordTelemetryDrop`，这不算投递失败），满 5 s 照常上传；
+      正常跑满 10 s 窗口的路径不变，heap/goroutine 是瞬时快照，不受影响，照常采集上传。
       另：Python 的 `error_transport.close(timeout)` 仍拿完整 timeout（既有行为，S3 未动），所以最坏情况下
       总耗时可超过 `timeout`；profiling 与 provider 部分没有这个问题。
     - greenlet：不检测（ADR 0014），代码里没有任何 greenlet 相关逻辑。
@@ -422,7 +424,7 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   `go test ./internal/gateway -run PythonPprof`。
 - [ ] S2 后：把采样器的可用性判断与窗口聚合拆开，重跑聚焦测试与 3.15 job。
 - [x] S3 后：确认 `Client.shutdown` 的预算与 Go SDK 一致，重跑全量 Python 测试。结论见 S3 落地说明
-  「与 Go SDK shutdown 的对照」：profiling 与 provider 共用 deadline，Go 无 5 s 门槛是唯一的行为差异，
+  「与 Go SDK shutdown 的对照」：profiling 与 provider 共用 deadline，Go 原先无 5 s 门槛是唯一的行为差异（G1 已对齐），
   `error_transport` 仍拿完整 timeout 是既有行为。全量测试见执行日志。
 
 ## 最终验证

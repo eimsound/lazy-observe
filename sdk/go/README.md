@@ -45,7 +45,7 @@ Go `bool` has no “unset” value, so signal switches use a compact matrix rule
 - `lo.WrapDB(driverName, dsn)` replaces `sql.Open`, creates DB client spans, and registers `database/sql` pool metrics. It does not register or patch drivers.
 - `lo.LLMTransport(base)` explicitly wraps an `http.RoundTripper` for OpenAI-compatible `/chat/completions`, Anthropic `/v1/messages`, and Ollama `/api/chat` calls. It records `gen_ai.*` model and token attributes, including usage from final SSE chunks, without patching a provider client.
 - Metrics-enabled clients also report goroutines, heap allocation, and GC count.
-- Profiling collects a 10-second CPU window every 60 seconds by default (10s/60s duty cycle), followed by heap and goroutine snapshots, and queues gzip pprof payloads with a stable upload ID. Go pprof itself typically adds about 1–5% overhead while CPU sampling is active.
+- Profiling collects a 10-second CPU window every 60 seconds by default (10s/60s duty cycle), followed by heap and goroutine snapshots, and queues gzip pprof payloads with a stable upload ID. If `Shutdown` interrupts a CPU window, it is uploaded only when it already ran at least 5 seconds; a shorter window is discarded and not counted as dropped telemetry, while the heap and goroutine snapshots are still collected; queued payloads are uploaded within the `Shutdown` context deadline. Go pprof itself typically adds about 1–5% overhead while CPU sampling is active.
 
 ### Fiber request buffers and `Immutable`
 

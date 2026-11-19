@@ -23,11 +23,11 @@ application, not from the sampling thread, not from ``shutdown``, not from
 code (:func:`warning_code`) and is logged once per process per code, with a link to
 the user documentation. A forked child is a new process and may warn again.
 
-**shutdown(timeout)** mirrors what Go does on ``ctx.Done()`` (stop sampling, keep the
-partial window, then drain the upload queue within the budget) but follows the owner's
-decision 14 for the partial window: sampling stops at once (``Sampler.stop``), a window
-that already ran for at least 5 s is encoded and uploaded inside the budget, a shorter
-one is dropped. Go uploads whatever it has, of any length.
+**shutdown(timeout)** mirrors what Go does on ``ctx.Done()`` (stop sampling, then drain
+the upload queue within the budget) and, like Go, follows the owner's decision 14 for
+the partial window: sampling stops at once (``Sampler.stop``), a window that already ran
+for at least 5 s is encoded and uploaded inside the budget, a shorter one is dropped
+without counting as dropped telemetry.
 
 **fork** (``os.register_at_fork``): the child inherits the parent's window in flight,
 its aggregation and whatever locks other parent threads held at that instant, but
