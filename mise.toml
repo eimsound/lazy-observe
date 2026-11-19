@@ -293,15 +293,20 @@ bash scripts/check-js-licenses.sh sdk/browser
 '''
 
 [tasks.sdk-python]
-description = "Install the Python SDK with test extras into sdk/python/.venv and run pytest"
-tools.python = "3.13.5"
+description = "Create sdk/python/.venv with uv (interpreter from LO_SDK_PYTHON_VERSION, default 3.13), install the test extras and run pytest"
+# 解释器由 uv 管理（uv python install），不用系统 Python，也不用 pip；CI 矩阵与本地用同一条命令：
+#   LO_SDK_PYTHON_VERSION=3.15t mise run sdk-python
+# 取值是 uv 的版本请求：3.9、3.13、3.15、3.15t（free-threaded）、3.16（预发布）等。
+tools.uv = "0.13.7"
 dir = "sdk/python"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-python -m venv .venv
-.venv/bin/python -m pip install --quiet --upgrade pip
-.venv/bin/python -m pip install --quiet -e ".[test]"
+version=${LO_SDK_PYTHON_VERSION:-3.13}
+uv python install --managed-python "$version"
+uv venv --managed-python --python "$version" --clear .venv
+uv pip install --quiet --python .venv/bin/python -e ".[test]"
+.venv/bin/python -VV
 .venv/bin/python -m pytest -q tests
 '''
 

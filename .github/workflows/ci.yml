@@ -485,12 +485,33 @@ jobs:
           restore-keys: pnpm-sdk-browser-${{ runner.os }}-${{ runner.arch }}-
       - run: mise run sdk-browser
 
+  # Python SDK：同一条 `mise run sdk-python` 按 LO_SDK_PYTHON_VERSION 在矩阵里跑（解释器由 uv 取，不用 setup-python）。
+  # 3.9、3.13、3.15（GIL 构建）、3.15t（free-threaded）阻塞；3.16 预发布只为提前暴露 CPython 接口变化，
+  # 红了不挡合并。持续剖析（ADR 0014）的真实采样只在 3.15t 上跑，其余格验证「开关打开只打 warning、不采集」，
+  # 各格由测试按解释器能力自行 skip。
+  # continue-on-error 只许出现在这里，且只对 experimental 的 3.16 格为 true（check-github-workflows.sh 钉住）：
+  # 带 continue-on-error 的失败格在 needs 里算 success，所以 ci-ok 不会因它变红。
   sdk-python:
-    name: Python SDK (install, pytest)
+    name: Python SDK (${{ matrix.python }})
     needs: changes
     if: needs.changes.outputs.sdk_python == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.9"
+            experimental: false
+          - python: "3.13"
+            experimental: false
+          - python: "3.15"
+            experimental: false
+          - python: "3.15t"
+            experimental: false
+          - python: "3.16"
+            experimental: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Restore mise cache
@@ -505,6 +526,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           MISE_CI_PROFILE: sdk-python
       - run: mise run sdk-python
+        env:
+          LO_SDK_PYTHON_VERSION: ${{ matrix.python }}
 
   # SDK journeys：起一个真实平台（带嵌入前端的二进制 + 外置 storage），对着它依次跑 Go、Node、Python、
   # Browser 四个 SDK 的 journey。任一语言工具链缺失都直接失败，不 skip。
