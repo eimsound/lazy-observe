@@ -30,6 +30,6 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {"unplugin": "^2.3.10"},
+  "dependencies": {"unplugin": "^3.7.0"},
   "devDependencies": {"tsup": "^9.0.0"}
 }
