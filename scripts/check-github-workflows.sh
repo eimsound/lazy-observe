@@ -364,6 +364,15 @@ while IFS= read -r lock; do
     fail "$workspace must set minimumReleaseAge: $((min_release_age_days * 1440)) (MIN_RELEASE_AGE_DAYS=$min_release_age_days x 1440 minutes)"
 done < <(git ls-files --cached --others --exclude-standard -- '*pnpm-lock.yaml')
 
+# Python 侧同一个最小发布年龄：各 pyproject.toml 的 [tool.uv] exclude-newer 必须是 scripts/release-age.env 的「N days」。
+# uv pip install、uv build 的构建后端解析都读它；缺了它 Python 依赖就不受最小发布年龄约束。
+while IFS= read -r manifest; do
+  grep -Eq '^\[tool\.uv\][[:space:]]*$' "$manifest" ||
+    fail "$manifest must have a [tool.uv] table with exclude-newer = \"$min_release_age_days days\" (MIN_RELEASE_AGE_DAYS=$min_release_age_days)"
+  grep -Eq "^exclude-newer[[:space:]]*=[[:space:]]*\"$min_release_age_days days\"[[:space:]]*(#.*)?$" "$manifest" ||
+    fail "$manifest must set exclude-newer = \"$min_release_age_days days\" under [tool.uv] (MIN_RELEASE_AGE_DAYS=$min_release_age_days)"
+done < <(git ls-files --cached --others --exclude-standard -- '*pyproject.toml')
+
 # 手工固定点的年龄门禁与每周追踪：PR 门禁是 ci.yml 里的 pinned-releases job，追踪是定时 workflow。
 # issues: write 只留给追踪 workflow 的那一个 job，别的 workflow 不该拿到它。
 [[ $(release_job .github/workflows/ci.yml pinned-releases) == *'run: bash scripts/check-pinned-releases.sh --gate'* ]] ||
