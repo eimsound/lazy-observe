@@ -25,7 +25,6 @@ set -euo pipefail
 # 不能只对 journey 的 sh 发信号：dash 等前台命令（例如 `sleep 70`）结束才跑 trap，示例进程会被孤立；
 # 非交互 bash 里 `&` 起的子进程还会忽略 SIGINT。journey 的临时目录（TMPDIR）放在 $work/journeys 下，
 # 即使 journey 被 KILL 来不及自己清理，也会随 $work 一起删掉。
-# 可重复验证见 scripts/sdk-journeys-interrupt-test.sh。
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$root"

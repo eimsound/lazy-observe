@@ -233,7 +233,7 @@ tools.helm = "3.21.3"
 run = '${HELM:-helm} lint deploy/helm/lazy-observe'
 
 [tasks.helm-template-test]
-description = "Validate rendered Helm templates"
+description = "Check the Helm chart keeps key material out of the environment and honours image.digest"
 tools.helm = "3.21.3"
 run = "bash scripts/helm-template-test.sh"
 
@@ -251,7 +251,7 @@ run = [
 ]
 
 [tasks.ci-changes-test]
-description = "Test the incremental CI change-surface grouping rules"
+description = "Test that the CI change detector falls back to a full run for CI, toolchain, unclassified paths and missing base"
 run = "bash scripts/ci-changes-test.sh"
 
 [tasks.pinned-releases]

@@ -105,6 +105,8 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 规则：门禁失败就停，先修失败，不要继续下一个切片。`CGO_ENABLED=0` 是硬约束，任何需要 CGO 的方案直接否决。`internal/db/ent` 不跟踪、不手改、不用 golines 格式化。
 
+脚本测试与结构断言只守「判错会悄悄放行、且后果重」的规则：安全、供应链、发版放行。实现细节不写断言，报告类和辅助脚本不写测试；改错了 CI 自己会红的东西，不需要再加一道断言。
+
 `mise run test-meta-pg` 从外网 Maven Central 取 Postgres 归档（`LO_TEST_PG_CACHE`，默认 `$HOME/.cache/embedded-postgres`；命中缓存就不联网，CI 也用 actions/cache 缓存同一目录）。缓存未命中又碰上 Maven Central 对共享出口 IP 限流时会失败，测试会把归档 URL 的真实 HTTP 状态码一起打出来（库本身只报 `no version found matching 18.3.0`），看到 403/429/5xx 重跑即可，不要去改测试。
 
 ### 本地必跑 `mise run e2e-ha` 的改动面
@@ -134,7 +136,7 @@ CI 分层（CI 不替你跑的，改到对应改动面时本地必须跑）：
 
 CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04-arm`），公开仓不挂自建 runner。
 `ci.yml` 先由 `changes` 作业按改动路径分组，各业务 job 只在自己的改动面变化时运行，最后 `ci-ok` 汇总；
-`ci-ok` 是 `ci.yml` 汇总出来的唯一候选 required check，被跳过的 job 视为通过；分支保护里配了它才是真 required，没配时按「提交、推送与合入」第 5 步的第二条路径等 CI。
+`ci-ok` 是 main ruleset 的 required check，被跳过的 job 视为通过；等 CI 见「提交、推送与合入」第 5 步。
 
 | 改动路径 | 跑哪些 job |
 | --- | --- |
@@ -158,7 +160,6 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 空 = 四个都跑；否则只跑列出的语言，混合改动取并集，其它任何会触发 sdk-journeys 的路径（服务端、Go 依赖、journey/storage/web 资产脚本、`sdk/` 根共享文件、CI、未分类）都回到全跑。
 窄范围只有：`sdk/go/**` → go、browser，`sdk/node/**` → node、browser（browser journey 会运行这两个 SDK 的示例），
 `sdk/python/**` → python，`sdk/browser/**` 与 `web/**` → browser。本地同样用 `LO_SDK_JOURNEYS_ONLY=go,browser mise run --skip-deps sdk-journeys`。
-改了 `scripts/sdk-journeys.sh` 的进程清理时，另跑 `bash scripts/sdk-journeys-interrupt-test.sh`（本地手动，约 2 分钟，不进 CI）。
 
 | 触发 | workflow | 跑什么 |
 | --- | --- | --- |
@@ -166,7 +167,7 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、镜像漏洞扫描（Trivy，有修复的 CRITICAL/HIGH 即失败）、`storage-bin-scan`（对下载并校验过 sha256 的嵌入 Victoria 上游二进制做 Trivy 扫描，参数与镜像扫描一致；ADR 0016：有命中只 `::warning::` 并写 step summary、不阻塞，扫描没跑成才失败）、性能门禁，全过才出包 |
 | 手动 | `bench.yml` | 依次跑 `bench`（30 秒摄入基准 + 基线门禁）、`perf-release`（双架构产物门禁 + 零配置 release smoke）、`perf-ha`（`e2e-ha` 全部 HA 断言 + 查询 P95 与弱扩展门禁）、`perf-results-check` |
 
-切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。分组规则由 `mise run ci-changes-test` 钉住，改分组时同步改测试。
+切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。`mise run ci-changes-test` 只守「CI 自身、工具链、未分类路径、取不到 base 一律全量」这几条兜底；具体分组改了不用同步改测试。
 
 只补验证、不改代码时（确认基线、补跑门禁、发版前复核），上面「本地必须跑」不适用：重门禁优先走 CI 手动入口，只有 CI 没有对应入口时才在本地跑。
 
@@ -210,33 +211,30 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 
 0. 记基线：`gh run list --workflow ci.yml --branch <base> --event push --status completed --limit 1 --json databaseId,conclusion,headSha` 取最近一次**已完成**的 push run。base 上可能有正在跑的 run，不加 `--status completed` 会拿到 `in_progress` 那条，`conclusion` 为空、基线作废。`conclusion` 为 `failure` 时用 `gh run view <id> --json jobs --jq '.jobs[] | select(.conclusion=="failure") | .name'` 抄下失败 job 名。base 本来就红时，这份名单是后面判定「是否新增失败」的基线。
 1. 切分支：`git switch -c slice/<topic>-<n> <base>`。`base` 默认 `main`；feature-multi 里是 integration branch。
-2. 一个切片只留一个 commit，信息用 `fix:` / `feat:` / `chore:` + 中文。CI 修复用 `git commit --amend` 折叠回这个 commit，不新增提交。
-3. 本地门禁先全绿（按验证矩阵那张表），再推：`git push -u origin slice/<topic>-<n>`。只推自己的切片分支；`--force-with-lease` 只允许用在自己的切片分支上，禁止 `--force`。
+2. 一个切片只留一个 commit，信息用 `fix:` / `feat:` / `chore:` + 中文。CI 修复用 `git commit --amend` 折叠回这个 commit，不新增提交（推送方式见第 6 步）。
+3. 本地门禁先全绿（按验证矩阵那张表），再推：`git push -u origin slice/<topic>-<n>`。只推自己的切片分支，不强推（修复流程见第 6 步）。
 4. 开 PR：`gh pr create --head slice/<topic>-<n> --base <base> --title "<标题>" --body-file -`（body 用 heredoc）。body 按 `/skill:pr` 的形状写：一张能说明改动的最小视觉材料、改前改后的证据、单向门还是双向门的判断。
-5. 等 CI：切片分支没有 push run，只看 PR run。先按 required check 等：`gh pr checks <number> --watch --interval 30 --required`。
-   它以 `no required checks reported` 退出，说明分支保护里没有配 required check（`gh api repos/eimsound/lazy-observe/rules/branches/main --jq '[.[].type]'`
-   里看不到 `required_status_checks`），改成盯这次 push 自己的 run：
+5. 等 CI：`ci-ok` 是 main ruleset 的 required check，按它等：`gh pr checks <number> --watch --interval 30 --required`。
+   刚开 PR 时 `ci-ok` 还没登记，上面这条会以 `no required checks reported` 退出；这时改按 `--commit` 找这次 push 的 run 来等：
 
    ```bash
-   head=$(git rev-parse HEAD)
-   for _ in $(seq 20); do   # 新 run 登记最多等 5 分钟
-     run_id=$(gh run list --workflow ci.yml --event pull_request --branch slice/<topic>-<n> \
-       --commit "$head" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-     [[ -n $run_id ]] && break
-     sleep 15
-   done
-   [[ -n $run_id ]] || { echo "no PR run for $head"; exit 1; }
-   gh run watch "$run_id" --interval 30 --exit-status   # 非零 = run 结论不是 success
-   gh run view "$run_id" --json conclusion,jobs --jq '.conclusion, (.jobs[] | "\(.conclusion)\t\(.name)")'
+   gh run list --workflow ci.yml --event pull_request --commit "$(git rev-parse HEAD)" --limit 1 \
+     --json databaseId --jq '.[0].databaseId // empty'   # 空 = run 还没登记，隔 15 秒再取，最多等 5 分钟
+   gh run watch <run-id> --interval 30 --exit-status      # 非零 = run 结论不是 success
    ```
 
-   `--commit "$head"` 是这儿的关键：`--amend` 重推后只按 `--branch` 取第一条，可能拿到上一个 commit 的 run，它被取消或带着旧结论，
-   两种都会被误当成这一次的结果。`// empty` 挡住「列表为空时 jq 返回 `null`」那种情况。
-   负责人把 `ci-ok` 配成 required 之后，`--required` 那条直接可用，本节不用改。
-
    逐 job 结果用 `gh pr checks <number> --json name,state,bucket`。全部通过就是绿；`ci-ok` 失败时用 `gh run view <run-id> --json jobs` 列出失败 job，与第 0 步的基线比对：全部是既有失败就算通过，出现基线外的新失败才转第 6 步。上限 30 分钟；超时就停下报告，不要盲等。
-6. CI 红：`gh run view <run-id> --log-failed` 看失败步骤（run id 来自 `gh pr checks` 的链接或 `gh run list --branch slice/<topic>-<n>`），修完 `git commit --amend` 后 `git push --force-with-lease`，回到第 5 步。同一个 PR 连续两次红且原因不明，停下。
+6. CI 红：`gh run view <run-id> --log-failed` 看失败步骤（run id 来自第 5 步）。修完 `git commit --amend`，换新分支名、开新 PR 取代旧 PR
+   （本环境拦截强推，`--force-with-lease` 也推不上去）：
+   1. `git branch -m slice/<topic>-<n+1>`，`git push -u origin slice/<topic>-<n+1>`；
+   2. 按第 4 步开新 PR，body 第一行写 `取代 #<旧号>`；
+   3. `gh pr close <旧号> --comment "由 #<新号> 取代：<一句原因>"`。
+
+   然后回到第 5 步。同一个切片连续两次红且原因不明，停下。
 7. 绿了才合并：`gh pr merge <number> --rebase --delete-branch`（一个切片一个 commit，不改写历史）；仓库不允许 rebase merge 时改用 `--squash`。合并后切回 `base`，`git pull --ff-only`，并 `git branch -D slice/<topic>-<n>` 删掉本地分支。
+   合并被拒、报错含 ``without `workflow` scope``：PR 的 base 之后 `main` 上有别的提交改了 `.github/workflows/*`，
+   本环境的 PAT 又没有 workflow scope。处理：`git fetch origin && git rebase origin/main`，重跑本地门禁，再按第 6 步的 1–3 换新分支、开新 PR、关旧 PR，
+   回到第 5 步。PAT 的 scope 由负责人决定，不换别的 API 或令牌绕过。
 8. 合并后在 `base` 上确认一次 CI：`gh run list --workflow ci.yml --branch <base> --event push --limit 1 --json databaseId,headSha,status,conclusion` 的 `headSha` 应等于合并后的 tip；用 `gh run watch <id>` 等它结束，再用 `gh run view <id> --json jobs` 的失败 job 比对第 0 步基线。出现基线外的新失败 job 就停下、不要继续下一个切片，并在报告里写明是哪个 job。
 
 CI 是第二道门，不能替代本地门禁。本地没跑绿就推上去等 CI 算违规。

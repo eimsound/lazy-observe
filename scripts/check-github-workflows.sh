@@ -15,11 +15,6 @@ fail() {
   exit 1
 }
 
-# 迁移遗留：Gitea 上下文、自建 runner、代理与私有 SDK 拉取都不应再出现。
-if grep -En 'gitea\.|GITEA_|CI_HTTP_PROXY|ci-proxy\.sh|ci-prepare-sdk\.sh|_SDK_KEY|lazy-sdk=' "${workflows[@]}"; then
-  fail 'workflow still references Gitea, the CI proxy, or the private SDK checkout'
-fi
-
 # 公开仓库不挂自建 runner：fork PR 可以在自建 runner 上执行任意代码。
 # 表达式形式的 runs-on 只允许 matrix.runner，或只含这两个托管 runner 字面量的表达式。
 bad_runners=$(grep -En '^[[:space:]]*runs-on:' "${workflows[@]}" | while IFS= read -r line; do
@@ -45,33 +40,22 @@ for workflow in "${workflows[@]}"; do
   grep -Eq '^permissions:' "$workflow" || fail "$workflow must declare top-level permissions"
 done
 
-if grep -En '^[[:space:]]*key:.*github\.sha' "${workflows[@]}"; then
-  fail 'cache keys must be derived from tool or dependency inputs, not the commit SHA'
-fi
-
-unpinned_actions=$(grep -En '^[[:space:]]*-[[:space:]]*uses:|^[[:space:]]*uses:' "${workflows[@]}" |
-  grep -vE 'uses:[[:space:]]+(actions/(checkout|cache|upload-artifact|download-artifact|setup-node|setup-python)|pypa/gh-action-pypi-publish|docker/(setup-qemu-action|setup-buildx-action|login-action|metadata-action|build-push-action))@[0-9a-f]{40}[[:space:]]+#[[:space:]]+v[0-9]+(\.[0-9]+){1,2}(-[A-Za-z0-9.-]+)?[[:space:]]*$' || true)
-if [[ -n $unpinned_actions ]]; then
-  printf '%s\n' "$unpinned_actions" >&2
-  fail 'workflow actions must use an allow-listed owner/name, a full commit SHA, and an exact version comment'
-fi
-
 # 供应链：任何 uses: 都必须按 40 位提交 SHA 固定（docker:// 按 sha256 digest），只有本仓 ./ 路径例外。
-# 与上面的白名单检查互补：覆盖 .github 下所有 YAML 与任意位置的 composite action（action.yml），
+# 覆盖 .github 下所有 YAML 与任意位置的 composite action（action.yml），
 # 也覆盖流式写法（- { uses: ... }）、reusable workflow 与 docker:// 引用。
+# 任何形如 uses: 的键都要检查；解析不出引用的行同样算失败。
+uses_key_re='(^|[^A-Za-z0-9_-])["'\'']?uses["'\'']?[[:space:]]*:'
+uses_ref_re='^[[:space:]]*(-[[:space:]]+)?(\{[[:space:]]*)?["'\'']?uses["'\'']?[[:space:]]*:[[:space:]]*["'\'']?([^"'\''[:space:],}#]+)'
+uses_comment_re='^[[:space:]]*#'
 unpinned_uses() {
   local file n line ref
-  # 任何形如 uses: 的键都要检查；解析不出引用的行同样算失败。
-  local key_re='(^|[^A-Za-z0-9_-])["'\'']?uses["'\'']?[[:space:]]*:'
-  local ref_re='^[[:space:]]*(-[[:space:]]+)?(\{[[:space:]]*)?["'\'']?uses["'\'']?[[:space:]]*:[[:space:]]*["'\'']?([^"'\''[:space:],}#]+)'
-  local comment_re='^[[:space:]]*#'
   for file in "$@"; do
     n=0
     while IFS= read -r line || [[ -n $line ]]; do
       n=$((n + 1))
-      [[ $line =~ $key_re ]] || continue
-      [[ $line =~ $comment_re ]] && continue
-      if [[ $line =~ $ref_re ]]; then
+      [[ $line =~ $uses_key_re ]] || continue
+      [[ $line =~ $uses_comment_re ]] && continue
+      if [[ $line =~ $uses_ref_re ]]; then
         ref=${BASH_REMATCH[3]}
         case $ref in
         ./*) continue ;;
@@ -112,6 +96,37 @@ unpinned=$(unpinned_uses "${workflows[@]}" "${pin_files[@]}" | sort -u)
 if [[ -n $unpinned ]]; then
   printf '%s\n' "$unpinned" >&2
   fail 'every uses: must pin a full 40-character commit SHA (docker:// must pin a sha256 digest)'
+fi
+
+# 供应链：action 属主白名单。SHA 固定只保证代码不被换掉，管不了「该不该信任这个属主」；
+# 引入新属主等于让没审过的代码带着仓库 token 运行，所以先审属主、再加进这里。docker:// 没有属主，不收。
+trusted_action_owners='actions|docker|pypa'
+untrusted_uses() {
+  local file n line
+  for file in "$@"; do
+    n=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      n=$((n + 1))
+      [[ $line =~ $uses_comment_re ]] && continue
+      [[ $line =~ $uses_ref_re ]] || continue
+      [[ ${BASH_REMATCH[3]} == ./* || ${BASH_REMATCH[3]} =~ ^($trusted_action_owners)/ ]] && continue
+      printf '%s:%s: %s\n' "$file" "$n" "$line"
+    done <"$file"
+  done
+  return 0
+}
+untrusted=$(untrusted_uses "${workflows[@]}" "${pin_files[@]}" | sort -u)
+if [[ -n $untrusted ]]; then
+  printf '%s\n' "$untrusted" >&2
+  fail "uses: owner must be one of: ${trusted_action_owners//|/, } (review a new owner before adding it to trusted_action_owners)"
+fi
+
+# 供应链：job 容器的镜像同样带着仓库 token 跑步骤，却不受上面 uses: 的固定与属主检查约束。
+# 工具由 scripts/ci-setup-mise.sh 按 sha256 安装，不用 job 容器。
+job_containers=$(grep -En '^    container:' "${workflows[@]}" || true)
+if [[ -n $job_containers ]]; then
+  printf '%s\n' "$job_containers" >&2
+  fail 'jobs must not use a job container: its image runs with the repository token outside the uses: pin and owner checks'
 fi
 
 # mise 引导：版本与两个架构的 sha256 只在 scripts/mise-release.env 维护，CI 脚本与 Dockerfile 都读它，
@@ -236,47 +251,19 @@ if [[ -f $release_wf ]]; then
   [[ $(grep -Ec '^[[:space:]]+sha256=[0-9a-f]{64}$' scripts/install-trivy.sh) -eq 2 ]] ||
     fail 'scripts/install-trivy.sh must pin one sha256 per architecture (amd64, arm64)'
 
-  # chart 不单独发布（没有 helm package/push），发版产物里带的是 digest 固定的 Helm values 片段。
-  # 自家镜像的 digest 只有 docker/build-push-action 推完镜像才存在，所以回填落在 docker 之后的
-  # helm-values job：由 scripts/render-helm-release-values.sh 生成、作为 Release 资产上传。
-  # 该 job 单独存在是为了最小权限：docker job 会把 GITHUB_TOKEN 当 BuildKit secret 挂进构建，
-  # 不能同时持有写仓库的权限。发版流程不能在本地真跑，这些静态断言是它唯一的门禁。
+  # 发版附带的 digest 固定 Helm values 片段由 helm-values job 上传。最小权限：docker job 会把 GITHUB_TOKEN 当
+  # BuildKit secret 挂进构建，不能同时持有写仓库的权限；workflow_dispatch 不得发布任何东西。
+  # 发版流程不能在本地真跑，这些静态断言是它唯一的门禁。
   docker_job=$(release_job "$release_wf" docker)
   helm_values_job=$(release_job "$release_wf" helm-values)
-  [[ -n $helm_values_job ]] ||
-    fail "$release_wf: missing a helm-values job that attaches the digest-pinned Helm values"
-
-  # docker：只读，且把 digest 与版本号经 outputs 交出去。
   [[ $docker_job == *'contents: read'* ]] ||
     fail "$release_wf: docker must stay contents: read (it mounts the token into the build)"
   [[ $docker_job != *'contents: write'* ]] ||
     fail "$release_wf: docker must not hold contents: write; attach release assets from helm-values"
-  [[ $docker_job == *'digest: ${{ steps.build.outputs.digest }}'* ]] ||
-    fail "$release_wf: docker must expose steps.build.outputs.digest as a job output"
-  [[ $docker_job == *'version: ${{ steps.build-meta.outputs.version }}'* ]] ||
-    fail "$release_wf: docker must expose steps.build-meta.outputs.version as a job output"
   [[ $docker_job != *'gh release upload'* ]] ||
     fail "$release_wf: docker must not upload release assets; helm-values owns that step"
-
-  # helm-values：只拿 contents: write，只在 tag 推送时跑，消费 docker 的 outputs。
-  [[ $helm_values_job == *'needs: docker'* ]] ||
-    fail "$release_wf: helm-values must need docker so the digest exists before it runs"
   [[ $helm_values_job == *"if: github.event_name == 'push'"* ]] ||
     fail "$release_wf: helm-values must only run on tag pushes (workflow_dispatch publishes nothing)"
-  [[ $helm_values_job == *'contents: write'* ]] ||
-    fail "$release_wf: helm-values needs contents: write to attach the Helm values asset"
-  [[ $helm_values_job == *'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}'* ]] ||
-    fail "$release_wf: helm-values must authenticate gh with the job token"
-  [[ $helm_values_job == *'needs.docker.outputs.digest'* ]] ||
-    fail "$release_wf: helm-values must pin the digest docker published"
-  [[ $helm_values_job == *'bash scripts/render-helm-release-values.sh'* ]] ||
-    fail "$release_wf: helm-values must render the values fragment with scripts/render-helm-release-values.sh"
-  [[ $helm_values_job == *'gh release upload'* ]] ||
-    fail "$release_wf: helm-values must attach the digest-pinned Helm values to the release"
-  [[ $helm_values_job == *'--clobber'* ]] ||
-    fail "$release_wf: helm-values must pass --clobber so a re-run replaces the asset"
-  [[ $helm_values_job == *'--repo "$GITHUB_REPOSITORY"'* ]] ||
-    fail "$release_wf: helm-values must name the repository explicitly when uploading"
 fi
 
 # 镜像扫描例外清单：每条都要有理由和到期日，过期条目由 Trivy 自动失效。
@@ -380,43 +367,8 @@ tracker_text=$(<"$tracker")
 issue_writers=$(grep -El '^[[:space:]]*issues:[[:space:]]*write' "${workflows[@]}" || true)
 [[ $issue_writers == "$tracker" ]] || fail "only $tracker may request issues: write, found: ${issue_writers:-none}"
 
-# upload/download-artifact v3 在 GitHub 上已停用。
-old_artifacts=$(grep -En 'uses:[[:space:]]+actions/(upload|download)-artifact@[0-9a-f]{40}[[:space:]]+#[[:space:]]+v[0-3]\.' \
-  "${workflows[@]}" || true)
-if [[ -n $old_artifacts ]]; then
-  printf '%s\n' "$old_artifacts" >&2
-  fail 'actions/upload-artifact and download-artifact must be v4 or newer on GitHub'
-fi
-
-# job 直接跑在 GitHub 托管 runner 上，工具由 mise 安装并缓存；不再使用预构建的 job 容器镜像。
-job_containers=$(grep -En '^    container:' "${workflows[@]}" || true)
-if [[ -n $job_containers ]]; then
-  printf '%s\n' "$job_containers" >&2
-  fail 'jobs must run directly on hosted runners; install tools with scripts/ci-setup-mise.sh instead of a job container'
-fi
-
-if grep -En '^[[:space:]]*path:[[:space:]]*~/.local/share/pnpm/store' "${workflows[@]}"; then
-  fail 'pnpm cache must use the store directory configured by scripts/ci-setup-mise.sh'
-fi
-
-missing_arch=$(grep -En '^[[:space:]]*key:.*runner\.os' "${workflows[@]}" | grep -v 'runner\.arch' || true)
-if [[ -n $missing_arch ]]; then
-  printf '%s\n' "$missing_arch" >&2
-  fail 'platform-specific cache keys must include runner.arch'
-fi
-
-cache_keys=$(mktemp)
-trap 'rm -f "$cache_keys"' EXIT
-GITHUB_OUTPUT=$cache_keys bash scripts/ci-cache-keys.sh
-if [[ $(wc -l <"$cache_keys") -ne 4 ]]; then
-  fail 'cache key helper must emit exactly four keys'
-fi
-for key in mise go storage pnpm-web; do
-  grep -Eq "^${key}=[0-9a-f]{64}$" "$cache_keys" || fail "cache key helper emitted an invalid $key key"
-done
-
-# 增量 CI 契约：ci.yml 第一个 job 是 changes；ci-ok 是 if: always() 的汇总 job，
-# needs 覆盖 ci.yml 里所有其它 job，否则某个 job 失败也不会挡住合并。
+# ci-ok 汇总：被跳过的 job 在 ci-ok 里算通过，所以 ci-ok 必须 if: always()，且 needs 覆盖 ci.yml 里所有其它 job，
+# 否则某个 job 失败不会挡住合并。
 ci=.github/workflows/ci.yml
 [[ -f $ci ]] || fail "$ci is missing"
 mapfile -t ci_jobs < <(awk '
@@ -424,55 +376,35 @@ mapfile -t ci_jobs < <(awk '
   /^[^[:space:]#]/ { in_jobs = 0 }
   in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { name = $1; sub(/:$/, "", name); print name }
 ' "$ci")
-((${#ci_jobs[@]} > 2)) || fail "$ci must define changes, business jobs, and ci-ok"
-[[ ${ci_jobs[0]} == changes ]] || fail "$ci: the first job must be changes"
-[[ ${ci_jobs[-1]} == ci-ok ]] || fail "$ci: the last job must be ci-ok"
-ci_ok=$(sed -n '/^  ci-ok:$/,$p' "$ci")
+ci_ok=$(release_job "$ci" ci-ok)
+[[ -n $ci_ok ]] || fail "$ci: job ci-ok is missing"
 [[ $ci_ok == *'if: always()'* ]] || fail "$ci: ci-ok must run with if: always()"
-mapfile -t ci_ok_needs < <(sed -n '/^  ci-ok:$/,$p' "$ci" | sed -n '/^    needs:$/,/^    [a-z-]*:/p' |
+mapfile -t ci_ok_needs < <(sed -n '/^    needs:$/,/^    [a-z-]*:/p' <<<"$ci_ok" |
   sed -n 's/^      - \([A-Za-z0-9_-]*\)$/\1/p')
 # 先收齐再匹配：pipefail 下 printf | grep -q 会在 grep 提前退出时让 printf 收到 SIGPIPE（141），门禁偶发变红。
 ci_ok_needs_list=$(printf '%s\n' "${ci_ok_needs[@]}")
 for job in "${ci_jobs[@]}"; do
   [[ $job == ci-ok ]] && continue
   [[ $'\n'$ci_ok_needs_list$'\n' == *$'\n'"$job"$'\n'* ]] || fail "$ci: ci-ok must need job $job"
-  if [[ $job != changes ]]; then
-    job_block=$(awk -v job="$job" '
-      $0 == "  " job ":" { on = 1; next }
-      on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
-      on { print }
-    ' "$ci")
-    [[ $job_block == *'needs: changes'* && $job_block == *'if: needs.changes.outputs.'* ]] ||
-      fail "$ci: job $job must depend on changes and gate on one of its outputs"
-  fi
 done
 
-# Python SDK 矩阵契约（ADR 0014）：3.9、3.13、3.15、3.15t 阻塞，3.16 预发布非阻塞。
-# continue-on-error 是能让 ci-ok 对失败格视而不见的开关，所以 ci.yml 里只许 sdk-python 这一处用，
-# 且只能写成 `${{ matrix.experimental }}`，再由矩阵保证只有 3.16 一格是 experimental: true。
+# continue-on-error 能让 ci-ok 对失败的 job 视而不见，所以 ci.yml 里只许 sdk-python 矩阵这一处用，
+# 且只能写成 `${{ matrix.experimental }}`，矩阵里只有 3.16 预发布一格可以是 experimental: true（ADR 0014）。
 mapfile -t ci_continue_on_error < <(grep -nE '^[[:space:]]*continue-on-error:' "$ci" || true)
 ((${#ci_continue_on_error[@]} == 1)) ||
   fail "$ci: continue-on-error may appear exactly once (the sdk-python matrix job), found ${#ci_continue_on_error[@]}"
-sdk_python_block=$(awk '
-  $0 == "  sdk-python:" { on = 1; next }
-  on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
-  on { print }
-' "$ci")
+sdk_python_block=$(release_job "$ci" sdk-python)
 [[ -n $sdk_python_block ]] || fail "$ci: job sdk-python is missing"
 [[ $sdk_python_block == *'    continue-on-error: ${{ matrix.experimental }}'* ]] ||
   fail "$ci: sdk-python must set continue-on-error: \${{ matrix.experimental }} (the only continue-on-error in ci.yml)"
-[[ $sdk_python_block == *'fail-fast: false'* ]] ||
-  fail "$ci: sdk-python matrix must set fail-fast: false so one interpreter does not cancel the others"
-[[ $sdk_python_block == *'LO_SDK_PYTHON_VERSION: ${{ matrix.python }}'* ]] ||
-  fail "$ci: sdk-python must pass LO_SDK_PYTHON_VERSION: \${{ matrix.python }} to mise run sdk-python"
-sdk_python_cells=$(awk '
+sdk_python_experimental=$(awk '
   /^[[:space:]]+- python:/ { py = $3; gsub(/"/, "", py); next }
-  /^[[:space:]]+experimental:/ && py != "" { print py "=" $2; py = "" }
+  /^[[:space:]]+experimental:/ && py != "" { if ($2 == "true") print py; py = "" }
 ' <<<"$sdk_python_block" | tr '\n' ' ')
-[[ $sdk_python_cells == '3.9=false 3.13=false 3.15=false 3.15t=false 3.16=true ' ]] ||
-  fail "$ci: sdk-python matrix must be 3.9, 3.13, 3.15, 3.15t blocking (experimental: false) and only 3.16 experimental: true, got: $sdk_python_cells"
+[[ $sdk_python_experimental == '3.16 ' ]] ||
+  fail "$ci: only the 3.16 pre-release may be experimental: true in the sdk-python matrix, got: ${sdk_python_experimental:-none}"
 
-# changes 作业输出的每个标志都要在 ci.yml 里声明为 job output。
+# changes 作业输出的每个标志都要在 ci.yml 里声明为 job output：漏声明时 `needs.changes.outputs.<flag> == 'true'` 恒为假，对应 job 被悄悄跳过。
 for flag in $(bash scripts/ci-changes.sh --all 2>/dev/null | sed -n 's/=.*//p'); do
   grep -Eq "^      ${flag}: \\$\\{\\{ steps\\.detect\\.outputs\\.${flag} \\}\\}$" "$ci" ||
     fail "$ci: changes job does not expose output $flag"

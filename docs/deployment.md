@@ -789,11 +789,10 @@ dispatch (`bench.yml`) and before a release.
 
 Pull request CI is incremental: a `changes` job classifies the diff and only the
 jobs whose surface it touches run. `ci-ok` aggregates every job — skipped counts
-as passed — and is the one check to require in branch protection; the repository
-does not currently enforce a required check. Pure documentation changes (`*.md`, `docs/**`,
+as passed — and is the only required check in the `main` ruleset. Pure documentation changes (`*.md`, `docs/**`,
 `.agents/**`, `LICENSE`) run no business job, while server changes additionally
 run the `e2e-ha` functional HA gate and `internal/**`/`cmd/**` changes run the
-single-replica `e2e` and `e2e-restart` jobs. Change detection is contract-tested
+single-replica `e2e` and `e2e-restart` jobs. The detector's full-run fallbacks are tested
 by `mise run ci-changes-test`.
 
 All workflows run on GitHub-hosted runners (`ubuntu-24.04` and the native
