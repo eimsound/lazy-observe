@@ -152,7 +152,7 @@ business job.
 | Trigger | Workflow | Scope |
 | --- | --- | --- |
 | Pull request, push to `main` or `integration/**` | `ci.yml` | Change-scoped jobs above, aggregated by `ci-ok` |
-| `v*` tag or manual release dispatch | `release.yml` | amd64/arm64 container smoke, a Trivy image scan that fails on fixable CRITICAL/HIGH vulnerabilities, and the performance gates, all before archives are built |
+| `v*` tag or manual release dispatch | `release.yml` | amd64/arm64 container smoke, a Trivy image scan, a Trivy scan of the embedded Victoria binaries (`mise run storage-bin-vulns`), and the performance gates, all before archives are built. Fixable CRITICAL/HIGH findings fail the image scan; for the embedded binaries a finding only warns while the pinned version is the latest upstream release at least 7 days old (upstream has no older fix to upgrade to), and fails once the pin is behind it or the upstream lookup fails |
 | Manual dispatch | `bench.yml` | Performance gates on demand |
 
 Performance gates are noisy on shared runners, so they run only on manual
@@ -160,6 +160,10 @@ dispatch and before a release; the PR job runs only the functional HA
 assertions of `e2e-ha`, never `perf-ha`. Run them locally when your change is
 performance-sensitive. `mise run ci-changes-test` pins the path grouping; update
 it together with the detector.
+
+The embedded-binary scan's verdict changes with time: once a newer upstream Victoria release is 7 days old, findings
+that only warned before start to block the release. That is not a flaky gate; the fix is to upgrade the pins in
+`scripts/download-storage-bins.sh` (`mise run pinned-releases` lists the target versions).
 
 ### PostgreSQL dialect tests
 

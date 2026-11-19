@@ -132,7 +132,7 @@ classify() {
     return
     ;;
   # Dependabot 配置只被 GitHub 的 Dependabot 服务读取，不改变任何 job 的行为；.trivyignore.yaml 只在
-  # release.yml 的镜像扫描里生效。两者的格式与覆盖面都由 go job 里的 workflow-check 校验，所以只跑 go。
+  # release.yml 的镜像扫描与嵌入二进制扫描里生效。两者的格式与覆盖面都由 go job 里的 workflow-check 校验，所以只跑 go。
   .github/dependabot.yml | .trivyignore.yaml)
     set_flags go
     ;;

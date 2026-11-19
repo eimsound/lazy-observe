@@ -766,7 +766,7 @@ image it just published, rendered by `scripts/render-helm-release-values.sh` —
 to the same Release, so a Helm deployment can pin the released image without
 hand-copying a digest. Before archives
 are built, that workflow requires the dual-architecture container smoke
-(including the Trivy scan that fails on fixable CRITICAL/HIGH vulnerabilities)
+(including the Trivy scans of the image and of the embedded Victoria binaries)
 and the full performance gates (`bench`, `perf-release`, `perf-ha`,
 `perf-results-check`) to pass; the same workflow can be dispatched manually to
 rerun those gates without publishing. Pull request CI does not run the
