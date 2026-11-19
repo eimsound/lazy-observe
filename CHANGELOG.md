@@ -363,6 +363,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   download it from Maven Central on every run, and a failed download reports
   the real HTTP status of the probed URL instead of the library's
   `no version found matching 18.3.0` (#66).
+- The bootstrap `mise` in `scripts/mise-release.env` (read by
+  `scripts/ci-setup-mise.sh` and the Dockerfile builder stage) is upgraded from
+  v2026.5.3 to v2026.11.7. A change to that file now runs every CI job, as a
+  change to `mise.toml` or the Dockerfile does, instead of only the Go checks
+  (#82).
+- Interrupting `scripts/sdk-journeys.sh` (`TERM`, `INT`, or `HUP`) now stops
+  the platform and the running journey by process group, so example servers,
+  builds, and browsers no longer outlive the run, and a journey's temporary
+  directory is removed even when the journey is killed; processes a finished
+  journey leaves behind are stopped with a warning. The `SDK journeys` CI job
+  runs only the journeys a change can affect (for example, `sdk/python/**` runs
+  only the Python journey; the full list is under "SDK journey scope" in
+  `CONTRIBUTING.md`) and still runs all four for server, CI, and unclassified
+  paths. `LO_SDK_JOURNEYS_ONLY` also accepts a space-separated list, and the
+  journey gateway port range moved from 44000–44999 to 14000–14999, below the
+  Linux ephemeral port range (#83).
+- The web console is built with Vite 8 (Rolldown) instead of Vite 6. The
+  `uplot`, `replay-engine`, `promql`, and `vendor` chunks are kept as Rolldown
+  `codeSplitting` groups, plus one group for the remaining third-party code of
+  the first load. No `build.target` is set, so the default target moves from
+  Vite 6's `modules` (Chrome 87, Edge 88, Firefox 78, Safari 14) to Vite 8's
+  `baseline-widely-available` (Chrome and Edge 111, Firefox 114, Safari and iOS
+  Safari 16.4): older browsers may no longer load the console. CSS is minified
+  with lightningcss instead of esbuild (MPL-2.0, build time only, not part of
+  the shipped application) (#85).
+- `@lazy-observe/node` now depends on Pino ^10.4 (was ^9) for `lo.pino()`.
+  Pino 10's only breaking change is dropping Node 18, which the SDK's
+  `>= 22.15` requirement already excludes; the SDK's code is unchanged, and the
+  options `lo.pino()` accepts and the `Logger` type it returns now come from
+  Pino 10 (#89).
+- The SDK packages (`@lazy-observe/node`, `@lazy-observe/browser`,
+  `@lazy-observe/react`, `@lazy-observe/bundler-plugin`) are built with tsdown
+  instead of tsup, and the web console and the SDKs move to TypeScript 7. The
+  published entries, ESM and CJS export names, external dependencies, and
+  declaration symbols are unchanged; the emitted JavaScript differs (Node
+  built-ins are imported with the `node:` prefix, and CJS exports carry a
+  `Symbol.toStringTag` of `"Module"`). In the declarations of
+  `@lazy-observe/bundler-plugin`, the `vite` and `webpack` exports are now typed
+  as the matching `UnpluginInstance` members instead of referencing a
+  `WebpackPluginInstance` type that was never imported. The web console lints
+  with Oxlint instead of ESLint and runs its unit tests on Vitest instead of
+  `node --test`, and `mise run sdk-browser` now also runs the bundler plugin's
+  tests (#97).
 - Made release archives consume the canonical root `LICENSE` file.
 - Made PostgreSQL the correctness boundary for multi-replica alert membership,
   per-rule leases/fencing, durable state, and notification Outbox work; Redis
@@ -531,6 +574,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The browser SDK counts a 408 or 429 answer to a Web Vital as
   `retry_exhausted` rather than `server_rejected`, because the same payload
   may be accepted later; 400, 404, and 422 remain `server_rejected` (#61).
+- The minimum-release-age gate for hand-pinned versions no longer fails when a
+  repository answers the authenticated GitHub API with a non-rate-limit 403,
+  such as an organization IP allow list rejecting `GITHUB_TOKEN`; the earlier
+  fallback, an anonymous API request, shares the runner's rate-limited IP and
+  often failed too. The gate now reads the release time and the pre-release
+  label from the repository's `github.com` release page, falls back to the
+  anonymous API only if that fails, and still exits 2 when every source fails
+  or a rate limit is hit. For such a repository the weekly report marks the
+  pin `unknown`, not outdated, when the release page cannot show that the
+  latest release is old enough, and `--latest-eligible` still exits 2, so the
+  storage-binary vulnerability check keeps blocking (#86).
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
