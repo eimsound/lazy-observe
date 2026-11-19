@@ -3,6 +3,7 @@
 > 2026-11 修订：S2 审查实测发现，GIL 构建上的进程内采样系统性看不见短 CPU 段。启用范围因此收窄为
 > 「Linux 上运行时没有 GIL 的 3.15t」，窗口对齐 Go SDK，并写明 greenlet 不支持。sidecar 与墙钟剖析
 > 一起推迟、另立项。证据见 [`python-cpu-profiling-gil.md`](../research/python-cpu-profiling-gil.md)。
+> 随后的 grilling 补定了失败分两级计数、`profiling_interval`、fork 后的窗口处理，并决定 SDK 不检测 greenlet。
 
 Python SDK 一直没有剖析信号：`sdk/python/README.md` 之前直接写「CPU/pprof profiling is not
 implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon），调研
@@ -29,8 +30,18 @@ implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon）
   `profiling.sampling.sample.sample(pid, collector, *, all_threads=True, mode=cpu)`，
   自定义 `profiling.sampling.Collector` 聚合栈。这两个符号不在 3.15 文档的公开 API 里，
   签名或语义可能随 CPython 小版本变化，因此启动时做特性探测（检查签名并试采），而不是维护
-  版本白名单。运行中满足以下任一条件就自动停用并 warning：连续 3 次采集失败；或一个窗口内
-  失败率超过阈值（阈值在 S3 确定）。失败率同时输出到 diagnostics。
+  版本白名单。
+- **失败分两级计数，停用后不恢复**：
+  - 窗口级：`sample()` 连续 3 个窗口抛异常就停用。
+  - tick 级：单次抓栈失败时，Tachyon 调用 `collect_failed_sample()`，但不抛异常。一个窗口内
+    失败 tick 超过一半（50%）就停用。这个阈值只用来拦「采样基本失效」（gevent 约 100%），
+    远高于 3.15t 无 greenlet 时 0.4–2.2% 的基线失败率；部分失真不归它管。
+  - 失败的 tick 计入 `record_telemetry_drop("profile", "sample_failed", n)`，`Diagnostics` 不加字段；
+    全部失败的窗口不上传。
+  - 停用（包括窗口前发现 GIL 已启用）后，本进程内不再恢复、不退避重试，因为原因都是环境性的。
+    退避只用于上传（`DeliveryQueue`）。
+  - warning 带稳定的原因码（如 `gil_build`、`gil_enabled`、`unsupported_platform`、
+    `python_too_old`、`probe_failed`、`sample_failure_rate`）和用户文档链接；每个进程每类最多一条。
 - **只采 CPU**：`mode=cpu`、`all_threads=True`，排除 SDK 自己的采样线程，上传 `type=cpu`。
   pprof sample type 沿用 Go SDK 的 `samples/count` + `cpu/nanoseconds`，样本值是「计数 × 周期」。
   墙钟类型以后与 sidecar 一起单独立项。
@@ -38,15 +49,24 @@ implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon）
   上面的支持范围。
 - **不支持 greenlet**：线程正跑在非主 greenlet 里时，Tachyon 抓栈报
   `RuntimeError: Incomplete sample: did not reach base frame`，整次样本作废，连同一时刻其它
-  线程的栈也一起丢失。进程内和外部 attach、各种 mode、3.15 和 3.15t 都是这样。gevent、eventlet 应用会因
-  连续失败而停用；只在局部使用 greenlet 的库（例如 SQLAlchemy asyncio）会间歇性丢样本，
-  靠失败率规则发现。用户文档写明不支持。
-- **prefork 每个 worker 各自采样**：用 `os.register_at_fork` 在子进程重启采样线程；
-  `upload_id` 每个窗口取 128 bit 随机数（`secrets.token_hex(16)`，与 Go SDK 的
-  `newEventID` 一致），`os.urandom` 本身 fork 安全，不需要重新播种；labels 不带 pid。
-- **100 Hz，每 60 s 采 10 s**，与 Go SDK 的 `collectProfiles`（`profilingCPUWindow = 10s`、
-  `ProfilingInterval` 默认 60 s）一致；投递复用 `sdk/python/lazyobserve/delivery.py` 的
-  `DeliveryQueue`。
+  线程的栈也一起丢失。进程内和外部 attach、各种 mode、3.15 和 3.15t 都是这样。
+  **SDK 不检测 greenlet**：持续剖析是用户显式打开的，用户文档写明「greenlet 里的代码不可见、
+  不支持」，由用户自行判断，SDK 不扩大自己的责任范围。gevent、eventlet 应用会因 tick 失败率
+  超过 50% 而停用。只在局部使用 greenlet 的库（例如 SQLAlchemy asyncio）不会触发停用，但火焰图
+  会失真：3.15t 实测失败率 8–29%，查询路径的 CPU 从真值的 36–44% 降到样本里的 1–5%（忙 1 ms 时）。
+- **prefork 每个 worker 各自采样**：用 `os.register_at_fork` 在子进程重启采样线程。子进程回调
+  里要丢弃继承来的当前窗口、聚合结果和锁，全部换成新对象，从一个新窗口开始。否则 `--preload`
+  时 master 在 fork 前采到的样本会被每个 worker 再上传一遍；继承来的锁如果在 fork 那一刻被
+  采样线程持有，子进程会死锁。`upload_id` 在窗口结束、编码时由上传方进程生成，取 128 bit
+  随机数（`secrets.token_hex(16)`，与 Go SDK 的 `newEventID` 一致）；`os.urandom` 本身 fork
+  安全，不需要重新播种。labels 不带 pid。各进程、各主机的窗口在平台查询时由 `pprof.Merge`
+  汇总为同一服务的火焰图；平台多副本共享元数据库与对象存储，`(project_id, upload_id)` 唯一
+  索引保证重试或并发落到不同副本时不会重复入库。
+- **100 Hz，每 `profiling_interval` 秒采 10 s**：新增 `Config.profiling_interval: float = 60.0`，
+  语义与 Go SDK 的 `ProfilingInterval` 相同，即两个窗口起点之间的间隔。窗口长度固定 10 s，
+  与 Go 的 `profilingCPUWindow` 一致，不开放配置。`≤0` 时回退到默认值（与 `export_interval`
+  相同）；小于 10 s 时窗口首尾相接，相当于连续采样。不支持环境变量配置。投递复用
+  `sdk/python/lazyobserve/delivery.py` 的 `DeliveryQueue`。
 - **零依赖自写 pprof 编码器**：只用标准库把聚合栈编码成 gzip pprof；用 Go 侧
   `github.com/google/pprof/profile`（`internal/gateway` 已依赖）回读测试，不引入新依赖。
 - **不改协议面**：仍走 `POST /api/profiles`，字段与 Go SDK 相同，`type=cpu`；
@@ -80,6 +100,13 @@ implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon）
   所以它只能作为显式开关，不能默认开启。
 - **原生扩展在不持 GIL 的原生线程里采样（拒绝）**：会破坏零依赖纯 Python SDK，需要按平台
   出 wheel，维护成本与本 ADR 的范围不匹配。
+- **检测到 `greenlet` 模块就停用（拒绝）**：能确定性地拦住 SQLAlchemy asyncio 这类局部失真，
+  但会误伤只导入、未使用 greenlet 的应用，也把「用户自己的部署选择」变成了 SDK 的责任。
+  改为在文档里写明。
+- **停用后退避重试（拒绝）**：停用原因（greenlet、C 扩展打开 GIL、CPython 接口变化）不会
+  自己消失，重试只会重复打 warning，或者静默空转。
+- **给 `Diagnostics` 加 profiling 专用字段（拒绝）**：`Diagnostics` 是投递损失的快照，加字段就是
+  改公开 API，还会与 Go SDK 不对齐；失败 tick 走已有的 `record_telemetry_drop`，用 `reason` 区分。
 - **CLI collapsed 转换（拒绝）**：丢完整文件路径，还要解析别人的文本格式，契约更脆。
 - **3.14 及更早用 `_remote_debugging`（拒绝）**：私有模块、接口与 3.15 不同，而且同样受 GIL
   限制，维护两条实现的成本高于覆盖收益。
@@ -101,3 +128,8 @@ implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon）
   随线程数增长；这是因为 `mode=cpu` 每个 tick 都要对每个线程读一次 `/proc/<pid>/task/<tid>/stat`。
   导入后 RSS 增加 15–19 MiB；忙线程吞吐变化在 ±4% 以内，与噪声无法区分。按每 60 s 采 10 s
   摊下来，平均开销约为上述数字的 1/6。
+- 火焰图只能看整个服务的汇总，不能按进程或实例拆开看（Go SDK 也不发 labels）。以下两条是平台
+  已有的特性，与 Python 无关，这次不处理：
+  - 火焰图查询读取时间窗口内的全部 blob 再合并，没有数量上限（`profileQuery` 不设 `Limit`）。
+    worker 数越多，单次查询读得越多：16 个 worker 看 1 小时约 960 份。
+  - HA E2E（`scripts/e2e-multi-replica.sh`）没有覆盖 profile；多副本并发去重的结论来自读代码。

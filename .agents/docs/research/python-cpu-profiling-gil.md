@@ -34,7 +34,7 @@ S2 审查发现，GIL 版 CPython 3.15.2 上进程内调用
 | 内核 | Linux 6.12.115+deb13.1-amd64（Debian 13），8 核，Yama `ptrace_scope=0` |
 | 解释器 | uv 管理的 `cpython-3.15.2-linux-x86_64-gnu` 与 `cpython-3.15.2+freethreaded-linux-x86_64-gnu`，所有脚本都用 `-I` 运行 |
 | 第三方包 | gevent 26.9.0、greenlet 3.5.6（GIL 版，`uv pip install --only-binary :all:`）；3.15t 只有 greenlet 3.5.6 的 wheel，gevent 没有 3.15t wheel |
-| PoC | 本地 `poc/python-315-sampling-s2-review/`，被 git 忽略，不提交。子目录：`attach/`、`wallvsall/`、`burst/`、`gevent/` |
+| PoC | 本地 `poc/python-315-sampling-s2-review/`，被 git 忽略，不提交。子目录：`attach/`、`wallvsall/`、`burst/`、`gevent/`、`sqla/` |
 
 ## 1. 忙闲切换下的准确性（`burst/`）
 
@@ -152,9 +152,35 @@ for r in 1..3; for sc in "1 0" "1 15" "1 63" "4 0"; for v in none cpu wall all:
   同一时刻其它线程的栈也一起丢失。
 - monkey patch 之后，用 `threading.Thread` 启动的「采样线程」其实是 greenlet，
   `threading.get_native_id()` 与主线程相同。
-- 推断（未测）：只在局部使用 greenlet 的库（例如 SQLAlchemy asyncio）会间歇性丢样本，凑不满连续 3 次
-  失败，因此需要失败率规则来发现。
 - 在 cpython 和 greenlet 仓库里搜 "did not reach base frame"、"greenlet profiling.sampling"，都没有找到 issue。
+  按负责人决定，不向上游提交任何东西。
+
+### 5.1 SQLAlchemy asyncio（`sqla/`，3.15t）
+
+环境：3.15.2t（`_is_gil_enabled()` 为 False）；SQLAlchemy 2.1.9、aiosqlite 0.22.1、greenlet 3.5.6
+（都有 cp315t wheel）。负载是 asyncio 循环反复执行「AsyncSession 查询内存 sqlite」，每次查询之间
+在 `burn()` 里烧 N ms CPU。对照组用 `asyncio.sleep(1 ms)` 代替查询，墙钟时间与查询相当。进程内
+`mode=cpu`，100 Hz，每次 5 s。命令：`.venv/bin/python -I sqla_cpu.py {sqla,sleep} N 5`。
+
+| 配置 | tick 失败率 | `burn` 真值 → 样本 | 查询路径在样本中的占比 |
+| --- | --- | --- | --- |
+| sqla，N=1（3 次） | 25.0 / 25.5 / 28.9%（复核一次为 27.7%） | 56–64% → 81–83% | 1.3–5.3%（真值约 36–44%） |
+| sqla，N=5（3 次） | 7.8–9.0% | 87–89% → 96–98% | 0.2–0.7%（真值约 11–13%） |
+| 对照组，N=1（2 次，复核 1 次） | 1.4 / 1.8 / 2.2% | 与真值一致 | — |
+| 对照组，N=5（2 次） | 0.4 / 0.4% | 与真值一致 | — |
+
+- 失败的报错不止一种。以 sqla N=1 的一次为例：
+  - `Failed to parse initial frame in chain` 59 次；
+  - `Incomplete sample: did not reach base frame` 48 次；
+  - `process_vm_readv failed` 31 次；
+  - `Unhandled frame owner` 7 次。
+- 失败几乎都发生在查询阶段（`fail_phase` 为 step 130、burn 15，跨线程读取，有竞态）。
+- `probe.py`：在 `AsyncConnection.run_sync` 的回调里（处于非主 greenlet），20 次 `RemoteUnwinder`
+  调用全部报 `did not reach base frame`；在 asyncio 主 greenlet 里，20 次全部成功。
+- 结论：这类局部使用 greenlet 的库会让 greenlet 里的 CPU 整段消失，火焰图因此失真，而失败率只有
+  8–29%，不会触发 50% 的停用阈值。SDK 不检测 greenlet，由用户按文档判断。
+- 没有 greenlet 时也有 0.4–2.2% 的基线失败（报错类型相同），根因没有逐条分析。这些失败计入
+  `sample_failed` 丢弃计数。
 
 ## 6. 各 mode 与 Go SDK 的对照
 
@@ -177,4 +203,16 @@ for r in 1..3; for sc in "1 0" "1 15" "1 63" "4 0"; for v in none cpu wall all:
 - 吞吐数字受宿主机负载干扰，没有给出百分比结论。
 - 外部 attach 在 GIL 争用下线程间偏斜的根因没查清；Yama scope=1 下 `PR_SET_PTRACER` 能否放行，
   只有源码论证，本机改不了 scope，无法实测。
-- greenlet 的失败是否属于 Tachyon 应修的 bug，没有向上游确认。
+- greenlet 的失败是否属于 Tachyon 应修的 bug，没有向上游确认（按负责人决定，不报上游）。
+- 3.15t 无 greenlet 时 0.4–2.2% 的基线失败，根因没查。
+
+## 附：多进程与平台多副本（读代码，未实测）
+
+- 每个窗口在平台上存为一行 `profile_metas`，blob 的 key 带随机 uuid。`(project_id, upload_id)`
+  唯一索引负责去重：内容相同返回 200，内容不同返回 409。两个副本并发写入时，后写的那个删掉自己的
+  blob 再回查（`internal/gateway/profile_api.go:198-215`）。
+- 火焰图按 `service + type + 时间窗口重叠` 读出全部记录，用 `pprof.Merge` 汇总
+  （`internal/meta/profiles.go:65-85`，`profile_api.go:278-311`）。所以多个 worker、多台主机的数据
+  汇总成同一服务的火焰图；多副本共享元数据库和对象存储，任一副本都能查全。
+- 查询不设 `Limit`，读取量随进程数和时间窗口线性增长。`scripts/e2e-multi-replica.sh` 没有覆盖
+  profile。
