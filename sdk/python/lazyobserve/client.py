@@ -10,6 +10,7 @@ import os
 import platform
 import resource
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from opentelemetry import metrics as _otel_metrics
@@ -97,6 +98,8 @@ class Client:
         self.error_transport = error_transport
         self._dropped_counter = dropped_counter
         self._init_err = init_err
+        #: The continuous-profiling controller when ``Config.profiling`` is on.
+        self.profiling: Any = None
 
         self._dropped_telemetry = 0
         self._drop_lock = threading.Lock()
@@ -231,8 +234,18 @@ class Client:
     def shutdown(self, timeout: float = 10.0) -> Optional[BaseException]:
         """Flush all enabled signals and release SDK resources."""
         errs: List[BaseException] = []
+        deadline = time.monotonic() + max(0.0, timeout)
         if self.error_transport is not None:
             result = self.error_transport.close(timeout)
+            if result:
+                errs.append(result)
+        if self.profiling is not None:
+            # After the error queue (short, user-triggered) and before the OTel
+            # providers, as in Go: a profiling window must not eat their budget.
+            try:
+                result = self.profiling.shutdown(max(0.0, deadline - time.monotonic()))
+            except Exception as exc:  # noqa: BLE001 - shutdown reports, it never raises
+                result = exc
             if result:
                 errs.append(result)
         for provider, name in (
@@ -364,6 +377,15 @@ def build_client(config: Any, parsed: Any) -> Client:
         retry_max=config.delivery.retry_max,
         warn=default_warn_factory(logger, "error"),
     )
+    if config.profiling:
+        # Experimental and optional: whatever goes wrong here must not degrade the
+        # client. The probe (a 0.1 s trial sample) runs on the profiling thread.
+        from . import _profiling
+
+        try:
+            client.profiling = _profiling.start_profiling(client, parsed, config, logger)
+        except Exception as exc:  # noqa: BLE001
+            _profiling.report_start_failure(logger, exc)
     return client
 
 
