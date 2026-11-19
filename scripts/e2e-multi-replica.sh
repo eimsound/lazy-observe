@@ -12,9 +12,9 @@ BIN_DIR=${LO_E2E_STORAGE_BIN_DIR:-"$ROOT/.cache/storage-bin"}
 # static binary and CA bundle (same entrypoint and ports as the Alpine default).
 # They are pulled from quay.io, VictoriaMetrics' second official registry, whose
 # -cluster digests are identical to Docker Hub's.
-VMSTORAGE_IMAGE=${LO_E2E_VMSTORAGE_IMAGE:-quay.io/victoriametrics/vmstorage:v1.147.0-cluster-scratch@sha256:36fe603968639fd81f1a310965803b06c89178b1eebeef7670d7e949ae26f353}
-VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-quay.io/victoriametrics/vminsert:v1.147.0-cluster-scratch@sha256:7a737181e381c0dd281349a42bc995bb1d4daecca736fa849604b8bd2ea3fa02}
-VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-quay.io/victoriametrics/vmselect:v1.147.0-cluster-scratch@sha256:293302fd3687358bb9e22bb411ef7c2e6802a05c3554c2e9605b50fca61828a0}
+VMSTORAGE_IMAGE=${LO_E2E_VMSTORAGE_IMAGE:-quay.io/victoriametrics/vmstorage:v1.156.0-cluster-scratch@sha256:af5ff1687fbdce82ad4efa77b83cff78ff42b866aa7ef8628ee6c7166268adec}
+VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-quay.io/victoriametrics/vminsert:v1.156.0-cluster-scratch@sha256:41fbf25df0ab77a12cae8ed0d2e8d76cd8d922e4e2fb824818f1087641a80e5e}
+VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-quay.io/victoriametrics/vmselect:v1.156.0-cluster-scratch@sha256:310ba425872897a618e60b884dc943772767d8ef0bad37a71c8e01678c232009}
 # SeaweedFS is Apache-2.0 and provides a real S3-compatible API without adding
 # a copyleft test dependency. Upstream only publishes Alpine-based images, so
 # this one stays Alpine; the digest pin keeps the gate repeatable.

@@ -386,6 +386,13 @@ The supervisor never starts, signals, or restarts the configured external
 metrics, logs, or traces services. If lazy-observe starts the optional vmagent,
 that process remains managed and is automatically restarted.
 
+Because the supervisor does not start external services, their query latency is
+your configuration. The embedded storage runs VictoriaMetrics and VictoriaTraces
+with `-search.latencyOffset=0s`, so fresh data is queryable immediately. VictoriaTraces
+v0.12 and later default to a 30-second offset (`-search.latencyOffset`) for the Jaeger,
+Tempo and LogsQL query APIs; an external VictoriaTraces or `vtselect` keeps that default
+unless you pass the flag yourself, and the LLM call statistics then lag by up to 30 seconds.
+
 The gateway uses one storage interface in both modes. In standalone mode the
 configured endpoints are routed as follows:
 

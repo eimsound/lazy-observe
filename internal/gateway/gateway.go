@@ -905,6 +905,10 @@ func (g *Gateway) metricsWrite(c *fiber.Ctx, path string, addProjectQuery bool) 
 
 func (g *Gateway) metricsQuery(c *fiber.Ctx) error {
 	p := currentProject(c)
+	// proxy only isolates when metricsProject is non-empty; fail closed instead of forwarding an unfiltered query.
+	if p.Slug == "" {
+		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
+	}
 	return g.proxy(c, g.storage.MetricsQueryBase(), c.Path(), proxyOptions{metricsProject: p.Slug})
 }
 
@@ -1060,6 +1064,11 @@ func (g *Gateway) applyMetricsIsolation(
 	project string,
 	defaultMatcher bool,
 ) error {
+	// VictoriaMetrics v1.153+ ignores empty extra_label/extra_filters values instead of rejecting them, so an
+	// empty project would silently become a cross-project query. Refuse it here.
+	if project == "" {
+		return errors.New("project slug is empty")
+	}
 	stripReserved(values)
 	if g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
 		if err := injectPromValues(values, project); err != nil {
