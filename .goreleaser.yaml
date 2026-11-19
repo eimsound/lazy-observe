@@ -65,6 +65,12 @@ changelog:
 release:
   draft: false
   prerelease: auto
+  # v0.x 是公开预览：Release 页面顶部写明预览声明（与 CHANGELOG、README、deployment 同一句）。
+  # 正文其余部分由 git log 生成，看不到 CHANGELOG；v1 起不再渲染。
+  header: |
+    {{ if eq .Major 0 -}}
+    > **Public preview.** v0.x releases are previews. Upgrading may require recreating the database, and protocols and SDKs may change incompatibly between versions.
+    {{ end -}}
   github:
     owner: eimsound
     name: lazy-observe
