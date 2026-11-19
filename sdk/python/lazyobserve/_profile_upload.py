@@ -81,6 +81,9 @@ class ProfileUploader:
             retry_max=retry_max,
             warn=warn,
             name=name,
+            # ProfilingController drops the whole uploader in a forked child and
+            # builds a new one; reviving this queue as well would leak a worker.
+            reinit_on_fork=False,
         )
 
     def enqueue(self, profile: CollectedProfile) -> bool:
