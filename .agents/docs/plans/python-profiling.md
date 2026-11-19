@@ -104,15 +104,35 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
     任一不满足，就返回「不可用 + 原因」。GIL 构建上试采不报错，只会返回空样本，所以这三道门必须
     放在试采之前。
   - 暴露一个「窗口前重查」接口（只查 GIL 状态），供 S3 每个窗口开始前调用。
-  - 失败停用规则：在连续 3 次失败之外，增加「窗口内失败率超过阈值」；失败率由采样器统计并暴露。
-  - Red：用 fake 模块分别断言 GIL 构建、`_is_gil_enabled()` 为 True、非 Linux 时返回不可用原因；
-    断言「间歇失败、凑不满连续 3 次」的序列会触发失败率停用。真实 3.15t 测试改成纯 Python 忙线程
-    负载（不再依赖释放 GIL 的 hashlib）；真实 3.15 GIL 测试断言返回不可用。
+  - 失败分两级计数：
+    - 窗口级：`sample()` 连续 3 个窗口抛异常就停用，即现有的 `MAX_CONSECUTIVE_FAILURES = 3`；
+    - tick 级：统计窗口内 `collect_failed_sample()` 的次数，失败超过一半（50%）就停用。
+  - 停用后在本进程内不再恢复，删掉 `backoff_seconds()` 的重试用途，退避只留给上传。
+  - 失败 tick 数交给 S3，由 S3 计入 `record_telemetry_drop("profile", "sample_failed", n)`。
+  - 不检测 greenlet（ADR 0014：用户自己打开、自己负责，只在文档里写明）。
+  - Red：用 fake 模块分别断言：
+    - GIL 构建、`_is_gil_enabled()` 为 True、非 Linux 时返回不可用原因码；
+    - 连续 3 个窗口抛异常时停用；
+    - 一个窗口内失败 tick 为 51% 时停用，49% 时不停用；
+    - 停用后不再开新窗口。
+
+    真实 3.15t 测试改为纯 Python 忙线程负载（不再依赖释放 GIL 的 hashlib）；真实 3.15 GIL 测试
+    断言返回不可用。
   - `d30b98c` 的执行日志里写着「等待负责人决定默认 mode」，现已决定：保持 `mode=cpu`。
-- **S3**：窗口改为每 60 s 采 10 s（见下文 S3 交付）；每个窗口开始前调用 S2 的 GIL 重查，
-  发现 GIL 已启用就停用，只打一条 warning；失败率阈值在开工前定下（建议 20%）。
-- **S4**：CI 中 3.15 GIL 构建 job 只验证「打 warning、不采样」，真实采样只在 3.15t job 里跑；
-  用户文档写明支持范围、所有打 warning 不采样的情况、不支持 greenlet，以及实测开销。
+- **S3**：
+  - 新增 `Config.profiling_interval: float = 60.0`（秒）：两个窗口起点之间的间隔，语义同 Go 的
+    `ProfilingInterval`；窗口固定 10 s；`≤0` 时回退默认值；小于 10 s 时窗口首尾相接。
+  - 每个窗口开始前调用 S2 的 GIL 重查，发现已启用就停用。
+  - warning 带原因码和文档链接，每个进程每类最多一条。
+  - 失败 tick 计入 `record_telemetry_drop("profile", "sample_failed", n)`，`Diagnostics` 不加字段；
+    全部失败的窗口不上传。
+  - fork 后子进程丢弃继承来的窗口、聚合结果和锁，重建后从新窗口开始；`upload_id` 在窗口结束、
+    编码时生成。
+- **S4**：
+  - CI 中 3.15 GIL 构建的 job 只验证「打 warning、不采样」，真实采样只在 3.15t job 里跑。
+  - 用户文档写明：支持范围；所有打 warning、不采样的情况；`profiling_interval`；不支持 greenlet
+    （gevent、eventlet 会自动停用；SQLAlchemy asyncio 等库不停用，但 greenlet 里的 CPU 不可见）；
+    实测开销。
 
 ## 实施步骤
 
@@ -202,9 +222,12 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   - 交付：`Config.profiling: bool = False` 与 `normalize_config` 默认值；
     `build_client` 在开启时探测可用性，不可用（<3.15、GIL 构建、GIL 已启用、非 Linux）
     只打一条带原因的 warning；
-    窗口循环与 Go SDK 一致：每 60 s 采 10 s（100 Hz、`mode=cpu`、`all_threads=True`），
-    每个窗口开始前重查 GIL 状态，发现已启用就停用并 warning；每窗口
-    `new_upload_id()` 后投递；`os.register_at_fork` 在子进程重启采样线程；
+    `Config.profiling_interval: float = 60.0`，`≤0` 时回退默认值；
+    窗口循环与 Go SDK 一致：每 `profiling_interval` 秒采 10 s（100 Hz、`mode=cpu`、
+    `all_threads=True`），间隔小于 10 s 时窗口首尾相接；每个窗口开始前重查 GIL 状态，发现已启用
+    就停用并 warning；停用后不恢复；每个窗口在结束、编码时才调用 `new_upload_id()`，然后投递；
+    失败 tick 计入 `record_telemetry_drop("profile", "sample_failed", n)`，全部失败的窗口不上传；
+    `os.register_at_fork` 在子进程里丢弃继承来的窗口、聚合结果和锁，重建后重启采样线程；
     `upload_id` 每窗口取 128 bit 随机数（`os.urandom` fork 安全），无需重新播种；
     `shutdown(timeout)` 立即停采，当前窗口已满 5 秒就在预算内上传，否则丢弃。
     窗口编码遇到非法帧时捕获编码器的 `TypeError`/`ValueError`，不能让异常冒到
@@ -213,10 +236,15 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   - 开工前核对：Go SDK 的 shutdown 处理是否与决策 14 一致（`sdk/go` 的
     `profilingLoop` 在 `ctx.Done()` 后直接返回，S3 需要对齐或记录差异）。
   - 涉及位置：`sdk/python/lazyobserve/config.py:37`、`client.py:231`、`client.py:269`。
-  - Red：`test_config.py` 断言 `profiling` 默认 False；`test_profiling_lifecycle.py`
-    用 fake 采样器与 fake 上传器断言：不可用时只 warning 一次、每 60 s 一个 10 s 窗口、
-    窗口前 GIL 重查为启用时停用并 warning、满 5 s 的窗口在 `shutdown` 内上传、不足 5 s 丢弃、
-    fork 后子进程重新注册。
+  - Red：`test_config.py` 断言 `profiling` 默认 False、`profiling_interval` 默认 60 且 `≤0` 回退
+    默认值；`test_profiling_lifecycle.py` 用 fake 采样器与 fake 上传器断言：
+    - 不可用时只 warning 一次，且带原因码；
+    - 默认每 60 s 一个 10 s 窗口，`profiling_interval=5` 时窗口首尾相接；
+    - 窗口前 GIL 重查为启用时停用并 warning，之后不再开窗口；
+    - 失败 tick 计入 `sample_failed`，全部失败的窗口不上传；
+    - 满 5 s 的窗口在 `shutdown` 内上传，不足 5 s 丢弃；
+    - fork 后子进程重新注册；在窗口中间 fork 时，父子进程的 `upload_id` 不同、子进程不上传
+      fork 前的样本、子进程不死锁。
     命令：`mise run sdk-python`。
   - Green：接上开关与生命周期，只覆盖上述断言。
   - 验证：`mise run sdk-python`；3.15/3.15t job。
@@ -233,9 +261,10 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
     - 支持范围：Linux + CPython 3.15t，运行时无 GIL；
     - 打 warning、不采样的情况：3.9–3.14、3.15 GIL 构建、GIL 被 `PYTHON_GIL=1`/`-X gil=1` 或
       不兼容的 C 扩展重新启用、macOS/Windows；
-    - 不支持 greenlet（gevent、eventlet 会自动停用；SQLAlchemy asyncio 等局部使用 greenlet 的库
-      可能丢样本）；
-    - 采样节奏（每 60 s 采 10 s）与实测开销。
+    - 不支持 greenlet（gevent、eventlet 会因失败率超过 50% 而自动停用；SQLAlchemy asyncio 等局部
+      使用 greenlet 的库不会停用，但 greenlet 里的 CPU 在火焰图上不可见）；
+    - 采样节奏（每 `profiling_interval` 秒采 10 s，默认 60）与实测开销；
+    - 火焰图是整个服务所有进程、实例的汇总，不能按进程拆开看。
 
     `CHANGELOG.md` 记一条；
     版本号保持 0.1.0；不改 `docs/version-matrix.md`（协议面不变）。
@@ -266,14 +295,13 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
 
 ## 未决事项
 
-- S2 的「连续失败 N 次自动停用」中 N 的取值：建议 3，S3 开工前由负责人确认。
-- S3 是否需要同时输出 profiling 自身的 diagnostics 计数（`dropped_telemetry`）：
-  建议复用 `record_telemetry_drop`，S3 时确认。
-- 失败率停用阈值：建议 20%，S3 开工前由负责人确认。
-- 是否像 Go 的 `ProfilingInterval` 那样把采样间隔开放给用户配置：S3 开工前确认。
-- greenlet 抓栈失败是否报给上游 CPython：由负责人决定，实现线程不自行提交。
+- 已定（2026-11 grilling）：窗口级 N = 3；tick 失败率阈值 50%；失败 tick 复用
+  `record_telemetry_drop`、`Diagnostics` 不加字段；开放 `profiling_interval`；不检测 greenlet；
+  不向 CPython 上游提交 issue 或草稿。
 - 后续立项（不在本计划内）：sidecar 外部 attach（覆盖 GIL 构建）与墙钟剖析（新增 profile
   类型，涉及协议面）。
+- 已知平台限制（只记录，本计划不处理）：火焰图查询读取窗口内全部 blob，没有数量上限；
+  HA E2E 没有覆盖 profile。
 
 ## 执行日志
 
