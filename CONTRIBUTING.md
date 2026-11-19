@@ -147,7 +147,7 @@ business job.
 | `scripts/e2e-multi-replica.sh` and its helpers, `bench/performance-gates.json`, `scripts/download-storage-bins.sh` | Adds HA E2E |
 | Packaging chain | Zero-config artifact smoke plus native arm64 build and smoke |
 | `.github/dependabot.yml`, `.trivyignore.yaml` | Go checks only (`workflow-check` validates them) |
-| `.github/**`, `mise.toml`, `scripts/ci-*`, `Dockerfile*` | Everything |
+| `.github/**`, `mise.toml`, `scripts/ci-*`, `scripts/mise-release.env`, `Dockerfile*` | Everything |
 
 | Trigger | Workflow | Scope |
 | --- | --- | --- |

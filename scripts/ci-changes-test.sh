@@ -75,7 +75,7 @@ expect '.github/dependabot.yml' 'go'
 expect '.trivyignore.yaml' 'go'
 expect 'scripts/check-image-vulns.sh' 'go pins'
 # 手工固定点：改动要触发 pins 门禁（联网查 release 发布时间）；门禁脚本自身、年龄常量同理，其测试只需 go。
-expect 'scripts/mise-release.env' 'go pins'
+# mise 引导版本另外走全量（见下面的全量用例）。
 expect 'scripts/install-trivy.sh' 'go pins'
 expect 'scripts/check-pinned-releases.sh' 'go pins'
 expect 'scripts/release-age.env' 'go pins'
@@ -107,6 +107,7 @@ expect '.github/workflows/ci.yml' "$all"
 expect 'mise.toml' "$all"
 expect 'scripts/ci-changes.sh' "$all"
 expect 'Dockerfile' "$all"
+expect 'scripts/mise-release.env' "$all"
 expect 'Makefile' "$all"
 
 # 不打开 HA 门禁的改动面：前端、非 Go SDK、文档、Helm。

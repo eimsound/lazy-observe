@@ -28,7 +28,7 @@ flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python 
 #   - 门禁本身：scripts/e2e-multi-replica.sh 和它现场编译的 scripts/e2e-{path-router,otlp-payload,otlp-sink}/**；
 #   - 门禁读取的预算：bench/performance-gates.json（副本 GOMAXPROCS、trace 夹具规模）；
 #   - 存储二进制下载：scripts/download-storage-bins.sh；
-#   - 全量路径（.github/**、mise.toml、scripts/ci-*、Dockerfile*、未分类路径）。
+#   - 全量路径（.github/**、mise.toml、scripts/ci-*、scripts/mise-release.env、Dockerfile*、未分类路径）。
 # 刻意不打开的：web/**（build-binary 不构建前端，HA 断言不走 UI）、deploy/**、config.example.yaml
 #（门禁不读 Helm chart 或示例配置，Helm 由 go job 的 helm-lint/helm-template-test 覆盖）、
 # scripts/e2e.sh / e2e-restart.sh 等单副本 e2e 脚本、非 Go 的 SDK 与纯文档。
@@ -41,7 +41,7 @@ flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python 
 #   - cmd/**、internal/**、go.mod/go.sum、ent 生成链路；
 #   - web/**、scripts/prepare-web-assets.sh（browser journey 登录真实 UI）；
 #   - scripts/download-storage-bins.sh、scripts/sdk-journeys.sh；
-#   - 全量路径（.github/**、mise.toml、scripts/ci-*、Dockerfile*、未分类路径）。
+#   - 全量路径（.github/**、mise.toml、scripts/ci-*、scripts/mise-release.env、Dockerfile*、未分类路径）。
 # 刻意不打开的：deploy/**、config.example.yaml、bench/**、单副本 e2e 与 HA 脚本。
 
 # 打包链路：动到这些路径时额外跑 arm64 构建与冒烟（以及 amd64 构建与冒烟）。
@@ -136,8 +136,9 @@ classify() {
   .github/dependabot.yml | .trivyignore.yaml)
     set_flags go
     ;;
-  # CI 自身、工具链与镜像：全量。
-  .github/* | mise.toml | scripts/ci-* | Dockerfile*)
+  # CI 自身、工具链与镜像：全量。scripts/mise-release.env 是每个 job 的 ci-setup-mise.sh 与 Dockerfile
+  # 共用的 mise 引导版本，升级 mise 要让所有引导路径都跑一遍。
+  .github/* | mise.toml | scripts/ci-* | scripts/mise-release.env | Dockerfile*)
     set_all
     ;;
   # 服务端经 replace 把 sdk/go 编进二进制（自监控链路），所以也要跑构建与 e2e。
