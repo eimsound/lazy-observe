@@ -433,24 +433,33 @@ jobs:
           restore-keys: go-sdk-${{ runner.os }}-${{ runner.arch }}-
       - run: mise run sdk-go
 
+  # Node SDK：同一条 `mise run sdk-node` 按 LO_SDK_NODE_VERSION 在 Node 22 / 24 / 26 三条受支持的主线上跑完整套件
+  # （mise 管 node，不用 setup-node）。版本精确到 patch，取每条线发布满 7 天的最新 patch；mise.toml 的 node 与 26 这一格同值。
+  # ci-ok 按 job id 汇总：矩阵里任何一格失败，sdk-node 的 result 就是 failure。
   sdk-node:
-    name: Node SDK (install, build, typecheck, test, licenses)
+    name: Node SDK (Node ${{ matrix.node }})
     needs: changes
     if: needs.changes.outputs.sdk_node == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.23.5", "24.22.3", "26.13.1"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Restore mise cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
-          key: mise-sdk-node-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
-          restore-keys: mise-sdk-node-${{ runner.os }}-${{ runner.arch }}-
+          key: mise-sdk-node-${{ matrix.node }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-sdk-node-${{ matrix.node }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # 装 mise.toml 钉的 node、pnpm，再加矩阵这一格的 node。
+          MISE_CI_TOOLS: node pnpm node@${{ matrix.node }}
       - name: Restore pnpm cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -458,32 +467,50 @@ jobs:
           key: pnpm-sdk-node-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'sdk/node/pnpm-lock.yaml') }}
           restore-keys: pnpm-sdk-node-${{ runner.os }}-${{ runner.arch }}-
       - run: mise run sdk-node
+        env:
+          LO_SDK_NODE_VERSION: ${{ matrix.node }}
 
+  # Browser SDK：bundler-plugin 只发 ESM，靠 Node 22.15+ 的 require(esm) 服务 CJS 调用方，所以它的加载冒烟
+  # （`mise run sdk-browser-smoke`）在 22 / 24 / 26 上各跑一遍；浏览器 SDK 的其余测试与 Node 版本无关，只在 26 上跑完整的
+  # `mise run sdk-browser`。版本选择规则同 sdk-node。
   sdk-browser:
-    name: Browser SDK (install, build, typecheck, test, licenses)
+    name: Browser SDK (Node ${{ matrix.node }})
     needs: changes
     if: needs.changes.outputs.sdk_browser == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: "22.23.5"
+            task: sdk-browser-smoke
+          - node: "24.22.3"
+            task: sdk-browser-smoke
+          - node: "26.13.1"
+            task: sdk-browser
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Restore mise cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
-          key: mise-sdk-browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
-          restore-keys: mise-sdk-browser-${{ runner.os }}-${{ runner.arch }}-
+          key: mise-sdk-browser-${{ matrix.node }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
+          restore-keys: mise-sdk-browser-${{ matrix.node }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          MISE_CI_TOOLS: node pnpm node@${{ matrix.node }}
       - name: Restore pnpm cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.pnpm-store
           key: pnpm-sdk-browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'sdk/browser/pnpm-lock.yaml') }}
           restore-keys: pnpm-sdk-browser-${{ runner.os }}-${{ runner.arch }}-
-      - run: mise run sdk-browser
+      - run: mise run ${{ matrix.task }}
+        env:
+          LO_SDK_NODE_VERSION: ${{ matrix.node }}
 
   # Python SDK：同一条 `mise run sdk-python` 按 LO_SDK_PYTHON_VERSION 在矩阵里跑（解释器由 uv 取，不用 setup-python）。
   # 3.9、3.13、3.15（GIL 构建）、3.15t（free-threaded）阻塞；3.16 预发布只为提前暴露 CPython 接口变化，

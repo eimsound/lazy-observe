@@ -70,7 +70,7 @@ mise exec -- go run ./examples/fiber load --duration 30s --concurrency 8
 | Go | `github.com/eimsound/lazy-observe/sdk/go` | Fiber v2、`slog`、`database/sql`、运行时指标、CPU/heap/goroutine 剖析 | [Go SDK](docs/sdk/go.md) |
 | Node.js | `@lazy-observe/node` | Express、Pino、Winston、运行时指标、错误、CPU/heap 剖析 | [Node SDK](docs/sdk/node.md) |
 | 浏览器 | `@lazy-observe/browser`、`@lazy-observe/react` | 错误、Web Vitals、fetch 与 XHR 链路、会话回放、React 错误边界与路由追踪 | [浏览器 SDK](docs/sdk/browser.md) |
-| 浏览器构建 | `@lazy-observe/bundler-plugin` | 从 Vite 和 Webpack 上传 Source Map | [Source Map](docs/sdk/browser.md#source-maps) |
+| 浏览器构建 | `@lazy-observe/bundler-plugin` | 通过 Vite 插件或 CLI 上传 Source Map | [Source Map](docs/sdk/browser.md#source-maps) |
 | Python | `lazyobserve` | Django、Django REST Framework、logging、数据库查询、大模型调用 | [Python SDK](docs/sdk/python.md) |
 
 SDK 源码在 [`sdk/`](sdk/) 目录下。Go SDK 可以直接用 `go get` 安装。Node、浏览器和 Python 的包还没有发布到 npm 或 PyPI，各自的文档里写了如何从本仓库安装。

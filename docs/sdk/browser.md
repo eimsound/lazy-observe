@@ -140,7 +140,7 @@ Browser profiling and React `withProfiler` are not implemented.
 
 ## Source maps
 
-The bundler plugin supports Vite and Webpack through one `unplugin` implementation.
+`@lazy-observe/bundler-plugin` uploads emitted source maps. It is ESM only, has no runtime dependencies and needs Node.js 22.15 or newer. Vite projects use the plugin; every other bundler uses the `lazy-observe-sourcemaps` CLI. Do not use both in one project.
 
 ```ts
 import { defineConfig } from "vite";
@@ -149,19 +149,17 @@ import { vite as lazyObserve } from "@lazy-observe/bundler-plugin";
 export default defineConfig({
   build: { sourcemap: true },
   plugins: [lazyObserve({
-    dsn: process.env.LO_DSN!,
+    dsn: process.env.LO_DSN,
     release: process.env.RELEASE
   })]
 });
 ```
 
-Webpack uses `import { webpack as lazyObserve }` and places the returned value in `plugins`.
-
 Plugin options:
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `dsn` | required | Gateway credentials |
+| `dsn` | unset | Gateway credentials. Missing or empty: the build prints a warning, uploads nothing and succeeds |
 | `release` | seven-character Git SHA | Release key used for upload and symbolication |
 | `upload` | true | Upload emitted `.map` files after build |
 | `stripSourceMaps` | false | Delete local `.map` files after successful upload |
@@ -173,4 +171,14 @@ declare const __LAZY_OBSERVE_RELEASE__: string;
 init({ dsn, release: __LAZY_OBSERVE_RELEASE__ });
 ```
 
-The server matches source maps by minified basename. Basenames must therefore be unique across the output tree; the plugin rejects duplicates.
+### Other bundlers and Next.js
+
+```sh
+lazy-observe-sourcemaps upload --dir <directory> [--dsn <dsn>] [--release <release>] [--strip]
+```
+
+`--dsn` defaults to `$LO_DSN`; `--release` defaults to `$LO_RELEASE`, then the seven-character Git SHA. The browser SDK does not read the release from the build, so give the same release to `init({ release })`. Next.js 16 builds with Turbopack by default, so use the CLI there: set `productionBrowserSourceMaps: true` in `next.config` and run `lazy-observe-sourcemaps upload --dir .next/static --strip` as the `postbuild` script. The package README has the full example.
+
+In CI, provide the DSN from a secret (as `LO_DSN`). Without a DSN, for example in a local build, the plugin and the CLI warn and skip the upload and still succeed. When a DSN is set and the upload fails, the Vite build fails and the CLI exits non-zero.
+
+The server matches source maps by minified basename. Basenames must therefore be unique across the output tree; the plugin and the CLI reject duplicates.

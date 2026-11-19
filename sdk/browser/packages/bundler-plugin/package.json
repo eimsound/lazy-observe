@@ -1,28 +1,27 @@
 {
   "name": "@lazy-observe/bundler-plugin",
   "version": "0.1.0",
-  "description": "Vite and Webpack source map uploader for lazy-observe",
+  "description": "Vite plugin and CLI that upload source maps to lazy-observe",
   "license": "MIT",
   "type": "module",
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
+  "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "default": "./dist/index.js"
     },
     "./vite": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "types": "./dist/vite.d.ts",
+      "default": "./dist/vite.js"
     },
-    "./webpack": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
-    }
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "lazy-observe-sourcemaps": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.15"
   },
   "files": [
     "dist",
@@ -33,9 +32,6 @@
     "build": "tsdown",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "unplugin": "^2.3.10"
   },
   "devDependencies": {
     "tsdown": "0.23.7"
