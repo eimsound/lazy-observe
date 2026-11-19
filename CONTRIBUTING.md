@@ -1,6 +1,6 @@
 # Contributing to lazy-observe
 
-Thanks for helping. The project is pre-release, and changes should preserve its single-binary direction, explicit SDK instrumentation, project isolation, and cross-platform pure-Go build.
+Thanks for helping. The project is a public preview (v0.x), and changes should preserve its single-binary direction, explicit SDK instrumentation, project isolation, and cross-platform pure-Go build.
 
 ## Before you start
 
@@ -192,7 +192,7 @@ The test uses embedded PostgreSQL and may download/start a local test server. CI
 
 ## Metadata baseline
 
-The project is pre-release and does not maintain a database upgrade chain.
+Before the first supported release, the project does not maintain a database upgrade chain.
 Schema changes update the complete baseline in both directories:
 
 ```text

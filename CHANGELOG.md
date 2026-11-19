@@ -2,9 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No version has been released yet; the first public release will be `v0.1.0` and versions will follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No version has been released yet; versions will follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+> **Public preview.** v0.x releases are previews. Upgrading may require
+> recreating the database, and protocols and SDKs may change incompatibly
+> between versions. The database baseline stays mutable until the first
+> supported release, which is not v0.1.0 and has no date yet.
 
 ### Added
 

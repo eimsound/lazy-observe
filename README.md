@@ -13,6 +13,10 @@ them, runs them as child processes that listen only on localhost, and restarts
 any that exit. Metadata is stored in SQLite by default, so you do not need to
 set up a database to try it.
 
+> **Public preview.** v0.x releases are previews. Upgrading may require
+> recreating the database, and protocols and SDKs may change incompatibly
+> between versions.
+
 lazy-observe has no published release yet. To try it, build it from source as
 shown in the quick start. It runs on Linux, on amd64 and arm64.
 

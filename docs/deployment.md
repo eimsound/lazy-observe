@@ -703,7 +703,7 @@ serializes first-run admin, default-project, and self-monitoring bootstrap.
 Consequently, multiple application replicas may start together on an empty
 database without racing seed records or credentials.
 
-The project is pre-release. SQLite and PostgreSQL each have one mutable
+Before the first supported release, SQLite and PostgreSQL each have one mutable
 `001_baseline.sql`; after an incompatible schema change, recreate the
 development database. Existing databases created by earlier commits are not a
 supported upgrade source. See [ADR 0003](../.agents/docs/adr/0003-pre-release-single-database-baseline.md).
@@ -730,6 +730,11 @@ Retention is global by signal, not per project. In all-in-one mode the three VM 
 Reducing retention makes older data eligible for engine or janitor deletion; take a backup first if the data may be needed.
 
 ## Pre-release replacement and backup
+
+v0.x releases are public previews. Upgrading may require recreating the
+database, and protocols and SDKs may change incompatibly between versions. The
+database baseline stays mutable until the first supported release, which is
+not v0.1.0 and has no date yet.
 
 For the default all-in-one/local deployment:
 

@@ -18,7 +18,7 @@ The same value can be supplied with `--meta-db-url` or `LO_META_DB_URL`. Credent
 
 ## Migrations
 
-`OpenStore` determines the dialect from the URL, then creates an empty database from the embedded baseline before constructing the shared ent client. SQLite uses `migrations/001_baseline.sql`; PostgreSQL uses `migrations/postgres/001_baseline.sql`. During the pre-release phase these paired files are mutable and describe the complete current schema. A single transactional `schema_version` row records the baseline name and checksum; it is not a supported version-to-version upgrade history. Runtime auto-migration is forbidden.
+`OpenStore` determines the dialect from the URL, then creates an empty database from the embedded baseline before constructing the shared ent client. SQLite uses `migrations/001_baseline.sql`; PostgreSQL uses `migrations/postgres/001_baseline.sql`. Before the first supported release these paired files are mutable and describe the complete current schema. A single transactional `schema_version` row records the baseline name and checksum; it is not a supported version-to-version upgrade history. Runtime auto-migration is forbidden.
 
 SQLite remains limited to one open database connection and keeps its foreign-key and busy-timeout settings. PostgreSQL uses pgx v5 through `database/sql`. Issue aggregation retains the process-level single-writer batch boundary on both databases.
 

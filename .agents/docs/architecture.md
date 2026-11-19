@@ -14,7 +14,7 @@ them back and lists them in its revision log:
   transactional notification outbox. The production path does not require
   `vmalert` or Alertmanager.
 - [ADR 0003](adr/0003-pre-release-single-database-baseline.md) supersedes the
-  earlier migration lifecycle while the project is pre-release. SQLite and
+  earlier migration lifecycle before the first supported release. SQLite and
   PostgreSQL each use one mutable baseline; development databases are recreated
   after schema changes. Atlas is not part of the production database path.
 - [ADR 0004](adr/0004-keep-ent-behind-metadata-persistence-seam.md) defines the
@@ -151,7 +151,7 @@ VictoriaLogs and VictoriaTraces use their native `AccountID`/`ProjectID` headers
 | VictoriaLogs | OTLP logs and raw structured error events | Issue aggregate state |
 | VictoriaTraces | OTLP traces | Application metadata |
 
-SQLite is the zero-configuration default at `data/meta/lazy-observe.db`. It uses the pure-Go `modernc.org/sqlite` driver, WAL, foreign keys, a five-second busy timeout, and one open connection. PostgreSQL uses pgx. During the pre-release phase, both dialects create the current schema from one embedded `001_baseline.sql`; the single `schema_version` row identifies that baseline and is not a supported upgrade chain.
+SQLite is the zero-configuration default at `data/meta/lazy-observe.db`. It uses the pure-Go `modernc.org/sqlite` driver, WAL, foreign keys, a five-second busy timeout, and one open connection. PostgreSQL uses pgx. Before the first supported release, both dialects create the current schema from one embedded `001_baseline.sql`; the single `schema_version` row identifies that baseline and is not a supported upgrade chain.
 
 Local blob keys are rooted under the configured data directory and partitioned by project. S3 uses the same logical keys; a custom endpoint enables path-style requests for S3-compatible services.
 

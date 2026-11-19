@@ -6,6 +6,8 @@ lazy-observe 是一套自托管的可观测性平台，整个服务是一个二�
 
 二进制里内嵌了 Web 界面和四个存储程序：VictoriaMetrics、VictoriaLogs、VictoriaTraces 和 vmagent。首次启动时，lazy-observe 会把它们解压出来，作为只监听本机地址的子进程运行，子进程退出后会自动重启。元数据默认存在 SQLite 里，所以试用时不需要另外准备数据库。
 
+> **公开预览。** v0.x 是预览版：升级可能需要重建数据库，协议和 SDK 可能出现不兼容变化。
+
 lazy-observe 还没有发布过正式版本。想试用的话，请按下面的快速开始从源码构建。支持的平台是 Linux 的 amd64 和 arm64。
 
 ## 功能
