@@ -145,11 +145,6 @@ updates:
       # typecheck 放过运行时不存在的 API。升级 mise.toml 的 node 主版本时同步改这里的上界。
       - dependency-name: "@types/node"
         versions: [">=27.0.0"]
-      # unplugin 3 只发 ESM：bundler-plugin 的 dist/index.cjs 会 require("unplugin")，Node <22.12 报 ERR_REQUIRE_ESM；
-      # engines 抬到 ^20.19.0 || >=22.12.0；其可选 peer 会把工作区 vite→lightningcss(MPL-2.0) 链进 --prod 许可证检查。
-      # 迁移切片定下 engines、CJS 取舍与许可证门禁口径后撤掉。
-      - dependency-name: "unplugin"
-        versions: [">=3.0.0"]
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
