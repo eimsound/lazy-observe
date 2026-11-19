@@ -393,6 +393,8 @@ CGO_ENABLED=0 go run ./cmd/ingest-bench \
 
 [tasks.gate-release-artifacts]
 description = "Gate existing linux embedded binaries and smoke the native zero-config artifact"
+# check-release-smoke.sh 的内嵌校验脚本用 uv 管理的固定版本 Python（LO_RELEASE_SMOKE_PYTHON_VERSION，默认 3.13），不用系统 python3。
+tools.uv = "0.13.7"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
