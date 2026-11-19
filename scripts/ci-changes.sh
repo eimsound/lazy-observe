@@ -69,6 +69,7 @@ packaging_paths=(
   scripts/prepare-embedded-storage.sh
   scripts/prepare-web-assets.sh
   scripts/check-embedded-artifact.sh
+  scripts/lib/uv-python.sh
   scripts/check-container-smoke.sh
 )
 
@@ -209,7 +210,7 @@ classify() {
     set_flags go build e2e ha sdk_journeys
     ;;
   # HA 门禁脚本与它现场编译的辅助程序；也保留单副本 e2e 原有的触发。
-  scripts/e2e-multi-replica.sh | scripts/e2e-path-router/* | scripts/e2e-otlp-payload/* | scripts/e2e-otlp-sink/*)
+  scripts/e2e-multi-replica.sh | scripts/lib/uv-python.sh | scripts/e2e-path-router/* | scripts/e2e-otlp-payload/* | scripts/e2e-otlp-sink/*)
     set_flags go e2e ha
     ;;
   scripts/download-storage-bins.sh)

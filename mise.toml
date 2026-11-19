@@ -93,6 +93,8 @@ run = "mise run build-binary"
 [tasks.dist-cross]
 description = "Build release binaries for linux and amd64/arm64"
 depends = ["web-assets"]
+# check-embedded-artifact.sh 的内嵌校验用 uv 受管的 Python（scripts/lib/uv-python.sh），不用系统 python3。
+tools.uv = "0.13.7"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -199,6 +201,8 @@ run = "bash scripts/check-e2e-contract.sh"
 
 [tasks.e2e-ha]
 description = "Run the VM/VLogs/VTraces cluster and S3 multi-replica HA gate locally (Docker required); PR CI runs it for server code changes"
+# e2e-multi-replica.sh 的内联辅助用 uv 受管的 Python（scripts/lib/uv-python.sh），不用系统 python3。
+tools.uv = "0.13.7"
 depends = ["build-binary", "storage-bins"]
 run = '''
 #!/usr/bin/env bash
@@ -213,6 +217,7 @@ LO_E2E_BINARY="$binary_path" LO_E2E_STORAGE_BIN_DIR="$storage_path" \
 
 [tasks.perf-ha]
 description = "Run controlled query P95 and capacity-controlled weak-scaling gates in the real HA fixture"
+tools.uv = "0.13.7"
 depends = ["build-binary", "storage-bins"]
 run = '''
 #!/usr/bin/env bash
@@ -398,7 +403,7 @@ CGO_ENABLED=0 go run ./cmd/ingest-bench \
 
 [tasks.gate-release-artifacts]
 description = "Gate existing linux embedded binaries and smoke the native zero-config artifact"
-# check-release-smoke.sh 的内嵌校验脚本用 uv 管理的固定版本 Python（LO_RELEASE_SMOKE_PYTHON_VERSION，默认 3.13），不用系统 python3。
+# check-release-smoke.sh 的内嵌校验脚本用 uv 管理的固定版本 Python（scripts/lib/uv-python.sh，LO_SCRIPTS_PYTHON_VERSION 默认 3.13），不用系统 python3。
 tools.uv = "0.13.7"
 run = '''
 #!/usr/bin/env bash
