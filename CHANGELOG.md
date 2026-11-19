@@ -139,6 +139,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prints the old and the new value, and records a
   `security.key_fingerprint_reset` audit event with actor `cli`. Running it
   with the same key prints `already recorded` and changes nothing (#60).
+- Added `image.digest` to the Helm chart, so the image can be pinned by digest:
+  it renders `<repository>:<tag>` without a digest (unchanged, default
+  `:latest`), `<repository>@<digest>` with only a digest, and
+  `<repository>:<tag>@<digest>` with both. A numeric `image.tag` such as `0.1`
+  now renders as the string it looks like instead of an invalid image name. An
+  empty `image.repository` or a digest that is not `sha256:` followed by 64
+  lowercase hex characters fails the render instead of producing a broken
+  reference or silently falling back to a mutable tag. Each release attaches
+  `helm-values-lazy-observe-<version>.yaml` to its GitHub Release, a values
+  snippet with the pushed image's tag and digest; the chart itself is still not
+  packaged and no digest is written back to `main`. The release job that
+  attaches the snippet has not run against a real `v*` release yet (#67).
 
 ### Security
 
@@ -181,6 +193,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `403 password_change_required`. The web UI redirects every application route
   to `/change-password`, and `/api/auth/login` and `/api/auth/me` return
   `must_change_password` (#18).
+- Hardened metrics project isolation: the gateway answers 500 and does not
+  forward a metrics query that has no project, and the isolation filter
+  rejects an empty project instead of building an empty `extra_filters` /
+  `extra_label`. VictoriaMetrics v1.153 and later silently ignore an empty
+  value there, so an unscoped query would otherwise run across all projects;
+  project slugs are never empty today, so this is defense in depth (#72).
+- Release builds now scan the embedded VictoriaMetrics, vmagent, VictoriaLogs,
+  and VictoriaTraces binaries with Trivy before anything is published; the
+  container image scan cannot see them, because they are gzip-compressed into
+  the `lazy-observe` binary through `go:embed`. A fixable CRITICAL/HIGH finding
+  only warns while the component's pin already is the latest stable upstream
+  release at least 7 days old (there is nothing to upgrade to), and blocks the
+  release once the pin is behind that release or the upstream lookup fails.
+  The verdict for one commit can therefore change over time: when a newer
+  upstream release turns 7 days old, its findings start to block until the pin
+  is upgraded. At the time of the change the remaining 8 HIGH Go standard
+  library findings per architecture only warn (#69).
 
 ### Changed
 
@@ -284,6 +313,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `mise run lint` and `mise run sdk-go` pass `--allow-serial-runners` to
   `golangci-lint`, so a second lint in another worktree waits for the shared
   lock instead of exiting with `parallel golangci-lint is running` (#64).
+- Upgraded the embedded Victoria components to the latest stable releases that
+  were at least 7 days old on 2026-11-19: VictoriaMetrics and vmagent
+  v1.147.0 → v1.156.0, VictoriaLogs v1.52.0 → v1.53.0, and VictoriaTraces
+  v0.9.4 → v0.13.0 (community editions only). Data directories and vmagent
+  queues written by the old versions open and work with the new binaries;
+  downgrading after the new versions have written data was not tested. For
+  deployers:
+  - From v0.12 on, VictoriaTraces' 30-second `-search.latencyOffset` default
+    also applies to LogsQL queries, which the LLM statistics page uses. The
+    supervised VictoriaTraces now runs with `-search.latencyOffset=0s`, so new
+    spans no longer wait 30 seconds to become queryable, and a trace that is
+    still being written may show up incomplete.
+  - An external VictoriaTraces (or a cluster's `vtselect`) in Standalone or HA
+    mode is not managed by lazy-observe: pass `-search.latencyOffset=0s` to it
+    yourself, otherwise the LLM statistics page lags by up to 30 seconds
+    (`docs/deployment.md`).
+  - Single-node VictoriaMetrics v1.154 and later answer the labels,
+    label-values, and series APIs (used by query completion and AI schema
+    collection) from the per-day index only. Long time ranges are slower (2–3
+    times in a 30,000-series, 90-day test, still tens of milliseconds);
+    upstream warns of much higher memory use at larger series counts and
+    retention (#72).
+- Versions pinned by hand in scripts, which Dependabot cannot see (the Victoria
+  storage binaries, the e2e cluster images, the bootstrap mise release, and
+  Trivy), now have a minimum release age of 7 days, kept in
+  `scripts/release-age.env`: the `pinned-releases` CI job fails a pull request
+  whose pin points at a release younger than that, a prerelease, or a draft
+  (and fails closed when the GitHub API cannot be read), and the new weekly
+  `pinned-releases` workflow keeps one tracking issue open while a pin is
+  behind the latest eligible release. Dependabot's `cooldown` and the
+  `minimumReleaseAge` of the `web`, `sdk/node`, and `sdk/browser` pnpm
+  workspaces use the same 7 days, so pnpm also holds back a security patch
+  younger than that until it is listed in `minimumReleaseAgeExclude`. `web` is
+  now a single-package pnpm workspace (`pnpm-workspace.yaml`); the lockfile is
+  unchanged. `sdk/python` is not covered yet (#70).
+- `mise run sdk-journeys` runs the Go, Node, Python, and browser SDK journeys
+  (`sdk/*/e2e.sh`) against a freshly started local platform, and changes that
+  touch server, SDK, web, or storage-download paths now run it as the
+  `SDK journeys` CI job, which `ci-ok` waits for. The browser
+  `performance-journey` was waiting for a heading the Performance page does not
+  have and now waits for its Web Vitals tab and breadcrumb; the web page is
+  unchanged. `sdk/browser/e2e.sh` installs Playwright system dependencies only
+  as root or with passwordless `sudo`. The browser and Python SDK READMEs,
+  which since #9 called the journeys manual-only, now point to this task (#68).
+- The PostgreSQL metadata tests (`mise run test-meta-pg`) cache the downloaded
+  embedded-postgres archive in `LO_TEST_PG_CACHE` (default
+  `$HOME/.cache/embedded-postgres`, also cached by CI), so they no longer
+  download it from Maven Central on every run, and a failed download reports
+  the real HTTP status of the probed URL instead of the library's
+  `no version found matching 18.3.0` (#66).
 - Made release archives consume the canonical root `LICENSE` file.
 - Made PostgreSQL the correctness boundary for multi-replica alert membership,
   per-rule leases/fencing, durable state, and notification Outbox work; Redis
