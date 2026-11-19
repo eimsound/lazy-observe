@@ -159,88 +159,183 @@ expect_rc 2 'gate fails when a pin can no longer be parsed'
 expect_out 'logs_version' 'gate names the missing pin'
 
 # ---------------------------------------------------------------------------
-# 认证 403：aquasecurity 这类开了 IP allow list 的组织会拒绝 Actions 的 GITHUB_TOKEN，匿名读公开仓库却是 200。
+# 认证 403：aquasecurity 这类开了 IP allow list 的组织会拒绝 Actions 的 GITHUB_TOKEN。来源顺序：带认证 API → github.com
+# release 网页 → 匿名 API（最后备选）。下面的用例故意让三个来源给出不同的答案（API 与匿名说 100 天，网页说别的），
+# 用结果判断到底采信了哪一个。
 # ---------------------------------------------------------------------------
 setup_root
 trivy_tag=$fx/aquasecurity__trivy/tags/v0.50.0.json
 trivy_path=repos/aquasecurity/trivy/releases/tags/v0.50.0
+trivy_web_path=aquasecurity/trivy/releases/tag/v0.50.0
+trivy_page=$fx/aquasecurity__trivy/web/tags/v0.50.0.html
 now_plus_hour=$((now + 3600))
-# inject_error KIND CONTENT：给 trivy 当前 tag 的请求注入失败（KIND=auth|anon）；CONTENT 是迷你 HTTP 响应。
-inject_error() { printf '%s' "$2" >"$trivy_tag.$1-error"; }
-clear_errors() { rm -f "$trivy_tag".auth-error "$trivy_tag".anon-error; }
+# inject_error KIND CONTENT：给 trivy 当前 tag 的请求注入失败（KIND=auth|anon|web）；CONTENT 是迷你 HTTP 响应。
+inject_error() {
+  case $1 in
+  web) printf '%s' "$2" >"$trivy_page.web-error" ;;
+  *) printf '%s' "$2" >"$trivy_tag.$1-error" ;;
+  esac
+}
+clear_errors() { rm -f "$trivy_tag".auth-error "$trivy_tag".anon-error "$trivy_page".web-error; }
 requests_of() { # 某类请求在日志里出现的次数
-  local kind=$1 line n=0
+  local kind=$1 line n=0 want=$trivy_path
+  [[ $kind != web ]] || want=$trivy_web_path
   while IFS= read -r line; do
-    [[ $line == "$kind $trivy_path" ]] && n=$((n + 1))
+    [[ $line == "$kind $want" ]] && n=$((n + 1))
   done <"$requests"
   printf '%s\n' "$n"
 }
+expect_requests() { # expect_requests AUTH WEB ANON 说明
+  [[ $(requests_of auth) == "$1" && $(requests_of web) == "$2" && $(requests_of anon) == "$3" ]] ||
+    fail "$4: want auth=$1 web=$2 anon=$3 requests, got auth=$(requests_of auth) web=$(requests_of web) anon=$(requests_of anon)"
+}
 
-# 9. 认证 403（非限流）、匿名 200 -> 门禁通过，且确实去掉认证重试了一次，并打印了响应体的 message。
-inject_error auth $'403\ncontent-type: application/json\nx-ratelimit-remaining: 4999\n\n{"message":"Forbidden by IP allow list"}'
+# web_page FILE DAYS_AGO [prerelease]：写一个假的 release 页面。真实页面里「released this」之前还有别的
+# <relative-time>（这里放一个 2000 年的诱饵），之后有 tag 的提交时间，解析必须锚定在「released this」上。
+web_page() {
+  local file=$1 days=$2 pre=${3:-false} published
+  published=$(date -u -d "@$((now - days * 86400))" +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$(dirname "$file")"
+  {
+    printf '<html><body>\n<relative-time datetime="2000-01-01T00:00:00Z">Jan 2000</relative-time>\n'
+    if [[ $pre == true ]]; then
+      printf '<span data-view-component="true" class="Label Label--warning Label--large v-align-text-bottom">Pre-release</span>\n'
+    fi
+    printf '  <a class="text-bold" href="/someone">someone</a>\n\n    released this\n\n'
+    printf '      <relative-time class="no-wrap" prefix="" datetime="%s">\n        some day\n      </relative-time>\n' "$published"
+    printf '<relative-time datetime="1999-12-31 00:00:00 UTC" threshold="PT0S">tag time</relative-time>\n</body></html>\n'
+  } >"$file"
+}
+deny_403='403
+content-type: application/json
+x-ratelimit-remaining: 4999
+
+{"message":"Forbidden by IP allow list"}'
+
+# 9. 认证 403（非限流）：改读 github.com 网页，网页说 100 天 -> 通过。不打匿名 API；输出里写明消息和来源。
+web_page "$trivy_page" 100
+inject_error auth "$deny_403"
 GH_TOKEN=fake run --gate
-expect_rc 0 'authenticated 403 (not a rate limit) falls back to an anonymous request'
-expect_out 'OK: every pinned release is at least 7 days old' 'fallback gate pass message'
-expect_out 'Forbidden by IP allow list' 'fallback prints the 403 message'
-expect_out 'retrying anonymously' 'fallback says it retries anonymously'
-[[ $(requests_of auth) == 1 && $(requests_of anon) == 1 ]] ||
-  fail "authenticated 403 must cost exactly one authenticated and one anonymous request, got auth=$(requests_of auth) anon=$(requests_of anon)"
+expect_rc 0 'authenticated 403 (not a rate limit) falls back to the github.com release page'
+expect_out 'OK: every pinned release is at least 7 days old' 'web fallback gate pass message'
+expect_out 'Forbidden by IP allow list' 'web fallback prints the 403 message'
+expect_out 'github.com/aquasecurity/trivy/releases/tag/v0.50.0' 'web fallback names the page it reads'
+expect_out '[time from the github.com release page]' 'the gate marks which pins used the page time'
+expect_requests 1 1 0 'a working release page needs no anonymous request'
+
+# 9a. 网页显示不满 7 天 -> 门禁阻塞（API 与匿名都说 100 天，说明确实采信了网页而不是回头问匿名 API）。
+web_page "$trivy_page" 3
+GH_TOKEN=fake run --gate
+expect_rc 1 'a release page that shows a young release blocks the gate'
+expect_out 'too-new' 'young page marks the pin too-new'
+expect_out 'v0.50.0' 'young page names the version'
+expect_out 'wait until 2026-11-23T12:00:00Z (4d 0h from now)' 'young page shows how long to wait'
+expect_requests 1 1 0 'a young page verdict is final: no anonymous request'
+# 恰好 7 天算通过。
+web_page "$trivy_page" 7
+GH_TOKEN=fake run --gate
+expect_rc 0 'a release page showing exactly 7 days passes'
+# 页面带 Pre-release 标签 -> 失败。
+web_page "$trivy_page" 100 true
+GH_TOKEN=fake run --gate
+expect_rc 1 'a release page labelled Pre-release blocks the gate'
+expect_out 'prerelease' 'the page prerelease label is explained'
+web_page "$trivy_page" 100
 
 # 9b. curl --retry 会把多次响应的头累积在同一个文件里：更早的 503 带 retry-after，最后一次才是真正的 403（无限流特征）。
-#     只能看最后一段头，否则这个 403 会被误判成限流而不做匿名重试。
+#     只能看最后一段头，否则这个 403 会被误判成限流而不改读网页。
 inject_error auth $'403\nHTTP/1.1 503 Service Unavailable\nretry-after: 1\nx-ratelimit-remaining: 0\nHTTP/1.1 403 Forbidden\ncontent-type: application/json\nx-ratelimit-remaining: 4999\n\n{"message":"Forbidden by IP allow list"}'
 GH_TOKEN=fake run --gate
 expect_rc 0 'only the last response header block counts: an earlier 503 retry-after must not make a plain 403 look rate limited'
-expect_out 'retrying anonymously' 'plain 403 after a retried 503 is retried anonymously'
-[[ $(requests_of anon) == 1 ]] || fail 'plain 403 after a retried 503 must be retried anonymously'
-# 反过来：最后一段头才是限流，仍然不重试。
+expect_requests 1 1 0 'plain 403 after a retried 503 reads the release page'
+# 反过来：最后一段头才是限流，不读网页、不匿名。
 inject_error auth $'403\nHTTP/1.1 503 Service Unavailable\nHTTP/1.1 403 Forbidden\nretry-after: 30\n\n{"message":"Forbidden"}'
 GH_TOKEN=fake run --gate
 expect_rc 2 'a rate limit in the last header block is still a rate limit'
-[[ $(requests_of anon) == 0 ]] || fail 'a rate limit in the last header block must not be retried anonymously'
-clear_errors
+expect_requests 1 0 0 'a rate limit in the last header block must neither read the page nor retry anonymously'
+inject_error auth "$deny_403"
 
-# 10. 认证 403、匿名也 403 -> 退出 2，两次的状态码与 message 都要出现。
-inject_error auth $'403\ncontent-type: application/json\nx-ratelimit-remaining: 4999\n\n{"message":"Forbidden by IP allow list"}'
+# 9c. 网页来源失败（404、5xx、没有「released this」结构、网络错误）-> 最后备选匿名 API；匿名 200（说 100 天）-> 通过。
+#     这是最后一步，且打印了网页为什么失败。
+for failure in $'404\n\nNot Found' $'502\n\nbad gateway' $'000\n\n'; do
+  inject_error web "$failure"
+  GH_TOKEN=fake run --gate
+  expect_rc 0 "a failing release page ($(head -1 <<<"$failure")) falls back to the anonymous API"
+  expect_out 'trying the anonymous API as a last resort' 'the last-resort anonymous request is announced'
+  expect_requests 1 1 1 "a failing release page ($(head -1 <<<"$failure")) costs exactly one anonymous request"
+done
+clear_errors
+inject_error auth "$deny_403"
+printf '<html><body>no release here, only a git tag</body></html>\n' >"$trivy_page"
+GH_TOKEN=fake run --gate
+expect_rc 0 'a page without the released-this structure is not trusted: falls back to the anonymous API'
+expect_out 'no "released this <relative-time datetime=...>"' 'the missing page structure is named'
+expect_requests 1 1 1 'a page without the released-this structure costs one anonymous request'
+web_page "$trivy_page" 100
+
+# 10. 认证 403、网页失败、匿名也 403 -> 退出 2，三个来源各自的状态码与 message 都要出现。
+inject_error web $'404\n\nNot Found'
 inject_error anon $'403\n\n{"message":"Blocked for all"}'
 GH_TOKEN=fake run --gate
-expect_rc 2 'gate fails closed when the anonymous retry is denied too'
-expect_out 'authenticated HTTP 403 (Forbidden by IP allow list), then anonymous HTTP 403 (Blocked for all)' \
-  'both denials are reported with their messages'
+expect_rc 2 'gate fails closed when the release page and the anonymous retry both fail'
+expect_out 'authenticated HTTP 403 (Forbidden by IP allow list), then github.com release page failed (HTTP 404 (release page not found)), then anonymous HTTP 403 (Blocked for all)' \
+  'all three failures are reported with their messages'
 clear_errors
 
-# 11. 限流 403（x-ratelimit-remaining: 0）-> 退出 2，写明限流和重置时间，不走匿名。
+# 10a. 事故现场（main push run 44487084652）：认证 403、网页取不到、匿名被别人用光限流 -> 退出 2，写明限流与重置时间。
+inject_error auth "$deny_403"
+inject_error web $'500\n\nserver error'
+inject_error anon $'403\nx-ratelimit-remaining: 0\nx-ratelimit-reset: '"$now_plus_hour"$'\n\n{"message":"API rate limit exceeded for 98.89.53.239."}'
+GH_TOKEN=fake run --gate
+expect_rc 2 'authenticated 403 + failing page + rate-limited anonymous API fails closed'
+expect_out 'github.com release page failed (HTTP 500)' 'the page failure is reported'
+expect_out 'then anonymous HTTP 403 (API rate limit exceeded for 98.89.53.239.)' 'the anonymous rate limit message is reported'
+expect_out 'resets at 2026-11-19T13:00:00Z' 'the anonymous rate limit reset time is shown'
+expect_requests 1 1 1 'the incident path tries every source exactly once'
+clear_errors
+
+# 10b. 网页 200 却解析不出时间，匿名也失败 -> 退出 2，不放行。
+inject_error auth "$deny_403"
+inject_error anon $'403\n\n{"message":"Blocked for all"}'
+printf '<html>released this <relative-time datetime="not-a-time">x</relative-time></html>\n' >"$trivy_page"
+GH_TOKEN=fake run --gate
+expect_rc 2 'an unparsable release page must not let the gate pass'
+expect_out 'no "released this <relative-time datetime=...>"' 'the unparsable page is named'
+web_page "$trivy_page" 100
+clear_errors
+
+# 11. 限流 403（x-ratelimit-remaining: 0）-> 退出 2，写明限流和重置时间，不读网页、不走匿名。
 inject_error auth $'403\nx-ratelimit-remaining: 0\nx-ratelimit-reset: '"$now_plus_hour"$'\n\n{"message":"API rate limit exceeded for 1.2.3.4."}'
 GH_TOKEN=fake run --gate
 expect_rc 2 'a rate-limited 403 is a failure'
 expect_out 'rate limited' 'rate limit is named'
 expect_out 'resets at 2026-11-19T13:00:00Z' 'rate limit reset time is shown'
 expect_out 'API rate limit exceeded' 'rate limit message is shown'
-[[ $(requests_of anon) == 0 ]] || fail 'a rate-limited 403 must not be retried anonymously'
+expect_requests 1 0 0 'a rate-limited 403 must neither read the page nor retry anonymously'
 clear_errors
 
-# 12. 次级限流：403 没有 x-ratelimit 头，只有 message 提到 rate limit -> 同样不走匿名。
+# 12. 次级限流：403 没有 x-ratelimit 头，只有 message 提到 rate limit -> 同样不读网页、不走匿名。
 inject_error auth $'403\n\n{"message":"You have exceeded a secondary rate limit. Please wait."}'
 GH_TOKEN=fake run --gate
 expect_rc 2 'a secondary rate limit is a failure'
 expect_out 'secondary rate limit' 'secondary rate limit message is shown'
-[[ $(requests_of anon) == 0 ]] || fail 'a secondary rate limit must not be retried anonymously'
+expect_requests 1 0 0 'a secondary rate limit must neither read the page nor retry anonymously'
 clear_errors
 
-# 13. 响应体不是 JSON：jq 解析失败不能吞掉错误，退回响应体文本；匿名重试成功则通过。
+# 13. 响应体不是 JSON：jq 解析失败不能吞掉错误，退回响应体文本；网页可用则通过。
 inject_error auth $'403\ncontent-type: text/html\n\n<html>blocked by gateway</html>'
 GH_TOKEN=fake run --gate
-expect_rc 0 'a non-JSON 403 body still falls back to anonymous'
+expect_rc 0 'a non-JSON 403 body still falls back to the release page'
 expect_out 'blocked by gateway' 'a non-JSON error body is printed instead of being swallowed'
 clear_errors
 
-# 14. 没有 token：匿名请求的 403 不重试（没有认证可去掉），直接失败；也不是限流时写明「不是限流」。
+# 14. 没有 token：匿名请求的 403 不改读网页（没有认证可去掉，网页也不是答案），直接失败；也不是限流时写明「不是限流」。
 inject_error anon $'403\n\n{"message":"Forbidden"}'
 run --gate
 expect_rc 2 'an anonymous 403 is a failure'
 expect_out 'HTTP 403 (Forbidden)' 'anonymous 403 message is shown'
 expect_out 'not a rate limit' 'anonymous 403 is not blamed on the rate limit'
-[[ $(requests_of auth) == 0 && $(requests_of anon) == 1 ]] || fail 'an anonymous 403 must not be retried'
+expect_requests 0 0 1 'an anonymous 403 must not be retried or read from the page'
 clear_errors
 
 # 15. 429 -> 限流，不重试。
@@ -248,7 +343,122 @@ inject_error auth $'429\nretry-after: 60\n\n{"message":"Too many requests"}'
 GH_TOKEN=fake run --gate
 expect_rc 2 'HTTP 429 is a failure'
 expect_out 'rate limited' '429 is named as a rate limit'
-[[ $(requests_of anon) == 0 ]] || fail 'HTTP 429 must not be retried anonymously'
+expect_requests 1 0 0 'HTTP 429 must neither read the page nor retry anonymously'
+clear_errors
+
+# 15b. 带 token 且 API 正常时不碰网页：网页只在认证 403 之后才是来源。
+GH_TOKEN=fake run --gate
+expect_rc 0 'a working authenticated API needs no fallback'
+expect_requests 1 0 0 'a working authenticated API must not read the page'
+
+# ---------------------------------------------------------------------------
+# 报告模式：release 列表被拒绝（认证 403、非限流）的仓库没有网页等价物，降级用 releases/latest 重定向 + release 页面。
+# ---------------------------------------------------------------------------
+trivy_dir=$fx/aquasecurity__trivy
+trivy_latest=$trivy_dir/web/latest
+# 把 VictoriaMetrics、VictoriaLogs 追平（上面的用例给 VictoriaLogs 加过 v1.21.0~v1.23.0，已满 7 天的最新是 v1.22.0），
+# 只让 Trivy 决定报告结果。
+sed -i -E \
+  -e 's/^([[:space:]]*)metrics_version=.*/\1metrics_version=v1.12.0/' \
+  -e 's/^([[:space:]]*)logs_version=.*/\1logs_version=v1.22.0/' \
+  -e 's#(quay\.io/victoriametrics/vm(storage|insert|select)):v[0-9.]+-cluster-scratch#\1:v1.12.0-cluster-scratch#' \
+  "$fixroot"/scripts/*
+deny_list() { # 组织的 IP allow list 拒绝这个仓库的所有认证请求：列表和每个 tag
+  local tag
+  printf '%s' "$deny_403" >"$trivy_dir/releases.json.auth-error"
+  for tag in v0.49.0 v0.50.0 v0.51.0; do printf '%s' "$deny_403" >"$trivy_dir/tags/$tag.json.auth-error"; done
+}
+latest_redirect() { # latest_redirect TAG：releases/latest 重定向到 TAG
+  mkdir -p "$trivy_dir/web"
+  printf '302\nlocation: https://github.com/aquasecurity/trivy/releases/tag/%s\n\n' "$1" >"$trivy_latest"
+}
+cleanup_denied() { rm -f "$trivy_dir"/releases.json.auth-error "$trivy_dir"/tags/*.auth-error "$trivy_latest" "$trivy_latest".web-error "$trivy_dir"/web/tags/v0.5[0-9].*.html; }
+deny_list
+# trivy 的网页版本：固定点 v0.50.0 与 Latest v0.51.0（30 天前）。
+web_page "$trivy_dir/web/tags/v0.51.0.html" 30
+web_page "$trivy_page" 100
+
+# R1. Latest 已满 7 天、比固定点新 -> outdated（退出 1），给出升级目标；固定点的请求已经发现这个仓库拒绝 token，列表不再打必败的请求。
+latest_redirect v0.51.0
+GH_TOKEN=fake run --report --markdown "$work/report-denied.md"
+expect_rc 1 'report: the denied repo falls back to the Latest release and flags outdated'
+expect_out 'upgrade to v0.51.0 in' 'report names the upgrade target for the denied repo'
+expect_out 'outdated: Trivy v0.50.0 -> v0.51.0' 'report lists the outdated Trivy pin'
+reject_out 'unknown' 'report must not call a resolvable denied repo unknown'
+expect_out 'GET repos/aquasecurity/trivy/releases/tags/v0.51.0: skipped, an earlier authenticated request to aquasecurity/trivy got HTTP 403' \
+  'a request skipped because the repo already denied the token is not logged as if it was sent'
+[[ $(<"$work/report-denied.md") == *'`v0.51.0`'* ]] || fail 'markdown shows the fallback latest'
+list_requests=0
+while IFS= read -r line; do [[ $line == 'auth repos/aquasecurity/trivy/releases' ]] && list_requests=$((list_requests + 1)); done <"$requests"
+((list_requests == 0)) || fail "a repo already known to deny the token must not get a doomed list request, got $list_requests"
+
+# R2. 固定点就是 Latest 且已满 7 天 -> ok，退出 0。
+latest_redirect v0.50.0
+GH_TOKEN=fake run --report
+expect_rc 0 'report: the pin equals the Latest release'
+expect_out 'OK: all pinned releases are up to date' 'report ok message for the denied repo'
+
+# R3. Latest 不满 7 天 -> 无法知道已满 7 天的最新版：unknown，不是 outdated 也不是 ok，退出 0（不让每周 job 误报）。
+web_page "$trivy_dir/web/tags/v0.51.0.html" 3
+latest_redirect v0.51.0
+GH_TOKEN=fake run --report --markdown "$work/report-denied.md"
+expect_rc 0 'report: an unknown latest eligible release does not turn the report red'
+expect_out 'unknown' 'report marks the denied repo unknown'
+expect_out 'unknown: Trivy: latest eligible release unknown' 'report explains why it is unknown'
+expect_out 'less than 7 days ago' 'report says the Latest release is too young'
+expect_out 'no pinned release is outdated or too new (1 with an unknown latest eligible release' 'report summary counts unknown rows'
+reject_out 'outdated:' 'unknown must not be reported as outdated'
+[[ $(<"$work/report-denied.md") == *'unknown'* ]] || fail 'markdown must mention the unknown row'
+# 固定点本身仍照常判定：固定点不满 7 天 -> too-new（退出 1），latest 仍是 unknown。
+web_page "$trivy_page" 2
+GH_TOKEN=fake run --report
+expect_rc 1 'report: a too-new pin is still too-new when the latest is unknown'
+expect_out 'too-new' 'report keeps too-new for the denied repo'
+web_page "$trivy_page" 100
+
+# R4. Latest 重定向到的不是严格 vX.Y.Z（LTS/-rc/-cluster）-> unknown。
+latest_redirect v0.51.0-rc1
+GH_TOKEN=fake run --report
+expect_rc 0 'report: a Latest that is not a strict vX.Y.Z tag is unknown'
+expect_out 'not a stable v<X>.<Y>.<Z> tag' 'report says why the Latest tag is not usable'
+# Latest 比固定点还旧（LTS 补丁线之类）-> unknown，不能据此说固定点是最新。
+web_page "$trivy_dir/web/tags/v0.49.0.html" 60
+latest_redirect v0.49.0
+GH_TOKEN=fake run --report
+expect_rc 0 'report: a Latest older than the pin is unknown'
+expect_out 'is older than the pinned v0.50.0' 'report says the Latest is older than the pin'
+# Latest 是 prerelease -> unknown。
+web_page "$trivy_dir/web/tags/v0.51.0.html" 30 true
+latest_redirect v0.51.0
+GH_TOKEN=fake run --report
+expect_rc 0 'report: a prerelease Latest is unknown'
+expect_out 'is a prerelease' 'report says the Latest is a prerelease'
+
+# R5. fail-closed：releases/latest 取不到、或 Latest 的页面取不到 -> 退出 2，不当 unknown 放过。
+latest_redirect v0.51.0
+printf '%s' $'500\n\nserver error' >"$trivy_latest.web-error"
+GH_TOKEN=fake run --report
+expect_rc 2 'report: a failing releases/latest redirect is a script error'
+expect_out 'did not redirect to the Latest release' 'report names the failed redirect'
+rm -f "$trivy_latest.web-error"
+rm -f "$trivy_dir/web/tags/v0.51.0.html"
+GH_TOKEN=fake run --report
+expect_rc 2 'report: a Latest release page that cannot be read (and an unauthorized anonymous API) is a script error'
+web_page "$trivy_dir/web/tags/v0.51.0.html" 30
+
+# R6. --latest-eligible 对被拒绝的仓库：退出 2、stdout 为空，不降级（GitHub 的 Latest 不一定是 semver 最大，
+#     而调用方会拿结果放宽「pin >= 最新合格版」的命中）；不读网页。
+latest_redirect v0.51.0
+rc=0
+: >"$requests"
+GH_TOKEN=fake LO_PINNED_RELEASES_ROOT=$work/empty LO_PINNED_RELEASES_FIXTURE=$fx LO_PINNED_RELEASES_FIXTURE_LOG=$requests \
+  bash "$script" --latest-eligible aquasecurity/trivy >"$work/latest.out" 2>"$work/out" || rc=$?
+expect_rc 2 'latest-eligible fails closed for a repo whose release list is denied'
+[[ ! -s $work/latest.out ]] || fail "latest-eligible must print nothing for a denied repo, got: $(cat "$work/latest.out")"
+expect_out 'cannot be determined (failing closed)' 'latest-eligible explains it does not degrade'
+expect_out 'Forbidden by IP allow list' 'latest-eligible shows the 403 message'
+[[ $(<"$requests") != *web* ]] || fail "latest-eligible must not read github.com pages for a denied repo: $(cat "$requests")"
+cleanup_denied
 clear_errors
 
 # ---------------------------------------------------------------------------
