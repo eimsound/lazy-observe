@@ -132,6 +132,9 @@ importers:
       oxlint:
         specifier: 1.93.0
         version: 1.93.0(oxlint-tsgolint@7.0.2006)
+      oxlint-tsgolint:
+        specifier: 7.0.2006
+        version: 7.0.2006
       tailwindcss:
         specifier: ^4.3.5
         version: 4.3.5
@@ -2707,7 +2710,6 @@ snapshots:
       '@oxlint-tsgolint/linux-x64': 7.0.2006
       '@oxlint-tsgolint/win32-arm64': 7.0.2006
       '@oxlint-tsgolint/win32-x64': 7.0.2006
-    optional: true
 
   oxlint@1.93.0(oxlint-tsgolint@7.0.2006):
     optionalDependencies:

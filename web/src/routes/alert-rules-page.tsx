@@ -209,7 +209,7 @@ export function AlertRulesPage() {
         onConfirm={async () => {
           if (!deleting) return;
           await deleteRule(deleting.id);
-          queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
+          void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
           setDeleting(null);
         }}
       />
@@ -265,7 +265,7 @@ function RuleFormDialog({
   const mutation = useMutation({
     mutationFn: () => (editing ? updateRule(editing.id, input) : createRule(input)),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
+      void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("alerts.ruleSaveError")),

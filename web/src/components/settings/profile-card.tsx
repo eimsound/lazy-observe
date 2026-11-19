@@ -25,7 +25,7 @@ export function ProfileCard() {
       setError(null);
       setSaved(true);
       await refresh();
-      queryClient.invalidateQueries({ queryKey: ["users"] });
+      void queryClient.invalidateQueries({ queryKey: ["users"] });
       setTimeout(() => setSaved(false), 2000);
     },
     onError: (cause) => setError((cause as Error).message),

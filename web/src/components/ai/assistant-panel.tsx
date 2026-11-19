@@ -205,7 +205,7 @@ function DisabledGuide() {
           size="sm"
           onClick={() => {
             setOpen(false);
-            navigate({ to: "/settings/ai" });
+            void navigate({ to: "/settings/ai" });
           }}
         >
           <Settings className="size-4" />
@@ -262,9 +262,9 @@ function AnswerView({ answer, onClose }: { answer: AssistantAnswer; onClose: () 
   function openInQueryPage() {
     onClose();
     if (isMetrics) {
-      navigate({ to: "/metrics", search: { q: answer.query, run: "1" } });
+      void navigate({ to: "/metrics", search: { q: answer.query, run: "1" } });
     } else {
-      navigate({ to: "/logs", search: { q: answer.query, range: DEFAULT_RANGE_ID } });
+      void navigate({ to: "/logs", search: { q: answer.query, range: DEFAULT_RANGE_ID } });
     }
   }
 

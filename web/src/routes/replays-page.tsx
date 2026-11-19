@@ -129,7 +129,7 @@ export function ReplaysPage() {
                 }
                 onKeyDown={(e) => {
                   if (e.key === "Enter")
-                    navigate({ to: "/replays/$sessionId", params: { sessionId: s.session_id } });
+                    void navigate({ to: "/replays/$sessionId", params: { sessionId: s.session_id } });
                 }}
                 className="cursor-pointer transition-colors hover:border-ring hover:bg-muted/30"
               >

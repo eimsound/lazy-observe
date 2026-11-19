@@ -234,8 +234,8 @@ export function ChannelsPage() {
         onConfirm={async () => {
           if (!deleting) return;
           await deleteChannel(deleting.id);
-          queryClient.invalidateQueries({ queryKey: ["channels"] });
-          queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
+          void queryClient.invalidateQueries({ queryKey: ["channels"] });
+          void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
           setDeleting(null);
         }}
       />
@@ -267,7 +267,7 @@ function ChannelFormDialog({
     mutationFn: (input: ChannelInput) =>
       editing ? updateChannel(editing.id, input) : createChannel(input),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["channels"] });
+      void queryClient.invalidateQueries({ queryKey: ["channels"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("alerts.channelSaveError")),

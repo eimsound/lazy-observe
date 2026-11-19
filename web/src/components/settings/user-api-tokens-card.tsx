@@ -50,7 +50,7 @@ export function UserAPITokensCard() {
       setName("");
       setCopied(false);
       setError(null);
-      queryClient.invalidateQueries({ queryKey: ["user-api-tokens"] });
+      void queryClient.invalidateQueries({ queryKey: ["user-api-tokens"] });
     },
     onError: (cause) => setError((cause as Error).message),
   });

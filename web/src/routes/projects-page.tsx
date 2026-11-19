@@ -291,7 +291,7 @@ function CreateProjectDialog({
   const mutation = useMutation({
     mutationFn: () => createProject(name.trim(), slug.trim()),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("projects.createError")),
@@ -398,8 +398,8 @@ function TokensDialog({
       setCreatedToken(tok);
       setName("");
       setCopied(false);
-      queryClient.invalidateQueries({ queryKey: ["project-api-tokens", projectId] });
-      queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-api-tokens", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
     onError: (e) => setError((e as Error).message),
   });
@@ -572,8 +572,8 @@ function TokensDialog({
         onConfirm={async () => {
           if (!revoking) return;
           await revokeProjectAPIToken(projectId, revoking.id);
-          queryClient.invalidateQueries({ queryKey: ["project-api-tokens", projectId] });
-          queryClient.invalidateQueries({ queryKey: ["projects"] });
+          void queryClient.invalidateQueries({ queryKey: ["project-api-tokens", projectId] });
+          void queryClient.invalidateQueries({ queryKey: ["projects"] });
           setRevoking(null);
         }}
       />
