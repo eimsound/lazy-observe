@@ -103,7 +103,7 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 | 安装脚本 | `mise run install-check` |
 | 性能 | `mise run perf-ha`（很慢）、`mise run performance-gates`（最慢） |
 
-规则：门禁失败就停，先修失败，不要继续下一个切片。`CGO_ENABLED=0` 是硬约束，任何需要 CGO 的方案直接否决。`internal/db/ent` 不跟踪、不手改、不用 golines 格式化。
+规则：门禁失败就停，先修失败，不要继续下一个切片。`CGO_ENABLED=0` 是硬约束，任何需要 CGO 的方案直接否决。`internal/db/ent` 是纳入 git 的生成代码：只用 `mise run ent-generate` 更新并随 schema 一起提交，不手改、不用 golines 格式化。
 
 脚本测试与结构断言只守「判错会悄悄放行、且后果重」的规则：安全、供应链、发版放行。实现细节不写断言，报告类和辅助脚本不写测试；改错了 CI 自己会红的东西，不需要再加一道断言。
 
@@ -129,8 +129,9 @@ PR CI 的 HA E2E 红了——两个副本没有共享密钥，后启动的那个
 `parallel golangci-lint is running`；跨 worktree 不需要编排者排队，`go build`/`go test` 的缓存本身支持并发。
 默认缓存 `~/.cache/golangci-lint` 是所有 worktree 共用的，出现过「报出别的 worktree 的问题」的误报（没能复现出来）；
 再碰到就把 `GOLANGCI_LINT_CACHE=$(mktemp -d)` 加在 `mise run lint` 前面重跑，代价是冷启动约 20 秒。
-同一个 worktree 内 Go 门禁仍串行：`vet` → `test` → `lint` → `fmt-check` 一条一条跑，这几条都以 `ent-generate` 为依赖，
-并行会抢着 `mv` 同一个 `internal/db/ent`（`scripts/generate-ent.sh` 第 38–41 行）。
+同一个 worktree 内 Go 门禁串行：`vet` → `test` → `lint` → `fmt-check` 一条一条跑，省得抢 CPU。
+`ent-generate` 和 `ent-generate-check` 会 `mv` 替换整个 `internal/db/ent`（`scripts/generate-ent.sh` 第 38–41 行），
+替换的瞬间目录不存在，所以这两条单独跑，不与其它 Go 门禁并行。
 
 CI 分层（CI 不替你跑的，改到对应改动面时本地必须跑）：
 

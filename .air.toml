@@ -5,7 +5,7 @@ tmp_dir = ".cache/air"
 
 [build]
   bin = "./.cache/air/lazy-observe"
-  cmd = "bash scripts/generate-ent.sh && CGO_ENABLED=0 go build -trimpath -o ./.cache/air/lazy-observe ./cmd/lazy-observe"
+  cmd = "CGO_ENABLED=0 go build -trimpath -o ./.cache/air/lazy-observe ./cmd/lazy-observe"
   delay = 400
   entrypoint = ["./scripts/run-dev-backend.sh"]
   exclude_dir = [".cache", "bench", "bin", "data", "internal/db/ent", "poc", "sdk/browser", "sdk/node", "web"]
