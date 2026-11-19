@@ -344,8 +344,11 @@ at-least-once. Defaults:
 A full queue drops new items and logs a local warning; retry exhaustion drops
 the batch after the finite budget. `Diagnostics().dropped_telemetry` exposes the
 process-local total, and metrics-enabled clients export
-`lazy_observe_sdk_dropped_telemetry` with `signal`/`reason` attributes. There is
-no disk spool.
+`lazy_observe_sdk_dropped_telemetry` with `signal`/`reason` attributes. Dropped
+error events are counted with `signal="error"` and the reasons `queue_full`,
+`retry_exhausted` and `shutdown_budget` (events still queued or retrying when
+the `shutdown` budget runs out, or captured after `shutdown`), the same as the
+Go SDK. There is no disk spool.
 
 ## Parity matrix (Go/Fiber -> Python/Django+DRF)
 

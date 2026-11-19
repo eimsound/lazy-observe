@@ -325,8 +325,21 @@ def _after_fork_in_child() -> None:
             continue
 
 
-def default_warn_factory(logger: logging.Logger, signal: str) -> DeliveryWarn:
+def default_warn_factory(
+    logger: logging.Logger,
+    signal: str,
+    record_drop: Optional[Callable[[str, str, int], None]] = None,
+) -> DeliveryWarn:
+    """Warn callback that logs a drop and, given ``record_drop``, counts it too.
+
+    ``record_drop(signal, reason, count)`` is ``Client.record_telemetry_drop``: the
+    ``Diagnostics().dropped_telemetry`` total and the
+    ``lazy_observe_sdk_dropped_telemetry`` counter, as the Go SDK does for its error queue.
+    """
+
     def warn(reason: str, err: Optional[BaseException], count: int) -> None:
+        if record_drop is not None:
+            record_drop(signal, reason, count)
         detail = f" {err}" if err else ""
         logger.warning("%s telemetry dropped: reason=%s count=%d%s", signal, reason, count, detail)
 

@@ -387,6 +387,24 @@ def test_the_drop_lock_is_replaced_again_in_grandchildren(platform, client):
     assert inner["dropped"] == 1
 
 
+def test_error_queue_drops_in_a_child_start_counting_from_zero(platform, client):
+    """The error queue's drops reach ``Client.dropped_telemetry`` through its warn
+    callback; the child counts only its own."""
+    delivery = client.error_transport.delivery
+    delivery.record_drop("retry_exhausted", None, 2)  # the parent's own drops
+    assert client.diagnostics().dropped_telemetry == 2
+
+    def child():
+        before = client.diagnostics().dropped_telemetry
+        delivery.record_drop("queue_full", None, 1)
+        return {"before": before, "after": client.diagnostics().dropped_telemetry}
+
+    payload = assert_child_ok(*run_in_child(child))
+
+    assert payload == {"before": 0, "after": 1}
+    assert client.diagnostics().dropped_telemetry == 2  # the child's drop is not the parent's
+
+
 def test_the_fork_hook_does_not_keep_a_client_alive(platform):
     import gc
     import weakref
