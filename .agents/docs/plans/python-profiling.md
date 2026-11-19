@@ -253,7 +253,7 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
 
 ### S3 公开 API 与生命周期
 
-- [ ] 3. 开关、窗口与 shutdown
+- [x] 3. 开关、窗口与 shutdown
   - 交付：`Config.profiling: bool = False` 与 `normalize_config` 默认值；
     `build_client` 在开启时探测可用性，不可用（<3.15、GIL 构建、GIL 已启用、非 Linux）
     只打一条带原因的 warning；
@@ -289,6 +289,59 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   - 验证：`mise run sdk-python`；3.15/3.15t job。
   - 验收：默认不采样；显式开启且满足启用条件（Linux + 3.15t + 无 GIL）时产生窗口；
     `shutdown` 不泄漏线程。
+  - 落地说明（实现细节与核对结论；决策本身见上面的「ADR 0014 修订带来的切片调整」，这里不重复）：
+    - 新模块 `lazyobserve/_profiling.py`，核心是 `ProfilingController`：一个 daemon 线程
+      `lazyobserve-profiling`，探测（含 0.1 s 试采）、窗口循环都在这个线程里，`build_client` 只负责
+      `start()` 就返回。`Client.profiling` 持有它，默认 `None`；启动失败只打 `internal_error` warning，
+      不让 client 变成 degraded。所有依赖（采样器工厂、上传器工厂、时钟、sleep、`record_drop`）都可注入，
+      Red 用 fake 采样器 + fake 时钟 + fake 上传器，不采真实解释器、不等真实 10 s。
+    - 窗口循环：`recheck_gil()` → `collect_window(10 s)` → `last_failed_ticks()` 计入
+      `record_telemetry_drop("profile", "sample_failed", n)`（被丢弃的窗口也计）→ `encode_window` →
+      编码成功后才 `new_upload_id()` → 入队；延迟 = `profiling_interval` − 本轮已用时间，下限 0
+      （< 10 s 时首尾相接）。窗口、编码失败的前两次是 `debug` 日志，不打 warning。
+    - `Config.profiling_interval` 的归一化：不是「正且有限」（`≤0`、NaN、±inf）都回退 60；`Event.wait(inf)`
+      会 `OverflowError`，所以 inf 也要回退。`init()` 现在认识这两个键（此前 `profiling` 会被当作未知键
+      丢弃，`test_config.py` 里相应注释已删）。
+    - 停采：`_AggregatingCollector.running`（默认 True，3.15.2 的 `SampleProfiler.sample` 每轮用
+      `hasattr(collector, "running") and not collector.running` 判断并 break，`finally` 里照常 flush 已聚合
+      的栈）；新增 `Sampler.stop()`，从 shutdown 线程置 False，并拒绝之后的窗口。`collect_window` 先发布
+      collector、再复查 stop 标志，`stop()` 先置标志、再读 collector，两步都在同一把 `_stop_lock` 里，
+      两边谁后执行谁看得到对方，stop 不会丢。
+      stop 是请求不是失败：不计失败、不停用。
+    - warning：不接采样器的自由文本回调（那条只写 `debug`）。原因码映射 `_profiling.warning_code`：
+      `python<3.15`→`python_too_old`，`not-linux`→`unsupported_platform`，`gil-build`→`gil_build`，
+      `gil-enabled`→`gil_enabled`，`import-failed`/`signature-mismatch`/`mode-constant-missing`/
+      `trial-sample-failed`→`probe_failed`，`too-many-failures`→`too_many_failures`（ADR 示例码之外新增的一个，
+      对应连续 3 个窗口失败），`failure-rate-exceeded`→`sample_failure_rate`，其余→`internal_error`。
+      每个进程每个码最多一条（模块级集合 + 锁，fork 子进程里重置）。格式
+      `lazyobserve continuous profiling is off: reason=<码> (<detail>); see <DOC_URL>`。
+      `DOC_URL` 指向 `docs/sdk/python.md#continuous-profiling`：**S4 必须在 `docs/sdk/python.md` 建这一节**，
+      并逐码说明；本切片不改用户文档。
+    - 上传器：`build_uploader` 把 `DeliveryQueue` 的丢弃同时计入 `record_telemetry_drop("profile", reason, n)`
+      并 `logger.warning`，与 Go 的 `newProfileDelivery.Warn` 对齐；队列容量用 S1 默认 6（Python 的
+      `DeliveryConfig` 没有 profile 容量字段，不新增）。
+    - fork：`os.register_at_fork(after_in_child=...)` 在第一个 controller `start()` 时注册一次（不可注销，
+      controller 用弱引用跟踪）。子进程里对「已启动、未关闭、未停用」的 controller 换掉锁、stop event、
+      采样器（含窗口与失败计数）、上传器（队列、锁、已不存在的 worker 线程和父进程排队的窗口），再起新线程，
+      子进程重新探测并从新窗口开始。已 `shutdown` 或已因环境原因停用的 controller 在子进程里保持关闭，
+      不重复 warning。fork 钩子不依赖任何继承来的锁（跟踪列表是只追加的 list，没有锁）。
+    - `shutdown(timeout)`：设 `closed`、置 stop、`Sampler.stop()`、在剩余预算内 join 采样线程（线程里
+      照常编码、入队 ≥5 s 的窗口，编码器异常由 `Sampler.encode_window` 和线程顶层 `except Exception` 接住，
+      不会出现在 shutdown 路径），再用剩余预算 `uploader.close()`。幂等；`Client.shutdown` 的顺序是
+      error transport → profiling → OTel provider，整个 profiling 共用 `Client.shutdown` 的同一个 deadline。
+      join 超时后采样线程若晚一步入队，`DeliveryQueue` 记 `shutdown_budget` 丢弃。
+    - **与 Go SDK shutdown 的对照（开工前核对的结论）**：顺序一致（error → profiling 停采 → profile 队列
+      `close(ctx)` → provider），共用一个 ctx/deadline，幂等（`sync.Once`/`closed` 标志）。差异只有一处：
+      Go 的 `profilingLoop` 在 `ctx.Done()` 后 `StopCPUProfile`，**不论窗口已跑多久**都把部分窗口入队，
+      与决策 14（满 5 s 才上传、否则丢弃）不一致；Python 按决策 14 实现，Go 未改（范围外，需要的话单独立项）。
+      另：Python 的 `error_transport.close(timeout)` 仍拿完整 timeout（既有行为，S3 未动），所以最坏情况下
+      总耗时可超过 `timeout`；profiling 与 provider 部分没有这个问题。
+    - greenlet：不检测（ADR 0014），代码里没有任何 greenlet 相关逻辑。
+    - 协议面（端点、字段、DSN、鉴权）没有改动，`docs/version-matrix.md` 未改。
+    - 本切片没处理的既有问题（只记录）：`ErrorTransport`/`DeliveryQueue` 同样没有 fork 后重建（子进程里
+      error 队列的 worker 线程不存在）；仅开 `traces` 时 `Client.shutdown` 会返回
+      `RuntimeError("metrics shutdown: 'NoOpMeterProvider' object has no attribute 'shutdown'")`
+      （`meter_provider` 是 NoOp 对象而不是 `None`），冒烟里碰到，与 profiling 无关。
 
 ### S4 CI 与文档
 
@@ -304,6 +357,10 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
       使用 greenlet 的库不会停用，但 greenlet 里的 CPU 在火焰图上不可见）；
     - 采样节奏（每 `profiling_interval` 秒采 10 s，默认 60）与实测开销；
     - 火焰图是整个服务所有进程、实例的汇总，不能按进程拆开看。
+    - `docs/sdk/python.md` 里建 `## Continuous profiling` 一节，锚点必须是 `#continuous-profiling`
+      （S3 的 warning 文本 `_profiling.DOC_URL` 已指向它），逐条说明 warning 原因码：`python_too_old`、
+      `unsupported_platform`、`gil_build`、`gil_enabled`、`probe_failed`、`too_many_failures`、
+      `sample_failure_rate`、`internal_error`。
 
     `CHANGELOG.md` 记一条；
     版本号保持 0.1.0；不改 `docs/version-matrix.md`（协议面不变）。
@@ -322,7 +379,9 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   `poc/` 代码或第三方依赖带进仓库；重跑 `mise run sdk-python` 与
   `go test ./internal/gateway -run PythonPprof`。
 - [ ] S2 后：把采样器的可用性判断与窗口聚合拆开，重跑聚焦测试与 3.15 job。
-- [ ] S3 后：确认 `Client.shutdown` 的预算与 Go SDK 一致，重跑全量 Python 测试。
+- [x] S3 后：确认 `Client.shutdown` 的预算与 Go SDK 一致，重跑全量 Python 测试。结论见 S3 落地说明
+  「与 Go SDK shutdown 的对照」：profiling 与 provider 共用 deadline，Go 无 5 s 门槛是唯一的行为差异，
+  `error_transport` 仍拿完整 timeout 是既有行为。全量测试见执行日志。
 
 ## 最终验证
 
@@ -398,3 +457,35 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   `python -B -m pytest -q tests`；没有运行 `mise run sdk-python`，它内部用 `python -m venv` + pip）：
   3.9.25 / 3.13.18 / 3.15.2（GIL 构建）各 `114 passed, 5 skipped`，3.15.2t `116 passed, 3 skipped`；
   `PYTHON_GIL=1` 的 3.15.2t `tests/test_sampler.py` `51 passed, 5 skipped`；真实 3.15t 测试连跑 5 次通过。
+- 2026-11-19 S3 开工：从 `origin/main`（`79689ca`）拉 `slice/python-profiling-3`；Go SDK 核对结论见 S3 落地说明。
+  环境：`uv venv --python <ver> ~/.cache/lo-s3/py<ver>`（3.9、3.13、3.15、3.15t）+
+  `VIRTUAL_ENV=… uv pip install -e 'sdk/python[test]'`，测试一律 `python -B -m pytest -q tests`；没有运行
+  `mise run sdk-python`（内部用 `python -m venv` + pip）。
+- 2026-11-19 S3 red（3.13.18）：`pytest -q tests/test_config.py` → 14 failed, 8 passed
+  （`Config` 没有 `profiling`/`profiling_interval`）；`pytest -q tests/test_sampler.py` →
+  4 failed, 51 passed, 5 skipped（`_AggregatingCollector.running`、`Sampler.stop()` 不存在）；
+  `pytest -q tests/test_profiling_lifecycle.py` →
+  `ImportError: cannot import name '_profiling' from 'lazyobserve'`（收集期，exit 2）。
+- 2026-11-19 S3 green 后对 `_profiling.py` 做变异检查，每个变异都让对应测试变红，还原后全绿：
+  子进程沿用继承来的锁 → 死锁测试 `child killed by signal 14`（SIGALRM 看门狗）；子进程不重启线程 →
+  2 个 fork 测试失败；`upload_id` 提前到窗口开始时生成 → `test_upload_id_is_generated_when_the_window_is_encoded_not_before`
+  失败；去掉 5 s 门槛 → 4.999 s 与 0 s 两个参数失败；去掉窗口前 `recheck_gil()` → GIL 重查测试失败。
+- 2026-11-19 S3 全量 pytest（`python -B -m pytest -q tests`）：3.9.25 → `191 passed, 6 skipped`；
+  3.13.18 → `191 passed, 6 skipped`；3.15.2（GIL 构建）→ `191 passed, 6 skipped`；
+  3.15.2 free-threading → `194 passed, 3 skipped`（含真实 3.15t 的 `test_real_315t_profiles_a_busy_thread…`
+  与 S2 的真实采样测试）；`PYTHON_GIL=1` 的 3.15.2t → `191 passed, 6 skipped`（真实采样测试按预期跳过）。
+- 2026-11-19 S3 稳定性：`tests/test_profiling_lifecycle.py -k "not real_315t"` 在 3.13.18 与 3.15.2t 各连跑 25 次，
+  0 次失败；真实 3.15t 测试连跑 5 次全部通过（各约 6.1 s）。
+- 2026-11-19 S3 真实 3.15.2t 冒烟（`~/.cache/lo-s3/smoke.py`，不入库；本地 `ThreadingHTTPServer` 当平台，
+  `lazyobserve.init(profiling=True, profiling_interval=1)`，2 个纯 Python 忙线程，运行 16 s 后 `shutdown(10)`）：
+  `init` 立即返回（打开 profiling 的额外开销 ≈ 9 ms，探测在后台线程）；收到 2 次 `POST /api/profiles`：
+  第 1 次是满 10 s 的窗口，第 2 次是 shutdown 时只有 5.8 s 的部分窗口（≥5 s 所以上传）；两次的
+  `upload_id` 不同且为 32 位 hex，`type=cpu`、`Authorization: Bearer`、`service`、RFC3339 `start`/`end`
+  齐全，解压后的 pprof 含 `burn_cpu_smoke`；`shutdown` 用时 0.010 s，之后没有残留的 `lazyobserve-profil*` 线程。
+- 2026-11-19 S3 `mise run workflow-check` → exit 0（本切片未改 CI、`mise.toml`、协议面）。
+- 2026-11-19 S3 审查后修整（折进同一 commit）：`Sampler.stop()` 与 `collect_window` 发布 collector 改用一把
+  只护两三次属性访问的锁，不再依赖无 GIL 构建下的内存序；fork 钩子逐个 controller 兜异常，一个失败不跳过其余；
+  真实 3.15t 测试的 6 s 从探测结束起算（慢 runner 上导入 `profiling.sampling` 变慢也不会让窗口不足 5 s）；
+  新增 fake 采样器/上传器与真实 `Sampler`/`ProfileUploader` 的签名一致性测试（改 fake 参数名即红）；
+  S4 交付补写 `#continuous-profiling` 锚点与逐码说明。全量 pytest：3.9.25 / 3.13.18 → `193 passed, 6 skipped`，
+  3.15.2t → `196 passed, 3 skipped`。

@@ -65,11 +65,14 @@ detected (ADR 0014). Nothing is ever raised into application code.
 
 A :class:`Sampler` is meant to be driven from one thread (the window loop):
 ``recheck_gil``, ``collect_window`` and ``encode_window`` are not synchronised.
+Only :meth:`Sampler.stop` may come from another thread.
 
 The window API is deliberately blocking: :meth:`Sampler.collect_window` runs one
 ``sample()`` call for ``duration_sec`` and returns the aggregated stacks with
-their timestamps. The 60 s window loop, the public switch, ``shutdown`` and
-``os.register_at_fork`` belong to the client lifecycle, not here.
+their timestamps. The one thing another thread may call is :meth:`Sampler.stop`
+(``shutdown``): it clears ``running`` on the collector in flight, so the blocked
+call returns the partial window within a tick. The window loop, the public switch,
+``shutdown`` and ``os.register_at_fork`` belong to ``_profiling``, not here.
 """
 
 from __future__ import annotations
@@ -339,6 +342,11 @@ class Sampler:
         self._last_error: Optional[BaseException] = None
         self._last_failure_rate = 0.0
         self._last_failed_ticks = 0
+        self._stop_requested = False
+        self._collector: Optional[_AggregatingCollector] = None  # the window in flight
+        # Pairs stop() with collect_window() publishing its collector. Held only for
+        # a couple of attribute accesses, never across sample().
+        self._stop_lock = threading.Lock()
 
     @classmethod
     def create(
@@ -415,6 +423,22 @@ class Sampler:
             return False
         return True
 
+    def stop(self) -> None:
+        """Ask the window in flight to end now and refuse further windows.
+
+        Called from another thread (``shutdown``). It flips ``running`` on the
+        collector that :meth:`collect_window` is feeding: ``SampleProfiler.sample``
+        checks it every tick, breaks, and flushes what it already aggregated, so the
+        blocked :meth:`collect_window` returns the partial window within a tick.
+        This is a request, not a failure: nothing is counted and the sampler is not
+        disabled. Safe to call repeatedly and on an unavailable sampler.
+        """
+        with self._stop_lock:
+            self._stop_requested = True
+            collector = self._collector
+        if collector is not None:
+            collector.running = False
+
     @property
     def rate_hz(self) -> int:
         return self._rate_hz
@@ -443,12 +467,19 @@ class Sampler:
         if duration_sec <= 0:
             raise ValueError("duration_sec must be positive")
         self._last_failed_ticks = 0
-        if not self.available():
+        if not self.available() or self._stop_requested:
             return None
 
         collector = _AggregatingCollector(
             self._interval_usec, exclude_thread_ids={threading.get_native_id()}
         )
+        # Publish the collector and re-check the flag under the lock stop() takes:
+        # either stop() sees this collector or this sees the stop, so none is lost
+        # (no reliance on memory ordering in a free-threaded build).
+        with self._stop_lock:
+            self._collector = collector
+            if self._stop_requested:
+                collector.running = False
         start_ns = time.time_ns()
         started = time.monotonic_ns()
         try:
@@ -464,6 +495,8 @@ class Sampler:
         except BaseException as exc:  # SystemExit on permission errors, plus bugs
             self._record_failure("profiling sample failed", exc)
             return None
+        finally:
+            self._collector = None
         duration_ns = max(0, time.monotonic_ns() - started)
 
         window = SamplingWindow(
@@ -552,6 +585,9 @@ class _AggregatingCollector:
 
     def __init__(self, interval_usec: int, *, exclude_thread_ids: Iterable[int] = ()) -> None:
         self.sample_interval_usec = interval_usec
+        #: ``SampleProfiler.sample`` breaks out of its loop (and flushes) once this is
+        #: False; ``Sampler.stop()`` flips it from the shutdown thread.
+        self.running = True
         self._exclude = set(exclude_thread_ids)
         self.counts: Dict[Stack, int] = {}
         self.samples = 0

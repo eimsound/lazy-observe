@@ -32,6 +32,34 @@ def test_normalize_defaults():
     assert cfg.delivery.retry_max == 1.0
 
 
+def test_profiling_is_off_by_default_with_a_60_second_interval():
+    assert Config().profiling is False
+    assert Config().profiling_interval == 60.0
+    cfg = normalize_config(Config(dsn="http://h/p/a@b"))
+    assert cfg.profiling is False
+    assert cfg.profiling_interval == 60.0
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -1, -0.5, float("nan"), float("inf"), float("-inf")])
+def test_profiling_interval_that_is_not_positive_and_finite_falls_back_to_default(value):
+    cfg = normalize_config(Config(dsn="http://h/p/a@b", profiling_interval=value))
+    assert cfg.profiling_interval == 60.0
+
+
+@pytest.mark.parametrize("value", [5, 5.0, 10.0, 600.0, 0.5])
+def test_profiling_interval_is_kept_when_positive(value):
+    # Below the 10 s window the windows simply run back to back; no clamping here.
+    cfg = normalize_config(Config(dsn="http://h/p/a@b", profiling=True, profiling_interval=value))
+    assert cfg.profiling is True
+    assert cfg.profiling_interval == value
+
+
+def test_init_accepts_profiling_keys_from_a_dict():
+    fields = lazyobserve.Config.__dataclass_fields__
+    assert "profiling" in fields
+    assert "profiling_interval" in fields
+
+
 def test_missing_dsn_invalid():
     with pytest.raises(InvalidConfigError):
         normalize_config(Config(dsn=""))
@@ -67,7 +95,6 @@ def test_init_degraded_ok_on_bad_export():
     lo = lazyobserve.init(
         {"dsn": "http://255.255.255.255:1/p/a@b", "service_name": "x"}
     )
-    # Unknown/legacy keys (e.g. profiling) are ignored, not rejected.
     # Bad-token DSN still constructs; registry returns the instance.
     assert lazyobserve.get_client() is lo
     lo.shutdown(timeout=1.0)

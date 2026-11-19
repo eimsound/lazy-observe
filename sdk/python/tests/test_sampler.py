@@ -496,6 +496,65 @@ def test_collect_window_rejects_non_positive_duration():
 # --- failure handling ------------------------------------------------------
 
 
+def test_aggregating_collector_is_running_until_told_to_stop():
+    # ``SampleProfiler.sample`` checks ``collector.running`` once per tick and
+    # breaks (then flushes what it aggregated) when it is False.
+    collector = _sampler._AggregatingCollector(10_000)
+    assert collector.running is True
+
+
+def test_stop_ends_a_window_in_flight_and_keeps_what_was_aggregated():
+    started = threading.Event()
+    seen = {}
+
+    def sample(pid, collector, *, duration_sec=None, all_threads=False, mode=0):
+        seen["collector"] = collector
+        started.set()
+        deadline = time.monotonic() + 5
+        # What 3.15.2's loop does: ``hasattr(collector, "running") and not collector.running``.
+        while collector.running and time.monotonic() < deadline:
+            time.sleep(0.001)
+        collector.collect(_stacks((1, [_frame("work")])), timestamps_us=[0] * 7)
+
+    probe = _sampler.SamplerProbe(True, mode=1, sample=sample)
+    sampler = _sampler.Sampler(probe)
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(window=sampler.collect_window(60.0)))
+    worker.start()
+    assert started.wait(5)
+
+    began = time.monotonic()
+    sampler.stop()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert time.monotonic() - began < 2.0  # nowhere near the 60 s window
+    assert seen["collector"].running is False
+    window = result["window"]
+    assert window is not None
+    assert window.counts == {(("work", "app.py", 1),): 7}
+    assert window.duration_ns < 5_000_000_000
+
+
+def test_stop_before_a_window_starts_samples_nothing():
+    fake = FakeSampling(stacks=_stacks((1, [_frame("work")])))
+    sampler = _sampler_for(fake)
+    sampler.stop()
+    assert sampler.collect_window(10.0) is None
+    assert fake.calls == []
+    assert sampler.last_failed_ticks() == 0
+    # Stopping is a request from shutdown, not a failure of the sampler.
+    assert not sampler.disabled()
+    assert sampler.consecutive_failures() == 0
+
+
+def test_stop_is_idempotent_and_safe_on_an_unavailable_sampler():
+    sampler = _sampler.Sampler(_sampler.SamplerProbe(False, reason=_sampler.REASON_GIL_BUILD))
+    sampler.stop()
+    sampler.stop()
+    assert sampler.collect_window(1.0) is None
+
+
 def test_collect_window_swallows_sampling_errors():
     fake = FakeSampling()
     sampler = _sampler_for(fake)

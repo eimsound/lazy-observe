@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -12,6 +13,8 @@ ERROR_QUEUE_SIZE = 100
 DELIVERY_MAX_ATTEMPTS = 3
 DELIVERY_RETRY_INITIAL = 0.1
 DELIVERY_RETRY_MAX = 1.0
+#: Default gap between the starts of two profiling windows (Go: ``ProfilingInterval``).
+PROFILING_INTERVAL = 60.0
 
 
 @dataclass
@@ -47,6 +50,13 @@ class Config:
     tags: Optional[Dict[str, str]] = None
     export_interval: float = 5.0
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
+    #: Experimental continuous CPU profiling (off by default). Samples only on Linux
+    #: with a free-threaded CPython 3.15+ whose GIL is off; anywhere else switching it
+    #: on logs one warning with a reason code and samples nothing.
+    profiling: bool = False
+    #: Seconds between the starts of two 10 s profiling windows; ``<= 0`` (or not a
+    #: finite number) selects the default, below 10 the windows run back to back.
+    profiling_interval: float = PROFILING_INTERVAL
 
 
 class InvalidConfigError(ValueError):
@@ -83,6 +93,9 @@ def normalize_config(cfg: Config) -> Config:
         raise InvalidConfigError("sample rate must be between 0 and 1")
     if cfg.export_interval <= 0:
         cfg.export_interval = 5.0
+    cfg.profiling = bool(cfg.profiling)
+    if not (cfg.profiling_interval > 0 and math.isfinite(cfg.profiling_interval)):
+        cfg.profiling_interval = PROFILING_INTERVAL  # also catches NaN and +-inf
     normalize_delivery(cfg.delivery)
     if cfg.tags is None:
         cfg.tags = {}
