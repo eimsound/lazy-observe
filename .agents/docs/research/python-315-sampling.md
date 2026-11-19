@@ -4,6 +4,10 @@
 >
 > 本文归档一次本地 spike 的实测结论，只说明候选路线是否可行、代价在哪里，不代表项目一定采用。
 > 是否进入产品、走哪条路线，需另行通过正式决策流程确认。
+>
+> 后续：本 spike 只测了持续忙的负载。S2 审查发现，GIL 构建上的进程内采样看不见短 CPU 段，
+> greenlet 下抓栈会失败。见 [`python-cpu-profiling-gil.md`](python-cpu-profiling-gil.md) 与
+> ADR 0014 的 2026-11 修订。
 
 ## 背景
 

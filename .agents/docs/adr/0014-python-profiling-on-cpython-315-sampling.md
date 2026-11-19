@@ -1,27 +1,52 @@
-# Python SDK 用 CPython 3.15 采样接口做进程内 CPU 剖析
+# Python SDK 只在无 GIL 的 CPython 3.15t 上做进程内 CPU 剖析
+
+> 2026-11 修订：S2 审查实测发现，GIL 构建上的进程内采样系统性看不见短 CPU 段。启用范围因此收窄为
+> 「Linux 上运行时没有 GIL 的 3.15t」，窗口对齐 Go SDK，并写明 greenlet 不支持。sidecar 与墙钟剖析
+> 一起推迟、另立项。证据见 [`python-cpu-profiling-gil.md`](../research/python-cpu-profiling-gil.md)。
 
 Python SDK 一直没有剖析信号：`sdk/python/README.md` 之前直接写「CPU/pprof profiling is not
 implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon），调研
 [`python-315-sampling.md`](../research/python-315-sampling.md) 实测确认进程内对自身 PID
-采样能产出平台可接受的 pprof，且不需要 ptrace 权限，也不改协议面。我们决定：
+采样能产出平台可接受的 pprof，且不需要 ptrace 权限，也不改协议面。
 
-- **只在 CPython ≥ 3.15 启用**。3.9–3.14 上用户打开开关只打一条 warning，不采样，也不走
-  3.14 的私有模块 `_remote_debugging`。SDK 整体兼容范围仍是 `>=3.9`。
+但带 GIL 的解释器上，进程内采样线程必须先拿到 GIL 才能读栈。它只有在业务线程释放 GIL
+（sleep、IO、`epoll`）或被强制切换（默认 5 ms）时才拿得到，所以短于切换间隔的 CPU 段永远
+被看成「停在等待处」。实测忙 1–3 ms、闲 2–6 ms 的负载里，`burn` 的 CPU 占比真值为 95–99%，
+进程内的各种 mode 和加权方式给出的是 0–33%：忙 1 ms 时全部为 0，GIL 版 asyncio 忙 3 ms 时
+几乎全部记到 `EpollSelector.select`。free-threaded 3.15t 上同样的负载用进程内 `mode=cpu`，可以把
+84–100% 记到 `burn`（真值 94–99%）；但 3.15t 一旦重新启用 GIL（`-X gil=1`），结果又退回到 0。
+我们决定：
+
+- **只在 Linux、CPython ≥ 3.15 的 free-threaded 构建、且运行时 `sys._is_gil_enabled()` 为
+  False 时采样**。下列情况打开开关只打一条 warning，不采样：3.9–3.14、3.15 GIL 构建、
+  3.15t 的 GIL 被 `PYTHON_GIL=1`/`-X gil=1` 或不兼容的 C 扩展重新启用、macOS 与 Windows。
+  GIL 可能在运行中被新导入的 C 扩展打开，所以每个窗口开始前重查一次，发现已启用就停用并
+  warning。GIL 构建上试采不报错，只会返回空样本，特性探测拦不住，必须显式判断。
+  SDK 整体兼容范围仍是 `>=3.9`，也不走 3.14 的私有模块 `_remote_debugging`。
 - **只做进程内、对自身 PID 的自采样**。sidecar（attach 其他 PID）和 CLI collapsed 两条路线
-  不进 SDK：前者要 ptrace 权限、开销在另一个进程，后者会丢完整文件路径。
+  不进 SDK，理由见备选方案。
 - **依赖未文档化接口**。采样线程调用
   `profiling.sampling.sample.sample(pid, collector, *, all_threads=True, mode=cpu)`，
   自定义 `profiling.sampling.Collector` 聚合栈。这两个符号不在 3.15 文档的公开 API 里，
-  签名或语义可能随 CPython 小版本变化，因此启动时做特性探测（检查签名并试采），
-  运行中连续采集失败就自动停用并 warning，而不是维护版本白名单。
-- **只采 CPU**：`mode=cpu`、`all_threads=True`，上传 `type=cpu`，pprof sample type 沿用
-  Go SDK 的 `samples/count` + `cpu/nanoseconds`。wall 模式的墙钟时间与 `cpu` 语义不一致，
-  墙钟类型以后单独立项。
-- **默认关闭**：用户显式设置 `profiling=True` 才启用；Python SDK README 标 experimental。
+  签名或语义可能随 CPython 小版本变化，因此启动时做特性探测（检查签名并试采），而不是维护
+  版本白名单。运行中满足以下任一条件就自动停用并 warning：连续 3 次采集失败；或一个窗口内
+  失败率超过阈值（阈值在 S3 确定）。失败率同时输出到 diagnostics。
+- **只采 CPU**：`mode=cpu`、`all_threads=True`，排除 SDK 自己的采样线程，上传 `type=cpu`。
+  pprof sample type 沿用 Go SDK 的 `samples/count` + `cpu/nanoseconds`，样本值是「计数 × 周期」。
+  墙钟类型以后与 sidecar 一起单独立项。
+- **默认关闭**：用户显式设置 `profiling=True` 才启用；Python SDK README 标 experimental，写明
+  上面的支持范围。
+- **不支持 greenlet**：线程正跑在非主 greenlet 里时，Tachyon 抓栈报
+  `RuntimeError: Incomplete sample: did not reach base frame`，整次样本作废，连同一时刻其它
+  线程的栈也一起丢失。进程内和外部 attach、各种 mode、3.15 和 3.15t 都是这样。gevent、eventlet 应用会因
+  连续失败而停用；只在局部使用 greenlet 的库（例如 SQLAlchemy asyncio）会间歇性丢样本，
+  靠失败率规则发现。用户文档写明不支持。
 - **prefork 每个 worker 各自采样**：用 `os.register_at_fork` 在子进程重启采样线程；
   `upload_id` 每个窗口取 128 bit 随机数（`secrets.token_hex(16)`，与 Go SDK 的
   `newEventID` 一致），`os.urandom` 本身 fork 安全，不需要重新播种；labels 不带 pid。
-- **100 Hz、60 s 窗口**，投递复用 `sdk/python/lazyobserve/delivery.py` 的 `DeliveryQueue`。
+- **100 Hz，每 60 s 采 10 s**，与 Go SDK 的 `collectProfiles`（`profilingCPUWindow = 10s`、
+  `ProfilingInterval` 默认 60 s）一致；投递复用 `sdk/python/lazyobserve/delivery.py` 的
+  `DeliveryQueue`。
 - **零依赖自写 pprof 编码器**：只用标准库把聚合栈编码成 gzip pprof；用 Go 侧
   `github.com/google/pprof/profile`（`internal/gateway` 已依赖）回读测试，不引入新依赖。
 - **不改协议面**：仍走 `POST /api/profiles`，字段与 Go SDK 相同，`type=cpu`；
@@ -29,13 +54,35 @@ implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon）
 
 ## 备选方案
 
-- **sidecar 子进程采样（拒绝）**：需要 ptrace 权限，且 free-threaded 与带 GIL 的解释器之间
-  不能互相 attach；SDK 里多一个子进程的生命周期比自采样更难保证。
+- **GIL 构建照做进程内采样，在文档里标注盲区（拒绝）**：这种做法给出的不是带噪声的数据，而是方向错误的火焰图。
+  典型 Web 请求的 CPU 段只有几毫秒，很可能落进盲区，CPU 会被算到 `select`、`recv`、`sleep` 上。
+- **wall/all + 按线程 CPU 时钟加权（拒绝）**：每个 tick 读取 `CLOCK_THREAD_CPUTIME`，把增量记到
+  此刻的栈上。对持续忙的线程准确，但在忙闲切换的负载下，增量会落到「突发结束后停住的等待栈」
+  上：3.15t 忙 3 ms 时只有 37% 记到 `burn`，GIL 版为 0–1%。实际上它退化成了墙钟分布。
+- **all + 状态位过滤（拒绝）**：GIL 构建上同样看不到短 CPU 段（忙 1–3 ms 时为 0–33%）。
+  3.15t 上它与 `mode=cpu` 等价，但 `mode=cpu` 在 C 层过滤，空闲线程不进 Python collector，
+  所以更省：1 个忙线程加 63 个空闲线程时，采样线程 CPU 在 `all` 下为单核的 15.3%，在
+  `mode=cpu` 下为 9.0%。
+- **用墙钟模式顺带当 CPU（拒绝）**：wall 样本包含不在 CPU 上的等待时间，sample type 必须与
+  mode 一致；而且 GIL 构建上进程内 wall 同样有盲区（忙 1–3 ms 时 `burn` 为 0%，真值 33%）。
+- **sidecar 子进程外部 attach（暂缓，与墙钟类型一起另立项）**：外部采样器不持有目标进程的 GIL，
+  GIL 构建上的 cpu 和 wall 都准确，忙闲切换下也准。原先「需要 ptrace 权限、跨构建不能
+  attach」的说法不准确：同 uid、Docker/containerd 默认 seccomp、内核 ≥ 4.8 时不需要
+  CAP_SYS_PTRACE，用 `sys.executable` 拉起就是同一构建。真正的门槛如下：
+  - Yama `ptrace_scope=1`（上游、Ubuntu、gVisor 的默认值）下，子进程读父进程要父进程先调
+    `PR_SET_PTRACER`，而每个进程只能有一个这样的放行关系，会和崩溃上报库互相覆盖；
+    scope=2/3 下不可行；
+  - 降权 worker（gunicorn `--user`、uwsgi `--uid`，dumpable=0）与 PSS baseline 下会失败；
+  - 每个 worker 多一个解释器（GIL 版 21 MiB，3.15t 39–41 MiB）；
+  - 子进程生命周期复杂：`PR_SET_PDEATHSIG` 跟随线程，管道 EOF 被 fork 继承，应用会接管
+    SIGCHLD，uwsgi/PyInstaller 下 `sys.executable` 不是 Python。
+
+  所以它只能作为显式开关，不能默认开启。
+- **原生扩展在不持 GIL 的原生线程里采样（拒绝）**：会破坏零依赖纯 Python SDK，需要按平台
+  出 wheel，维护成本与本 ADR 的范围不匹配。
 - **CLI collapsed 转换（拒绝）**：丢完整文件路径，还要解析别人的文本格式，契约更脆。
-- **3.14 及更早用 `_remote_debugging`（拒绝）**：私有模块、接口与 3.15 不同，维护两条实现
-  的成本高于覆盖收益。
-- **用墙钟模式顺带当 CPU（拒绝）**：wall 样本包含不在 CPU 上的等待时间，火焰图会把
-  `Thread.join` 之类的阻塞算成热点；sample type 必须与 mode 一致。
+- **3.14 及更早用 `_remote_debugging`（拒绝）**：私有模块、接口与 3.15 不同，而且同样受 GIL
+  限制，维护两条实现的成本高于覆盖收益。
 - **版本白名单（拒绝）**：未文档化接口的变更不会跟着版本号走，白名单需要持续维护；
   特性探测能直接回答「这台解释器能不能采」。
 - **引入第三方 pprof 编码库（拒绝）**：为 profile.proto 的一个子集新增运行时依赖，还要过
@@ -43,10 +90,14 @@ implemented in Python」。CPython 3.15 新增 `profiling.sampling`（Tachyon）
 
 ## 后果
 
-- Python SDK 多一条只在 3.15+ 生效的剖析路径；3.9–3.14 的行为不变，只是开关打开时多一条
-  warning。
+- Python SDK 多一条只在 Linux 3.15t 上生效的剖析路径，绝大多数 GIL 构建用户拿不到 CPU 剖析；
+  3.9–3.14 和 GIL 构建的行为不变，只是开关打开时多一条 warning。覆盖 GIL 构建要等 sidecar 立项。
 - CPython 升级可能打破采样：失效时 SDK 自动停用并 warning，不抛错、不中断业务；CI 固定跑
   最新 3.15.x，另有一个非阻塞的 3.16 预发布 job 提前暴露签名变化。
 - pprof 编码器成为 SDK 的内部契约，由 Go `pprof` 解析器回读测试钉住；Python 侧只做结构断言，
   避免自己解码自己。
-- 采样开销落在应用进程内（调研实测示例负载约 −2% 到 −3% 吞吐），需要按 100 Hz 的默认值使用。
+- 采样开销落在应用进程内。3.15t 上 `mode=cpu` 实测（每次 4 s、栈深 30、每组 3 轮、机器 load
+  1.3–4.5，吞吐只作参考）：采样线程约占单核 1.75%（1 个线程）、3.6%（16 个）、9.0%（64 个），
+  随线程数增长；这是因为 `mode=cpu` 每个 tick 都要对每个线程读一次 `/proc/<pid>/task/<tid>/stat`。
+  导入后 RSS 增加 15–19 MiB；忙线程吞吐变化在 ±4% 以内，与噪声无法区分。按每 60 s 采 10 s
+  摊下来，平均开销约为上述数字的 1/6。
