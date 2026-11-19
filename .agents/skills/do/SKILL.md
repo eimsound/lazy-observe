@@ -69,6 +69,15 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 3. 修完跑同一命令转绿，附上修复前后输出。
 4. `/skill:retro` 问一句：什么环境改动能防止这类 bug 再发生。
 
+### release
+
+1. 打 tag 前，在 Renovate Dependency Dashboard 勾选重跑，确认 Victoria、Trivy 等手工固定点没有待合并的升级；有就先合并或明确放过。
+   版本是否落后只看这一步，`storage-bin-scan` 不查（ADR 0016）。Renovate 由后续切片接入，接入前先人工核对
+   `scripts/download-storage-bins.sh` 与 `scripts/install-trivy.sh` 里的 pin。
+2. 更新 `docs/version-matrix.md`（先矩阵、后发布），确认该提交的 CI 为绿，更新 `CHANGELOG.md`。
+3. 打 tag 属于「必须停下来等人」的动作：由负责人确认后再打。`release.yml` 的 `storage-bin-scan` 命中只警告，
+   发版后看 run 的 step summary 里的警告表即可；扫描失败才会挡住出包。
+
 ### afk-run
 
 见下一节。afk-run 是 feature/feature-multi 的无人值守版本，步骤相同，只多了暂停条件和决策日志。
@@ -154,7 +163,7 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | 触发 | workflow | 跑什么 |
 | --- | --- | --- |
 | PR、push 到 `main`、`integration/**` | `ci.yml` | 上表按改动面挑出的 job，由 `ci-ok` 汇总 |
-| `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、镜像漏洞扫描（Trivy，有修复的 CRITICAL/HIGH 即失败）、`storage-bin-scan`（对下载并校验过 sha256 的嵌入 Victoria 上游二进制做 Trivy 扫描，规则与镜像扫描一致；pin 已是上游满 7 天的最新稳定版而命中的未修复漏洞只警告）、性能门禁，全过才出包 |
+| `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、镜像漏洞扫描（Trivy，有修复的 CRITICAL/HIGH 即失败）、`storage-bin-scan`（对下载并校验过 sha256 的嵌入 Victoria 上游二进制做 Trivy 扫描，参数与镜像扫描一致；ADR 0016：有命中只 `::warning::` 并写 step summary、不阻塞，扫描没跑成才失败）、性能门禁，全过才出包 |
 | 手动 | `bench.yml` | 依次跑 `bench`（30 秒摄入基准 + 基线门禁）、`perf-release`（双架构产物门禁 + 零配置 release smoke）、`perf-ha`（`e2e-ha` 全部 HA 断言 + 查询 P95 与弱扩展门禁）、`perf-results-check` |
 
 切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。分组规则由 `mise run ci-changes-test` 钉住，改分组时同步改测试。

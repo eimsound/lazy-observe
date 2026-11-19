@@ -92,7 +92,6 @@ expect 'scripts/check-pinned-releases.sh' 'go pins'
 expect 'scripts/release-age.env' 'go pins'
 expect 'scripts/check-pinned-releases-test.sh' 'go'
 expect 'scripts/check-storage-bin-vulns.sh' 'go'
-expect 'scripts/check-storage-bin-vulns-test.sh' 'go'
 expect 'scripts/check-js-licenses.sh' 'web sdk_node sdk_browser'
 
 # 打包链路：加 arm64。

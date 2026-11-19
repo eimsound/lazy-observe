@@ -215,14 +215,6 @@ if [[ -f $release_wf ]]; then
   if grep -Eq '^[[:space:]]+(-[[:space:]]+)?if:' <<<"$storage_scan"; then
     fail "$release_wf: storage-bin-scan must not be conditional (no job- or step-level if:)"
   fi
-  # 扫描要调 GitHub API 查上游 release（check-pinned-releases.sh --latest-eligible），step 必须带 GH_TOKEN，
-  # 否则匿名 60 次/小时在共享 runner 出口上容易被限流，而限流会让扫描 fail-closed 把发版挡住。
-  grep -Eq '^[[:space:]]+GH_TOKEN:[[:space:]]+\$\{\{ github\.token \}\}[[:space:]]*$' <<<"$storage_scan" ||
-    fail "$release_wf: storage-bin-scan must pass GH_TOKEN: \${{ github.token }} to the scan step"
-  # 测试钩子只给离线测试用：release.yml 里出现它们，说明有人想替换下载步骤或伪造 release 数据来放行门禁。
-  hooks_in_release=$(grep -En 'LO_STORAGE_BIN_DOWNLOADER|LO_PINNED_RELEASES_(FIXTURE|NOW|ROOT)' "$release_wf" || true)
-  [[ -z $hooks_in_release ]] ||
-    fail "$release_wf must not set offline-test hooks: $hooks_in_release"
   # archive 的 needs 必须是单行列表且包含 storage-bin-scan（精确到列表元素，不是子串）。
   archive_needs=$(grep -E '^    needs:' <<<"$archive_job" || true)
   [[ $(grep -c . <<<"$archive_needs") -eq 1 && $archive_needs == *'['*']'* ]] ||

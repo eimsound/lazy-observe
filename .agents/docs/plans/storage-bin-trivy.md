@@ -188,3 +188,14 @@ VictoriaLogs v1.54.0 发布于 2026-11-13，2026-11-20 起满 7 天：那之后 
   Logs/Traces 的命中仍只警告。临时文件已删，没有改任何 pin。
 - 2026-11-19（复审）报告里有命中但 Trivy 退出码不是 1（例如 2）时原先会落到只警告分支并通过；改为有命中时只认退出码 1，其他一律失败。
   离线测试加 `findings with exit 2`：修复前该用例 `FAIL: findings with exit 2: must fail but exited 0`，修复后 PASS。
+- 2026-11-20（ADR 0016 改为只警告，取代上面「放行策略」一节）：负责人决定嵌入的 Victoria 只用上游官方二进制、绝不自行编译，
+  扫描有命中只警告、不再随 pin 是否落后于 latest-eligible 阻塞；版本落后与否改由发版前的 Renovate Dependency Dashboard 判断。
+  `check-storage-bin-vulns.sh` 删掉 latest-eligible 联动、组件到上游仓库的映射、`newer_hint`、`LO_STORAGE_BIN_DOWNLOADER` 与
+  `LO_PINNED_RELEASES_*` 透传，`GH_TOKEN` 也不再需要；`check-storage-bin-vulns-test.sh` 删除。
+  保留「没扫成就失败」：Trivy 出错、gobinary 不是恰好四个、有命中但退出码不是 1、无命中但退出码非 0、报告不可解析。
+  `storage-bin-scan` 仍是 `archive` 的前置 job，`check-github-workflows.sh` 保留它不能被 `if:`/`continue-on-error` 绕过的断言，
+  删除「要求 GH_TOKEN」「禁止测试钩子出现在 release.yml」两条。
+- 2026-11-20（复审）命中清单原先经进程替换 `< <(jq …)` 读取，jq 在这里失败（例如字段是对象、`@tsv` 报错）不触发 `set -e`，
+  命中被读成零行、落到 ok 分支 exit 0。改为先写进临时 TSV（pipefail 下 jq 失败即退出），并要求行数等于报告条数；
+  空字段补 `-`，避免 tab 被 `read` 合并后字段错位、`warn_bins[$key]` 未绑定；step summary 单元格转义 `|`。
+  一次性桩复核：修复前 `PkgName` 为对象时 exit 0，修复后 exit 5；`InstalledVersion` 为空时修复前 unbound variable 失败，修复后正常警告。
