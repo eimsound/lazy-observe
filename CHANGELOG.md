@@ -213,14 +213,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Release builds now scan the embedded VictoriaMetrics, vmagent, VictoriaLogs,
   and VictoriaTraces binaries with Trivy before anything is published; the
   container image scan cannot see them, because they are gzip-compressed into
-  the `lazy-observe` binary through `go:embed`. A fixable CRITICAL/HIGH finding
-  only warns while the component's pin already is the latest stable upstream
-  release at least 7 days old (there is nothing to upgrade to), and blocks the
-  release once the pin is behind that release or the upstream lookup fails.
-  The verdict for one commit can therefore change over time: when a newer
-  upstream release turns 7 days old, its findings start to block until the pin
-  is upgraded. At the time of the change the remaining 8 HIGH Go standard
-  library findings per architecture only warn (#69).
+  the `lazy-observe` binary through `go:embed`. Findings only warn: each
+  fixable CRITICAL/HIGH finding becomes a deduplicated workflow warning and a
+  row in the step summary, and never blocks the release, because it comes
+  from the upstream binaries and the project ships only the official upstream
+  binaries, never ones it compiled itself (ADR 0016). On 2026-11-20 the scan
+  reports 6 such findings covering 5 CVEs, all HIGH in the Go standard
+  library. The `storage-bin-scan` job still fails, and the archive still waits
+  for it, when
+  the scan itself does not complete: Trivy errors, anything other than exactly
+  four Go binaries recognized, or a report that does not match Trivy's exit
+  code. Whether a pin is behind upstream is not decided by this job: before
+  tagging a release, check the Renovate Dependency Dashboard (rerun it first)
+  for pending upgrades of the Victoria binaries and Trivy; until Renovate is
+  set up, check the pins by hand. The first version of this scan (#69)
+  blocked a release when a pin was behind the latest upstream release that
+  was at least 7 days old, or when that lookup failed; ADR 0016 replaced that
+  policy (#69, #117). The container image scan is unchanged and still blocks.
+- Source map upload now has its own credential, the project-scoped **source map
+  upload token** (`los_…`; ADR 0018). `POST /api/releases/:release/sourcemaps`
+  used to accept the project API token, which sits in public pages (ADR 0010)
+  and could overwrite any release's source maps and keep creating releases
+  until the storage was full. The endpoint now accepts only an upload token,
+  which uploads source maps for its own project and nothing else; the project
+  API token and the user API token (`lou_…`) get `403
+  source_map_upload_token_required` there, and a `los_…` token gets `403
+  upload_only_token` on every other route (ingest, query, `/mcp`, management).
+  Only admins can list, create, or revoke upload tokens
+  (`GET|POST /api/projects/:id/source-map-upload-tokens`, `DELETE
+  …/:tokenID`, and the "Source map upload tokens" section of the project's
+  token dialog); the value is shown once at creation, stored as a SHA-256
+  digest, and creation and revocation are audited without the value. A revoked
+  token stops working at once on the replica that handled the revocation and
+  within 30 seconds on the others. There is still no per-project quota on
+  total source map storage, only the existing per-release limit of 200 files
+  and 50 MB (#116).
 
 ### Changed
 
@@ -256,6 +283,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   refused for the fingerprint mismatch. `allinone` with persistence keeps its
   data-directory key, and `allinone` without a PVC loses key and database
   together (#60).
+- **Breaking:** `POST /api/releases/:release/sourcemaps` no longer accepts a
+  project API token (`lo_…`) (ADR 0018). A build that uploads source maps
+  with an `lo_…` DSN now gets `403 source_map_upload_token_required`: the Vite
+  build fails and `lazy-observe-sourcemaps` exits non-zero. To migrate, an
+  admin creates a source map upload token in Settings → Projects → Manage
+  tokens → Source map upload tokens and copies the DSN shown once
+  (`<origin>/p/<project>@los_…`); replace the CI secret that feeds the build
+  (for example `LO_DSN`) with that DSN, and keep the ordinary `lo_…` DSN in
+  the browser's `init({ dsn })`. The DSN shape and the endpoint are unchanged
+  (#116).
+- **Breaking:** `@lazy-observe/bundler-plugin` no longer builds on unplugin
+  (#112). It is now a Vite plugin (the `vite` export of the package root and of
+  `@lazy-observe/bundler-plugin/vite`) plus a `lazy-observe-sourcemaps upload
+  --dir <directory> [--dsn <dsn>] [--release <release>] [--strip]` command for
+  every other bundler, and it has no runtime dependencies. The package is ESM
+  only, with no CJS build, and needs Node.js >= 22.15, where `require()` of it
+  still works. The `webpack` export and the `./webpack` entry are gone:
+  webpack, Rollup, esbuild, and Turbopack (Next.js 16) projects run the
+  command after the build, for example `lazy-observe-sourcemaps upload --dir
+  <output.path>`, and pass the same release to `init({ release })`; the
+  package README has the Next.js recipe. `--dsn` defaults to `$LO_DSN` and
+  `--release` to `$LO_RELEASE`, then to the 7-character Git SHA. The `dsn`
+  option is now optional: with no DSN the plugin and the command warn, upload
+  nothing, and succeed, so a local build needs no credentials (the old plugin
+  failed the build). With a DSN set, an invalid DSN, a missing directory, or a
+  failed upload fails the Vite build, or makes the command exit 1 (usage
+  errors exit 2), and the error message never contains the token.
 - The metadata baseline gained `platform_key_fingerprints`, so a metadata
   database (SQLite file or PostgreSQL database) created by an earlier commit
   refuses to start with `metadata migration 1 checksum mismatch`; recreate it
@@ -284,8 +338,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   page when a request reports an expired session; sign-out clears every cached
   result.
 - Alert rule expressions are edited with the PromQL/LogsQL code editors.
-- The web build runs ESLint with the React hooks rules (`pnpm lint`, part of
-  `mise run web`); mock data is no longer bundled into production builds.
+- The web build lints with Oxlint (`pnpm lint`, part of `mise run web`),
+  including the React hooks rules and the type-aware
+  `typescript/no-floating-promises` (#97, #111); mock data is no longer
+  bundled into production builds.
 - Automatic Issue AI analyses report `lazy_observe.issue_ai.automatic_outcomes`
   (completed, queue_full, rate_limited, failed) and log failure causes.
 
@@ -363,7 +419,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   workspaces use the same 7 days, so pnpm also holds back a security patch
   younger than that until it is listed in `minimumReleaseAgeExclude`. `web` is
   now a single-package pnpm workspace (`pnpm-workspace.yaml`); the lockfile is
-  unchanged. `sdk/python` is not covered yet (#70).
+  unchanged. `sdk/python` follows with `[tool.uv] exclude-newer = "7 days"` in
+  its `pyproject.toml` (#70, #119).
 - `mise run sdk-journeys` runs the Go, Node, Python, and browser SDK journeys
   (`sdk/*/e2e.sh`) against a freshly started local platform, and changes that
   touch server, SDK, web, or storage-download paths now run it as the
@@ -415,10 +472,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   published entries, ESM and CJS export names, external dependencies, and
   declaration symbols are unchanged; the emitted JavaScript differs (Node
   built-ins are imported with the `node:` prefix, and CJS exports carry a
-  `Symbol.toStringTag` of `"Module"`). In the declarations of
-  `@lazy-observe/bundler-plugin`, the `vite` and `webpack` exports are now typed
-  as the matching `UnpluginInstance` members instead of referencing a
-  `WebpackPluginInstance` type that was never imported. The web console lints
+  `Symbol.toStringTag` of `"Module"`; `@lazy-observe/bundler-plugin` has
+  since become ESM only, see #112). The web console lints
   with Oxlint instead of ESLint and runs its unit tests on Vitest instead of
   `node --test`, and `mise run sdk-browser` now also runs the bundler plugin's
   tests (#97).
@@ -426,6 +481,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   uv-managed CPython, no pip) and runs the Python SDK tests on the interpreter
   named by `LO_SDK_PYTHON_VERSION` (default 3.13; for example `3.9` or
   `3.15t`); CI runs it on 3.9, 3.13, 3.15, and 3.15t (#103).
+- The Python SDK adopts the repository's 7-day minimum release age:
+  `sdk/python/pyproject.toml` sets `[tool.uv] exclude-newer = "7 days"`, which
+  limits what `uv pip install` and `uv build` (for the build backend) resolve
+  to package versions that have been on PyPI for at least 7 days, and
+  `scripts/check-github-workflows.sh` fails when it differs from
+  `scripts/release-age.env`. Without a lockfile the window is relative to the
+  current time, so resolution moves forward as time passes. The PyPI release
+  path (`sdk-release.yml`, `sdk-python-v*` tags) no longer uses `setup-python`
+  or pip: it installs only uv through mise and runs `mise run
+  sdk-python-release`, which builds the sdist and wheel with `uv build
+  --managed-python --python 3.13`; the artifacts are the same as before. The
+  upload step and its trusted-publishing permission are unchanged. The new
+  release path has not run through a real `workflow_dispatch` dry run or tag
+  push yet, so run a dry run before the first release (#119).
+- CI runs `sdk-node` on Node 22.23.5, 24.22.3, and 26.13.1, and `sdk-browser`
+  on 26.13.1 for the full suite plus a bundler-plugin load smoke test on
+  22.23.5 and 24.22.3 (`mise run sdk-browser-smoke`); `LO_SDK_NODE_VERSION`
+  selects the Node version for these three tasks. The checks are named `Node
+  SDK (Node <version>)` and `Browser SDK (Node <version>)`; `ci-ok` still waits
+  for all of them (#112).
+- The Go SDK's `Shutdown` no longer uploads a CPU profile window it cut short
+  unless the window had already run for 5 seconds; a shorter one is discarded,
+  and the discard is not counted in `DroppedTelemetry`, the same rule as the
+  Python SDK. The heap and goroutine snapshots are still collected, and a
+  window that runs its full 10 seconds is not affected (#118).
 - Made release archives consume the canonical root `LICENSE` file.
 - Made PostgreSQL the correctness boundary for multi-replica alert membership,
   per-rule leases/fencing, durable state, and notification Outbox work; Redis
@@ -447,10 +527,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The metadata baseline SQL changed again: `users` gained
   `must_change_password`, so pre-release development databases must be rebuilt
   (single-baseline policy) (#18).
+- The metadata baseline SQL (SQLite and PostgreSQL) changed once more: it gained
+  the `source_map_upload_tokens` table, added directly to
+  `001_baseline.sql` with no incremental migration (ADR 0003), so
+  pre-release development databases must be rebuilt (#116).
 - `@lazy-observe/node` now requires Node >= 22.15 and ships OpenTelemetry JS
   3.x (`@opentelemetry/sdk-trace` replaces `sdk-trace-node`, the OTLP proto
-  exporter is 0.301.1, `api-logs` is folded into `api`), with the span and log
-  processor constructors rewritten accordingly (#32).
+  exporters are 0.301.2, `api-logs` is folded into `api`), with the span and
+  log processor constructors rewritten accordingly (#32, #115).
 - The Go SDK now requires OpenTelemetry Go 1.45 (logs 0.21) and emits the
   matching v1.43 semconv schema URL; with the old v1.41 URL, an application on
   OTel Go 1.45 failed to create the client on a schema-URL conflict (#11).
@@ -491,7 +575,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Removed the built-in dashboards and host middleware views. Dashboards are
   delegated to external Grafana or Perses through the Prometheus-compatible
-  query API.
+  query API (ADR 0017).
 - Removed the cross-repository SDK plumbing: the sibling-directory `replace`,
   the CI deploy key and SDK checkout scripts, the release-time SDK alignment
   gate, and the SDK-side server compatibility build.
@@ -603,8 +687,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   anonymous API only if that fails, and still exits 2 when every source fails
   or a rate limit is hit. For such a repository the weekly report marks the
   pin `unknown`, not outdated, when the release page cannot show that the
-  latest release is old enough, and `--latest-eligible` still exits 2, so the
-  storage-binary vulnerability check keeps blocking (#86).
+  latest release is old enough, and `--latest-eligible` still exits 2 (#86).
+  The release-time storage-binary scan no longer calls `--latest-eligible`
+  (ADR 0016, #117).
 - `lazyobserve.Client.shutdown(timeout)` in the Python SDK no longer returns a
   spurious `... has no attribute 'shutdown'` error for a signal that is not
   enabled (or on a degraded client). Its steps (error transport, profiling,
@@ -628,7 +713,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reason `shutdown_budget` and logged through the `lazyobserve` logger,
   instead of staying queued uncounted and possibly going out after `shutdown`
   returned; dropped profile uploads also count in
-  `Diagnostics().dropped_telemetry` (#105).
+  `Diagnostics().dropped_telemetry` (#105), and since #108 the dropped error
+  events do too.
+- Error events the Python SDK drops from its delivery queue are now counted
+  like the other SDKs count them: in `Diagnostics().dropped_telemetry` and in
+  `lazy_observe_sdk_dropped_telemetry` with `signal="error"` and the reasons
+  `queue_full`, `retry_exhausted`, and `shutdown_budget`, before the warning
+  is logged. Until now these drops were only logged, so with metrics enabled a
+  Python client shows new `signal="error"` series and a larger
+  `dropped_telemetry` than before (#108).
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
