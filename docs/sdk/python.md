@@ -281,8 +281,9 @@ machine (load 1.3–4.5):
 - It is only paid inside the 10-second windows, so with the default 60-second interval the
   average is about one sixth of the numbers above.
 - Importing the sampler raises RSS by 15–19 MiB.
-- Throughput of a busy thread changed by no more than ±6%, which cannot be told apart from
-  measurement noise.
+- Throughput of a busy thread changed by at most 3.2% averaged over three rounds and about
+  5% in any single round, comparable to how much the unprofiled baseline itself varied
+  between rounds (up to 4.8%), so it cannot be told apart from measurement noise.
 - Turning profiling on adds about 9 ms to `init`, because the probe runs in the background.
 
 These are measurements of one workload on one machine, not guarantees. Measure your own
