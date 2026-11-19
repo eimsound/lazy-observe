@@ -11,7 +11,7 @@ fail() {
 
 # 本脚本只做服务端自身 e2e / restart / cross-platform artifact 的静态契约检查。
 # SDK（sdk/<lang>）的单元测试由 ci.yml 的 sdk-* job 运行；各语言 journey（sdk/*/e2e.sh）
-# 需要外部平台，暂不进 CI。
+# 由 mise run sdk-journeys 起真实平台后依次跑，ci.yml 的 sdk-journeys job 跑同一条任务（见下面的契约）。
 
 e2e_task=$(sed -n '/^\[tasks\.e2e\]$/,/^\[tasks\.e2e-restart\]$/p' mise.toml)
 [[ $e2e_task == *'bash scripts/e2e.sh'* ]] || fail 'mise e2e must delegate to the root orchestrator'
@@ -100,6 +100,34 @@ done
 if rg -n 'mise run (perf-ha|perf-release|bench|performance-gates)' "$ci"; then
   fail 'push/PR CI must not run the performance gates'
 fi
+
+# SDK journeys 按改动面跟 PR 跑：mise run sdk-journeys 起一个真实平台，依次跑 Go、Node、Python、Browser 四个
+# journey；ci.yml 的 sdk-journeys job 由 sdk_journeys 标志控制，跑同一条 mise 任务。工具链缺失必须报错而不是 skip。
+journeys_task=$(sed -n '/^\[tasks\.sdk-journeys\]$/,/^\[tasks\.install-check\]$/p' mise.toml)
+[[ $journeys_task == *'depends = ["build", "storage-bins", "sdk-python"]'* ]] ||
+  fail 'mise sdk-journeys must depend on build, storage-bins and sdk-python'
+[[ $journeys_task == *'bash scripts/sdk-journeys.sh'* ]] || fail 'mise sdk-journeys must run scripts/sdk-journeys.sh'
+journeys_script=scripts/sdk-journeys.sh
+[[ -f $journeys_script ]] || fail 'scripts/sdk-journeys.sh is missing'
+rg -Fq 'all_journeys=(go node python browser)' "$journeys_script" ||
+  fail 'sdk-journeys.sh must run the go, node, python and browser journeys in that order'
+if rg -n 'exit 77|SKIP:' "$journeys_script"; then
+  fail 'sdk-journeys.sh must fail, not skip, when a toolchain is missing'
+fi
+for language in go node python browser; do
+  [[ -f sdk/$language/e2e.sh ]] || fail "sdk/$language/e2e.sh is missing"
+done
+journeys_job=$(awk '$0 == "  sdk-journeys:" { on = 1; next } on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } on { print }' "$ci")
+[[ -n $journeys_job ]] || fail 'push/PR CI lacks the sdk-journeys job'
+[[ $journeys_job == *"if: needs.changes.outputs.sdk_journeys == 'true'"* ]] ||
+  fail 'ci.yml sdk-journeys must gate on the sdk_journeys change flag'
+[[ $journeys_job == *'MISE_CI_PROFILE: sdk-journeys'* ]] || fail 'ci.yml sdk-journeys must install the sdk-journeys mise profile'
+[[ $journeys_job == *'- run: mise run sdk-journeys'* ]] || fail 'ci.yml sdk-journeys must run mise run sdk-journeys'
+for path in sdk/go/e2e.sh sdk/node/e2e.sh sdk/python/e2e.sh sdk/browser/e2e/performance-journey.spec.ts \
+  cmd/lazy-observe/main.go internal/gateway/router.go web/src/App.tsx go.mod scripts/sdk-journeys.sh; do
+  flags_out=$(printf '%s\n' "$path" | bash "$changes_script" --stdin 2>/dev/null)
+  [[ $'\n'$flags_out$'\n' == *$'\n'sdk_journeys=true$'\n'* ]] || fail "SDK journeys do not trigger on $path"
+done
 
 # 性能门禁不跟 PR 跑：必须挡在发版链路上（archive 之前），bench.yml 只留手动入口。
 for task in 'mise run bench' 'mise run perf-release' 'mise run perf-ha' 'mise run perf-results-check'; do

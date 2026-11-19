@@ -73,9 +73,12 @@ LO_E2E_ADMIN_PASSWORD=... \
   ./e2e.sh
 ```
 
-`./e2e.sh` is a manual journey: neither `mise` nor CI runs it (`mise run sdk-python`
-and the CI SDK job only run pytest). Run it yourself against an already running
-lazy-observe platform:
+`mise run sdk-python` and the CI `Python SDK` job only run pytest. The real-platform
+journey is `./e2e.sh`. The standard way to run it is `mise run sdk-journeys` from the
+repository root: it starts a throwaway platform (temporary data dir, free ports, known
+admin password) and runs the Go, Node, Python and Browser journeys in turn; the CI
+`SDK journeys` job runs the same task. To run only this journey, point it at an
+already running lazy-observe platform:
 
 - `LO_E2E_PLATFORM_URL`: base URL of the running platform.
 - `LO_E2E_TOKEN`: the `default` project's API token (`lo_…`). It only builds the

@@ -18,7 +18,7 @@ set -euo pipefail
 # 本地测试：`printf '%s\n' a.go b.md | bash scripts/ci-changes.sh --stdin`，
 # 标志写到 stdout（以及 $GITHUB_OUTPUT，若设置）。见 scripts/ci-changes-test.sh。
 
-flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys)
 
 # ha：多副本 HA 功能门禁（mise run e2e-ha → scripts/e2e-multi-replica.sh，只做功能断言，
 # 不含 perf-ha 的性能部分）。它跑的是 build-binary 产出的服务端二进制、外置的 storage-bins
@@ -33,6 +33,16 @@ flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python)
 #（门禁不读 Helm chart 或示例配置，Helm 由 go job 的 helm-lint/helm-template-test 覆盖）、
 # scripts/e2e.sh / e2e-restart.sh 等单副本 e2e 脚本、非 Go 的 SDK 与纯文档。
 # 与 e2e 不完全同范围，所以单列一个标志。
+
+# sdk_journeys：四个 SDK 的 journey（mise run sdk-journeys → scripts/sdk-journeys.sh）。它起一个真实平台
+# （带嵌入前端的 build-binary + 外置 storage-bins），再对着它跑 sdk/{go,node,python,browser}/e2e.sh，
+# 所以输入是 SDK 自身、服务端 Go 代码与依赖、会被嵌进二进制的前端、storage 二进制下载和门禁脚本：
+#   - sdk/**（任一语言的 SDK，含各自的 e2e.sh 与示例；纯文档由 *.md 规则先挡掉）；
+#   - cmd/**、internal/**、go.mod/go.sum、ent 生成链路；
+#   - web/**、scripts/prepare-web-assets.sh（browser journey 登录真实 UI）；
+#   - scripts/download-storage-bins.sh、scripts/sdk-journeys.sh；
+#   - 全量路径（.github/**、mise.toml、scripts/ci-*、Dockerfile*、未分类路径）。
+# 刻意不打开的：deploy/**、config.example.yaml、bench/**、单副本 e2e 与 HA 脚本。
 
 # 打包链路：动到这些路径时额外跑 arm64 构建与冒烟（以及 amd64 构建与冒烟）。
 # scripts/check-e2e-contract.sh 校验这份列表。
@@ -107,42 +117,50 @@ classify() {
     ;;
   # 服务端经 replace 把 sdk/go 编进二进制（自监控链路），所以也要跑构建与 e2e。
   sdk/go/*)
-    set_flags sdk_go go build e2e ha
+    set_flags sdk_go go build e2e ha sdk_journeys
     ;;
   sdk/node/*)
-    set_flags sdk_node
+    set_flags sdk_node sdk_journeys
     ;;
   sdk/browser/*)
-    set_flags sdk_browser
+    set_flags sdk_browser sdk_journeys
     ;;
   sdk/python/*)
-    set_flags sdk_python
+    set_flags sdk_python sdk_journeys
     ;;
   sdk/*)
-    set_flags sdk_go sdk_node sdk_browser sdk_python
+    set_flags sdk_go sdk_node sdk_browser sdk_python sdk_journeys
     ;;
   web/*)
-    set_flags web build
+    set_flags web build sdk_journeys
     ;;
   internal/db/* | internal/meta/* | entc.mod | entc.sum | tools/entgen/* | scripts/generate-ent.sh)
-    set_flags go build e2e ha meta_pg
+    set_flags go build e2e ha meta_pg sdk_journeys
     ;;
   # 依赖升级可能动到 pgx / embedded-postgres，PG 元数据测试一起跑。
   go.mod | go.sum)
-    set_flags go build e2e ha meta_pg
+    set_flags go build e2e ha meta_pg sdk_journeys
     ;;
   cmd/* | internal/*)
-    set_flags go build e2e ha
+    set_flags go build e2e ha sdk_journeys
     ;;
   # HA 门禁脚本与它现场编译的辅助程序；也保留单副本 e2e 原有的触发。
   scripts/e2e-multi-replica.sh | scripts/e2e-path-router/* | scripts/e2e-otlp-payload/* | scripts/e2e-otlp-sink/*)
     set_flags go e2e ha
     ;;
   scripts/download-storage-bins.sh)
-    set_flags go e2e ha
+    set_flags go e2e ha sdk_journeys
     ;;
-  scripts/e2e* | scripts/prepare-web-assets.sh)
+  scripts/e2e*)
     set_flags go e2e
+    ;;
+  # 嵌入前端的产物也是 SDK journey 里 browser 登录的真实 UI。
+  scripts/prepare-web-assets.sh)
+    set_flags go e2e sdk_journeys
+    ;;
+  # SDK journey 门禁自身：起真实平台跑四个 SDK 的 journey。
+  scripts/sdk-journeys.sh)
+    set_flags go sdk_journeys
     ;;
   # HA 门禁读取副本 GOMAXPROCS 与 trace 夹具规模。
   bench/performance-gates.json)

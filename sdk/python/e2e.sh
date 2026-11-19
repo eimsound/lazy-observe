@@ -8,7 +8,8 @@ EXAMPLE_PORT=${LO_E2E_EXAMPLE_PORT:-43520}
 EXAMPLE_URL="http://127.0.0.1:$EXAMPLE_PORT"
 PYTHON=${LO_E2E_PYTHON:-"$SDK_DIR/.venv/bin/python"}
 
-# journey 需要手动对着一个运行中的 lazy-observe 平台执行，mise 和 CI 都不调用本脚本。
+# 标准入口是 `mise run sdk-journeys`（scripts/sdk-journeys.sh 起平台、准备下面三个变量并依次跑四个 journey，
+# CI 的 SDK journeys job 也跑它）。也可以手动对着一个运行中的 lazy-observe 平台单独执行本脚本，需要：
 #   LO_E2E_PLATFORM_URL    平台地址
 #   LO_E2E_TOKEN           默认项目的项目 API Token（lo_…），只用来拼 DSN 做摄取
 #   LO_E2E_ADMIN_PASSWORD  admin 密码；所有读请求都用登录得到的会话 Cookie 加

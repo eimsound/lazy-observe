@@ -6,7 +6,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 script="$root/scripts/ci-changes.sh"
-flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys)
 all="${flags[*]}"
 failures=0
 
@@ -40,21 +40,21 @@ expect 'sdk/node/README.md,docs/sdk/go.md,.github/ISSUE_TEMPLATE/bug_report.yml'
 expect '' ''
 
 # SDK：只跑对应语言；Go SDK 额外跑服务端 Go 检查。
-expect 'sdk/node/packages/node/src/index.ts' 'sdk_node'
-expect 'sdk/browser/packages/react/package.json' 'sdk_browser'
-expect 'sdk/python/lazyobserve/client.py' 'sdk_python'
-expect 'sdk/go/delivery.go' 'sdk_go go build e2e ha'
-expect 'sdk/scripts/sdk-publish.sh' 'sdk_go sdk_node sdk_browser sdk_python'
+expect 'sdk/node/packages/node/src/index.ts' 'sdk_node sdk_journeys'
+expect 'sdk/browser/packages/react/package.json' 'sdk_browser sdk_journeys'
+expect 'sdk/python/lazyobserve/client.py' 'sdk_python sdk_journeys'
+expect 'sdk/go/delivery.go' 'sdk_go go build e2e ha sdk_journeys'
+expect 'sdk/scripts/sdk-publish.sh' 'sdk_go sdk_node sdk_browser sdk_python sdk_journeys'
 
 # 前端：web + 嵌入前端的 amd64 构建。
-expect 'web/src/App.tsx' 'web build'
+expect 'web/src/App.tsx' 'web build sdk_journeys'
 
 # 服务端：Go 代码同时打开多副本 HA 功能门禁。
-expect 'internal/gateway/router.go' 'go build e2e ha'
-expect 'cmd/lazy-observe/main.go' 'go build e2e ha'
-expect 'internal/meta/store.go' 'go build e2e ha meta_pg'
-expect 'internal/db/schema/rule.go' 'go build e2e ha meta_pg'
-expect 'tools/entgen/main.go' 'go build e2e ha meta_pg'
+expect 'internal/gateway/router.go' 'go build e2e ha sdk_journeys'
+expect 'cmd/lazy-observe/main.go' 'go build e2e ha sdk_journeys'
+expect 'internal/meta/store.go' 'go build e2e ha meta_pg sdk_journeys'
+expect 'internal/db/schema/rule.go' 'go build e2e ha meta_pg sdk_journeys'
+expect 'tools/entgen/main.go' 'go build e2e ha meta_pg sdk_journeys'
 expect 'scripts/e2e-restart.sh' 'go e2e'
 expect 'scripts/e2e.sh' 'go e2e'
 expect 'deploy/helm/lazy-observe/values.yaml' 'go'
@@ -76,14 +76,22 @@ expect 'scripts/check-image-vulns.sh' 'go'
 expect 'scripts/check-js-licenses.sh' 'web sdk_node sdk_browser'
 
 # 打包链路：加 arm64。
-expect 'go.mod' 'go build e2e ha meta_pg arm64'
-expect 'go.sum' 'go build e2e ha meta_pg arm64'
-expect 'internal/embed/bins/bins_linux_amd64.go' 'go build e2e ha arm64'
-expect 'scripts/download-storage-bins.sh' 'go build e2e ha arm64'
-expect 'scripts/prepare-web-assets.sh' 'go build e2e arm64'
+expect 'go.mod' 'go build e2e ha meta_pg arm64 sdk_journeys'
+expect 'go.sum' 'go build e2e ha meta_pg arm64 sdk_journeys'
+expect 'internal/embed/bins/bins_linux_amd64.go' 'go build e2e ha arm64 sdk_journeys'
+expect 'scripts/download-storage-bins.sh' 'go build e2e ha arm64 sdk_journeys'
+expect 'scripts/prepare-web-assets.sh' 'go build e2e arm64 sdk_journeys'
 expect '.goreleaser.yaml' 'go build arm64'
 expect_matrix 'go.mod' '[{"arch":"amd64","runner":"ubuntu-24.04"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]'
 expect_matrix 'internal/gateway/router.go' '[{"arch":"amd64","runner":"ubuntu-24.04"}]'
+
+# SDK journey：SDK、服务端 Go、前端与 storage 下载变化时跑；纯文档、Helm、基准与 HA 脚本不跑。
+expect 'sdk/go/e2e.sh' 'sdk_go go build e2e ha sdk_journeys'
+expect 'sdk/browser/e2e/performance-journey.spec.ts' 'sdk_browser sdk_journeys'
+expect 'sdk/node/e2e.sh' 'sdk_node sdk_journeys'
+expect 'sdk/python/e2e.sh' 'sdk_python sdk_journeys'
+expect 'scripts/sdk-journeys.sh' 'go sdk_journeys'
+expect 'sdk/browser/README.md,sdk/python/README.md' ''
 
 # CI 自身、工具链与未知路径：全量。
 expect '.github/workflows/ci.yml' "$all"
@@ -94,12 +102,12 @@ expect 'Makefile' "$all"
 
 # 不打开 HA 门禁的改动面：前端、非 Go SDK、文档、Helm。
 expect 'web/src/App.tsx,sdk/node/packages/node/src/index.ts,sdk/browser/packages/react/package.json' \
-  'web build sdk_node sdk_browser'
+  'web build sdk_node sdk_browser sdk_journeys'
 expect 'docs/deployment.md,deploy/helm/lazy-observe/templates/deployment.yaml,sdk/python/lazyobserve/client.py' \
-  'go sdk_python'
+  'go sdk_python sdk_journeys'
 
 # 组合：取并集。
-expect 'README.md,sdk/python/pyproject.toml,web/package.json' 'sdk_python web build'
+expect 'README.md,sdk/python/pyproject.toml,web/package.json' 'sdk_python web build sdk_journeys'
 
 # --all：全量。
 got=$(GITHUB_OUTPUT='' bash "$script" --all 2>/dev/null)

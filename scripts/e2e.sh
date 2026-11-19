@@ -37,9 +37,10 @@ mark() {
 cd "$root"
 
 # 这里只编排服务端自身的 e2e 检查与 evidence 机制。客户端 SDK（sdk/go、sdk/node、
-# sdk/browser、sdk/python）的各语言 journey 在各自的 e2e.sh 里，mise 和 CI 都不调用：
-# 需要手动对着一个运行中的平台执行，传 LO_E2E_PLATFORM_URL、LO_E2E_TOKEN（lo_，只用于摄取 DSN）
-# 和 LO_E2E_ADMIN_PASSWORD（读请求用 admin 会话 Cookie 加 X-LO-Project，见 ADR 0010）。
+# sdk/browser、sdk/python）的各语言 journey 在各自的 e2e.sh 里，由 `mise run sdk-journeys`
+# （scripts/sdk-journeys.sh）起一个真实平台、准备凭据并依次跑；CI 的 SDK journeys job 跑同一条任务。
+# 手动对着一个运行中的平台单独执行某个 e2e.sh 时，传 LO_E2E_PLATFORM_URL、LO_E2E_TOKEN（lo_，只用于
+# 摄取 DSN）和 LO_E2E_ADMIN_PASSWORD（读请求用 admin 会话 Cookie 加 X-LO-Project，见 ADR 0010）。
 # CI 的 sdk-* job 只跑各语言单元测试。
 
 printf 'checking the supervisor recovery module before the product journey...\n'
