@@ -4,14 +4,28 @@ Behavior mirrors the Go SDK's delivery.go: capacity includes the batch currently
 being exported, a full queue drops new items, sends retry with exponential
 backoff (100ms -> 1s, 3 attempts by default), and shutdown drains the queue
 within a caller-provided budget before dropping the remainder.
+
+**fork** (``os.register_at_fork``): a forked child inherits the queue, its locks and
+whatever the parent had queued, but not the worker thread. Without a hook the child's
+events would sit in a queue nobody drains and ``close`` would wait out its whole
+budget (gunicorn ``--preload`` and uwsgi fork after ``init``). So each queue is tracked
+weakly, and one module-level hook (registered once) makes every live queue in the child
+start over: new lock, condition variables, events and worker thread, an empty backlog
+(what the parent still had queued is the parent's to send, never the child's) and a
+fresh drop counter. Nothing inherited is acquired, since another parent thread may
+have held it at the instant of the fork. A queue that was closed stays closed. A queue
+built with ``reinit_on_fork=False`` is left alone for its owner to rebuild
+(``ProfilingController`` replaces its whole uploader, queue included).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
+import weakref
 from typing import Callable, Generic, List, Optional, TypeVar
 
 T = TypeVar("T")
@@ -36,6 +50,7 @@ class DeliveryQueue(Generic[T]):
         retry_max: float = 1.0,
         warn: Optional[DeliveryWarn] = None,
         name: str = "delivery",
+        reinit_on_fork: bool = True,
     ) -> None:
         if capacity <= 0:
             raise ValueError("delivery queue capacity must be positive")
@@ -49,19 +64,41 @@ class DeliveryQueue(Generic[T]):
         self._warn = warn
         self._name = name
 
-        self._items: "queue.Queue[T | object]" = queue.Queue(maxsize=capacity)
-        self._cancel = threading.Event()
         self._closed = False
+        self._init_state()
+        if reinit_on_fork:
+            _track(self)  # before the worker starts: no running worker is ever untracked
+        self._start_worker()
+
+    def _init_state(self) -> None:
+        """(Re)create everything that holds a lock, a condition variable or the backlog."""
+        self._items: "queue.Queue[T | object]" = queue.Queue(maxsize=self._capacity)
+        self._cancel = threading.Event()
         self._close_lock = threading.Lock()
         self._dropped = 0
         self._drop_lock = threading.Lock()
         self._last_error: Optional[BaseException] = None
         self._done = threading.Event()
 
+    def _start_worker(self) -> None:
         self._thread = threading.Thread(
-            target=self._run, name=f"lazyobserve-{name}", daemon=True
+            target=self._run, name=f"lazyobserve-{self._name}", daemon=True
         )
         self._thread.start()
+
+    def _reinit_after_fork(self) -> None:
+        """Runs in the child right after ``fork``; only the forking thread exists.
+
+        Nothing inherited is used, least of all acquired: the locks, the queue's
+        mutex and the events may have been held by a parent thread at fork time and
+        would stay locked forever. The backlog is dropped without being counted; the
+        parent still owns and will send it.
+        """
+        self._init_state()
+        if self._closed:
+            self._done.set()  # shut down before the fork: stay closed, no worker
+            return
+        self._start_worker()
 
     # -- public API ---------------------------------------------------------
 
@@ -218,6 +255,43 @@ class DeliveryQueue(Generic[T]):
     @property
     def name(self) -> str:
         return self._name
+
+
+# --- fork hook -----------------------------------------------------------------------------
+
+_queues: "List[weakref.ReferenceType[DeliveryQueue]]" = []
+_queues_lock = threading.Lock()
+_fork_hook_registered = False
+
+
+def _track(delivery_queue: "DeliveryQueue") -> None:
+    global _fork_hook_registered
+    with _queues_lock:
+        _queues[:] = [ref for ref in _queues if ref() is not None]  # queues come and go
+        _queues.append(weakref.ref(delivery_queue))
+        if not _fork_hook_registered and hasattr(os, "register_at_fork"):
+            _fork_hook_registered = True
+            os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def _after_fork_in_child() -> None:
+    global _queues_lock
+    # Another parent thread may have held the registry lock at the fork: replace it,
+    # never acquire it. A copy of the list is enough, since this is the only thread.
+    _queues_lock = threading.Lock()
+    try:
+        alive = [ref for ref in list(_queues) if ref() is not None]
+        _queues[:] = alive
+    except Exception:  # noqa: BLE001 - never let a fork hook break the child
+        return
+    for ref in alive:
+        delivery_queue = ref()
+        if delivery_queue is None:
+            continue
+        try:
+            delivery_queue._reinit_after_fork()
+        except Exception:  # noqa: BLE001 - one queue failing must not skip the rest
+            continue
 
 
 def default_warn_factory(logger: logging.Logger, signal: str) -> DeliveryWarn:
