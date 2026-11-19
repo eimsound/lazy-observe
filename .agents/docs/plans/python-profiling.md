@@ -2,15 +2,21 @@
 
 ## 目标与来源
 
-- 源规格：`.agents/docs/research/python-315-sampling.md`（spike 结论）、负责人 2026-11 的切片决策
-  （S1–S4 串行，不阻塞 v0.1.0），以及 ADR 0014。
-- 最终状态：Python 应用显式设置 `profiling=True` 后，SDK 在 CPython 3.15+ 上以
-  `mode=cpu`、`all_threads=True`、100 Hz 采样自身进程，按 60 s 窗口聚合成 pprof，
-  经 `POST /api/profiles` 上传；`type=cpu`，协议面不变；3.9–3.14 打开开关只打一条 warning、
-  不采样；默认关闭，README 标 experimental。
+- 源规格：`.agents/docs/research/python-315-sampling.md`（spike 结论）、
+  `.agents/docs/research/python-cpu-profiling-gil.md`（S2 审查后的 GIL 与忙闲切换实测）、
+  负责人 2026-11 的切片决策（S1–S4 串行，不阻塞 v0.1.0），以及 ADR 0014（2026-11 修订）。
+- 最终状态：Python 应用显式设置 `profiling=True` 后，SDK 只在 Linux、CPython 3.15+
+  free-threaded 构建、且运行时 `sys._is_gil_enabled()` 为 False 时，以
+  `mode=cpu`、`all_threads=True`、100 Hz 采样自身进程，每 60 s 采 10 s 并聚合成 pprof，
+  经 `POST /api/profiles` 上传；`type=cpu`，协议面不变。3.9–3.14、3.15 GIL 构建、
+  GIL 被重新启用的 3.15t、macOS/Windows 打开开关只打一条 warning、不采样。默认关闭，
+  README 标 experimental，写明支持范围，并写明不支持 greenlet（gevent、eventlet）。
 - 范围外：
-  - sidecar（attach 其他 PID）与 CLI collapsed 两条采样路线（决策 2）。
+  - sidecar（attach 其他 PID）与 CLI collapsed 两条采样路线（决策 2）；sidecar 与墙钟剖析
+    一起推迟、另立项，是覆盖 GIL 构建的唯一候选。
   - 3.14 私有模块 `_remote_debugging` 和 3.9–3.14 的任何采样实现（决策 3）。
+  - GIL 构建上的任何进程内采样，包括 wall/all + 线程 CPU 时钟加权和状态位过滤
+    （ADR 0014 备选方案）。
   - wall/gil/exception 采样类型与 pprof sample type 的扩展；墙钟剖析单独立项（决策 5）。
   - 协议面、`docs/version-matrix.md`、`CHANGELOG.md`、README 的改动放在 S4 或完全不改（决策 5、16）。
   - 白名单式版本判断；只做特性探测（决策 4）。
@@ -84,6 +90,29 @@
 2. S2：采样器（依赖 S1 的聚合输入形状；3.15 特性探测）。
 3. S3：公开开关与生命周期（依赖 S1 投递、S2 采样器）。
 4. S4：CI 矩阵与文档（依赖 S1–S3 的可运行行为）。
+
+## ADR 0014 修订带来的切片调整（2026-11）
+
+S2 审查实测：GIL 构建上进程内采样看不见短 CPU 段，3.15t 重新启用 GIL 后也一样；greenlet 下
+Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profiling-gil.md`。各切片的追加
+要求如下，S2 的原交付不在此重写：
+
+- **S2（本地 `d30b98c` 恢复时）**：
+  - 保留 `mode=cpu`、`all_threads=True`、按 `len(timestamps_us)` 计数；S1 编码器不改。
+  - 可用性判断新增三道门：`sys.platform == "linux"`；free-threaded 构建
+    （`sysconfig.get_config_var("Py_GIL_DISABLED")`）；运行时 `sys._is_gil_enabled()` 为 False。
+    任一不满足，就返回「不可用 + 原因」。GIL 构建上试采不报错，只会返回空样本，所以这三道门必须
+    放在试采之前。
+  - 暴露一个「窗口前重查」接口（只查 GIL 状态），供 S3 每个窗口开始前调用。
+  - 失败停用规则：在连续 3 次失败之外，增加「窗口内失败率超过阈值」；失败率由采样器统计并暴露。
+  - Red：用 fake 模块分别断言 GIL 构建、`_is_gil_enabled()` 为 True、非 Linux 时返回不可用原因；
+    断言「间歇失败、凑不满连续 3 次」的序列会触发失败率停用。真实 3.15t 测试改成纯 Python 忙线程
+    负载（不再依赖释放 GIL 的 hashlib）；真实 3.15 GIL 测试断言返回不可用。
+  - `d30b98c` 的执行日志里写着「等待负责人决定默认 mode」，现已决定：保持 `mode=cpu`。
+- **S3**：窗口改为每 60 s 采 10 s（见下文 S3 交付）；每个窗口开始前调用 S2 的 GIL 重查，
+  发现 GIL 已启用就停用，只打一条 warning；失败率阈值在开工前定下（建议 20%）。
+- **S4**：CI 中 3.15 GIL 构建 job 只验证「打 warning、不采样」，真实采样只在 3.15t job 里跑；
+  用户文档写明支持范围、所有打 warning 不采样的情况、不支持 greenlet，以及实测开销。
 
 ## 实施步骤
 
@@ -171,8 +200,10 @@
 
 - [ ] 3. 开关、窗口与 shutdown
   - 交付：`Config.profiling: bool = False` 与 `normalize_config` 默认值；
-    `build_client` 在开启时探测可用性，<3.15 只打一条 warning；
-    60 s 窗口循环（100 Hz、`mode=cpu`、`all_threads=True`），每窗口
+    `build_client` 在开启时探测可用性，不可用（<3.15、GIL 构建、GIL 已启用、非 Linux）
+    只打一条带原因的 warning；
+    窗口循环与 Go SDK 一致：每 60 s 采 10 s（100 Hz、`mode=cpu`、`all_threads=True`），
+    每个窗口开始前重查 GIL 状态，发现已启用就停用并 warning；每窗口
     `new_upload_id()` 后投递；`os.register_at_fork` 在子进程重启采样线程；
     `upload_id` 每窗口取 128 bit 随机数（`os.urandom` fork 安全），无需重新播种；
     `shutdown(timeout)` 立即停采，当前窗口已满 5 秒就在预算内上传，否则丢弃。
@@ -183,20 +214,30 @@
     `profilingLoop` 在 `ctx.Done()` 后直接返回，S3 需要对齐或记录差异）。
   - 涉及位置：`sdk/python/lazyobserve/config.py:37`、`client.py:231`、`client.py:269`。
   - Red：`test_config.py` 断言 `profiling` 默认 False；`test_profiling_lifecycle.py`
-    用 fake 采样器与 fake 上传器断言：<3.15 只 warning 一次、窗口大小 60 s、
-    满 5 s 的窗口在 `shutdown` 内上传、不足 5 s 丢弃、fork 后子进程重新注册。
+    用 fake 采样器与 fake 上传器断言：不可用时只 warning 一次、每 60 s 一个 10 s 窗口、
+    窗口前 GIL 重查为启用时停用并 warning、满 5 s 的窗口在 `shutdown` 内上传、不足 5 s 丢弃、
+    fork 后子进程重新注册。
     命令：`mise run sdk-python`。
   - Green：接上开关与生命周期，只覆盖上述断言。
   - 验证：`mise run sdk-python`；3.15/3.15t job。
-  - 验收：默认不采样；显式开启且 3.15+ 时产生窗口；`shutdown` 不泄漏线程。
+  - 验收：默认不采样；显式开启且满足启用条件（Linux + 3.15t + 无 GIL）时产生窗口；
+    `shutdown` 不泄漏线程。
 
 ### S4 CI 与文档
 
 - [ ] 4. CI 矩阵、README 与 CHANGELOG
   - 交付：`.github/workflows/ci.yml` 的 Python SDK job 矩阵：
-    3.9、3.13、3.15、3.15t 阻塞，3.16 预发布非阻塞；3.9/3.13 只验证
-    「开关打开打 warning、不采集」。`sdk/python/README.md` 与
-    `docs/sdk/python.md` 标注 experimental 与启用方式；`CHANGELOG.md` 记一条；
+    3.9、3.13、3.15、3.15t 阻塞，3.16 预发布非阻塞；3.9/3.13/3.15（GIL）只验证
+    「开关打开打 warning、不采集」，真实采样只在 3.15t 上跑。`sdk/python/README.md` 与
+    `docs/sdk/python.md` 标注 experimental 与启用方式，并写明：
+    - 支持范围：Linux + CPython 3.15t，运行时无 GIL；
+    - 打 warning、不采样的情况：3.9–3.14、3.15 GIL 构建、GIL 被 `PYTHON_GIL=1`/`-X gil=1` 或
+      不兼容的 C 扩展重新启用、macOS/Windows；
+    - 不支持 greenlet（gevent、eventlet 会自动停用；SQLAlchemy asyncio 等局部使用 greenlet 的库
+      可能丢样本）；
+    - 采样节奏（每 60 s 采 10 s）与实测开销。
+
+    `CHANGELOG.md` 记一条；
     版本号保持 0.1.0；不改 `docs/version-matrix.md`（协议面不变）。
   - 阻塞于：S1–S3。
   - 涉及位置：`.github/workflows/ci.yml`、`sdk/python/README.md`、`docs/sdk/python.md`、
@@ -205,7 +246,7 @@
   - Green：更新矩阵与文档。
   - 验证：`mise run workflow-check`、`mise run ci-changes-test`、`mise run sdk-python`。
   - 验收：Python SDK job 在四个阻塞版本上绿；3.16 预发布红不挡合并；README 明确
-    experimental 与默认关闭。
+    experimental、默认关闭、支持范围与不支持 greenlet。
 
 ## Green 后审查与重构
 
@@ -228,6 +269,11 @@
 - S2 的「连续失败 N 次自动停用」中 N 的取值：建议 3，S3 开工前由负责人确认。
 - S3 是否需要同时输出 profiling 自身的 diagnostics 计数（`dropped_telemetry`）：
   建议复用 `record_telemetry_drop`，S3 时确认。
+- 失败率停用阈值：建议 20%，S3 开工前由负责人确认。
+- 是否像 Go 的 `ProfilingInterval` 那样把采样间隔开放给用户配置：S3 开工前确认。
+- greenlet 抓栈失败是否报给上游 CPython：由负责人决定，实现线程不自行提交。
+- 后续立项（不在本计划内）：sidecar 外部 attach（覆盖 GIL 构建）与墙钟剖析（新增 profile
+  类型，涉及协议面）。
 
 ## 执行日志
 
