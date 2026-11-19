@@ -317,3 +317,86 @@ def test_the_error_queue_is_restarted_once_and_the_profile_uploader_is_left_to_i
         assert payload["uploader_alive"] is False  # ProfilingController builds its own in the child
     finally:
         uploader.close(1.0)
+
+
+# --- Client._drop_lock ------------------------------------------------------------------------
+
+
+def test_a_child_forked_while_another_thread_holds_the_drop_lock_does_not_deadlock(platform, client):
+    """``record_telemetry_drop`` is what the profile uploader's warn callback and the
+    ``sample_failed`` count call: a child that inherited ``_drop_lock`` locked would hang
+    on the first drop it records."""
+    client.record_telemetry_drop("profile", "queue_full", 3)  # the parent's own drops
+    holding = threading.Event()
+    done = threading.Event()
+
+    def hold_lock():
+        with client._drop_lock:
+            holding.set()
+            done.wait(30)
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert holding.wait(5)
+
+    def child():
+        client.record_telemetry_drop("profile", "sample_failed", 2)
+        err = client.shutdown(SHUTDOWN_BUDGET)
+        return {"err": repr(err), "dropped": client.diagnostics().dropped_telemetry}
+
+    try:
+        payload = assert_child_ok(*run_in_child(child))
+    finally:
+        done.set()
+        holder.join(5)
+
+    assert payload["err"] == "None"
+    assert payload["dropped"] == 2  # the child counts its own drops; the parent's 3 stay the parent's
+    client.record_telemetry_drop("profile", "sample_failed", 1)  # the parent's lock is untouched
+    assert client.diagnostics().dropped_telemetry == 4
+
+
+def test_the_drop_lock_is_replaced_again_in_grandchildren(platform, client):
+    def child():
+        holding = threading.Event()
+        done = threading.Event()
+
+        def hold_lock():
+            with client._drop_lock:  # the child's own lock, held at the grandchild's fork
+                holding.set()
+                done.wait(30)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        assert holding.wait(5)
+
+        def grandchild():
+            client.record_telemetry_drop("profile", "sample_failed", 1)
+            return {"dropped": client.diagnostics().dropped_telemetry}
+
+        try:
+            status, payload = run_in_child(grandchild)
+        finally:
+            done.set()
+            holder.join(5)
+        return {"status": status, "payload": payload}
+
+    outer = assert_child_ok(*run_in_child(child))
+    inner = assert_child_ok(outer["status"], outer["payload"])
+
+    assert inner["dropped"] == 1
+
+
+def test_the_fork_hook_does_not_keep_a_client_alive(platform):
+    import gc
+    import weakref
+
+    from lazyobserve.client import degraded_client
+
+    ghost = degraded_client(lazyobserve.Config(), RuntimeError("never used"))
+    ref = weakref.ref(ghost)
+    del ghost
+    gc.collect()
+
+    assert ref() is None
+    assert_child_ok(*run_in_child(lambda: {"ok": True}))  # forking with a dead entry in the registry

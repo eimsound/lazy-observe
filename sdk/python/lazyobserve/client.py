@@ -12,6 +12,7 @@ import resource
 import sys
 import threading
 import time
+import weakref
 from typing import Any, Dict, List, Optional
 
 from opentelemetry import metrics as _otel_metrics
@@ -104,6 +105,19 @@ class Client:
 
         self._dropped_telemetry = 0
         self._drop_lock = threading.Lock()
+        _track(self)
+
+    def _reinit_after_fork(self) -> None:
+        """Runs in the child right after ``fork``; only the forking thread exists.
+
+        A parent thread may have held ``_drop_lock`` at the instant of the fork (the
+        profiling warn callback and the ``sample_failed`` count take it), and nothing
+        would ever release it in the child: replace it, never acquire it. The count
+        starts over, like ``DeliveryQueue``'s: the parent's drops are the parent's, and
+        ``diagnostics()`` is a process-local snapshot.
+        """
+        self._drop_lock = threading.Lock()
+        self._dropped_telemetry = 0
 
     # -- public API ---------------------------------------------------------
 
@@ -277,6 +291,51 @@ class Client:
 
     def __repr__(self) -> str:
         return f"<Client degraded={self.degraded} service={self.config.service_name!r}>"
+
+
+# --- fork hook ---------------------------------------------------------------------------------
+#
+# Same shape as ``delivery.py`` and ``_profiling.py``: clients are tracked weakly and one
+# module-level hook gives every live client a fresh lock in a forked child. Unlike theirs,
+# it is registered when this module is imported, not by the first instance:
+# ``lazyobserve/__init__`` imports this module before anything else in the package can
+# run, and the delivery and profiling hooks are registered only when their first queue or
+# controller is built, so this hook is always first, whatever is built in which order.
+# ``register_at_fork`` runs hooks in registration order, so the lock is already new by the
+# time the child's profiling thread is restarted and records a drop.
+
+_clients: "List[weakref.ReferenceType[Client]]" = []
+_clients_lock = threading.Lock()
+
+
+def _track(client: Client) -> None:
+    with _clients_lock:
+        _clients[:] = [ref for ref in _clients if ref() is not None]  # clients come and go
+        _clients.append(weakref.ref(client))
+
+
+def _after_fork_in_child() -> None:
+    global _clients_lock
+    # Another parent thread may have held the registry lock at the fork: replace it,
+    # never acquire it. A copy of the list is enough, since this is the only thread.
+    _clients_lock = threading.Lock()
+    try:
+        alive = [ref for ref in list(_clients) if ref() is not None]
+        _clients[:] = alive
+    except Exception:  # noqa: BLE001 - never let a fork hook break the child
+        return
+    for ref in alive:
+        client = ref()
+        if client is None:
+            continue
+        try:
+            client._reinit_after_fork()
+        except Exception:  # noqa: BLE001 - one client failing must not skip the rest
+            continue
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _run_bounded(name: str, fn: Any, budget: float) -> Optional[BaseException]:

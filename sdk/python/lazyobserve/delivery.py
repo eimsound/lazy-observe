@@ -125,9 +125,17 @@ class DeliveryQueue(Generic[T]):
                 except queue.Full:
                     # The worker is busy; the stop flag still terminates draining.
                     pass
+        # ``timeout=None`` waits for the worker for as long as it takes, so the budget-spent
+        # branch below only ever sees a number.
         if not self._done.wait(timeout):
+            # Budget spent, as when Go's ctx is done: cancel, and what is still queued is
+            # dropped as ``shutdown_budget`` now rather than whenever a stuck send returns.
             self._cancel.set()
-            self._thread.join(timeout=min(timeout or 1.0, 1.0))
+            self._discard_queued()
+            if timeout is not None and timeout > 0:
+                # A short grace period for a worker that is waiting out a retry delay.
+                # An exhausted budget (0 or negative) gets none: the caller's deadline holds.
+                self._thread.join(timeout=min(timeout, 1.0))
             return self._last_error or TimeoutError("delivery queue close timed out")
         return self._last_error
 
@@ -154,6 +162,29 @@ class DeliveryQueue(Generic[T]):
             self._dropped += count
         if self._warn is not None:
             self._warn(reason, err, count)
+
+    def _discard_queued(self) -> None:
+        """Drop everything still queued and count it as ``shutdown_budget``.
+
+        An item is taken by exactly one of this thread and the worker, so nothing is
+        counted twice; the batch the worker already holds is the worker's to count.
+        A close sentinel is always left behind, even when ``close`` found the queue
+        full and could not enqueue one: with ``flush_interval=0`` the worker blocks on
+        an empty queue with no timeout, and only the sentinel ends it.
+        """
+        dropped = 0
+        while True:
+            try:
+                item = self._items.get_nowait()
+            except queue.Empty:
+                break
+            if item is not _CLOSE:
+                dropped += 1
+        try:
+            self._items.put_nowait(_CLOSE)  # a spare one is harmless: the worker stops at the first
+        except queue.Full:
+            pass  # refilled by an enqueue that passed the closed check just before close
+        self._record_drop("shutdown_budget", None, dropped)
 
     def _set_error(self, err: BaseException) -> None:
         self._last_error = err

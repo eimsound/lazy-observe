@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import threading
 from typing import Any, Optional
 
 __version__ = "0.1.0"
@@ -11,13 +10,13 @@ __all__ = ["get_active_client", "set_active", "configure", "active"]
 
 
 class _ClientRegistry:
+    # No lock: setting and reading one attribute is atomic, with or without the GIL,
+    # and a lock held by another thread at a fork would stay held in the child.
     def __init__(self) -> None:
-        self._lock = threading.Lock()
         self._active: Optional[Any] = None
 
     def set_active(self, client: Optional[Any]) -> None:
-        with self._lock:
-            self._active = client
+        self._active = client
 
     def get_active_client(self) -> Optional[Any]:
         return self._active
