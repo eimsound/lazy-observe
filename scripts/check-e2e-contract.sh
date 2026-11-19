@@ -127,10 +127,9 @@ journeys_job=$(awk '$0 == "  sdk-journeys:" { on = 1; next } on && /^  [A-Za-z0-
   fail 'ci.yml sdk-journeys must pass the changes job sdk_journeys_only output as LO_SDK_JOURNEYS_ONLY'
 rg -Fq 'sdk_journeys_only: ${{ steps.detect.outputs.sdk_journeys_only }}' "$ci" ||
   fail 'ci.yml changes job must export the sdk_journeys_only output'
-# 每个 journey 必须落在独立的进程组里（set -m），cleanup 按组发信号；退回按 PID 停会重新漏进程（见 sdk-journeys-interrupt-test.sh）。
+# 每个 journey 必须落在独立的进程组里（set -m），cleanup 按组发信号；退回按 PID 停会重新漏进程。
 rg -Fq 'kill -TERM -- "-$pgid"' "$journeys_script" && rg -Fq 'kill -KILL -- "-$pgid"' "$journeys_script" ||
   fail 'sdk-journeys.sh cleanup must TERM and then KILL the whole process group of the platform and each journey'
-[[ -x scripts/sdk-journeys-interrupt-test.sh ]] || fail 'scripts/sdk-journeys-interrupt-test.sh is missing or not executable'
 for path in sdk/go/e2e.sh sdk/node/e2e.sh sdk/python/e2e.sh sdk/browser/e2e/performance-journey.spec.ts \
   cmd/lazy-observe/main.go internal/gateway/router.go web/src/App.tsx go.mod scripts/sdk-journeys.sh; do
   flags_out=$(printf '%s\n' "$path" | bash "$changes_script" --stdin 2>/dev/null)

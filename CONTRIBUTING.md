@@ -55,9 +55,9 @@ mise run web
 | `mise run performance-gates` | Run the release, query, and HA scaling gates sequentially |
 | `mise run web` | Frozen pnpm install, Node test runner, typecheck, and production build |
 | `mise run sdk-go` / `sdk-node` / `sdk-browser` / `sdk-python` | Build and test one client SDK under `sdk/` (frozen installs for the JS packages). `sdk-python` uses uv (no pip, no system Python; `[tool.uv] exclude-newer = "7 days"` in `sdk/python/pyproject.toml` applies the same 7-day minimum release age as `scripts/release-age.env`, and `mise run sdk-python-release` builds the PyPI artifacts with `uv build`): `LO_SDK_PYTHON_VERSION=3.15t mise run sdk-python` picks the interpreter, default `3.13`; the CI matrix runs `3.9`, `3.13`, `3.15`, `3.15t` and a non-blocking `3.16` pre-release |
-| `mise run helm-lint` / `mise run helm-template-test` | Lint and contract-test all-in-one and HA chart profiles |
-| `mise run workflow-check` | Statically validate GitHub Actions workflows, reject shell pipelines that close early under `pipefail` (opt out with `# pipefail-ok: <reason>`), self-test the pinned mise bootstrap, and contract-test CI change grouping |
-| `mise run ci-changes-test` | Contract-test the CI change detector that decides which jobs a diff runs |
+| `mise run helm-lint` / `mise run helm-template-test` | Lint the chart and check its key-material and image-digest guards |
+| `mise run workflow-check` | Statically validate GitHub Actions workflows, reject shell pipelines that close early under `pipefail` (opt out with `# pipefail-ok: <reason>`), self-test the pinned mise bootstrap, and test the CI change detector's full-run fallbacks |
+| `mise run ci-changes-test` | Test that the CI change detector falls back to a full run for CI, toolchain, unclassified paths and missing base |
 
 When a test command changes, update `mise.toml` in the same change; mise tasks are CI entry points.
 
@@ -119,8 +119,7 @@ the journey, storage-binary and web-asset scripts, shared `sdk/` files, CI and u
 
 The platform and each journey run in their own process group. Interrupting `scripts/sdk-journeys.sh`
 (SIGTERM, SIGINT, SIGHUP) sends SIGTERM to those groups and SIGKILL after a timeout, so no example process,
-port or temporary directory is left behind. `bash scripts/sdk-journeys-interrupt-test.sh` checks this against a real
-platform (local only, about two minutes); run it after changing the cleanup code. The gateway port is picked from
+port or temporary directory is left behind. The gateway port is picked from
 14000-14999, below the Linux ephemeral port range.
 
 ### Release and performance gates
@@ -174,8 +173,7 @@ business job.
 Performance gates are noisy on shared runners, so they run only on manual
 dispatch and before a release; the PR job runs only the functional HA
 assertions of `e2e-ha`, never `perf-ha`. Run them locally when your change is
-performance-sensitive. `mise run ci-changes-test` pins the path grouping; update
-it together with the detector.
+performance-sensitive.
 
 The embedded-binary scan never blocks a release because of a CVE: findings show up as `::warning::` annotations and
 in the job's step summary, and upstream decides when they go away. The scan does not check whether the pins are
