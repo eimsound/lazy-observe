@@ -8,10 +8,14 @@ REACT_PID=
 GO_PID=
 NODE_PID=
 CPU_LOAD_PID=
-VANILLA_PORT=${LO_E2E_VANILLA_PORT:-43520}
-REACT_PORT=${LO_E2E_REACT_PORT:-43530}
-GO_PORT=${LO_E2E_GO_PORT:-43540}
-NODE_PORT=${LO_E2E_NODE_PORT:-43550}
+# 示例端口取 16520–16550：低于 Linux 临时端口范围（32768–60999），不会和本机出站连接抢；低于平台组件端口
+# （19428+ 再加 scripts/sdk-journeys.sh 的随机偏移），高于网关端口段 14000–14999，也避开 HA 脚本等其它固定端口。
+# go/node/python journey 用同一段里的 16320–16330、16420–16430、16620，四个 journey 互不重叠。
+# 两个 vite 命令带 --strictPort：端口被占就直接失败，不会悄悄换端口让后面的请求打错地方。
+VANILLA_PORT=${LO_E2E_VANILLA_PORT:-16520}
+REACT_PORT=${LO_E2E_REACT_PORT:-16530}
+GO_PORT=${LO_E2E_GO_PORT:-16540}
+NODE_PORT=${LO_E2E_NODE_PORT:-16550}
 VANILLA_URL="http://127.0.0.1:$VANILLA_PORT"
 REACT_URL="http://127.0.0.1:$REACT_PORT"
 GO_URL="http://127.0.0.1:$GO_PORT"
@@ -120,6 +124,11 @@ if [ "$(id -u)" = 0 ] || sudo -n true >/dev/null 2>&1; then
 fi
 (
 	cd "$SDK_DIR"
+	# bundler-plugin 的 bin（lazy-observe-sourcemaps）指向 dist/cli.js，examples/react 依赖它；
+	# dist 还没构建就整体 install，pnpm 会报 "Failed to create bin"。先只装并构建 bundler-plugin，
+	# 再整体 install，bin 链接就是完整的，发布产物（package.json 的 bin / files）不用动。
+	pnpm install --frozen-lockfile --filter @lazy-observe/bundler-plugin
+	pnpm --filter @lazy-observe/bundler-plugin build
 	pnpm install --frozen-lockfile
 	pnpm build
 	# shellcheck disable=SC2086 # 有意按空白拆分参数
@@ -216,9 +225,9 @@ if find "$SDK_DIR/examples/react/dist" -name '*.map' -print -quit | rg -q .; the
 fi
 
 printf 'starting vanilla dev and React production examples...\n'
-(cd "$SDK_DIR" && pnpm --filter @lazy-observe/example-vanilla exec vite --host 127.0.0.1 --port "$VANILLA_PORT") >"$WORK/vanilla.log" 2>&1 &
+(cd "$SDK_DIR" && pnpm --filter @lazy-observe/example-vanilla exec vite --host 127.0.0.1 --port "$VANILLA_PORT" --strictPort) >"$WORK/vanilla.log" 2>&1 &
 VANILLA_PID=$!
-(cd "$SDK_DIR" && LO_E2E_JOURNEY_TARGET="$GO_URL" pnpm --filter @lazy-observe/example-react exec vite preview --host 127.0.0.1 --port "$REACT_PORT") >"$WORK/react.log" 2>&1 &
+(cd "$SDK_DIR" && LO_E2E_JOURNEY_TARGET="$GO_URL" pnpm --filter @lazy-observe/example-react exec vite preview --host 127.0.0.1 --port "$REACT_PORT" --strictPort) >"$WORK/react.log" 2>&1 &
 REACT_PID=$!
 wait_http "$VANILLA_URL/" || {
 	sed -n '1,160p' "$WORK/vanilla.log" >&2

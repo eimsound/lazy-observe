@@ -5,8 +5,9 @@ SDK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/lazy-observe-go-sdk-e2e.XXXXXX")
 EXAMPLE_PID=
 LLM_PID=
-EXAMPLE_PORT=${LO_E2E_EXAMPLE_PORT:-43320}
-LLM_PORT=${LO_E2E_LLM_PORT:-43330}
+# 示例端口取 16320/16330，理由同 sdk/browser/e2e.sh 顶部：低于临时端口范围和平台组件端口，高于网关端口段。
+EXAMPLE_PORT=${LO_E2E_EXAMPLE_PORT:-16320}
+LLM_PORT=${LO_E2E_LLM_PORT:-16330}
 EXAMPLE_URL="http://127.0.0.1:$EXAMPLE_PORT"
 LLM_URL="http://127.0.0.1:$LLM_PORT"
 
