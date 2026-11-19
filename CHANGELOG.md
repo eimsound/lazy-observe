@@ -151,6 +151,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   snippet with the pushed image's tag and digest; the chart itself is still not
   packaged and no digest is written back to `main`. The release job that
   attaches the snippet has not run against a real `v*` release yet (#67).
+- Added experimental continuous CPU profiling to the Python SDK, off by
+  default: `profiling=True` (and `profiling_interval`, default 60 seconds)
+  records one 10-second, 100 Hz window per interval from a background thread
+  and uploads it to `POST /api/profiles` with the Go SDK's wire contract. It
+  samples only on Linux with a free-threaded CPython 3.15+ (`python3.15t`)
+  whose GIL is off; anywhere else, or once the GIL turns on, the SDK logs one
+  warning with a reason code and does not sample. Prefork servers (gunicorn,
+  uWSGI) work: each worker restarts its own sampler after `fork`.
+  Greenlet-based code (gevent, eventlet) is not supported. See
+  `docs/sdk/python.md#continuous-profiling` for the support range, measured
+  overhead, and warning codes (#98, #100, #103).
 
 ### Security
 
@@ -325,10 +336,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     supervised VictoriaTraces now runs with `-search.latencyOffset=0s`, so new
     spans no longer wait 30 seconds to become queryable, and a trace that is
     still being written may show up incomplete.
-  - An external VictoriaTraces (or a cluster's `vtselect`) in Standalone or HA
-    mode is not managed by lazy-observe: pass `-search.latencyOffset=0s` to it
-    yourself, otherwise the LLM statistics page lags by up to 30 seconds
-    (`docs/deployment.md`).
+  - The gateway now sends `disable_latency_offset=true` with its LogsQL
+    queries to VictoriaTraces, so the LLM statistics page is current on an
+    external VictoriaTraces (or a cluster's `vtselect`) v0.12+ without any
+    flag. The Jaeger trace views have no such per-request switch: on an
+    external VictoriaTraces in Standalone or HA mode, lower
+    `-search.latencyOffset` (trace list, default 30 s) and
+    `-insert.indexFlushInterval` (trace detail, default 20 s, on the single
+    node or `vtinsert`) yourself if you need fresh traces there
+    (`docs/deployment.md`; #101).
   - Single-node VictoriaMetrics v1.154 and later answer the labels,
     label-values, and series APIs (used by query completion and AI schema
     collection) from the per-day index only. Long time ranges are slower (2–3
@@ -406,6 +422,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with Oxlint instead of ESLint and runs its unit tests on Vitest instead of
   `node --test`, and `mise run sdk-browser` now also runs the bundler plugin's
   tests (#97).
+- `mise run sdk-python` builds its virtual environment with uv (a
+  uv-managed CPython, no pip) and runs the Python SDK tests on the interpreter
+  named by `LO_SDK_PYTHON_VERSION` (default 3.13; for example `3.9` or
+  `3.15t`); CI runs it on 3.9, 3.13, 3.15, and 3.15t (#103).
 - Made release archives consume the canonical root `LICENSE` file.
 - Made PostgreSQL the correctness boundary for multi-replica alert membership,
   per-rule leases/fencing, durable state, and notification Outbox work; Redis
@@ -585,6 +605,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pin `unknown`, not outdated, when the release page cannot show that the
   latest release is old enough, and `--latest-eligible` still exits 2, so the
   storage-binary vulnerability check keeps blocking (#86).
+- `lazyobserve.Client.shutdown(timeout)` in the Python SDK no longer returns a
+  spurious `... has no attribute 'shutdown'` error for a signal that is not
+  enabled (or on a degraded client). Its steps (error transport, profiling,
+  then the log, trace, and metric providers) now share one `timeout` deadline
+  instead of each waiting on its own, so `shutdown` returns within `timeout`;
+  a step still running at the deadline is left to finish in the background
+  and reported as `TimeoutError("<step> shutdown: budget exhausted")`. During
+  interpreter finalization (for example from `__del__`) no thread can be
+  started, so the steps run inline and `timeout` does not bound them (#102).
+- The Python SDK's error-event delivery recovers in a forked child process:
+  when the SDK was initialized before the fork (gunicorn `--preload`, uWSGI),
+  `capture_exception` in a worker used to return normally while the event was
+  never sent, because the child inherited the queue without its sender
+  thread, and `shutdown` then timed out. Each child now restarts its own
+  sender; events the parent had queued stay with the parent and are not
+  resent. The `Client` drop-counter lock is replaced in the child as well,
+  so counting a profiling drop can no longer deadlock after a fork, and the
+  child's `dropped_telemetry` starts from 0 (#104, #105).
+- When the Python SDK's `shutdown` budget runs out (including `shutdown(0)`),
+  the error events and profile uploads still queued are dropped at once with
+  reason `shutdown_budget` and logged through the `lazyobserve` logger,
+  instead of staying queued uncounted and possibly going out after `shutdown`
+  returned; dropped profile uploads also count in
+  `Diagnostics().dropped_telemetry` (#105).
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
