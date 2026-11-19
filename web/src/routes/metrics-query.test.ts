@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 import { closeBrackets, insertBracket } from "@codemirror/autocomplete";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import dayjs, { dayjsLocale } from "../lib/dayjs.ts";

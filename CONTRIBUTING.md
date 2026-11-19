@@ -78,7 +78,7 @@ mise run sdk-python
 mise run web
 ```
 
-Go tests run without CGO. Browser and Node SDK package tests use Vitest; the Python SDK uses pytest. Web contract and route tests use Node's built-in `node --test` runner; the Web task then runs typecheck and the production build.
+Go tests run without CGO. Browser and Node SDK package tests use Vitest; the Python SDK uses pytest. Web contract and route tests use Vitest as well, and the Web task also runs Oxlint (`web/.oxlintrc.json`), typecheck and the production build. SDK packages are built with tsdown.
 
 ### Storage E2E
 

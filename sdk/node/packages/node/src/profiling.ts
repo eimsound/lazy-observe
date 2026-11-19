@@ -117,7 +117,7 @@ function encodedProfile(
 }
 
 /** Convert V8's leaf node samples and microsecond deltas to leaf-first pprof stacks. */
-export function cpuProfileToPprof(profile: V8CpuProfile, start = new Date()): Uint8Array {
+export function cpuProfileToPprof(profile: V8CpuProfile, start: Date = new Date()): Uint8Array {
   const tables = profileTables();
   const nodes = new Map(profile.nodes.map((node) => [node.id, node]));
   const parents = new Map<number, number>();
@@ -146,7 +146,7 @@ export function cpuProfileToPprof(profile: V8CpuProfile, start = new Date()): Ui
 }
 
 /** Convert sampled live heap bytes to pprof's inuse_space sample semantics. */
-export function heapProfileToPprof(profile: V8HeapProfile, start = new Date(), end = start): Uint8Array {
+export function heapProfileToPprof(profile: V8HeapProfile, start: Date = new Date(), end: Date = start): Uint8Array {
   const tables = profileTables();
   const nodes = new Map<number, V8HeapProfileNode>();
   const parents = new Map<number, number>();

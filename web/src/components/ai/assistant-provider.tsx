@@ -111,7 +111,7 @@ export function AssistantProvider({ children }: { children: ReactNode }) {
   );
 }
 
-// eslint-disable-next-line react-refresh/only-export-components
+// oxlint-disable-next-line react/only-export-components
 export function useAssistant(): AssistantContextValue {
   const ctx = useContext(AssistantContext);
   if (!ctx) throw new Error("useAssistant must be used within AssistantProvider");

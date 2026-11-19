@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 
 import { AUTH_QUERY_KEY, handleSessionExpiry } from "./session-expiry.ts";

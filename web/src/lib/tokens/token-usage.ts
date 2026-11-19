@@ -6,7 +6,7 @@
  * The strings below mirror `docs/deployment.md` (§Query API, MCP, and Grafana)
  * and the SDK DSN shape `<origin>/p/<slug>@<token>` (`docs/sdk/*.md`).
  *
- * Pure and Vite-free so it runs under `node --test`.
+ * Pure and Vite-free so it runs under Vitest in the node environment (`pnpm test`).
  */
 
 /** Project the gateway serves when a read carries no `X-LO-Project` header. */

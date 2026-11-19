@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 
 import type { IssueListResult, IssueSummary } from "../lib/api/issues.ts";
 import {

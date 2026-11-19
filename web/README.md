@@ -6,7 +6,8 @@ lazy-observe 一体化可观测性平台的生产前端。它采用侧栏 + 顶�
 
 | 领域 | 选择 | 理由 |
 |---|---|---|
-| 构建 | **Vite 6 + React 19 + TypeScript** | 快、生态成熟。 |
+| 构建 | **Vite 8（Rolldown）+ React 19 + TypeScript 7** | 快、生态成熟；类型检查用 `tsc`（TypeScript 7 原生编译器）。 |
+| 静态检查 / 单测 | **Oxlint** / **Vitest** | `pnpm lint`（`.oxlintrc.json`，规则集与迁移前的 ESLint 一一对应）；`pnpm test`（`vitest run`，断言用 `node:assert/strict`）。 |
 | 路由 | **纯 Vite SPA + TanStack Router**（代码式路由） | 见下方「为什么不用 TanStack Start」。 |
 | 数据请求 | **TanStack Query** | 查询缓存、加载/错误态、取消（AbortSignal）开箱即用。 |
 | UI 组件 | **shadcn/ui**（手写进仓库）+ Radix + Tailwind v4 | 组件即代码、可完全受主题变量驱动；除布局骨架外不引入第二套组件库。 |
@@ -38,7 +39,9 @@ VITE_MOCK=1 mise exec -- pnpm dev
 # 开发（对接真实后端，vite 代理 /api -> http://localhost:3100）
 mise exec -- pnpm dev
 
-# 类型检查 / 生产构建
+# 静态检查（Oxlint）/ 单测（Vitest）/ 类型检查 / 生产构建
+mise exec -- pnpm lint
+mise exec -- pnpm test
 mise exec -- pnpm typecheck
 mise exec -- pnpm build
 ```
@@ -192,7 +195,7 @@ Jaeger JSON 契约。检索页 `src/routes/traces-page.tsx`、详情页 `src/rou
 
 ## ★ 平台管理页
 
-- **项目（`routes/projects-page.tsx`，`/settings/projects`）**：项目列表 + 新建、重命名、删除（admin，内置自监控项目 `lazy-observe` 不可编辑/删除）；每项目「管理令牌」对话框——顶部标注「仅摄取（ingest only）」（ADR 0010：项目 Token 只上报遥测，查询/MCP/Grafana 用个人 Token），签发（token 值只在创建响应显示一次，含复制按钮与告警文案，并给出可复制的 DSN `<origin>/p/<slug>@<token>`）、吊销（`ConfirmDialog` 确认）。片段字符串由 `lib/tokens/token-usage.ts` 纯函数生成（`node --test` 覆盖）。
+- **项目（`routes/projects-page.tsx`，`/settings/projects`）**：项目列表 + 新建、重命名、删除（admin，内置自监控项目 `lazy-observe` 不可编辑/删除）；每项目「管理令牌」对话框——顶部标注「仅摄取（ingest only）」（ADR 0010：项目 Token 只上报遥测，查询/MCP/Grafana 用个人 Token），签发（token 值只在创建响应显示一次，含复制按钮与告警文案，并给出可复制的 DSN `<origin>/p/<slug>@<token>`）、吊销（`ConfirmDialog` 确认）。片段字符串由 `lib/tokens/token-usage.ts` 纯函数生成（Vitest 覆盖）。
 - **设置页个人 Token（`components/settings/user-api-tokens-card.tsx`，`/settings`）**：签发后除 token 值外，给出可复制的 MCP 命令 `lazy-observe mcp --dsn '<origin>/p/<slug>@<lou_token>'`（slug 取当前项目，缺省 `default`）与 Grafana Prometheus 数据源要点（网关根 URL + `Authorization: Bearer …`、`X-LO-Project: <slug>` 两个自定义请求头），口径以 `docs/deployment.md` 为准。
 - **用户（`routes/users-page.tsx`，`/settings/users`，仅 admin）**：列表、新建（用户名/密码/角色）、行内改角色、删除；对「自己的账户」禁用改角色/删除。非 admin 直达时渲染「无访问权限」空态（侧栏该项也隐藏）。
 
