@@ -100,6 +100,7 @@ type Client struct {
 	profileURL       string
 	profileToken     string
 	profileDelivery  *deliveryQueue[collectedProfile]
+	cpuProfiler      *cpuProfiler // nil means systemCPUProfiler; tests inject fakes
 	errorTransport   *errorTransport
 	droppedTelemetry atomic.Uint64
 	droppedCounter   metric.Int64Counter

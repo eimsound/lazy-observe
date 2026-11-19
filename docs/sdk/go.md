@@ -139,6 +139,6 @@ lo := lazyobserve.Init(lazyobserve.Config{
 })
 ```
 
-Each cycle records a 10-second CPU window followed by heap and goroutine snapshots, then uploads the three gzip pprof payloads to `/api/profiles`. Failed uploads back off up to 15 minutes and do not fail application requests.
+Each cycle records a 10-second CPU window followed by heap and goroutine snapshots, then uploads the three gzip pprof payloads to `/api/profiles`. Failed uploads back off up to 15 minutes and do not fail application requests. If `Shutdown` interrupts a CPU window, the window is uploaded only if it already ran at least 5 seconds; a shorter one is discarded (this is not counted as dropped telemetry). Heap and goroutine snapshots are instantaneous and are still collected; everything queued is uploaded within the `Shutdown` context deadline.
 
 See the runnable [Fiber example](../../sdk/go/examples/fiber/) for a nested order trace, database child spans, correlated logs, controlled fast/slow/error routes, and a concurrent load generator that populates the Performance page.

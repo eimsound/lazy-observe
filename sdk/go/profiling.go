@@ -18,7 +18,30 @@ const (
 	profilingCPUWindow   = 10 * time.Second
 	profilingQueueSize   = 6
 	profilingSendTimeout = 15 * time.Second
+	// profilingMinCancelledWindow is the shortest CPU window that is still
+	// uploaded when shutdown cancels it early (the owner's decision 14, shared
+	// with the Python SDK; see .agents/docs/plans/python-profiling.md). A window
+	// that ran for less is discarded: it is not a delivery failure, so it is not
+	// counted as dropped telemetry.
+	profilingMinCancelledWindow = 5 * time.Second
 )
+
+// cpuProfiler is the clock and CPU profiler a collection cycle runs against.
+// Production uses systemCPUProfiler; tests inject fakes so the 5 s boundary
+// does not need a real 5 s window.
+type cpuProfiler struct {
+	now       func() time.Time
+	start     func(io.Writer) error
+	stop      func()
+	minWindow time.Duration
+}
+
+var systemCPUProfiler = &cpuProfiler{
+	now:       time.Now,
+	start:     pprof.StartCPUProfile,
+	stop:      pprof.StopCPUProfile,
+	minWindow: profilingMinCancelledWindow,
+}
 
 type collectedProfile struct {
 	uploadID string
@@ -32,7 +55,7 @@ func (c *Client) profilingLoop(ctx context.Context) {
 	defer close(c.profileDone)
 	for {
 		cycleStart := time.Now()
-		profiles := collectProfiles(ctx, profilingCPUWindow)
+		profiles := collectProfiles(ctx, profilingCPUWindow, c.cpuProfilerOrDefault())
 		for _, collected := range profiles {
 			c.profileDelivery.enqueue(collected)
 		}
@@ -85,32 +108,22 @@ func newProfileDelivery(c *Client) *deliveryQueue[collectedProfile] {
 	})
 }
 
-func collectProfiles(ctx context.Context, cpuWindow time.Duration) []collectedProfile {
-	result := make([]collectedProfile, 0, 3)
-	var cpu bytes.Buffer
-	start := time.Now().UTC()
-	if err := pprof.StartCPUProfile(&cpu); err == nil {
-		timer := time.NewTimer(cpuWindow)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
-		}
-		pprof.StopCPUProfile()
-		end := time.Now().UTC()
-		if data, err := ensureGzip(cpu.Bytes()); err == nil && len(data) > 0 {
-			result = append(result, collectedProfile{
-				uploadID: newEventID(),
-				typeName: "cpu",
-				start:    start,
-				end:      end,
-				data:     data,
-			})
-		}
+func (c *Client) cpuProfilerOrDefault() *cpuProfiler {
+	if c.cpuProfiler != nil {
+		return c.cpuProfiler
 	}
+	return systemCPUProfiler
+}
 
+// collectProfiles records one CPU window and then heap and goroutine
+// snapshots. When ctx is cancelled before the window completes, the CPU
+// window is kept only if it ran for at least p.minWindow; the snapshots are
+// instantaneous and are always collected.
+func collectProfiles(ctx context.Context, cpuWindow time.Duration, p *cpuProfiler) []collectedProfile {
+	result := make([]collectedProfile, 0, 3)
+	if cpu, ok := collectCPUWindow(ctx, cpuWindow, p); ok {
+		result = append(result, cpu)
+	}
 	if heap, ok := collectSnapshotProfile("heap", "heap"); ok {
 		result = append(result, heap)
 	}
@@ -118,6 +131,36 @@ func collectProfiles(ctx context.Context, cpuWindow time.Duration) []collectedPr
 		result = append(result, goroutine)
 	}
 	return result
+}
+
+func collectCPUWindow(ctx context.Context, cpuWindow time.Duration, p *cpuProfiler) (collectedProfile, bool) {
+	var cpu bytes.Buffer
+	start := p.now().UTC()
+	if err := p.start(&cpu); err != nil {
+		return collectedProfile{}, false
+	}
+	cancelled := false
+	timer := time.NewTimer(cpuWindow)
+	select {
+	case <-ctx.Done():
+		cancelled = true
+		if !timer.Stop() {
+			<-timer.C
+		}
+	case <-timer.C:
+	}
+	p.stop()
+	end := p.now().UTC()
+	if cancelled && end.Sub(start) < p.minWindow {
+		// Shutdown cut the window short. Discarding it is not a delivery
+		// failure, so it is neither queued nor counted as dropped telemetry.
+		return collectedProfile{}, false
+	}
+	data, err := ensureGzip(cpu.Bytes())
+	if err != nil || len(data) == 0 {
+		return collectedProfile{}, false
+	}
+	return collectedProfile{uploadID: newEventID(), typeName: "cpu", start: start, end: end, data: data}, true
 }
 
 func collectSnapshotProfile(profileName, typeName string) (collectedProfile, bool) {
