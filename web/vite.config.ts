@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath, URL } from "node:url";
@@ -58,6 +58,11 @@ export default defineConfig({
         },
       },
     },
+  },
+  // 单测：与迁移前的 `node --test` 用同一批 *.test.ts，断言仍是 node:assert/strict。
+  test: {
+    include: ["src/**/*.test.ts"],
+    environment: "node",
   },
   server: {
     host: "0.0.0.0",

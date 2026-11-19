@@ -31,9 +31,9 @@ const ANSI_BASE_COLORS = [
 ];
 
 // ANSI escape sequences are control characters by definition.
-// eslint-disable-next-line no-control-regex
+// oxlint-disable-next-line no-control-regex
 const ANSI_OSC_PATTERN = /\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g;
-// eslint-disable-next-line no-control-regex
+// oxlint-disable-next-line no-control-regex
 const ANSI_CSI_PATTERN = /(?:\u001B\[|\u009B)([0-?]*)([ -/]*)([@-~])/g;
 
 function defaultAnsiStyle(): AnsiStyleState {
