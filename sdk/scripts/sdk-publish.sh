@@ -98,12 +98,15 @@ case $sdk in
     py_versions=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' sdk/python/pyproject.toml)
     py_version=${py_versions%%$'\n'*}
     expect_version sdk/python/pyproject.toml "$py_version"
-    python=${PYTHON:-python3}
+    # 只用 uv（CI 里由 `mise run sdk-python-release` 提供），不用系统 Python 与 pip；
+    # sdk/python/pyproject.toml 的 [tool.uv] exclude-newer 同样约束构建后端的解析。
+    # --managed-python：新 runner 上没有 uv 托管的解释器时，裸 `uv build` 会退到系统 /usr/bin/python3；
+    # 固定 3.13 与 sdk-python 的默认解释器、改用 uv 前 setup-python 的版本一致。
+    command -v uv >/dev/null 2>&1 || fail "uv is required to build the Python SDK (run via 'mise run sdk-python-release')"
     (
       cd sdk/python
-      "$python" -m pip install --quiet build
       rm -rf dist
-      "$python" -m build
+      uv build --managed-python --python 3.13
     )
     printf 'built: %s\n' "$(ls sdk/python/dist)"
     if [[ $publish == 1 ]]; then
