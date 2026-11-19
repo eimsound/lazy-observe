@@ -258,6 +258,7 @@ func componentDefinitions(cfg Config, dataDir string) []component {
 				dataDir: filepath.Join(dataDir, "traces"), storage: true,
 				args: []string{
 					"-retentionPeriod=" + retentionArg(cfg.TracesRetention),
+					"-search.latencyOffset=0s",
 					"-inmemoryDataFlushInterval=1s",
 					"-insert.indexFlushInterval=1s",
 				},

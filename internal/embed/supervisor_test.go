@@ -248,6 +248,13 @@ func TestManagedStorageUsesBoundedUncleanShutdownFlushWindow(t *testing.T) {
 	if !slices.Contains(byName["traces"], "-insert.indexFlushInterval=1s") {
 		t.Fatalf("traces args do not persist the query index promptly: %v", byName["traces"])
 	}
+	// VictoriaTraces v0.12+ also applies its 30s default latency offset to the LogsQL APIs (LLM stats); managed
+	// storage keeps queries near real time, the same as metrics.
+	for _, name := range []string{"metrics", "traces"} {
+		if !slices.Contains(byName[name], "-search.latencyOffset=0s") {
+			t.Fatalf("%s args do not disable the query latency offset: %v", name, byName[name])
+		}
+	}
 }
 
 func startTestSupervisor(

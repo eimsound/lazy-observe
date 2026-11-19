@@ -9,16 +9,16 @@ platform="$goos-$goarch"
 
 case "$platform" in
   linux-amd64)
-    metrics_sha=7d16e5099be040e10019cfe0c03c50043bad4e896b371129cb41be80efd687cc
-    vmutils_sha=1e5da38c3d8d7af9c4fc0daa8a2103f2578c40ed81752d21f20a3bd6d0506b3f
-    logs_sha=d14f585144b8d6813f15e11f0041f487e15e10e5f5e5a31be0311367e93d3494
-    traces_sha=a082f58abfdb1d5ca57d936313eb2980ee0d775f654acfbc8daf3888879b47fa
+    metrics_sha=54409ea381db0316f0bf6f242c718bc498085eb1eb37520b73526e6d86891601
+    vmutils_sha=d71f7f00e07782531000620ec6c2a9d7ec83324f364dd1f36095ab378b5fb43b
+    logs_sha=55feba89713cafa952673f91b8b38e7701bb0290989263da671b47a0de16edd3
+    traces_sha=789e006d076f3c8b99de7bb1d0277024a7db776db0294d1c27fcc5422d98c4bc
     ;;
   linux-arm64)
-    metrics_sha=3ef55ae5fb54882246ac936d3229c21a82078aa5964d68c12e0d27bab17ab6cd
-    vmutils_sha=0348ec940845fe35197310dd49df0620fca840d43e67d75616ba55eebd7e6edb
-    logs_sha=91338c3e5e3d743a862c0a8665bf80862f639dbd4de6f6ff19ada7df5e9acf45
-    traces_sha=7a08df830ffc040593c6018a8434117fd7ca9292171c6766ff66defa205b86fa
+    metrics_sha=f777110b232bfdf435556c57d0896716e27000afafe969c4eb08852352dceb7d
+    vmutils_sha=1a8e4ed55df2a59d5cd03056213f50d293d4fab029e38dd960597362d92cf176
+    logs_sha=301b7ef12ff9fac7f70b155191affe07ac6212755514174461d775548699ef96
+    traces_sha=210bc863666865ba9a4ff0a19901318042da0c474d248fec69ca71c07b1e5f7a
     ;;
   *)
     printf 'unsupported storage binary platform: %s (supported: linux x amd64/arm64)\n' "$platform" >&2
@@ -26,9 +26,9 @@ case "$platform" in
     ;;
 esac
 
-metrics_version=v1.147.0
-logs_version=v1.52.0
-traces_version=v0.9.4
+metrics_version=v1.156.0
+logs_version=v1.53.0
+traces_version=v0.13.0
 metrics_asset="victoria-metrics-$platform-$metrics_version.tar.gz"
 vmutils_asset="vmutils-$platform-$metrics_version.tar.gz"
 logs_asset="victoria-logs-$platform-$logs_version.tar.gz"
