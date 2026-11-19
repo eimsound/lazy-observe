@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createUnplugin } from "unplugin";
+import type { UnpluginInstance } from "unplugin";
 
 export interface LazyObservePluginOptions {
   dsn: string;
@@ -98,6 +99,8 @@ const unplugin = createUnplugin<LazyObservePluginOptions>((options) => {
   };
 });
 
-export const vite = unplugin.vite;
-export const webpack = unplugin.webpack;
+// d.ts 由 isolatedDeclarations（oxc）生成，导出必须有显式类型；同时避免 tsgo 把推断类型展开成 unplugin 内部类型。
+type PluginInstance = UnpluginInstance<LazyObservePluginOptions>;
+export const vite: PluginInstance["vite"] = unplugin.vite;
+export const webpack: PluginInstance["webpack"] = unplugin.webpack;
 export default vite;

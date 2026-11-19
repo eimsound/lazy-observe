@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 
 import { v8AutoSortKind, v8SortDescFirst } from "./v8-sort-parity.ts";
 

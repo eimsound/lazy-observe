@@ -2,7 +2,7 @@ import type { QueryClient } from "@tanstack/react-query";
 
 /**
  * Project scope for data reads (`X-LO-Project`). Kept free of Vite/React so it
- * runs under `node --test`.
+ * runs under Vitest in the node environment (`pnpm test`).
  */
 
 export const PROJECT_STORAGE_KEY = "lo-project";

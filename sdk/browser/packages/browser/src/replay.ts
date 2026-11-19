@@ -137,7 +137,7 @@ export function buildReplayHTTPMarker(
   input: RequestInfo | URL,
   status: number,
   durationMs: number,
-  timestamp = Date.now(),
+  timestamp: number = Date.now(),
 ): ReplayHTTPMarkerPayload {
   return {
     timestamp: Math.max(0, Math.trunc(timestamp)),
@@ -238,7 +238,7 @@ export class ReplayController {
     if (!this.sampled && this.config.onErrorFullCapture) this.scheduleUpload(true, false);
   }
 
-  http(method: string, input: RequestInfo | URL, status: number, durationMs: number, timestamp = Date.now()): void {
+  http(method: string, input: RequestInfo | URL, status: number, durationMs: number, timestamp: number = Date.now()): void {
     this.custom(REPLAY_CUSTOM_EVENT_TAGS.http, buildReplayHTTPMarker(method, input, status, durationMs, timestamp));
   }
 
