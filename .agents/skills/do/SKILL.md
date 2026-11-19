@@ -130,21 +130,31 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | 改动路径 | 跑哪些 job |
 | --- | --- |
 | `*.md`、`docs/**`、`LICENSE`、`.agents/**`、`.claude/**` | 不跑业务 job，`ci-ok` 直接绿 |
-| `sdk/node/**`、`sdk/browser/**`、`sdk/python/**` | 对应语言的 SDK job |
-| `sdk/go/**` | Go SDK job + 服务端 Go 检查、构建、e2e、HA E2E |
-| `web/**` | web |
+| `sdk/node/**`、`sdk/browser/**`、`sdk/python/**` | 对应语言的 SDK job + sdk-journeys（范围见表后说明：node → node、browser，python → python，browser → browser） |
+| `sdk/go/**` | Go SDK job + 服务端 Go 检查、构建、e2e、HA E2E + sdk-journeys（go、browser） |
+| `web/**` | web + 构建 + sdk-journeys（只跑 browser） |
+| `cmd/**`（`cmd/perf-gate/**` 除外）、`internal/**`、`go.mod`/`go.sum`、`scripts/download-storage-bins.sh`、`scripts/prepare-web-assets.sh`、`scripts/sdk-journeys.sh` | 另加 sdk-journeys 全跑（四个 journey） |
+| `cmd/perf-gate/**` | 同 `cmd/**` 的 Go 检查、构建、e2e、HA E2E，但不跑 sdk-journeys（它不进平台二进制） |
 | `internal/db/**`、`internal/meta/**` | 另加 PG 元数据测试 |
 | `cmd/**`、`internal/**` | Go 检查、构建、e2e、e2e-restart、HA E2E |
 | `go.mod`/`go.sum` | 同上 + meta-pg |
 | `scripts/e2e-multi-replica.sh` 及其辅助程序、`bench/performance-gates.json`、`scripts/download-storage-bins.sh` | HA E2E（另加各自原有的 job） |
 | 打包链路 | 零配置产物冒烟 + 原生 arm64 构建与冒烟 |
 | `.github/dependabot.yml`、`.trivyignore.yaml` | 只跑 Go 检查（workflow-check 校验它们） |
-| `.github/**`、`mise.toml`、`scripts/ci-*`、`Dockerfile*` | 全量 |
+| `scripts/download-storage-bins.sh`、`scripts/mise-release.env`、`scripts/check-image-vulns.sh`、`scripts/install-trivy.sh`、`scripts/e2e-multi-replica.sh`、`scripts/check-pinned-releases.sh`、`scripts/release-age.env` | 叠加 `pins`：`pinned-releases` job（手工固定点的最小发布年龄门禁，要联网查 GitHub API；叠加在上面原有的分组上） |
+| `.github/**`、`mise.toml`、`scripts/ci-*`、`scripts/mise-release.env`、`Dockerfile*` | 全量 |
+
+`sdk-journeys` job（`mise run sdk-journeys`，PR CI 里最长的一条，冷缓存约 9.5 分钟）：起一个真实平台，再依次跑
+`sdk/{go,node,python,browser}/e2e.sh`。范围由 `ci-changes.sh` 的 `sdk_journeys_only` 输出决定，经 `LO_SDK_JOURNEYS_ONLY` 传入：
+空 = 四个都跑；否则只跑列出的语言，混合改动取并集，其它任何会触发 sdk-journeys 的路径（服务端、Go 依赖、journey/storage/web 资产脚本、`sdk/` 根共享文件、CI、未分类）都回到全跑。
+窄范围只有：`sdk/go/**` → go、browser，`sdk/node/**` → node、browser（browser journey 会运行这两个 SDK 的示例），
+`sdk/python/**` → python，`sdk/browser/**` 与 `web/**` → browser。本地同样用 `LO_SDK_JOURNEYS_ONLY=go,browser mise run --skip-deps sdk-journeys`。
+改了 `scripts/sdk-journeys.sh` 的进程清理时，另跑 `bash scripts/sdk-journeys-interrupt-test.sh`（本地手动，约 2 分钟，不进 CI）。
 
 | 触发 | workflow | 跑什么 |
 | --- | --- | --- |
 | PR、push 到 `main`、`integration/**` | `ci.yml` | 上表按改动面挑出的 job，由 `ci-ok` 汇总 |
-| `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、镜像漏洞扫描（Trivy，有修复的 CRITICAL/HIGH 即失败）、性能门禁，全过才出包 |
+| `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、镜像漏洞扫描（Trivy，有修复的 CRITICAL/HIGH 即失败）、`storage-bin-scan`（对下载并校验过 sha256 的嵌入 Victoria 上游二进制做 Trivy 扫描，规则与镜像扫描一致；pin 已是上游满 7 天的最新稳定版而命中的未修复漏洞只警告）、性能门禁，全过才出包 |
 | 手动 | `bench.yml` | 依次跑 `bench`（30 秒摄入基准 + 基线门禁）、`perf-release`（双架构产物门禁 + 零配置 release smoke）、`perf-ha`（`e2e-ha` 全部 HA 断言 + 查询 P95 与弱扩展门禁）、`perf-results-check` |
 
 切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。分组规则由 `mise run ci-changes-test` 钉住，改分组时同步改测试。

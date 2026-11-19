@@ -14,17 +14,26 @@ set -euo pipefail
 #
 # 可选环境变量：
 #   BINARY / STORAGE_BIN_DIR          平台二进制与 storage 二进制目录，默认 bin/lazy-observe、.cache/storage-bin
-#   LO_SDK_JOURNEYS_ONLY              逗号分隔的子集，例如 go,browser；默认 go,node,python,browser（按此顺序）
+#   LO_SDK_JOURNEYS_ONLY              逗号或空格分隔的子集，例如 go,browser 或 "go browser"（CI 传的是 ci-changes 的
+#                                     sdk_journeys_only，空格分隔）；空 = 默认 go,node,python,browser（按此顺序）
 #   LO_SDK_JOURNEYS_READY_TIMEOUT     等 /readyz 的秒数，默认 120
 #   LO_E2E_KEEP=1                     保留临时目录（journey 自己的临时目录也由它控制）
 # 顺序不能换成并行：python 与 browser 的示例默认都从 43520 起，串行才不冲突。
+#
+# 中断清理：平台和每个 journey 各占一个独立进程组（`set -m` 下起的后台任务，组 ID 即其 PID）。
+# 收到 TERM/INT/HUP 或正常退出时，cleanup 对整个组先 TERM，到期（平台 45s、journey 15s）再 KILL。
+# 不能只对 journey 的 sh 发信号：dash 等前台命令（例如 `sleep 70`）结束才跑 trap，示例进程会被孤立；
+# 非交互 bash 里 `&` 起的子进程还会忽略 SIGINT。journey 的临时目录（TMPDIR）放在 $work/journeys 下，
+# 即使 journey 被 KILL 来不及自己清理，也会随 $work 一起删掉。
+# 可重复验证见 scripts/sdk-journeys-interrupt-test.sh。
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$root"
 
 all_journeys=(go node python browser)
 ready_timeout=${LO_SDK_JOURNEYS_READY_TIMEOUT:-120}
-shutdown_timeout=45
+shutdown_timeout=45 # 平台：等它自己优雅停掉受管的 Victoria 组件
+journey_stop_timeout=15 # journey：只有示例进程和临时目录要收拾
 
 fail() {
   printf 'sdk-journeys: %s\n' "$*" >&2
@@ -37,21 +46,21 @@ esac
 
 journeys=()
 if [[ -n ${LO_SDK_JOURNEYS_ONLY:-} ]]; then
-  IFS=',' read -r -a requested <<<"$LO_SDK_JOURNEYS_ONLY"
+  IFS=', ' read -r -a requested <<<"$LO_SDK_JOURNEYS_ONLY"
   for name in "${requested[@]}"; do
     [[ " ${all_journeys[*]} " == *" $name "* ]] ||
       fail "unknown journey '$name' in LO_SDK_JOURNEYS_ONLY (known: ${all_journeys[*]})"
   done
   # 按固定顺序跑，与请求里的顺序无关。
   for name in "${all_journeys[@]}"; do
-    [[ ",$LO_SDK_JOURNEYS_ONLY," == *",$name,"* ]] && journeys+=("$name")
+    [[ " ${requested[*]} " == *" $name "* ]] && journeys+=("$name")
   done
 else
   journeys=("${all_journeys[@]}")
 fi
 ((${#journeys[@]} > 0)) || fail "no journey selected"
 
-for command in curl jq go node pnpm rg od tr sed pgrep; do
+for command in curl jq go node pnpm rg od tr sed pgrep ps awk; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
 done
 
@@ -73,7 +82,7 @@ if [[ " ${journeys[*]} " == *" python "* ]]; then
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/lazy-observe-sdk-journeys.XXXXXX")
-mkdir "$work/cwd" "$work/home"
+mkdir "$work/cwd" "$work/home" "$work/journeys"
 log=$work/server.log
 server_pid=
 journey_pid=
@@ -89,26 +98,42 @@ dump_log() {
   fi
 }
 
-stop_pid() {
-  local pid=$1 deadline
-  [[ -n $pid ]] || return 0
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
-    deadline=$((SECONDS + shutdown_timeout))
-    while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do
+# 进程组里是否还有活着的成员。已退出但还没被 wait 的僵尸（Z）不算：组长是本脚本的子进程，
+# 没 wait 之前它一直是僵尸，`kill -0 -- -PGID` 会因此一直成功。
+group_alive() {
+  local alive
+  alive=$(ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { print "alive" }' || true)
+  [[ -n $alive ]]
+}
+
+# stop_group PGID TIMEOUT NAME：先对整个进程组 TERM，到期还在就 KILL 整个组，最后回收组长。
+# PGID 就是 `set -m` 下起的后台任务的 PID；组里还有成员时这个 ID 不会被复用。
+stop_group() {
+  local pgid=$1 timeout=$2 name=$3 deadline
+  [[ -n $pgid ]] || return 0
+  if group_alive "$pgid"; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    deadline=$((SECONDS + timeout))
+    while group_alive "$pgid" && ((SECONDS < deadline)); do
       sleep 0.2
     done
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    if group_alive "$pgid"; then
+      printf 'sdk-journeys: %s did not exit within %ss of SIGTERM, sending SIGKILL to its process group\n' \
+        "$name" "$timeout" >&2
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
   fi
-  wait "$pid" 2>/dev/null || true
+  wait "$pgid" 2>/dev/null || true
 }
 
 cleanup() {
   local rc=$? leftovers
-  trap - EXIT HUP INT TERM
-  # 先停正在跑的 journey（它自己的 trap 会清理示例进程），再停平台。
-  stop_pid "$journey_pid"
-  stop_pid "$server_pid"
+  # 清理期间再来的信号不能打断清理（子进程会继承忽略，但它们此刻只是 sleep/ps/kill）。
+  trap '' HUP INT TERM
+  trap - EXIT
+  # 先停正在跑的 journey 的整个进程组（示例、构建、浏览器），再停平台的整个进程组。
+  stop_group "$journey_pid" "$journey_stop_timeout" "journey"
+  stop_group "$server_pid" "$shutdown_timeout" "platform"
   # 最后兜底：平台的受管子进程（VictoriaMetrics 等）的命令行都带着本次的临时 data_dir，
   # 按这个唯一路径匹配，不会误伤宿主机上别的 Victoria 进程。
   leftovers=$(pgrep -f -- "$work/data" || true)
@@ -141,10 +166,14 @@ port_busy() {
 }
 
 # 网关端口与四个受管组件端口（默认 18428/19428/20428/22428，再加偏移）都要空闲。
+# 网关端口取 14000–14999：低于 Linux 临时端口范围（32768–60999），不会和本机出站连接抢；
+# 低于组件端口的下限（18428+1000），所以不会与同一次运行的组件撞车；仓库其它脚本的固定端口
+# （HA 的 23101/23102、29090–29492、30428–30492，release smoke 的 42880，SDK journey 的 43320–43550，
+# 以及组件默认端口 18428–22428）都不在这个区间里。
 gateway_port=
 port_offset=
 for _ in $(seq 50); do
-  candidate_gateway=$((44000 + RANDOM % 1000))
+  candidate_gateway=$((14000 + RANDOM % 1000))
   candidate_offset=$((1000 + RANDOM % 9000))
   busy=0
   for port in "$candidate_gateway" $((18428 + candidate_offset)) $((19428 + candidate_offset)) \
@@ -168,6 +197,8 @@ admin_password=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
 (umask 077 && printf '%s\n' "$admin_password" >"$work/admin-password")
 
 printf 'starting lazy-observe at %s (component port offset %s)...\n' "$platform_url" "$port_offset"
+# 平台独占一个进程组（set -m 只包住这一次 fork，组 ID = server_pid），cleanup 按组停掉它和受管的 Victoria 组件。
+set -m
 (
   cd "$work/cwd"
   # 空 cwd + 白名单环境：宿主机上的 LO_* 配置、云凭据都不会流进平台。
@@ -176,8 +207,9 @@ printf 'starting lazy-observe at %s (component port offset %s)...\n' "$platform_
     LO_SELF_MONITORING_ENABLED=false \
     "$binary" server --listen "127.0.0.1:$gateway_port" --data-dir "$work/data" \
     --storage-bin-dir "$storage" --component-port-offset "$port_offset"
-) >"$log" 2>&1 &
+) >"$log" 2>&1 </dev/null &
 server_pid=$!
+set +m
 
 ready=0
 deadline=$((SECONDS + ready_timeout))
@@ -219,11 +251,20 @@ failed=()
 for name in "${journeys[@]}"; do
   printf '\n=== SDK journey: %s ===\n' "$name"
   started=$SECONDS
-  # 放到后台再 wait：收到 TERM/INT 时 trap 能立刻跑，并转发给 journey 脚本。
-  sh "$root/sdk/$name/e2e.sh" &
+  # 放到后台再 wait：收到 TERM/INT 时 trap 能立刻跑。`set -m` 让它独占一个进程组（组 ID = journey_pid），
+  # cleanup 对整个组发信号，示例、构建和浏览器都跟着停；TMPDIR 指到 $work/journeys，journey 被 KILL 时
+  # 它自己的临时目录也会随 $work 删掉。stdin 接 /dev/null，后台组读终端会被 SIGTTIN 停住。
+  set -m
+  TMPDIR=$work/journeys sh "$root/sdk/$name/e2e.sh" </dev/null &
   journey_pid=$!
+  set +m
   status=0
   wait "$journey_pid" || status=$?
+  # journey 正常退出后，组里若还留着示例进程，也一并收掉（并留一条警告，说明 journey 自己没清干净）。
+  if group_alive "$journey_pid"; then
+    printf 'sdk-journeys: journey %s left processes behind, stopping its process group\n' "$name" >&2
+    stop_group "$journey_pid" "$journey_stop_timeout" "journey $name leftovers"
+  fi
   journey_pid=
   elapsed=$((SECONDS - started))
   if ((status == 0)); then

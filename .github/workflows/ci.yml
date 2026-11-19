@@ -47,6 +47,7 @@ jobs:
       sdk_browser: ${{ steps.detect.outputs.sdk_browser }}
       sdk_python: ${{ steps.detect.outputs.sdk_python }}
       sdk_journeys: ${{ steps.detect.outputs.sdk_journeys }}
+      sdk_journeys_only: ${{ steps.detect.outputs.sdk_journeys_only }}
       pins: ${{ steps.detect.outputs.pins }}
       build_matrix: ${{ steps.detect.outputs.build_matrix }}
     steps:
@@ -555,7 +556,10 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('sdk/browser/pnpm-lock.yaml') }}
           restore-keys: playwright-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-
+      # sdk_journeys_only 为空 = 四个 journey 都跑；否则是空格分隔的语言列表（只改 web/ 或单个 SDK 时收窄）。
       - run: mise run sdk-journeys
+        env:
+          LO_SDK_JOURNEYS_ONLY: ${{ needs.changes.outputs.sdk_journeys_only }}
 
   # 手工固定点（Victoria、mise、Trivy 等 GitHub release 版本）的最小发布年龄门禁：Dependabot 看不到这些固定点，
   # 它们的 cooldown 要靠这里兜底。只在固定点文件变化时跑（scripts/ci-changes.sh 的 pins 标志）。

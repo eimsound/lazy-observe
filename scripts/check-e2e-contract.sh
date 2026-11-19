@@ -123,10 +123,32 @@ journeys_job=$(awk '$0 == "  sdk-journeys:" { on = 1; next } on && /^  [A-Za-z0-
   fail 'ci.yml sdk-journeys must gate on the sdk_journeys change flag'
 [[ $journeys_job == *'MISE_CI_PROFILE: sdk-journeys'* ]] || fail 'ci.yml sdk-journeys must install the sdk-journeys mise profile'
 [[ $journeys_job == *'- run: mise run sdk-journeys'* ]] || fail 'ci.yml sdk-journeys must run mise run sdk-journeys'
+[[ $journeys_job == *'LO_SDK_JOURNEYS_ONLY: ${{ needs.changes.outputs.sdk_journeys_only }}'* ]] ||
+  fail 'ci.yml sdk-journeys must pass the changes job sdk_journeys_only output as LO_SDK_JOURNEYS_ONLY'
+rg -Fq 'sdk_journeys_only: ${{ steps.detect.outputs.sdk_journeys_only }}' "$ci" ||
+  fail 'ci.yml changes job must export the sdk_journeys_only output'
+# 每个 journey 必须落在独立的进程组里（set -m），cleanup 按组发信号；退回按 PID 停会重新漏进程（见 sdk-journeys-interrupt-test.sh）。
+rg -Fq 'kill -TERM -- "-$pgid"' "$journeys_script" && rg -Fq 'kill -KILL -- "-$pgid"' "$journeys_script" ||
+  fail 'sdk-journeys.sh cleanup must TERM and then KILL the whole process group of the platform and each journey'
+[[ -x scripts/sdk-journeys-interrupt-test.sh ]] || fail 'scripts/sdk-journeys-interrupt-test.sh is missing or not executable'
 for path in sdk/go/e2e.sh sdk/node/e2e.sh sdk/python/e2e.sh sdk/browser/e2e/performance-journey.spec.ts \
   cmd/lazy-observe/main.go internal/gateway/router.go web/src/App.tsx go.mod scripts/sdk-journeys.sh; do
   flags_out=$(printf '%s\n' "$path" | bash "$changes_script" --stdin 2>/dev/null)
   [[ $'\n'$flags_out$'\n' == *$'\n'sdk_journeys=true$'\n'* ]] || fail "SDK journeys do not trigger on $path"
+done
+
+# 默认项目的 token 只在首次创建时通过 slog 打一次日志，几个脚本从日志里解析它。这里锁住日志的 msg 与 key：
+# internal/meta/store.go 的这条日志一改，下面的消费方就读不到 token（失败原因会很难看），所以改格式必须同步改它们，
+# 并在这里先失败。slog 文本格式输出 `msg="created default project" ... project_api_token=lo_…`。
+token_log_msg='created default project'
+token_log_key='project_api_token'
+rg -Fq "logger.Info(\"$token_log_msg\"," internal/meta/store.go ||
+  fail "internal/meta/store.go no longer logs the default project token with msg \"$token_log_msg\""
+rg -q "logger\\.Info\\(\"$token_log_msg\",.*\"$token_log_key\", token\\)" internal/meta/store.go ||
+  fail "the \"$token_log_msg\" log in internal/meta/store.go must carry the token under key $token_log_key"
+for consumer in scripts/sdk-journeys.sh scripts/e2e-multi-replica.sh scripts/check-release-smoke.sh; do
+  rg -Fq "$token_log_msg" "$consumer" && rg -Fq "$token_log_key=" "$consumer" ||
+    fail "$consumer no longer parses the default project token from the \"$token_log_msg\" log ($token_log_key=)"
 done
 
 # 性能门禁不跟 PR 跑：必须挡在发版链路上（archive 之前），bench.yml 只留手动入口。
