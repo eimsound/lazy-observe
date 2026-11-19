@@ -8,7 +8,7 @@ v1.0 需求基线 5.2 把 Standalone 的兼容范围定为「VM 系 + Grafana �
 - **Loki/LogQL、Tempo/TraceQL 适配器出范围**：不是「尚未实现的后续工作」，而是按设计不支持。不在路线图中排期。
 - **通用 Prometheus 兼容查询端点不再是官方支持范围**：`storage.metrics.kind: prometheus`（Prometheus 本体、Mimir、Thanos 等）的代码和现有测试保留，但文档不再推荐，示例与发布验证只覆盖 VictoriaMetrics，出问题不保证修。Prometheus remote-write 1.0 摄入与 PromQL/MetricsQL 查询兼容属于协议层生态兼容，不受本决策影响。
 
-需求基线 v1.0 不可编辑，本 ADR 记录对 5.2、第 2 节 Standalone 一行以及第 9 节决策记录第 4 条的偏离。
+本 ADR 记录对需求基线 v1.0 的 5.2、第 2 节 Standalone 一行以及第 9 节决策记录第 4 条的偏离。
 
 ## 备选方案
 

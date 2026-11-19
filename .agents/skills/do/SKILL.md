@@ -50,7 +50,7 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 ### feature
 
-1. 读 `.agents/docs/requirements.md` 对应小节、相关 ADR、`.agents/docs/GLOSSARY.md` 术语。不要改 `requirements.md`。
+1. 读 `.agents/docs/requirements.md` 对应小节、相关 ADR、`.agents/docs/GLOSSARY.md` 术语。
 2. `/skill:spec-to-plan` 产出计划，落到 `.agents/docs/plans/<topic>.md`；计划里必须有仓库证据、两条备选路线、Tracer Bullet 切片、每切片的 red/green 命令。
 3. `/skill:implement`：每个切片先写失败测试，再最小实现，跑门禁，在计划里勾选并贴证据（命令 + 结论）。
 4. 收尾：`/skill:code-review`（Standards 对照 `AGENTS.md`，Spec 对照计划）→ 更新 `CHANGELOG.md` → `/skill:retro`。

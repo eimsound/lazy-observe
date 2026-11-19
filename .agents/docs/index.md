@@ -5,7 +5,7 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| [`requirements.md`](requirements.md) | 需求基线 v1.0，不要编辑 |
+| [`requirements.md`](requirements.md) | 需求基线 v1.1，修订记录在文末 |
 | [`architecture.md`](architecture.md) | 进程模型、数据流、存储边界、安全模型，以及已接受的架构转变 |
 | [`GLOSSARY.md`](GLOSSARY.md) | 领域术语表 |
 | [`adr/`](adr/) | 架构决策记录，编号顺延 |

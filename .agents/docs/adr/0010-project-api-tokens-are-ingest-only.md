@@ -1,6 +1,6 @@
 # 项目 API Token 只能摄取，查询只认会话与用户 API Token
 
-浏览器 SDK 会把项目 API Token 直接写进公开页面，任何访客都能拿到它。此前 `queryRequired` 和 `/mcp` 在收到非 `lou_` 的 bearer 时直接走项目 Token 鉴权，等于把整个项目的日志、链路、Replay、Issue 读权限交给了公开页面的访客。我们决定：项目 API Token 回到需求基线（`.agents/docs/requirements.md` 第 301 行「写入侧由 ingest token 解析项目，查询侧由会话校验」）的 ingest token 语义，只能用于摄取路由；所有读路由（含 `/mcp`、`/api/system/info`）对项目 Token 返回 `403`，错误码 `ingest_only_token`。查询只接受会话 Cookie，或用户 API Token（`lou_…`）加 `X-LO-Project` 选择项目。MCP 的 DSN 形状不变（`/p/<slug>@<token>`），但 token 必须是用户 API Token，slug 通过 `X-LO-Project` 转发。
+浏览器 SDK 会把项目 API Token 直接写进公开页面，任何访客都能拿到它。此前 `queryRequired` 和 `/mcp` 在收到非 `lou_` 的 bearer 时直接走项目 Token 鉴权，等于把整个项目的日志、链路、Replay、Issue 读权限交给了公开页面的访客。我们决定：项目 API Token 回到需求基线（`.agents/docs/requirements.md` 5.5 节「写入侧由 ingest token 解析项目，查询侧由会话校验」）的 ingest token 语义，只能用于摄取路由；所有读路由（含 `/mcp`、`/api/system/info`）对项目 Token 返回 `403`，错误码 `ingest_only_token`。查询只接受会话 Cookie，或用户 API Token（`lou_…`）加 `X-LO-Project` 选择项目。MCP 的 DSN 形状不变（`/p/<slug>@<token>`），但 token 必须是用户 API Token，slug 通过 `X-LO-Project` 转发。
 
 ## 备选方案
 
