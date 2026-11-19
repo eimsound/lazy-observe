@@ -291,6 +291,52 @@ if [[ -n $missing_dependabot ]]; then
   fail "$dependabot must cover every manifest directory listed above"
 fi
 
+# 最小发布年龄：天数只在 scripts/release-age.env 维护，Dependabot cooldown、pnpm minimumReleaseAge（分钟）都要与它一致，
+# 手工固定点由 scripts/check-pinned-releases.sh 按同一个值检查。
+release_age_env=scripts/release-age.env
+[[ -f $release_age_env ]] || fail "$release_age_env is missing"
+min_release_age_days=$(
+  MIN_RELEASE_AGE_DAYS=
+  # shellcheck source=scripts/release-age.env
+  . "$release_age_env"
+  printf '%s' "$MIN_RELEASE_AGE_DAYS"
+)
+[[ $min_release_age_days =~ ^[1-9][0-9]*$ ]] || fail "$release_age_env must set MIN_RELEASE_AGE_DAYS to a positive integer"
+cooldown_count=0
+dependabot_entry_count=0
+while IFS= read -r line || [[ -n $line ]]; do
+  if [[ $line =~ ^[[:space:]]*-[[:space:]]+package-ecosystem: ]]; then
+    dependabot_entry_count=$((dependabot_entry_count + 1))
+  elif [[ $line =~ ^[[:space:]]+default-days:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+    cooldown_count=$((cooldown_count + 1))
+    [[ ${BASH_REMATCH[1]} == "$min_release_age_days" ]] ||
+      fail "$dependabot: cooldown default-days ${BASH_REMATCH[1]} must equal MIN_RELEASE_AGE_DAYS=$min_release_age_days ($release_age_env)"
+  fi
+done <"$dependabot"
+((cooldown_count == dependabot_entry_count)) ||
+  fail "$dependabot: every update entry needs cooldown.default-days: $min_release_age_days ($cooldown_count of $dependabot_entry_count have one)"
+while IFS= read -r lock; do
+  workspace=${lock%pnpm-lock.yaml}pnpm-workspace.yaml
+  [[ -f $workspace ]] || fail "$workspace is missing: pnpm projects must set minimumReleaseAge there"
+  grep -Eq "^minimumReleaseAge:[[:space:]]*$((min_release_age_days * 1440))[[:space:]]*$" "$workspace" ||
+    fail "$workspace must set minimumReleaseAge: $((min_release_age_days * 1440)) (MIN_RELEASE_AGE_DAYS=$min_release_age_days x 1440 minutes)"
+done < <(git ls-files --cached --others --exclude-standard -- '*pnpm-lock.yaml')
+
+# 手工固定点的年龄门禁与每周追踪：PR 门禁是 ci.yml 里的 pinned-releases job，追踪是定时 workflow。
+# issues: write 只留给追踪 workflow 的那一个 job，别的 workflow 不该拿到它。
+[[ $(release_job .github/workflows/ci.yml pinned-releases) == *'run: bash scripts/check-pinned-releases.sh --gate'* ]] ||
+  fail ".github/workflows/ci.yml: pinned-releases must run scripts/check-pinned-releases.sh --gate"
+tracker=.github/workflows/pinned-releases.yml
+[[ -f $tracker ]] || fail "$tracker is missing"
+tracker_text=$(<"$tracker")
+[[ $tracker_text == *$'\n  schedule:\n'* && $tracker_text == *$'\n  workflow_dispatch:'* ]] ||
+  fail "$tracker must run on schedule and workflow_dispatch"
+[[ $tracker_text == *'scripts/check-pinned-releases.sh --report'* ]] ||
+  fail "$tracker must run scripts/check-pinned-releases.sh --report"
+[[ $(release_job "$tracker" report) == *'issues: write'* ]] || fail "$tracker: the report job must hold issues: write"
+issue_writers=$(grep -El '^[[:space:]]*issues:[[:space:]]*write' "${workflows[@]}" || true)
+[[ $issue_writers == "$tracker" ]] || fail "only $tracker may request issues: write, found: ${issue_writers:-none}"
+
 # upload/download-artifact v3 在 GitHub 上已停用。
 old_artifacts=$(grep -En 'uses:[[:space:]]+actions/(upload|download)-artifact@[0-9a-f]{40}[[:space:]]+#[[:space:]]+v[0-3]\.' \
   "${workflows[@]}" || true)

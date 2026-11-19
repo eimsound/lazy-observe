@@ -47,6 +47,7 @@ jobs:
       sdk_browser: ${{ steps.detect.outputs.sdk_browser }}
       sdk_python: ${{ steps.detect.outputs.sdk_python }}
       sdk_journeys: ${{ steps.detect.outputs.sdk_journeys }}
+      pins: ${{ steps.detect.outputs.pins }}
       build_matrix: ${{ steps.detect.outputs.build_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -556,6 +557,23 @@ jobs:
           restore-keys: playwright-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-
       - run: mise run sdk-journeys
 
+  # 手工固定点（Victoria、mise、Trivy 等 GitHub release 版本）的最小发布年龄门禁：Dependabot 看不到这些固定点，
+  # 它们的 cooldown 要靠这里兜底。只在固定点文件变化时跑（scripts/ci-changes.sh 的 pins 标志）。
+  # 要联网查 GitHub API，所以不放进离线的 workflow-check；runner 自带 curl 和 jq，不需要 mise。
+  # 每周的新版本报告在 pinned-releases.yml。
+  pinned-releases:
+    name: Pinned releases (minimum release age)
+    needs: changes
+    if: needs.changes.outputs.pins == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Gate pinned release age
+        run: bash scripts/check-pinned-releases.sh --gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
   # 唯一的 required check。被跳过的 job 算通过；任一 job 失败或被取消则失败。
   ci-ok:
     # check 名必须就是 ci-ok：分支保护按这个名字匹配 required check。
@@ -576,6 +594,7 @@ jobs:
       - sdk-browser
       - sdk-python
       - sdk-journeys
+      - pinned-releases
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
