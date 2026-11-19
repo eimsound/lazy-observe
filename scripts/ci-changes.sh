@@ -38,11 +38,22 @@ flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python 
 # （带嵌入前端的 build-binary + 外置 storage-bins），再对着它跑 sdk/{go,node,python,browser}/e2e.sh，
 # 所以输入是 SDK 自身、服务端 Go 代码与依赖、会被嵌进二进制的前端、storage 二进制下载和门禁脚本：
 #   - sdk/**（任一语言的 SDK，含各自的 e2e.sh 与示例；纯文档由 *.md 规则先挡掉）；
-#   - cmd/**、internal/**、go.mod/go.sum、ent 生成链路；
+#   - cmd/**（cmd/perf-gate/** 除外：它是独立的性能门禁程序，不被平台二进制引用）、internal/**、go.mod/go.sum、ent 生成链路；
 #   - web/**、scripts/prepare-web-assets.sh（browser journey 登录真实 UI）；
 #   - scripts/download-storage-bins.sh、scripts/sdk-journeys.sh；
 #   - 全量路径（.github/**、mise.toml、scripts/ci-*、scripts/mise-release.env、Dockerfile*、未分类路径）。
-# 刻意不打开的：deploy/**、config.example.yaml、bench/**、单副本 e2e 与 HA 脚本。
+# 刻意不打开的：deploy/**、config.example.yaml、bench/**、单副本 e2e 与 HA 脚本、cmd/perf-gate/**。
+#
+# sdk_journeys_only：sdk_journeys 为 true 时要跑哪几个 journey。空 = 四个都跑；否则是空格分隔的语言列表
+# （按 go node python browser 的固定顺序），ci.yml 原样传给 LO_SDK_JOURNEYS_ONLY。只有下面这些改动面是「窄」的，
+# 混合改动时取并集，其它任何会打开 sdk_journeys 的「宽」路径（服务端、Go 依赖、journey/storage/web 资产脚本、sdk/ 根共享文件、
+# CI、未分类）都让它回到空：
+#   - sdk/go/**      → go browser    （browser journey 会现场编译并运行 sdk/go 的 fiber 示例）
+#   - sdk/node/**    → node browser  （browser journey 会构建并运行 sdk/node 的 express 示例）
+#   - sdk/python/**  → python
+#   - sdk/browser/** → browser
+#   - web/**         → browser       （只有 browser journey 登录嵌入的前端）
+# sdk_journeys 为 false 时它也是空，ci.yml 里没有 job 会读它。
 
 # 打包链路：动到这些路径时额外跑 arm64 构建与冒烟（以及 amd64 构建与冒烟）。
 # scripts/check-e2e-contract.sh 校验这份列表。
@@ -80,6 +91,11 @@ for flag in "${flags[@]}"; do
   out[$flag]=false
 done
 
+# SDK journey 的范围：journey_full=true 表示四个都跑；否则只跑 journey_langs 里的语言。
+journey_languages=(go node python browser)
+journey_full=false
+declare -A journey_langs=()
+
 log() {
   printf '[ci-changes] %s\n' "$*" >&2
 }
@@ -88,6 +104,18 @@ set_flags() {
   local flag
   for flag in "$@"; do
     out[$flag]=true
+    # 没有显式限定语言的 sdk_journeys 就是四个全跑。
+    [[ $flag == sdk_journeys ]] && journey_full=true
+  done
+  return 0
+}
+
+# set_journeys LANG...：打开 sdk_journeys，但只跑这些语言的 journey（多次调用取并集）。
+set_journeys() {
+  local language
+  out[sdk_journeys]=true
+  for language in "$@"; do
+    journey_langs[$language]=1
   done
 }
 
@@ -143,22 +171,27 @@ classify() {
     ;;
   # 服务端经 replace 把 sdk/go 编进二进制（自监控链路），所以也要跑构建与 e2e。
   sdk/go/*)
-    set_flags sdk_go go build e2e ha sdk_journeys
+    set_flags sdk_go go build e2e ha
+    set_journeys go browser
     ;;
   sdk/node/*)
-    set_flags sdk_node sdk_journeys
+    set_flags sdk_node
+    set_journeys node browser
     ;;
   sdk/browser/*)
-    set_flags sdk_browser sdk_journeys
+    set_flags sdk_browser
+    set_journeys browser
     ;;
   sdk/python/*)
-    set_flags sdk_python sdk_journeys
+    set_flags sdk_python
+    set_journeys python
     ;;
   sdk/*)
     set_flags sdk_go sdk_node sdk_browser sdk_python sdk_journeys
     ;;
   web/*)
-    set_flags web build sdk_journeys
+    set_flags web build
+    set_journeys browser
     ;;
   internal/db/* | internal/meta/* | entc.mod | entc.sum | tools/entgen/* | scripts/generate-ent.sh)
     set_flags go build e2e ha meta_pg sdk_journeys
@@ -166,6 +199,11 @@ classify() {
   # 依赖升级可能动到 pgx / embedded-postgres，PG 元数据测试一起跑。
   go.mod | go.sum)
     set_flags go build e2e ha meta_pg sdk_journeys
+    ;;
+  # perf-gate 是独立的性能门禁程序（mise 的 performance-gates 与 HA 脚本用它），不在 cmd/lazy-observe 的依赖里，
+  # 平台二进制不含它，所以不触发 SDK journey；其余标志与 cmd/* 一致。
+  cmd/perf-gate/*)
+    set_flags go build e2e ha
     ;;
   cmd/* | internal/*)
     set_flags go build e2e ha sdk_journeys
@@ -260,6 +298,18 @@ for flag in "${flags[@]}"; do
     printf '%s=%s\n' "$flag" "${out[$flag]}" >>"$output"
   fi
 done
+
+# sdk_journeys_only：见文件头部的说明。sdk_journeys 为 false 或要全跑时为空。
+journeys_only=''
+if [[ ${out[sdk_journeys]} == true && $journey_full == false ]]; then
+  for language in "${journey_languages[@]}"; do
+    [[ -n ${journey_langs[$language]:-} ]] && journeys_only+="${journeys_only:+ }$language"
+  done
+fi
+printf 'sdk_journeys_only=%s\n' "$journeys_only"
+if [[ -n $output ]]; then
+  printf 'sdk_journeys_only=%s\n' "$journeys_only" >>"$output"
+fi
 
 # arm64 进入 build 矩阵时，同时给出 build 与冒烟用的 runner 矩阵。
 if [[ ${out[arm64]} == true ]]; then

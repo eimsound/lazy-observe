@@ -40,5 +40,5 @@ SDK 面向 lazy-observe 服务端上报遥测时必须遵守以下守则（与 `
 - 本地入口：`mise run sdk-go`、`mise run sdk-node`、`mise run sdk-browser`、
   `mise run sdk-python`；四个语言的 journey（对着真实平台的端到端）由 `mise run sdk-journeys`
   起临时平台后依次跑。CI 由根 `.github/workflows/ci.yml` 的 `changes` 作业按目录
-  只跑改动到的语言包，`sdk-journeys` job 在 SDK、服务端或前端改动时跑四个 journey。
+  只跑改动到的语言包，`sdk-journeys` job 在 SDK、服务端或前端改动时跑：只改单个 SDK 或 `web/` 时只跑相关语言，服务端与平台改动跑四个 journey（范围见 `scripts/ci-changes.sh` 的 `sdk_journeys_only`）。
 - 所有脚本用 `bash`，命名小写连字符；新增脚本需 `sh -n` 通过。

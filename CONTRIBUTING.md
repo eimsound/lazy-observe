@@ -106,10 +106,22 @@ temporary data directory, free ports and a known admin password (provided throug
 `security.admin_password_file`, so no forced password change), reads the default
 project's ingest token from the bootstrap log, and runs the Go, Node, Python and
 Browser SDK journeys (`sdk/*/e2e.sh`) against it in that order. A missing toolchain
-is an error, never a skip. `LO_SDK_JOURNEYS_ONLY=go,browser` runs a subset. The
+is an error, never a skip. `LO_SDK_JOURNEYS_ONLY=go,browser` (comma or space separated) runs a subset. The
 Browser journey installs Chromium with `playwright install` and adds `--with-deps`
 only when root or passwordless sudo is available. Pull request CI runs it as the
-`SDK journeys` job when SDK, server, or Web code changes.
+`SDK journeys` job when SDK, server, or Web code changes, and passes the languages to run
+(`sdk_journeys_only` from `scripts/ci-changes.sh`) as `LO_SDK_JOURNEYS_ONLY`.
+
+SDK journey scope: `sdk/go/**` runs Go and Browser (the Browser journey builds and runs the Go Fiber example),
+`sdk/node/**` runs Node and Browser (it runs the Node Express example), `sdk/python/**` runs Python,
+`sdk/browser/**` and `web/**` run Browser. Mixed changes take the union; any other path that triggers SDK journeys (server code, Go dependencies,
+the journey, storage-binary and web-asset scripts, shared `sdk/` files, CI and unclassified paths) runs all four.
+
+The platform and each journey run in their own process group. Interrupting `scripts/sdk-journeys.sh`
+(SIGTERM, SIGINT, SIGHUP) sends SIGTERM to those groups and SIGKILL after a timeout, so no example process,
+port or temporary directory is left behind. `bash scripts/sdk-journeys-interrupt-test.sh` checks this against a real
+platform (local only, about two minutes); run it after changing the cleanup code. The gateway port is picked from
+14000-14999, below the Linux ephemeral port range.
 
 ### Release and performance gates
 
@@ -137,15 +149,19 @@ business job.
 | Changed paths | Jobs that run |
 | --- | --- |
 | `*.md`, `docs/**`, `LICENSE`, `.agents/**`, `.claude/**` | None |
-| `sdk/node/**`, `sdk/browser/**`, `sdk/python/**` | The matching SDK job |
-| `sdk/go/**` | Go SDK job plus the gateway Go checks, build, E2E, and HA E2E (the server links `sdk/go` through `replace`) |
-| `web/**` | Web |
-| `sdk/**`, `web/**`, `cmd/**`, `internal/**`, `go.mod`, `go.sum`, `scripts/sdk-journeys.sh` | Adds SDK journeys |
+| `sdk/node/**`, `sdk/browser/**`, `sdk/python/**` | The matching SDK job, plus SDK journeys limited to the languages in the "SDK journey scope" list below |
+| `sdk/go/**` | Go SDK job plus the gateway Go checks, build, E2E, and HA E2E (the server links `sdk/go` through `replace`), plus Go and Browser SDK journeys |
+| `web/**` | Web, the embedded-UI build, and the Browser SDK journey only |
+| other `sdk/**` files (shared scripts and docs) | Every SDK job and every SDK journey |
+| `cmd/**` except `cmd/perf-gate/**`, `internal/**`, `go.mod`, `go.sum`, `scripts/sdk-journeys.sh`, `scripts/prepare-web-assets.sh`, `scripts/download-storage-bins.sh` | Adds all four SDK journeys |
+| `cmd/perf-gate/**` | Same as `cmd/**` minus SDK journeys (the performance gate is not part of the platform binary) |
 | `internal/db/**`, `internal/meta/**` | Adds PostgreSQL metadata tests |
 | `cmd/**`, `internal/**` | Go checks, build, E2E, restart, HA E2E |
 | `go.mod`, `go.sum` | Same as above plus PostgreSQL metadata tests |
 | `scripts/e2e-multi-replica.sh` and its helpers, `bench/performance-gates.json`, `scripts/download-storage-bins.sh` | Adds HA E2E |
-| Packaging chain | Zero-config artifact smoke plus native arm64 build and smoke |
+| `scripts/e2e.sh`, `scripts/e2e-restart.sh` and other single-replica E2E scripts | Go checks and E2E |
+| Packaging chain (`Dockerfile`, `.dockerignore`, `.goreleaser.yaml`, `go.mod`, `go.sum`, `mise.toml`, `internal/embed/**`, `scripts/download-storage-bins.sh`, `scripts/prepare-embedded-storage.sh`, `scripts/prepare-web-assets.sh`, `scripts/check-embedded-artifact.sh`, `scripts/check-container-smoke.sh`) | Zero-config artifact smoke plus native arm64 build and smoke |
+| `scripts/download-storage-bins.sh`, `scripts/mise-release.env`, `scripts/check-image-vulns.sh`, `scripts/install-trivy.sh`, `scripts/e2e-multi-replica.sh`, `scripts/check-pinned-releases.sh`, `scripts/release-age.env` | Adds the pinned-release minimum-age gate (`pins`; it queries the GitHub API, so it only runs when a pin changes) |
 | `.github/dependabot.yml`, `.trivyignore.yaml` | Go checks only (`workflow-check` validates them) |
 | `.github/**`, `mise.toml`, `scripts/ci-*`, `scripts/mise-release.env`, `Dockerfile*` | Everything |
 

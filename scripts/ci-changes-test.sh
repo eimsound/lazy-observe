@@ -24,6 +24,17 @@ expect() {
   done
 }
 
+# expect_only "<files>" "<sdk_journeys_only 的值>"：空 = 四个 journey 都跑（或 sdk_journeys 未打开）。
+expect_only() {
+  local files=$1 want=$2 got value
+  got=$(tr ',' '\n' <<<"$files" | GITHUB_OUTPUT='' bash "$script" --stdin 2>/dev/null)
+  value=$(sed -n 's/^sdk_journeys_only=//p' <<<"$got")
+  if [[ $value != "$want" ]] || ! grep -q '^sdk_journeys_only=' <<<"$got"; then
+    printf 'FAIL [%s] sdk_journeys_only=%s, want %s\n' "$files" "${value:-<empty>}" "${want:-<empty>}" >&2
+    failures=$((failures + 1))
+  fi
+}
+
 expect_matrix() {
   local files=$1 want=$2 got
   got=$(tr ',' '\n' <<<"$files" | GITHUB_OUTPUT='' bash "$script" --stdin 2>/dev/null | sed -n 's/^build_matrix=//p')
@@ -102,6 +113,44 @@ expect 'sdk/python/e2e.sh' 'sdk_python sdk_journeys'
 expect 'scripts/sdk-journeys.sh' 'go sdk_journeys'
 expect 'sdk/browser/README.md,sdk/python/README.md' ''
 
+# cmd/perf-gate 是独立的性能门禁程序，不被平台二进制引用：不触发 SDK journey，其余标志与 cmd/* 一致。
+expect 'cmd/perf-gate/main.go' 'go build e2e ha'
+expect 'cmd/perf-gate/query_test.go' 'go build e2e ha'
+expect 'cmd/perf-gate/main.go,cmd/lazy-observe/main.go' 'go build e2e ha sdk_journeys'
+
+# sdk_journeys_only：窄改动面只跑对应语言，混合取并集，任何宽路径回到空（四个都跑）。
+# browser journey 会运行 sdk/go 的 fiber 示例与 sdk/node 的 express 示例，所以这两个 SDK 同时带上 browser。
+expect_only 'sdk/go/delivery.go' 'go browser'
+expect_only 'sdk/go/e2e.sh' 'go browser'
+expect_only 'sdk/node/packages/node/src/index.ts' 'node browser'
+expect_only 'sdk/python/lazyobserve/client.py' 'python'
+expect_only 'sdk/python/e2e.sh' 'python'
+expect_only 'sdk/browser/packages/react/package.json' 'browser'
+expect_only 'sdk/browser/e2e/performance-journey.spec.ts' 'browser'
+expect_only 'web/src/App.tsx' 'browser'
+expect_only 'web/package.json,README.md' 'browser'
+expect_only 'sdk/python/lazyobserve/client.py,web/src/App.tsx' 'python browser'
+expect_only 'web/src/App.tsx,sdk/node/packages/node/src/index.ts,sdk/go/delivery.go' 'go node browser'
+expect_only 'sdk/python/lazyobserve/client.py,sdk/python/pyproject.toml,sdk/python/e2e.sh' 'python'
+# 宽路径：服务端、平台、门禁脚本、CI、未分类、sdk 根目录的共享文件都全跑。
+expect_only 'internal/gateway/router.go' ''
+expect_only 'cmd/lazy-observe/main.go' ''
+expect_only 'go.mod' ''
+expect_only 'scripts/sdk-journeys.sh' ''
+expect_only 'scripts/download-storage-bins.sh' ''
+expect_only 'scripts/prepare-web-assets.sh' ''
+expect_only 'sdk/scripts/sdk-publish.sh' ''
+expect_only '.github/workflows/ci.yml' ''
+expect_only 'Makefile' ''
+expect_only 'sdk/python/lazyobserve/client.py,internal/gateway/router.go' ''
+expect_only 'web/src/App.tsx,cmd/lazy-observe/main.go' ''
+expect_only 'sdk/go/delivery.go,Makefile' ''
+# 混入 perf-gate 或文档不改变范围；sdk_journeys 没打开时为空。
+expect_only 'sdk/python/lazyobserve/client.py,cmd/perf-gate/main.go,README.md' 'python'
+expect_only 'cmd/perf-gate/main.go' ''
+expect_only 'README.md' ''
+expect_only '' ''
+
 # CI 自身、工具链与未知路径：全量。
 expect '.github/workflows/ci.yml' "$all"
 expect 'mise.toml' "$all"
@@ -127,6 +176,10 @@ for flag in "${flags[@]}"; do
     failures=$((failures + 1))
   fi
 done
+grep -qx 'sdk_journeys_only=' <<<"$got" || {
+  printf 'FAIL [--all] sdk_journeys_only must be empty (run every journey)\n' >&2
+  failures=$((failures + 1))
+}
 
 # 没有可用 base 的事件按全量处理。
 got=$(cd "$root" && CI_EVENT_NAME=workflow_dispatch GITHUB_OUTPUT='' bash "$script" 2>/dev/null)
