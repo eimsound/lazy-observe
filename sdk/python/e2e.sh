@@ -4,7 +4,8 @@ set -eu
 SDK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/lazy-observe-python-e2e.XXXXXX")
 EXAMPLE_PID=
-EXAMPLE_PORT=${LO_E2E_EXAMPLE_PORT:-43520}
+# 示例端口取 16620，理由同 sdk/browser/e2e.sh 顶部：低于临时端口范围和平台组件端口，高于网关端口段。
+EXAMPLE_PORT=${LO_E2E_EXAMPLE_PORT:-16620}
 EXAMPLE_URL="http://127.0.0.1:$EXAMPLE_PORT"
 PYTHON=${LO_E2E_PYTHON:-"$SDK_DIR/.venv/bin/python"}
 

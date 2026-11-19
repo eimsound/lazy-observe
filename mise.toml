@@ -292,12 +292,15 @@ exec bash -ec "$steps"
 [tasks.sdk-browser]
 description = "Install, build, typecheck, unit-test, and license-check the Browser SDK workspace (Node from LO_SDK_NODE_VERSION, default: [tools] node)"
 # 完整套件只在 [tools] 钉的那个 Node 上跑；其它 Node 版本只跑 sdk-browser-smoke。参数化方式同 sdk-node。
+# 先只装并构建 bundler-plugin 再整体 install，避免 examples/react 的 bin 指向还没构建的 dist/cli.js 报 "Failed to create bin"（同 sdk/browser/e2e.sh）。
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 export CI=true
 steps='node --version
-cd sdk/browser && pnpm install --frozen-lockfile && pnpm build && pnpm typecheck && pnpm test
+cd sdk/browser && pnpm install --frozen-lockfile --filter @lazy-observe/bundler-plugin
+pnpm --filter @lazy-observe/bundler-plugin build
+pnpm install --frozen-lockfile && pnpm build && pnpm typecheck && pnpm test
 cd ../.. && bash scripts/check-js-licenses.sh sdk/browser'
 if [[ -n ${LO_SDK_NODE_VERSION:-} ]]; then
   exec mise exec "node@$LO_SDK_NODE_VERSION" -- bash -ec "$steps"
@@ -310,13 +313,15 @@ description = "Build @lazy-observe/bundler-plugin and run its load smoke (requir
 # bundler-plugin 只发 ESM，靠 Node 22.15+ 的 require(esm) 服务 CJS 调用方：每个受支持的 Node 主线都要验证一遍；
 # 浏览器 SDK 其余测试与 Node 版本无关，只在 sdk-browser 里跑一次。
 #   LO_SDK_NODE_VERSION=22.23.5 mise run sdk-browser-smoke
+# 安装顺序同 sdk-browser：先装并构建 bundler-plugin，再整体 install（vitest 在工作区根的 devDependencies 里）。
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 export CI=true
 steps='node --version
-cd sdk/browser && pnpm install --frozen-lockfile
+cd sdk/browser && pnpm install --frozen-lockfile --filter @lazy-observe/bundler-plugin
 pnpm --filter @lazy-observe/bundler-plugin build
+pnpm install --frozen-lockfile
 pnpm --filter @lazy-observe/bundler-plugin exec vitest run test/smoke.test.ts'
 if [[ -n ${LO_SDK_NODE_VERSION:-} ]]; then
   exec mise exec "node@$LO_SDK_NODE_VERSION" -- bash -ec "$steps"

@@ -18,7 +18,7 @@ set -euo pipefail
 #                                     sdk_journeys_only，空格分隔）；空 = 默认 go,node,python,browser（按此顺序）
 #   LO_SDK_JOURNEYS_READY_TIMEOUT     等 /readyz 的秒数，默认 120
 #   LO_E2E_KEEP=1                     保留临时目录（journey 自己的临时目录也由它控制）
-# 顺序不能换成并行：python 与 browser 的示例默认都从 43520 起，串行才不冲突。
+# 顺序不能换成并行：四个 journey 的示例端口虽已互不重叠（16320–16620），但共用同一个平台，没有为并行设计。
 #
 # 中断清理：平台和每个 journey 各占一个独立进程组（`set -m` 下起的后台任务，组 ID 即其 PID）。
 # 收到 TERM/INT/HUP 或正常退出时，cleanup 对整个组先 TERM，到期（平台 45s、journey 15s）再 KILL。
@@ -167,7 +167,7 @@ port_busy() {
 # 网关端口与四个受管组件端口（默认 18428/19428/20428/22428，再加偏移）都要空闲。
 # 网关端口取 14000–14999：低于 Linux 临时端口范围（32768–60999），不会和本机出站连接抢；
 # 低于组件端口的下限（18428+1000），所以不会与同一次运行的组件撞车；仓库其它脚本的固定端口
-# （HA 的 23101/23102、29090–29492、30428–30492，release smoke 的 42880，SDK journey 的 43320–43550，
+# （HA 的 23101/23102、29090–29492、30428–30492，release smoke 的 42880，SDK journey 示例的 16320–16620，
 # 以及组件默认端口 18428–22428）都不在这个区间里。
 gateway_port=
 port_offset=
