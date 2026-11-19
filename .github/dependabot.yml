@@ -124,6 +124,10 @@ updates:
       # typecheck 放过运行时不存在的 API。升级 mise.toml 的 node 主版本时同步改这里的上界。
       - dependency-name: "@types/node"
         versions: [">=27.0.0"]
+      # TypeScript 7 不再提供 JS 编译器 API；tsup 9.0.0 自身直接调用 ts.parseJsonConfigFileContent 生成 d.ts，
+      # 即使装 @typescript/typescript6 也无法构建。tsup 支持 TS7 或迁移到 tsdown 后再撤掉。
+      - dependency-name: "typescript"
+        versions: [">=7.0.0"]
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
@@ -145,6 +149,10 @@ updates:
       # typecheck 放过运行时不存在的 API。升级 mise.toml 的 node 主版本时同步改这里的上界。
       - dependency-name: "@types/node"
         versions: [">=27.0.0"]
+      # TypeScript 7 不再提供 JS 编译器 API；tsup 9.0.0 自身直接调用 ts.parseJsonConfigFileContent 生成 d.ts，
+      # 即使装 @typescript/typescript6 也无法构建。tsup 支持 TS7 或迁移到 tsdown 后再撤掉。
+      - dependency-name: "typescript"
+        versions: [">=7.0.0"]
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
