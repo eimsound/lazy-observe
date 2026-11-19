@@ -76,19 +76,17 @@ jobs:
 
   # 嵌入的 Victoria 二进制在 lazy-observe 里是 gzip 后 go:embed 的 payload，镜像与归档里没有独立的可执行文件，
   # 上面的镜像扫描读不到它们的 Go buildinfo。这里对下载并校验过 sha256 的原始上游二进制（amd64 + arm64，
-  # Trivy 只读静态 buildinfo，一台 runner 即可）跑 trivy rootfs：规则与镜像扫描一致，例外共用 .trivyignore.yaml。
-  # archive 依赖本 job，所以出包前会挡住发版。放行策略（负责人：忽略上游 7 天内未解决的 CVE）：pin 已是上游满 7 天的最新稳定版、
-  # 命中却还没修复的组件只警告；pin 落后于它、或查询上游失败则照常阻塞。细节见 scripts/check-storage-bin-vulns.sh。
+  # Trivy 只读静态 buildinfo，一台 runner 即可）跑 trivy rootfs：参数与镜像扫描一致，例外共用 .trivyignore.yaml。
+  # 嵌入的是上游官方二进制、不自行编译（ADR 0016），所以命中只警告（::warning:: 注解 + step summary），不阻塞发版。
+  # 但扫描没跑成（Trivy 出错、没有恰好识别出四个 Go 二进制、报告与退出码对不上）时本 job 失败；archive 依赖本 job，
+  # 失败会挡住出包。细节见 scripts/check-storage-bin-vulns.sh。
   storage-bin-scan:
     name: Embedded storage binary vulnerability scan
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Scan embedded Victoria binaries for fixable CRITICAL/HIGH vulnerabilities
-        env:
-          # check-pinned-releases.sh --latest-eligible 查上游 release 用；job 权限仍只有 contents: read。
-          GH_TOKEN: ${{ github.token }}
+      - name: Scan embedded Victoria binaries for fixable CRITICAL/HIGH vulnerabilities (warn only)
         run: bash scripts/check-storage-bin-vulns.sh
 
   # 性能门禁不跟 PR 跑，改为挡在发版链路上：tag 发布和手动 snapshot 都必须先过这一关。

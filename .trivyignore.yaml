@@ -1,11 +1,11 @@
-# 漏洞扫描的例外清单，两个扫描共用：镜像扫描（scripts/check-image-vulns.sh）与嵌入的 Victoria 二进制扫描
-# （scripts/check-storage-bin-vulns.sh）。
+# 漏洞扫描的例外清单，两个扫描共用：镜像扫描（scripts/check-image-vulns.sh，有修复的 CRITICAL/HIGH 即失败）与嵌入的
+# Victoria 二进制扫描（scripts/check-storage-bin-vulns.sh，只警告、不阻塞，见 ADR 0016；只有扫描没跑成才失败）。
 #
 # 只在确认是误报、或漏洞代码路径在本产品里不可达时才加条目；能升级修掉的不要加。
 # 每条必须同时带：
 #   - id：CVE / GHSA / GO-* 编号；
 #   - statement：为什么可以忽略（不可达的理由、上游 issue 链接、谁确认的）；
-#   - expired_at：到期日（YYYY-MM-DD），最长 90 天。到期后 Trivy 不再忽略，发版会重新被挡住，届时复查。
+#   - expired_at：到期日（YYYY-MM-DD），最长 90 天。到期后 Trivy 不再忽略：镜像扫描会重新挡住发版，Victoria 二进制扫描会重新警告，届时复查。
 # 可选 paths / purls 收窄到具体文件或包。scripts/check-github-workflows.sh 校验必填字段。
 #
 # 示例：

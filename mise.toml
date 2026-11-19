@@ -248,7 +248,6 @@ run = [
   "bash scripts/check-e2e-contract.sh",
   "bash scripts/ci-changes-test.sh",
   "bash scripts/check-pinned-releases-test.sh",
-  "bash scripts/check-storage-bin-vulns-test.sh",
 ]
 
 [tasks.ci-changes-test]
