@@ -93,6 +93,20 @@ _避免使用_：时间窗口匹配、可能相关
 依据共同服务和时间范围选择的跨信号关系，不宣称两条记录来自同一次请求。
 _避免使用_：因果链接、精确匹配
 
+## 凭据
+
+**项目 API Token（Project API token）**：
+属于某个项目、会被写进公开页面的摄取凭据；只能把遥测写入所属项目，不能查询，也不能上传 Source Map（ADR 0010、ADR 0018）。
+_避免使用_：DSN token、ingest key、项目密钥
+
+**用户 API Token（User API token）**：
+代表某个用户身份的凭据，用于查询和 MCP，权限跟随该用户在项目里的角色（ADR 0010）。
+_避免使用_：个人 Token、查询 Token
+
+**Source Map 上传 Token（Source map upload token）**：
+属于某个项目、只放在接入方构建流水线里的保密凭据；只能为所属项目上传 Source Map（ADR 0018）。
+_避免使用_：发布 Token、CI Token、项目 API Token
+
 ## 错误跟踪
 
 **错误事件（Error event）**：

@@ -32,6 +32,12 @@ export const mockTokens: Record<string, ProjectAPIToken[]> = {
   prj_demo: [],
 };
 
+export const mockUploadTokens: Record<string, ProjectAPIToken[]> = {
+  prj_default: [
+    { id: "ust_a1", name: "github-actions", prefix: "los_a1b2c3d4", created_at: ago(60 * 24 * 5), last_used_at: ago(60 * 3), revoked: false },
+  ],
+};
+
 export const mockUsers: ManagedUser[] = [
   { id: "usr_admin", username: "admin", role: "admin", created_at: ago(60 * 24 * 40) },
   { id: "usr_alice", username: "alice", role: "member", created_at: ago(60 * 24 * 18) },
@@ -45,6 +51,7 @@ export function createMockProject(name: string, slug: string): Project {
   const p: Project = { id: nextId("prj"), name, slug, created_at: nowIso() };
   mockProjects.push(p);
   mockTokens[p.id] = [];
+  mockUploadTokens[p.id] = [];
   return p;
 }
 
@@ -60,6 +67,7 @@ export function deleteMockProject(id: string): void {
   const index = mockProjects.findIndex((project) => project.id === id);
   if (index >= 0) mockProjects.splice(index, 1);
   delete mockTokens[id];
+  delete mockUploadTokens[id];
 }
 
 export function createMockProjectAPIToken(projectId: string, name: string): IssuedProjectAPIToken {
@@ -82,6 +90,26 @@ export function revokeMockProjectAPIToken(projectId: string, tokenId: string): v
   const list = mockTokens[projectId];
   if (!list) return;
   const token = list.find((item) => item.id === tokenId);
+  if (token) token.revoked = true;
+}
+
+export function createMockUploadToken(projectId: string, name: string): IssuedProjectAPIToken {
+  const prefix = `los_${hexId(`${projectId}${name}${counter}`, 8)}`;
+  const secret = `${prefix}${hexId(`secret${projectId}${name}${counter++}`, 40)}`;
+  const tok: ProjectAPIToken = {
+    id: nextId("ust"),
+    name,
+    prefix,
+    created_at: nowIso(),
+    last_used_at: null,
+    revoked: false,
+  };
+  (mockUploadTokens[projectId] ??= []).push(tok);
+  return { ...tok, value: secret };
+}
+
+export function revokeMockUploadToken(projectId: string, tokenId: string): void {
+  const token = mockUploadTokens[projectId]?.find((item) => item.id === tokenId);
   if (token) token.revoked = true;
 }
 

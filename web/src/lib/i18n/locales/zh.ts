@@ -811,7 +811,22 @@ export const zh = {
     copyWarning: "关闭后将无法再次查看完整令牌。",
     ingestOnlyTitle: "仅摄取（ingest only）",
     ingestOnlyDesc:
-      "项目 API Token 只能上报遥测（SDK、OTel exporter、remote write）。用它访问查询、MCP 或 Grafana 一律返回 403 ingest_only_token，读取请使用个人 API Token 并带上 X-LO-Project。",
+      "项目 API Token 只能上报遥测（SDK、OTel exporter、remote write）。用它访问查询、MCP 或 Grafana 一律返回 403 ingest_only_token，读取请使用个人 API Token 并带上 X-LO-Project。上传 Source Map 请改用 Source Map 上传 Token。",
+    smUploadTitle: "Source Map 上传 Token",
+    smUploadDesc:
+      "保密凭据（los_…），只能为本项目上传 Source Map。请只放进 CI 的 secret，不要写进页面或产物：持有它的人可以替换本项目的 Source Map。",
+    smUploadName: "上传 Token 名称",
+    smUploadNamePlaceholder: "例如：github-actions",
+    smUploadCreate: "创建上传 Token",
+    smUploadNone: "该项目暂无 Source Map 上传 Token",
+    smUploadRevoke: "吊销上传 Token",
+    smUploadRevokeConfirm: "确认吊销上传 Token “{{name}}”？",
+    smUploadRevokeConfirmDesc: "吊销后使用该令牌的构建将无法再上传 Source Map，此操作不可撤销。",
+    smUploadCreatedTitle: "Source Map 上传 Token 已创建",
+    smUploadCreatedDesc: "请立即复制到 CI 的 secret 中。出于安全考虑，令牌值只会显示这一次。",
+    smUploadDsnLabel: "Source Map 上传用 DSN（放进 CI secret）",
+    smUploadDsnHint:
+      "把这个 DSN 放进 CI secret（例如 LAZY_OBSERVE_DSN），供 bundler 插件或 lazy-observe-sourcemaps CLI 使用。它不是发给浏览器的 DSN。",
     dsnLabel: "SDK DSN（仅摄取）",
     dsnHint: "lazy-observe SDK 使用这个 DSN；OTel exporter 与 remote write 改用 Authorization: Bearer <token> 请求头。不要用它读数据。",
   },

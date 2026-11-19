@@ -11,10 +11,15 @@ SDK 面向 lazy-observe 服务端上报遥测时必须遵守以下守则（与 `
 
 1. **静默降级，严禁抛错**：当私有 ingest API（`/api/events/errors`、
    `/api/events/vitals`、`/api/events/diagnostics`、`/api/replay/segments`、
-   `/api/profiles`、`/api/releases/:release/sourcemaps`）返回 404/4xx、或请求/
+   `/api/profiles`）返回 404/4xx、或请求/
    响应中出现未知字段 / 未知枚举值时，SDK 一律静默降级：丢弃该次负载，可重试
    场景（如回放分段、profile 分片）缓存后退避重试，并叠加 diagnostics 上报。
    **绝不向应用抛错、绝不中断业务线程、绝不改变上层业务行为。**
+   `POST /api/releases/:release/sourcemaps` 不适用本条：它是私有上传端点，调用方是
+   构建期工具（`@lazy-observe/bundler-plugin` 的 Vite 插件与 `lazy-observe-sourcemaps`
+   CLI），不在应用运行时里。配置了 DSN 而上传失败（含 4xx，例如项目 API Token 被拒的
+   `403 source_map_upload_token_required`）时必须让失败可见：Vite 构建失败、CLI 非零退出；
+   只有未配置 DSN 时才警告并跳过（ADR 0018）。
    服务端一侧的现状见 `docs/version-matrix.md` §5：`/api/events/vitals` 的指标名与
    `/api/events/diagnostics` 的 `signal` / `reason` 都已实现跳过未知值并在响应的
    `rejected` 里计数（同批的已知值照常写入，所以那里的 `rejected > 0` 不是降级原因）；

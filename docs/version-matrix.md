@@ -43,7 +43,7 @@
 | 私有 ingest | `POST /api/events/diagnostics` | SDK 诊断信息上报；未知 `signal` / `reason` 跳过并计数（§5），响应含 `rejected` |
 | 私有 ingest | `POST /api/replay/segments` | 会话回放分段上报 |
 | 私有 ingest | `POST /api/profiles` | 持续剖析（pprof）上报 |
-| 私有 ingest | `POST /api/releases/:release/sourcemaps` | Source Map 制品上传 |
+| 私有上传 | `POST /api/releases/:release/sourcemaps` | Source Map 制品上传；**只**接受 Source Map 上传 Token（`los_...`，§2.2），项目 API Token 与用户 API Token 返回 `403` `source_map_upload_token_required` |
 
 `POST /api/events/diagnostics` 的枚举值当前为：
 
@@ -68,6 +68,23 @@ http(s)://<host>/p/<project-slug>@<token>
 端点。所有读路由（含 `/mcp`、`/api/system/info`）收到项目 Token 时返回 `403`，
 响应体 `code` 为 `ingest_only_token`；读操作只接受会话 Cookie，或用户 API Token
 （`lou_...`）加 `X-LO-Project` 请求头选择项目。
+
+Source Map 上传（ADR 0018）使用独立的项目级保密凭据 **Source Map 上传 Token**（`los_...`）。
+DSN 形状不变（`http(s)://<host>/p/<project-slug>@<los_...>`），bundler-plugin 与
+`lazy-observe-sourcemaps` CLI 照常解析 DSN，只是其中放的是上传 Token；它只放进 CI
+secret，不下发给浏览器。admin（全局角色，与项目 API Token 的管理权限相同）在 Web UI「设置 → 项目 → 管理令牌」创建与吊销
+（`GET|POST /api/projects/:id/source-map-upload-tokens`、
+`DELETE /api/projects/:id/source-map-upload-tokens/:tokenID`，均需 admin；值只在创建
+响应里返回一次，创建与吊销写审计 `source_map_upload_token.create` /
+`source_map_upload_token.revoke`）。鉴权规则：
+
+- `POST /api/releases/:release/sourcemaps` 只接受 `los_` Token，且只能写入它所属的
+  项目。项目 API Token（`lo_`）与用户 API Token（`lou_`）返回 `403`，`code` 为
+  `source_map_upload_token_required`；缺失、未知或已吊销的 Token 返回 `401`。
+- `los_` Token 用于其它任何路由（摄取、查询、`/mcp`、管理 API）一律返回 `403`，
+  `code` 为 `upload_only_token`。
+- 吊销后该 Token 在本副本立即失效，其它副本最迟在 30 秒认证缓存过期后失效（与项目
+  API Token 相同）。
 
 MCP（`lazy-observe mcp --dsn`）的 DSN 形状与上面相同，但 `<token>` 必须是
 `lou_...` 前缀的用户 API Token（在 Web UI「设置 → 个人 API Token」创建）；
@@ -157,6 +174,11 @@ SDK 必须：
    业务行为；
 4. **向后兼容新服务端**：SDK 必须忽略响应中一切未知字段（向前兼容），仅解析自己
    认识的结构。
+
+本守则只针对应用运行时里的 SDK。`POST /api/releases/:release/sourcemaps` 是私有上传端点
+（§2.1），调用方是构建期工具（bundler-plugin 的 Vite 插件与 `lazy-observe-sourcemaps`
+CLI），不适用静默降级：配置了 DSN 而上传失败（含 4xx）时 Vite 构建失败、CLI 非零退出；
+未配置 DSN 时警告并跳过。
 
 服务端侧的现状：`POST /api/events/vitals`（指标名）与 `POST /api/events/diagnostics`
 （`signal` / `reason`）都实现了对未知枚举值的宽容。它们遇到本服务端不认识的值时不整批

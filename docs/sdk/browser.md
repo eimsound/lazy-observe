@@ -140,6 +140,12 @@ Browser profiling and React `withProfiler` are not implemented.
 
 ## Source maps
 
+Uploading source maps needs a **source map upload token** (`los_…`), not the project API token that browsers use. The project API token is public (it ships in your pages), so the upload endpoint rejects it with `403 source_map_upload_token_required`. An upload token can only upload source maps to its own project; it cannot ingest or read anything.
+
+1. An admin (the global role that also manages project API tokens) opens **Settings → Projects → Manage tokens → Source map upload tokens**, creates a token and copies the DSN shown once (`<origin>/p/<project>@los_…`).
+2. Store that DSN in a CI secret (for example `LO_DSN`) and expose it only to the build job. Never put it in a page, a bundle or a committed file. Revoke the token from the same dialog if it leaks.
+3. Keep using the ordinary project DSN (`lo_…`) in `init({ dsn })` for the browser.
+
 `@lazy-observe/bundler-plugin` uploads emitted source maps. It is ESM only, has no runtime dependencies and needs Node.js 22.15 or newer. Vite projects use the plugin; every other bundler uses the `lazy-observe-sourcemaps` CLI. Do not use both in one project.
 
 ```ts
@@ -159,7 +165,7 @@ Plugin options:
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `dsn` | unset | Gateway credentials. Missing or empty: the build prints a warning, uploads nothing and succeeds |
+| `dsn` | unset | Gateway DSN carrying a source map upload token (`los_…`), from a CI secret. Missing or empty: the build prints a warning, uploads nothing and succeeds |
 | `release` | seven-character Git SHA | Release key used for upload and symbolication |
 | `upload` | true | Upload emitted `.map` files after build |
 | `stripSourceMaps` | false | Delete local `.map` files after successful upload |
@@ -179,6 +185,6 @@ lazy-observe-sourcemaps upload --dir <directory> [--dsn <dsn>] [--release <relea
 
 `--dsn` defaults to `$LO_DSN`; `--release` defaults to `$LO_RELEASE`, then the seven-character Git SHA. The browser SDK does not read the release from the build, so give the same release to `init({ release })`. Next.js 16 builds with Turbopack by default, so use the CLI there: set `productionBrowserSourceMaps: true` in `next.config` and run `lazy-observe-sourcemaps upload --dir .next/static --strip` as the `postbuild` script. The package README has the full example.
 
-In CI, provide the DSN from a secret (as `LO_DSN`). Without a DSN, for example in a local build, the plugin and the CLI warn and skip the upload and still succeed. When a DSN is set and the upload fails, the Vite build fails and the CLI exits non-zero.
+In CI, provide the upload-token DSN from a secret (as `LO_DSN`). Without a DSN, for example in a local build, the plugin and the CLI warn and skip the upload and still succeed. When a DSN is set and the upload fails, the Vite build fails and the CLI exits non-zero.
 
 The server matches source maps by minified basename. Basenames must therefore be unique across the output tree; the plugin and the CLI reject duplicates.

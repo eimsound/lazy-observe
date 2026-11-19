@@ -32,6 +32,7 @@ import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { SnippetBlock } from "@/components/common/snippet-block";
+import { SourceMapUploadTokens } from "@/components/projects/source-map-upload-tokens";
 import { projectDsn } from "@/lib/tokens/token-usage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -426,7 +427,7 @@ function TokensDialog({
         onOpenChange(o);
       }}
     >
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <KeyRound className="size-4" />
@@ -554,6 +555,8 @@ function TokensDialog({
             </p>
           )}
         </div>
+
+        {canManage && project && <SourceMapUploadTokens key={project.id} project={project} />}
 
         {!canManage && (
           <p className="flex items-center gap-1.5 text-xs text-muted-foreground">

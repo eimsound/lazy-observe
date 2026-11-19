@@ -826,7 +826,24 @@ export const en: typeof zh = {
     copyWarning: "You won't be able to view the full token again after closing.",
     ingestOnlyTitle: "Ingest only",
     ingestOnlyDesc:
-      "Project API tokens can only send telemetry (SDK, OTel exporters, remote write). Any query, MCP or Grafana request that presents one is rejected with 403 ingest_only_token; reads need a personal API token plus X-LO-Project.",
+      "Project API tokens can only send telemetry (SDK, OTel exporters, remote write). Any query, MCP or Grafana request that presents one is rejected with 403 ingest_only_token; reads need a personal API token plus X-LO-Project. To upload source maps use a source map upload token instead.",
+    smUploadTitle: "Source map upload tokens",
+    smUploadDesc:
+      "A confidential credential (los_…) that can only upload source maps to this project. Keep it in your CI secrets, never in a page or bundle: whoever holds it can replace this project's source maps.",
+    smUploadName: "Upload token name",
+    smUploadNamePlaceholder: "e.g. github-actions",
+    smUploadCreate: "Create upload token",
+    smUploadNone: "No source map upload tokens for this project",
+    smUploadRevoke: "Revoke upload token",
+    smUploadRevokeConfirm: "Revoke upload token “{{name}}”?",
+    smUploadRevokeConfirmDesc:
+      "Builds using this token can no longer upload source maps. This cannot be undone.",
+    smUploadCreatedTitle: "Source map upload token created",
+    smUploadCreatedDesc:
+      "Copy it into your CI secret store now. For security, the token value is shown only once.",
+    smUploadDsnLabel: "DSN for the source map upload (CI secret)",
+    smUploadDsnHint:
+      "Put this DSN in a CI secret (e.g. LAZY_OBSERVE_DSN) for the bundler plugin or the lazy-observe-sourcemaps CLI. It is not the DSN you ship to browsers.",
     dsnLabel: "SDK DSN (ingest only)",
     dsnHint:
       "Use this DSN in lazy-observe SDKs; OTel exporters and remote write send the token as Authorization: Bearer <token> instead. Never present a project token to a read route.",
