@@ -3,9 +3,9 @@
 Explicit Django + DRF instrumentation for the lazy-observe observability
 platform, feature-aligned with the Go Fiber SDK: HTTP metrics/traces and 5xx
 Issue capture, correlated logs, explicit DB spans, and LLM call tracking.
-(*CPU/pprof profiling is not implemented in Python — no pprof-producing CPU
-sampler supports modern CPython; see sdk/docs/sdk/python.md.*) Importing it
-installs no hooks and changes no global OpenTelemetry providers.
+Experimental, opt-in [continuous profiling](#continuous-profiling-experimental) is
+available on a narrow set of interpreters. Importing the package installs no hooks
+and changes no global OpenTelemetry providers.
 
 ## Three-line setup
 
@@ -50,7 +50,7 @@ degraded instance.
 | `lo.llm_transport()` (httpx transport) | `lo.LLMTransport` — OpenAI/Anthropic/Ollama spans with `gen_ai.*` attributes and usage |
 | `lo.capture_exception(exc)` | `CaptureException(ctx, err)` — error event with stack + trace correlation |
 | runtime metrics | `process.runtime.python.threads` / `.memory.rss` / `.gc.count` |
-| CPU profiling | not implemented (no pprof-producing sampler for modern CPython; see docs) |
+| `profiling=True` (experimental) | Continuous CPU profiling (pprof, `type=cpu`), off by default; Linux + free-threaded CPython 3.15 without the GIL only; see below |
 | `lo.shutdown()` / diagnostics | drains bounded queues, flushes OTel, returns last failure |
 
 All signals are opt-in switches (`metrics`/`logs`/`traces` follow the Go matrix:
@@ -61,19 +61,72 @@ low-cardinality metric.
 See the `examples/django/` project for a runnable Django + DRF app, and
 `docs/sdk/python.md` for the full configuration table and parity notes.
 
+## Continuous profiling (experimental)
+
+Off by default. Opt in with `profiling=True`:
+
+```python
+lo = lazyobserve.init({
+    "dsn": "http://host:3100/p/myapp@token",
+    "service_name": "checkout-api",
+    "profiling": True,
+    "profiling_interval": 60,  # seconds between window starts (default 60)
+})
+```
+
+- **Supported**: Linux, CPython 3.15+ **free-threaded** build (`python3.15t`), and
+  `sys._is_gil_enabled()` is `False` at run time. The rest of the SDK still supports CPython 3.9+.
+- **Everywhere else it only logs one warning and does not sample**: CPython 3.9–3.14, the
+  regular 3.15 GIL build, a 3.15t whose GIL was switched back on (`PYTHON_GIL=1`, `-X gil=1`,
+  or a C extension that needs the GIL), macOS and Windows. The warning carries a stable
+  `reason=<code>` and a link to the [per-code explanation](https://github.com/eimsound/lazy-observe/blob/main/docs/sdk/python.md#continuous-profiling).
+  Sampling also stops for good if the GIL comes back, or the sampler keeps failing.
+- **Rhythm**: every `profiling_interval` seconds (default 60) one 10-second window is sampled
+  at 100 Hz (CPU time, all threads) and uploaded to `/api/profiles`.
+- **Overhead** (3.15.2t, measured): the sampling thread uses about 1.75% of one core with
+  one thread and about 9% with 64 threads while a window runs; averaged over the default
+  60-second interval about one sixth of that. RSS grows by 15–19 MiB.
+- **No greenlet**: code running inside a greenlet is invisible to the sampler. gevent and
+  eventlet make more than 50% of the ticks fail, so profiling turns itself off
+  (`sample_failure_rate`). Libraries that use greenlets locally, such as SQLAlchemy asyncio,
+  do not trigger that, but the CPU spent inside their greenlets will be missing from the flame graph.
+- **The flame graph is a sum** over all processes and instances of the service; it cannot be split by
+  process or instance.
+
 ## Development
 
+The interpreter and the virtualenv come from [uv](https://docs.astral.sh/uv/); no system Python
+or pip is involved. The standard entry is the repository's mise task, which pins uv, creates
+`sdk/python/.venv`, installs the `[test]` extras and runs pytest. `LO_SDK_PYTHON_VERSION`
+picks the interpreter (default `3.13`; the CI matrix uses `3.9`, `3.13`, `3.15`, `3.15t`
+and the non-blocking pre-release `3.16`):
+
 ```sh
-uv venv --python 3.11 .venv
-uv pip install -e ".[test]"
-.venv/bin/python -m pytest tests/
+mise run sdk-python
+LO_SDK_PYTHON_VERSION=3.15t mise run sdk-python
+```
+
+The equivalent by hand, from `sdk/python`:
+
+```sh
+uv venv --python 3.15t .venv
+uv pip install --python .venv/bin/python -e ".[test]"
+.venv/bin/python -m pytest -q tests
+```
+
+Only 3.15t actually samples; on 3.9, 3.13 and the 3.15 GIL build the profiling tests check that the
+switch warns and samples nothing, and the real-sampler tests are skipped.
+
+To run the real-platform journey:
+
+```sh
 LO_E2E_PLATFORM_URL=http://127.0.0.1:3100 \
 LO_E2E_TOKEN=lo_... \
 LO_E2E_ADMIN_PASSWORD=... \
   ./e2e.sh
 ```
 
-`mise run sdk-python` and the CI `Python SDK` job only run pytest. The real-platform
+`mise run sdk-python` and the CI `Python SDK` matrix only run pytest. The real-platform
 journey is `./e2e.sh`. The standard way to run it is `mise run sdk-journeys` from the
 repository root: it starts a throwaway platform (temporary data dir, free ports, known
 admin password) and runs the Go, Node, Python and Browser journeys in turn; the CI

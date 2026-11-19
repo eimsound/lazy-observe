@@ -84,11 +84,11 @@ else
     ci_tools=(go)
     ;;
   sdk-python)
-    ci_tools=(python@3.13.5)
+    ci_tools=(uv@0.13.7)
     ;;
-  # SDK journeys：服务端构建（go、web 的 node/pnpm）、journey 的 jq/rg 与 sdk-python 任务的 Python。
+  # SDK journeys：服务端构建（go、web 的 node/pnpm）、journey 的 jq/rg 与 sdk-python 任务的 uv（解释器由 uv 取）。
   sdk-journeys)
-    ci_tools=(go node pnpm jq rg python@3.13.5)
+    ci_tools=(go node pnpm jq rg uv@0.13.7)
     ;;
   release)
     ci_tools=(

@@ -446,6 +446,31 @@ for job in "${ci_jobs[@]}"; do
   fi
 done
 
+# Python SDK 矩阵契约（ADR 0014）：3.9、3.13、3.15、3.15t 阻塞，3.16 预发布非阻塞。
+# continue-on-error 是能让 ci-ok 对失败格视而不见的开关，所以 ci.yml 里只许 sdk-python 这一处用，
+# 且只能写成 `${{ matrix.experimental }}`，再由矩阵保证只有 3.16 一格是 experimental: true。
+mapfile -t ci_continue_on_error < <(grep -nE '^[[:space:]]*continue-on-error:' "$ci" || true)
+((${#ci_continue_on_error[@]} == 1)) ||
+  fail "$ci: continue-on-error may appear exactly once (the sdk-python matrix job), found ${#ci_continue_on_error[@]}"
+sdk_python_block=$(awk '
+  $0 == "  sdk-python:" { on = 1; next }
+  on && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
+  on { print }
+' "$ci")
+[[ -n $sdk_python_block ]] || fail "$ci: job sdk-python is missing"
+[[ $sdk_python_block == *'    continue-on-error: ${{ matrix.experimental }}'* ]] ||
+  fail "$ci: sdk-python must set continue-on-error: \${{ matrix.experimental }} (the only continue-on-error in ci.yml)"
+[[ $sdk_python_block == *'fail-fast: false'* ]] ||
+  fail "$ci: sdk-python matrix must set fail-fast: false so one interpreter does not cancel the others"
+[[ $sdk_python_block == *'LO_SDK_PYTHON_VERSION: ${{ matrix.python }}'* ]] ||
+  fail "$ci: sdk-python must pass LO_SDK_PYTHON_VERSION: \${{ matrix.python }} to mise run sdk-python"
+sdk_python_cells=$(awk '
+  /^[[:space:]]+- python:/ { py = $3; gsub(/"/, "", py); next }
+  /^[[:space:]]+experimental:/ && py != "" { print py "=" $2; py = "" }
+' <<<"$sdk_python_block" | tr '\n' ' ')
+[[ $sdk_python_cells == '3.9=false 3.13=false 3.15=false 3.15t=false 3.16=true ' ]] ||
+  fail "$ci: sdk-python matrix must be 3.9, 3.13, 3.15, 3.15t blocking (experimental: false) and only 3.16 experimental: true, got: $sdk_python_cells"
+
 # changes 作业输出的每个标志都要在 ci.yml 里声明为 job output。
 for flag in $(bash scripts/ci-changes.sh --all 2>/dev/null | sed -n 's/=.*//p'); do
   grep -Eq "^      ${flag}: \\$\\{\\{ steps\\.detect\\.outputs\\.${flag} \\}\\}$" "$ci" ||

@@ -345,7 +345,7 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
 
 ### S4 CI 与文档
 
-- [ ] 4. CI 矩阵、README 与 CHANGELOG
+- [x] 4. CI 矩阵、README 与 CHANGELOG
   - 交付：`.github/workflows/ci.yml` 的 Python SDK job 矩阵：
     3.9、3.13、3.15、3.15t 阻塞，3.16 预发布非阻塞；3.9/3.13/3.15（GIL）只验证
     「开关打开打 warning、不采集」，真实采样只在 3.15t 上跑。`sdk/python/README.md` 与
@@ -372,6 +372,48 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   - 验证：`mise run workflow-check`、`mise run ci-changes-test`、`mise run sdk-python`。
   - 验收：Python SDK job 在四个阻塞版本上绿；3.16 预发布红不挡合并；README 明确
     experimental、默认关闭、支持范围与不支持 greenlet。
+  - 落地说明（实现细节与核对结论；决策本身见上面的「ADR 0014 修订带来的切片调整」，这里不重复）：
+    - **`CHANGELOG.md` 不在本 commit**：按 `do` 的「收尾」约定走独立 `chore/changelog-*` 分支，由主线程另派；上面「交付」里
+      的 `CHANGELOG.md` 一条因此留给那条分支。版本号仍是 0.1.0。
+    - **`mise run sdk-python` 改用 uv**：`tools.uv = "0.13.7"`（任务级，沿用原先 `tools.python` 的写法，不进 `[tools]`），
+      `LO_SDK_PYTHON_VERSION`（默认 3.13）→ `uv python install --managed-python` → `uv venv --managed-python --python <版本>
+      --clear .venv` → `uv pip install --python .venv/bin/python -e ".[test]"` → `.venv/bin/python -VV` → pytest。
+      任务里没有 pip、没有 `python -m venv`、没有系统 Python（`--managed-python` 让 CI runner 自带的 3.12/hostedtoolcache
+      不参与选择）。`scripts/ci-setup-mise.sh` 的 `sdk-python`、`sdk-journeys` 两个 profile 从 `python@3.13.5` 换成
+      `uv@0.13.7`。`sdk-journeys` 依赖 `sdk-python`（默认 3.13）建 `sdk/python/.venv`，`sdk/python/e2e.sh` 与
+      `scripts/sdk-journeys.sh` 不用改。
+    - **uv 版本与发布年龄**：选 0.13.7（2026-11-03 发布，距今 16 天）。0.13.8 是 2026-11-12 17:03Z 发布，开工时（11-19 14:00Z）
+      还差约 3 小时满 7 天，0.13.9 是 11-17，所以都没选。`scripts/check-pinned-releases.sh` 不覆盖 mise.toml 工具版本（脚本末尾
+      「暂不检查」清单里写着），年龄是用 `gh api repos/astral-sh/uv/releases/tags/<版本>` 手工核对的，没有新增自动门禁。
+      0.13.7 的 python 清单含 3.15.2、3.15.2 free-threaded 与 3.16.0a1。
+    - **CI 矩阵**：`sdk-python` 作业 `strategy.matrix.include` 五格（3.9、3.13、3.15、3.15t 的 `experimental: false`，3.16 的
+      `experimental: true`），`fail-fast: false`，`continue-on-error: ${{ matrix.experimental }}`，`LO_SDK_PYTHON_VERSION:
+      ${{ matrix.python }}` 传给 `mise run sdk-python`；解释器由 uv 取，没有引入 `actions/setup-python`。作业名从
+      `Python SDK (install, pytest)` 变成 `Python SDK (<版本>)`；`ci-ok` 是唯一候选 required check，它的 `needs` 名没变。
+    - **`ci-ok` 与 `continue-on-error`**：`ci-ok` 只看 `needs.*.result`；GitHub 文档里作业级 `continue-on-error: true`
+      的失败格不会让 workflow 失败、`needs` 结果算 success，所以 3.16 红了 `ci-ok` 不变红。**这一点只依据文档，本切片没推送，
+      没有在真实 run 上验证**，PR 的 CI 里 3.16 若恰好红，可以顺便确认。`ci-ok` 的汇总逻辑未改。
+    - **`scripts/check-github-workflows.sh` 新增矩阵断言**（原来只有 release workflow 对 `continue-on-error` 有断言）：`ci.yml` 里
+      `continue-on-error:` 全文只许出现 1 次、必须是 `${{ matrix.experimental }}` 且位于 `sdk-python`；矩阵单元必须恰好是
+      `3.9=false 3.13=false 3.15=false 3.15t=false 3.16=true`；`fail-fast: false`；传入 `LO_SDK_PYTHON_VERSION`。变异验证：
+      3.15 改 `experimental: true`、再加一处 `continue-on-error`、删 `fail-fast`、把版本写死，各自让 `workflow-check` 变红。
+      `scripts/ci-changes.sh` 的分组与 `ci-changes-test.sh` 不需要改（`.github/**`、`mise.toml`、`scripts/ci-*` 本来就是全量）。
+    - **各格测试（本地 `LO_SDK_PYTHON_VERSION=<版本> mise run sdk-python` 实测）**：3.9.25、3.13.18、3.15.2（GIL）、3.16.0a1 都是
+      `193 passed, 6 skipped`；3.15.2t 是 `196 passed, 3 skipped`。3.15t 上有 4 个真实采样测试从 skip 变成运行（`test_sampler.py` 的 3 个 + S3 的
+      `test_real_315t_profiles_a_busy_thread…`），同时 3.15 GIL 构建的真实「返回不可用」测试在 3.15t 上跳过，所以净多 3 个通过；3.15t 跳过的 3 个是只在其它解释器上有意义的断言（pre-3.15、3.15 GIL 构建、
+      `PYTHON_GIL=1`）。3.15 GIL 构建跳过的是 `needs Linux + free-threaded CPython 3.15+ without GIL` 的真实采样测试，同时真实
+      3.15 GIL 测试断言返回不可用，符合「只验证打 warning、不采集」。
+    - **文档**：`sdk/python/README.md` 与 `docs/sdk/python.md` 去掉「not implemented」的旧说法；README 加 `## Continuous profiling
+      (experimental)`，`docs/sdk/python.md` 加 `## Continuous profiling`（锚点 `#continuous-profiling`，与 `_profiling.DOC_URL` 一致），
+      含启用方式、支持范围、采样节奏、greenlet、实测开销、火焰图汇总，以及 `### Warning codes` 里 8 个原因码的逐条表。
+      配置表补 `profiling`、`profiling_interval` 两行，parity 表的 pprof 一行同步。数字全部来自
+      `research/python-cpu-profiling-gil.md`（开销、SQLAlchemy asyncio）、ADR 0014 与 S3 冒烟（`init` 额外 ≈ 9 ms），没有新测。
+      用户文档里没有链接 `.agents/` 路径。开发说明（README 的 Development、`CONTRIBUTING.md` 的 SDK 任务行）改为 uv 与
+      `LO_SDK_PYTHON_VERSION`。`docs/sdk/python.md` 的 Install 一节里面向使用者的 `pip install <路径>` 保留（那是使用者的安装方式，
+      不是仓库开发环境）。
+    - 协议面（端点、字段、DSN、鉴权）没有改动，`docs/version-matrix.md` 未改；SDK 运行时代码未改（B1、B2 同时在改）。
+    - 没处理：3.16 预发布格的 `continue-on-error` 在真实 CI 上的行为未验证；uv 管理的解释器与 pytest 依赖（PyPI）在 CI 里每次
+      重新下载，没有加缓存；Python 测试依赖本身没有最小发布年龄约束（`pip` 时代就没有，这次不改）。
 
 ## Green 后审查与重构
 
@@ -388,7 +430,7 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
 - [ ] `mise run sdk-python`（3.13 本地；CI 另覆盖 3.9/3.15/3.15t/3.16 预发布）。
 - [ ] `mise run vet`、`mise run test`、`mise run fmt-check`、
   `GOLANGCI_LINT_CACHE=$(mktemp -d) mise run lint`（S1 改到 `internal/gateway`）。
-- [ ] `mise run workflow-check`、`mise run ci-changes-test`（S4 改 CI 后）。
+- [x] `mise run workflow-check`、`mise run ci-changes-test`（S4 改 CI 后）。
 - [ ] `git status --short` 只包含 S1–S4 计划内文件，`poc/` 不在其中。
 
 ## 未决事项
@@ -489,3 +531,19 @@ Tachyon 抓栈必然失败。证据见 `.agents/docs/research/python-cpu-profili
   新增 fake 采样器/上传器与真实 `Sampler`/`ProfileUploader` 的签名一致性测试（改 fake 参数名即红）；
   S4 交付补写 `#continuous-profiling` 锚点与逐码说明。全量 pytest：3.9.25 / 3.13.18 → `193 passed, 6 skipped`，
   3.15.2t → `196 passed, 3 skipped`。
+- 2026-11-19 S4 开工：从 `origin/main`（`94c27fa`）拉 `slice/python-profiling-4`；`git status --short` 干净。uv 版本年龄核对：
+  `gh api repos/astral-sh/uv/releases/tags/{0.13.7,0.13.8,0.13.9}` → 11-03 / 11-12 17:03Z / 11-17（开工时 14:00Z，0.13.8 还差约 3 小时），选 0.13.7。
+- 2026-11-19 S4 `mise run sdk-python`（改 uv 后，任务里无 pip；`LO_SDK_PYTHON_VERSION` 逐版本）：3.9 → Python 3.9.25，`193 passed, 6 skipped`；
+  3.13 → 3.13.18，`193 passed, 6 skipped`；3.15 → 3.15.2（GIL 构建），`193 passed, 6 skipped`；3.15t → 3.15.2 free-threading build，
+  `196 passed, 3 skipped`；3.16 → 3.16.0a1，`193 passed, 6 skipped`（预发布格的本地预演）；均 exit 0。
+- 2026-11-19 S4 `bash scripts/check-github-workflows.sh` 变异验证：3.15 改 `experimental: true`、再加一处 `continue-on-error`、删 `fail-fast`、
+  版本写死 → 各自 exit 1 且信息指向对应断言；还原后 exit 0。
+- 2026-11-19 S4 `mise run workflow-check` → exit 0；`mise run ci-changes-test` → exit 0。
+- 2026-11-19 S4 `mise run sdk-python`（默认 3.13，重建 `.venv`）→ `193 passed, 6 skipped`；`mise run build && mise run storage-bins &&
+  LO_SDK_JOURNEYS_ONLY=python mise run --skip-deps sdk-journeys` → exit 0，Python journey 全部 `ok`（metrics、metric-contract、logs、issue、
+  trace、db-span、llm-span），`PASS: all SDK journeys (python)`，用的是 uv 建的 `sdk/python/.venv`。
+- 2026-11-19 S4 交付审查：`sdk/python/README.md` 指向原因码说明的相对链接 `../../docs/sdk/python.md#continuous-profiling` 在 PyPI 上
+  失效（README 是包的 long description），改为与 `_profiling.DOC_URL` 相同的绝对地址；`sdk/python/e2e.sh` 顶部注释仍写
+  「Profiling is not implemented」，改为「journey 不打开持续剖析」。复跑 `LO_SDK_PYTHON_VERSION=3.13 mise run sdk-python` →
+  `193 passed, 6 skipped`，`LO_SDK_PYTHON_VERSION=3.15t` → `196 passed, 3 skipped`；`mise run workflow-check`、`mise run ci-changes-test`、
+  `bash scripts/check-e2e-contract.sh` → exit 0。

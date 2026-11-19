@@ -22,8 +22,8 @@ PLATFORM_URL=${LO_E2E_PLATFORM_URL}
 TOKEN=${LO_E2E_TOKEN}
 ADMIN_PASSWORD=${LO_E2E_ADMIN_PASSWORD}
 
-# Profiling (pprof sampling) is not implemented in the Python SDK; see
-# sdk/docs/sdk/python.md (Python runtime has no pprof sampler on 3.12+).
+# The journey does not turn on continuous profiling: it is experimental and only samples on
+# Linux + free-threaded CPython 3.15t (see docs/sdk/python.md#continuous-profiling).
 cleanup() {
 	if [ -n "$EXAMPLE_PID" ]; then
 		kill -TERM "$EXAMPLE_PID" 2>/dev/null || true
