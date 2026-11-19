@@ -43,7 +43,12 @@ output=${LO_ARTIFACT_EVIDENCE:-$root/.cache/artifact-evidence/$platform.json}
 case $output in /*) ;; *) output=$root/$output ;; esac
 mkdir -p "${output%/*}"
 
-python3 - "$binary" "$machine" "$platform" "$manifest" "$asset_dir" "$output" "${required[@]}" <<'PY'
+# 内嵌校验只用 Python 标准库；解释器由 uv 受管（scripts/lib/uv-python.sh），不用系统 python3，uv 缺失即失败。
+# shellcheck source=lib/uv-python.sh
+. "$root/scripts/lib/uv-python.sh"
+python_command=$(lo_uv_python) || exit 1
+
+"$python_command" - "$binary" "$machine" "$platform" "$manifest" "$asset_dir" "$output" "${required[@]}" <<'PY'
 import gzip
 import hashlib
 import json

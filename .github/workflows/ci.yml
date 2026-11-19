@@ -156,7 +156,7 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           BINARY: .cache/build/linux-${{ matrix.arch }}/lazy-observe
       - name: Record embedded artifact evidence
-        run: mise x go -- bash scripts/check-embedded-artifact.sh ".cache/build/linux-${{ matrix.arch }}/lazy-observe" "linux/${{ matrix.arch }}"
+        run: mise x go uv@0.13.7 -- bash scripts/check-embedded-artifact.sh ".cache/build/linux-${{ matrix.arch }}/lazy-observe" "linux/${{ matrix.arch }}"
         env:
           LO_ARTIFACT_EVIDENCE: .cache/artifact-evidence/linux-${{ matrix.arch }}.json
 

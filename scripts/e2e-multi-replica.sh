@@ -38,16 +38,21 @@ skip() {
 
 command -v docker >/dev/null 2>&1 || skip "Docker is unavailable; cluster HA e2e was not run"
 docker info >/dev/null 2>&1 || skip "Docker daemon is unavailable; cluster HA e2e was not run"
-for command in python3 curl gzip go; do
+for command in curl gzip go; do
   command -v "$command" >/dev/null 2>&1 || skip "$command is required; cluster HA e2e was not run"
 done
-GATEWAY_GOMAXPROCS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ha_scaling"]["gomaxprocs_per_replica"])' "$ROOT/bench/performance-gates.json")
+# 内联的 JSON/随机数/HTTP 辅助只用 Python 标准库。解释器由 uv 受管（scripts/lib/uv-python.sh），不用系统 python3；
+# uv 缺失是失败而不是 SKIP（由 mise e2e-ha / perf-ha 的 tools.uv 提供）。
+# shellcheck source=lib/uv-python.sh
+. "$ROOT/scripts/lib/uv-python.sh"
+PY=$(lo_uv_python) || exit 1
+GATEWAY_GOMAXPROCS=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["ha_scaling"]["gomaxprocs_per_replica"])' "$ROOT/bench/performance-gates.json")
 case "$GATEWAY_GOMAXPROCS" in '' | *[!0-9]* | 0)
   echo "FAIL: invalid per-replica GOMAXPROCS performance budget" >&2
   exit 1
   ;;
 esac
-TRACE_SEARCH_MAX=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["query"]["medium_fixture"]["traces"])' "$ROOT/bench/performance-gates.json")
+TRACE_SEARCH_MAX=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["query"]["medium_fixture"]["traces"])' "$ROOT/bench/performance-gates.json")
 case "$TRACE_SEARCH_MAX" in '' | *[!0-9]*)
   echo "FAIL: invalid medium trace fixture size" >&2
   exit 1
@@ -316,7 +321,7 @@ wait_http http://127.0.0.1:30428/health
 wait_http http://127.0.0.1:29091/health
 
 : >"$WORK/webhook.count"
-python3 -c 'import http.server,sys,threading
+"$PY" -c 'import http.server,sys,threading
 path=sys.argv[1]
 lock=threading.Lock()
 class H(http.server.BaseHTTPRequestHandler):
@@ -334,16 +339,15 @@ CGO_ENABLED=0 go build -o "$WORK/e2e-otlp-payload" ./scripts/e2e-otlp-payload
 # HA deployments provide the first admin password: a generated one would only
 # land in the bootstrap winner's data_dir. Both replicas read the same 0600 file.
 ADMIN_PASSWORD_FILE="$WORK/admin-password"
-(umask 077 && python3 -c 'import secrets; print(secrets.token_urlsafe(24))' >"$ADMIN_PASSWORD_FILE")
+(umask 077 && "$PY" -c 'import secrets; print(secrets.token_urlsafe(24))' >"$ADMIN_PASSWORD_FILE")
 PASSWORD=$(cat "$ADMIN_PASSWORD_FILE")
 
 # Replicas share one metadata database, so they must share one platform
 # encryption key. Each replica has its own data_dir; without this file every
 # replica would generate its own key and all but the concurrent-bootstrap
-# winner would be refused for a fingerprint mismatch. python3 is already a
-# required prerequisite for this script.
+# winner would be refused for a fingerprint mismatch.
 SECRET_KEY_FILE="$WORK/secret.key"
-(umask 077 && python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())' >"$SECRET_KEY_FILE")
+(umask 077 && "$PY" -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())' >"$SECRET_KEY_FILE")
 
 write_config() {
   file=$1 listen=$2 logs_url=$3 metrics_ingest_url=$4 offset=$5
@@ -481,15 +485,15 @@ CSRF=$(awk '$6=="lo_csrf" {print $7; exit}' "$WORK/cookies")
 
 PROJECT_TWO=$(curl -fsS -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"name":"HA Project Two","slug":"ha-p2"}' http://127.0.0.1:23101/api/projects)
-PROJECT_TWO_ID=$(printf '%s' "$PROJECT_TWO" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+PROJECT_TWO_ID=$(printf '%s' "$PROJECT_TWO" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 ISSUED_TOKEN=$(curl -fsS -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"name":"ha-e2e"}' "http://127.0.0.1:23101/api/projects/$PROJECT_TWO_ID/tokens")
-TOKEN_TWO=$(printf '%s' "$ISSUED_TOKEN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+TOKEN_TWO=$(printf '%s' "$ISSUED_TOKEN" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["value"])')
 # Project tokens ($TOKEN for slug "default", $TOKEN_TWO for slug "ha-p2") are
 # ingest-only. Every read uses the admin's user API token plus X-LO-Project.
 ISSUED_USER_TOKEN=$(curl -fsS -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"name":"ha-e2e-read"}' http://127.0.0.1:23101/api/auth/tokens)
-READ_TOKEN=$(printf '%s' "$ISSUED_USER_TOKEN" | python3 -c 'import json,sys; v=json.load(sys.stdin)["value"]; assert v.startswith("lou_"); print(v)')
+READ_TOKEN=$(printf '%s' "$ISSUED_USER_TOKEN" | "$PY" -c 'import json,sys; v=json.load(sys.stdin)["value"]; assert v.startswith("lou_"); print(v)')
 PROJECT_DEFAULT=default
 PROJECT_TWO_SLUG=ha-p2
 
@@ -506,7 +510,7 @@ wait_metric_value() {
   while [ "$count" -lt 30 ]; do
     curl -fsSG -H "Authorization: Bearer $READ_TOKEN" -H "X-LO-Project: $project" "$base/api/v1/query" \
       --data-urlencode 'query=ha_cluster_metric' --data-urlencode 'nocache=1' >"$output"
-    if python3 -c 'import json,sys
+    if "$PY" -c 'import json,sys
 p=json.load(open(sys.argv[1])); rows=p.get("data",{}).get("result",[])
 sys.exit(0 if len(rows)==1 and float(rows[0]["value"][1])==float(sys.argv[2]) else 1)' "$output" "$expected"; then
       return 0
@@ -521,12 +525,12 @@ wait_metric_value http://127.0.0.1:23102 "$PROJECT_DEFAULT" 11 "$WORK/metric-def
 wait_metric_value http://127.0.0.1:23101 "$PROJECT_TWO_SLUG" 22 "$WORK/metric-p2.json"
 curl -fsSG -H "Authorization: Bearer $READ_TOKEN" -H "X-LO-Project: $PROJECT_TWO_SLUG" http://127.0.0.1:23102/api/v1/query \
   --data-urlencode 'query=ha_cluster_metric' --data-urlencode 'extra_filters[]={project_id="default"}' >"$WORK/metric-hostile-query.json"
-python3 -c 'import json,sys
+"$PY" -c 'import json,sys
 p=json.load(open(sys.argv[1])); rows=p.get("data",{}).get("result",[])
 assert len(rows)==1 and float(rows[0]["value"][1])==22' "$WORK/metric-hostile-query.json"
 curl -fsSG http://$VMSELECT_HOST:8481/select/41/prometheus/api/v1/query \
   --data-urlencode 'query=ha_cluster_metric' >"$WORK/metric-other-account.json"
-python3 -c 'import json,sys
+"$PY" -c 'import json,sys
 p=json.load(open(sys.argv[1])); assert p.get("data",{}).get("result",[])==[]' "$WORK/metric-other-account.json"
 echo "PASS: VM cluster account 42 preserves project_id label isolation across replicas"
 
@@ -565,9 +569,9 @@ echo "PASS: VLogs vlinsert/vlselect/two-vlstorage cluster enforces native Projec
 
 DEFAULT_SERVICE="ha-traces-default-$RUN_ID"
 P2_SERVICE="ha-traces-p2-$RUN_ID"
-NOW_NANO=$(python3 -c 'import time; print(time.time_ns())')
+NOW_NANO=$("$PY" -c 'import time; print(time.time_ns())')
 printf '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"%s"}}]},"scopeSpans":[{"scope":{"name":"ha-e2e"},"spans":[{"traceId":"11111111111111111111111111111111","spanId":"1111111111111111","name":"default","kind":1,"startTimeUnixNano":"%s","endTimeUnixNano":"%s","status":{}}]}]}]}' "$DEFAULT_SERVICE" "$NOW_NANO" "$((NOW_NANO + 1000000))" >"$WORK/trace-default.json"
-NOW_NANO=$(python3 -c 'import time; print(time.time_ns())')
+NOW_NANO=$("$PY" -c 'import time; print(time.time_ns())')
 printf '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"%s"}}]},"scopeSpans":[{"scope":{"name":"ha-e2e"},"spans":[{"traceId":"22222222222222222222222222222222","spanId":"2222222222222222","name":"p2","kind":1,"startTimeUnixNano":"%s","endTimeUnixNano":"%s","status":{}}]}]}]}' "$P2_SERVICE" "$NOW_NANO" "$((NOW_NANO + 1000000))" >"$WORK/trace-p2.json"
 post_payload http://127.0.0.1:23101/v1/traces "$TOKEN" application/json "$WORK/trace-default.json" "default trace ingest"
 post_payload http://127.0.0.1:23102/v1/traces "$TOKEN_TWO" application/json "$WORK/trace-p2.json" "project-two trace ingest"
@@ -590,7 +594,7 @@ wait_trace_detail() {
   while [ "$count" -lt 60 ]; do
     status=$(curl -sS -o "$output" -w '%{http_code}' -H "Authorization: Bearer $READ_TOKEN" -H "X-LO-Project: $project" \
       "$base/api/traces/$trace_id" 2>/dev/null || true)
-    if [ "$status" = 200 ] && python3 - "$output" "$trace_id" <<'PY'; then
+    if [ "$status" = 200 ] && "$PY" - "$output" "$trace_id" <<'PY'; then
 import json
 import sys
 
@@ -626,22 +630,22 @@ wait_trace_detail http://127.0.0.1:23102 "$PROJECT_TWO_SLUG" 2222222222222222222
 echo "PASS: VTraces vtinsert/vtselect/two-vtstorage cluster enforces native ProjectID isolation in both directions"
 
 if [ "${LO_E2E_PERF_GATES:-0}" = 1 ]; then
-  PERF_COUNTS=$(python3 -c 'import json,sys
+  PERF_COUNTS=$("$PY" -c 'import json,sys
 p=json.load(open(sys.argv[1]))["query"]["medium_fixture"]
 print(p["issues"], p["logs"], p["traces"])' "$ROOT/bench/performance-gates.json")
   set -- $PERF_COUNTS
   PERF_ISSUE_COUNT=$1
   PERF_LOG_COUNT=$2
   PERF_TRACE_COUNT=$3
-  PERF_QUERY_START=$(python3 -c 'import time; print(int(time.time())-3600)')
-  PERF_QUERY_END=$(python3 -c 'import time; print(int(time.time())+600)')
+  PERF_QUERY_START=$("$PY" -c 'import time; print(int(time.time())-3600)')
+  PERF_QUERY_END=$("$PY" -c 'import time; print(int(time.time())+600)')
 
   PERF_LOG_MARKER="ha-perf-log-$RUN_ID"
   "$WORK/e2e-otlp-payload" -kind logs -name "$PERF_LOG_MARKER" -count "$PERF_LOG_COUNT" >"$WORK/perf-logs.pb"
   post_payload http://127.0.0.1:23102/v1/logs "$TOKEN_TWO" application/x-protobuf "$WORK/perf-logs.pb" "medium log fixture"
 
   mkdir -p "$WORK/perf-issue-batches"
-  python3 - "$WORK/perf-issue-batches" "$RUN_ID" "$PERF_ISSUE_COUNT" <<'PY'
+  "$PY" - "$WORK/perf-issue-batches" "$RUN_ID" "$PERF_ISSUE_COUNT" <<'PY'
 import datetime
 import json
 import pathlib
@@ -677,7 +681,7 @@ PY
 
   PERF_TRACE_SERVICE="ha-perf-traces-$RUN_ID"
   PERF_TRACE_ID=00000000000000000000000000000001
-  python3 - "$PERF_TRACE_SERVICE" "$PERF_TRACE_COUNT" >"$WORK/perf-traces.json" <<'PY'
+  "$PY" - "$PERF_TRACE_SERVICE" "$PERF_TRACE_COUNT" >"$WORK/perf-traces.json" <<'PY'
 import json
 import sys
 import time
@@ -710,7 +714,7 @@ PY
     curl -fsS -H "Authorization: Bearer $READ_TOKEN" -H "X-LO-Project: $PROJECT_TWO_SLUG" \
       'http://127.0.0.1:23101/api/v1/issues?status=open&sort=last_seen&page=1' >"$WORK/perf-issue-list.json"
     PERF_ISSUE_ID=$(
-      python3 - "$WORK/perf-issue-list.json" "$PERF_ISSUE_COUNT" <<'PY' || true
+      "$PY" - "$WORK/perf-issue-list.json" "$PERF_ISSUE_COUNT" <<'PY' || true
 import json
 import sys
 
@@ -737,7 +741,7 @@ PY
       --data-urlencode "query=_msg:=\"$PERF_LOG_MARKER\"" \
       --data-urlencode "start=$PERF_QUERY_START" --data-urlencode "end=$PERF_QUERY_END" \
       --data-urlencode 'step=1h' >"$WORK/perf-log-hits.json"
-    if python3 - "$WORK/perf-log-hits.json" "$PERF_LOG_COUNT" <<'PY'; then
+    if "$PY" - "$WORK/perf-log-hits.json" "$PERF_LOG_COUNT" <<'PY'; then
 import json
 import sys
 
@@ -761,7 +765,7 @@ PY
       --data-urlencode "service=$PERF_TRACE_SERVICE" --data-urlencode "limit=$PERF_TRACE_COUNT" \
       --data-urlencode "start=$((PERF_QUERY_START * 1000000))" \
       --data-urlencode "end=$((PERF_QUERY_END * 1000000))" >"$WORK/perf-trace-search.json"
-    if python3 - "$WORK/perf-trace-search.json" "$PERF_TRACE_COUNT" "$PERF_TRACE_ID" <<'PY'; then
+    if "$PY" - "$WORK/perf-trace-search.json" "$PERF_TRACE_COUNT" "$PERF_TRACE_ID" <<'PY'; then
 import json
 import sys
 
@@ -790,7 +794,7 @@ PY
   # prove at least the configured headroom over the scaled gateway result.
   CGO_ENABLED=0 go build -o "$WORK/e2e-otlp-sink" ./scripts/e2e-otlp-sink
   PERF_SINK_URL=http://127.0.0.1:31480
-  PERF_BATCH_SIZE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ha_scaling"]["batch_size"])' "$ROOT/bench/performance-gates.json")
+  PERF_BATCH_SIZE=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["ha_scaling"]["batch_size"])' "$ROOT/bench/performance-gates.json")
   case "$PERF_BATCH_SIZE" in '' | *[!0-9]* | 0)
     echo "FAIL: invalid performance batch size" >&2
     exit 1
@@ -860,12 +864,12 @@ curl -fsS -H 'Content-Type: application/octet-stream' -H "Authorization: Bearer 
 curl -fsS -H "Authorization: Bearer $READ_TOKEN" -H "X-LO-Project: $PROJECT_DEFAULT" \
   'http://127.0.0.1:23102/api/replay/sessions/ha-s3/segments/0' >"$WORK/replay-from-b.json.gz"
 gzip -dc "$WORK/replay-from-b.json.gz" >"$WORK/replay-from-b.json"
-python3 -c 'import json,sys
+"$PY" -c 'import json,sys
 p=json.load(open(sys.argv[1])); assert p[0]["data"]["href"]=="https://example.invalid/ha"' "$WORK/replay-from-b.json"
 echo "PASS: replica A wrote Replay to the real SeaweedFS S3 API and replica B read the same object"
 
 CHANNEL=$(curl -fsS -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" -H 'X-LO-Project: default' -H 'Content-Type: application/json' -d '{"type":"webhook","name":"ha-e2e","config":{"url":"http://127.0.0.1:29090"}}' http://127.0.0.1:23101/api/channels)
-CHANNEL_ID=$(printf '%s' "$CHANNEL" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+CHANNEL_ID=$(printf '%s' "$CHANNEL" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 curl -fsS -b "$WORK/cookies" -X PUT -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -d "{\"new_issue\":true,\"regression\":false,\"error_rate_threshold_per_min\":0,\"channel_ids\":[$CHANNEL_ID]}" http://127.0.0.1:23101/api/projects/1/alert-config >/dev/null
 
 EVENT='{"events":[{"event_id":"EVENT_ID","timestamp":"2026-07-17T03:00:00Z","platform":"go","level":"error","exception":{"type":"SharedReplicaError","value":"same fingerprint","stacktrace":{"frames":[{"function":"checkout.Handle","filename":"checkout.go","lineno":42,"in_app":true}]}}}]}'
@@ -878,7 +882,7 @@ wait "$POST_A" "$POST_B"
 count=0
 while [ "$count" -lt 30 ]; do
   ISSUES=$(curl -fsS -b "$WORK/cookies" -H 'X-LO-Project: default' http://127.0.0.1:23102/api/issues)
-  ISSUE_COUNT=$(printf '%s' "$ISSUES" | python3 -c 'import json,sys; x=json.load(sys.stdin).get("issues",[]); print(x[0]["count"] if x else 0)')
+  ISSUE_COUNT=$(printf '%s' "$ISSUES" | "$PY" -c 'import json,sys; x=json.load(sys.stdin).get("issues",[]); print(x[0]["count"] if x else 0)')
   [ "$ISSUE_COUNT" = 2 ] && break
   count=$((count + 1))
   sleep 1

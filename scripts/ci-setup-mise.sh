@@ -65,8 +65,9 @@ if [[ -n ${MISE_CI_TOOLS:-} ]]; then
   read -r -a ci_tools <<<"$MISE_CI_TOOLS"
 else
   case "$profile" in
+  # base 含 uv：build 的 check-embedded-artifact.sh 与 e2e-ha 的 e2e-multi-replica.sh 用 uv 受管的 Python（scripts/lib/uv-python.sh），不用系统 python3。
   base)
-    ci_tools=(go node pnpm jq)
+    ci_tools=(go node pnpm jq uv@0.13.7)
     ;;
   go-ci)
     ci_tools=(
@@ -95,9 +96,11 @@ else
   perf-gates)
     ci_tools=(go node pnpm jq uv@0.13.7)
     ;;
+  # release：.goreleaser.yaml 的 before hook 跑 dist-cross 与 gate-release-artifacts，
+  # 其中 check-embedded-artifact.sh、check-release-smoke.sh 用 uv 受管的 Python（scripts/lib/uv-python.sh）。
   release)
     ci_tools=(
-      go node pnpm jq
+      go node pnpm jq uv@0.13.7
       goreleaser@2.17.0
       go:github.com/google/go-licenses/v2@2.0.1
     )
