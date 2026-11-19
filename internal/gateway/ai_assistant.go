@@ -482,6 +482,9 @@ func (g *Gateway) isolatedQuery(
 	default:
 		return nil, errors.New("unsupported query signal")
 	}
+	if signal == "traces" {
+		disableTracesLatencyOffset(path, query)
+	}
 	if signal == "metrics" {
 		defaultMatcher := path != "/api/v1/query" && path != "/api/v1/query_range"
 		if err := g.applyMetricsIsolation(query, project.Slug, defaultMatcher); err != nil {
@@ -519,6 +522,16 @@ func (g *Gateway) isolatedQuery(
 		)
 	}
 	return body, nil
+}
+
+// disableTracesLatencyOffset asks VictoriaTraces (v0.12+, single-node and vtselect) to skip its 30 s
+// -search.latencyOffset for this LogsQL request, so an external deployment does not need the flag.
+// Before v0.12 LogsQL applies no offset and ignores the unknown argument. The Jaeger and Tempo APIs have
+// no per-request switch and are left untouched.
+func disableTracesLatencyOffset(path string, query url.Values) {
+	if strings.HasPrefix(path, "/select/logsql/") {
+		query.Set("disable_latency_offset", "true")
+	}
 }
 
 func cloneQueryValues(source url.Values) url.Values {

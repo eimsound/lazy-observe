@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,6 +64,9 @@ func TestLLMTimeseriesBucketsAndTenantQuery(t *testing.T) {
 		if r.URL.Query().Get("query") != `"span_attr:gen_ai.operation.name":*` || r.URL.Query().Get("start") == "" ||
 			r.URL.Query().Get("end") == "" {
 			t.Errorf("query=%v", r.URL.Query())
+		}
+		if r.URL.Query().Get("disable_latency_offset") != "true" {
+			t.Errorf("traces LogsQL request must disable the latency offset: %v", r.URL.Query())
 		}
 		for _, row := range []struct {
 			at     time.Time
@@ -131,5 +135,41 @@ func TestLLMRangeAndLimitProtection(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("%s status=%d", target, resp.StatusCode)
 		}
+	}
+}
+
+func TestIsolatedQueryDisablesTracesLatencyOffsetOnlyForLogsQL(t *testing.T) {
+	var got []url.Values
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Query())
+		_, _ = w.Write([]byte("{}\n"))
+	}))
+	defer upstream.Close()
+	g := newTestGateway(Config{Traces: upstream.URL, Logs: upstream.URL})
+	project := meta.ProjectInfo{ID: 42, Slug: "alpha"}
+	input := url.Values{"query": {"*"}}
+	for _, call := range []struct{ signal, path string }{
+		{"traces", "/select/logsql/query"},
+		{"traces", "/select/jaeger/api/traces/abc"},
+		{"logs", "/select/logsql/query"},
+	} {
+		if _, err := g.isolatedQuery(context.Background(), project, call.signal, call.path, input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("requests=%v", got)
+	}
+	if got[0].Get("disable_latency_offset") != "true" || got[0].Get("query") != "*" {
+		t.Fatalf("traces LogsQL query=%v", got[0])
+	}
+	if got[1].Has("disable_latency_offset") {
+		t.Fatalf("Jaeger has no per-request offset switch: %v", got[1])
+	}
+	if got[2].Has("disable_latency_offset") {
+		t.Fatalf("VictoriaLogs query must not carry the traces-only argument: %v", got[2])
+	}
+	if input.Has("disable_latency_offset") {
+		t.Fatalf("caller query was mutated: %v", input)
 	}
 }

@@ -388,10 +388,24 @@ that process remains managed and is automatically restarted.
 
 Because the supervisor does not start external services, their query latency is
 your configuration. The embedded storage runs VictoriaMetrics and VictoriaTraces
-with `-search.latencyOffset=0s`, so fresh data is queryable immediately. VictoriaTraces
-v0.12 and later default to a 30-second offset (`-search.latencyOffset`) for the Jaeger,
-Tempo and LogsQL query APIs; an external VictoriaTraces or `vtselect` keeps that default
-unless you pass the flag yourself, and the LLM call statistics then lag by up to 30 seconds.
+with `-search.latencyOffset=0s`, so fresh data is queryable immediately.
+
+VictoriaTraces hides spans newer than `-search.latencyOffset` (default 30 seconds)
+from its Jaeger and Tempo search APIs, and from v0.12 on also from LogsQL queries.
+The gateway sends `disable_latency_offset=true` with every LogsQL request it makes
+to VictoriaTraces (the LLM call statistics). Single-node VictoriaTraces and `vtselect`
+v0.12 and later honor it, so an external deployment needs no flag for the LLM
+statistics to be current. Before v0.12 LogsQL applies no offset, and those versions
+read only the query arguments they know, so the extra one is ignored (checked in the
+upstream source, not against old binaries).
+
+The Jaeger API has no per-request switch. On an external VictoriaTraces the trace
+list leaves out spans newer than `-search.latencyOffset`, and a trace's detail view
+(also used by Issue AI analysis) returns not found until the trace-ID index is
+flushed, which takes up to `-insert.indexFlushInterval` (default 20 seconds, set on
+the single node or `vtinsert`). Lower both flags on the external service if the trace
+views must show fresh traces. The embedded VictoriaTraces runs with
+`-search.latencyOffset=0s` and `-insert.indexFlushInterval=1s` for this reason.
 
 The gateway uses one storage interface in both modes. In standalone mode the
 configured endpoints are routed as follows:
