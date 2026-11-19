@@ -186,7 +186,7 @@ export function UsersPage() {
         onConfirm={async () => {
           if (!deleting) return;
           await deleteUser(deleting.id);
-          queryClient.invalidateQueries({ queryKey: ["users"] });
+          void queryClient.invalidateQueries({ queryKey: ["users"] });
           setDeleting(null);
         }}
       />
@@ -211,7 +211,7 @@ function CreateUserDialog({
   const mutation = useMutation({
     mutationFn: () => createUser(username.trim(), password, roleValue),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["users"] });
+      void queryClient.invalidateQueries({ queryKey: ["users"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("users.createError")),

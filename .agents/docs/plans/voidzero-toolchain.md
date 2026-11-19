@@ -83,7 +83,15 @@ web 与 sdk/browser 里原有的 `lightningcss`（MPL-2.0，`.agents/docs/licens
 抽样：`no-floating-promises` 的 127 条里，`queryClient.invalidateQueries(...)` 18 条、`navigate({ to })` 一批、`node:test` 的 `test(...)` 一批——
 都是 TanStack Query / Router / 测试框架的惯用写法，不是 bug；全部修掉要在 100+ 处加 `void`，是行为无关的大面积改动，超出本切片范围。
 **结论：本 PR 不开类型感知规则**（`.oxlintrc.json` 与 `lint` 脚本都不带 `--type-aware`）。注意 pnpm 的 `auto-install-peers` 会把 `oxlint` 的可选 peer `oxlint-tsgolint` 一并装进锁文件（7.0.2006，MIT，原生二进制，满 7 天），所以依赖树里有它，只是不启用。后续若要开，建议单独切片，先开 `no-floating-promises`
-并统一 `void` 约定，其余规则按噪声排序逐条放开。
+并统一 `void` 约定，其余规则按噪声排序逐条放开。（此结论已被下面的后续切片取代。）
+**后续切片（`slice/web-no-floating-promises-1`）：已开启 `typescript/no-floating-promises`**（负责人决定：命中处在调用前写 `void`，不靠白名单）。
+- `web/package.json` 的 `lint` 改为 `oxlint --type-aware --max-warnings 0 .`；`oxlint-tsgolint` 精确 pin `7.0.2006` 成为直接 devDependency（MIT，2026-11-05 发布，满 7 天；只作为可选 peer 落在 `.pnpm` 下时 `oxlint --type-aware` 找不到它的可执行文件）。`.oxlintrc.json` 只新增这一条（error），其它类型感知规则一律不开；实测 `--type-aware` 不会隐式启用别的规则（探针里的 `no-misused-promises`、`no-base-to-string`、`require-await`、`no-for-in-array`、多余类型断言都不报）。
+- 白名单：**没有配** `allowForKnownSafeCalls`。当前 `web/src`、`web/e2e` 只 import `vitest` 和 `@playwright/test`（没有 `node:test`，上面抽样里的那批 `test(...)` 已不存在），它们的 `test`/`describe`/`it`/各 hook 返回 void，探针实测不命中，没有需要放行的函数；`navigate`、`invalidateQueries` 等业务 API 一律不进白名单。`e2e/` 不在 `tsconfig.json` 的 `include` 里，但同样拿到类型信息、在检查范围内。探针里没 `await` 的 `page.goto`、`expect(locator).toBeVisible()`、`test.step`、`expect.poll`、`expect(fn).toPass()`、vitest 的 `vi.waitFor`、`expect(p).resolves` 都报——它们不等就是真漏 `await`，不能放进白名单；`test.describe.configure` 也不报。
+  若以后某个测试框架函数开始返回 Promise，用 `{ "from": "package", "package": "<包名>", "name": ["<函数名>"] }` 加进 `allowForKnownSafeCalls`（实测 package specifier 能匹配方法名，例如 `@tanstack/query-core` 的 `invalidateQueries`）。
+- 命中处理：25 处，全部是故意不等的 fire-and-forget（`queryClient.invalidateQueries` 18 处、`navigate` 7 处），在调用前加 `void`，行为不变；没有发现真正漏 `await` 的 bug。`void` 不会吞错：`invalidateQueries` 不传 `throwOnError` 时返回的 promise 不因单个查询失败而 reject（query-core 5.107.1 `refetchQueries` 注释）；客户端 `navigate` 返回的 `_commitPromise` 只有 resolve（router-core 1.171.39 `commitLocation`），加载错误走路由的错误组件。这些调用之后的代码都不依赖刷新或导航完成。
+- 变异验证：去掉一处 `void` → lint 失败；临时把 `invalidateQueries` 放进白名单并去掉该处 `void` → 通过；白名单只放 `invalidateQueries` 时去掉一处 `navigate` 的 `void` 仍失败（测完已还原）。
+
+其余类型感知规则（`no-misused-promises`、`no-unnecessary-type-assertion`、`no-base-to-string`、`no-unsafe-assignment`、`require-await`）仍未开，按噪声排序逐条放开。
 
 **结论：迁了。** 规则等价（71 条逐条对应），差异见上两条，无门禁缺口。
 

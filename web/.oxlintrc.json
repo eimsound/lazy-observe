@@ -92,6 +92,10 @@
     "react/rules-of-hooks": "error",
     "react/exhaustive-deps": "error",
     // react-refresh 的 vite 预设。
-    "react/only-export-components": ["error", { "allowConstantExport": true, "allowCompoundComponents": true }]
+    "react/only-export-components": ["error", { "allowConstantExport": true, "allowCompoundComponents": true }],
+    // 类型感知规则（lint 脚本带 --type-aware，需要直接依赖 oxlint-tsgolint）。只开这一条，其它类型感知规则一律不开。
+    // 故意不等的 promise 在调用前写 `void`；不配 allowForKnownSafeCalls：vitest / Playwright 的 test、describe、
+    // it、各 hook 返回 void，不会命中，没有需要放行的函数。
+    "typescript/no-floating-promises": "error"
   }
 }

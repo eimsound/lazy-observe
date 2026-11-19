@@ -147,7 +147,7 @@ export function SilencesPage() {
         onConfirm={async () => {
           if (!deleting) return;
           await deleteSilence(deleting.id);
-          queryClient.invalidateQueries({ queryKey: ["silences"] });
+          void queryClient.invalidateQueries({ queryKey: ["silences"] });
           setDeleting(null);
         }}
       />
@@ -280,7 +280,7 @@ function SilenceFormDialog({
     mutationFn: (input: SilenceInput) =>
       editing ? updateSilence(editing.id, input) : createSilence(input),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["silences"] });
+      void queryClient.invalidateQueries({ queryKey: ["silences"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("alerts.silenceSaveError")),

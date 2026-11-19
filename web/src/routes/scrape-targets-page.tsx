@@ -205,7 +205,7 @@ export function ScrapeTargetsPage() {
         onConfirm={async () => {
           if (!deleting) return;
           await deleteScrapeTarget(deleting.id);
-          queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
+          void queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
           setDeleting(null);
         }}
       />
@@ -275,7 +275,7 @@ function TargetFormDialog({
     mutationFn: () =>
       editing ? updateScrapeTarget(editing.id, input) : createScrapeTarget(input),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
+      void queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("scrapeTargets.saveError")),

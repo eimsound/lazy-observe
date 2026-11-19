@@ -61,7 +61,7 @@ export function CommandPalette({
           keywords: `${t(item.labelKey)} ${item.to}`,
           action: () => {
             onOpenChange(false);
-            navigate({ to: item.to });
+            void navigate({ to: item.to });
           },
         });
       }
@@ -96,7 +96,7 @@ export function CommandPalette({
         keywords: "",
         action: () => {
           onOpenChange(false);
-          navigate({ to: "/traces/$traceID", params: { traceID: query.trim() } });
+          void navigate({ to: "/traces/$traceID", params: { traceID: query.trim() } });
         },
       });
     }

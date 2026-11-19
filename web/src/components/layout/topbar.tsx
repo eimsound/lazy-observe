@@ -53,7 +53,7 @@ export function Topbar() {
       setSignOutFailed(true);
       return;
     }
-    navigate({ to: "/login" });
+    void navigate({ to: "/login" });
   }
 
   return (
