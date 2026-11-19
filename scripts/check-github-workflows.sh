@@ -364,6 +364,43 @@ while IFS= read -r lock; do
     fail "$workspace must set minimumReleaseAge: $((min_release_age_days * 1440)) (MIN_RELEASE_AGE_DAYS=$min_release_age_days x 1440 minutes)"
 done < <(git ls-files --cached --others --exclude-standard -- '*pnpm-lock.yaml')
 
+# Python 侧同一个最小发布年龄：uv 的 exclude-newer 只在各 Python 工程的 pyproject.toml 的 [tool.uv] 里设，写成「N days」。
+# uv pip install、uv build 的构建后端解析都读它；缺了它 Python 依赖就不受最小发布年龄约束。
+while IFS= read -r manifest; do
+  grep -Eq '^\[tool\.uv\][[:space:]]*$' "$manifest" ||
+    fail "$manifest must have a [tool.uv] table with exclude-newer = \"$min_release_age_days days\" (MIN_RELEASE_AGE_DAYS=$min_release_age_days)"
+  grep -Eq "^exclude-newer[[:space:]]*=[[:space:]]*\"$min_release_age_days days\"[[:space:]]*(#.*)?$" "$manifest" ||
+    fail "$manifest must set exclude-newer = \"$min_release_age_days days\" under [tool.uv] (MIN_RELEASE_AGE_DAYS=$min_release_age_days)"
+done < <(git ls-files --cached --others --exclude-standard -- '*pyproject.toml')
+
+# SDK 发布 workflow 的 PyPI job 只用 uv（经 mise 引导）：不得出现 setup-python、pip、系统 Python，
+# 否则构建依赖绕过上面的最小发布年龄约束。id-token: write（PyPI trusted publishing）与按 SHA 固定的上传 action 必须保留。
+sdk_release=.github/workflows/sdk-release.yml
+if [[ -f $sdk_release ]]; then
+  sdk_release_python=$(release_job "$sdk_release" python | grep -vE '^[[:space:]]*#' || true)
+  [[ -n $sdk_release_python ]] || fail "$sdk_release: job python is missing"
+  if grep -Eq 'setup-python|pip[[:space:]]|pip3|[[:space:]]PYTHON:|python3?[[:space:]]+-m' <<<"$sdk_release_python"; then
+    fail "$sdk_release: the python job must not use actions/setup-python, pip, or a system Python (build with uv via mise)"
+  fi
+  [[ $sdk_release_python == *'run: bash scripts/ci-setup-mise.sh'* && $sdk_release_python == *'MISE_CI_PROFILE: sdk-python'* ]] ||
+    fail "$sdk_release: the python job must bootstrap uv with MISE_CI_PROFILE=sdk-python via scripts/ci-setup-mise.sh"
+  [[ $sdk_release_python == *'run: mise run sdk-python-release'* ]] ||
+    fail "$sdk_release: the python job must build with 'mise run sdk-python-release'"
+  [[ $sdk_release_python == *'id-token: write'* ]] ||
+    fail "$sdk_release: the python job must keep id-token: write (PyPI trusted publishing)"
+  [[ $sdk_release_python == *'uses: pypa/gh-action-pypi-publish@'* ]] ||
+    fail "$sdk_release: the python job must upload with pypa/gh-action-pypi-publish"
+fi
+sdk_publish=sdk/scripts/sdk-publish.sh
+if [[ -f $sdk_publish ]]; then
+  sdk_publish_python=$(sed -n '/^  python)$/,/^    ;;$/p' "$sdk_publish" | grep -vE '^[[:space:]]*#' || true)
+  [[ $sdk_publish_python == *'uv build --managed-python '* ]] ||
+    fail "$sdk_publish: the python branch must build with 'uv build --managed-python' (a bare uv build falls back to the system Python)"
+  if grep -Eq 'pip|python3?[[:space:]]+-m|PYTHON' <<<"${sdk_publish_python//sdk\/python/}"; then
+    fail "$sdk_publish: the python branch must not use pip, python -m, or a system Python"
+  fi
+fi
+
 # 手工固定点的年龄门禁与每周追踪：PR 门禁是 ci.yml 里的 pinned-releases job，追踪是定时 workflow。
 # issues: write 只留给追踪 workflow 的那一个 job，别的 workflow 不该拿到它。
 [[ $(release_job .github/workflows/ci.yml pinned-releases) == *'run: bash scripts/check-pinned-releases.sh --gate'* ]] ||
@@ -470,6 +507,13 @@ sdk_python_cells=$(awk '
 ' <<<"$sdk_python_block" | tr '\n' ' ')
 [[ $sdk_python_cells == '3.9=false 3.13=false 3.15=false 3.15t=false 3.16=true ' ]] ||
   fail "$ci: sdk-python matrix must be 3.9, 3.13, 3.15, 3.15t blocking (experimental: false) and only 3.16 experimental: true, got: $sdk_python_cells"
+
+# sdk-python 的 uv 包缓存：key 必须带矩阵解释器版本，否则各格互相覆盖、命中错误的缓存。
+grep -Eq '^[[:space:]]+path:[[:space:]]+~/\.cache/uv[[:space:]]*$' <<<"$sdk_python_block" ||
+  fail "$ci: sdk-python must cache ~/.cache/uv with actions/cache"
+uv_cache_key=$(grep -E '^[[:space:]]+key:[[:space:]]+uv-sdk-python-' <<<"$sdk_python_block" || true)
+[[ $uv_cache_key == *'${{ matrix.python }}'* && $uv_cache_key == *"hashFiles('sdk/python/pyproject.toml')"* && $uv_cache_key == *'runner.arch'* ]] ||
+  fail "$ci: the sdk-python uv cache key must include runner.arch, matrix.python and hashFiles('sdk/python/pyproject.toml'), got: ${uv_cache_key:-none}"
 
 # changes 作业输出的每个标志都要在 ci.yml 里声明为 job output。
 for flag in $(bash scripts/ci-changes.sh --all 2>/dev/null | sed -n 's/=.*//p'); do

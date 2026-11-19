@@ -36,3 +36,8 @@ include = ["lazyobserve*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 DJANGO_SETTINGS_MODULE = "tests.django_settings"
+
+[tool.uv]
+# 最小发布年龄 7 天，与 scripts/release-age.env 的 MIN_RELEASE_AGE_DAYS、pnpm minimumReleaseAge、Dependabot cooldown 一致；
+# uv 解析（uv pip install、uv build 的构建依赖）只取发布满 7 天的版本。
+exclude-newer = "7 days"

@@ -117,6 +117,17 @@ uv pip install --python .venv/bin/python -e ".[test]"
 Only 3.15t actually samples; on 3.9, 3.13 and the 3.15 GIL build the profiling tests check that the
 switch warns and samples nothing, and the real-sampler tests are skipped.
 
+`pyproject.toml` sets `[tool.uv] exclude-newer = "7 days"`: uv only resolves package versions that
+have been on PyPI for at least seven days, the same minimum release age as the repository's pnpm
+`minimumReleaseAge` and Dependabot `cooldown`. It applies to `uv pip install` and to the build
+backend that `uv build` resolves. Release artifacts are built the same way; the local dry run
+verifies the version in `pyproject.toml` against the tag and runs `uv build` with a uv-managed
+Python 3.13 (`--managed-python`, never the system interpreter) into `sdk/python/dist`:
+
+```sh
+SDK_TAG=sdk-python-v0.1.0 mise run sdk-python-release
+```
+
 To run the real-platform journey:
 
 ```sh

@@ -310,6 +310,19 @@ uv pip install --quiet --python .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest -q tests
 '''
 
+[tasks.sdk-python-release]
+description = "Verify the sdk-python-v* tag and build the PyPI sdist + wheel with uv (reads SDK_TAG and optional PUBLISH_FLAG from the environment)"
+# 发布路径与 sdk-python 一样只用 uv：不用 setup-python、系统 Python 与 pip；sdk/python/pyproject.toml 的
+# [tool.uv] exclude-newer 同样约束 uv build 的构建后端（setuptools）解析。由 .github/workflows/sdk-release.yml 的 python job 调用，
+# 本地 dry run：SDK_TAG=sdk-python-v0.1.0 mise run sdk-python-release
+tools.uv = "0.13.7"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+# PUBLISH_FLAG 故意不加引号：为空就是 dry run。
+bash sdk/scripts/sdk-publish.sh "${SDK_TAG:?SDK_TAG must be set, e.g. sdk-python-v0.1.0}" ${PUBLISH_FLAG:-}
+'''
+
 [tasks.sdk-journeys]
 description = "Start a real platform (temp data dir, free ports) and run the Go, Node, Python, and Browser SDK journeys against it"
 # build 带嵌入的前端（browser journey 要登录真实 UI）；sdk-python 准备 sdk/python/.venv。
