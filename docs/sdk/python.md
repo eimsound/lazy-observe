@@ -348,7 +348,10 @@ process-local total, and metrics-enabled clients export
 error events are counted with `signal="error"` and the reasons `queue_full`,
 `retry_exhausted` and `shutdown_budget` (events still queued or retrying when
 the `shutdown` budget runs out, or captured after `shutdown`), the same as the
-Go SDK. There is no disk spool.
+Go SDK. Once the budget has run out the queue starts no new request: neither
+the first attempt for a batch it already holds nor a retry whose delay has just
+ended. That batch is counted as `shutdown_budget` too; a request already in
+flight is left to finish. There is no disk spool.
 
 ## Parity matrix (Go/Fiber -> Python/Django+DRF)
 

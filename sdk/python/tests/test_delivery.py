@@ -207,3 +207,58 @@ def test_a_worker_blocked_on_an_empty_queue_still_stops_after_a_budget_spent_clo
     assert isinstance(err, TimeoutError)
     assert drops == [("shutdown_budget", 2)]
     assert queue._done.wait(5)  # the worker saw a sentinel and stopped
+
+
+def test_a_cancelled_queue_sends_nothing_and_counts_the_batch_as_shutdown_budget():
+    """Go checks ``runCtx.Err()`` before the first send. Once the budget is spent the batch
+    the worker picks up is dropped and counted, not sent as one last request."""
+    sent = []
+    drops = []
+    queue = DeliveryQueue(
+        send=lambda batch, _t: sent.append(list(batch)),
+        capacity=4,
+        batch_size=1,
+        flush_interval=0.01,
+        max_attempts=3,
+        warn=lambda reason, err, count: drops.append((reason, count)),
+    )
+    queue._cancel.set()  # the budget is already spent when the worker takes the batch
+    queue.enqueue("a")
+
+    err = queue.close(timeout=2.0)  # waits for the worker; no sleep on the clock
+    assert sent == []
+    assert drops == [("shutdown_budget", 1)]
+    assert queue.dropped() == 1
+    assert isinstance(err, TimeoutError)  # the spent budget, whoever reads the error first
+
+
+def test_a_retry_is_not_sent_when_the_queue_is_cancelled_while_waiting():
+    """Every attempt, not only the first, checks for cancellation before it sends."""
+    sent = []
+    drops = []
+
+    def sender(batch, _t):
+        sent.append(list(batch))
+        raise RuntimeError("boom")
+
+    queue = DeliveryQueue(
+        send=sender,
+        capacity=4,
+        batch_size=1,
+        flush_interval=0.01,
+        max_attempts=3,
+        retry_initial=0,
+        warn=lambda reason, err, count: drops.append((reason, count)),
+    )
+
+    def cancelled_during_the_wait(_delay):
+        queue._cancel.set()  # cancel lands as the delay ends: _wait still says "go on"
+        return True
+
+    queue._wait = cancelled_during_the_wait  # type: ignore[method-assign]
+    queue.enqueue("a")
+
+    assert queue._done.wait(5)
+    assert sent == [["a"]]  # the first attempt only; no second request after the cancel
+    assert drops == [("shutdown_budget", 1)]
+    assert queue.dropped() == 1
