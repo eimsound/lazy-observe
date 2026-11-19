@@ -18,7 +18,7 @@ set -euo pipefail
 # 本地测试：`printf '%s\n' a.go b.md | bash scripts/ci-changes.sh --stdin`，
 # 标志写到 stdout（以及 $GITHUB_OUTPUT，若设置）。见 scripts/ci-changes-test.sh。
 
-flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys pins)
 
 # ha：多副本 HA 功能门禁（mise run e2e-ha → scripts/e2e-multi-replica.sh，只做功能断言，
 # 不含 perf-ha 的性能部分）。它跑的是 build-binary 产出的服务端二进制、外置的 storage-bins
@@ -61,6 +61,20 @@ packaging_paths=(
   scripts/check-container-smoke.sh
 )
 
+# pins：手工固定点的「最小发布年龄」门禁（scripts/check-pinned-releases.sh --gate，要联网查 GitHub API，
+# 所以只在固定点本身变化时跑）。路径与 check-pinned-releases.sh 解析的文件一一对应：
+# Victoria 存储二进制、mise 引导版本、Trivy 版本（拆出 install-trivy.sh 前后各一个位置）、e2e 的 VM 集群镜像，
+# 以及脚本自身、测试用的年龄常量。它是叠加标志：不改变这些文件原有的分组。
+pinned_release_paths=(
+  scripts/download-storage-bins.sh
+  scripts/mise-release.env
+  scripts/check-image-vulns.sh
+  scripts/install-trivy.sh
+  scripts/e2e-multi-replica.sh
+  scripts/check-pinned-releases.sh
+  scripts/release-age.env
+)
+
 declare -A out=()
 for flag in "${flags[@]}"; do
   out[$flag]=false
@@ -93,12 +107,23 @@ matches_packaging() {
   return 1
 }
 
+matches_pinned_releases() {
+  local file=$1 pattern
+  for pattern in "${pinned_release_paths[@]}"; do
+    [[ $file == "$pattern" ]] && return 0
+  done
+  return 1
+}
+
 # classify FILE：把单个文件映射到改动面。没有命中任何已知分组的文件按全量处理。
 classify() {
   local file=$1
 
   if matches_packaging "$file"; then
     set_flags build arm64
+  fi
+  if matches_pinned_releases "$file"; then
+    set_flags pins
   fi
 
   case "$file" in

@@ -5,11 +5,22 @@
 # 覆盖面由 scripts/check-github-workflows.sh 校验：每个 go.mod、pnpm-lock.yaml、pyproject.toml、Dockerfile
 # 所在目录都必须有对应条目。
 #
+# cooldown 的天数与 scripts/release-age.env（MIN_RELEASE_AGE_DAYS）、各 pnpm 工程的 minimumReleaseAge 是同一个值，
+# 由 scripts/check-github-workflows.sh 校验一致；要改一起改。
+#
 # Dependabot 管不到、需要手工更新的固定点：
 #   - entc.mod / entc.sum（Ent 代码生成用的备用 modfile，Dependabot 只认 go.mod）；
 #   - mise.toml 里的工具版本（含 govulncheck）、scripts/ci-setup-mise.sh 的 go-ci 工具清单；
 #   - workflow 里 setup-buildx-action 的 BuildKit 镜像（driver-opts，带 digest）；
-#   - scripts/check-image-vulns.sh 的 Trivy 版本与 sha256、存储二进制与 e2e 容器镜像。
+#   - scripts/check-image-vulns.sh 的 Trivy 版本与 sha256（拆出 scripts/install-trivy.sh 之后在那里）、
+#     scripts/download-storage-bins.sh 的存储二进制、scripts/mise-release.env 的 mise 引导版本、
+#     scripts/e2e-multi-replica.sh 的 e2e 容器镜像（带 digest）。
+#
+# 其中 GitHub release 型固定点由 `mise run pinned-releases`（scripts/check-pinned-releases.sh）覆盖：
+#   - 覆盖：Victoria 三个存储二进制、e2e 的 VictoriaMetrics 集群镜像（按 tag 对应的 release 检查）、mise 引导版本、Trivy。
+#   - PR 门禁：这些文件变化时 ci.yml 的 pinned-releases job 跑 --gate，引用的 release 发布不满 cooldown 天数就失败；
+#   - 每周追踪：.github/workflows/pinned-releases.yml 跑 --report，有比当前更新且已满 cooldown 的版本就变红并更新 issue。
+#   - 暂未覆盖：BuildKit 与 e2e 其它镜像的 digest、mise.toml 工具版本、ci-setup-mise.sh 工具清单、entc.mod/entc.sum。
 version: 2
 updates:
   # SHA 固定的 action：Dependabot 同时改 40 位 SHA 和行尾的 `# vX.Y.Z` 注释。

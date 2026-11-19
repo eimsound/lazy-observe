@@ -6,7 +6,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 script="$root/scripts/ci-changes.sh"
-flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys pins)
 all="${flags[*]}"
 failures=0
 
@@ -62,7 +62,7 @@ expect 'deploy/helm/lazy-observe/values.yaml' 'go'
 expect 'config.example.yaml' 'go'
 
 # HA 门禁自身、它现场编译的辅助程序、读取的预算与存储二进制下载。
-expect 'scripts/e2e-multi-replica.sh' 'go e2e ha'
+expect 'scripts/e2e-multi-replica.sh' 'go e2e ha pins'
 expect 'scripts/e2e-path-router/main.go' 'go e2e ha'
 expect 'scripts/e2e-otlp-payload/main.go' 'go e2e ha'
 expect 'scripts/e2e-otlp-sink/main.go' 'go e2e ha'
@@ -73,14 +73,20 @@ expect '.gitignore' 'go'
 # Dependabot 配置与镜像扫描例外清单只影响 GitHub 服务和 release.yml，由 go job 的 workflow-check 校验。
 expect '.github/dependabot.yml' 'go'
 expect '.trivyignore.yaml' 'go'
-expect 'scripts/check-image-vulns.sh' 'go'
+expect 'scripts/check-image-vulns.sh' 'go pins'
+# 手工固定点：改动要触发 pins 门禁（联网查 release 发布时间）；门禁脚本自身、年龄常量同理，其测试只需 go。
+expect 'scripts/mise-release.env' 'go pins'
+expect 'scripts/install-trivy.sh' 'go pins'
+expect 'scripts/check-pinned-releases.sh' 'go pins'
+expect 'scripts/release-age.env' 'go pins'
+expect 'scripts/check-pinned-releases-test.sh' 'go'
 expect 'scripts/check-js-licenses.sh' 'web sdk_node sdk_browser'
 
 # 打包链路：加 arm64。
 expect 'go.mod' 'go build e2e ha meta_pg arm64 sdk_journeys'
 expect 'go.sum' 'go build e2e ha meta_pg arm64 sdk_journeys'
 expect 'internal/embed/bins/bins_linux_amd64.go' 'go build e2e ha arm64 sdk_journeys'
-expect 'scripts/download-storage-bins.sh' 'go build e2e ha arm64 sdk_journeys'
+expect 'scripts/download-storage-bins.sh' 'go build e2e ha arm64 sdk_journeys pins'
 expect 'scripts/prepare-web-assets.sh' 'go build e2e arm64 sdk_journeys'
 expect '.goreleaser.yaml' 'go build arm64'
 expect_matrix 'go.mod' '[{"arch":"amd64","runner":"ubuntu-24.04"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]'
