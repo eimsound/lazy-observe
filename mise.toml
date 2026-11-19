@@ -11,7 +11,7 @@ air = "1.67.1"
 "go:github.com/golangci/golines" = "0.15.0"
 
 [tasks.ent-generate]
-description = "Generate the ignored Ent client into internal/db/ent"
+description = "Regenerate the tracked Ent client in internal/db/ent from internal/db/schema"
 run = "bash scripts/generate-ent.sh"
 
 [tasks.dev-storage]
@@ -27,7 +27,7 @@ LO_STORAGE_BIN_DIR="$PWD/.cache/storage-bin/$platform" \
 
 [tasks.dev-backend]
 description = "Run the Go gateway and VM suite with Air live reload"
-depends = ["dev-storage", "ent-generate"]
+depends = ["dev-storage"]
 run = "air -c .air.toml"
 
 [tasks.dev-web]
@@ -46,7 +46,6 @@ run = "bash scripts/dev.sh"
 
 [tasks.build-binary]
 description = "Build the lazy-observe gateway"
-depends = ["ent-generate"]
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -119,12 +118,10 @@ done
 
 [tasks.test]
 description = "Run Go tests without CGO"
-depends = ["ent-generate"]
 run = "CGO_ENABLED=0 go test ./..."
 
 [tasks.vet]
 description = "Run go vet without CGO"
-depends = ["ent-generate"]
 run = "CGO_ENABLED=0 go vet ./..."
 
 [tasks.fmt-check]
@@ -154,7 +151,7 @@ CGO_ENABLED=0 go mod tidy -diff
 
 [tasks.lint]
 description = "Run golangci-lint v2.12.2 and the alert lease clock check"
-depends = ["ent-generate", "alert-lease-clock-check"]
+depends = ["alert-lease-clock-check"]
 tools."golangci-lint" = "2.12.2"
 # --allow-serial-runners: 并行 worktree 共用一份全局锁，拿不到锁时排队等待而不是以
 # "parallel golangci-lint is running" 退出。只影响等锁行为，不影响检查结果。
@@ -466,7 +463,6 @@ bash scripts/check-js-licenses.sh web
 
 [tasks.test-meta-pg]
 description = "Run PostgreSQL metadata tests against the current baseline"
-depends = ["ent-generate"]
 # embedded-postgres 现场从 Maven Central 下载 Postgres 归档（18.3.0，约 15 MB），默认缓存路径
 # 保持稳定，避免每次运行都重新下载；CI 用 actions/cache 缓存同一目录。
 # 命中缓存时不会有任何下载，设置 LO_TEST_PG_CACHE 到别处即换一个缓存目录。
@@ -483,27 +479,36 @@ fi
 
 [tasks.migration-check]
 description = "Validate the paired pre-release database baselines"
-depends = ["ent-generate"]
 run = '''
 bash scripts/check-migrations.sh
 CGO_ENABLED=0 go test ./internal/meta -run '^TestSingleBaselineSetsMatch$' -count=1
 '''
 
 [tasks.ent-generate-check]
-description = "Verify ignored Ent generation is atomic, deterministic, and migration-free"
+description = "Verify tracked Ent code matches the schema and generation is atomic, deterministic, and migration-free"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-before_modules=$(sha256sum go.mod go.sum entc.mod entc.sum)
-if [[ -n $(git ls-files internal/db/ent) ]]; then
-  printf 'internal/db/ent must not contain tracked files\n' >&2
-  exit 1
-fi
-bash scripts/generate-ent.sh
-git check-ignore -q internal/db/ent/client.go || {
-  printf 'internal/db/ent must remain ignored\n' >&2
-  exit 1
+# 已跟踪的生成代码必须等于生成器输出：工作区相对索引不得有改动、删除或未跟踪文件。
+# 生成前查一次拦住手改，生成后再查一次拦住 schema 改了却没重新生成。
+# 本地改了 schema 后先 `git add internal/db/ent` 再跑；CI 里索引即 HEAD。
+# git diff 看不到新增文件，另用 git ls-files --others（含被忽略的文件）兜住；
+# 只用 git，不依赖 release profile 里没装的 rg。
+require_ent_clean() {
+  local untracked
+  if ! git diff --exit-code --stat -- internal/db/ent >&2; then
+    printf 'internal/db/ent %s: run `mise run ent-generate` and commit the result\n' "$1" >&2
+    exit 1
+  fi
+  untracked=$(git ls-files --others -- internal/db/ent)
+  if [[ -n $untracked ]]; then
+    printf 'internal/db/ent %s: untracked files:\n%s\n' "$1" "$untracked" >&2
+    exit 1
+  fi
 }
+before_modules=$(sha256sum go.mod go.sum entc.mod entc.sum)
+require_ent_clean "differs from the index before generation"
+bash scripts/generate-ent.sh
 generated_before=$(find internal/db/ent -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
 failure_log=$(mktemp)
 trap 'rm -f "$failure_log"' EXIT
@@ -532,19 +537,18 @@ if [[ "$generated_before" != "$generated_after" ]]; then
   printf 'Ent generation is not deterministic\n' >&2
   exit 1
 fi
+require_ent_clean "is stale relative to internal/db/schema"
 rm -f "$failure_log"
 trap - EXIT
 '''
 
 [tasks.license-check]
 description = "Allow only Apache-2.0, MIT, and BSD licenses in the production Go package graph"
-depends = ["ent-generate"]
 tools."go:github.com/google/go-licenses/v2" = "2.0.1"
 run = "bash scripts/check-go-licenses.sh"
 
 [tasks.vulncheck]
 description = "Report reachable known vulnerabilities in the server module and the sdk/go module (govulncheck)"
-depends = ["ent-generate"]
 # 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
 # 漏洞库在运行时从 vuln.go.dev 拉取，所以结果会随新公告变化。
 tools."go:golang.org/x/vuln/cmd/govulncheck" = "1.9.0"
@@ -562,13 +566,11 @@ exit "$status"
 
 [tasks.third-party-notices]
 description = "Regenerate third_party/go/THIRD_PARTY_NOTICES.txt from the linked Go dependency graph"
-depends = ["ent-generate"]
 tools."go:github.com/google/go-licenses/v2" = "2.0.1"
 run = "bash scripts/third-party-notices.sh"
 
 [tasks.snapshot]
 description = "Build a local GoReleaser snapshot"
-depends = ["ent-generate"]
 tools.goreleaser = "2.17.0"
 run = "goreleaser release --snapshot --clean"
 

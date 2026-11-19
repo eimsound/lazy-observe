@@ -5,7 +5,6 @@
 /.cache/
 /lazy-observe
 /.pnpm-store/
-/internal/db/ent/
 /internal/db/.ent.tmp.*/
 /internal/db/.ent.previous.*/
 *.out

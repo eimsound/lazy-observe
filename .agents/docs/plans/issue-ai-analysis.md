@@ -20,7 +20,7 @@
 - `internal/meta/issues.go` 与 `internal/meta/issues_test.go` 已提供双方言 Issue 行为；`internal/meta/notification_outbox.go` 及其测试展示了 SQLite/PostgreSQL 的持久领取、过期恢复和条件结算模式，但通知领域的表和预算不能复用。
 - 旧告警路径遗留的 `LeaseLocker`/Redis lease 已因无生产调用且缺少续租语义而删除；Issue AI 必须按任务接管语义新建 owner-safe 续租 seam 与真实内存 TTL 测试实现。
 - `internal/ai/provider.go`、`client.go` 和 `stream.go` 已封装 Provider 调用与流；`web/src/components/ai/issue-ai-analysis-card.tsx`、`web/src/lib/api/issues.ts` 和 Issue 页面已提供展示入口。
-- Ent schema 位于 `internal/db/schema`；双方言可变基线位于 `internal/meta/migrations/001_baseline.sql` 与 `internal/meta/migrations/postgres/001_baseline.sql`；生成的 `internal/db/ent` 必须保持不被跟踪。
+- Ent schema 位于 `internal/db/schema`；双方言可变基线位于 `internal/meta/migrations/001_baseline.sql` 与 `internal/meta/migrations/postgres/001_baseline.sql`；生成的 `internal/db/ent` 纳入 git，改 schema 后用 `mise run ent-generate` 重新生成并一并提交。
 - 已核实的门禁包括 `mise run test`、`test-meta-pg`、`migration-check`、`ent-generate-check`、`fmt-check`、`vet`、`lint`、`web` 和 `e2e`。
 - 制定本计划时只运行了只读检索、文件阅读和文档检查，没有运行 Go、Web 或 E2E 测试。
 

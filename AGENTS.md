@@ -13,7 +13,7 @@
 - CI 入口是 mise tasks；测试命令变更时同步改 `mise.toml`。
 - 非生成的 Go 文件用 `golines -m 120 --chain-split-dots` 格式化（就地加 `-w`），不格式化 `internal/db/ent`。
 - 代码或查询语言的输入框、文本展示优先用 CodeMirror。
-- `internal/db/ent` 由 mise 生成，必须保持不被跟踪（schema 在 `internal/db/schema`）。
+- `internal/db/ent` 是生成代码并纳入 git：改 `internal/db/schema` 后运行 `mise run ent-generate`，与 schema 一并提交，不手改。
 - fencing/租约被拒（如 `meta.ErrStaleRuleFence`）不得静默丢弃：放弃结果的调用方至少 `slog.Warn`，带规则、成员和纪元；
   `errors.Is` 命中后直接 `return`/`continue` 不留日志算缺陷。
 - `alert_engine_members`、`alert_rule_leases` 读数据库时间只走 `alertClockSQL`/`alertLeaseExpiry`（ADR 0011）。

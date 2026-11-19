@@ -1,9 +1,9 @@
 # Metadata database
 
-The hand-written metadata service lives in this package. The tracked Ent model
-is in `internal/db/schema`; its generated client is written to the ignored
-`internal/db/ent` directory by `mise run ent-generate`. Generated Ent source is
-not stored in `internal/meta` and is not committed.
+The hand-written metadata service lives in this package. The Ent model is in
+`internal/db/schema`; its generated client is tracked in git under
+`internal/db/ent` and refreshed by `mise run ent-generate`. Generated Ent source
+is not stored in `internal/meta`.
 
 lazy-observe uses SQLite by default. Leave `meta.db_url` empty for the zero-configuration database at `data_dir/meta/lazy-observe.db`; this is the right choice for a single-node installation and keeps directory backup/restore simple. A custom SQLite file can be selected with `sqlite://path/to/meta.db`.
 
