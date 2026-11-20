@@ -353,3 +353,72 @@ func TestSaveIssueAnalysisConcurrencyAndRejectsStaleOverwrite(t *testing.T) {
 		}
 	})
 }
+
+func TestPostgresIssueWritesBypassProcessIssueMutexAndAvoidMultiDeltaDeadlock(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		p, err := store.CreateProject(ctx, "MultiDelta", "multi-delta")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		// Opposite-order multi-delta batches must not deadlock on PostgreSQL row locks.
+		var wg sync.WaitGroup
+		errs := make(chan error, 12)
+		for i := range 12 {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				a := errortrack.IssueDelta{
+					ProjectID: p.ID, Fingerprint: "fp-alpha", Title: "Alpha", Level: "error",
+					Count: 1, FirstSeen: now, LastSeen: now.Add(time.Duration(idx) * time.Millisecond),
+					LastEventID: fmt.Sprintf("a-%d", idx), AcceptedAt: now, AppliedAt: now,
+				}
+				b := errortrack.IssueDelta{
+					ProjectID: p.ID, Fingerprint: "fp-beta", Title: "Beta", Level: "error",
+					Count: 1, FirstSeen: now, LastSeen: now.Add(time.Duration(idx) * time.Millisecond),
+					LastEventID: fmt.Sprintf("b-%d", idx), AcceptedAt: now, AppliedAt: now,
+				}
+				batch := []errortrack.IssueDelta{a, b}
+				if idx%2 == 1 {
+					batch = []errortrack.IssueDelta{b, a}
+				}
+				_, runErr := store.ApplyIssueDeltas(ctx, batch)
+				errs <- runErr
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for runErr := range errs {
+			if runErr != nil {
+				t.Fatalf("concurrent multi-delta ApplyIssueDeltas failed: %v", runErr)
+			}
+		}
+		rows, err := store.ListIssues(ctx, p.ID, IssueListOptions{})
+		if err != nil || len(rows) != 2 || rows[0].Count != 12 || rows[1].Count != 12 {
+			t.Fatalf("multi-delta rows=%#v err=%v", rows, err)
+		}
+
+		// On PostgreSQL, holding the SQLite-only process mutex must not block issue writes.
+		if store.dialect == "postgres" {
+			store.issueMu.Lock()
+			defer store.issueMu.Unlock()
+			done := make(chan error, 1)
+			go func() {
+				_, runErr := store.ApplyIssueDeltas(ctx, []errortrack.IssueDelta{{
+					ProjectID: p.ID, Fingerprint: "fp-pg-unlocked", Title: "PGUnlocked", Level: "error",
+					Count: 1, FirstSeen: now, LastSeen: now, LastEventID: "pg-1", AcceptedAt: now, AppliedAt: now,
+				}})
+				done <- runErr
+			}()
+			select {
+			case runErr := <-done:
+				if runErr != nil {
+					t.Fatalf("PG ApplyIssueDeltas failed: %v", runErr)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("PostgreSQL ApplyIssueDeltas blocked on process-wide issueMu")
+			}
+		}
+	})
+}

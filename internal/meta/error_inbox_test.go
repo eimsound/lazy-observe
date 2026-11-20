@@ -372,3 +372,178 @@ func TestErrorInboxConcurrentRetryAndCompleteAvoidDeadlockAcrossDialects(t *test
 		}
 	})
 }
+
+func TestAcceptErrorEventsIdempotencyAndConflictOutsideStateLockAcrossDialects(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "IdemLock", "idem-lock")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		payload := []byte(`{"event_id":"idem-1"}`)
+		capacity := errortrack.InboxCapacity{MaxItems: 1, MaxBytes: 1 << 20}
+		entry := errortrack.InboxEntry{
+			ProjectID: project.ID, EventID: "idem-1", CanonicalDigest: "digest-a",
+			Payload: payload, PayloadBytes: int64(len(payload)), OccurredAt: now, AcceptedAt: now,
+		}
+		if err := store.AcceptErrorEvents(ctx, []errortrack.InboxEntry{entry}, capacity); err != nil {
+			t.Fatalf("initial accept: %v", err)
+		}
+		// Duplicate retry at full capacity must return nil without bumping rejections_total.
+		if err := store.AcceptErrorEvents(ctx, []errortrack.InboxEntry{entry}, capacity); err != nil {
+			t.Fatalf("duplicate retry at full capacity failed: %v", err)
+		}
+		// Conflicting digest at full capacity must return ErrConflict without bumping rejections_total.
+		conflict := entry
+		conflict.CanonicalDigest = "digest-b"
+		if err := store.AcceptErrorEvents(
+			ctx,
+			[]errortrack.InboxEntry{conflict},
+			capacity,
+		); !errors.Is(err, errortrack.ErrConflict) {
+			t.Fatalf("conflicting digest err=%v want ErrConflict", err)
+		}
+		summary, err := store.ErrorInboxSummary(ctx)
+		if err != nil || summary.ActiveItems != 1 || summary.RejectionsTotal != 0 {
+			t.Fatalf("summary after idempotent/conflict checks=%#v err=%v", summary, err)
+		}
+
+		// Concurrent identical & conflicting writes for a brand-new event ID must
+		// remain atomic, never produce unique-constraint errors, and count active_items once.
+		capacity.MaxItems = 10
+		var wg sync.WaitGroup
+		errs := make(chan error, 8)
+		for i := range 8 {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				digest := "same-digest"
+				if idx == 7 {
+					digest = "conflicting-digest"
+				}
+				p := []byte(`{"event_id":"race-1"}`)
+				errs <- store.AcceptErrorEvents(ctx, []errortrack.InboxEntry{{
+					ProjectID: project.ID, EventID: "race-1", CanonicalDigest: digest,
+					Payload: p, PayloadBytes: int64(len(p)), OccurredAt: now, AcceptedAt: now,
+				}}, capacity)
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		conflicts := 0
+		for runErr := range errs {
+			switch {
+			case runErr == nil:
+			case errors.Is(runErr, errortrack.ErrConflict):
+				conflicts++
+			default:
+				t.Fatalf("unexpected concurrent accept error: %v", runErr)
+			}
+		}
+		if conflicts == 0 {
+			t.Fatalf("expected at least one conflict error from conflicting concurrent writer")
+		}
+		summary, err = store.ErrorInboxSummary(ctx)
+		if err != nil || summary.ActiveItems != 2 {
+			t.Fatalf("summary after concurrent race=%#v want active_items=2 err=%v", summary, err)
+		}
+	})
+}
+
+func TestIssueLifecycleEventsPersistNewIssueAndRegressionAtomicallyAcrossDialects(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "LifecyclePG", "lifecycle-pg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		capacity := errortrack.InboxCapacity{MaxItems: 10, MaxBytes: 1 << 20}
+		acceptAndComplete := func(eventID string, at time.Time) []errortrack.IssueChange {
+			t.Helper()
+			p := []byte(fmt.Sprintf(`{"event_id":%q}`, eventID))
+			if err := store.AcceptErrorEvents(ctx, []errortrack.InboxEntry{{
+				ProjectID: project.ID, EventID: eventID, CanonicalDigest: "digest-" + eventID,
+				Payload: p, PayloadBytes: int64(len(p)), OccurredAt: at, AcceptedAt: at,
+			}}, capacity); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := store.ClaimErrorEvents(ctx, "worker-life", 1, at, time.Minute)
+			if err != nil || len(claimed) != 1 {
+				t.Fatalf("claim %s=%#v err=%v", eventID, claimed, err)
+			}
+			changes, err := store.CompleteErrorEvent(
+				ctx,
+				claimed[0].ID,
+				"worker-life",
+				claimed[0].ClaimEpoch,
+				errortrack.IssueDelta{
+					ProjectID: project.ID, Fingerprint: "fp-life", Title: "LifeErr", Level: "error",
+					Count: 1, FirstSeen: at, LastSeen: at, LastEventID: eventID,
+				},
+				at.Add(time.Second),
+			)
+			if err != nil {
+				t.Fatalf("complete %s: %v", eventID, err)
+			}
+			return changes
+		}
+
+		// First event creates new_issue and persists one lifecycle event.
+		firstChanges := acceptAndComplete("life-1", base)
+		if len(firstChanges) != 1 || firstChanges[0].Kind != "new_issue" {
+			t.Fatalf("firstChanges=%#v", firstChanges)
+		}
+		// Second event on open issue emits no lifecycle event.
+		if secondChanges := acceptAndComplete("life-2", base.Add(2*time.Second)); len(secondChanges) != 0 {
+			t.Fatalf("secondChanges=%#v want empty", secondChanges)
+		}
+		// Resolve, then emit a later event -> persists regression lifecycle event.
+		if _, err := store.SetIssueStatus(
+			ctx, project.ID, firstChanges[0].IssueID, "resolved", base.Add(5*time.Second),
+		); err != nil {
+			t.Fatal(err)
+		}
+		regChanges := acceptAndComplete("life-3", base.Add(10*time.Second))
+		if len(regChanges) != 1 || regChanges[0].Kind != "regression" {
+			t.Fatalf("regChanges=%#v", regChanges)
+		}
+
+		events, err := store.ClaimIssueLifecycleEvents(ctx, "dispatcher-1", 10, base.Add(15*time.Second), time.Minute)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("claimed lifecycle events=%#v err=%v", events, err)
+		}
+		if events[0].Kind != "new_issue" || events[1].Kind != "regression" ||
+			events[0].IssueID != firstChanges[0].IssueID || events[1].IssueID != firstChanges[0].IssueID {
+			t.Fatalf("unexpected lifecycle sequence=%#v", events)
+		}
+		// Verify fencing & retry/complete semantics on lifecycle events.
+		if err := store.RetryIssueLifecycleEvent(
+			ctx, events[0].ID, "dispatcher-1", events[0].ClaimEpoch,
+			base.Add(16*time.Second), base.Add(17*time.Second), "transient",
+		); err != nil {
+			t.Fatalf("retry lifecycle event: %v", err)
+		}
+		if err := store.CompleteIssueLifecycleEvent(
+			ctx, events[0].ID, "dispatcher-1", events[0].ClaimEpoch, base.Add(18*time.Second),
+		); !errors.Is(err, errortrack.ErrClaimLost) {
+			t.Fatalf("stale complete after retry err=%v want ErrClaimLost", err)
+		}
+		reclaimed, err := store.ClaimIssueLifecycleEvents(
+			ctx,
+			"dispatcher-2",
+			10,
+			base.Add(18*time.Second),
+			time.Minute,
+		)
+		if err != nil || len(reclaimed) != 1 || reclaimed[0].ID != events[0].ID || reclaimed[0].ClaimEpoch != 2 {
+			t.Fatalf("reclaimed=%#v err=%v", reclaimed, err)
+		}
+		if err := store.CompleteIssueLifecycleEvent(
+			ctx, reclaimed[0].ID, "dispatcher-2", reclaimed[0].ClaimEpoch, base.Add(19*time.Second),
+		); err != nil {
+			t.Fatalf("complete reclaimed lifecycle event: %v", err)
+		}
+	})
+}

@@ -11,7 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
@@ -335,5 +338,183 @@ func TestSymbolicateMatchesPathSuffixWithoutBasenameCollision(t *testing.T) {
 	}
 	if frames[2].Symbolicated || frames[2].Filename != "https://cdn.example/static/other/index.js" {
 		t.Fatalf("unrelated index.js collided with another directory: %#v", frames[2])
+	}
+}
+
+func TestSymbolicateNodePlatformFrames(t *testing.T) {
+	ctx := context.Background()
+	store, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join("testdata", "app.min.js.map"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	digest := hex.EncodeToString(sum[:])
+	if err := store.Put(ctx, RevisionKey("default", digest), bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := json.Marshal(map[string]string{
+		"kind":                 "content-addressed-v1",
+		"release":              "node-r1",
+		"file:dist/app.min.js": digest,
+	})
+	engine := New(store, 128)
+	line, col := 1, 37
+	event := errortrack.Event{
+		Platform: "node",
+		Release:  "node-r1",
+		Exception: errortrack.Exception{
+			Stacktrace: errortrack.Stacktrace{
+				Frames: []errortrack.Frame{
+					{Function: "run", Filename: "file:///srv/app/dist/app.min.js", Lineno: &line, Colno: &col},
+					{Function: "handler", Filename: "/srv/app/dist/app.min.js", Lineno: &line, Colno: &col},
+					{
+						Function: "processTicks",
+						Filename: "node:internal/process/task_queues",
+						Lineno:   &line,
+						Colno:    &col,
+					},
+				},
+			},
+		},
+	}
+	got, err := engine.Symbolicate(ctx, "default", snapshot, event)
+	if err != nil {
+		t.Fatalf("node Symbolicate error: %v", err)
+	}
+	frames := got.Exception.Stacktrace.Frames
+	for _, idx := range []int{0, 1} {
+		if !frames[idx].Symbolicated || frames[idx].Filename != "lazy-observe-original.js" ||
+			frames[idx].Lineno == nil || *frames[idx].Lineno != 3 ||
+			frames[idx].Colno == nil || *frames[idx].Colno != 12 {
+			t.Fatalf("node frame[%d] = %#v", idx, frames[idx])
+		}
+	}
+	if frames[2].Symbolicated || frames[2].Filename != "node:internal/process/task_queues" {
+		t.Fatalf("node internal frame unexpectedly changed: %#v", frames[2])
+	}
+
+	// Non-JS/Node platforms remain untouched.
+	goEvent := event
+	goEvent.Platform = "go"
+	unchanged, err := engine.Symbolicate(ctx, "default", snapshot, goEvent)
+	if err != nil {
+		t.Fatalf("go platform error: %v", err)
+	}
+	if unchanged.Exception.Stacktrace.Frames[0].Symbolicated {
+		t.Fatalf("non-JS/Node platform unexpectedly symbolicated: %#v", unchanged)
+	}
+}
+
+type blockingCountBlobStore struct {
+	data    []byte
+	started chan struct{}
+	release chan struct{}
+	gets    atomic.Int64
+}
+
+func (s *blockingCountBlobStore) Put(context.Context, string, io.Reader) error { return nil }
+func (s *blockingCountBlobStore) Get(ctx context.Context, _ string) (io.ReadCloser, error) {
+	s.gets.Add(1)
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+		return io.NopCloser(bytes.NewReader(s.data)), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (s *blockingCountBlobStore) List(context.Context, string) ([]blob.Object, error) {
+	return nil, nil
+}
+func (s *blockingCountBlobStore) Delete(context.Context, string) error       { return nil }
+func (s *blockingCountBlobStore) DeletePrefix(context.Context, string) error { return nil }
+
+func TestSymbolicateSingleflightDeduplicatesConcurrentLoadsAndSurvivesLeaderCancel(t *testing.T) {
+	rawMap := []byte(`{"version":3,"sources":["src/server.ts"],"names":["handle"],"mappings":"AAAAA"}`)
+	sum := sha256.Sum256(rawMap)
+	digest := hex.EncodeToString(sum[:])
+	snapshot, _ := json.Marshal(map[string]string{
+		"kind":               "content-addressed-v1",
+		"release":            "r-sf",
+		"file:dist/index.js": digest,
+	})
+	blobs := &blockingCountBlobStore{
+		data:    rawMap,
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	engine := New(blobs, 128)
+	line, col := 1, 0
+	mkEvent := func() errortrack.Event {
+		return errortrack.Event{
+			Platform: "node",
+			Release:  "r-sf",
+			Exception: errortrack.Exception{
+				Stacktrace: errortrack.Stacktrace{
+					Frames: []errortrack.Frame{
+						{Function: "x", Filename: "/app/dist/index.js", Lineno: &line, Colno: &col},
+					},
+				},
+			},
+		}
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := engine.Symbolicate(leaderCtx, "default", snapshot, mkEvent())
+		leaderDone <- err
+	}()
+	select {
+	case <-blobs.started:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not start blob load")
+	}
+
+	const followers = 6
+	var wg sync.WaitGroup
+	followerResults := make(chan errortrack.Event, followers)
+	followerErrs := make(chan error, followers)
+	for range followers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := engine.Symbolicate(context.Background(), "default", snapshot, mkEvent())
+			if err != nil {
+				followerErrs <- err
+				return
+			}
+			followerResults <- got
+		}()
+	}
+	// Give followers a moment to join the inflight singleflight call, then cancel leader.
+	time.Sleep(20 * time.Millisecond)
+	cancelLeader()
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader err=%v want context.Canceled", err)
+	}
+	close(blobs.release)
+	wg.Wait()
+	close(followerErrs)
+	close(followerResults)
+
+	for err := range followerErrs {
+		t.Fatalf("follower failed after leader cancel: %v", err)
+	}
+	for got := range followerResults {
+		frame := got.Exception.Stacktrace.Frames[0]
+		if !frame.Symbolicated || frame.Filename != "src/server.ts" || frame.Function != "handle" {
+			t.Fatalf("follower frame=%#v", frame)
+		}
+	}
+	if gets := blobs.gets.Load(); gets != 1 {
+		t.Fatalf("blobs.Get calls=%d want 1 (singleflight deduplication)", gets)
 	}
 }

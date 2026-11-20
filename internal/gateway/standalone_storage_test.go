@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -118,7 +117,7 @@ func TestStandaloneStorageRoutesQueriesWritesAndTenantsThroughBackend(t *testing
 		{"metrics-query", http.MethodGet, "/api/v1/query"},
 		{"metrics-ingest", http.MethodPost, "/opentelemetry/v1/metrics"},
 		{"metrics-ingest", http.MethodPost, "/api/v1/write"},
-		{"metrics-ingest", http.MethodPost, "/api/v1/import/prometheus"},
+		{"metrics-ingest", http.MethodPost, "/api/v1/write"},
 		{"logs", http.MethodPost, "/insert/opentelemetry/v1/logs"},
 		{"logs", http.MethodGet, "/select/logsql/query"},
 		{"traces", http.MethodPost, "/insert/opentelemetry/v1/traces"},
@@ -164,8 +163,28 @@ func TestStandaloneStorageRoutesQueriesWritesAndTenantsThroughBackend(t *testing
 		labels[1].Value != "alpha" {
 		t.Errorf("remote-write labels=%v", labels)
 	}
-	if !bytes.Contains([]byte(got[3].body), []byte(`web_vitals_lcp{project_id="alpha",page="/checkout"}`)) {
-		t.Errorf("Web Vitals write body=%q", got[3].body)
+	if got[3].contentType != "application/x-protobuf" || got[3].contentEncoding != "snappy" ||
+		got[3].remoteWriteVersion != "0.1.0" {
+		t.Errorf("Web Vitals Prometheus remote-write headers=%#v", got[3])
+	}
+	vitalsDecoded, err := snappy.Decode(nil, []byte(got[3].body))
+	if err != nil {
+		t.Fatalf("decode Web Vitals remote-write body: %v", err)
+	}
+	var vitalsWrite prompb.WriteRequest
+	if err := vitalsWrite.Unmarshal(vitalsDecoded); err != nil {
+		t.Fatalf("unmarshal Web Vitals remote-write body: %v", err)
+	}
+	if len(vitalsWrite.Timeseries) != 1 {
+		t.Fatalf("Web Vitals remote-write timeseries=%#v", vitalsWrite.Timeseries)
+	}
+	vitalsLabels := make(map[string]string, len(vitalsWrite.Timeseries[0].Labels))
+	for _, lbl := range vitalsWrite.Timeseries[0].Labels {
+		vitalsLabels[lbl.Name] = lbl.Value
+	}
+	if vitalsLabels["__name__"] != "web_vitals_lcp" || vitalsLabels["project_id"] != "alpha" ||
+		vitalsLabels["page"] != "/checkout" {
+		t.Errorf("Web Vitals remote-write labels=%v", vitalsLabels)
 	}
 	for _, i := range []int{4, 5, 6, 7} {
 		if got[i].accountID != "0" || got[i].projectID != "42" {

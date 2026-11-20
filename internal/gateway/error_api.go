@@ -21,6 +21,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -34,11 +35,14 @@ const (
 	maxVitalsBatchSize             = 100
 	maxVitalPageBytes              = 256
 	maxVitalsDistinctPagesPerBatch = 32
+
+	defaultIssueTrendTimeout = 2 * time.Second
 )
 
 var (
 	minMetricTimestamp = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	maxMetricTimestamp = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	issueTrendTimeout  = defaultIssueTrendTimeout
 )
 
 type errorEnvelope struct {
@@ -132,7 +136,7 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 			JSON(fiber.Map{"error": fmt.Sprintf("vitals batch exceeds %d items", maxVitalsBatchSize)})
 	}
 	project := currentProject(c)
-	var samples strings.Builder
+	samples := make([]storage.MetricSample, 0, len(body.Vitals))
 	// Unknown metric names are a forward-compatibility signal (a newer SDK knows a
 	// vital this server does not), not a malformed batch: skip and count them so the
 	// known metrics in the same batch still land. Structural problems stay fatal for
@@ -166,15 +170,15 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 			skipped++
 			continue
 		}
-		fmt.Fprintf(
-			&samples,
-			"web_vitals_%s{project_id=%s,page=%s} %s %d\n",
-			name,
-			formatPromLabelValue(project.Slug),
-			formatPromLabelValue(page),
-			strconv.FormatFloat(vital.Value, 'g', -1, 64),
-			timestamp.UnixMilli(),
-		)
+		samples = append(samples, storage.MetricSample{
+			Name: "web_vitals_" + name,
+			Labels: []storage.MetricLabel{
+				{Name: "project_id", Value: project.Slug},
+				{Name: "page", Value: page},
+			},
+			Value:     vital.Value,
+			Timestamp: timestamp,
+		})
 	}
 	if skipped > 0 {
 		g.logger.Warn(
@@ -185,8 +189,8 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 			"names", skippedNames.String(),
 		)
 	}
-	if samples.Len() > 0 {
-		if err := g.importPrometheusSamples(c.Context(), samples.String()); err != nil {
+	if len(samples) > 0 {
+		if err := g.writeMetricSamples(c.Context(), samples); err != nil {
 			return err
 		}
 	}
@@ -280,7 +284,7 @@ func (g *Gateway) sdkDiagnosticsIngest(c fiber.Ctx) error {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid SDK diagnostics batch"})
 	}
 	project := currentProject(c)
-	var samples strings.Builder
+	samples := make([]storage.MetricSample, 0, len(body.Measurements))
 	// Unknown signal/reason values are a forward-compatibility signal (a newer SDK knows
 	// a diagnostic this server does not), not a malformed batch: skip and count them so
 	// the known measurements in the same batch still land. Structural problems (missing
@@ -317,17 +321,18 @@ func (g *Gateway) sdkDiagnosticsIngest(c fiber.Ctx) error {
 		// Browser diagnostics report per-batch drop deltas rather than a
 		// monotonic cumulative OTel counter, so they use a dedicated _delta
 		// metric name to avoid corrupting cumulative counter queries.
-		fmt.Fprintf(
-			&samples,
-			"lazy_observe_sdk_dropped_telemetry_delta{project_id=%s,service_name=%s,"+
-				"sdk_language=\"browser\",signal=%s,reason=%s} %d %d\n",
-			formatPromLabelValue(project.Slug),
-			formatPromLabelValue(measurement.Service),
-			formatPromLabelValue(measurement.Signal),
-			formatPromLabelValue(measurement.Reason),
-			measurement.Dropped,
-			timestamp.UnixMilli(),
-		)
+		samples = append(samples, storage.MetricSample{
+			Name: "lazy_observe_sdk_dropped_telemetry_delta",
+			Labels: []storage.MetricLabel{
+				{Name: "project_id", Value: project.Slug},
+				{Name: "service_name", Value: measurement.Service},
+				{Name: "sdk_language", Value: "browser"},
+				{Name: "signal", Value: measurement.Signal},
+				{Name: "reason", Value: measurement.Reason},
+			},
+			Value:     float64(measurement.Dropped),
+			Timestamp: timestamp,
+		})
 	}
 	if skipped > 0 {
 		g.logger.Warn(
@@ -339,8 +344,8 @@ func (g *Gateway) sdkDiagnosticsIngest(c fiber.Ctx) error {
 			"reasons", skippedReasons.String(),
 		)
 	}
-	if samples.Len() > 0 {
-		if err := g.importPrometheusSamples(c.Context(), samples.String()); err != nil {
+	if len(samples) > 0 {
+		if err := g.writeMetricSamples(c.Context(), samples); err != nil {
 			return err
 		}
 	}
@@ -376,23 +381,8 @@ func validSDKDiagnosticReason(value string) bool {
 	return false
 }
 
-func (g *Gateway) importPrometheusSamples(ctx context.Context, samples string) error {
-	path := "/api/v1/import/prometheus"
-	if g.storage.MetricsClustered() {
-		path = "/prometheus" + path
-	}
-	target := strings.TrimRight(g.storage.MetricsIngestBase(), "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(samples))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "text/plain")
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return fiber.NewError(http.StatusBadGateway, err.Error())
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
+func (g *Gateway) writeMetricSamples(ctx context.Context, samples []storage.MetricSample) error {
+	if err := storage.WriteMetricSamples(ctx, g.storage, g.client, samples); err != nil {
 		return fiber.NewError(http.StatusBadGateway, "metrics import failed")
 	}
 	return nil
@@ -406,32 +396,8 @@ func validVitalName(name string) bool {
 	return false
 }
 
-// formatPromLabelValue formats a Prometheus text exposition label value using
-// only the three escapes allowed by the Prometheus exposition spec (\, ", \n),
-// preventing Go-only strconv.Quote escapes (\t, \r, \x.., \u....) from causing
-// VictoriaMetrics 400 -> Gateway 502 rejections.
 func formatPromLabelValue(value string) string {
-	valid := strings.ToValidUTF8(value, "\ufffd")
-	var b strings.Builder
-	b.Grow(len(valid) + 2)
-	b.WriteByte('"')
-	for i := 0; i < len(valid); i++ {
-		switch valid[i] {
-		case '\\':
-			b.WriteString(`\\`)
-		case '"':
-			b.WriteString(`\"`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			// Prometheus text format does not define \r escaping; strip CR so
-			// it cannot split the line exposition record.
-		default:
-			b.WriteByte(valid[i])
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
+	return storage.FormatPromLabelValue(value)
 }
 
 func normalizeVitalPage(raw string) (string, bool) {
@@ -700,7 +666,13 @@ func (g *Gateway) listIssues(c fiber.Ctx) error {
 	}
 	trends, err := g.queryIssueTrends(c.Context(), project.ID, issues)
 	if err != nil {
-		return fiber.NewError(http.StatusBadGateway, err.Error())
+		g.logger.Warn(
+			"degrade issue list trends after VLogs query failure",
+			"project_id", project.ID,
+			"issues", len(issues),
+			"error", err,
+		)
+		trends = emptyIssueTrends(issues)
 	}
 	result := make([]issueSummaryDTO, 0, len(issues))
 	for _, row := range issues {
@@ -727,7 +699,13 @@ func (g *Gateway) getIssue(c fiber.Ctx) error {
 	}
 	trends, err := g.queryIssueTrends(c.Context(), currentProject(c).ID, []meta.IssueView{row})
 	if err != nil {
-		return fiber.NewError(http.StatusBadGateway, err.Error())
+		g.logger.Warn(
+			"degrade issue detail trends after VLogs query failure",
+			"project_id", currentProject(c).ID,
+			"issue_id", row.ID,
+			"error", err,
+		)
+		trends = emptyIssueTrends([]meta.IssueView{row})
 	}
 	summaries := make([]issueEventSummaryDTO, 0, len(events))
 	for _, event := range events {
@@ -871,6 +849,7 @@ func (g *Gateway) queryIssueEvents(c fiber.Ctx, fingerprint, eventID string, lim
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("VLogs query status %d", resp.StatusCode)
 	}
 	result := make([]issueEventDTO, 0)
@@ -983,20 +962,33 @@ type issueTrendRangeResponse struct {
 	} `json:"data"`
 }
 
+func emptyIssueTrends(rows []meta.IssueView) map[string][]int64 {
+	result := make(map[string][]int64, len(rows))
+	for _, row := range rows {
+		result[row.Fingerprint] = make([]int64, issueTrendBuckets)
+	}
+	return result
+}
+
 func (g *Gateway) queryIssueTrends(
 	ctx context.Context,
 	projectID int,
 	rows []meta.IssueView,
 ) (map[string][]int64, error) {
-	result := make(map[string][]int64, len(rows))
+	result := emptyIssueTrends(rows)
 	filters := make([]string, 0, len(rows))
 	for _, row := range rows {
-		result[row.Fingerprint] = make([]int64, issueTrendBuckets)
 		filters = append(filters, strconv.Quote(row.Fingerprint))
 	}
 	if len(filters) == 0 {
 		return result, nil
 	}
+	timeout := issueTrendTimeout
+	if timeout <= 0 {
+		timeout = defaultIssueTrendTimeout
+	}
+	trendCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	now := g.now().UTC()
 	today := now.Truncate(24 * time.Hour)
 	firstDay := today.Add(-(issueTrendBuckets - 1) * 24 * time.Hour)
@@ -1009,7 +1001,7 @@ func (g *Gateway) queryIssueTrends(
 		"end":   []string{end.Format(time.RFC3339Nano)},
 		"step":  []string{"24h"},
 	}.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	req, err := http.NewRequestWithContext(trendCtx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1020,6 +1012,7 @@ func (g *Gateway) queryIssueTrends(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("VLogs stats_query_range status %d", resp.StatusCode)
 	}
 	var payload issueTrendRangeResponse

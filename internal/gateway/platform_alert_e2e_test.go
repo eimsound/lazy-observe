@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/alert"
+	"github.com/eimsound/lazy-observe/internal/errortrack"
+	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
@@ -218,5 +220,144 @@ func TestPlatformAlertPipelineRealStore(t *testing.T) {
 	issue, err := store.GetIssue(ctx, project.ID, issueID)
 	if err != nil || issue.Status != "open" || issue.RegressedAt == nil {
 		t.Fatalf("persisted regression=%#v err=%v", issue, err)
+	}
+}
+
+func TestDurableIssueLifecycleSurvivesCrashAndDeduplicatesRedelivery(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	project, err := store.CreateProject(ctx, "DurableAlert", "durable-alert")
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifications := make(chan alert.Notification, 8)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var n alert.Notification
+		if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		notifications <- n
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer webhook.Close()
+	logs := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+	)
+	defer logs.Close()
+
+	alerts := alert.NewService(alert.Config{
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		// Use a long GroupWait to prove issue lifecycle events are durably enqueued
+		// to notification_outbox synchronously without waiting on an in-memory timer.
+		GroupWait:      time.Hour,
+		RepeatInterval: time.Hour,
+	})
+	defer alerts.Close()
+	channel, err := alerts.CreateChannel(
+		ctx,
+		alert.ChannelInput{Type: "webhook", Name: "durable-hook", Config: map[string]any{"url": webhook.URL}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := alerts.PutProjectAlertConfig(ctx, project.ID, alert.ProjectAlertConfigInput{
+		NewIssue:   true,
+		Regression: true,
+		ChannelIDs: []int{channel.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate worker 1 committing CompleteErrorEvent and crashing before dispatching
+	// any lifecycle alert (OnChange == nil).
+	writer := &blockedErrorWriter{started: make(chan struct{}, 1), release: make(chan struct{})}
+	close(writer.release)
+	first, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	event := errortrack.Event{
+		EventID:   "crash-new-1",
+		Timestamp: now,
+		Platform:  "go",
+		Level:     "error",
+		Exception: errortrack.Exception{
+			Type:  "CrashSafeError",
+			Value: "must not drop alert",
+			Stacktrace: errortrack.Stacktrace{
+				Frames: []errortrack.Frame{{Function: "svc.Run", Filename: "svc.go", InApp: true}},
+			},
+		},
+	}
+	raw, _ := json.Marshal(event)
+	if err := first.Accept(
+		ctx,
+		errortrack.Project{ID: project.ID, Slug: project.Slug},
+		[]errortrack.AcceptedEvent{{Raw: raw, Event: event}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		diag, diagErr := first.Diagnostics(ctx)
+		if diagErr != nil {
+			t.Fatal(diagErr)
+		}
+		if diag.ActiveItems == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("first inbox did not complete event: %#v", diag)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := first.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Worker 2 restarts with alerts.HandleIssueChange and delivers the persisted
+	// lifecycle event immediately into notification_outbox despite GroupWait=1h.
+	var deliveredChange errortrack.IssueChange
+	second, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		PollInterval: time.Millisecond,
+		OnChange: func(cbCtx context.Context, change errortrack.IssueChange) error {
+			deliveredChange = change
+			return alerts.HandleIssueChange(cbCtx, change)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close(context.Background()) }()
+
+	select {
+	case n := <-notifications:
+		if n.Rule != "new_issue" || len(n.Alerts) != 1 ||
+			n.Alerts[0].Annotations["title"] != "CrashSafeError: must not drop alert" {
+			t.Fatalf("recovered notification=%#v", n)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for recovered durable lifecycle alert")
+	}
+	if deliveredChange.LifecycleID <= 0 {
+		t.Fatalf("expected non-zero LifecycleID on recovered change, got %#v", deliveredChange)
+	}
+
+	// Redelivering the exact same LifecycleID (simulating crash between outbox enqueue
+	// and CompleteIssueLifecycleEvent) must deduplicate in notification_outbox.
+	if err := alerts.HandleIssueChange(ctx, deliveredChange); err != nil {
+		t.Fatalf("idempotent redelivery failed: %v", err)
+	}
+	outboxRows, err := store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{
+		ProjectID: project.ID,
+		Limit:     10,
+	})
+	if err != nil || len(outboxRows) != 1 {
+		t.Fatalf("expected exactly 1 deduplicated outbox row, got %#v err=%v", outboxRows, err)
 	}
 }

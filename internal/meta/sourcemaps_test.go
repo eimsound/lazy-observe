@@ -112,3 +112,83 @@ func TestUpsertSourceMapArtifactsAtomicQuotaAndConcurrentUpsert(t *testing.T) {
 		}
 	})
 }
+
+func TestListSourceMapReleasesSQLPushdownAggregationAndLimit(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		p1, err := store.CreateProject(ctx, "ReleasesOne", "releases-one")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p2, err := store.CreateProject(ctx, "ReleasesTwo", "releases-two")
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+		// Release v1: 2 files, newest at base+1m, total size 300.
+		if err := store.UpsertSourceMapArtifact(
+			ctx, p1.ID, "v1", "a.js", 100, strings.Repeat("1", 64), base,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertSourceMapArtifact(
+			ctx, p1.ID, "v1", "b.js", 200, strings.Repeat("2", 64), base.Add(time.Minute),
+		); err != nil {
+			t.Fatal(err)
+		}
+		// Release v2: 1 file at base+3m, size 500.
+		if err := store.UpsertSourceMapArtifact(
+			ctx, p1.ID, "v2", "app.js", 500, strings.Repeat("3", 64), base.Add(3*time.Minute),
+		); err != nil {
+			t.Fatal(err)
+		}
+		// Release v3: 3 files, newest at base+2m, total size 60.
+		for idx := range 3 {
+			if err := store.UpsertSourceMapArtifact(
+				ctx,
+				p1.ID,
+				"v3",
+				fmt.Sprintf("chunk-%d.js", idx),
+				20,
+				strings.Repeat("4", 64),
+				base.Add(2*time.Minute),
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Other project release must remain isolated.
+		if err := store.UpsertSourceMapArtifact(
+			ctx, p2.ID, "other-rel", "x.js", 999, strings.Repeat("5", 64), base.Add(10*time.Minute),
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		all, err := store.ListSourceMapReleases(ctx, p1.ID, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(all) != 3 {
+			t.Fatalf("len(all)=%d want 3: %#v", len(all), all)
+		}
+		if all[0].Release != "v2" || all[0].Files != 1 || all[0].Size != 500 ||
+			!all[0].CreatedAt.Equal(base.Add(3*time.Minute)) {
+			t.Fatalf("all[0]=%#v", all[0])
+		}
+		if all[1].Release != "v3" || all[1].Files != 3 || all[1].Size != 60 ||
+			!all[1].CreatedAt.Equal(base.Add(2*time.Minute)) {
+			t.Fatalf("all[1]=%#v", all[1])
+		}
+		if all[2].Release != "v1" || all[2].Files != 2 || all[2].Size != 300 ||
+			!all[2].CreatedAt.Equal(base.Add(time.Minute)) {
+			t.Fatalf("all[2]=%#v", all[2])
+		}
+
+		limited, err := store.ListSourceMapReleases(ctx, p1.ID, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(limited) != 2 || limited[0].Release != "v2" || limited[1].Release != "v3" {
+			t.Fatalf("limited=%#v", limited)
+		}
+	})
+}
