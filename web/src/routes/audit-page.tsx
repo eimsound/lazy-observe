@@ -5,10 +5,18 @@ import { ChevronLeft, ChevronRight, History, ShieldAlert, ShieldCheck } from "lu
 import { listAudit, type AuditEvent } from "@/lib/api/audit";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { canManageUsers } from "@/lib/auth/permissions";
+import {
+  INITIAL_CURSOR_PAGINATION,
+  canGoBackCursor,
+  popCursorPage,
+  pushCursorPage,
+  type CursorPaginationState,
+} from "@/lib/cursor-pagination";
 import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -22,18 +30,30 @@ export function AuditPage() {
   const { role } = useAuth();
   const [action, setAction] = useState("");
   const [actor, setActor] = useState("");
-  const [before, setBefore] = useState<number | undefined>(undefined);
-  const [history, setHistory] = useState<number[]>([]);
+  const [pagination, setPagination] = useState<CursorPaginationState>(INITIAL_CURSOR_PAGINATION);
 
   const audit = useQuery({
-    queryKey: ["audit", { action: action.trim() || undefined, actor: actor.trim() || undefined, before }],
+    queryKey: [
+      "audit",
+      {
+        action: action.trim() || undefined,
+        actor: actor.trim() || undefined,
+        before: pagination.before,
+      },
+    ],
     queryFn: ({ signal }) =>
       listAudit(
-        { action: action.trim() || undefined, actor: actor.trim() || undefined, before_id: before, limit: PAGE_SIZE },
+        {
+          action: action.trim() || undefined,
+          actor: actor.trim() || undefined,
+          before_id: pagination.before,
+          limit: PAGE_SIZE,
+        },
         signal,
       ),
     placeholderData: keepPreviousData,
     enabled: canManageUsers(role),
+    retry: false,
   });
 
   if (!canManageUsers(role)) {
@@ -55,16 +75,12 @@ export function AuditPage() {
   const events: AuditEvent[] = audit.data ?? [];
   const hasMore = events.length === PAGE_SIZE;
   const goBack = () => {
-    const previous = history[history.length - 1];
-    if (previous === undefined) return;
-    setHistory((items) => items.slice(0, -1));
-    setBefore(previous);
+    setPagination((prev) => popCursorPage(prev));
   };
   const goForward = () => {
     const oldest = events[events.length - 1];
     if (!oldest) return;
-    setHistory((items) => (before === undefined ? [] : [...items, before]));
-    setBefore(oldest.id);
+    setPagination((prev) => pushCursorPage(prev, oldest.id));
   };
 
   return (
@@ -75,8 +91,7 @@ export function AuditPage() {
           value={action}
           onChange={(event) => {
             setAction(event.target.value);
-            setBefore(undefined);
-            setHistory([]);
+            setPagination(INITIAL_CURSOR_PAGINATION);
           }}
           placeholder={t("audit.filterAction")}
         />
@@ -85,8 +100,7 @@ export function AuditPage() {
           value={actor}
           onChange={(event) => {
             setActor(event.target.value);
-            setBefore(undefined);
-            setHistory([]);
+            setPagination(INITIAL_CURSOR_PAGINATION);
           }}
           placeholder={t("audit.filterActor")}
         />
@@ -99,6 +113,13 @@ export function AuditPage() {
                 <Skeleton key={i} className="h-10 w-full" />
               ))}
             </div>
+          ) : audit.isError ? (
+            <QueryErrorState
+              error={audit.error}
+              forbiddenTitle={t("audit.forbiddenTitle")}
+              forbiddenDesc={t("audit.forbiddenDesc")}
+              onRetry={() => void audit.refetch()}
+            />
           ) : events.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -152,11 +173,21 @@ export function AuditPage() {
         </CardContent>
       </Card>
       <div className="mt-4 flex items-center justify-end gap-2">
-        <Button variant="outline" size="sm" onClick={goBack} disabled={history.length === 0 || audit.isLoading}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={goBack}
+          disabled={!canGoBackCursor(pagination) || audit.isLoading}
+        >
           <ChevronLeft className="size-4" />
           {t("audit.newer")}
         </Button>
-        <Button variant="outline" size="sm" onClick={goForward} disabled={!hasMore || audit.isLoading}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={goForward}
+          disabled={!hasMore || audit.isLoading || audit.isError}
+        >
           {t("audit.older")}
           <ChevronRight className="size-4" />
         </Button>

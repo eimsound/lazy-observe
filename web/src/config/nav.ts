@@ -23,10 +23,14 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import type { Role } from "@/lib/api/auth";
+import { hasMinimumRole } from "@/lib/auth/permissions";
+
 /**
  * Primary navigation model (GitLab-style grouped sidebar). Adding a section =
  * one entry here + a route in src/router.tsx. Items may be gated by role
- * (`adminOnly`) — the sidebar hides those the current user can't reach.
+ * (`minRole`) — the sidebar and command palette hide those the current user
+ * can't reach.
  */
 
 export interface NavItem {
@@ -37,8 +41,8 @@ export interface NavItem {
   icon: LucideIcon;
   /** Not yet implemented — shows a placeholder page + a muted style. */
   placeholder?: boolean;
-  /** Only visible to admins (e.g. user management). */
-  adminOnly?: boolean;
+  /** Minimum role required to access this route (matches backend RBAC). */
+  minRole?: Role;
 }
 
 export interface NavGroup {
@@ -73,24 +77,29 @@ export const NAV_GROUPS: NavGroup[] = [
     labelKey: "nav.groupAlerts",
     items: [
       { to: "/alerts", labelKey: "nav.alertEvents", icon: BellRing },
-      { to: "/alerts/rules", labelKey: "nav.alertRules", icon: ListChecks },
-      { to: "/alerts/silences", labelKey: "nav.silences", icon: BellOff },
-      { to: "/alerts/channels", labelKey: "nav.channels", icon: Send },
-      { to: "/alerts/notifications", labelKey: "nav.notifications", icon: History },
+      { to: "/alerts/rules", labelKey: "nav.alertRules", icon: ListChecks, minRole: "member" },
+      { to: "/alerts/silences", labelKey: "nav.silences", icon: BellOff, minRole: "member" },
+      { to: "/alerts/channels", labelKey: "nav.channels", icon: Send, minRole: "admin" },
+      { to: "/alerts/notifications", labelKey: "nav.notifications", icon: History, minRole: "member" },
     ],
   },
   {
     labelKey: "nav.groupManage",
     items: [
       { to: "/settings/projects", labelKey: "nav.projects", icon: FolderKanban },
-      { to: "/settings/users", labelKey: "nav.users", icon: Users, adminOnly: true },
-      { to: "/settings/audit", labelKey: "nav.audit", icon: ScrollText, adminOnly: true },
-      { to: "/settings/diagnostics", labelKey: "nav.diagnostics", icon: Stethoscope, adminOnly: true },
-      { to: "/settings/ai", labelKey: "nav.aiSettings", icon: Sparkles, adminOnly: true },
+      { to: "/settings/users", labelKey: "nav.users", icon: Users, minRole: "admin" },
+      { to: "/settings/audit", labelKey: "nav.audit", icon: ScrollText, minRole: "admin" },
+      { to: "/settings/diagnostics", labelKey: "nav.diagnostics", icon: Stethoscope, minRole: "admin" },
+      { to: "/settings/ai", labelKey: "nav.aiSettings", icon: Sparkles, minRole: "admin" },
       { to: "/settings", labelKey: "nav.settings", icon: Settings },
     ],
   },
 ];
+
+/** Whether a role can access a navigation entry (shared by sidebar & command palette). */
+export function canAccessNavItem(item: Pick<NavItem, "minRole">, role: Role | null): boolean {
+  return hasMinimumRole(role, item.minRole);
+}
 
 /** Flat lookup for breadcrumb resolution. */
 export const NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items);

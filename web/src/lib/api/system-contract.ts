@@ -34,18 +34,28 @@ function counter(value: unknown, label: string): number {
   return value;
 }
 
+const HEALTHY_ERROR_INBOX_SUMMARY = /^active_items=\d+\s+active_bytes=\d+$/;
+
+function normalizeComponentState(
+  name: ManagedComponentName,
+  rawState: string,
+): ManagedComponentState {
+  const trimmed = rawState.trim();
+  if (trimmed === "ok") return "ok";
+  if (name === "error_inbox" && HEALTHY_ERROR_INBOX_SUMMARY.test(trimmed)) {
+    return "ok";
+  }
+  if (trimmed.toLowerCase().includes("restarting")) return "restarting";
+  return "unavailable";
+}
+
 export function normalizeHealthDiagnostics(value: unknown): HealthDiagnostics {
   const envelope = record(value, "health diagnostics");
   const rawComponents = record(envelope.components, "health diagnostics components");
   const components = MANAGED_COMPONENTS.flatMap((name) => {
     const rawState = rawComponents[name];
     if (typeof rawState !== "string") return [];
-    const state: ManagedComponentState = rawState === "ok"
-      ? "ok"
-      : rawState.toLowerCase().includes("restarting")
-        ? "restarting"
-        : "unavailable";
-    return [{ name, state }];
+    return [{ name, state: normalizeComponentState(name, rawState) }];
   });
   if (components.length === 0) throw new TypeError("health diagnostics has no known components");
   return {

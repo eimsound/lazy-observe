@@ -67,15 +67,57 @@ export interface PerfWindow {
   step: number;
 }
 
-/** Latest non-null value of a series (for KPI tiles). */
-export function lastValue(series: TimeSeries[] | undefined): number | null {
-  const pts = series?.[0]?.points;
-  if (!pts) return null;
+/** Latest finite value of a single series. */
+function seriesLastValue(s: TimeSeries): number | null {
+  const pts = s.points;
   for (let i = pts.length - 1; i >= 0; i--) {
     const v = pts[i][1];
     if (v != null && Number.isFinite(v)) return v;
   }
   return null;
+}
+
+/**
+ * Latest value across one or more series (for KPI tiles). When "All pages" is
+ * selected in real mode, VictoriaMetrics returns one series per page; average
+ * every series' latest sample rather than reading only `series[0]`.
+ */
+export function lastValue(series: TimeSeries[] | undefined): number | null {
+  if (!series || series.length === 0) return null;
+  let sum = 0;
+  let count = 0;
+  for (const s of series) {
+    const v = seriesLastValue(s);
+    if (v != null) {
+      sum += v;
+      count += 1;
+    }
+  }
+  return count > 0 ? sum / count : null;
+}
+
+/**
+ * Aggregates one or more series into a single sparkline value array by
+ * averaging finite values at each timestamp across all series.
+ */
+export function aggregateTrend(series: TimeSeries[] | undefined): number[] {
+  if (!series || series.length === 0) return [];
+  if (series.length === 1) {
+    return series[0].points.map((p) => (p[1] != null && Number.isFinite(p[1]) ? p[1] : 0));
+  }
+  const byTime = new Map<number, { sum: number; count: number }>();
+  for (const s of series) {
+    for (const [ts, val] of s.points) {
+      if (val == null || !Number.isFinite(val)) continue;
+      const entry = byTime.get(ts) ?? { sum: 0, count: 0 };
+      entry.sum += val;
+      entry.count += 1;
+      byTime.set(ts, entry);
+    }
+  }
+  return [...byTime.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, { sum, count }]) => (count > 0 ? sum / count : 0));
 }
 
 /** Trend series for a single vital, optionally scoped to one page. */
