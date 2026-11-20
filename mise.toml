@@ -21,7 +21,7 @@ helm = { version = "3.21.3", lazy = true }
 goreleaser = { version = "2.17.0", lazy = true }
 "go:github.com/google/go-licenses/v2" = { version = "2.0.1", lazy = true, lazy_bins = ["go-licenses"] }
 # 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
-"go:golang.org/x/vuln/cmd/govulncheck" = { version = "1.9.0", lazy = true, lazy_bins = ["govulncheck"] }
+"go:golang.org/x/vuln/cmd/govulncheck" = { version = "1.10.0", lazy = true, lazy_bins = ["govulncheck"] }
 
 [tasks.ent-generate]
 description = "Regenerate the tracked Ent client in internal/db/ent from internal/db/schema"
