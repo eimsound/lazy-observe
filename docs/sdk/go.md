@@ -20,8 +20,9 @@ go mod edit \
   -replace github.com/eimsound/lazy-observe/sdk/go=/absolute/path/to/lazy-observe/sdk/go
 ```
 
-For development inside this repository, run examples from `sdk/go`, whose
-`go.mod` declares the SDK module.
+For development inside this repository, run the Fiber example from its standalone
+module directory `sdk/go/examples/fiber`, whose `go.mod` isolates example-only
+dependencies such as `modernc.org/sqlite` from `sdk/go/go.mod`.
 
 ## Initialize and shut down
 
@@ -62,7 +63,22 @@ app.Get("/orders/:id", func(c fiber.Ctx) error {
 duration and active-request metrics, and recovers panics as HTTP 500 with a
 correlated stack log. Panics and returned handler errors whose effective status
 is 5xx are asynchronously submitted as error events and aggregated into Issues.
+`url.scheme` reads Fiber v3 `Ctx.Scheme()`, honoring forwarded scheme headers
+only when the app explicitly trusts the peer via `fiber.Config{TrustProxy: true}`.
 Use context-aware slog methods to attach `trace_id` and `span_id`.
+
+For tighter host isolation, use `lo.FiberWithOptions(lazyobserve.FiberOptions{...})`:
+
+```go
+app.Use(lo.FiberWithOptions(lazyobserve.FiberOptions{
+    // Map domain errors to status codes without invoking Fiber's ErrorHandler inside the middleware.
+    StatusFromError: func(err error) int { ... },
+    // Re-panic after recording spans, metrics, logs, and error events when an outer recovery middleware owns HTTP 500 responses.
+    RepanicOnPanic:  true,
+    // Sanitize sensitive path segments before recording url.path, panic logs, and error-event URLs.
+    RedactPath:      func(path string) string { ... },
+}))
+```
 
 The SDK does not call `slog.SetDefault`; the application chooses whether to do so.
 
@@ -78,7 +94,7 @@ defer db.Close()
 row := db.QueryRowContext(c.Context(), "SELECT status FROM orders WHERE id = $1", id)
 ```
 
-`WrapDB` replaces `sql.Open`, creates client spans, and registers pool metrics without patching or registering drivers. Import the chosen database driver normally. SQL text is disabled by default; setting `CaptureDBStatement: true` captures query text but never bound parameter values.
+`WrapDB` replaces `sql.Open`, creates client spans, and registers pool metrics without patching or registering drivers; its `metric.Registration` is automatically unregistered during `lo.Shutdown`. For short-lived or dynamically rotated database pools, use `lo.WrapDBContext(poolCtx, driverName, dsn)` so pool metric registration is unregistered immediately when `poolCtx` is cancelled (as well as on `Shutdown`) without leaking callbacks. Import the chosen database driver normally. SQL text is disabled by default; setting `CaptureDBStatement: true` captures query text but never bound parameter values.
 
 ## Configuration and capability switches
 
@@ -94,7 +110,8 @@ row := db.QueryRowContext(c.Context(), "SELECT status FROM orders WHERE id = $1"
 | `Tags` | empty | Application tags copied during initialization and attached to error events |
 | `ExportInterval` | 5 seconds | Periodic metrics/log export |
 | `Profiling` | enabled | Pointer to false disables CPU, heap, and goroutine profiling |
-| `ProfilingInterval` | 60 seconds | Time between CPU sampling window starts |
+| `ProfilingCPU` | enabled | Pointer to false disables CPU pprof sampling while continuing heap and goroutine snapshots (useful when another profiler owns `runtime/pprof.StartCPUProfile`) |
+| `ProfilingInterval` | 60 seconds | Base interval between profiling cycle starts (jittered on initial start and each cycle) |
 
 Example: only metrics and traces:
 
@@ -128,8 +145,12 @@ Request bodies, headers, cookies, authorization values, and URL queries are not
 captured.
 
 Error sending uses a bounded non-blocking queue and batches up to 20 events.
-Queue saturation drops the event and emits a local warning instead of delaying
-the request. `Shutdown` drains the queue and reports the latest export failure.
+Before enqueueing, each event is bounded against the gateway's 200 KiB single-event
+budget (capping message, exception type/value, release/environment, URL, tags, and
+stack frames in UTF-8-safe steps). Queue saturation drops the event, updates
+`Diagnostics().DroppedTelemetry` and the drop metric accurately, and emits a
+rate-limited local warning instead of delaying requests or flooding logs.
+`Shutdown` drains the queue and reports the latest export failure.
 
 ## Continuous profiling
 
@@ -145,6 +166,6 @@ lo := lazyobserve.Init(lazyobserve.Config{
 })
 ```
 
-Each cycle records a 10-second CPU window followed by heap and goroutine snapshots, then uploads the three gzip pprof payloads to `/api/profiles`. Uploads use the bounded `Delivery` retry budget (`MaxAttempts`, jittered exponential backoff, and server `Retry-After` honoring, dropping immediately on permanent 4xx or payloads over 10 MiB) and never fail application requests. If `Shutdown` interrupts a CPU window, the window is uploaded only if it already ran at least 5 seconds; a shorter one is discarded (this is not counted as dropped telemetry). Heap and goroutine snapshots are instantaneous and are still collected; everything queued is uploaded within the `Shutdown` context deadline.
+Each cycle records a 10-second CPU window (unless `ProfilingCPU` is set to `false`) followed by heap and goroutine snapshots, then uploads the gzip pprof payloads to `/api/profiles`. Both the initial start and subsequent cycle intervals include randomized jitter to prevent fleet-wide synchronized spikes. If another profiler already owns `pprof.StartCPUProfile`, the SDK logs a single warning and continues collecting heap and goroutine snapshots. Uploads share the SDK's dedicated ingest HTTP client and bounded `Delivery` retry budget (`MaxAttempts`, Full Jitter exponential backoff, and server `Retry-After` honoring, dropping immediately on permanent 4xx or payloads over 10 MiB) and never fail application requests. If `Shutdown` interrupts a CPU window, the window is uploaded only if it already ran at least 5 seconds; a shorter one is discarded (this is not counted as dropped telemetry). Heap and goroutine snapshots are instantaneous and are still collected; everything queued is uploaded within the `Shutdown` context deadline.
 
 See the runnable [Fiber example](../../sdk/go/examples/fiber/) for a nested order trace, database child spans, correlated logs, controlled fast/slow/error routes, and a concurrent load generator that populates the Performance page.

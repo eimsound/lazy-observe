@@ -63,8 +63,13 @@ func TestCaptureExceptionQueuesCorrelatedEvent(t *testing.T) {
 			Environment: "test",
 			Tags:        map[string]string{"region": "local"},
 		},
-		logger:         logger,
-		errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+		logger: logger,
+		errorTransport: newErrorTransport(
+			newIngestClient(server.URL, "secret", nil),
+			logger,
+			defaultDeliveryConfig(t),
+			nil,
+		),
 	}
 
 	eventID := client.CaptureException(sampledContext(), errors.New("payment failed"))
@@ -108,12 +113,17 @@ func TestFiberReportsPanicAndReturnedServerError(t *testing.T) {
 	traceProvider := sdktrace.NewTracerProvider()
 	t.Cleanup(func() { _ = traceProvider.Shutdown(context.Background()) })
 	client := &Client{
-		cfg:            Config{ServiceName: "fiber-errors"},
-		meter:          metricnoop.NewMeterProvider(),
-		tracer:         traceProvider,
-		logger:         logger,
-		propagator:     propagation.TraceContext{},
-		errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+		cfg:        Config{ServiceName: "fiber-errors"},
+		meter:      metricnoop.NewMeterProvider(),
+		tracer:     traceProvider,
+		logger:     logger,
+		propagator: propagation.TraceContext{},
+		errorTransport: newErrorTransport(
+			newIngestClient(server.URL, "secret", nil),
+			logger,
+			defaultDeliveryConfig(t),
+			nil,
+		),
 	}
 	app := fiber.New()
 	app.Use(client.Fiber())
@@ -191,8 +201,7 @@ func TestClientShutdownReturnsTerminalErrorExportFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	client := &Client{cfg: Config{ServiceName: "checkout"}, logger: logger}
 	client.errorTransport = newErrorTransport(
-		server.URL,
-		"secret",
+		newIngestClient(server.URL, "secret", nil),
 		logger,
 		defaultDeliveryConfig(t),
 		client.recordTelemetryDrop,
@@ -309,8 +318,7 @@ func TestErrorTransport4xxDropsAsServerRejectedAndHonorsRetryAfter(t *testing.T)
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		client := &Client{cfg: Config{ServiceName: "checkout"}, logger: logger}
 		client.errorTransport = newErrorTransport(
-			server.URL,
-			"secret",
+			newIngestClient(server.URL, "secret", nil),
 			logger,
 			defaultDeliveryConfig(t),
 			func(signal, reason string, count int) {
@@ -353,7 +361,12 @@ func TestErrorTransport4xxDropsAsServerRejectedAndHonorsRetryAfter(t *testing.T)
 		var mu sync.Mutex
 		var waited []time.Duration
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-		transport := newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil)
+		transport := newErrorTransport(
+			newIngestClient(server.URL, "secret", nil),
+			logger,
+			defaultDeliveryConfig(t),
+			nil,
+		)
 		transport.delivery.options.Wait = func(_ context.Context, delay time.Duration) error {
 			mu.Lock()
 			waited = append(waited, delay)
@@ -413,8 +426,13 @@ func TestErrorEventSizeBudgetAnd413BatchSplit(t *testing.T) {
 				ServiceName: "checkout",
 				Tags:        map[string]string{"huge": strings.Repeat("值", 40_000)},
 			},
-			logger:         logger,
-			errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+			logger: logger,
+			errorTransport: newErrorTransport(
+				newIngestClient(server.URL, "secret", nil),
+				logger,
+				defaultDeliveryConfig(t),
+				nil,
+			),
 		}
 		hugeErr := errors.New(strings.Repeat("错\x00", 120_000))
 		client.CaptureException(context.Background(), hugeErr)
@@ -466,8 +484,7 @@ func TestErrorEventSizeBudgetAnd413BatchSplit(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		client := &Client{cfg: Config{ServiceName: "checkout"}, logger: logger}
 		client.errorTransport = newErrorTransport(
-			server.URL,
-			"secret",
+			newIngestClient(server.URL, "secret", nil),
 			logger,
 			defaultDeliveryConfig(t),
 			func(signal, reason string, count int) {
@@ -497,6 +514,183 @@ func TestErrorEventSizeBudgetAnd413BatchSplit(t *testing.T) {
 			)
 		}
 	})
+}
+
+func TestErrorEventBudgetContractAndValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("enforces per-field and frame budgets while keeping innermost frames", func(t *testing.T) {
+		t.Parallel()
+		tags := make(map[string]string, maxErrorTagCount+20)
+		tags["service.name"] = "checkout"
+		for i := range maxErrorTagCount + 19 {
+			tags[strings.Repeat("k", 200)+string(rune('a'+i%26))+string(rune('0'+i/26))] = strings.Repeat("值", 600)
+		}
+		frames := make([]errorFrame, 0, maxErrorFrameCount+12)
+		// Insert an invalid blank frame that would fail gateway validation if kept.
+		frames = append(frames, errorFrame{Function: "   ", Filename: ""})
+		for i := range maxErrorFrameCount + 10 {
+			line := i + 1
+			frames = append(frames, errorFrame{
+				Function: strings.Repeat("fn", 400) + "_" + string(rune('A'+i%26)),
+				Filename: strings.Repeat("f", 400) + ".go",
+				Lineno:   &line,
+				AbsPath:  "/very/long/" + strings.Repeat("dir/", 400) + "file.go",
+				Module:   strings.Repeat("mod/", 100) + "pkg",
+				InApp:    true,
+			})
+		}
+
+		event := errorEvent{
+			EventID:     newEventID(),
+			Timestamp:   time.Now().UTC(),
+			Platform:    "go",
+			Release:     strings.Repeat("rel-", 200),
+			Environment: strings.Repeat("env-", 100),
+			Level:       "error",
+			Message:     strings.Repeat("中", 20_000),
+			Exception: errorException{
+				Type:       strings.Repeat("CustomErr", 80),
+				Value:      strings.Repeat("错", 20_000),
+				Stacktrace: errorStacktrace{Frames: frames},
+			},
+			Tags: tags,
+			URL:  "https://example.com/" + strings.Repeat("p", 8000),
+		}
+
+		bounded, ok := boundErrorEventWithBudget(event, defaultErrorEventBudget)
+		if !ok {
+			t.Fatal("expected oversized event to be bounded successfully")
+		}
+		if len(bounded.Message) > defaultErrorEventBudget.MaxMessageBytes ||
+			len(bounded.Exception.Value) > defaultErrorEventBudget.MaxExceptionValueBytes ||
+			len(bounded.Exception.Type) > defaultErrorEventBudget.MaxExceptionTypeBytes ||
+			len(bounded.Release) > defaultErrorEventBudget.MaxReleaseBytes ||
+			len(bounded.Environment) > defaultErrorEventBudget.MaxEnvironmentBytes ||
+			len(bounded.URL) > defaultErrorEventBudget.MaxURLBytes {
+			t.Fatalf("scalar field exceeded budget: msg=%d val=%d type=%d rel=%d env=%d url=%d",
+				len(bounded.Message), len(bounded.Exception.Value), len(bounded.Exception.Type),
+				len(bounded.Release), len(bounded.Environment), len(bounded.URL))
+		}
+		if len(bounded.Tags) > defaultErrorEventBudget.MaxTagCount {
+			t.Fatalf("tags=%d want <= %d", len(bounded.Tags), defaultErrorEventBudget.MaxTagCount)
+		}
+		if bounded.Tags["service.name"] != "checkout" {
+			t.Fatalf("essential tag service.name lost: %v", bounded.Tags)
+		}
+		for k, v := range bounded.Tags {
+			if len(k) > defaultErrorEventBudget.MaxTagKeyBytes || len(v) > defaultErrorEventBudget.MaxTagValueBytes {
+				t.Fatalf("tag %q (len %d) -> val len %d exceeded budget", k, len(k), len(v))
+			}
+		}
+		gotFrames := bounded.Exception.Stacktrace.Frames
+		if len(gotFrames) != defaultErrorEventBudget.MaxFrames {
+			t.Fatalf("frames=%d want=%d", len(gotFrames), defaultErrorEventBudget.MaxFrames)
+		}
+		// Outermost-first order: last frame must be the innermost frame (line maxErrorFrameCount+10).
+		if gotFrames[len(gotFrames)-1].Lineno == nil || *gotFrames[len(gotFrames)-1].Lineno != maxErrorFrameCount+10 {
+			t.Fatalf("innermost frame not preserved: %+v", gotFrames[len(gotFrames)-1])
+		}
+		for _, f := range gotFrames {
+			if len(f.Function) > defaultErrorEventBudget.MaxFrameFunctionBytes ||
+				len(f.Filename) > defaultErrorEventBudget.MaxFrameFilenameBytes ||
+				len(f.AbsPath) > defaultErrorEventBudget.MaxFrameAbsPathBytes ||
+				len(f.Module) > defaultErrorEventBudget.MaxFrameModuleBytes {
+				t.Fatalf("frame field exceeded budget: %+v", f)
+			}
+		}
+		if !validErrorEventContract(bounded) {
+			t.Fatalf("bounded event violates gateway contract: %+v", bounded)
+		}
+		raw, err := json.Marshal(bounded)
+		if err != nil || len(raw) > defaultErrorEventBudget.MaxEventBytes {
+			t.Fatalf("encoded len=%d err=%v exceeds %d", len(raw), err, defaultErrorEventBudget.MaxEventBytes)
+		}
+	})
+
+	t.Run("rejects structurally invalid events", func(t *testing.T) {
+		t.Parallel()
+		if _, ok := boundErrorEventWithBudget(errorEvent{Platform: "go", Level: "error"}, defaultErrorEventBudget); ok {
+			t.Fatal("missing EventID/Timestamp/Message should be rejected")
+		}
+		if _, ok := boundErrorEventWithBudget(errorEvent{
+			EventID:   newEventID(),
+			Timestamp: time.Now().UTC(),
+			Platform:  "go",
+			Level:     "error",
+		}, defaultErrorEventBudget); ok {
+			t.Fatal("empty Type and Message should be rejected")
+		}
+	})
+}
+
+func TestErrorTransportThrottlesQueueFullWarningsWhileCountingAllDrops(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"accepted":1}`)
+	}))
+	t.Cleanup(server.Close)
+
+	capture := &captureHandler{}
+	logger := slog.New(capture)
+	now := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	cfg := defaultDeliveryConfig(t)
+	cfg.ErrorQueueCapacity = 1
+	client := &Client{cfg: Config{ServiceName: "throttle-test"}, logger: logger}
+	transport := newErrorTransport(
+		newIngestClient(server.URL, "secret", nil),
+		logger,
+		cfg,
+		client.recordTelemetryDrop,
+	)
+	transport.warnThrottle.now = func() time.Time { return now }
+	client.errorTransport = transport
+
+	client.CaptureException(context.Background(), errors.New("in-flight"))
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not start")
+	}
+
+	const burst = 15
+	for range burst {
+		client.CaptureException(context.Background(), errors.New("overflow"))
+	}
+	if got := client.Diagnostics().DroppedTelemetry; got != burst {
+		t.Fatalf("DroppedTelemetry=%d want=%d", got, burst)
+	}
+	if count := capture.count(); count != 1 {
+		t.Fatalf("queue_full warn log count=%d want=1 during throttle window", count)
+	}
+
+	// Advance clock past throttle window and trigger one more overflow.
+	now = now.Add(deliveryDefaultQueueFullLogInterval)
+	client.CaptureException(context.Background(), errors.New("overflow-after-window"))
+	if got := client.Diagnostics().DroppedTelemetry; got != burst+1 {
+		t.Fatalf("DroppedTelemetry=%d want=%d", got, burst+1)
+	}
+	if count := capture.count(); count != 2 {
+		t.Fatalf("queue_full warn log count=%d want=2 after throttle window", count)
+	}
+	if got := capture.lastAttrs()["suppressed"]; got != "14" {
+		t.Fatalf("suppressed attr=%q want=\"14\"", got)
+	}
+
+	close(release)
+	shutdownClient(t, client)
 }
 
 func containsInAppFunction(frames []errorFrame, want string) bool {

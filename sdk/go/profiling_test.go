@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,8 +22,14 @@ func TestProfilingDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Profiling == nil || !*cfg.Profiling || cfg.ProfilingInterval != 60*time.Second {
-		t.Fatalf("profiling defaults: enabled=%v interval=%s", cfg.Profiling, cfg.ProfilingInterval)
+	if cfg.Profiling == nil || !*cfg.Profiling || cfg.ProfilingCPU == nil || !*cfg.ProfilingCPU ||
+		cfg.ProfilingInterval != 60*time.Second {
+		t.Fatalf(
+			"profiling defaults: enabled=%v cpu=%v interval=%s",
+			cfg.Profiling,
+			cfg.ProfilingCPU,
+			cfg.ProfilingInterval,
+		)
 	}
 }
 
@@ -89,10 +97,8 @@ func TestUploadProfileIncludesStableUploadID(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	client := &Client{
-		cfg:           Config{ServiceName: "checkout"},
-		profileURL:    server.URL + "/api/profiles",
-		profileToken:  "secret",
-		profileClient: &http.Client{Timeout: 5 * time.Second},
+		cfg:    Config{ServiceName: "checkout"},
+		ingest: newIngestClient(server.URL, "secret", &http.Client{Timeout: 5 * time.Second}),
 	}
 	profile := collectedProfile{
 		uploadID: newEventID(),
@@ -131,10 +137,8 @@ func TestUploadProfileIsolatesFromDefaultClientAndEnforcesLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &Client{
-		cfg:           cfg,
-		profileURL:    server.URL + "/api/profiles",
-		profileToken:  "secret",
-		profileClient: &http.Client{Timeout: 5 * time.Second},
+		cfg:    cfg,
+		ingest: newIngestClient(server.URL, "secret", &http.Client{Timeout: 5 * time.Second}),
 	}
 
 	// Pre-check rejects > 10 MiB payload without sending any HTTP request.
@@ -307,11 +311,11 @@ func TestProfilingLoopShutdownShortWindowIsDiscardedWithoutDropCount(t *testing.
 				t.Fatal(err)
 			}
 			client := &Client{
-				cfg:          cfg,
-				profileURL:   server.URL + "/api/profiles",
-				profileToken: "secret",
-				profileDone:  make(chan struct{}),
-				cpuProfiler:  fakeCPUProfiler(tc.elapsed),
+				cfg:                 cfg,
+				ingest:              newIngestClient(server.URL, "secret", nil),
+				profileDone:         make(chan struct{}),
+				cpuProfiler:         fakeCPUProfiler(tc.elapsed),
+				profileInitialDelay: func(time.Duration) time.Duration { return 0 },
 			}
 			client.profileDelivery = newProfileDelivery(client)
 
@@ -340,5 +344,135 @@ func TestProfilingLoopShutdownShortWindowIsDiscardedWithoutDropCount(t *testing.
 				t.Fatalf("DroppedTelemetry=%d want=0: discarding a short window is not a delivery failure", dropped)
 			}
 		})
+	}
+}
+
+func TestProfilingCPUSubSwitchSkipsCPUAndCollectsSnapshots(t *testing.T) {
+	t.Parallel()
+	cpuDisabled := false
+	cfg, err := normalizedConfig(Config{ServiceName: "no-cpu", ProfilingCPU: &cpuDisabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startCalls atomic.Int32
+	fake := fakeCPUProfiler(time.Second)
+	fake.start = func(io.Writer) error {
+		startCalls.Add(1)
+		return errors.New("StartCPUProfile must not be called when ProfilingCPU is false")
+	}
+	client := &Client{
+		cfg:         cfg,
+		cpuProfiler: fake,
+	}
+	profiles := client.collectCycleProfiles(context.Background())
+	if startCalls.Load() != 0 {
+		t.Fatalf("StartCPUProfile calls=%d want 0", startCalls.Load())
+	}
+	got := profileTypes(profiles)
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"goroutine", "heap"}) {
+		t.Fatalf("profiles=%v want [goroutine heap]", got)
+	}
+}
+
+func TestProfilingCPUConflictWarnsOnceAndContinuesSnapshots(t *testing.T) {
+	t.Parallel()
+	capture := &captureHandler{}
+	cfg, err := normalizedConfig(Config{ServiceName: "cpu-conflict"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startAttempts atomic.Int32
+	fake := fakeCPUProfiler(time.Second)
+	fake.start = func(io.Writer) error {
+		startAttempts.Add(1)
+		return errors.New("cpu profiling already in use")
+	}
+	client := &Client{
+		cfg:         cfg,
+		logger:      slog.New(capture),
+		cpuProfiler: fake,
+	}
+	for range 3 {
+		profiles := client.collectCycleProfiles(context.Background())
+		got := profileTypes(profiles)
+		slices.Sort(got)
+		if !slices.Equal(got, []string{"goroutine", "heap"}) {
+			t.Fatalf("profiles=%v want [goroutine heap]", got)
+		}
+	}
+	if startAttempts.Load() != 3 {
+		t.Fatalf("startAttempts=%d want 3", startAttempts.Load())
+	}
+	if capture.count() != 1 {
+		t.Fatalf("conflict warning count=%d want 1 (warn once per client)", capture.count())
+	}
+	if !strings.Contains(capture.lastMessage(), "CPU profiling skipped") {
+		t.Fatalf("unexpected conflict warning message: %q", capture.lastMessage())
+	}
+}
+
+func TestProfilingInitialAndPeriodicJitter(t *testing.T) {
+	t.Parallel()
+	initialSeen := make(map[time.Duration]struct{})
+	for range 64 {
+		d := jitterInitialProfilingDelay(60 * time.Second)
+		if d < 0 || d > 5*time.Second {
+			t.Fatalf("jitterInitialProfilingDelay(60s)=%s out of [0, 5s]", d)
+		}
+		initialSeen[d] = struct{}{}
+	}
+	if len(initialSeen) < 2 {
+		t.Fatalf("jitterInitialProfilingDelay showed no variation: %v", initialSeen)
+	}
+
+	periodicSeen := make(map[time.Duration]struct{})
+	for range 64 {
+		d := jitterProfilingDelay(50 * time.Second)
+		if d < 50*time.Second || d > 55*time.Second {
+			t.Fatalf("jitterProfilingDelay(50s)=%s out of [50s, 55s]", d)
+		}
+		periodicSeen[d] = struct{}{}
+	}
+	if len(periodicSeen) < 2 {
+		t.Fatalf("jitterProfilingDelay showed no variation: %v", periodicSeen)
+	}
+
+	// Verify profilingLoop honors initial delay cancellation without collecting.
+	var startCalls atomic.Int32
+	fake := fakeCPUProfiler(time.Second)
+	fake.start = func(io.Writer) error {
+		startCalls.Add(1)
+		return nil
+	}
+	cfg, err := normalizedConfig(Config{ServiceName: "initial-delay-cancel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotInitialArg atomic.Int64
+	client := &Client{
+		cfg:         cfg,
+		profileDone: make(chan struct{}),
+		cpuProfiler: fake,
+		profileInitialDelay: func(interval time.Duration) time.Duration {
+			gotInitialArg.Store(int64(interval))
+			return time.Hour
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go client.profilingLoop(ctx)
+	cancel()
+	select {
+	case <-client.profileDone:
+	case <-time.After(time.Second):
+		t.Fatal("profilingLoop did not stop during initial delay cancellation")
+	}
+	if gotInitialArg.Load() != int64(cfg.ProfilingInterval) || startCalls.Load() != 0 {
+		t.Fatalf(
+			"initialArg=%s startCalls=%d want=%s/0",
+			time.Duration(gotInitialArg.Load()),
+			startCalls.Load(),
+			cfg.ProfilingInterval,
+		)
 	}
 }

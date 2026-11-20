@@ -26,17 +26,64 @@ import (
 )
 
 const (
-	errorBatchSize       = 20
-	errorFlushInterval   = 100 * time.Millisecond
-	errorQueueSize       = 100
-	errorSendTimeout     = 5 * time.Second
-	maxErrorEventBytes   = 200 << 10
-	maxErrorMessageBytes = 32 << 10
-	maxErrorURLBytes     = 4 << 10
-	maxErrorTagCount     = 64
-	maxErrorTagKeyBytes  = 128
-	maxErrorTagValBytes  = 1024
+	errorBatchSize              = 20
+	errorFlushInterval          = 100 * time.Millisecond
+	errorQueueSize              = 100
+	errorSendTimeout            = 5 * time.Second
+	maxErrorEventBytes          = 200 << 10
+	maxErrorMessageBytes        = 32 << 10
+	maxErrorExceptionTypeBytes  = 256
+	maxErrorExceptionValueBytes = 32 << 10
+	maxErrorReleaseBytes        = 256
+	maxErrorEnvironmentBytes    = 128
+	maxErrorURLBytes            = 4 << 10
+	maxErrorTagCount            = 64
+	maxErrorTagKeyBytes         = 128
+	maxErrorTagValBytes         = 1024
+	maxErrorFrameCount          = 64
+	maxErrorFrameFunctionBytes  = 512
+	maxErrorFrameFilenameBytes  = 256
+	maxErrorFrameAbsPathBytes   = 1024
+	maxErrorFrameModuleBytes    = 256
 )
+
+// errorEventBudget centralizes all per-field and whole-event byte/count limits
+// aligned with the server gateway's 200 KiB single error-event ingest contract.
+type errorEventBudget struct {
+	MaxEventBytes          int
+	MaxMessageBytes        int
+	MaxExceptionTypeBytes  int
+	MaxExceptionValueBytes int
+	MaxReleaseBytes        int
+	MaxEnvironmentBytes    int
+	MaxURLBytes            int
+	MaxTagCount            int
+	MaxTagKeyBytes         int
+	MaxTagValueBytes       int
+	MaxFrames              int
+	MaxFrameFunctionBytes  int
+	MaxFrameFilenameBytes  int
+	MaxFrameAbsPathBytes   int
+	MaxFrameModuleBytes    int
+}
+
+var defaultErrorEventBudget = errorEventBudget{
+	MaxEventBytes:          maxErrorEventBytes,
+	MaxMessageBytes:        maxErrorMessageBytes,
+	MaxExceptionTypeBytes:  maxErrorExceptionTypeBytes,
+	MaxExceptionValueBytes: maxErrorExceptionValueBytes,
+	MaxReleaseBytes:        maxErrorReleaseBytes,
+	MaxEnvironmentBytes:    maxErrorEnvironmentBytes,
+	MaxURLBytes:            maxErrorURLBytes,
+	MaxTagCount:            maxErrorTagCount,
+	MaxTagKeyBytes:         maxErrorTagKeyBytes,
+	MaxTagValueBytes:       maxErrorTagValBytes,
+	MaxFrames:              maxErrorFrameCount,
+	MaxFrameFunctionBytes:  maxErrorFrameFunctionBytes,
+	MaxFrameFilenameBytes:  maxErrorFrameFilenameBytes,
+	MaxFrameAbsPathBytes:   maxErrorFrameAbsPathBytes,
+	MaxFrameModuleBytes:    maxErrorFrameModuleBytes,
+}
 
 type errorFrame struct {
 	Function string `json:"function"`
@@ -89,24 +136,22 @@ type errorCaptureOptions struct {
 }
 
 type errorTransport struct {
-	endpoint string
-	token    string
-	client   *http.Client
-	logger   *slog.Logger
-	delivery *deliveryQueue[errorEvent]
+	ingest       *ingestClient
+	logger       *slog.Logger
+	warnThrottle *queueFullLogThrottle
+	delivery     *deliveryQueue[errorEvent]
 }
 
 func newErrorTransport(
-	endpoint, token string,
+	ingest *ingestClient,
 	logger *slog.Logger,
 	config DeliveryConfig,
 	onDrop func(signal, reason string, count int),
 ) *errorTransport {
 	transport := &errorTransport{
-		endpoint: strings.TrimRight(endpoint, "/") + "/api/events/errors",
-		token:    token,
-		client:   &http.Client{Timeout: errorSendTimeout},
-		logger:   logger,
+		ingest:       ingest,
+		logger:       logger,
+		warnThrottle: newQueueFullLogThrottle(deliveryDefaultQueueFullLogInterval),
 	}
 	transport.delivery = newDeliveryQueue(deliveryOptions[errorEvent]{
 		Capacity:      config.ErrorQueueCapacity,
@@ -120,17 +165,36 @@ func newErrorTransport(
 			if onDrop != nil {
 				onDrop("error", reason, dropped)
 			}
-			if logger != nil {
+			if logger == nil {
+				return
+			}
+			allowed, suppressed := transport.warnThrottle.allow(reason, dropped)
+			if !allowed {
+				return
+			}
+			if suppressed > 0 {
 				logger.Warn(
 					"error event telemetry dropped",
 					"reason",
 					reason,
 					"events",
 					dropped,
+					"suppressed",
+					suppressed,
 					"error",
 					err,
 				)
+				return
 			}
+			logger.Warn(
+				"error event telemetry dropped",
+				"reason",
+				reason,
+				"events",
+				dropped,
+				"error",
+				err,
+			)
 		},
 	})
 	return transport
@@ -176,11 +240,11 @@ func (c *Client) captureException(ctx context.Context, err error, options errorC
 			SpanID:  spanContext.SpanID().String(),
 		}}
 	}
-	bounded, ok := boundErrorEvent(event, maxErrorEventBytes)
+	bounded, ok := boundErrorEventWithBudget(event, defaultErrorEventBudget)
 	if !ok {
 		c.errorTransport.delivery.recordDrop(
 			"server_rejected",
-			fmt.Errorf("error event exceeds %d-byte limit", maxErrorEventBytes),
+			fmt.Errorf("error event exceeds %d-byte limit", defaultErrorEventBudget.MaxEventBytes),
 			1,
 		)
 		return eventID
@@ -268,57 +332,52 @@ func (t *errorTransport) postBatch(parent context.Context, events []errorEvent) 
 	if err != nil {
 		return fmt.Errorf("marshal error events: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(parent, errorSendTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create error event request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+t.token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := t.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("send error events: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		response, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return &deliveryError{
-			statusCode: resp.StatusCode,
-			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
-			permanent:  isPermanentHTTPStatus(resp.StatusCode),
-			err: fmt.Errorf(
-				"send error events: HTTP %d: %s",
-				resp.StatusCode,
-				strings.TrimSpace(string(response)),
-			),
-		}
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
+	return t.ingest.post(parent, ingestRequest{
+		Path:          "/api/events/errors",
+		ContentType:   "application/json",
+		ContentLength: int64(len(body)),
+		Body:          func() io.ReadCloser { return io.NopCloser(bytes.NewReader(body)) },
+		Timeout:       errorSendTimeout,
+		Op:            "send error events",
+	})
 }
 
 func boundErrorEvent(event errorEvent, limit int) (errorEvent, bool) {
-	event.Message = truncateUTF8Bytes(event.Message, maxErrorMessageBytes)
-	event.Exception.Value = truncateUTF8Bytes(event.Exception.Value, maxErrorMessageBytes)
-	event.URL = truncateUTF8Bytes(event.URL, maxErrorURLBytes)
-	event.Tags = boundErrorTags(event.Tags, maxErrorTagCount, maxErrorTagKeyBytes, maxErrorTagValBytes)
-	if eventFitsJSON(event, limit) {
+	budget := defaultErrorEventBudget
+	budget.MaxEventBytes = limit
+	return boundErrorEventWithBudget(event, budget)
+}
+
+func boundErrorEventWithBudget(event errorEvent, budget errorEventBudget) (errorEvent, bool) {
+	if budget.MaxEventBytes <= 0 {
+		return errorEvent{}, false
+	}
+	event.Release = truncateUTF8Bytes(event.Release, budget.MaxReleaseBytes)
+	event.Environment = truncateUTF8Bytes(event.Environment, budget.MaxEnvironmentBytes)
+	event.Exception.Type = truncateUTF8Bytes(event.Exception.Type, budget.MaxExceptionTypeBytes)
+	event.Message = truncateUTF8Bytes(event.Message, budget.MaxMessageBytes)
+	event.Exception.Value = truncateUTF8Bytes(event.Exception.Value, budget.MaxExceptionValueBytes)
+	event.URL = truncateUTF8Bytes(event.URL, budget.MaxURLBytes)
+	event.Tags = boundErrorTags(event.Tags, budget.MaxTagCount, budget.MaxTagKeyBytes, budget.MaxTagValueBytes)
+	event.Exception.Stacktrace.Frames = boundErrorFrames(event.Exception.Stacktrace.Frames, budget)
+	if !validErrorEventContract(event) {
+		return errorEvent{}, false
+	}
+	if eventFitsJSON(event, budget.MaxEventBytes) {
 		return event, true
 	}
 
 	for _, textLimit := range []int{4 << 10, 1024, 256} {
-		event.Message = truncateUTF8Bytes(event.Message, textLimit)
-		event.Exception.Value = truncateUTF8Bytes(event.Exception.Value, textLimit)
-		if eventFitsJSON(event, limit) {
+		event.Message = truncateUTF8Bytes(event.Message, min(textLimit, budget.MaxMessageBytes))
+		event.Exception.Value = truncateUTF8Bytes(event.Exception.Value, min(textLimit, budget.MaxExceptionValueBytes))
+		if eventFitsJSON(event, budget.MaxEventBytes) {
 			return event, true
 		}
 	}
 
-	event.URL = truncateUTF8Bytes(event.URL, 256)
-	event.Tags = essentialErrorTags(event.Tags, 256)
-	if eventFitsJSON(event, limit) {
+	event.URL = truncateUTF8Bytes(event.URL, min(256, budget.MaxURLBytes))
+	event.Tags = essentialErrorTags(event.Tags, min(256, budget.MaxTagValueBytes))
+	if eventFitsJSON(event, budget.MaxEventBytes) {
 		return event, true
 	}
 
@@ -328,19 +387,63 @@ func boundErrorEvent(event errorEvent, limit int) (errorEvent, bool) {
 			frames[i].AbsPath = ""
 		}
 		event.Exception.Stacktrace.Frames = frames
-		if eventFitsJSON(event, limit) {
+		if eventFitsJSON(event, budget.MaxEventBytes) {
 			return event, true
 		}
 		for _, maxFrames := range []int{32, 16, 8, 0} {
 			if len(frames) > maxFrames {
 				event.Exception.Stacktrace.Frames = frames[len(frames)-maxFrames:]
 			}
-			if eventFitsJSON(event, limit) {
+			if eventFitsJSON(event, budget.MaxEventBytes) {
 				return event, true
 			}
 		}
 	}
 	return errorEvent{}, false
+}
+
+func boundErrorFrames(frames []errorFrame, budget errorEventBudget) []errorFrame {
+	if len(frames) == 0 || budget.MaxFrames == 0 {
+		return []errorFrame{}
+	}
+	valid := make([]errorFrame, 0, len(frames))
+	for _, frame := range frames {
+		bounded := errorFrame{
+			Function: truncateUTF8Bytes(frame.Function, budget.MaxFrameFunctionBytes),
+			Filename: truncateUTF8Bytes(frame.Filename, budget.MaxFrameFilenameBytes),
+			Lineno:   frame.Lineno,
+			AbsPath:  truncateUTF8Bytes(frame.AbsPath, budget.MaxFrameAbsPathBytes),
+			Module:   truncateUTF8Bytes(frame.Module, budget.MaxFrameModuleBytes),
+			InApp:    frame.InApp,
+		}
+		if strings.TrimSpace(bounded.Function) == "" && strings.TrimSpace(bounded.Filename) == "" {
+			continue
+		}
+		valid = append(valid, bounded)
+	}
+	if budget.MaxFrames > 0 && len(valid) > budget.MaxFrames {
+		// Frames are outermost-first; preserve the innermost crash/capture frames.
+		valid = valid[len(valid)-budget.MaxFrames:]
+	}
+	return valid
+}
+
+// validErrorEventContract mirrors the server gateway's structural validation
+// in internal/gateway/error_api.go so malformed events never poison a batch.
+func validErrorEventContract(event errorEvent) bool {
+	if strings.TrimSpace(event.EventID) == "" || event.Timestamp.IsZero() ||
+		strings.TrimSpace(event.Platform) == "" || strings.TrimSpace(event.Level) == "" {
+		return false
+	}
+	if strings.TrimSpace(event.Exception.Type) == "" && strings.TrimSpace(event.Message) == "" {
+		return false
+	}
+	for _, frame := range event.Exception.Stacktrace.Frames {
+		if strings.TrimSpace(frame.Function) == "" && strings.TrimSpace(frame.Filename) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func eventFitsJSON(event errorEvent, limit int) bool {
@@ -430,7 +533,7 @@ func essentialErrorTags(tags map[string]string, maxVal int) map[string]string {
 }
 
 func callerFrames(skip int) []errorFrame {
-	pcs := make([]uintptr, 64)
+	pcs := make([]uintptr, maxErrorFrameCount)
 	count := runtime.Callers(skip, pcs)
 	iterator := runtime.CallersFrames(pcs[:count])
 	frames := make([]errorFrame, 0, count)

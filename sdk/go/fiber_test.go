@@ -293,12 +293,17 @@ func TestFiberUnmatchedRouteUsesLowCardinalityAndDoesNotPolluteRoot(t *testing.T
 	t.Cleanup(server.Close)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	client := &Client{
-		cfg:            Config{ServiceName: "fiber-unmatched"},
-		meter:          meterProvider,
-		tracer:         traceProvider,
-		logger:         logger,
-		propagator:     propagation.TraceContext{},
-		errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+		cfg:        Config{ServiceName: "fiber-unmatched"},
+		meter:      meterProvider,
+		tracer:     traceProvider,
+		logger:     logger,
+		propagator: propagation.TraceContext{},
+		errorTransport: newErrorTransport(
+			newIngestClient(server.URL, "secret", nil),
+			logger,
+			defaultDeliveryConfig(t),
+			nil,
+		),
 	}
 	app := fiber.New()
 	app.Use(client.Fiber())
@@ -377,12 +382,17 @@ func TestFiber4xxCustomErrorHandlerAndPanicFormatting(t *testing.T) {
 	t.Cleanup(server.Close)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	client := &Client{
-		cfg:            Config{ServiceName: "fiber-errors-custom"},
-		meter:          meterProvider,
-		tracer:         traceProvider,
-		logger:         logger,
-		propagator:     propagation.TraceContext{},
-		errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+		cfg:        Config{ServiceName: "fiber-errors-custom"},
+		meter:      meterProvider,
+		tracer:     traceProvider,
+		logger:     logger,
+		propagator: propagation.TraceContext{},
+		errorTransport: newErrorTransport(
+			newIngestClient(server.URL, "secret", nil),
+			logger,
+			defaultDeliveryConfig(t),
+			nil,
+		),
 	}
 
 	app := fiber.New(fiber.Config{
@@ -461,4 +471,263 @@ func TestFiber4xxCustomErrorHandlerAndPanicFormatting(t *testing.T) {
 			t.Fatalf("4xx unexpectedly captured as Issue: %#v", ev)
 		}
 	}
+}
+
+func TestFiberOptionsStatusFromErrorRepanicAndRedactPath(t *testing.T) {
+	t.Parallel()
+
+	t.Run("StatusFromError keeps outer error pipeline untouched", func(t *testing.T) {
+		t.Parallel()
+		errNotFound := errors.New("missing item")
+		errGateway := errors.New("backend unavailable")
+
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+		t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
+		t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+		collector := &errorEventCollector{}
+		server := httptest.NewServer(http.HandlerFunc(collector.handler))
+		t.Cleanup(server.Close)
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		client := &Client{
+			cfg:        Config{ServiceName: "fiber-status-from-error"},
+			meter:      mp,
+			tracer:     tp,
+			logger:     logger,
+			propagator: propagation.TraceContext{},
+			errorTransport: newErrorTransport(
+				newIngestClient(server.URL, "secret", nil),
+				logger,
+				defaultDeliveryConfig(t),
+				nil,
+			),
+		}
+
+		var outerObservedErrors []error
+		app := fiber.New(fiber.Config{
+			ErrorHandler: func(c fiber.Ctx, err error) error {
+				status := fiber.StatusInternalServerError
+				switch {
+				case errors.Is(err, errNotFound):
+					status = fiber.StatusNotFound
+				case errors.Is(err, errGateway):
+					status = fiber.StatusBadGateway
+				default:
+					var fe *fiber.Error
+					if errors.As(err, &fe) {
+						status = fe.Code
+					}
+				}
+				return c.Status(status).JSON(fiber.Map{"outer_error_handler": true})
+			},
+		})
+		// Outer middleware verifies returned errors are NOT swallowed by FiberWithOptions.
+		app.Use(func(c fiber.Ctx) error {
+			err := c.Next()
+			if err != nil {
+				outerObservedErrors = append(outerObservedErrors, err)
+			}
+			return err
+		})
+		app.Use(client.FiberWithOptions(FiberOptions{
+			StatusFromError: func(err error) int {
+				switch {
+				case errors.Is(err, errNotFound):
+					return fiber.StatusNotFound
+				case errors.Is(err, errGateway):
+					return fiber.StatusBadGateway
+				default:
+					return 0 // fallback to *fiber.Error or 500
+				}
+			},
+		}))
+		app.Get("/missing", func(fiber.Ctx) error { return errNotFound })
+		app.Get("/gateway", func(fiber.Ctx) error { return errGateway })
+		app.Get("/fiber-400", func(fiber.Ctx) error { return fiber.NewError(fiber.StatusBadRequest, "bad") })
+
+		for _, tc := range []struct {
+			path   string
+			status int
+		}{
+			{"/missing", fiber.StatusNotFound},
+			{"/gateway", fiber.StatusBadGateway},
+			{"/fiber-400", fiber.StatusBadRequest},
+		} {
+			resp, err := app.Test(httptest.NewRequest(http.MethodGet, tc.path, nil), fiber.TestConfig{Timeout: 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("%s status=%d want=%d", tc.path, resp.StatusCode, tc.status)
+			}
+		}
+		shutdownClient(t, client)
+
+		if len(outerObservedErrors) != 3 {
+			t.Fatalf("outer middleware saw %d errors, want 3 (errors must propagate)", len(outerObservedErrors))
+		}
+		spans := exporter.GetSpans()
+		if len(spans) != 3 {
+			t.Fatalf("spans=%d want 3", len(spans))
+		}
+		if spans[0].Status.Code == codes.Error || spans[2].Status.Code == codes.Error {
+			t.Fatalf("4xx spans should not be marked Error: 404=%+v 400=%+v", spans[0].Status, spans[2].Status)
+		}
+		if spans[1].Status.Code != codes.Error ||
+			spanStringAttrs(spans[1].Attributes)["http.response.status_code"] != "502" {
+			t.Fatalf("502 span unexpected: status=%+v attrs=%v", spans[1].Status, spanStringAttrs(spans[1].Attributes))
+		}
+		_, _, events := collector.snapshot()
+		if len(events) != 1 || events[0].Tags["http.response.status_code"] != "502" {
+			t.Fatalf("events=%#v want 1 event with status 502", events)
+		}
+	})
+
+	t.Run("RepanicOnPanic records telemetry and hands panic to outer middleware", func(t *testing.T) {
+		t.Parallel()
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+		t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+		t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+		collector := &errorEventCollector{}
+		server := httptest.NewServer(http.HandlerFunc(collector.handler))
+		t.Cleanup(server.Close)
+		capture := &captureHandler{}
+		logger := slog.New(capture)
+		client := &Client{
+			cfg:        Config{ServiceName: "fiber-repanic"},
+			meter:      mp,
+			tracer:     tp,
+			logger:     logger,
+			propagator: propagation.TraceContext{},
+			errorTransport: newErrorTransport(
+				newIngestClient(server.URL, "secret", nil),
+				logger,
+				defaultDeliveryConfig(t),
+				nil,
+			),
+		}
+
+		var outerRecovered any
+		app := fiber.New()
+		app.Use(func(c fiber.Ctx) (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					outerRecovered = r
+					err = c.Status(fiber.StatusTeapot).SendString("handled-by-outer")
+				}
+			}()
+			return c.Next()
+		})
+		app.Use(client.FiberWithOptions(FiberOptions{RepanicOnPanic: true}))
+		app.Get("/boom", func(fiber.Ctx) error { panic("outer-owned panic") })
+
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/boom", nil), fiber.TestConfig{Timeout: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		shutdownClient(t, client)
+
+		if outerRecovered != "outer-owned panic" {
+			t.Fatalf("outerRecovered=%v want \"outer-owned panic\"", outerRecovered)
+		}
+		if resp.StatusCode != fiber.StatusTeapot || string(body) != "handled-by-outer" {
+			t.Fatalf("outer recovery response status=%d body=%q", resp.StatusCode, string(body))
+		}
+		spans := exporter.GetSpans()
+		if len(spans) != 1 || spans[0].Status.Code != codes.Error {
+			t.Fatalf("panic span missing error status: %#v", spans)
+		}
+		var collected metricdata.ResourceMetrics
+		if err := reader.Collect(t.Context(), &collected); err != nil {
+			t.Fatal(err)
+		}
+		for _, scope := range collected.ScopeMetrics {
+			for _, m := range scope.Metrics {
+				if m.Name == "http.server.active_requests" {
+					if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
+						for _, pt := range sum.DataPoints {
+							if pt.Value != 0 {
+								t.Fatalf("active_requests leaked: %d", pt.Value)
+							}
+						}
+					}
+				}
+			}
+		}
+		_, _, events := collector.snapshot()
+		if len(events) != 1 || events[0].Exception.Type != "panic" {
+			t.Fatalf("panic event=%#v want 1 panic event", events)
+		}
+	})
+
+	t.Run("RedactPath sanitizes spans logs and error URLs while preserving Scheme", func(t *testing.T) {
+		t.Parallel()
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+		t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
+		t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+		collector := &errorEventCollector{}
+		server := httptest.NewServer(http.HandlerFunc(collector.handler))
+		t.Cleanup(server.Close)
+		capture := &captureHandler{}
+		logger := slog.New(capture)
+		client := &Client{
+			cfg:        Config{ServiceName: "fiber-redact"},
+			meter:      mp,
+			tracer:     tp,
+			logger:     logger,
+			propagator: propagation.TraceContext{},
+			errorTransport: newErrorTransport(
+				newIngestClient(server.URL, "secret", nil),
+				logger,
+				defaultDeliveryConfig(t),
+				nil,
+			),
+		}
+
+		app := fiber.New()
+		app.Use(client.FiberWithOptions(FiberOptions{
+			RedactPath: func(p string) string {
+				if len(p) > 0 {
+					return "/users/[redacted]/profile"
+				}
+				return p
+			},
+		}))
+		app.Get("/users/:email/profile", func(fiber.Ctx) error { panic("pii boom") })
+
+		req := httptest.NewRequest(http.MethodGet, "http://api.example/users/alice@secret.test/profile", nil)
+		req.Header.Set(fiber.HeaderXForwardedProto, "https") // untrusted: must stay http
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		shutdownClient(t, client)
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 {
+			t.Fatalf("spans=%d want 1", len(spans))
+		}
+		attrs := spanStringAttrs(spans[0].Attributes)
+		if attrs["url.path"] != "/users/[redacted]/profile" || attrs["http.route"] != "/users/:email/profile" ||
+			attrs["url.scheme"] != "http" {
+			t.Fatalf("span attrs=%v", attrs)
+		}
+		if capture.lastAttrs()["url.path"] != "/users/[redacted]/profile" {
+			t.Fatalf("panic log url.path=%q", capture.lastAttrs()["url.path"])
+		}
+		_, _, events := collector.snapshot()
+		if len(events) != 1 || events[0].URL != "http://api.example/users/[redacted]/profile" {
+			t.Fatalf("error event URL=%#v want redacted http URL", events)
+		}
+	})
 }

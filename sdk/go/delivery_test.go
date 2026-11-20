@@ -358,17 +358,59 @@ func TestDeliveryQueueHonorsRetryAfterAndJitter(t *testing.T) {
 		t.Fatalf("parseRetryAfter(garbage)=%s want=0", got)
 	}
 
-	// Verify jitter stays within [backoff/2, backoff] and varies across samples.
+	// Verify Full Jitter stays within [0, backoff], varies across samples, and
+	// can sample below backoff/2 (unlike Equal Jitter).
 	seen := make(map[time.Duration]struct{})
-	for range 32 {
+	sawLowerHalf := false
+	for range 128 {
 		d := queue.retryDelay(0, 0)
-		if d < 50*time.Millisecond || d > 100*time.Millisecond {
-			t.Fatalf("jittered retryDelay=%s out of [50ms, 100ms]", d)
+		if d < 0 || d > 100*time.Millisecond {
+			t.Fatalf("full-jittered retryDelay=%s out of [0, 100ms]", d)
+		}
+		if d < 50*time.Millisecond {
+			sawLowerHalf = true
 		}
 		seen[d] = struct{}{}
 	}
-	if len(seen) < 2 {
-		t.Fatalf("retryDelay produced no jitter variation: %v", seen)
+	if len(seen) < 2 || !sawLowerHalf {
+		t.Fatalf(
+			"retryDelay did not exhibit Full Jitter in [0, 100ms]: samples=%d sawLowerHalf=%v",
+			len(seen),
+			sawLowerHalf,
+		)
+	}
+}
+
+func TestQueueFullLogThrottle(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	throttle := &queueFullLogThrottle{
+		interval: 10 * time.Second,
+		now:      func() time.Time { return now },
+	}
+
+	// First queue_full logs immediately with 0 suppressed.
+	if ok, suppressed := throttle.allow("queue_full", 1); !ok || suppressed != 0 {
+		t.Fatalf("first allow=(%v, %d) want (true, 0)", ok, suppressed)
+	}
+	// Burst within throttle window is suppressed while accumulating dropped count.
+	for range 25 {
+		if ok, suppressed := throttle.allow("queue_full", 1); ok || suppressed != 0 {
+			t.Fatalf("burst allow=(%v, %d) want (false, 0)", ok, suppressed)
+		}
+	}
+	// Other drop reasons are never throttled.
+	if ok, suppressed := throttle.allow("server_rejected", 3); !ok || suppressed != 0 {
+		t.Fatalf("server_rejected allow=(%v, %d) want (true, 0)", ok, suppressed)
+	}
+	// Advancing clock past interval emits again with suppressed count.
+	now = now.Add(10 * time.Second)
+	if ok, suppressed := throttle.allow("queue_full", 1); !ok || suppressed != 25 {
+		t.Fatalf("post-window allow=(%v, %d) want (true, 25)", ok, suppressed)
+	}
+	// Subsequent drop in new window is suppressed again.
+	if ok, _ := throttle.allow("queue_full", 1); ok {
+		t.Fatal("expected second window drop to be suppressed")
 	}
 }
 

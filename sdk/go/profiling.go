@@ -55,29 +55,50 @@ type collectedProfile struct {
 
 func (c *Client) profilingLoop(ctx context.Context) {
 	defer close(c.profileDone)
+	if initialDelay := c.nextInitialProfilingDelay(c.cfg.ProfilingInterval); initialDelay > 0 {
+		if err := waitForDeliveryRetry(ctx, initialDelay); err != nil {
+			return
+		}
+	}
 	for {
 		cycleStart := time.Now()
-		profiles := collectProfiles(ctx, profilingCPUWindow, c.cpuProfilerOrDefault())
+		profiles := c.collectCycleProfiles(ctx)
 		for _, collected := range profiles {
 			c.profileDelivery.enqueue(collected)
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		delay := jitterProfilingDelay(c.cfg.ProfilingInterval - time.Since(cycleStart))
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+		delay := c.nextCycleProfilingDelay(c.cfg.ProfilingInterval - time.Since(cycleStart))
+		if err := waitForDeliveryRetry(ctx, delay); err != nil {
 			return
-		case <-timer.C:
 		}
 	}
+}
+
+func (c *Client) nextInitialProfilingDelay(interval time.Duration) time.Duration {
+	if c.profileInitialDelay != nil {
+		return c.profileInitialDelay(interval)
+	}
+	return jitterInitialProfilingDelay(interval)
+}
+
+func (c *Client) nextCycleProfilingDelay(remaining time.Duration) time.Duration {
+	if c.profileCycleDelay != nil {
+		return c.profileCycleDelay(remaining)
+	}
+	return jitterProfilingDelay(remaining)
+}
+
+func jitterInitialProfilingDelay(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	spread := min(interval/10, 5*time.Second)
+	if spread <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(spread) + 1))
 }
 
 func jitterProfilingDelay(delay time.Duration) time.Duration {
@@ -92,6 +113,7 @@ func jitterProfilingDelay(delay time.Duration) time.Duration {
 }
 
 func newProfileDelivery(c *Client) *deliveryQueue[collectedProfile] {
+	throttle := newQueueFullLogThrottle(deliveryDefaultQueueFullLogInterval)
 	return newDeliveryQueue(deliveryOptions[collectedProfile]{
 		Capacity:      c.cfg.Delivery.ProfileQueueCapacity,
 		BatchSize:     1,
@@ -100,23 +122,40 @@ func newProfileDelivery(c *Client) *deliveryQueue[collectedProfile] {
 		RetryInitial:  c.cfg.Delivery.RetryInitial,
 		RetryMax:      c.cfg.Delivery.RetryMax,
 		Send: func(ctx context.Context, profiles []collectedProfile) error {
-			uploadCtx, cancel := context.WithTimeout(ctx, profilingSendTimeout)
-			defer cancel()
-			return c.uploadProfile(uploadCtx, profiles[0])
+			return c.uploadProfile(ctx, profiles[0])
 		},
 		Warn: func(reason string, err error, dropped int) {
 			c.recordTelemetryDrop("profile", reason, dropped)
-			if c.logger != nil {
+			if c.logger == nil {
+				return
+			}
+			allowed, suppressed := throttle.allow(reason, dropped)
+			if !allowed {
+				return
+			}
+			if suppressed > 0 {
 				c.logger.Warn(
 					"profile telemetry dropped",
 					"reason",
 					reason,
 					"profiles",
 					dropped,
+					"suppressed",
+					suppressed,
 					"error",
 					err,
 				)
+				return
 			}
+			c.logger.Warn(
+				"profile telemetry dropped",
+				"reason",
+				reason,
+				"profiles",
+				dropped,
+				"error",
+				err,
+			)
 		},
 	})
 }
@@ -128,14 +167,52 @@ func (c *Client) cpuProfilerOrDefault() *cpuProfiler {
 	return systemCPUProfiler
 }
 
+func (c *Client) cpuProfilingEnabled() bool {
+	return c.cfg.ProfilingCPU == nil || *c.cfg.ProfilingCPU
+}
+
+func (c *Client) warnCPUProfileConflict(err error) {
+	c.cpuConflictOnce.Do(func() {
+		if c.logger != nil {
+			c.logger.Warn(
+				"CPU profiling skipped because another profiler is active; heap and goroutine snapshots continue",
+				"error",
+				err,
+			)
+		}
+	})
+}
+
+func (c *Client) collectCycleProfiles(ctx context.Context) []collectedProfile {
+	return collectProfilesWithOptions(
+		ctx,
+		profilingCPUWindow,
+		c.cpuProfilerOrDefault(),
+		c.cpuProfilingEnabled(),
+		c.warnCPUProfileConflict,
+	)
+}
+
 // collectProfiles records one CPU window and then heap and goroutine
 // snapshots. When ctx is cancelled before the window completes, the CPU
 // window is kept only if it ran for at least p.minWindow; the snapshots are
 // instantaneous and are always collected.
 func collectProfiles(ctx context.Context, cpuWindow time.Duration, p *cpuProfiler) []collectedProfile {
+	return collectProfilesWithOptions(ctx, cpuWindow, p, true, nil)
+}
+
+func collectProfilesWithOptions(
+	ctx context.Context,
+	cpuWindow time.Duration,
+	p *cpuProfiler,
+	includeCPU bool,
+	onCPUStartErr func(error),
+) []collectedProfile {
 	result := make([]collectedProfile, 0, 3)
-	if cpu, ok := collectCPUWindow(ctx, cpuWindow, p); ok {
-		result = append(result, cpu)
+	if includeCPU {
+		if cpu, ok := collectCPUWindow(ctx, cpuWindow, p, onCPUStartErr); ok {
+			result = append(result, cpu)
+		}
 	}
 	if heap, ok := collectSnapshotProfile("heap", "heap"); ok {
 		result = append(result, heap)
@@ -146,10 +223,18 @@ func collectProfiles(ctx context.Context, cpuWindow time.Duration, p *cpuProfile
 	return result
 }
 
-func collectCPUWindow(ctx context.Context, cpuWindow time.Duration, p *cpuProfiler) (collectedProfile, bool) {
+func collectCPUWindow(
+	ctx context.Context,
+	cpuWindow time.Duration,
+	p *cpuProfiler,
+	onStartErr func(error),
+) (collectedProfile, bool) {
 	var cpu bytes.Buffer
 	start := p.now().UTC()
 	if err := p.start(&cpu); err != nil {
+		if onStartErr != nil {
+			onStartErr(err)
+		}
 		return collectedProfile{}, false
 	}
 	cancelled := false
@@ -217,14 +302,10 @@ func ensureGzip(data []byte) ([]byte, error) {
 	return compressed.Bytes(), nil
 }
 
-func (c *Client) httpProfileClient() *http.Client {
-	if c.profileClient != nil {
-		return c.profileClient
-	}
-	return &http.Client{Timeout: profilingSendTimeout}
-}
-
 func (c *Client) uploadProfile(ctx context.Context, collected collectedProfile) error {
+	if c.ingest == nil {
+		return fmt.Errorf("profile upload: ingest client is not configured")
+	}
 	if len(collected.data) > profilingMaxPayloadBytes {
 		return &deliveryError{
 			statusCode: http.StatusRequestEntityTooLarge,
@@ -266,34 +347,12 @@ func (c *Client) uploadProfile(ctx context.Context, collected collectedProfile) 
 			strings.NewReader(suffix),
 		))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.profileURL, newBody())
-	if err != nil {
-		return err
-	}
-	req.ContentLength = int64(len(prefixBytes) + len(collected.data) + len(suffix))
-	req.GetBody = func() (io.ReadCloser, error) { return newBody(), nil }
-	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+c.profileToken)
-	resp, err := c.httpProfileClient().Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		response, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		msg := strings.TrimSpace(string(response))
-		errMsg := fmt.Errorf("profile upload returned %s", resp.Status)
-		if msg != "" {
-			errMsg = fmt.Errorf("profile upload returned %s: %s", resp.Status, msg)
-		}
-		return &deliveryError{
-			statusCode: resp.StatusCode,
-			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
-			permanent:  isPermanentHTTPStatus(resp.StatusCode),
-			err:        errMsg,
-		}
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return nil
+	return c.ingest.post(ctx, ingestRequest{
+		Path:          "/api/profiles",
+		ContentType:   contentType,
+		ContentLength: int64(len(prefixBytes) + len(collected.data) + len(suffix)),
+		Body:          newBody,
+		Timeout:       profilingSendTimeout,
+		Op:            "profile upload",
+	})
 }

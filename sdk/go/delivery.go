@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	deliveryDefaultFlushInterval = 100 * time.Millisecond
-	deliveryDefaultRetryInitial  = 100 * time.Millisecond
-	deliveryDefaultRetryMax      = time.Second
-	deliveryDefaultMaxAttempts   = 3
-	deliveryMaxRetryAfter        = 30 * time.Second
+	deliveryDefaultFlushInterval        = 100 * time.Millisecond
+	deliveryDefaultRetryInitial         = 100 * time.Millisecond
+	deliveryDefaultRetryMax             = time.Second
+	deliveryDefaultMaxAttempts          = 3
+	deliveryMaxRetryAfter               = 30 * time.Second
+	deliveryDefaultQueueFullLogInterval = 10 * time.Second
 )
 
 var defaultDeliveryShutdownTimeout = 10 * time.Second
@@ -325,7 +326,42 @@ func (q *deliveryQueue[T]) retryDelay(retryIndex int, retryAfter time.Duration) 
 		ceiling := min(floor+floor/4, maxRetryAfter)
 		return q.options.Jitter(floor, ceiling)
 	}
-	return q.options.Jitter(backoff/2, backoff)
+	return q.options.Jitter(0, backoff)
+}
+
+type queueFullLogThrottle struct {
+	interval   time.Duration
+	now        func() time.Time
+	lastLogNs  atomic.Int64
+	suppressed atomic.Int64
+}
+
+func newQueueFullLogThrottle(interval time.Duration) *queueFullLogThrottle {
+	return &queueFullLogThrottle{interval: interval, now: time.Now}
+}
+
+func (t *queueFullLogThrottle) allow(reason string, dropped int) (bool, int64) {
+	if reason != "queue_full" || t == nil || t.interval <= 0 {
+		return true, 0
+	}
+	nowFn := t.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	nowNs := nowFn().UnixNano()
+	if nowNs <= 0 {
+		nowNs = 1
+	}
+	for {
+		last := t.lastLogNs.Load()
+		if last != 0 && nowNs-last < t.interval.Nanoseconds() {
+			t.suppressed.Add(int64(dropped))
+			return false, 0
+		}
+		if t.lastLogNs.CompareAndSwap(last, nowNs) {
+			return true, t.suppressed.Swap(0)
+		}
+	}
 }
 
 func (q *deliveryQueue[T]) dropBatchAndQueued(batch []T, err error) {

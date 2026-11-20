@@ -7,9 +7,9 @@
 先启动 lazy-observe，使用首次启动日志中的项目 API Token：
 
 ```sh
-cd sdk/go
+cd sdk/go/examples/fiber
 LO_DSN='http://127.0.0.1:3100/p/default@lo_xxx' \
-  mise exec -- go run ./examples/fiber
+  mise exec -- go run .
 ```
 
 示例默认监听 `127.0.0.1:3320`。可通过 `PORT` 修改端口；不需要持续性能剖析时设置 `LO_PROFILING=false`。
@@ -47,7 +47,8 @@ Fiber 中间件记录每个路由的 HTTP span、`http.server.request.duration` 
 使用同一个示例二进制生成并发流量：
 
 ```sh
-mise exec -- go run ./examples/fiber load \
+cd sdk/go/examples/fiber
+mise exec -- go run . load \
   --url http://127.0.0.1:3320 \
   --duration 30s \
   --concurrency 8

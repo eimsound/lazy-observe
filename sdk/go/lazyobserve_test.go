@@ -3,6 +3,8 @@ package lazyobserve
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,16 +12,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -274,16 +279,16 @@ func TestShutdownStopsProfilingBeforeErrorDrainTimeoutAndBoundsNoDeadline(t *tes
 			t.Fatal(err)
 		}
 		profileCtx, profileStop := context.WithCancel(context.Background())
+		ingest := newIngestClient(server.URL, "secret", &http.Client{Timeout: time.Second})
 		client := &Client{
-			cfg:            cfg,
-			logger:         logger,
-			profileURL:     server.URL + "/api/profiles",
-			profileToken:   "secret",
-			profileClient:  &http.Client{Timeout: time.Second},
-			profileStop:    profileStop,
-			profileDone:    make(chan struct{}),
-			cpuProfiler:    fakeCPUProfiler(time.Second),
-			errorTransport: newErrorTransport(server.URL, "secret", logger, cfg.Delivery, nil),
+			cfg:                 cfg,
+			logger:              logger,
+			ingest:              ingest,
+			profileStop:         profileStop,
+			profileDone:         make(chan struct{}),
+			cpuProfiler:         fakeCPUProfiler(time.Second),
+			profileInitialDelay: func(time.Duration) time.Duration { return 0 },
+			errorTransport:      newErrorTransport(ingest, logger, cfg.Delivery, nil),
 		}
 		client.profileDelivery = newProfileDelivery(client)
 		go client.profilingLoop(profileCtx)
@@ -318,9 +323,14 @@ func TestShutdownStopsProfilingBeforeErrorDrainTimeoutAndBoundsNoDeadline(t *tes
 
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		client := &Client{
-			cfg:            Config{ServiceName: "no-deadline"},
-			logger:         logger,
-			errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+			cfg:    Config{ServiceName: "no-deadline"},
+			logger: logger,
+			errorTransport: newErrorTransport(
+				newIngestClient(server.URL, "secret", nil),
+				logger,
+				defaultDeliveryConfig(t),
+				nil,
+			),
 		}
 		client.CaptureException(context.Background(), errors.New("hang"))
 		startedAt := time.Now()
@@ -340,9 +350,14 @@ func TestShutdownStopsProfilingBeforeErrorDrainTimeoutAndBoundsNoDeadline(t *tes
 
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		client := &Client{
-			cfg:            Config{ServiceName: "deferred-shutdown"},
-			logger:         logger,
-			errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+			cfg:    Config{ServiceName: "deferred-shutdown"},
+			logger: logger,
+			errorTransport: newErrorTransport(
+				newIngestClient(server.URL, "secret", nil),
+				logger,
+				defaultDeliveryConfig(t),
+				nil,
+			),
 		}
 		var shutdownErr error
 		func() {
@@ -412,4 +427,153 @@ func (h *captureHandler) lastMessage() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.records[len(h.records)-1].message
+}
+
+func (h *captureHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.records)
+}
+
+func TestBuildResourceAvoidsSchemaURLConflict(t *testing.T) {
+	t.Parallel()
+	const foreignSchemaURL = "https://opentelemetry.io/schemas/9.99.0"
+	base := resource.NewWithAttributes(
+		foreignSchemaURL,
+		attribute.String("service.name", "host-default"),
+		attribute.String("host.arch", "amd64"),
+	)
+	merged, err := buildResource(base, "orders-api", "prod")
+	if err != nil {
+		t.Fatalf("buildResource returned error on distinct SchemaURL: %v", err)
+	}
+	if merged.SchemaURL() != foreignSchemaURL {
+		t.Fatalf("SchemaURL=%q want %q", merged.SchemaURL(), foreignSchemaURL)
+	}
+	attrs := map[string]string{}
+	for _, kv := range merged.Attributes() {
+		attrs[string(kv.Key)] = kv.Value.AsString()
+	}
+	if attrs["service.name"] != "orders-api" || attrs["lazy_observe.project"] != "prod" ||
+		attrs["host.arch"] != "amd64" {
+		t.Fatalf("merged resource attributes=%v", attrs)
+	}
+}
+
+var registerStubSQLDriverOnce sync.Once
+
+type stubSQLDriver struct{}
+type stubSQLConn struct{}
+
+func (stubSQLDriver) Open(string) (driver.Conn, error) { return stubSQLConn{}, nil }
+func (stubSQLConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("not implemented")
+}
+func (stubSQLConn) Close() error              { return nil }
+func (stubSQLConn) Begin() (driver.Tx, error) { return nil, errors.New("not implemented") }
+
+func stubSQLDriverName() string {
+	const name = "lazyobserve_test_stub"
+	registerStubSQLDriverOnce.Do(func() {
+		sql.Register(name, stubSQLDriver{})
+	})
+	return name
+}
+
+func hasDBPoolMetrics(t *testing.T, reader *sdkmetric.ManualReader) bool {
+	t.Helper()
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &collected); err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if strings.HasPrefix(m.Name, "db.sql.") || strings.HasPrefix(m.Name, "db.client.connections") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestWrapDBLifecycleUnregistersOnCancelAndShutdown(t *testing.T) {
+	t.Parallel()
+	driverName := stubSQLDriverName()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+
+	client := &Client{
+		cfg:        Config{ServiceName: "db-lifecycle"},
+		meter:      provider,
+		tracer:     tracenoop.NewTracerProvider(),
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		propagator: propagation.TraceContext{},
+	}
+
+	// Already-cancelled context must fail fast without leaking registrations.
+	cancelledCtx, cancelAlready := context.WithCancel(context.Background())
+	cancelAlready()
+	if _, err := client.WrapDBContext(cancelledCtx, driverName, "dsn"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WrapDBContext(cancelled) err=%v want context.Canceled", err)
+	}
+	if got := client.activeDBRegistrations(); got != 0 {
+		t.Fatalf("activeDBRegistrations=%d want 0", got)
+	}
+
+	// Cancelling dbCtx unregisters pool metrics without waiting for Shutdown.
+	dbCtx, cancelDB := context.WithCancel(context.Background())
+	db1, err := client.WrapDBContext(dbCtx, driverName, "dsn-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db1.Close() })
+	if got := client.activeDBRegistrations(); got != 1 {
+		t.Fatalf("activeDBRegistrations=%d want 1", got)
+	}
+	if !hasDBPoolMetrics(t, reader) {
+		t.Fatal("expected DB pool metrics while WrapDBContext is active")
+	}
+
+	cancelDB()
+	deadline := time.Now().Add(time.Second)
+	for client.activeDBRegistrations() != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := client.activeDBRegistrations(); got != 0 {
+		t.Fatalf("activeDBRegistrations after cancel=%d want 0", got)
+	}
+	if hasDBPoolMetrics(t, reader) {
+		t.Fatal("DB pool metrics still reported after WrapDBContext cancellation")
+	}
+
+	// WrapDB (background context) unregisters on Client.Shutdown.
+	db2, err := client.WrapDB(driverName, "dsn-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db2.Close() })
+	if got := client.activeDBRegistrations(); got != 1 || !hasDBPoolMetrics(t, reader) {
+		t.Fatalf("WrapDB active=%d hasMetrics=%v want 1/true", got, hasDBPoolMetrics(t, reader))
+	}
+	if err := client.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.activeDBRegistrations(); got != 0 {
+		t.Fatalf("activeDBRegistrations after Shutdown=%d want 0", got)
+	}
+	if hasDBPoolMetrics(t, reader) {
+		t.Fatal("DB pool metrics still reported after Shutdown")
+	}
+
+	// WrapDB after Shutdown must not leak a new registration.
+	db3, err := client.WrapDB(driverName, "dsn-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db3.Close() })
+	if got := client.activeDBRegistrations(); got != 0 || hasDBPoolMetrics(t, reader) {
+		t.Fatalf("post-Shutdown WrapDB leaked registration: active=%d hasMetrics=%v", got, hasDBPoolMetrics(t, reader))
+	}
 }

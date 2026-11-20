@@ -39,19 +39,20 @@ defer func() {
 | `Tags` | empty | Application tags copied at initialization and attached to error events |
 | `ExportInterval` | `5s` | Metrics and logs export interval; shorter values are useful for tests |
 | `Profiling` | `nil` (enabled) | Pointer to `false` disables continuous pprof CPU, heap, and goroutine collection |
-| `ProfilingInterval` | `60s` | Interval between CPU sampling window starts |
+| `ProfilingCPU` | `nil` (enabled) | Pointer to `false` disables CPU pprof sampling while continuing heap and goroutine snapshots |
+| `ProfilingInterval` | `60s` | Base interval between profiling cycle starts (jittered on initial start and each cycle) |
 | `Delivery` | zero-value defaults | Bounds custom error/profile queues and their retry budget; see Delivery reliability below |
 
 Go `bool` has no “unset” value, so signal switches use a compact matrix rule: all three false means the zero-config default (all on); once any field is true, the three values are explicit. Examples: `Metrics: true` enables only metrics; `Logs: true, Traces: true` disables only metrics. This preserves the required `Config{DSN: ...}` default while allowing every non-empty subset. To disable all telemetry, do not call `Init`/install middleware.
 
 ## Signals
 
-- `lo.Fiber()` creates server spans, `http.server.request.duration` and `http.server.active_requests`, route/method/status attributes, and a correlated error log plus stack on panic. Panics and handler errors that resolve to an HTTP 5xx status are also queued for Issue aggregation. A recovered panic returns HTTP 500 and is not re-panicked.
+- `lo.Fiber()` creates server spans, `http.server.request.duration` and `http.server.active_requests`, route/method/status attributes, and a correlated error log plus stack on panic. Panics and handler errors that resolve to an HTTP 5xx status are also queued for Issue aggregation. By default a recovered panic returns HTTP 500 and is not re-panicked. Use `lo.FiberWithOptions(lazyobserve.FiberOptions{StatusFromError, RepanicOnPanic, RedactPath})` to classify returned errors without calling `ErrorHandler` inside the middleware, re-panic to an outer recovery middleware, or redact sensitive path segments before telemetry capture.
 - `lo.Slog()` adds `service.name` and extracts `trace_id`/`span_id` from the supplied context. Use `InfoContext`, `ErrorContext`, and friends inside request handlers.
-- `lo.WrapDB(driverName, dsn)` replaces `sql.Open`, creates DB client spans, and registers `database/sql` pool metrics. It does not register or patch drivers.
+- `lo.WrapDB(driverName, dsn)` replaces `sql.Open`, creates DB client spans, and registers `database/sql` pool metrics that unregister on `Shutdown`. Use `lo.WrapDBContext(ctx, driverName, dsn)` for short-lived or rotated pools so pool metric registrations unregister as soon as `ctx` is cancelled. Neither registers or patches drivers.
 - `lo.LLMTransport(base)` explicitly wraps an `http.RoundTripper` for OpenAI-compatible `/chat/completions`, Anthropic `/v1/messages`, and Ollama `/api/chat` calls. It records `gen_ai.*` model and token attributes, including usage from final SSE chunks, without patching a provider client.
 - Metrics-enabled clients also report goroutines, heap allocation, and GC count.
-- Profiling collects a 10-second CPU window every 60 seconds by default (10s/60s duty cycle), followed by heap and goroutine snapshots, and queues gzip pprof payloads with a stable upload ID. If `Shutdown` interrupts a CPU window, it is uploaded only when it already ran at least 5 seconds; a shorter window is discarded and not counted as dropped telemetry, while the heap and goroutine snapshots are still collected; queued payloads are uploaded within the `Shutdown` context deadline. Go pprof itself typically adds about 1–5% overhead while CPU sampling is active.
+- Profiling collects a 10-second CPU window every 60 seconds by default (10s/60s duty cycle, with randomized initial and periodic jitter), followed by heap and goroutine snapshots, and queues gzip pprof payloads with a stable upload ID. Set `ProfilingCPU` to `&false` to skip CPU sampling while keeping heap and goroutine snapshots. If another profiler already owns `pprof.StartCPUProfile`, the SDK emits a one-time warning and continues collecting snapshots. If `Shutdown` interrupts a CPU window, it is uploaded only when it already ran at least 5 seconds; a shorter window is discarded and not counted as dropped telemetry, while the heap and goroutine snapshots are still collected; queued payloads are uploaded within the `Shutdown` context deadline. Go pprof itself typically adds about 1–5% overhead while CPU sampling is active.
 
 ### Fiber request buffers and `Immutable`
 
@@ -116,11 +117,17 @@ at-least-once. The zero-value `DeliveryConfig` selects these defaults:
 | `RetryMax` | `1s` |
 
 Queue capacity includes the batch currently being exported. A full queue drops
-new telemetry and logs a local warning; retry exhaustion drops the failed batch
-only after the finite budget. `lo.Diagnostics().DroppedTelemetry` exposes the
-process-local total. Metrics-enabled clients also export the low-cardinality
-counter `lazy_observe_sdk_dropped_telemetry` with `signal` and `reason`
-attributes. Profiles reuse the same stable `upload_id` on every attempt.
+new telemetry, updates drop counters/metrics on every drop, and emits a
+rate-limited local warning (reporting suppressed drop counts on the next window)
+so high-QPS outages do not flood host logs. Both error-event and profile uploads
+share a dedicated ingest HTTP client isolated from `http.DefaultClient`, classify
+permanent `4xx` (dropping immediately) vs retryable `408`/`429`/`5xx`, honor
+`Retry-After`, apply Full Jitter exponential backoff, and cap response body
+reads/drains. Retry exhaustion drops the failed batch only after the finite
+budget. `lo.Diagnostics().DroppedTelemetry` exposes the process-local total.
+Metrics-enabled clients also export the low-cardinality counter
+`lazy_observe_sdk_dropped_telemetry` with `signal` and `reason` attributes.
+Profiles reuse the same stable `upload_id` on every attempt.
 
 OTel traces and logs use their SDK-native bounded batch processors (queue 2048,
 maximum export batch 512); lazy-observe does not wrap them in a duplicate queue.
@@ -149,4 +156,5 @@ See the runnable [`examples/fiber`](examples/fiber/) project for nested applicat
 | `github.com/gofiber/fiber/v3` | Fiber v3 middleware | MIT |
 | `go.opentelemetry.io/contrib/bridges/otelslog` | slog-to-OTel bridge | Apache-2.0 |
 | `go.opentelemetry.io/otel` and OTel SDK/exporters | API, SDK, OTLP/HTTP | Apache-2.0 |
-| `modernc.org/sqlite` | example-only SQLite driver | BSD-3-Clause |
+
+The runnable [`examples/fiber`](examples/fiber/) project has its own `go.mod` so example-only dependencies (`modernc.org/sqlite`) stay out of the `github.com/eimsound/lazy-observe/sdk/go` module graph.
