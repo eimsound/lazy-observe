@@ -34,6 +34,16 @@ func defaultHTTPClient() *http.Client {
 	return &http.Client{Timeout: defaultHTTPTimeout, Transport: transport}
 }
 
+// QueryClient is the project-isolated read-only platform query port consumed by
+// MCP tool handlers. APIClient implements it over HTTP against the gateway's
+// query API; tests or in-process embedders can supply alternative implementations
+// without changing tool contracts.
+type QueryClient interface {
+	JSON(ctx context.Context, path string, query url.Values) (any, error)
+	Metrics(ctx context.Context, path string, query url.Values) (map[string]any, error)
+	Logs(ctx context.Context, query url.Values, requested int) (map[string]any, error)
+}
+
 type APIClient struct {
 	BaseURL string
 	// Token is a user API token (lou_…). Project API tokens are ingest-only and
@@ -129,6 +139,21 @@ func (c *APIClient) get(ctx context.Context, path string, query url.Values) ([]b
 		return nil, fmt.Errorf("platform returned HTTP %d: %s", resp.StatusCode, apiErr.Error)
 	}
 	return body, nil
+}
+
+// JSON performs an authenticated GET request and decodes the JSON body.
+func (c *APIClient) JSON(ctx context.Context, path string, query url.Values) (any, error) {
+	return c.json(ctx, path, query)
+}
+
+// Metrics performs a bounded Prometheus instant/range query against path.
+func (c *APIClient) Metrics(ctx context.Context, path string, query url.Values) (map[string]any, error) {
+	return c.metrics(ctx, path, query)
+}
+
+// Logs performs a bounded LogsQL query with explicit truncation detection.
+func (c *APIClient) Logs(ctx context.Context, query url.Values, requested int) (map[string]any, error) {
+	return c.logs(ctx, query, requested)
 }
 
 func (c *APIClient) json(ctx context.Context, path string, query url.Values) (any, error) {

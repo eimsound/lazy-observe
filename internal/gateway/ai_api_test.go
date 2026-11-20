@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/ai"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestAIStatusTestAndRBAC(t *testing.T) {
@@ -153,5 +155,81 @@ func TestAIKeyNeverAppearsInErrorResponseOrLogs(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte(secret)) || strings.Contains(logs.String(), secret) {
 		t.Fatalf("secret leaked: response=%s logs=%s", body, logs.String())
+	}
+}
+
+func TestGatewayAIUsageMetricsRecordedInOTel(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model": "usage-model",
+			"choices": []any{
+				map[string]any{"message": map[string]any{"role": "assistant", "content": "pong"}},
+			},
+			"usage": map[string]any{"prompt_tokens": 11, "completion_tokens": 4},
+		})
+	}))
+	defer provider.Close()
+
+	client, err := ai.New(ai.Config{
+		Provider:  "openai",
+		BaseURL:   provider.URL,
+		APIKey:    "sk-test",
+		Model:     "usage-model",
+		MaxTokens: 64,
+		Timeout:   time.Second,
+		Client:    provider.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := testStore(t)
+	admin := sessionCookie(t, store, "usage-admin", "password", "admin")
+	app := newMetadataTestGateway(store, Config{
+		Tokens:        store,
+		Store:         store,
+		AIEnabled:     true,
+		AIProvider:    "openai",
+		AIModel:       "usage-model",
+		AIClient:      client,
+		MeterProvider: mp,
+	}).App()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/ai/test", nil)
+	req.AddCookie(admin)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/ai/test status=%d want 200", resp.StatusCode)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	gotTokens := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "lazy_observe.ai.tokens" {
+				continue
+			}
+			sum := m.Data.(metricdata.Sum[int64])
+			for _, pt := range sum.DataPoints {
+				dir, _ := pt.Attributes.Value("direction")
+				op, _ := pt.Attributes.Value("operation")
+				if op.AsString() == "connectivity_test" {
+					gotTokens[dir.AsString()] += pt.Value
+				}
+			}
+		}
+	}
+	if gotTokens["input"] != 11 || gotTokens["output"] != 4 || gotTokens["total"] != 15 {
+		t.Fatalf("gateway AI usage tokens=%v want input=11 output=4 total=15", gotTokens)
 	}
 }

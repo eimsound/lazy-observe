@@ -4,12 +4,12 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/eimsound/lazy-observe/internal/query"
 	"github.com/gofiber/fiber/v3"
 )
 
 const (
 	maxTraceServiceNameLength = 256
-	maxTraceIDLength          = 32
 )
 
 func (g *Gateway) traceOperations(c fiber.Ctx) error {
@@ -75,17 +75,5 @@ func validateTraceServiceName(svc string) bool {
 }
 
 func validateTraceID(traceID string) bool {
-	if len(traceID) == 0 || len(traceID) > maxTraceIDLength {
-		return false
-	}
-	for i := 0; i < len(traceID); i++ {
-		ch := traceID[i]
-		isDigit := ch >= '0' && ch <= '9'
-		isLowerHex := ch >= 'a' && ch <= 'f'
-		isUpperHex := ch >= 'A' && ch <= 'F'
-		if !isDigit && !isLowerHex && !isUpperHex {
-			return false
-		}
-	}
-	return true
+	return query.ValidateTraceID(traceID)
 }
