@@ -65,6 +65,13 @@ func TestAlertRulePersistenceListAndCreateAreProjectScoped(t *testing.T) {
 		if err != nil || preserved.Name != "InstanceDown" {
 			t.Fatalf("alpha rule after cross-project writes=%+v err=%v", preserved, err)
 		}
+		byID, err := store.AlertRuleByID(ctx, created.ID)
+		if err != nil || byID.ID != created.ID || byID.Project.Slug != "alpha" || byID.Name != "InstanceDown" {
+			t.Fatalf("AlertRuleByID=%+v err=%v", byID, err)
+		}
+		if _, err := store.AlertRuleByID(ctx, created.ID+999999); !IsNotFound(err) {
+			t.Fatalf("missing AlertRuleByID error=%v, want not found", err)
+		}
 	})
 }
 

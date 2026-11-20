@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eimsound/lazy-observe/internal/alert/ownership"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/storage"
@@ -973,6 +974,330 @@ func TestUpdateAlertRuleExpressionAndDisableDeliverResolvedOnce(t *testing.T) {
 		t.Fatalf("duplicate notification after disable: %#v", extra)
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+func TestNativeEvaluatorRefreshesRuleAfterLeaseAcquisition(t *testing.T) {
+	t.Run("expression update before lease acquisition does not revive old alert", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "RefreshExpr", "refresh-expr")
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
+			Type: "webhook", Name: "refresh-hook", Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug: project.Slug, Name: "RefreshRule", Signal: "metrics", Expression: "up == 0", For: "0s",
+			Severity: "critical", ChannelIDs: []int{channel.ID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+		var curTime atomic.Int64
+		curTime.Store(now.UnixNano())
+		query := &recordingExprRuleQuery{firingExpr: "up == 0"}
+		const memberID = "refresh-member"
+		evaluator := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           query,
+			MemberID:        memberID,
+			MetricsInterval: time.Second,
+			GroupWait:       time.Second,
+			RepeatInterval:  time.Hour,
+			MaxConcurrency:  1,
+			LeaseTTL:        time.Minute,
+			MemberTTL:       time.Minute,
+			Now:             func() time.Time { return time.Unix(0, curTime.Load()).UTC() },
+		})
+
+		// Cycle 1 & 2: fire and notify under the original expression.
+		evaluator.evaluateCycle(ctx)
+		curTime.Store(now.Add(2 * time.Second).UnixNano())
+		evaluator.evaluateCycle(ctx)
+		states, err := store.AlertRuleStates(ctx, rule.ID)
+		if err != nil || len(states) != 1 || states[0].Status != "firing" {
+			t.Fatalf("expected active firing state before update, got states=%#v err=%v", states, err)
+		}
+		evaluator.mu.Lock()
+		initialEpoch := evaluator.leases[rule.ID].Epoch
+		evaluator.mu.Unlock()
+
+		// Capture a stale snapshot as evaluateCycle would before UpdateAlertRule commits.
+		staleRules, err := store.AlertEvaluationRules(ctx)
+		if err != nil || len(staleRules) != 1 || staleRules[0].Expression != "up == 0" {
+			t.Fatalf("unexpected stale rules snapshot=%#v err=%v", staleRules, err)
+		}
+		query.Reset()
+
+		// Commit expression change: advances & soft-expires lease, enqueues resolved notification, clears state.
+		newExpr := "vector(0) > 0"
+		resolvedRuleID := rule.ID
+		if _, err := store.UpdateAlertRule(ctx, project.Slug, rule.ID, meta.AlertRuleUpdate{
+			Expression:    &newExpr,
+			ResolveFiring: true,
+			BuildResolveNotifications: func(
+				resolved []meta.AlertRuleState,
+				enabledChannelIDs []int,
+				resolvedAt time.Time,
+			) ([]meta.NotificationOutboxEnqueue, error) {
+				alerts := make([]Alert, 0, len(resolved))
+				for _, state := range resolved {
+					alerts = append(alerts, alertFromRuleState(state, "resolved", resolvedAt))
+				}
+				ruleView := rule
+				ruleView.EnabledChannelIDs = enabledChannelIDs
+				return nativeOutboxEntries(
+					&ruleView,
+					&rule.Project,
+					[]Notification{{Project: project.Slug, Rule: rule.Name, Status: "resolved", Alerts: alerts}},
+					resolvedAt,
+					time.Hour,
+				), nil
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Now run evaluateRules with the stale snapshot after the interval is due:
+		// AcquireAlertRuleLease obtains a fresh epoch, then must reload the new rule.
+		curTime.Store(now.Add(4 * time.Second).UnixNano())
+		evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{memberID})
+
+		if seen := query.Expressions(); !slices.Equal(seen, []string{newExpr}) {
+			t.Fatalf("evaluator queried stale expression after lease acquire: got=%v want=[%q]", seen, newExpr)
+		}
+		evaluator.mu.Lock()
+		refreshedEpoch := evaluator.leases[resolvedRuleID].Epoch
+		evaluator.mu.Unlock()
+		if refreshedEpoch <= initialEpoch {
+			t.Fatalf("expected refreshed lease epoch > %d, got %d", initialEpoch, refreshedEpoch)
+		}
+		states, err = store.AlertRuleStates(ctx, rule.ID)
+		if err != nil || len(states) != 0 {
+			t.Fatalf("stale snapshot revived alert states: states=%#v err=%v", states, err)
+		}
+
+		// A subsequent normal evaluation cycle must not emit a duplicate resolved notification.
+		curTime.Store(now.Add(6 * time.Second).UnixNano())
+		evaluator.evaluateCycle(ctx)
+
+		outbox, err := store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resolvedCount int
+		for _, entry := range outbox {
+			item, loadErr := store.NotificationOutboxItem(ctx, entry.ID)
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			var n Notification
+			if unmarshalErr := json.Unmarshal(item.Payload, &n); unmarshalErr != nil {
+				t.Fatal(unmarshalErr)
+			}
+			if n.Status == "resolved" {
+				resolvedCount++
+			}
+		}
+		if resolvedCount != 1 {
+			t.Fatalf(
+				"expected exactly 1 resolved notification in outbox, got %d (total=%d)",
+				resolvedCount,
+				len(outbox),
+			)
+		}
+	})
+
+	t.Run("disabled paused or deleted rule in stale snapshot is skipped without evaluation", func(t *testing.T) {
+		for _, action := range []string{"disable", "pause", "delete"} {
+			t.Run(action, func(t *testing.T) {
+				ctx := context.Background()
+				store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				project, err := store.CreateProject(ctx, "Ineligible", "ineligible")
+				if err != nil {
+					t.Fatal(err)
+				}
+				rule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+					ProjectSlug: project.Slug, Name: "StaleSkip", Signal: "metrics", Expression: "up == 0", For: "0s",
+					Severity: "warning",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				const memberID = "skip-member"
+				if _, err := store.HeartbeatAlertEngine(ctx, memberID, time.Minute); err != nil {
+					t.Fatal(err)
+				}
+				staleRules, err := store.AlertEvaluationRules(ctx)
+				if err != nil || len(staleRules) != 1 {
+					t.Fatalf("staleRules=%#v err=%v", staleRules, err)
+				}
+				switch action {
+				case "disable":
+					disabled := false
+					if _, err := store.UpdateAlertRule(ctx, project.Slug, rule.ID, meta.AlertRuleUpdate{
+						Enabled: &disabled,
+					}); err != nil {
+						t.Fatal(err)
+					}
+				case "pause":
+					if err := store.PauseAlertRuleEvaluation(ctx, rule.ID); err != nil {
+						t.Fatal(err)
+					}
+				case "delete":
+					if err := store.DeleteAlertRule(ctx, project.Slug, rule.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				query := &recordingExprRuleQuery{firingExpr: "up == 0"}
+				evaluator := NewRuleEvaluator(RuleEvaluatorConfig{
+					Store: store, Query: query, MemberID: memberID,
+					MetricsInterval: time.Second, LeaseTTL: time.Minute, MemberTTL: time.Minute,
+				})
+				evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{memberID})
+				if seen := query.Expressions(); len(seen) != 0 {
+					t.Fatalf("ineligible rule after %s should not be queried, got=%v", action, seen)
+				}
+				evaluator.mu.Lock()
+				_, held := evaluator.leases[rule.ID]
+				evaluator.mu.Unlock()
+				if held {
+					t.Fatalf("evaluator retained local lease after %s", action)
+				}
+			})
+		}
+	})
+
+	t.Run("signal change transferring ownership releases newly acquired lease", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "SignalMove", "signal-move")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug: project.Slug, Name: "MoveRule", Signal: "metrics", Expression: "up == 0", For: "0s",
+			Severity: "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Pick two members so metrics maps to metricsOwner and logs maps to logsOwner.
+		var metricsOwner, logsOwner ownership.MemberID
+		for i := range 128 {
+			a := ownership.MemberID(fmt.Sprintf("member-a-%d", i))
+			b := ownership.MemberID(fmt.Sprintf("member-b-%d", i))
+			o1, err1 := ownership.Owner(
+				ownership.RuleKey{ProjectID: project.ID, Signal: "metrics", RuleID: rule.ID},
+				[]ownership.MemberID{a, b},
+			)
+			o2, err2 := ownership.Owner(
+				ownership.RuleKey{ProjectID: project.ID, Signal: "logs", RuleID: rule.ID},
+				[]ownership.MemberID{a, b},
+			)
+			if err1 == nil && err2 == nil && o1 != o2 {
+				metricsOwner, logsOwner = o1, o2
+				break
+			}
+		}
+		if metricsOwner == "" || logsOwner == "" {
+			t.Fatal("failed to find distinct owners for metrics vs logs")
+		}
+		for _, member := range []ownership.MemberID{metricsOwner, logsOwner} {
+			if _, err := store.HeartbeatAlertEngine(ctx, string(member), time.Minute); err != nil {
+				t.Fatal(err)
+			}
+		}
+		staleRules, err := store.AlertEvaluationRules(ctx)
+		if err != nil || len(staleRules) != 1 {
+			t.Fatalf("staleRules=%#v err=%v", staleRules, err)
+		}
+
+		logsSignal := "logs"
+		if _, err := store.UpdateAlertRule(ctx, project.Slug, rule.ID, meta.AlertRuleUpdate{
+			Signal: &logsSignal,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		query := &recordingExprRuleQuery{firingExpr: "up == 0"}
+		evaluator := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store: store, Query: query, MemberID: string(metricsOwner),
+			MetricsInterval: time.Second, LogsInterval: time.Second, LeaseTTL: time.Minute, MemberTTL: time.Minute,
+		})
+		evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{metricsOwner, logsOwner})
+
+		if seen := query.Expressions(); len(seen) != 0 {
+			t.Fatalf("previous owner queried rule after signal ownership transfer: %v", seen)
+		}
+		evaluator.mu.Lock()
+		_, held := evaluator.leases[rule.ID]
+		evaluator.mu.Unlock()
+		if held {
+			t.Fatal("previous owner retained local lease after signal ownership transfer")
+		}
+		// New owner must be able to acquire the lease immediately because previous owner released it.
+		if _, err := store.AcquireAlertRuleLease(ctx, rule.ID, string(logsOwner), time.Minute); err != nil {
+			t.Fatalf("new owner failed to acquire lease released after ownership transfer: %v", err)
+		}
+	})
+}
+
+type recordingExprRuleQuery struct {
+	mu          sync.Mutex
+	firingExpr  string
+	expressions []string
+}
+
+func (q *recordingExprRuleQuery) Evaluate(
+	_ context.Context,
+	rule *meta.AlertRuleView,
+	project *meta.ProjectInfo,
+	_ time.Time,
+) ([]RuleSample, error) {
+	q.mu.Lock()
+	q.expressions = append(q.expressions, rule.Expression)
+	q.mu.Unlock()
+	if rule.Expression != q.firingExpr {
+		return nil, nil
+	}
+	return []RuleSample{{
+		Fingerprint: "recording-expr-fp",
+		Labels:      map[string]string{"project_id": project.Slug, "alertname": rule.Name},
+		Annotations: map[string]string{"summary": "active"},
+		Value:       1,
+	}}, nil
+}
+
+func (q *recordingExprRuleQuery) Expressions() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return slices.Clone(q.expressions)
+}
+
+func (q *recordingExprRuleQuery) Reset() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.expressions = nil
 }
 
 type exprAwareRuleQuery struct {

@@ -211,7 +211,22 @@ func (s *Store) CreateAlertRule(ctx context.Context, input AlertRuleCreate) (Ale
 	if err != nil {
 		return AlertRuleView{}, err
 	}
-	return s.alertRuleByID(ctx, row.ID)
+	return s.AlertRuleByID(ctx, row.ID)
+}
+
+// AlertRuleByID loads the latest persisted alert rule by ID without project
+// slug filtering. Internal evaluators use it after acquiring a lease so
+// evaluation always runs against the current rule definition.
+func (s *Store) AlertRuleByID(ctx context.Context, id int) (AlertRuleView, error) {
+	row, err := s.client.AlertRule.Query().
+		Where(alertrule.IDEQ(id)).
+		WithProject().
+		WithChannels().
+		Only(ctx)
+	if err != nil {
+		return AlertRuleView{}, err
+	}
+	return alertRuleView(row)
 }
 
 func (s *Store) AlertRule(ctx context.Context, projectSlug string, id int) (AlertRuleView, error) {
@@ -503,18 +518,6 @@ func (s *Store) DeleteAlertRule(ctx context.Context, projectSlug string, id int)
 		return fmt.Errorf("commit alert rule delete: %w", err)
 	}
 	return nil
-}
-
-func (s *Store) alertRuleByID(ctx context.Context, id int) (AlertRuleView, error) {
-	row, err := s.client.AlertRule.Query().
-		Where(alertrule.IDEQ(id)).
-		WithProject().
-		WithChannels().
-		Only(ctx)
-	if err != nil {
-		return AlertRuleView{}, err
-	}
-	return alertRuleView(row)
 }
 
 func alertRuleView(row *dbent.AlertRule) (AlertRuleView, error) {
