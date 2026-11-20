@@ -47,7 +47,7 @@ shown in the quick start. It runs on Linux, on amd64 and arm64.
 
 ## Quick start
 
-You need mise 2025.8.4 or newer, `curl`, `tar`, and `sha256sum` or another
+You need mise 2026.10.13 or newer, `curl`, `tar`, and `sha256sum` or another
 SHA-256 tool. mise installs the Go, Node.js, and pnpm versions this repository
 pins.
 

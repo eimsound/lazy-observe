@@ -42,7 +42,7 @@ for command in curl gzip go; do
   command -v "$command" >/dev/null 2>&1 || skip "$command is required; cluster HA e2e was not run"
 done
 # 内联的 JSON/随机数/HTTP 辅助只用 Python 标准库。解释器由 uv 受管（scripts/lib/uv-python.sh），不用系统 python3；
-# uv 缺失是失败而不是 SKIP（由 mise e2e-ha / perf-ha 的 tools.uv 提供）。
+# uv 缺失是失败而不是 SKIP（由 mise.toml [tools] 的 uv 提供，e2e-ha / perf-ha 经 mise 运行）。
 # shellcheck source=lib/uv-python.sh
 . "$ROOT/scripts/lib/uv-python.sh"
 PY=$(lo_uv_python) || exit 1

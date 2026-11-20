@@ -7,7 +7,7 @@ unset GITHUB_TOKEN GH_TOKEN GORELEASER_FORCE_TOKEN
 
 root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
-# The pinned GoReleaser OSS 2.17.0 schema has no native prebuilt builder. Its Go
+# The GoReleaser OSS schema pinned in mise.toml has no native prebuilt builder. Its Go
 # builder still permits a custom tool; for the build command this adapter imports
 # the exact binary prepared and gated by the global GoReleaser before hooks. Other
 # commands are delegated to Go so GoReleaser's toolchain discovery still works.

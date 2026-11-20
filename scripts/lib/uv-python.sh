@@ -16,7 +16,7 @@
 lo_uv_python() {
   _lo_py_version=${LO_SCRIPTS_PYTHON_VERSION:-3.13}
   if ! command -v uv >/dev/null 2>&1; then
-    echo "FAIL: uv is required (managed Python $_lo_py_version); run through mise so tools.uv is on PATH" >&2
+    echo "FAIL: uv is required (managed Python $_lo_py_version); run through mise so [tools] uv is on PATH" >&2
     return 1
   fi
   if ! uv python install --managed-python --no-bin "$_lo_py_version" >&2; then
