@@ -16,6 +16,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const unmatchedHTTPRoute = "_unmatched"
+
 var httpServerRequestDurationBucketsSeconds = []float64{
 	0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
 }
@@ -60,7 +62,7 @@ func (c *Client) Fiber() fiber.Handler {
 				strings.TrimPrefix(string(fc.Request().Header.Protocol()), "HTTP/"),
 			),
 		}
-		ctx, span := tracer.Start(parent, method+" "+path,
+		ctx, span := tracer.Start(parent, method,
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(spanAttrs...),
 		)
@@ -69,47 +71,64 @@ func (c *Client) Fiber() fiber.Handler {
 		active.Add(ctx, 1, activeAttrs)
 
 		defer func() {
-			status := fc.Response().StatusCode()
-			route := path
-			if fc.Route() != nil && fc.Route().Path != "" {
-				// Registered route paths are app-owned, but Route() falls back to the
-				// borrowed request path when no route is set; clone either way.
+			route := unmatchedHTTPRoute
+			if fc.Matched() && fc.Route() != nil && fc.Route().Path != "" {
+				// Registered route paths are app-owned, but clone defensively.
 				route = strings.Clone(fc.Route().Path)
 			}
 			panicked := false
+			var spanErrDesc string
 			if recovered := recover(); recovered != nil {
 				panicked = true
-				status = fiber.StatusInternalServerError
 				panicErr := fmt.Errorf("panic: %v", recovered)
+				spanErrDesc = panicErr.Error()
 				span.RecordError(panicErr, trace.WithStackTrace(true))
-				span.SetStatus(codes.Error, panicErr.Error())
+				span.SetStatus(codes.Error, spanErrDesc)
 				c.logger.ErrorContext(ctx, "panic recovered",
 					"error", panicErr,
 					"stack", string(debug.Stack()),
 					"http.request.method", method,
 					"url.path", path,
 				)
+				if handlerErr := fc.App().ErrorHandler(fc, fiber.ErrInternalServerError); handlerErr != nil {
+					_ = fc.SendStatus(fiber.StatusInternalServerError)
+				}
+				status := fc.Response().StatusCode()
+				if status < http.StatusInternalServerError {
+					status = fiber.StatusInternalServerError
+				}
 				c.captureException(ctx, fmt.Errorf("%v", recovered), errorCaptureOptions{
 					exceptionType: "panic",
 					frames:        callerFrames(4),
 					tags:          fiberErrorTags(method, route, status),
 					url:           fiberRequestURL(fc),
 				})
-				returnErr = fc.Status(status).SendString(http.StatusText(status))
+				returnErr = nil
 			}
-			if returnErr != nil {
-				span.RecordError(returnErr)
-				span.SetStatus(codes.Error, returnErr.Error())
-				if status < 400 {
-					status = fiber.StatusInternalServerError
-					var fiberErr *fiber.Error
-					if errors.As(returnErr, &fiberErr) {
-						status = fiberErr.Code
-					}
+			handledErr := returnErr
+			if handledErr != nil {
+				if handlerErr := fc.App().ErrorHandler(fc, handledErr); handlerErr != nil {
+					_ = fc.SendStatus(fiber.StatusInternalServerError)
+					handledErr = errors.Join(handledErr, handlerErr)
+				}
+				returnErr = nil
+			}
+			status := fc.Response().StatusCode()
+			if panicked && status < http.StatusInternalServerError {
+				status = fiber.StatusInternalServerError
+			}
+			if handledErr != nil && status < http.StatusBadRequest {
+				status = fiber.StatusInternalServerError
+				var fiberErr *fiber.Error
+				if errors.As(handledErr, &fiberErr) && fiberErr.Code >= http.StatusBadRequest {
+					status = fiberErr.Code
 				}
 			}
-			if returnErr != nil && status >= http.StatusInternalServerError && !panicked {
-				c.captureException(ctx, returnErr, errorCaptureOptions{
+			if handledErr != nil && status >= http.StatusInternalServerError && !panicked {
+				spanErrDesc = handledErr.Error()
+				span.RecordError(handledErr)
+				span.SetStatus(codes.Error, spanErrDesc)
+				c.captureException(ctx, handledErr, errorCaptureOptions{
 					omitStack: true,
 					tags:      fiberErrorTags(method, route, status),
 					url:       fiberRequestURL(fc),
@@ -120,7 +139,7 @@ func (c *Client) Fiber() fiber.Handler {
 				attribute.String("http.route", route),
 				attribute.Int("http.response.status_code", status),
 			)
-			if status >= 500 {
+			if status >= http.StatusInternalServerError && spanErrDesc == "" {
 				span.SetStatus(codes.Error, http.StatusText(status))
 			}
 			duration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(

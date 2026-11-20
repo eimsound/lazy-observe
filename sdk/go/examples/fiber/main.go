@@ -33,9 +33,13 @@ func main() {
 	if err := lo.Err(); err != nil {
 		slog.Error("lazy-observe initialization failed; telemetry is degraded", "error", err)
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	defer func() { _ = lo.Shutdown(shutdownCtx) }()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := lo.Shutdown(shutdownCtx); err != nil {
+			slog.Error("lazy-observe shutdown failed", "error", err)
+		}
+	}()
 
 	slog.SetDefault(lo.Slog())
 	db, err := lo.WrapDB("sqlite", "file:lazy-observe-example?mode=memory&cache=shared")

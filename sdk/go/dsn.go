@@ -15,7 +15,7 @@ type dsn struct {
 func parseDSN(raw string) (dsn, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return dsn{}, fmt.Errorf("parse DSN: %w", err)
+		return dsn{}, fmt.Errorf("parse DSN: invalid URL")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return dsn{}, fmt.Errorf("parse DSN: scheme must be http or https")

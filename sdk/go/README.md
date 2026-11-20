@@ -15,9 +15,13 @@ slog.SetDefault(lo.Slog())   // logs + trace correlation
 `Init` never panics. Check `lo.Err()` after construction: an error means `lo` is a safe degraded instance. Always flush before process exit:
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-defer lo.Shutdown(ctx)
+defer func() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := lo.Shutdown(ctx); err != nil {
+		slog.Error("lazy-observe shutdown failed", "error", err)
+	}
+}()
 ```
 
 ## Configuration

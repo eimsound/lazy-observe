@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -67,6 +68,7 @@ func TestEnsureGzip(t *testing.T) {
 
 func TestUploadProfileIncludesStableUploadID(t *testing.T) {
 	var uploadID, authorization string
+	var uploadedBytes []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorization = r.Header.Get("Authorization")
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
@@ -75,26 +77,96 @@ func TestUploadProfileIncludesStableUploadID(t *testing.T) {
 			return
 		}
 		uploadID = r.FormValue("upload_id")
+		file, _, err := r.FormFile("profile")
+		if err != nil {
+			t.Errorf("read profile part: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		uploadedBytes, _ = io.ReadAll(file)
+		_ = file.Close()
 		w.WriteHeader(http.StatusCreated)
 	}))
 	t.Cleanup(server.Close)
 	client := &Client{
-		cfg:          Config{ServiceName: "checkout"},
-		profileURL:   server.URL + "/api/profiles",
-		profileToken: "secret",
+		cfg:           Config{ServiceName: "checkout"},
+		profileURL:    server.URL + "/api/profiles",
+		profileToken:  "secret",
+		profileClient: &http.Client{Timeout: 5 * time.Second},
 	}
 	profile := collectedProfile{
 		uploadID: newEventID(),
 		typeName: "heap",
 		start:    time.Now().UTC(),
 		end:      time.Now().UTC().Add(time.Second),
-		data:     []byte{0x1f, 0x8b, 0x00},
+		data:     []byte{0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef},
 	}
 	if err := client.uploadProfile(context.Background(), profile); err != nil {
 		t.Fatal(err)
 	}
-	if uploadID != profile.uploadID || len(uploadID) != 32 || authorization != "Bearer secret" {
-		t.Fatalf("upload_id=%q authorization=%q", uploadID, authorization)
+	if uploadID != profile.uploadID || len(uploadID) != 32 || authorization != "Bearer secret" ||
+		!bytes.Equal(uploadedBytes, profile.data) {
+		t.Fatalf("upload_id=%q authorization=%q bytes=%x", uploadID, authorization, uploadedBytes)
+	}
+}
+
+func TestUploadProfileIsolatesFromDefaultClientAndEnforcesLimits(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	t.Cleanup(server.Close)
+
+	origDefault := http.DefaultClient
+	http.DefaultClient = &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("http.DefaultClient must not be used by uploadProfile")
+		}),
+	}
+	t.Cleanup(func() { http.DefaultClient = origDefault })
+
+	cfg, err := normalizedConfig(Config{ServiceName: "checkout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{
+		cfg:           cfg,
+		profileURL:    server.URL + "/api/profiles",
+		profileToken:  "secret",
+		profileClient: &http.Client{Timeout: 5 * time.Second},
+	}
+
+	// Pre-check rejects > 10 MiB payload without sending any HTTP request.
+	oversized := collectedProfile{
+		uploadID: newEventID(),
+		typeName: "heap",
+		start:    time.Now().UTC(),
+		end:      time.Now().UTC(),
+		data:     make([]byte, profilingMaxPayloadBytes+1),
+	}
+	err = client.uploadProfile(context.Background(), oversized)
+	var dErr *deliveryError
+	if !errors.As(err, &dErr) || !dErr.permanent || requests.Load() != 0 {
+		t.Fatalf("oversized err=%v requests=%d want permanent deliveryError with 0 requests", err, requests.Load())
+	}
+
+	// Permanent 422 response uses dedicated client (not http.DefaultClient) and is not retried.
+	client.profileDelivery = newProfileDelivery(client)
+	client.profileDelivery.enqueue(collectedProfile{
+		uploadID: newEventID(),
+		typeName: "heap",
+		start:    time.Now().UTC(),
+		end:      time.Now().UTC(),
+		data:     []byte{0x1f, 0x8b, 0x01},
+	})
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.profileDelivery.close(closeCtx); err == nil {
+		t.Fatal("expected 422 error from profileDelivery.close")
+	}
+	if requests.Load() != 1 || client.Diagnostics().DroppedTelemetry != 1 {
+		t.Fatalf("requests=%d dropped=%d want=1/1", requests.Load(), client.Diagnostics().DroppedTelemetry)
 	}
 }
 

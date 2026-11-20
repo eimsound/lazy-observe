@@ -17,7 +17,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const llmContentLimit = 4 * 1024
+const (
+	llmContentLimit        = 4 * 1024
+	llmBodyInspectionLimit = 1 << 20
+)
 
 type llmSystem string
 
@@ -54,11 +57,14 @@ func (t *llmTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !ok {
 		return t.base.RoundTrip(req)
 	}
-	body, err := readAndRestoreRequest(req)
+	reqBody, restoredBody, fullRead, err := peekRequestBody(req.Body, llmBodyInspectionLimit)
 	if err != nil {
 		return nil, err
 	}
-	request := parseLLMRequest(system, body)
+	var request llmRequest
+	if fullRead && len(reqBody) > 0 {
+		request = parseLLMRequest(system, reqBody, t.captureContent)
+	}
 	attrs := []attribute.KeyValue{
 		attribute.String("gen_ai.operation.name", "chat"),
 		attribute.String("gen_ai.provider.name", string(system)),
@@ -77,16 +83,22 @@ func (t *llmTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
 	)
-	req = req.Clone(ctx)
-	if req.Header == nil {
-		req.Header = make(http.Header)
+	outReq := req.Clone(ctx)
+	if outReq.Header == nil {
+		outReq.Header = make(http.Header)
 	}
-	if len(body) > 0 {
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		req.ContentLength = int64(len(body))
+	if restoredBody != nil {
+		outReq.Body = restoredBody
+		if fullRead {
+			bodyCopy := reqBody
+			outReq.ContentLength = int64(len(bodyCopy))
+			outReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyCopy)), nil
+			}
+		}
 	}
-	t.propagator.Inject(ctx, propagation.HeaderCarrier(req.Header))
-	resp, err := t.base.RoundTrip(req)
+	t.propagator.Inject(ctx, propagation.HeaderCarrier(outReq.Header))
+	resp, err := t.base.RoundTrip(outReq)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -96,23 +108,39 @@ func (t *llmTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if resp.StatusCode >= http.StatusBadRequest {
 		span.SetStatus(codes.Error, resp.Status)
 	}
+	if resp.Body == nil {
+		span.End()
+		return resp, nil
+	}
 	if isStreamingResponse(resp, request.Stream) {
 		resp.Body = newLLMStreamBody(resp.Body, system, span, t.captureContent)
 		return resp, nil
 	}
-	responseBody, readErr := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, llmBodyInspectionLimit+1))
 	if readErr != nil {
 		span.RecordError(readErr)
 		span.SetStatus(codes.Error, readErr.Error())
-	} else {
-		applyLLMResponse(span, parseLLMResponse(system, responseBody), t.captureContent)
+		span.End()
+		resp.Body = &errTailReadCloser{
+			prefix: bytes.NewReader(responseBody),
+			err:    readErr,
+			closer: resp.Body,
+		}
+		return resp, nil
 	}
+	if len(responseBody) > llmBodyInspectionLimit {
+		span.SetAttributes(attribute.Bool("gen_ai.usage.missing", true))
+		resp.Body = &multiReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(responseBody), resp.Body),
+			closer: resp.Body,
+		}
+		span.End()
+		return resp, nil
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+	applyLLMResponse(span, parseLLMResponse(system, responseBody, t.captureContent), t.captureContent)
 	span.End()
-	if readErr != nil {
-		return nil, readErr
-	}
 	return resp, nil
 }
 
@@ -148,28 +176,85 @@ func isStreamingResponse(resp *http.Response, requested bool) bool {
 		strings.Contains(contentType, "application/x-ndjson")
 }
 
-func readAndRestoreRequest(req *http.Request) ([]byte, error) {
-	if req.Body == nil {
-		return nil, nil
-	}
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, err
-	}
-	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(body))
-	return body, nil
+type multiReadCloser struct {
+	io.Reader
+	closer io.Closer
 }
 
-func parseLLMRequest(system llmSystem, body []byte) llmRequest {
-	var raw map[string]any
-	if json.Unmarshal(body, &raw) != nil {
+func (m *multiReadCloser) Close() error {
+	if m.closer != nil {
+		return m.closer.Close()
+	}
+	return nil
+}
+
+type errTailReadCloser struct {
+	prefix *bytes.Reader
+	err    error
+	closer io.Closer
+}
+
+func (r *errTailReadCloser) Read(p []byte) (int, error) {
+	if r.prefix.Len() > 0 {
+		return r.prefix.Read(p)
+	}
+	return 0, r.err
+}
+
+func (r *errTailReadCloser) Close() error {
+	if r.closer != nil {
+		return r.closer.Close()
+	}
+	return nil
+}
+
+func peekRequestBody(body io.ReadCloser, limit int64) ([]byte, io.ReadCloser, bool, error) {
+	if body == nil {
+		return nil, nil, true, nil
+	}
+	prefix, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		_ = body.Close()
+		return nil, nil, false, err
+	}
+	if int64(len(prefix)) <= limit {
+		_ = body.Close()
+		return prefix, io.NopCloser(bytes.NewReader(prefix)), true, nil
+	}
+	combined := &multiReadCloser{
+		Reader: io.MultiReader(bytes.NewReader(prefix), body),
+		closer: body,
+	}
+	return nil, combined, false, nil
+}
+
+func parseLLMRequest(system llmSystem, body []byte, captureContent bool) llmRequest {
+	if !captureContent {
+		var meta struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		if json.Unmarshal(body, &meta) != nil {
+			return llmRequest{}
+		}
+		return llmRequest{Model: meta.Model, Stream: meta.Stream}
+	}
+	var payload struct {
+		Model    string          `json:"model"`
+		Stream   bool            `json:"stream"`
+		Messages json.RawMessage `json:"messages"`
+		System   json.RawMessage `json:"system"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
 		return llmRequest{}
 	}
-	result := llmRequest{Model: stringValue(raw["model"]), Stream: boolValue(raw["stream"])}
-	prompt := map[string]any{"messages": raw["messages"]}
-	if system == llmAnthropic && raw["system"] != nil {
-		prompt["system"] = raw["system"]
+	result := llmRequest{Model: payload.Model, Stream: payload.Stream}
+	prompt := map[string]json.RawMessage{"messages": payload.Messages}
+	if len(payload.Messages) == 0 {
+		prompt["messages"] = json.RawMessage("null")
+	}
+	if system == llmAnthropic && len(payload.System) > 0 && string(payload.System) != "null" {
+		prompt["system"] = payload.System
 	}
 	if encoded, err := json.Marshal(prompt); err == nil {
 		result.Prompt = string(encoded)
@@ -177,7 +262,7 @@ func parseLLMRequest(system llmSystem, body []byte) llmRequest {
 	return result
 }
 
-func parseLLMResponse(system llmSystem, body []byte) llmResponse {
+func parseLLMResponse(system llmSystem, body []byte, captureContent bool) llmResponse {
 	var raw map[string]any
 	if json.Unmarshal(body, &raw) != nil {
 		return llmResponse{}
@@ -188,16 +273,22 @@ func parseLLMResponse(system llmSystem, body []byte) llmResponse {
 		usage := objectValue(raw["usage"])
 		result.InputTokens = int64Pointer(usage["prompt_tokens"])
 		result.OutputTokens = int64Pointer(usage["completion_tokens"])
-		result.Completion = openAICompletion(raw)
+		if captureContent {
+			result.Completion = openAICompletion(raw)
+		}
 	case llmAnthropic:
 		usage := objectValue(raw["usage"])
 		result.InputTokens = int64Pointer(usage["input_tokens"])
 		result.OutputTokens = int64Pointer(usage["output_tokens"])
-		result.Completion = anthropicCompletion(raw["content"])
+		if captureContent {
+			result.Completion = anthropicCompletion(raw["content"])
+		}
 	case llmOllama:
 		result.InputTokens = int64Pointer(raw["prompt_eval_count"])
 		result.OutputTokens = int64Pointer(raw["eval_count"])
-		result.Completion = stringValue(objectValue(raw["message"])["content"])
+		if captureContent {
+			result.Completion = stringValue(objectValue(raw["message"])["content"])
+		}
 	}
 	return result
 }
@@ -262,22 +353,24 @@ func (b *llmStreamBody) Close() error {
 
 func (b *llmStreamBody) consume(chunk []byte) {
 	// Streaming JSON is line-oriented (SSE data lines or Ollama NDJSON). Keep
-	// incomplete data between Read calls by feeding it through a small scanner.
+	// incomplete data between Read calls by feeding it through a bounded buffer.
 	_, _ = b.buffer.Write(chunk)
 	for {
 		line, err := b.buffer.ReadString('\n')
 		if err != nil {
-			b.buffer.WriteString(line)
+			if len(line) <= llmBodyInspectionLimit {
+				b.buffer.WriteString(line)
+			}
 			return
 		}
-		parseStreamLine(&b.result, b.system, line)
+		parseStreamLine(&b.result, b.system, line, b.captureContent)
 	}
 }
 
 func (b *llmStreamBody) finish(err error) {
 	b.once.Do(func() {
 		if b.buffer.Len() > 0 {
-			parseStreamLine(&b.result, b.system, b.buffer.String())
+			parseStreamLine(&b.result, b.system, b.buffer.String(), b.captureContent)
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			b.span.RecordError(err)
@@ -288,7 +381,7 @@ func (b *llmStreamBody) finish(err error) {
 	})
 }
 
-func parseStreamLine(result *llmResponse, system llmSystem, line string) {
+func parseStreamLine(result *llmResponse, system llmSystem, line string, captureContent bool) {
 	line = strings.TrimSpace(line)
 	if strings.HasPrefix(line, "data:") {
 		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
@@ -300,10 +393,10 @@ func parseStreamLine(result *llmResponse, system llmSystem, line string) {
 	if json.Unmarshal([]byte(line), &raw) != nil {
 		return
 	}
-	parsed := parseLLMResponse(system, []byte(line))
-	mergeLLMResponse(result, parsed)
-	if system == llmOpenAI {
-		result.Completion += openAIStreamContent(raw)
+	parsed := parseLLMResponse(system, []byte(line), captureContent)
+	mergeLLMResponse(result, parsed, captureContent)
+	if system == llmOpenAI && captureContent {
+		appendBoundedCompletion(&result.Completion, openAIStreamContent(raw))
 	}
 	if system == llmAnthropic {
 		if message := objectValue(raw["message"]); message != nil {
@@ -320,13 +413,15 @@ func parseStreamLine(result *llmResponse, system llmSystem, line string) {
 				result.OutputTokens = value
 			}
 		}
-		if delta := objectValue(raw["delta"]); delta != nil {
-			result.Completion += stringValue(delta["text"])
+		if captureContent {
+			if delta := objectValue(raw["delta"]); delta != nil {
+				appendBoundedCompletion(&result.Completion, stringValue(delta["text"]))
+			}
 		}
 	}
 }
 
-func mergeLLMResponse(dst *llmResponse, src llmResponse) {
+func mergeLLMResponse(dst *llmResponse, src llmResponse, captureContent bool) {
 	if src.Model != "" {
 		dst.Model = src.Model
 	}
@@ -336,9 +431,21 @@ func mergeLLMResponse(dst *llmResponse, src llmResponse) {
 	if src.OutputTokens != nil {
 		dst.OutputTokens = src.OutputTokens
 	}
-	if src.Completion != "" {
-		dst.Completion += src.Completion
+	if captureContent && src.Completion != "" {
+		appendBoundedCompletion(&dst.Completion, src.Completion)
 	}
+}
+
+func appendBoundedCompletion(dst *string, chunk string) {
+	const maxRetained = llmContentLimit + utf8.UTFMax
+	if chunk == "" || len(*dst) >= maxRetained {
+		return
+	}
+	remaining := maxRetained - len(*dst)
+	if len(chunk) > remaining {
+		chunk = chunk[:remaining]
+	}
+	*dst += chunk
 }
 
 func openAICompletion(raw map[string]any) string {
@@ -371,7 +478,6 @@ func anthropicCompletion(value any) string {
 
 func objectValue(value any) map[string]any { result, _ := value.(map[string]any); return result }
 func stringValue(value any) string         { result, _ := value.(string); return result }
-func boolValue(value any) bool             { result, _ := value.(bool); return result }
 func int64Pointer(value any) *int64 {
 	number, ok := value.(float64)
 	if !ok {
