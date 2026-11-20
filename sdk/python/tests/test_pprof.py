@@ -260,3 +260,15 @@ def test_committed_fixture_matches_encoder():
         "`cd sdk/python && .venv/bin/python -m tests.generate_pprof_fixture`"
     )
     assert gzip.decompress(FIXTURE_PATH.read_bytes()) == gzip.decompress(build_fixture())
+
+
+def test_surrogate_paths_produce_valid_utf8_string_table():
+    data = encode_cpu_profile(
+        {((("work", "/tmp/bad_\udcff_file.py", 7),)): 2},
+        period_ns=PERIOD_NS,
+        start_ns=START_NS,
+        duration_ns=DURATION_NS,
+    )
+    profile = _parse_fields(gzip.decompress(data))
+    decoded = [raw.decode("utf-8", "strict") for raw in profile[6]]
+    assert "/tmp/bad_?_file.py" in decoded

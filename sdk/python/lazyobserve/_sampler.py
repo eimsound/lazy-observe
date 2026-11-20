@@ -477,9 +477,9 @@ class Sampler:
         # either stop() sees this collector or this sees the stop, so none is lost
         # (no reliance on memory ordering in a free-threaded build).
         with self._stop_lock:
-            self._collector = collector
             if self._stop_requested:
-                collector.running = False
+                return None
+            self._collector = collector
         start_ns = time.time_ns()
         started = time.monotonic_ns()
         try:
@@ -496,7 +496,8 @@ class Sampler:
             self._record_failure("profiling sample failed", exc)
             return None
         finally:
-            self._collector = None
+            with self._stop_lock:
+                self._collector = None
         duration_ns = max(0, time.monotonic_ns() - started)
 
         window = SamplingWindow(
@@ -530,7 +531,7 @@ class Sampler:
                 start_ns=window.start_ns,
                 duration_ns=window.duration_ns,
             )
-        except (TypeError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001
             self._record_failure("profiling encode failed", exc)
             return None
         self._failures = 0

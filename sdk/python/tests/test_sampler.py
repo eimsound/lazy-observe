@@ -548,6 +548,42 @@ def test_stop_before_a_window_starts_samples_nothing():
     assert sampler.consecutive_failures() == 0
 
 
+def test_stop_racing_into_lock_skips_sample_call():
+    fake = FakeSampling(stacks=_stacks((1, [_frame("work")])))
+    sampler = _sampler_for(fake)
+
+    class _RaceLock:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.acquire()
+            # Simulate stop() arriving after the fast-path check but before publishing _collector.
+            sampler._stop_requested = True
+            return self
+
+        def __exit__(self, *args):
+            self._inner.release()
+            return False
+
+    sampler._stop_lock = _RaceLock(threading.Lock())
+    assert sampler.collect_window(10.0) is None
+    assert fake.calls == []
+
+
+def test_encode_window_catches_general_exceptions_like_oserror():
+    def failing_encoder(*args, **kwargs):
+        raise OSError("disk or zlib error")
+
+    fake = FakeSampling(stacks=_stacks((1, [_frame("work")])))
+    sampler = _sampler_for(fake, encoder=failing_encoder)
+    window = sampler.collect_window(1.0)
+    assert window is not None
+    assert sampler.encode_window(window) is None
+    assert sampler.consecutive_failures() == 1
+    assert not sampler.disabled()
+
+
 def test_stop_is_idempotent_and_safe_on_an_unavailable_sampler():
     sampler = _sampler.Sampler(_sampler.SamplerProbe(False, reason=_sampler.REASON_GIL_BUILD))
     sampler.stop()

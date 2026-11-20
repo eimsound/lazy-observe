@@ -76,7 +76,7 @@ def encode_cpu_profile(
     for message in function_messages:
         body += _bytes(5, message)
     for value in strings.items:
-        body += _bytes(6, value.encode("utf-8", "surrogatepass"))
+        body += _bytes(6, value.encode("utf-8", "replace"))
     body += _uint(9, start_ns)
     body += _uint(10, duration_ns)
     body += _bytes(11, cpu_type)

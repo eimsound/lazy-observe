@@ -79,11 +79,15 @@ Add `lazyobserve.DjangoMiddleware` to `MIDDLEWARE`. The middleware:
 - extracts W3C `traceparent` and creates a SERVER span (`url.path`,
   `http.request.method`, `url.scheme`, `server.address`, protocol version);
 - records `http.server.request.duration` and `http.server.active_requests`;
-- recovers unhandled exceptions as HTTP 500 with an error log and queues the
-  exception as a platform error event (Issue aggregation). Setting
-  `config.re_raise_on_500 = True` re-raises instead (preserves the Django DEBUG
-  experience; default matches the Fiber behavior of returning 500);
-- attaches `http.route` (resolver route) and `http.response.status_code`.
+- observes unhandled view exceptions in `process_exception` (logs with `exc_info`
+  and queues the exception as a platform error event for Issue aggregation) and
+  returns `None` so Django's native 500 pipeline (`got_request_exception`,
+  `DEBUG` error page, custom `handler500`) stays intact; in direct non-Django
+  middleware calls, `config.re_raise_on_500 = True` re-raises instead of
+  returning HTTP 500;
+- attaches low-cardinality `http.route` (resolver route, or `"unmatched"` when
+  unmatched) and `http.response.status_code`, and updates the span name once the
+  route resolves.
 
 ```python
 MIDDLEWARE = [
@@ -107,8 +111,9 @@ REST_FRAMEWORK = {
 }
 ```
 
-Non-API exceptions are re-raised so the Django 500 path (and the middleware)
-captures them exactly once. 4xx API errors (validation, auth) never become
+Non-API exceptions return `None` per DRF's exception-handler contract so
+`APIView.raise_uncaught_exception` lets Django's 500 path (and the middleware)
+capture them exactly once. 4xx API errors (validation, auth) never become
 Issues.
 
 ## Logs
@@ -256,10 +261,11 @@ stops for good if the GIL is on.
 - Every `profiling_interval` seconds (default 60) one 10-second window is recorded, encoded
   and queued for upload. The window length is fixed. With `profiling_interval` below 10 the
   windows run back to back.
-- Upload uses the bounded in-memory delivery queue (capacity 6) with retries. Rejected
-  uploads (4xx) are not retried. Failed ticks and dropped uploads are counted in
-  `Diagnostics().dropped_telemetry` with `signal="profile"` and reasons such as `sample_failed`,
-  `queue_full`, `retry_exhausted`, `shutdown_budget` and `rejected`.
+- Upload uses the bounded in-memory delivery queue (capacity 6) with retries. Non-transient 4xx
+  uploads (excluding 408/429) and profiles exceeding the 10 MiB limit are not retried. Failed
+  ticks and dropped uploads are counted in `Diagnostics().dropped_telemetry` with
+  `signal="profile"` and reasons such as `sample_failed`, `queue_full`, `retry_exhausted`,
+  `shutdown_budget` and `server_rejected`.
 - The flame graph on the platform is the **sum of all processes and instances** of the service
   in the selected time range. Windows are not labeled with a pid or host, so you cannot split
   the view by process or instance.
@@ -346,8 +352,9 @@ the batch after the finite budget. `Diagnostics().dropped_telemetry` exposes the
 process-local total, and metrics-enabled clients export
 `lazy_observe_sdk_dropped_telemetry` with `signal`/`reason` attributes. Dropped
 error events are counted with `signal="error"` and the reasons `queue_full`,
-`retry_exhausted` and `shutdown_budget` (events still queued or retrying when
-the `shutdown` budget runs out, or captured after `shutdown`), the same as the
+`retry_exhausted`, `shutdown_budget` and `server_rejected` (events still queued or
+retrying when the `shutdown` budget runs out, captured after `shutdown`, rejected
+with non-transient 4xx, or exceeding the 200 KiB per-event limit), the same as the
 Go SDK. Once the budget has run out the queue starts no new request: neither
 the first attempt for a batch it already holds nor a retry whose delay has just
 ended. That batch is counted as `shutdown_budget` too; a request already in

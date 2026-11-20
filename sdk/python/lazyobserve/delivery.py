@@ -20,9 +20,13 @@ built with ``reinit_on_fork=False`` is left alone for its owner to rebuild
 
 from __future__ import annotations
 
+import datetime
+import email.utils
 import logging
+import math
 import os
 import queue
+import random
 import threading
 import time
 import weakref
@@ -31,9 +35,42 @@ from typing import Callable, Generic, List, Optional, TypeVar
 T = TypeVar("T")
 
 _CLOSE = object()
+MAX_RETRY_AFTER = 30.0
 
 DeliveryWarn = Callable[[str, Optional[BaseException], int], None]
 DeliverySender = Callable[[List[T], Optional[float]], None]
+
+
+class RetryableError(RuntimeError):
+    """Transient delivery failure that may carry a server-provided Retry-After delay."""
+
+    def __init__(self, message: str, *, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def parse_retry_after(
+    header_value: Optional[str], *, max_delay: float = MAX_RETRY_AFTER
+) -> Optional[float]:
+    """Parse an HTTP ``Retry-After`` header (delta-seconds or HTTP-date), capped."""
+    if not header_value:
+        return None
+    raw = header_value.strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            dt = email.utils.parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            seconds = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        except Exception:  # noqa: BLE001
+            return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return min(seconds, max_delay)
 
 
 class DeliveryQueue(Generic[T]):
@@ -103,18 +140,21 @@ class DeliveryQueue(Generic[T]):
     # -- public API ---------------------------------------------------------
 
     def enqueue(self, item: T) -> bool:
-        if not item or item is _CLOSE:
+        if item is None or item is _CLOSE:
             return False
+        drop_reason: Optional[str] = None
         with self._close_lock:
             if self._closed:
-                self._record_drop("shutdown_budget", None, 1)
-                return False
-        try:
-            self._items.put_nowait(item)
-            return True
-        except queue.Full:
-            self._record_drop("queue_full", None, 1)
-            return False
+                drop_reason = "shutdown_budget"
+            else:
+                try:
+                    self._items.put_nowait(item)
+                    return True
+                except queue.Full:
+                    drop_reason = "queue_full"
+        if drop_reason is not None:
+            self._record_drop(drop_reason, None, 1)
+        return False
 
     def close(self, timeout: Optional[float] = None) -> Optional[BaseException]:
         with self._close_lock:
@@ -186,16 +226,23 @@ class DeliveryQueue(Generic[T]):
             pass  # refilled by an enqueue that passed the closed check just before close
         self._record_drop("shutdown_budget", None, dropped)
 
-    def _set_error(self, err: BaseException) -> None:
+    def _set_error(self, err: Optional[BaseException]) -> None:
         self._last_error = err
 
-    def _retry_delay(self, retry_index: int) -> float:
+    def _retry_delay(self, retry_index: int, err: Optional[BaseException] = None) -> float:
         delay = self._retry_initial
         for _ in range(retry_index):
             if delay >= self._retry_max / 2:
-                return self._retry_max
+                delay = self._retry_max
+                break
             delay *= 2.0
-        return min(delay, self._retry_max)
+        delay = min(delay, self._retry_max)
+        if delay > 0:
+            delay *= random.uniform(0.5, 1.0)
+        retry_after = getattr(err, "retry_after", None) if err is not None else None
+        if isinstance(retry_after, (int, float)) and math.isfinite(retry_after) and retry_after > 0:
+            delay = max(delay, min(float(retry_after), MAX_RETRY_AFTER))
+        return delay
 
     def _wait(self, delay: float) -> bool:
         """Return False when the queue should stop waiting."""
@@ -211,36 +258,55 @@ class DeliveryQueue(Generic[T]):
         timeout = self._flush_interval if self._flush_interval > 0 else None
         try:
             while True:
+                if self._closed:
+                    self._drain_and_close()
+                    return
                 try:
                     item = self._items.get(timeout=timeout)
                 except queue.Empty:
                     if self._closed:
-                        break
+                        self._drain_and_close()
+                        return
                     continue
                 if item is _CLOSE:
                     self._drain_and_close()
                     return
                 batch = [item]  # type: List[T]
-                self._gather(batch)
+                saw_close = self._gather(batch)
                 if not self._deliver(batch):
+                    return
+                if saw_close or self._closed:
+                    self._drain_and_close()
                     return
         finally:
             self._done.set()
 
-    def _gather(self, batch: List[T]) -> None:
+    def _gather(self, batch: List[T]) -> bool:
+        if self._flush_interval <= 0:
+            while len(batch) < self._batch_size:
+                try:
+                    item = self._items.get_nowait()
+                except queue.Empty:
+                    return False
+                if item is _CLOSE:
+                    self._closed = True
+                    return True
+                batch.append(item)
+            return False
         deadline = time.monotonic() + self._flush_interval
         while len(batch) < self._batch_size:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return
+                return False
             try:
                 item = self._items.get(timeout=remaining)
             except queue.Empty:
-                return
+                return False
             if item is _CLOSE:
                 self._closed = True
-                return
+                return True
             batch.append(item)
+        return False
 
     def _deliver(self, batch: List[T]) -> bool:
         """Deliver a batch; returns True to continue, False to stop the worker."""
@@ -259,6 +325,7 @@ class DeliveryQueue(Generic[T]):
             err = None
             try:
                 self._send(batch, None)
+                self._set_error(None)
                 return True
             except BaseException as exc:  # noqa: BLE001 - delivery must not crash the worker
                 err = exc
@@ -270,7 +337,7 @@ class DeliveryQueue(Generic[T]):
                 self._set_error(err)
                 self._record_drop("retry_exhausted", err, len(batch))
                 return True
-            if not self._wait(self._retry_delay(attempt)):
+            if not self._wait(self._retry_delay(attempt, err)):
                 self._set_error(err or RuntimeError("delivery cancelled"))
                 self._record_drop("shutdown_budget", err, len(batch))
                 return False
@@ -288,10 +355,16 @@ class DeliveryQueue(Generic[T]):
                 remaining.append(item)
         if not remaining:
             return
-        if self._cancel.is_set():
-            self._record_drop("shutdown_budget", None, len(remaining))
-            return
-        self._deliver(remaining)
+        for start in range(0, len(remaining), self._batch_size):
+            chunk = remaining[start : start + self._batch_size]
+            if self._cancel.is_set():
+                self._record_drop("shutdown_budget", None, len(remaining) - start)
+                return
+            if not self._deliver(chunk):
+                after = len(remaining) - (start + len(chunk))
+                if after > 0:
+                    self._record_drop("shutdown_budget", None, after)
+                return
 
     @property
     def name(self) -> str:

@@ -91,8 +91,11 @@ lazyobserve.init(
     }
 )
 
+_lo_client = lazyobserve.get_client()
 logging.getLogger("lazyobserve").info(
-    "lazy-observe SDK initialized: dsn=%s", LO_DSN, extra={"dsn": LO_DSN}
+    "lazy-observe SDK initialized: service=%s degraded=%s",
+    _lo_client.config.service_name if _lo_client else "",
+    _lo_client.degraded if _lo_client else True,
 )
 
 # Shut the SDK down cleanly on ordinary interpreters (WSGI/management commands).

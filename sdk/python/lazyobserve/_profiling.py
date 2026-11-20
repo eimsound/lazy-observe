@@ -347,19 +347,25 @@ def _timestamp(ns: int) -> datetime.datetime:
 # --- fork hook ---------------------------------------------------------------------------
 
 _controllers: List["weakref.ReferenceType[ProfilingController]"] = []
+_controllers_lock = threading.Lock()
 _fork_hook_registered = False
 
 
 def _track(controller: ProfilingController) -> None:
     global _fork_hook_registered
-    _controllers.append(weakref.ref(controller))
-    if not _fork_hook_registered and hasattr(os, "register_at_fork"):
-        _fork_hook_registered = True
-        os.register_at_fork(after_in_child=_after_fork_in_child)
+    with _controllers_lock:
+        _controllers[:] = [ref for ref in _controllers if ref() is not None]
+        _controllers.append(weakref.ref(controller))
+        if not _fork_hook_registered and hasattr(os, "register_at_fork"):
+            _fork_hook_registered = True
+            os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _after_fork_in_child() -> None:
-    global _controllers
+    global _controllers, _controllers_lock
+    # Another parent thread may have held the registry lock at the fork: replace it,
+    # never acquire it. A copy of the list is enough, since this is the only thread.
+    _controllers_lock = threading.Lock()
     try:
         _reset_warning_state()  # a new process warns again, once per code
         alive = [ref for ref in list(_controllers) if ref() is not None]

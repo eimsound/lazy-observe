@@ -13,18 +13,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from .django import _UNMATCHED_ROUTE, _request_scheme, _route_for, _safe_host
+
 
 def _request_context(request: Any) -> dict:
     if request is None:
         return {}
-    resolver = getattr(request, "resolver_match", None)
-    route = getattr(resolver, "route", None) if resolver else None
-    if not route:
-        route = getattr(request, "path", "") or ""
+    route = _route_for(request)
     path = getattr(request, "path", "") or ""
     method = getattr(request, "method", "") or ""
-    scheme = "https" if getattr(request, "is_secure", lambda: False)() else "http"
-    host = request.get_host() if hasattr(request, "get_host") else ""
+    scheme = _request_scheme(request)
+    host = _safe_host(request)
     url = f"{scheme}://{host}{path}" if host else path
     return {
         "http.request.method": method,
@@ -42,22 +41,26 @@ def build_exception_handler(client: Any):
 
         response = drf_handler(exc, context)
         if response is None:
-            # Non-API exception: re-raise so Django's 500 path (and the lazyobserve
-            # middleware) captures it once.
-            raise exc
+            # Non-API exception: follow the DRF protocol by returning None so
+            # APIView.raise_uncaught_exception lets Django's 500 path (and the
+            # middleware) capture it once.
+            return None
         status = response.status_code
-        if status >= 500:
-            info = _request_context(context.get("request"))
-            tags = {
-                "http.request.method": info.get("http.request.method", ""),
-                "http.route": info.get("http.route", ""),
-                "http.response.status_code": str(status),
-            }
-            client.capture_exception(
-                exc,
-                tags=tags,
-                url=info.get("url") or None,
-            )
+        if status >= 500 and client is not None and not client.degraded:
+            try:
+                info = _request_context(context.get("request") if isinstance(context, dict) else None)
+                tags = {
+                    "http.request.method": info.get("http.request.method", ""),
+                    "http.route": info.get("http.route", _UNMATCHED_ROUTE),
+                    "http.response.status_code": str(status),
+                }
+                client.capture_exception(
+                    exc,
+                    tags=tags,
+                    url=info.get("url") or None,
+                )
+            except Exception:  # noqa: BLE001 - silent degradation, never break DRF response
+                pass
         return response
 
     return handler

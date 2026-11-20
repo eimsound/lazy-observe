@@ -36,7 +36,7 @@ class Config:
     explicit enabled set.
     """
 
-    dsn: str = ""
+    dsn: str = field(default="", repr=False)
     service_name: str = ""
     metrics: bool = False
     logs: bool = False
@@ -45,6 +45,7 @@ class Config:
     tee_to_stderr: bool = True
     capture_db_statement: bool = False
     capture_llm_content: bool = False
+    re_raise_on_500: bool = False
     release: str = ""
     environment: str = ""
     tags: Optional[Dict[str, str]] = None
@@ -94,12 +95,28 @@ def normalize_config(cfg: Config) -> Config:
     if cfg.export_interval <= 0:
         cfg.export_interval = 5.0
     cfg.profiling = bool(cfg.profiling)
+    cfg.re_raise_on_500 = bool(cfg.re_raise_on_500)
     if not (cfg.profiling_interval > 0 and math.isfinite(cfg.profiling_interval)):
         cfg.profiling_interval = PROFILING_INTERVAL  # also catches NaN and +-inf
+    cfg.delivery = _coerce_delivery_config(cfg.delivery)
     normalize_delivery(cfg.delivery)
     if cfg.tags is None:
         cfg.tags = {}
     return cfg
+
+
+def _coerce_delivery_config(value: object) -> DeliveryConfig:
+    if value is None:
+        return DeliveryConfig()
+    if isinstance(value, DeliveryConfig):
+        return value
+    if isinstance(value, dict):
+        known = DeliveryConfig.__dataclass_fields__
+        try:
+            return DeliveryConfig(**{k: v for k, v in value.items() if k in known})
+        except TypeError as exc:
+            raise InvalidConfigError(f"invalid delivery configuration: {exc}") from exc
+    raise InvalidConfigError("delivery must be a DeliveryConfig or dict")
 
 
 def normalize_delivery(cfg: DeliveryConfig) -> None:

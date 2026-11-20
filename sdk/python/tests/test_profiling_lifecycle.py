@@ -1171,6 +1171,68 @@ def test_warning_dedupe_is_per_process_so_a_child_may_warn_again(caplog_profilin
     assert "reason=gil_build" in payload["messages"][0]
 
 
+def test_track_is_thread_safe_prunes_dead_refs_and_registers_fork_hook_once(monkeypatch):
+    import gc
+
+    registrations = []
+    monkeypatch.setattr(_profiling, "_controllers", [])
+    monkeypatch.setattr(_profiling, "_fork_hook_registered", False)
+    monkeypatch.setattr(
+        os,
+        "register_at_fork",
+        lambda **kwargs: registrations.append(kwargs),
+    )
+
+    barrier = threading.Barrier(8)
+    controllers = []
+
+    def worker():
+        barrier.wait()
+        for _ in range(5):
+            ctrl = build(FakeSampler(available=False)).controller
+            controllers.append(ctrl)
+            _profiling._track(ctrl)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(registrations) == 1
+    controllers.clear()
+    gc.collect()
+    live = build(FakeSampler(available=False)).controller
+    _profiling._track(live)
+    assert len(_profiling._controllers) == 1
+
+
+@needs_fork
+def test_fork_while_controllers_lock_is_held_does_not_deadlock():
+    holding = threading.Event()
+    done = threading.Event()
+
+    def hold_lock():
+        with _profiling._controllers_lock:
+            holding.set()
+            done.wait(20)
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert holding.wait(5)
+    try:
+        def child():
+            ctrl = build(FakeSampler(available=False)).controller
+            _profiling._track(ctrl)
+            return {"ok": True}
+
+        payload = assert_child_ok(*run_in_child(child))
+        assert payload == {"ok": True}
+    finally:
+        done.set()
+        holder.join(5)
+
+
 # --- real interpreter (free-threaded 3.15 only) ---------------------------------------------
 
 

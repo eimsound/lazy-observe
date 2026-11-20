@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib import parse
 
 
@@ -14,7 +14,7 @@ class DSNSchemeError(ValueError):
 class DSN:
     endpoint: str
     project: str
-    token: str
+    token: str = field(repr=False)
 
 
 def parse_dsn(raw: str) -> DSN:
