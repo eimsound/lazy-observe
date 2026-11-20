@@ -24,17 +24,34 @@ func newPreStopCommand() *cobra.Command {
 			return runPreStop(delay)
 		},
 	}
-	command.Flags().DurationVar(&delay, "delay", delay, "delay after signaling PID 1")
+	command.Flags().DurationVar(&delay, "delay", delay, "delay after marking PID 1 unready and before SIGTERM")
 	return command
 }
 
 func runPreStop(delay time.Duration) error {
-	if os.Getpid() == 1 {
+	return runPreStopWith(os.Getpid(), 1, delay, syscall.Kill, time.Sleep)
+}
+
+func runPreStopWith(
+	selfPID, targetPID int,
+	delay time.Duration,
+	killFn func(int, syscall.Signal) error,
+	sleepFn func(time.Duration),
+) error {
+	if selfPID == targetPID {
 		return errors.New("pre-stop must run as a lifecycle hook, not PID 1")
 	}
-	if err := syscall.Kill(1, syscall.SIGTERM); err != nil {
-		return fmt.Errorf("signal server PID 1: %w", err)
+	// First mark PID 1 unready via SIGUSR1 so readiness probes and kube-proxy
+	// observe 503 while the listener keeps serving in-flight and still-routed
+	// connections for the full pre-stop window.
+	if err := killFn(targetPID, syscall.SIGUSR1); err != nil {
+		return fmt.Errorf("signal server PID %d to begin drain: %w", targetPID, err)
 	}
-	time.Sleep(delay)
+	if delay > 0 {
+		sleepFn(delay)
+	}
+	if err := killFn(targetPID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("signal server PID %d to stop: %w", targetPID, err)
+	}
 	return nil
 }

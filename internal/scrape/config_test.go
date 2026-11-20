@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
@@ -73,5 +75,55 @@ func TestTargetValidationRejectsLoopAndReservedLabels(t *testing.T) {
 		if err := service.validate(input, false); !errors.Is(err, ErrInvalidTarget) {
 			t.Errorf("input %#v: err=%v", input, err)
 		}
+	}
+}
+
+func TestServiceConcurrentSyncIsSerializedAndLeavesNoTempFiles(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if _, err := store.CreateProject(ctx, "Alpha", "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateScrapeTarget(ctx, meta.ScrapeTargetCreate{
+		ProjectSlug: "alpha", Name: "node", URL: "http://127.0.0.1:9100/metrics", Interval: "15s",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scrape.yml")
+	var reloads atomic.Int32
+	svc := NewService(Config{
+		Store:      store,
+		ConfigPath: path,
+		Reload: func() error {
+			reloads.Add(1)
+			return nil
+		},
+	})
+	var wg sync.WaitGroup
+	errs := make(chan error, 12)
+	for range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := svc.Sync(ctx); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent Sync failed: %v", err)
+	}
+	if reloads.Load() != 12 {
+		t.Fatalf("reloads=%d want 12", reloads.Load())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "scrape.yml" {
+		t.Fatalf("unexpected files in scrape config dir: %v", entries)
 	}
 }

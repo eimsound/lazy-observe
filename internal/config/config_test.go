@@ -588,3 +588,60 @@ func TestMetaDBURLPrecedenceAndValidation(t *testing.T) {
 		t.Fatal("zero metadata migration lock timeout accepted")
 	}
 }
+
+func TestEmptyAndCommentOnlyYAMLConfigLoadsDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{name: "empty", content: ""},
+		{name: "comments-only", content: "# default configuration\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+			if err != nil {
+				t.Fatalf("Load(%s): %v", tc.name, err)
+			}
+			if cfg.Listen != Defaults().Listen || !cfg.Security.CSRF {
+				t.Fatalf("unexpected defaults from %s YAML: %+v", tc.name, cfg)
+			}
+		})
+	}
+}
+
+func TestSecurityEnvironmentAndValidation(t *testing.T) {
+	env := map[string]string{
+		"LO_SECURITY_CSRF":                  "false",
+		"LO_SECURITY_SESSION_SECURE_COOKIE": "true",
+		"LO_SECURITY_AUDIT_RETENTION":       "30d",
+		"LO_SECURITY_TLS_CERT":              "/etc/tls/cert.pem",
+		"LO_SECURITY_TLS_KEY":               "/etc/tls/key.pem",
+	}
+	cfg, _, err := Load(nil, func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+	if err != nil {
+		t.Fatalf("Load security env: %v", err)
+	}
+	if cfg.Security.CSRF || !cfg.Security.SessionSecureCookie ||
+		cfg.Security.AuditRetention.Value() != 30*24*time.Hour ||
+		cfg.Security.TLSCert != "/etc/tls/cert.pem" || cfg.Security.TLSKey != "/etc/tls/key.pem" {
+		t.Fatalf("security env mismatch: %+v", cfg.Security)
+	}
+
+	// Single-sided TLS config must fail validation.
+	badTLS := Defaults()
+	badTLS.Security.TLSCert = "/etc/tls/cert.pem"
+	if err := badTLS.Validate(); err == nil || !strings.Contains(err.Error(), "tls_cert") {
+		t.Fatalf("single-sided TLS err=%v", err)
+	}
+
+	// Non-positive audit retention must fail validation.
+	badAudit := Defaults()
+	badAudit.Security.AuditRetention = 0
+	if err := badAudit.Validate(); err == nil {
+		t.Fatal("zero audit retention was accepted")
+	}
+}

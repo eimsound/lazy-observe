@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -17,8 +15,8 @@ type ReplaySession struct {
 func (ReplaySession) Fields() []ent.Field {
 	return []ent.Field{
 		field.String("session_id").NotEmpty(),
-		field.Time("started_at").Default(time.Now).Immutable(),
-		field.Time("last_seen_at").Default(time.Now),
+		field.Time("started_at").Default(UTCNow).Immutable(),
+		field.Time("last_seen_at").Default(UTCNow),
 		field.Int("segment_count").Default(0).NonNegative(),
 		field.Int64("total_bytes").Default(0).NonNegative(),
 		field.Bool("has_error").Default(false),

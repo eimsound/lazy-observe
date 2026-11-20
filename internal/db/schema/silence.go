@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -17,7 +15,7 @@ func (Silence) Fields() []ent.Field {
 		field.Time("ends_at"),
 		field.String("comment").Optional(),
 		field.String("creator").NotEmpty(),
-		field.Time("created_at").Default(time.Now).Immutable(),
+		field.Time("created_at").Default(UTCNow).Immutable(),
 		field.Int("project_id"),
 	}
 }

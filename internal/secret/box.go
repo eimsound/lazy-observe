@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // keyBytes is the AES-256 key length.
@@ -60,10 +62,16 @@ func LoadOrCreate(path string) (*Box, error) {
 		if _, err := rand.Read(box.key[:]); err != nil {
 			return nil, fmt.Errorf("generate encryption key: %w", err)
 		}
-		if err := persist(path, box.key[:]); err != nil {
+		created, err := persistExclusive(path, box.key[:])
+		if err != nil {
 			return nil, err
 		}
-		return &box, nil
+		if created {
+			return &box, nil
+		}
+		// Another replica won the first-start race on a shared volume; load
+		// the winner's key so every replica converges on the same fingerprint.
+		return loadWithRetry(path)
 	default:
 		return nil, fmt.Errorf("read encryption key file %s: %w", path, err)
 	}
@@ -102,20 +110,113 @@ func boxFromRaw(raw []byte) (*Box, error) {
 	return &box, nil
 }
 
-func persist(path string, raw []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create key directory: %w", err)
+// persistExclusive writes raw atomically without ever overwriting an existing
+// key file. It returns created=true if this call persisted the key, or
+// created=false if another process created path first.
+func persistExclusive(path string, raw []byte) (bool, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, fmt.Errorf("create key directory: %w", err)
 	}
 	encoded := make([]byte, base64.RawStdEncoding.EncodedLen(len(raw)))
 	base64.RawStdEncoding.Encode(encoded, raw)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, encoded, 0o600); err != nil {
-		return fmt.Errorf("write encryption key file: %w", err)
+
+	tmpFile, err := os.CreateTemp(dir, ".secret.key-*")
+	if err != nil {
+		return false, fmt.Errorf("create temporary encryption key file: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("persist encryption key file: %w", err)
+	tmpPath := tmpFile.Name()
+	cleanupTmp := func() { _ = os.Remove(tmpPath) }
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		cleanupTmp()
+		return false, fmt.Errorf("chmod temporary encryption key file: %w", err)
 	}
-	return nil
+	if _, err := tmpFile.Write(encoded); err != nil {
+		_ = tmpFile.Close()
+		cleanupTmp()
+		return false, fmt.Errorf("write encryption key file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		cleanupTmp()
+		return false, fmt.Errorf("sync encryption key file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		cleanupTmp()
+		return false, fmt.Errorf("close encryption key file: %w", err)
+	}
+
+	linkErr := os.Link(tmpPath, path)
+	cleanupTmp()
+	switch {
+	case linkErr == nil:
+		_ = syncDir(dir)
+		return true, nil
+	case errors.Is(linkErr, os.ErrExist):
+		return false, nil
+	case isHardLinkUnsupported(linkErr):
+		return writeExclusiveDirect(path, dir, encoded)
+	default:
+		return false, fmt.Errorf("persist encryption key file: %w", linkErr)
+	}
+}
+
+func writeExclusiveDirect(path, dir string, encoded []byte) (bool, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("create encryption key file: %w", err)
+	}
+	if _, err := f.Write(encoded); err != nil {
+		_ = f.Close()
+		return false, fmt.Errorf("write encryption key file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return false, fmt.Errorf("sync encryption key file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return false, fmt.Errorf("close encryption key file: %w", err)
+	}
+	_ = syncDir(dir)
+	return true, nil
+}
+
+func isHardLinkUnsupported(err error) bool {
+	return errors.Is(err, syscall.EPERM) ||
+		errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.EXDEV)
+}
+
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+func loadWithRetry(path string) (*Box, error) {
+	var lastErr error
+	for attempt := range 20 {
+		box, err := Load(path)
+		if err == nil {
+			return box, nil
+		}
+		lastErr = err
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return nil, lastErr
 }
 
 // Encrypt seals plaintext into base64(nonce || ciphertext). The same value

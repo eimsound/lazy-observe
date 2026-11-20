@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/field"
 )
@@ -23,7 +21,7 @@ func (AISetting) Fields() []ent.Field {
 		field.String("model").Default(""),
 		field.String("api_key_ciphertext").Default(""),
 		field.Int("max_tokens").Default(0),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 		field.String("updated_by").Default(""),
 	}
 }

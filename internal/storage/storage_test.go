@@ -67,6 +67,11 @@ func TestVMClusterTenantEndpoints(t *testing.T) {
 	if got, want := b.PrometheusRemoteWriteBase(), server.URL+"/insert/7/prometheus"; got != want {
 		t.Fatalf("Prometheus remote-write base=%q want=%q", got, want)
 	}
+	header := http.Header{}
+	b.SetTenantHeaders(header, 42)
+	if header.Get("AccountID") != "7" || header.Get("ProjectID") != "42" {
+		t.Fatalf("cluster tenant headers=%v want AccountID=7 ProjectID=42", header)
+	}
 }
 
 func TestVMClusterHealthProbesVMSelectAndVMInsert(t *testing.T) {

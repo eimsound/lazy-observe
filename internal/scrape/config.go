@@ -3,8 +3,10 @@ package scrape
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
@@ -19,6 +22,8 @@ import (
 )
 
 var ErrInvalidTarget = errors.New("invalid scrape target")
+
+const DefaultLeaderSyncInterval = 5 * time.Second
 
 type ReloadFunc func() error
 
@@ -34,6 +39,12 @@ type Service struct {
 	configPath    string
 	reload        ReloadFunc
 	platformPorts map[string]struct{}
+
+	syncMu   sync.Mutex
+	leaderMu sync.RWMutex
+	isLeader bool
+	hasHash  bool
+	lastHash [sha256.Size]byte
 }
 
 type Input struct {
@@ -51,19 +62,151 @@ func NewService(cfg Config) *Service {
 			ports[strconv.Itoa(port)] = struct{}{}
 		}
 	}
-	return &Service{store: cfg.Store, configPath: cfg.ConfigPath, reload: cfg.Reload, platformPorts: ports}
+	clustered := cfg.Store != nil && cfg.Store.IsClustered()
+	return &Service{
+		store:         cfg.Store,
+		configPath:    cfg.ConfigPath,
+		reload:        cfg.Reload,
+		platformPorts: ports,
+		isLeader:      !clustered,
+	}
 }
 
 func JobName(t meta.ScrapeTargetView) string { return fmt.Sprintf("scrape-%d", t.ID) }
 
+func (s *Service) IsLeader() bool {
+	s.leaderMu.RLock()
+	defer s.leaderMu.RUnlock()
+	return s.isLeader
+}
+
+func (s *Service) setLeader(leader bool) {
+	s.leaderMu.Lock()
+	s.isLeader = leader
+	s.leaderMu.Unlock()
+}
+
 func (s *Service) Sync(ctx context.Context) error {
-	if err := WriteConfig(ctx, s.store, s.configPath); err != nil {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	if s.store != nil && s.store.IsClustered() && !s.IsLeader() {
+		// In HA mode, only the replica holding the scrape leader lock renders
+		// targets to vmagent. The leader's sync loop picks up DB changes written
+		// by non-leader replicas automatically.
+		return nil
+	}
+	return s.syncActiveLocked(ctx, true)
+}
+
+func (s *Service) syncActiveLocked(ctx context.Context, forceReload bool) error {
+	data, err := renderConfig(ctx, s.store)
+	if err != nil {
 		return err
 	}
+	sum := sha256.Sum256(data)
+	if !forceReload && s.hasHash && s.lastHash == sum {
+		return nil
+	}
+	if err := writeAtomicFile(s.configPath, data); err != nil {
+		return err
+	}
+	s.lastHash = sum
+	s.hasHash = true
 	if s.reload != nil {
 		return s.reload()
 	}
 	return nil
+}
+
+func (s *Service) syncStandbyLocked() error {
+	data := []byte("scrape_configs: []\n")
+	sum := sha256.Sum256(data)
+	if s.hasHash && s.lastHash == sum {
+		return nil
+	}
+	if err := writeAtomicFile(s.configPath, data); err != nil {
+		return err
+	}
+	s.lastHash = sum
+	s.hasHash = true
+	if s.reload != nil {
+		return s.reload()
+	}
+	return nil
+}
+
+// RunLeaderLoop coordinates single-owner scraping across HA PostgreSQL replicas
+// and periodically reconciles target changes written through other replicas.
+func (s *Service) RunLeaderLoop(ctx context.Context, logger *slog.Logger, interval time.Duration) {
+	if s.store == nil || !s.store.IsClustered() {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if interval <= 0 {
+		interval = DefaultLeaderSyncInterval
+	}
+	var release func() error
+	releaseLeader := func() {
+		s.setLeader(false)
+		if release != nil {
+			if err := release(); err != nil {
+				logger.Warn("release scrape leader lock failed", "error", err)
+			}
+			release = nil
+		}
+	}
+	defer releaseLeader()
+
+	step := func() {
+		if !s.IsLeader() {
+			rel, acquired, err := s.store.TryAcquireScrapeLeader(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					logger.Warn("acquire scrape leader lock failed", "error", err)
+				}
+				return
+			}
+			if !acquired {
+				s.syncMu.Lock()
+				err = s.syncStandbyLocked()
+				s.syncMu.Unlock()
+				if err != nil {
+					logger.Warn("clear standby scrape config failed", "error", err)
+				}
+				return
+			}
+			release = rel
+			s.setLeader(true)
+			logger.Info("acquired HA scrape leader lock")
+			s.syncMu.Lock()
+			err = s.syncActiveLocked(ctx, true)
+			s.syncMu.Unlock()
+			if err != nil {
+				logger.Warn("initial leader scrape sync failed", "error", err)
+			}
+			return
+		}
+		s.syncMu.Lock()
+		err := s.syncActiveLocked(ctx, false)
+		s.syncMu.Unlock()
+		if err != nil && ctx.Err() == nil {
+			logger.Warn("reconcile leader scrape config failed", "error", err)
+		}
+	}
+
+	step()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			step()
+		}
+	}
 }
 
 func (s *Service) List(ctx context.Context, slug string) ([]meta.ScrapeTargetView, error) {
@@ -197,15 +340,27 @@ type staticConfig struct {
 }
 
 func WriteConfig(ctx context.Context, store *meta.Store, path string) error {
-	targets, err := store.ScrapeConfigSnapshot(ctx)
+	data, err := renderConfig(ctx, store)
 	if err != nil {
 		return err
+	}
+	return writeAtomicFile(path, data)
+}
+
+func WriteEmptyConfig(path string) error {
+	return writeAtomicFile(path, []byte("scrape_configs: []\n"))
+}
+
+func renderConfig(ctx context.Context, store *meta.Store) ([]byte, error) {
+	targets, err := store.ScrapeConfigSnapshot(ctx)
+	if err != nil {
+		return nil, err
 	}
 	cfg := vmagentConfig{ScrapeConfigs: make([]scrapeConfig, 0, len(targets))}
 	for _, target := range targets {
 		u, err := parseTargetURL(target.URL)
 		if err != nil {
-			return fmt.Errorf("target %d: %w", target.ID, err)
+			return nil, fmt.Errorf("target %d: %w", target.ID, err)
 		}
 		labels := make(map[string]string, len(target.Labels)+2)
 		keys := make([]string, 0, len(target.Labels))
@@ -234,18 +389,43 @@ func WriteConfig(ctx context.Context, store *meta.Store, path string) error {
 			},
 		)
 	}
-	data, err := yaml.Marshal(cfg)
+	return yaml.Marshal(cfg)
+}
+
+func writeAtomicFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".scrape-*.tmp")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
 }
 
 func parseTargetURL(raw string) (*url.URL, error) {

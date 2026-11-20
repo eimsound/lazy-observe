@@ -4,19 +4,30 @@ package janitor
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 )
 
-const DefaultInterval = time.Hour
+const (
+	DefaultInterval    = time.Hour
+	DefaultTaskTimeout = 5 * time.Minute
+)
 
 type Task interface {
 	Clean(context.Context, time.Time) (int, error)
 }
 
+// Coordinator arbitrates cluster-wide janitor ownership (for example via a
+// PostgreSQL advisory lock) so HA replicas do not run full retention sweeps
+// simultaneously.
+type Coordinator interface {
+	TryAcquireJanitorLock(context.Context) (func() error, bool, error)
+}
+
 type registration struct {
 	name      string
 	retention time.Duration
+	interval  time.Duration
+	lastRun   time.Time
 	task      Task
 }
 
@@ -28,10 +39,13 @@ type Result struct {
 }
 
 type Janitor struct {
-	logger   *slog.Logger
-	interval time.Duration
-	now      func() time.Time
-	tasks    []registration
+	logger       *slog.Logger
+	interval     time.Duration
+	taskTimeout  time.Duration
+	initialDelay time.Duration
+	coordinator  Coordinator
+	now          func() time.Time
+	tasks        []registration
 }
 
 func New(logger *slog.Logger, interval time.Duration) *Janitor {
@@ -41,68 +55,156 @@ func New(logger *slog.Logger, interval time.Duration) *Janitor {
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
-	return &Janitor{logger: logger, interval: interval, now: time.Now}
+	return &Janitor{
+		logger:      logger,
+		interval:    interval,
+		taskTimeout: DefaultTaskTimeout,
+		now:         time.Now,
+	}
+}
+
+func (j *Janitor) SetCoordinator(coordinator Coordinator) {
+	j.coordinator = coordinator
+}
+
+func (j *Janitor) SetTaskTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		j.taskTimeout = timeout
+	}
+}
+
+func (j *Janitor) SetInitialDelay(delay time.Duration) {
+	if delay >= 0 {
+		j.initialDelay = delay
+	}
 }
 
 func (j *Janitor) Register(name string, retention time.Duration, task Task) {
+	j.RegisterWithInterval(name, retention, j.interval, task)
+}
+
+func (j *Janitor) RegisterWithInterval(name string, retention, interval time.Duration, task Task) {
 	if name == "" || retention <= 0 || task == nil {
 		return
 	}
-	j.tasks = append(j.tasks, registration{name: name, retention: retention, task: task})
+	if interval <= 0 {
+		interval = j.interval
+	}
+	j.tasks = append(j.tasks, registration{name: name, retention: retention, interval: interval, task: task})
 }
 
 func (j *Janitor) RunOnce(ctx context.Context) []Result {
-	results := make([]Result, len(j.tasks))
+	return j.run(ctx, true)
+}
+
+func (j *Janitor) run(ctx context.Context, forceAll bool) []Result {
 	now := j.now().UTC()
-	var wg sync.WaitGroup
-	for i, registered := range j.tasks {
-		wg.Add(1)
-		go func(i int, registered registration) {
-			defer wg.Done()
-			started := time.Now()
-			deleted, err := registered.task.Clean(ctx, now.Add(-registered.retention))
-			result := Result{Name: registered.name, Deleted: deleted, Duration: time.Since(started), Err: err}
-			results[i] = result
-			if err != nil {
-				j.logger.Error(
-					"retention cleanup failed",
-					"task",
-					result.Name,
-					"deleted",
-					result.Deleted,
-					"duration",
-					result.Duration,
-					"error",
-					err,
-				)
-				return
+	dueIndices := make([]int, 0, len(j.tasks))
+	for i := range j.tasks {
+		if forceAll || j.tasks[i].lastRun.IsZero() || now.Sub(j.tasks[i].lastRun) >= j.tasks[i].interval {
+			dueIndices = append(dueIndices, i)
+		}
+	}
+	if len(dueIndices) == 0 {
+		return nil
+	}
+	if j.coordinator != nil {
+		release, acquired, err := j.coordinator.TryAcquireJanitorLock(ctx)
+		if err != nil {
+			j.logger.Warn("retention janitor lock acquisition failed", "error", err)
+			return nil
+		}
+		if !acquired {
+			j.logger.Debug("skipping retention cleanup; another replica holds the janitor lock")
+			return nil
+		}
+		defer func() {
+			if releaseErr := release(); releaseErr != nil {
+				j.logger.Warn("release retention janitor lock failed", "error", releaseErr)
 			}
-			j.logger.Info(
-				"retention cleanup completed",
+		}()
+	}
+
+	results := make([]Result, 0, len(dueIndices))
+	for _, idx := range dueIndices {
+		if ctx.Err() != nil {
+			break
+		}
+		registered := &j.tasks[idx]
+		started := time.Now()
+		taskCtx := ctx
+		var cancel context.CancelFunc
+		if j.taskTimeout > 0 {
+			taskCtx, cancel = context.WithTimeout(ctx, j.taskTimeout)
+		}
+		deleted, err := registered.task.Clean(taskCtx, now.Add(-registered.retention))
+		if cancel != nil {
+			cancel()
+		}
+		registered.lastRun = now
+		result := Result{Name: registered.name, Deleted: deleted, Duration: time.Since(started), Err: err}
+		results = append(results, result)
+		if err != nil {
+			j.logger.Error(
+				"retention cleanup failed",
 				"task",
 				result.Name,
 				"deleted",
 				result.Deleted,
 				"duration",
 				result.Duration,
+				"error",
+				err,
 			)
-		}(i, registered)
+			continue
+		}
+		j.logger.Info(
+			"retention cleanup completed",
+			"task",
+			result.Name,
+			"deleted",
+			result.Deleted,
+			"duration",
+			result.Duration,
+		)
 	}
-	wg.Wait()
 	return results
 }
 
-// Run executes all registered tasks on startup and then on a shared interval.
+func (j *Janitor) tickInterval() time.Duration {
+	minInterval := j.interval
+	for _, task := range j.tasks {
+		if task.interval > 0 && task.interval < minInterval {
+			minInterval = task.interval
+		}
+	}
+	if minInterval <= 0 {
+		return DefaultInterval
+	}
+	return minInterval
+}
+
+// Run executes registered tasks after an optional startup delay and then on
+// their configured schedule.
 func (j *Janitor) Run(ctx context.Context) {
-	j.RunOnce(ctx)
-	ticker := time.NewTicker(j.interval)
+	if j.initialDelay > 0 {
+		timer := time.NewTimer(j.initialDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+	j.run(ctx, false)
+	ticker := time.NewTicker(j.tickInterval())
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			j.RunOnce(ctx)
+			j.run(ctx, false)
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -75,4 +76,84 @@ func TestJanitorRunsOnStartupAndInterval(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+type fakeCoordinator struct {
+	acquired bool
+	releases atomic.Int32
+}
+
+func (c *fakeCoordinator) TryAcquireJanitorLock(context.Context) (func() error, bool, error) {
+	if !c.acquired {
+		return nil, false, nil
+	}
+	return func() error {
+		c.releases.Add(1)
+		return nil
+	}, true, nil
+}
+
+type concurrencyCheckTask struct {
+	active    *atomic.Int32
+	maxActive *atomic.Int32
+	calls     atomic.Int32
+}
+
+func (t *concurrencyCheckTask) Clean(context.Context, time.Time) (int, error) {
+	t.calls.Add(1)
+	cur := t.active.Add(1)
+	for {
+		prev := t.maxActive.Load()
+		if cur <= prev || t.maxActive.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
+	time.Sleep(10 * time.Millisecond)
+	t.active.Add(-1)
+	return 1, nil
+}
+
+func TestJanitorCoordinatorLeadershipSequentialExecutionAndPerTaskInterval(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	j := New(logger, time.Hour)
+
+	// When coordinator reports lock held by another replica, skip all tasks.
+	coord := &fakeCoordinator{acquired: false}
+	j.SetCoordinator(coord)
+	var active, maxActive atomic.Int32
+	t1 := &concurrencyCheckTask{active: &active, maxActive: &maxActive}
+	t2 := &concurrencyCheckTask{active: &active, maxActive: &maxActive}
+	j.Register("t1", time.Hour, t1)
+	j.Register("t2", time.Hour, t2)
+	if results := j.RunOnce(context.Background()); len(results) != 0 {
+		t.Fatalf("expected skipped cycle when lock unavailable, got %+v", results)
+	}
+	if t1.calls.Load() != 0 || t2.calls.Load() != 0 {
+		t.Fatalf("tasks ran without lock: t1=%d t2=%d", t1.calls.Load(), t2.calls.Load())
+	}
+
+	// When lock is acquired, tasks run sequentially and lock is released.
+	coord.acquired = true
+	results := j.RunOnce(context.Background())
+	if len(results) != 2 || coord.releases.Load() != 1 {
+		t.Fatalf("results=%d releases=%d", len(results), coord.releases.Load())
+	}
+	if maxActive.Load() != 1 {
+		t.Fatalf("max concurrent tasks=%d want 1 (sequential)", maxActive.Load())
+	}
+
+	// Per-task interval allows replay cleanup to run more frequently than other tasks.
+	fast := &recordingTask{}
+	slow := &recordingTask{}
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	j2 := New(logger, time.Hour)
+	j2.now = func() time.Time { return now }
+	j2.RegisterWithInterval("fast", time.Hour, 5*time.Minute, fast)
+	j2.Register("slow", time.Hour, slow)
+	j2.run(context.Background(), false)
+	now = now.Add(10 * time.Minute)
+	j2.run(context.Background(), false)
+	if fast.calls() != 2 || slow.calls() != 1 {
+		t.Fatalf("per-task interval calls: fast=%d slow=%d want 2,1", fast.calls(), slow.calls())
+	}
 }

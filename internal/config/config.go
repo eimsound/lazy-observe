@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -227,7 +228,7 @@ func Load(args []string, lookupEnv func(string) (string, bool)) (Config, string,
 		}
 		dec := yaml.NewDecoder(bytes.NewReader(data))
 		dec.KnownFields(true)
-		if err := dec.Decode(&cfg); err != nil {
+		if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 			return Config{}, configPath, fmt.Errorf("parse config: %w", err)
 		}
 	}
@@ -377,6 +378,18 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 	fs.Var(&cfg.Security.AuditRetention, "audit-retention", "management audit event retention")
 	fs.StringVar(&cfg.Security.TLSCert, "tls-cert", cfg.Security.TLSCert, "TLS certificate file (enables HTTPS)")
 	fs.StringVar(&cfg.Security.TLSKey, "tls-key", cfg.Security.TLSKey, "TLS private key file")
+	fs.StringVar(
+		&cfg.Security.SecretKeyFile,
+		"security-secret-key-file",
+		cfg.Security.SecretKeyFile,
+		"platform encryption key file path",
+	)
+	fs.StringVar(
+		&cfg.Security.AdminPasswordFile,
+		"security-admin-password-file",
+		cfg.Security.AdminPasswordFile,
+		"initial admin password file path",
+	)
 	fs.StringSliceVar(
 		&cfg.Security.OutboundAllowlist,
 		"security-outbound-allowlist",
@@ -455,6 +468,8 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		// Paths, not the secrets: the key material itself never travels via env.
 		"LO_SECURITY_SECRET_KEY_FILE":     &c.Security.SecretKeyFile,
 		"LO_SECURITY_ADMIN_PASSWORD_FILE": &c.Security.AdminPasswordFile,
+		"LO_SECURITY_TLS_CERT":            &c.Security.TLSCert,
+		"LO_SECURITY_TLS_KEY":             &c.Security.TLSKey,
 	}
 	for name, dst := range stringsMap {
 		if v, ok := lookup(name); ok {
@@ -498,8 +513,10 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		c.Standalone = parsed
 	}
 	for name, dst := range map[string]*bool{
-		"LO_SERVE_WEB_UI":            &c.ServeWebUI,
-		"LO_STORAGE_METRICS_CLUSTER": &c.Storage.Metrics.Cluster,
+		"LO_SERVE_WEB_UI":                   &c.ServeWebUI,
+		"LO_STORAGE_METRICS_CLUSTER":        &c.Storage.Metrics.Cluster,
+		"LO_SECURITY_CSRF":                  &c.Security.CSRF,
+		"LO_SECURITY_SESSION_SECURE_COOKIE": &c.Security.SessionSecureCookie,
 	} {
 		if v, ok := lookup(name); ok {
 			parsed, err := strconv.ParseBool(v)
@@ -582,6 +599,7 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		"LO_PROCESS_RESTART_INITIAL":     &c.Process.RestartInitial,
 		"LO_PROCESS_RESTART_MAX":         &c.Process.RestartMax,
 		"LO_PROCESS_DRAIN_TIMEOUT":       &c.Process.DrainTimeout,
+		"LO_SECURITY_AUDIT_RETENTION":    &c.Security.AuditRetention,
 	}
 	for name, dst := range canonicalDurations {
 		if v, ok := lookup(name); ok {
@@ -650,9 +668,13 @@ func (c Config) Validate() error {
 		c.Retention.SourceMaps <= 0 ||
 		c.Retention.AlertEvents <= 0 ||
 		c.Retention.Profiles <= 0 ||
+		c.Security.AuditRetention <= 0 ||
 		c.Alert.GroupWait <= 0 ||
 		c.Alert.RepeatInterval <= 0 {
-		return errors.New("signal retention and alert intervals must be positive")
+		return errors.New("signal retention, audit retention, and alert intervals must be positive")
+	}
+	if (strings.TrimSpace(c.Security.TLSCert) == "") != (strings.TrimSpace(c.Security.TLSKey) == "") {
+		return errors.New("security.tls_cert and security.tls_key must be set together")
 	}
 	if c.Blob.Backend != "local" && c.Blob.Backend != "s3" {
 		return fmt.Errorf("unsupported blob store %q", c.Blob.Backend)

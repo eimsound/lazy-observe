@@ -72,12 +72,17 @@ func NewWithMetricsOptions(
 	if kind != MetricsVM && kind != MetricsPrometheus {
 		return nil, fmt.Errorf("unsupported metrics kind %q", kind)
 	}
+	if opts.TenantAccountID != "" {
+		if _, err := strconv.ParseUint(opts.TenantAccountID, 10, 32); err != nil {
+			return nil, fmt.Errorf("metrics tenant account ID must be an unsigned 32-bit integer: %w", err)
+		}
+	}
 	if opts.Cluster {
 		if kind != MetricsVM {
 			return nil, errors.New("metrics cluster mode requires kind vm")
 		}
-		if _, err := strconv.ParseUint(opts.TenantAccountID, 10, 32); err != nil {
-			return nil, fmt.Errorf("metrics tenant account ID must be an unsigned 32-bit integer: %w", err)
+		if opts.TenantAccountID == "" {
+			return nil, errors.New("metrics tenant account ID is required in cluster mode")
 		}
 		if ingestURL == "" {
 			return nil, errors.New("metrics ingest URL is required in cluster mode")
@@ -125,7 +130,11 @@ func (b *Backend) SetTenantHeaders(header http.Header, projectID int) {
 	if projectID <= 0 {
 		panic(fmt.Sprintf("storage: invalid project ID %d for tenant headers", projectID))
 	}
-	header.Set("AccountID", "0")
+	accountID := b.tenantAccountID
+	if accountID == "" {
+		accountID = "0"
+	}
+	header.Set("AccountID", accountID)
 	header.Set("ProjectID", strconv.Itoa(projectID))
 }
 

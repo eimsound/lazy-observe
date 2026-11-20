@@ -814,6 +814,13 @@ func TestDeleteProjectCleansProfileAndReplayBlobs(t *testing.T) {
 	if err := blobs.Put(ctx, "replay/disposable/sess/0.json.gz", strings.NewReader("r")); err != nil {
 		t.Fatal(err)
 	}
+	if err := blobs.Put(
+		ctx,
+		"sourcemaps/disposable/revisions/"+strings.Repeat("a", 64)+".map",
+		strings.NewReader("s"),
+	); err != nil {
+		t.Fatal(err)
+	}
 	admin, err := store.CreateUser(ctx, "profile-del-admin", "password", "admin")
 	if err != nil {
 		t.Fatal(err)
@@ -842,5 +849,30 @@ func TestDeleteProjectCleansProfileAndReplayBlobs(t *testing.T) {
 	}
 	if _, err := blobs.Get(ctx, "replay/disposable/sess/0.json.gz"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("replay blob still present after project delete: err=%v", err)
+	}
+	if _, err := blobs.Get(
+		ctx,
+		"sourcemaps/disposable/revisions/"+strings.Repeat("a", 64)+".map",
+	); !errors.Is(
+		err,
+		blob.ErrNotFound,
+	) {
+		t.Fatalf("sourcemap blob still present after project delete: err=%v", err)
+	}
+	// Recreating a project with the deleted slug must be rejected with 409 Conflict.
+	recreateReq := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects",
+		strings.NewReader(`{"name":"Reused","slug":"disposable"}`),
+	)
+	recreateReq.Header.Set("Authorization", "Bearer "+adminToken)
+	recreateReq.Header.Set("Content-Type", "application/json")
+	recreateResp, err := app.Test(recreateReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recreateResp.Body.Close()
+	if recreateResp.StatusCode != http.StatusConflict {
+		t.Fatalf("recreate deleted slug status=%d want 409 body=%s", recreateResp.StatusCode, readBody(recreateResp))
 	}
 }

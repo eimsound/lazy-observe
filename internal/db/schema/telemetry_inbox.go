@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/entsql"
 	entschema "entgo.io/ent/schema"
@@ -39,8 +37,8 @@ func (TelemetryInbox) Fields() []ent.Field {
 		field.String("outcome").Default(""),
 		field.Time("processed_at").Optional().Nillable(),
 		field.Time("completed_at").Optional().Nillable(),
-		field.Time("created_at").Default(time.Now).Immutable(),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("created_at").Default(UTCNow).Immutable(),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 		field.Int("project_id"),
 	}
 }

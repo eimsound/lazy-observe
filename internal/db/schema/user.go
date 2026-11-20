@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -20,7 +18,7 @@ func (User) Fields() []ent.Field {
 		field.Enum("role").Values("admin", "member", "viewer"),
 		field.String("display_name").Optional(),
 		field.String("email").Optional().Unique(),
-		field.Time("created_at").Default(time.Now).Immutable(),
+		field.Time("created_at").Default(UTCNow).Immutable(),
 		field.Time("last_login_at").Optional(),
 		// MustChangePassword blocks every API except reading the current user,
 		// changing the own password, and logout until the password is changed.

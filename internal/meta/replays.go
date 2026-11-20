@@ -212,3 +212,23 @@ func (s *Store) ListExpiredReplaySessions(
 func (s *Store) DeleteReplaySession(ctx context.Context, id int) error {
 	return s.client.ReplaySession.DeleteOneID(id).Exec(ctx)
 }
+
+// DeleteExpiredReplaySession removes a replay session row only if it is still
+// older than cutoff, preventing a cleanup pass from deleting a session that
+// received a new segment after the candidate scan.
+func (s *Store) DeleteExpiredReplaySession(ctx context.Context, id int, cutoff time.Time) (bool, error) {
+	result, err := s.db.ExecContext(
+		ctx,
+		bind(s.dialect, `DELETE FROM replay_sessions WHERE id = ? AND last_seen_at < ?`),
+		id,
+		cutoff.UTC().Round(0),
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
