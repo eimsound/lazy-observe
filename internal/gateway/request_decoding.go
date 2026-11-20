@@ -14,38 +14,50 @@ import (
 // boundedRequestDecoding removed, for handlers whose contract depends on it.
 const decodedContentEncodingLocal = "lazy-observe.decoded-content-encoding"
 
+// maxContentEncodingLayers bounds stacked HTTP Content-Encoding transformations
+// so crafted multi-layer headers cannot amplify CPU work before auth.
+const maxContentEncodingLayers = 4
+
 var errDecodedBodyTooLarge = errors.New("decoded request body exceeds limit")
 
 // boundedRequestDecoding removes HTTP content codings before any handler runs.
 // Fiber's Ctx.Body, BodyParser, and fasthttp's MultipartForm otherwise
-// decompress gzip, deflate, and brotli without a size limit, so a small
+// decompress gzip, deflate, brotli, and zstd without a size limit, so a small
 // compressed request could claim gigabytes of memory on any route, including
 // unauthenticated ones. After this middleware the request carries the decoded
 // body and no Content-Encoding header, so proxied requests also stay
-// self-consistent. A single coding the gateway does not decode (for example
-// snappy on Prometheus remote-write) is left for its handler.
+// self-consistent. Only Prometheus remote-write (/api/v1/write) is exempted for
+// a single snappy layer, whose handler enforces its own bounded snappy decode.
 func boundedRequestDecoding(c fiber.Ctx) error {
-	header := strings.TrimSpace(string(c.Request().Header.Peek(fiber.HeaderContentEncoding)))
-	if header == "" {
+	rawHeaders := c.Request().Header.PeekAll(fiber.HeaderContentEncoding)
+	if len(rawHeaders) == 0 {
 		return c.Next()
 	}
 	codings := make([]string, 0, 2)
 	known := false
 	unknown := false
-	for _, raw := range strings.Split(header, ",") {
-		coding := strings.ToLower(strings.TrimSpace(raw))
-		switch coding {
-		case "", "identity":
-			continue
-		case "gzip", "x-gzip", "deflate", "br":
-			known = true
-		default:
-			unknown = true
+	for _, rawHeader := range rawHeaders {
+		for _, raw := range strings.Split(string(rawHeader), ",") {
+			coding := strings.ToLower(strings.TrimSpace(raw))
+			switch coding {
+			case "", "identity":
+				continue
+			case "gzip", "x-gzip", "deflate", "br", "zstd":
+				known = true
+			default:
+				unknown = true
+			}
+			codings = append(codings, coding)
+			if len(codings) > maxContentEncodingLayers {
+				return unsupportedContentEncoding(c)
+			}
 		}
-		codings = append(codings, coding)
+	}
+	if len(codings) == 0 {
+		return c.Next()
 	}
 	if !known {
-		if len(codings) <= 1 {
+		if len(codings) == 1 && codings[0] == "snappy" && c.Path() == "/api/v1/write" {
 			return c.Next()
 		}
 		return unsupportedContentEncoding(c)
@@ -79,6 +91,18 @@ func unsupportedContentEncoding(c fiber.Ctx) error {
 }
 
 func decodeBounded(coding string, body []byte, limit int) ([]byte, error) {
+	if coding == "zstd" {
+		var req fasthttp.Request
+		req.SetBodyRaw(body)
+		decoded, err := req.BodyUnzstdWithLimit(limit)
+		if errors.Is(err, fasthttp.ErrBodyTooLarge) {
+			return nil, errDecodedBodyTooLarge
+		}
+		if err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	}
 	out := &limitedBuffer{limit: limit}
 	var err error
 	switch coding {
@@ -128,10 +152,9 @@ var _ io.Writer = (*limitedBuffer)(nil)
 // it. Handlers must not use Ctx.Body: Fiber v3's Body decodes Content-Encoding
 // a second time, and for a coding it cannot undo (snappy on Prometheus
 // remote-write) it answers 415 or 501 and returns the error text in place of
-// the bytes. It would also decode a single zstd body that the proxy forwards
-// with its Content-Encoding header intact. Reading fasthttp's raw body keeps
-// the v2 contract. GetBytes detaches the slice when the app is Immutable, as
-// Ctx.Body did, because fasthttp reuses the buffer for the next request.
+// the bytes. Reading fasthttp's raw body keeps the v2 contract. GetBytes
+// detaches the slice when the app is Immutable, as Ctx.Body did, because
+// fasthttp reuses the buffer for the next request.
 func requestBody(c fiber.Ctx) []byte {
 	return c.App().GetBytes(c.Request().Body())
 }

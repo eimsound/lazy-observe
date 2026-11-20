@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -119,7 +120,11 @@ func (b *Backend) TracesBase() string { return b.tracesURL }
 
 // SetTenantHeaders applies the native VictoriaLogs/VictoriaTraces tenant
 // boundary. The gateway strips incoming values before calling this method.
+// Non-positive project IDs fail closed instead of silently landing in tenant 0.
 func (b *Backend) SetTenantHeaders(header http.Header, projectID int) {
+	if projectID <= 0 {
+		panic(fmt.Sprintf("storage: invalid project ID %d for tenant headers", projectID))
+	}
 	header.Set("AccountID", "0")
 	header.Set("ProjectID", strconv.Itoa(projectID))
 }
@@ -193,6 +198,7 @@ func (b *Backend) probe(ctx context.Context, base string, paths ...string) error
 			lastErr = err
 			continue
 		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return nil

@@ -243,3 +243,21 @@ func TestInjectPromQLRejectsInvalidQuery(t *testing.T) {
 		t.Fatal("expected parse error")
 	}
 }
+
+func TestSetTenantHeadersRejectsNonPositiveProjectID(t *testing.T) {
+	b := &Backend{}
+	for _, id := range []int{0, -1, -42} {
+		panicked := false
+		func() {
+			defer func() {
+				if recover() != nil {
+					panicked = true
+				}
+			}()
+			b.SetTenantHeaders(http.Header{}, id)
+		}()
+		if !panicked {
+			t.Fatalf("SetTenantHeaders(%d) did not panic", id)
+		}
+	}
+}
