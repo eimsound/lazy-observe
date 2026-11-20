@@ -2,6 +2,9 @@ import { execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+const SOURCE_MAP_COMPONENT = /^[A-Za-z0-9._-]+$/;
+const DEFAULT_UPLOAD_TIMEOUT_MS = 30_000;
+
 export interface UploadSourceMapsOptions {
   /** `<origin>/p/<project>@<token>`。缺失或为空时打一条警告并跳过上传（不算失败）。 */
   dsn?: string;
@@ -9,12 +12,14 @@ export interface UploadSourceMapsOptions {
   release?: string;
   /** 递归扫描 `.map` 文件的目录。 */
   dir: string;
-  /** 上传成功后删除本地 `.map`。 */
+  /** 删除本地 `.map`（无 DSN 时同样执行剥离，避免线上暴露源码映射；有 DSN 但上传失败时保留以便排查）。 */
   stripSourceMaps?: boolean;
   /** 推断 release 时执行 git 的目录，缺省 `process.cwd()`。 */
   cwd?: string;
   /** 警告出口，缺省 `console.warn`；Vite 插件传入 Rollup 的 `this.warn`。 */
   warn?: (message: string) => void;
+  /** 上传请求超时时间（毫秒），默认 30 秒。 */
+  timeoutMs?: number;
 }
 
 export interface UploadSourceMapsResult {
@@ -27,9 +32,39 @@ export interface UploadSourceMapsResult {
 export interface SourceMapOutput { mapPath: string; filename: string }
 type GitRunner = (cwd: string) => string;
 
+/**
+ * 规范化源映射对应的压缩文件名，确保满足服务端 `^[A-Za-z0-9._-]+$` 校验
+ * （例如 Next.js 动态路由 chunk `[id]-abc.js`、`[...slug].js`）。
+ * 原本已合规的文件名保持不变；不合规字符按十六进制 `_XX_` 确定性编码避免冲突。
+ */
+export function normalizeSourceMapFilename(raw: string): string {
+  const trimmed = raw.trim();
+  if (SOURCE_MAP_COMPONENT.test(trimmed) && trimmed !== "." && trimmed !== "..") {
+    return trimmed;
+  }
+  const encoded = trimmed.replace(
+    /[^A-Za-z0-9._-]/g,
+    (ch) => `_${ch.charCodeAt(0).toString(16).toUpperCase()}_`,
+  );
+  if (!encoded || encoded === "." || encoded === "..") {
+    throw new Error(`lazy-observe: invalid source map filename ${JSON.stringify(raw)}`);
+  }
+  return encoded;
+}
+
+export function validateRelease(release: string): string {
+  const trimmed = release.trim();
+  if (!trimmed || trimmed === "." || trimmed === ".." || !SOURCE_MAP_COMPONENT.test(trimmed)) {
+    throw new Error(
+      `lazy-observe: invalid release ${JSON.stringify(release)}; release must match /^[A-Za-z0-9._-]+$/`,
+    );
+  }
+  return trimmed;
+}
+
 export function inferRelease(explicit: string | undefined, cwd: string, runGit: GitRunner = defaultGitRunner): string {
   const configured = explicit?.trim();
-  if (configured) return configured;
+  if (configured) return validateRelease(configured);
   let sha = "";
   try { sha = runGit(cwd).trim(); }
   catch (error) {
@@ -37,26 +72,41 @@ export function inferRelease(explicit: string | undefined, cwd: string, runGit: 
     throw new Error("lazy-observe: unable to infer release from git; set release explicitly", { cause: error });
   }
   if (!sha) throw new Error("lazy-observe: unable to infer release from git; set release explicitly");
-  return sha.slice(0, 7);
+  return validateRelease(sha.slice(0, 7));
 }
 
 function defaultGitRunner(cwd: string): string {
   return execFileSync("git", ["rev-parse", "--short=7", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
 }
 
-export async function collectSourceMaps(outputDir: string): Promise<SourceMapOutput[]> {
-  const found: SourceMapOutput[] = [];
+async function collectRawMapPaths(outputDir: string): Promise<string[]> {
+  const paths: string[] = [];
   async function visit(directory: string): Promise<void> {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     await Promise.all(entries.map(async (entry) => {
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(absolute);
-      else if (entry.isFile() && entry.name.endsWith(".map")) found.push({ mapPath: absolute, filename: entry.name.slice(0, -4) });
+      else if (entry.isFile() && entry.name.endsWith(".map")) paths.push(absolute);
     }));
   }
   try { await visit(outputDir); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  found.sort((a, b) => a.mapPath.localeCompare(b.mapPath));
+  paths.sort((a, b) => a.localeCompare(b));
+  return paths;
+}
+
+export async function stripLocalSourceMaps(outputDir: string): Promise<number> {
+  const mapPaths = await collectRawMapPaths(outputDir);
+  await Promise.all(mapPaths.map((mapPath) => fs.unlink(mapPath)));
+  return mapPaths.length;
+}
+
+export async function collectSourceMaps(outputDir: string): Promise<SourceMapOutput[]> {
+  const mapPaths = await collectRawMapPaths(outputDir);
+  const found: SourceMapOutput[] = mapPaths.map((mapPath) => ({
+    mapPath,
+    filename: normalizeSourceMapFilename(path.basename(mapPath).slice(0, -4)),
+  }));
   const names = new Set<string>();
   for (const item of found) {
     if (names.has(item.filename)) throw new Error(`lazy-observe: duplicate minified filename ${item.filename}`);
@@ -71,22 +121,27 @@ export function parseDsn(value: string): { origin: string; token: string } {
   catch { throw new Error("lazy-observe: DSN must match <origin>/p/<project>@<token>"); }
   const match = url.pathname.match(/^\/p\/[^/@]+@([^/]+)\/?$/);
   if (!match || url.search || url.hash) throw new Error("lazy-observe: DSN must match <origin>/p/<project>@<token>");
-  return { origin: url.origin, token: decodeURIComponent(match[1]) };
+  let token: string;
+  try { token = decodeURIComponent(match[1]); }
+  catch { throw new Error("lazy-observe: DSN must match <origin>/p/<project>@<token>"); }
+  return { origin: url.origin, token };
 }
 
 /**
  * 把 `dir` 下的 `.map` 以 multipart 一次性上传到 `POST /api/releases/:release/sourcemaps`。
- * 未配置 DSN 时只警告并返回；配置了 DSN 却上传失败时抛错（调用方据此让构建或命令失败）。
+ * 未配置 DSN 时只警告并跳过上传（若配置了 `stripSourceMaps: true` 仍剥离本地 `.map`）；
+ * 配置了 DSN 却上传失败时抛错并保留本地 `.map`（调用方据此让构建或命令失败）。
  */
 export async function uploadSourceMaps(options: UploadSourceMapsOptions): Promise<UploadSourceMapsResult> {
   const warn = options.warn ?? ((message: string) => console.warn(message));
   const dsnValue = options.dsn?.trim();
+  const dir = path.resolve(options.dir);
   if (!dsnValue) {
     warn("lazy-observe: no DSN configured; skipping source map upload");
+    if (options.stripSourceMaps) await stripLocalSourceMaps(dir);
     return { uploaded: 0, skipped: "no-dsn" };
   }
   const dsn = parseDsn(dsnValue);
-  const dir = path.resolve(options.dir);
   const stat = await fs.stat(dir).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;
     throw error;
@@ -100,9 +155,15 @@ export async function uploadSourceMaps(options: UploadSourceMapsOptions): Promis
   }
   const form = new FormData();
   for (const file of files) form.append(file.filename, new Blob([await fs.readFile(file.mapPath)], { type: "application/json" }), `${file.filename}.map`);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS;
   let response: Response;
   try {
-    response = await fetch(`${dsn.origin}/api/releases/${encodeURIComponent(release)}/sourcemaps`, { method: "POST", headers: { Authorization: `Bearer ${dsn.token}` }, body: form });
+    response = await fetch(`${dsn.origin}/api/releases/${encodeURIComponent(release)}/sourcemaps`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${dsn.token}` },
+      body: form,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
   } catch (error) {
     // 网络层错误（undici 只报 "fetch failed"，原因在 cause 里）：带上 origin 便于定位，不带 token。
     const cause = (error as Error).cause;

@@ -24,13 +24,15 @@ import type {
   StartSpanOptions,
   TraceTarget,
 } from "./types";
-import { eventId, getSessionId, normalizePage, randomHex } from "./utils";
+import { eventId, formatNonError, getSessionId, normalizePage, randomHex, safeSessionStorage, sanitizeUrl } from "./utils";
 import { startVitals } from "./vitals";
 
 const XHR_URL = Symbol("lazy-observe:xhr-url");
 const XHR_METHOD = Symbol("lazy-observe:xhr-method");
 const XHR_DONE = Symbol("lazy-observe:xhr-done");
+const XHR_HAS_TRACEPARENT = Symbol("lazy-observe:xhr-has-traceparent");
 
+const MAX_ERROR_EVENT_BYTES = 200 * 1024;
 const DEFAULT_ERROR_QUEUE_CAPACITY = 100;
 const DEFAULT_TRACE_QUEUE_CAPACITY = 1_000;
 const DEFAULT_REPLAY_QUEUE_CAPACITY = 10;
@@ -71,22 +73,42 @@ export class Client implements BrowserClient {
   private closed = false;
   private restoreFetch?: () => void;
   private restoreXhr?: () => void;
+  private disposeVitals?: () => void;
   private readonly onError = (event: ErrorEvent) => {
-    const error = event.error instanceof Error ? event.error : new Error(event.message || "Script error");
-    if (!error.stack && event.filename) error.stack = `${error.name}: ${error.message}\n    at <anonymous> (${event.filename}:${event.lineno}:${event.colno})`;
+    if (event.error instanceof Error) {
+      if (!event.error.stack && event.filename) {
+        event.error.stack = syntheticStack(
+          event.error.name || "Error",
+          event.error.message,
+          event.filename,
+          event.lineno,
+          event.colno,
+        );
+      }
+      this.captureException(event.error);
+      return;
+    }
+    const message = event.message || (event.error != null ? formatNonError(event.error) : "Script error");
+    const error = new Error(message);
+    if (event.filename) {
+      error.stack = syntheticStack(error.name, error.message, event.filename, event.lineno, event.colno);
+    }
     this.captureException(error);
   };
   private readonly onRejection = (event: PromiseRejectionEvent) => {
-    this.captureException(event.reason instanceof Error ? event.reason : new Error(String(event.reason)));
+    this.captureException(event.reason instanceof Error ? event.reason : new Error(formatNonError(event.reason)));
   };
   private readonly onUnload = () => { void this.flush(true); };
+  private readonly onVisibilityChange = () => {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") void this.flush(true);
+  };
 
   constructor(private readonly config: BrowserConfig) {
     const dsn = parseDsn(config.dsn);
     this.nativeFetch = typeof window !== "undefined" && typeof window.fetch === "function" ? window.fetch.bind(window) : globalThis.fetch?.bind(globalThis);
     this.transport = new Transport(dsn, this.nativeFetch);
     this.limiter = new MinuteRateLimiter(config.errorLimitPerMinute ?? 60);
-    this.sessionId = getSessionId(typeof sessionStorage === "undefined" ? undefined : sessionStorage);
+    this.sessionId = getSessionId(safeSessionStorage());
     this.currentPage = normalizePage(typeof location === "undefined" ? "/" : location.href);
     this.allowlist = typeof config.fetchTracing === "object" ? config.fetchTracing.allowlist ?? [] : [];
     this.serviceName = config.serviceName?.trim()
@@ -134,6 +156,9 @@ export class Client implements BrowserClient {
       window.addEventListener("unhandledrejection", this.onRejection);
     }
     window.addEventListener("pagehide", this.onUnload);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
     if (this.config.replay !== false) {
       this.replay = new ReplayController(
         replayDefaults(typeof this.config.replay === "object" ? this.config.replay : {}),
@@ -144,13 +169,14 @@ export class Client implements BrowserClient {
           maxAttempts: this.config.delivery?.maxAttempts ?? DEFAULT_DELIVERY_MAX_ATTEMPTS,
           retryInitialMs: this.config.delivery?.retryInitialMs ?? DEFAULT_DELIVERY_RETRY_INITIAL_MS,
           retryMaxMs: this.config.delivery?.retryMaxMs ?? DEFAULT_DELIVERY_RETRY_MAX_MS,
+          storage: safeSessionStorage(),
           onDrop: (drop) => this.recordTelemetryDrop("replay", drop),
         },
       );
       void this.replay.start().catch(() => { this.replay = undefined; });
     }
     if (this.config.vitals !== false) {
-      startVitals(
+      this.disposeVitals = startVitals(
         this.transport,
         () => this.currentPage,
         (sample) => this.replay?.vital(sample),
@@ -195,7 +221,7 @@ export class Client implements BrowserClient {
 
   captureException(value: unknown, options: CaptureOptions = {}): string | undefined {
     if (this.closed || !this.limiter.take()) return undefined;
-    const error = value instanceof Error ? value : new Error(String(value));
+    const error = value instanceof Error ? value : new Error(formatNonError(value));
     const trace = options.trace ?? this.traces.current();
     const contexts = browserContext() ?? {};
     if (trace) contexts.trace = trace;
@@ -205,12 +231,18 @@ export class Client implements BrowserClient {
       level: options.level ?? "error", message: error.message,
       exception: { type: error.name || "Error", value: error.message, stacktrace: { frames: parseStack(error.stack) } },
       tags: options.tags, contexts: Object.keys(contexts).length ? contexts : undefined,
-      session_id: this.sessionId, url: typeof location === "undefined" ? undefined : location.href
+      session_id: this.sessionId, url: typeof location === "undefined" ? undefined : sanitizeUrl(location.href)
     };
     if (this.config.beforeSend) {
       try { const changed = this.config.beforeSend(payload); if (!changed) return undefined; payload = changed; }
       catch { return undefined; }
     }
+    const trimmed = trimErrorEventToBudget(payload, MAX_ERROR_EVENT_BYTES);
+    if (!trimmed) {
+      this.recordTelemetryDrop("error", { reason: "server_rejected", count: 1 });
+      return undefined;
+    }
+    payload = trimmed;
     this.errorDelivery.enqueue(payload);
     this.replay?.error(payload);
     return payload.event_id;
@@ -276,8 +308,16 @@ export class Client implements BrowserClient {
   private patchFetch(): void {
     if (!this.nativeFetch) return;
     const previous = window.fetch;
-    window.fetch = this.wrapFetch(this.nativeFetch);
-    this.restoreFetch = () => { window.fetch = previous; };
+    const traced = this.wrapFetch(this.nativeFetch);
+    let active = true;
+    const wrapped = ((input: RequestInfo | URL, init?: RequestInit) => (
+      active ? traced(input, init) : previous.call(window, input, init)
+    )) as typeof fetch;
+    window.fetch = wrapped;
+    this.restoreFetch = () => {
+      active = false;
+      if (window.fetch === wrapped) window.fetch = previous;
+    };
   }
 
   private patchXhr(): void {
@@ -285,24 +325,41 @@ export class Client implements BrowserClient {
     const prototype = XMLHttpRequest.prototype as XMLHttpRequest & Record<symbol, unknown>;
     const originalOpen = prototype.open;
     const originalSend = prototype.send;
+    const originalSetRequestHeader = prototype.setRequestHeader;
     const client = this;
-    prototype.open = function(this: XMLHttpRequest, method: string, url: string | URL, ...rest: unknown[]) {
-      (this as unknown as Record<symbol, unknown>)[XHR_URL] = String(url);
-      (this as unknown as Record<symbol, unknown>)[XHR_METHOD] = method;
-      delete (this as unknown as Record<symbol, unknown>)[XHR_DONE];
+    let active = true;
+
+    const wrappedOpen = function(this: XMLHttpRequest, method: string, url: string | URL, ...rest: unknown[]) {
+      if (active) {
+        const xhr = this as unknown as Record<symbol, unknown>;
+        xhr[XHR_URL] = String(url);
+        xhr[XHR_METHOD] = method;
+        delete xhr[XHR_DONE];
+        delete xhr[XHR_HAS_TRACEPARENT];
+      }
       return originalOpen.call(this, method, url, ...(rest as [boolean, string?, string?]));
     } as typeof XMLHttpRequest.prototype.open;
-    prototype.send = function(body?: Document | XMLHttpRequestBodyInit | null) {
+
+    const wrappedSetRequestHeader = function(this: XMLHttpRequest, name: string, value: string) {
+      if (active && String(name).toLowerCase() === "traceparent") {
+        (this as unknown as Record<symbol, unknown>)[XHR_HAS_TRACEPARENT] = true;
+      }
+      return originalSetRequestHeader.call(this, name, value);
+    };
+
+    const wrappedSend = function(this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
+      if (!active) return originalSend.call(this, body);
       const xhr = this as unknown as XMLHttpRequest & Record<symbol, unknown>;
       const url = String(xhr[XHR_URL] ?? "");
       const method = String(xhr[XHR_METHOD] ?? "GET");
       const started = monotonicNow();
       let requestSpan: Omit<RecordedSpan, "endTimeUnixNano" | "status"> | undefined;
-      if (shouldTrace(url, client.allowlist)) {
+      if (shouldTrace(url, client.allowlist) && !xhr[XHR_HAS_TRACEPARENT]) {
         const parent = client.traces.current();
         const context = createTraceContext(parent);
         try {
-          this.setRequestHeader("traceparent", traceparent(context));
+          originalSetRequestHeader.call(this, "traceparent", traceparent(context));
+          xhr[XHR_HAS_TRACEPARENT] = true;
           requestSpan = {
             context,
             parentSpanId: parent?.span_id,
@@ -334,7 +391,16 @@ export class Client implements BrowserClient {
       this.addEventListener("loadend", done, { once: true });
       try { return originalSend.call(this, body); } catch (error) { done(); throw error; }
     };
-    this.restoreXhr = () => { prototype.open = originalOpen; prototype.send = originalSend; };
+
+    prototype.open = wrappedOpen;
+    prototype.setRequestHeader = wrappedSetRequestHeader;
+    prototype.send = wrappedSend;
+    this.restoreXhr = () => {
+      active = false;
+      if (prototype.open === wrappedOpen) prototype.open = originalOpen;
+      if (prototype.setRequestHeader === wrappedSetRequestHeader) prototype.setRequestHeader = originalSetRequestHeader;
+      if (prototype.send === wrappedSend) prototype.send = originalSend;
+    };
   }
 
   setPage(page: string): void { this.currentPage = normalizePage(page); this.replay?.page(this.currentPage); }
@@ -360,6 +426,11 @@ export class Client implements BrowserClient {
       window.removeEventListener("unhandledrejection", this.onRejection);
       window.removeEventListener("pagehide", this.onUnload);
     }
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    }
+    this.disposeVitals?.();
+    this.disposeVitals = undefined;
     this.restoreFetch?.(); this.restoreXhr?.();
     await Promise.all([
       this.errorDelivery.close(),
@@ -417,5 +488,83 @@ function requestPath(input: RequestInfo | URL | string): string {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return error instanceof Error ? error.message : formatNonError(error);
+}
+
+function syntheticStack(
+  name: string,
+  message: string,
+  filename: string,
+  lineno?: number,
+  colno?: number,
+): string {
+  const loc = lineno && lineno > 0
+    ? (colno && colno > 0 ? `${filename}:${lineno}:${colno}` : `${filename}:${lineno}`)
+    : `${filename}:0:0`;
+  return `${name}: ${message}\n    at <anonymous> (${loc})`;
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+function truncateText(value: string, maxChars: number): string {
+  return value.length > maxChars ? `${value.slice(0, maxChars)}...[truncated]` : value;
+}
+
+export function trimErrorEventToBudget(
+  payload: ErrorEventPayload,
+  maxBytes: number = MAX_ERROR_EVENT_BYTES,
+): ErrorEventPayload | undefined {
+  if (jsonByteLength(payload) <= maxBytes) return payload;
+  const trimmed: ErrorEventPayload = {
+    ...payload,
+    exception: {
+      ...payload.exception,
+      stacktrace: { frames: payload.exception.stacktrace.frames.map((frame) => ({ ...frame })) },
+    },
+    ...(payload.tags ? { tags: { ...payload.tags } } : {}),
+  };
+
+  const fits = () => jsonByteLength(trimmed) <= maxBytes;
+
+  if (trimmed.tags) {
+    for (const [key, value] of Object.entries(trimmed.tags)) {
+      if (value.length > 4_096) trimmed.tags[key] = truncateText(value, 4_096);
+    }
+    if (fits()) return trimmed;
+  }
+
+  if (trimmed.message) trimmed.message = truncateText(trimmed.message, 8_192);
+  trimmed.exception.value = truncateText(trimmed.exception.value, 8_192);
+  if (trimmed.url) trimmed.url = truncateText(trimmed.url, 2_048);
+  if (fits()) return trimmed;
+
+  if (trimmed.tags) {
+    for (const [key, value] of Object.entries(trimmed.tags)) {
+      if (value.length > 512) trimmed.tags[key] = truncateText(value, 512);
+    }
+    if (fits()) return trimmed;
+    delete trimmed.tags;
+    if (fits()) return trimmed;
+  }
+
+  if (trimmed.exception.stacktrace.frames.length > 50) {
+    trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-50);
+    if (fits()) return trimmed;
+  }
+
+  trimmed.message = trimmed.message ? truncateText(trimmed.message, 1_024) : trimmed.message;
+  trimmed.exception.value = truncateText(trimmed.exception.value, 1_024);
+  for (const frame of trimmed.exception.stacktrace.frames) {
+    frame.filename = truncateText(frame.filename, 512);
+    frame.function = truncateText(frame.function, 256);
+  }
+  if (fits()) return trimmed;
+
+  trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-10);
+  if (fits()) return trimmed;
+
+  trimmed.exception.stacktrace.frames = [];
+  return fits() ? trimmed : undefined;
 }

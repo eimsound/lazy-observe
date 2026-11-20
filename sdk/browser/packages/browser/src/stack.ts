@@ -20,7 +20,9 @@ function numeric(value?: string): number | undefined {
 
 function parseLine(line: string, origin?: string): StackFrame | undefined {
   const trimmed = line.trim();
-  if (!trimmed || /^\w*Error\b/.test(trimmed)) return undefined;
+  // Skip Chrome/V8 error header lines (e.g. "TypeError: boom" or "Error"), without dropping
+  // Firefox/Safari function frames whose names end in "Error" (e.g. "handleError@https://...").
+  if (!trimmed || /^[\w$]*Error(?::|$)/.test(trimmed)) return undefined;
   let fn = "<anonymous>";
   let location = "";
   let match = trimmed.match(/^at\s+(.*?)\s+\((.*)\)$/);
@@ -30,7 +32,8 @@ function parseLine(line: string, origin?: string): StackFrame | undefined {
   else return undefined;
 
   // Keep the final URL inside Chrome eval frames; line/column always come last.
-  const loc = location.match(/^(.*?)(?::(\d+))?(?::(\d+))$/);
+  // Match :line:col before :line so line-only frames populate lineno rather than colno.
+  const loc = location.match(/^(.*):(\d+):(\d+)$/) ?? location.match(/^(.*):(\d+)$/);
   if (!loc) return undefined;
   let filename = loc[1].replace(/^async\s+/, "");
   if (filename.includes(", ")) filename = filename.slice(filename.lastIndexOf(", ") + 2);

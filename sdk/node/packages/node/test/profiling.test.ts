@@ -1,15 +1,22 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Profile } from "pprof-format";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  computeCollectionDelay,
   cpuProfileToPprof,
   createProfileUploadID,
   heapProfileToPprof,
+  MAX_COLLECTION_BACKOFF_MS,
   resolveProfilingConfig,
+  startProfiling,
   type V8CpuProfile,
   type V8HeapProfile,
 } from "../src/profiling.js";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 function fixture<T>(name: string): T {
   return JSON.parse(readFileSync(fileURLToPath(new URL(`fixtures/${name}`, import.meta.url)), "utf8")) as T;
@@ -64,4 +71,86 @@ describe("profiling switches", () => {
 
 it("creates a stable-format profile upload identifier", () => {
   expect(createProfileUploadID()).toMatch(/^[0-9a-f]{32}$/);
+});
+
+describe("profiling lifecycle and backoff", () => {
+  it("caps exponential collection backoff at 15 minutes", () => {
+    expect(computeCollectionDelay(60_000, 10_000, 0)).toBe(50_000);
+    expect(computeCollectionDelay(60_000, 10_000, 1)).toBe(120_000);
+    expect(computeCollectionDelay(60_000, 10_000, 4)).toBe(MAX_COLLECTION_BACKOFF_MS);
+    expect(computeCollectionDelay(60_000, 10_000, 10)).toBe(MAX_COLLECTION_BACKOFF_MS);
+  });
+
+  it("aborts an in-flight CPU window on shutdown without uploading a truncated sample", async () => {
+    const fetcher = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    const stop = startProfiling(
+      {
+        endpoint: "https://observe.example",
+        token: "lo_tok",
+        service: "test-svc",
+        intervalMs: 60_000,
+        warn: () => undefined,
+        queueCapacity: 4,
+        maxAttempts: 1,
+        retryInitialMs: 1,
+        retryMaxMs: 1,
+        onDrop: () => undefined,
+      },
+      { cpuWindowMs: 5_000 },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await stop({ timeoutMs: 1_000 });
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("activates collection backoff when async profile uploads fail and uses async gzip", async () => {
+    const sleepDelays: number[] = [];
+    let releaseSecondSleep!: () => void;
+    const secondSleep = new Promise<void>((resolve) => { releaseSecondSleep = resolve; });
+    const fetcher = vi.fn(async () => new Response("rejected", { status: 422 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    const drops: Array<{ reason: string; count: number }> = [];
+    const stop = startProfiling(
+      {
+        endpoint: "https://observe.example",
+        token: "lo_tok",
+        service: "test-svc",
+        intervalMs: 60_000,
+        warn: () => undefined,
+        queueCapacity: 4,
+        maxAttempts: 3,
+        retryInitialMs: 1,
+        retryMaxMs: 1,
+        onDrop: (drop) => drops.push({ reason: drop.reason, count: drop.count }),
+      },
+      {
+        cpuWindowMs: 15,
+        sleep: async (ms, signal) => {
+          sleepDelays.push(ms);
+          if (sleepDelays.length === 1) {
+            // Wait until the first cycle's async uploads have failed & recorded drops.
+            await vi.waitFor(() => expect(drops.length).toBeGreaterThanOrEqual(1));
+            return;
+          }
+          releaseSecondSleep();
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) return resolve();
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+
+    await secondSleep;
+    await expect(stop({ timeoutMs: 1_000 })).rejects.toThrow(/HTTP 422/);
+    // Permanent 422 must be dropped as server_rejected without retrying 3x per profile.
+    expect(drops.every((drop) => drop.reason === "server_rejected")).toBe(true);
+    // Second cycle must observe uploadFailures >= 1 and back off beyond intervalMs (60_000 -> >= 120_000).
+    expect(sleepDelays[1]).toBeGreaterThanOrEqual(120_000);
+  });
 });

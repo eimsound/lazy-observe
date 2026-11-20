@@ -1,6 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
-import { DeliveryQueue } from "../src/delivery.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { DeliveryQueue, parseRetryAfterMs, TransportError } from "../src/delivery.js";
 import { init } from "../src/sdk.js";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("DeliveryQueue", () => {
   it("returns immediately and counts an in-flight item against capacity", async () => {
@@ -52,8 +56,76 @@ describe("DeliveryQueue", () => {
 
     expect(send).toHaveBeenCalledTimes(3);
     expect(send.mock.calls.map(([batch]) => batch)).toEqual([[7, 8], [7, 8], [7, 8]]);
-    expect(wait.mock.calls.map(([delay]) => delay)).toEqual([10, 15]);
+    const delays = wait.mock.calls.map(([delay]) => delay);
+    expect(delays).toHaveLength(2);
+    expect(delays[0]).toBeGreaterThanOrEqual(5);
+    expect(delays[0]).toBeLessThanOrEqual(10);
+    expect(delays[1]).toBeGreaterThanOrEqual(7);
+    expect(delays[1]).toBeLessThanOrEqual(15);
     expect(drops).toEqual([{ reason: "retry_exhausted", count: 2 }]);
+  });
+
+  it.each([400, 401, 403, 404, 413, 422])("drops permanent HTTP %s immediately as server_rejected without retrying", async (status) => {
+    const rejection = new TransportError(status, `HTTP ${status}`);
+    const send = vi.fn(async () => { throw rejection; });
+    const wait = vi.fn(async () => undefined);
+    const drops: Array<{ reason: string; count: number }> = [];
+    const queue = new DeliveryQueue<number>({
+      capacity: 2,
+      batchSize: 1,
+      flushIntervalMs: 1,
+      maxAttempts: 3,
+      retryInitialMs: 10,
+      retryMaxMs: 20,
+      send,
+      wait,
+      onDrop: (drop) => drops.push({ reason: drop.reason, count: drop.count }),
+    });
+
+    queue.enqueue(1);
+    await expect(queue.close({ timeoutMs: 100 })).rejects.toThrow(`HTTP ${status}`);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(wait).not.toHaveBeenCalled();
+    expect(drops).toEqual([{ reason: "server_rejected", count: 1 }]);
+  });
+
+  it("retries 429/408 with capped Retry-After and clears lastError once a later delivery succeeds", async () => {
+    let calls = 0;
+    const send = vi.fn(async (batch: number[]) => {
+      calls++;
+      if (batch[0] === 1 && calls === 1) throw new TransportError(429, "rate limited", 3_500);
+      if (batch[0] === 1 && calls === 2) throw new TransportError(408, "timeout", 90_000);
+      if (batch[0] === 1) throw new TransportError(503, "still down");
+      // batch [2] succeeds -> must clear lastError so close() resolves cleanly!
+    });
+    const wait = vi.fn(async (_delay: number, _signal: AbortSignal) => undefined);
+    const queue = new DeliveryQueue<number>({
+      capacity: 4,
+      batchSize: 1,
+      flushIntervalMs: 1,
+      maxAttempts: 3,
+      retryInitialMs: 10,
+      retryMaxMs: 20,
+      maxRetryAfterMs: 30_000,
+      send,
+      wait,
+    });
+
+    queue.enqueue(1);
+    await vi.waitFor(() => expect(queue.diagnostics().dropped).toBe(1));
+    expect(queue.diagnostics().lastError).toBeDefined();
+    expect(wait.mock.calls.map(([delay]) => delay)).toEqual([3_500, 30_000]);
+
+    queue.enqueue(2);
+    await expect(queue.close({ timeoutMs: 200 })).resolves.toBeUndefined();
+    expect(queue.diagnostics().lastError).toBeUndefined();
+  });
+
+  it("parses Retry-After seconds and HTTP-date headers", () => {
+    const now = Date.parse("2026-01-01T00:00:00Z");
+    expect(parseRetryAfterMs("7", now)).toBe(7_000);
+    expect(parseRetryAfterMs("Thu, 01 Jan 2026 00:00:15 GMT", now)).toBe(15_000);
+    expect(parseRetryAfterMs("garbage", now)).toBeUndefined();
   });
 
   it("aborts a hung exporter when the shutdown budget expires", async () => {

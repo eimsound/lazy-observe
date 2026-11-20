@@ -39,13 +39,28 @@ export function parseTraceparent(value: string): TraceContext | undefined {
   return match ? { trace_id: match[1], span_id: match[2] } : undefined;
 }
 
+function matchesStringAllowlist(url: URL, rule: string): boolean {
+  try {
+    const target = new URL(rule);
+    if (url.origin !== target.origin) return false;
+    if (target.pathname.endsWith("/")) return url.pathname.startsWith(target.pathname);
+    return url.pathname === target.pathname || url.pathname.startsWith(`${target.pathname}/`);
+  } catch {
+    return false;
+  }
+}
+
 export function shouldTrace(input: RequestInfo | URL, allowlist: TraceTarget[], origin?: string): boolean {
-  const raw = input instanceof Request ? input.url : String(input);
+  const raw = typeof Request !== "undefined" && input instanceof Request ? input.url : String(input);
   let url: URL;
   try { url = new URL(raw, origin ?? (typeof location === "undefined" ? undefined : location.href)); } catch { return false; }
   const ownOrigin = origin ?? (typeof location === "undefined" ? undefined : location.origin);
   if (ownOrigin && url.origin === ownOrigin) return true;
-  return allowlist.some((rule) => typeof rule === "string" ? url.href.startsWith(rule) : (rule.lastIndex = 0, rule.test(url.href)));
+  return allowlist.some((rule) => (
+    typeof rule === "string"
+      ? matchesStringAllowlist(url, rule)
+      : (rule.lastIndex = 0, rule.test(url.href))
+  ));
 }
 
 export class TraceWindow {

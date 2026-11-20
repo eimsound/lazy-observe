@@ -1,4 +1,5 @@
 import process from "node:process";
+import { Writable } from "node:stream";
 import { context, ProxyTracerProvider, ROOT_CONTEXT, SeverityNumber, SpanKind, SpanStatusCode, trace, type Attributes, type Context, type Span, type SpanContext } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
@@ -13,13 +14,13 @@ import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic
 import pinoFactory, { type Logger as PinoLogger, type LoggerOptions as PinoOptions } from "pino";
 import TransportStream from "winston-transport";
 import type { ErrorRequestHandler, Request, RequestHandler, Response } from "express";
-import { errorEvent, type ErrorEvent } from "./errors.js";
+import { errorEvent, safeJsonStringify, trimErrorEventToBudget, type ErrorEvent } from "./errors.js";
 import { parseDSN } from "./dsn.js";
 import { createHTTPServerRequestDurationHistogram } from "./http-metrics.js";
 import { registerRuntimeMetrics } from "./runtime.js";
 import { resolveProfilingConfig, startProfiling } from "./profiling.js";
 import { createWrappedLLMFetch } from "./llm.js";
-import { DeliveryQueue, type DeliveryDrop } from "./delivery.js";
+import { DeliveryQueue, parseRetryAfterMs, TransportError, type DeliveryDrop } from "./delivery.js";
 
 const instrumentationName = "@lazy-observe/node";
 
@@ -116,7 +117,45 @@ function attributeValue(value: unknown): string | number | boolean | undefined {
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
   if (value instanceof Error) return value.stack ?? value.message;
   if (value == null) return undefined;
-  try { return JSON.stringify(value); } catch { return String(value); }
+  return safeJsonStringify(value);
+}
+
+const ANSI_ESCAPE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+const WINSTON_LEVEL_SYMBOL = Symbol.for("level");
+
+export function parseWinstonLevel(info: Record<string, unknown>): number {
+  const symbolLevel = (info as Record<PropertyKey, unknown>)[WINSTON_LEVEL_SYMBOL];
+  const raw = typeof symbolLevel === "string" ? symbolLevel : String(info.level ?? "info");
+  const normalized = raw.replace(ANSI_ESCAPE, "").trim().toLowerCase();
+  if (normalized === "fatal" || normalized === "crit" || normalized === "alert" || normalized === "emerg") return 60;
+  if (normalized === "error") return 50;
+  if (normalized === "warn" || normalized === "warning") return 40;
+  if (normalized === "debug" || normalized === "verbose") return 20;
+  if (normalized === "trace" || normalized === "silly") return 10;
+  return 30;
+}
+
+export function resolveExpressRoute(req: Request): string {
+  const routePath = (req.route as { path?: unknown } | undefined)?.path;
+  if (typeof routePath !== "string") return "/*";
+  const base = typeof req.baseUrl === "string" ? req.baseUrl : "";
+  if (!base) return routePath || "/";
+  if (routePath === "/" || routePath === "") return base;
+  return `${base.replace(/\/+$/, "")}/${routePath.replace(/^\/+/, "")}`;
+}
+
+function sanitizeRequestPath(rawUrl: string | undefined): string {
+  if (!rawUrl) return "/";
+  const pathOnly = rawUrl.split(/[?#]/, 1)[0];
+  return pathOnly || "/";
+}
+
+function createSilentWritable(): Writable {
+  return new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
 }
 
 function attributes(record: Record<string, unknown>): Attributes {
@@ -235,7 +274,13 @@ export function init(config: Config): LazyObserve {
       body: JSON.stringify({ events }),
       signal: AbortSignal.any([signal, AbortSignal.timeout(ERROR_SEND_TIMEOUT_MS)]),
     });
-    if (!response.ok) throw new Error(`error event export failed: HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new TransportError(
+        response.status,
+        `error event export failed: HTTP ${response.status}`,
+        parseRetryAfterMs(response.headers.get("retry-after")),
+      );
+    }
   };
   const errorDelivery = new DeliveryQueue<ErrorEvent>({
     capacity: delivery.errorQueueCapacity ?? ERROR_QUEUE_CAPACITY,
@@ -247,16 +292,32 @@ export function init(config: Config): LazyObserve {
     send: sendErrors,
     onDrop: (drop) => recordTelemetryDrop("error", drop),
   });
+  const enqueueError = (
+    error: unknown,
+    options?: { url?: string; spanContext?: SpanContext },
+    immediate = false,
+  ) => {
+    if (closed) return;
+    try {
+      const event = errorEvent(error, {
+        spanContext: options?.spanContext ?? current(),
+        release: config.release,
+        environment: config.environment,
+        tags: config.tags,
+        url: options?.url,
+      });
+      const trimmed = trimErrorEventToBudget(event);
+      if (!trimmed) {
+        recordTelemetryDrop("error", { reason: "server_rejected", count: 1 });
+        return;
+      }
+      errorDelivery.enqueue(trimmed, { immediate });
+    } catch {
+      /* SDK error capture must degrade silently and never disrupt host execution */
+    }
+  };
   const reportError = (error: unknown, options?: { url?: string; spanContext?: SpanContext }) => {
-    if (closed) return Promise.resolve();
-    const event = errorEvent(error, {
-      spanContext: options?.spanContext ?? current(),
-      release: config.release,
-      environment: config.environment,
-      tags: config.tags,
-      url: options?.url,
-    });
-    errorDelivery.enqueue(event);
+    enqueueError(error, options, false);
     return Promise.resolve();
   };
 
@@ -288,8 +349,7 @@ export function init(config: Config): LazyObserve {
     const finish = () => {
       if (ended) return;
       ended = true;
-      const state = requestStates.get(res)!;
-      const route = (req.route as { path?: string } | undefined)?.path ?? state.path;
+      const route = resolveExpressRoute(req);
       const status = res.statusCode;
       const attrs: Attributes = { "http.request.method": method, "http.route": route, "http.response.status_code": status };
       span.updateName(`${method} ${route}`);
@@ -307,11 +367,16 @@ export function init(config: Config): LazyObserve {
   };
 
   const expressError = (): ErrorRequestHandler => (error, req, res, next) => {
-    const state = requestStates.get(res);
-    state?.span.recordException(error instanceof Error ? error : new Error(String(error)));
-    state?.span.setStatus({ code: SpanStatusCode.ERROR, message: error instanceof Error ? error.message : String(error) });
-    const url = `${req.protocol}://${req.get("host") ?? req.hostname}${req.originalUrl}`;
-    void reportError(error, { url, spanContext: state?.span.spanContext() });
+    try {
+      const state = requestStates.get(res);
+      state?.span.recordException(error instanceof Error ? error : new Error(String(error)));
+      state?.span.setStatus({ code: SpanStatusCode.ERROR, message: error instanceof Error ? error.message : String(error) });
+      const host = req.get("host") ?? req.hostname;
+      const url = `${req.protocol}://${host}${sanitizeRequestPath(req.originalUrl || req.url)}`;
+      enqueueError(error, { url, spanContext: state?.span.spanContext() }, false);
+    } catch {
+      /* never swallow the original business error */
+    }
     next(error);
   };
 
@@ -321,39 +386,55 @@ export function init(config: Config): LazyObserve {
       ...options.hooks,
       logMethod(this: PinoLogger, args: unknown[], method: (...args: unknown[]) => void, level: number) {
         const sc = current();
-        const first = typeof args[0] === "object" && args[0] !== null ? args[0] as Record<string, unknown> : {};
-        const message = typeof args[0] === "string" ? args[0] : typeof args[1] === "string" ? args[1] : "";
         const correlation = { "service.name": serviceName, ...(sc && trace.isSpanContextValid(sc) ? { trace_id: sc.traceId, span_id: sc.spanId } : {}) };
-        emitLog(level, message, { ...first, ...correlation });
-        const enriched = typeof args[0] === "object" && args[0] !== null ? [{ ...first, ...correlation }, ...args.slice(1)] : [correlation, ...args];
+        let fields: Record<string, unknown>;
+        let message: string;
+        let enriched: unknown[];
+        if (args[0] instanceof Error) {
+          const err = args[0];
+          fields = { err, ...correlation };
+          message = typeof args[1] === "string" ? args[1] : err.message;
+          enriched = [{ err, ...correlation }, ...args.slice(1)];
+        } else if (typeof args[0] === "object" && args[0] !== null) {
+          const first = args[0] as Record<string, unknown>;
+          fields = { ...first, ...correlation };
+          message = typeof args[1] === "string" ? args[1] : "";
+          enriched = [fields, ...args.slice(1)];
+        } else {
+          fields = correlation;
+          message = typeof args[0] === "string" ? args[0] : "";
+          enriched = [correlation, ...args];
+        }
+        emitLog(level, message, fields);
         if (userHook) (userHook as (...values: unknown[]) => void).call(this, enriched, method, level);
         else method.apply(this, enriched);
       },
     };
-    return pinoFactory({ ...options, hooks }, (config.teeToStdout ?? true) ? pinoFactory.destination(1) : pinoFactory.destination("/dev/null"));
+    const destination = (config.teeToStdout ?? true) ? pinoFactory.destination(1) : createSilentWritable();
+    return pinoFactory({ ...options, hooks }, destination);
   };
 
   class LazyObserveTransport extends TransportStream {
     log(info: Record<string, unknown>, callback: () => void): void {
-      setImmediate(() => this.emit("logged", info));
-      const sc = current();
-      if (sc && trace.isSpanContextValid(sc)) { info.trace_id = sc.traceId; info.span_id = sc.spanId; }
-      info["service.name"] = serviceName;
-      const level = String(info.level ?? "info");
-      const numeric = level === "error" ? 50 : level === "warn" ? 40 : level === "debug" ? 20 : 30;
-      emitLog(numeric, String(info.message ?? ""), info);
-      if (config.teeToStdout ?? true) process.stdout.write(`${JSON.stringify(info)}\n`);
-      callback();
+      try {
+        setImmediate(() => this.emit("logged", info));
+        const sc = current();
+        if (sc && trace.isSpanContextValid(sc)) { info.trace_id = sc.traceId; info.span_id = sc.spanId; }
+        info["service.name"] = serviceName;
+        const numeric = parseWinstonLevel(info);
+        emitLog(numeric, String(info.message ?? ""), info);
+        if (config.teeToStdout ?? true) process.stdout.write(`${safeJsonStringify(info)}\n`);
+      } finally {
+        callback();
+      }
     }
   }
 
-  const onUncaught = (error: Error) => { void reportError(error); };
-  const onRejection = (reason: unknown) => {
-    void reportError(reason instanceof Error ? reason : new Error(String(reason)));
-  };
+  const onUncaught = (error: unknown) => { enqueueError(error, undefined, true); };
   if (config.captureUnhandledErrors) {
+    // Node >= 15 routes both uncaughtException and unhandledRejection (default throw mode)
+    // through uncaughtExceptionMonitor without suppressing Node's fatal crash semantics.
     process.on("uncaughtExceptionMonitor", onUncaught);
-    process.on("unhandledRejection", onRejection);
   }
 
   return {
@@ -366,7 +447,6 @@ export function init(config: Config): LazyObserve {
       closed = true;
       if (config.captureUnhandledErrors) {
         process.off("uncaughtExceptionMonitor", onUncaught);
-        process.off("unhandledRejection", onRejection);
       }
       stopRuntime();
       const timeoutMs = options.timeoutMs ?? config.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS;

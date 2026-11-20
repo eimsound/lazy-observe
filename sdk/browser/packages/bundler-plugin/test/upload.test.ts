@@ -17,17 +17,51 @@ async function setup(status = 200) {
 describe("uploadSourceMaps", () => {
   it("posts every map to the release endpoint with the DSN token", async () => {
     const { server, dir } = await setup();
-    const result = await uploadSourceMaps({ dsn: dsnFor(server.origin), release: "rel/1", dir });
-    expect(result).toEqual({ uploaded: 2, release: "rel/1" });
+    const result = await uploadSourceMaps({ dsn: dsnFor(server.origin), release: "rel-1.0", dir });
+    expect(result).toEqual({ uploaded: 2, release: "rel-1.0" });
     expect(server.requests).toHaveLength(1);
     const [request] = server.requests;
     expect(request.method).toBe("POST");
-    expect(request.url).toBe("/api/releases/rel%2F1/sourcemaps");
+    expect(request.url).toBe("/api/releases/rel-1.0/sourcemaps");
     expect(request.authorization).toBe("Bearer secret-token");
     expect(request.body).toContain('name="app.js"; filename="app.js.map"');
     expect(request.body).toContain('name="style.css"; filename="style.css.map"');
     expect(request.body).toContain('"sources":["app.ts"]');
     await expect(fs.stat(path.join(dir, "assets", "app.js.map"))).resolves.toBeTruthy();
+  });
+
+  it("normalizes Next.js dynamic route chunk names like [id] to satisfy server regex", async () => {
+    const { server, dir } = await setup();
+    await fs.writeFile(path.join(dir, "assets", "[id]-abc123.js.map"), '{"version":3,"sources":["[id].tsx"]}');
+    const result = await uploadSourceMaps({ dsn: dsnFor(server.origin), release: "next-1", dir });
+    expect(result).toEqual({ uploaded: 3, release: "next-1" });
+    const [request] = server.requests;
+    expect(request.body).toContain('name="_5B_id_5D_-abc123.js"; filename="_5B_id_5D_-abc123.js.map"');
+    expect(request.body).not.toContain('name="[id]-abc123.js"');
+  });
+
+  it("rejects releases containing slashes or invalid characters before uploading", async () => {
+    const { server, dir } = await setup();
+    await expect(uploadSourceMaps({ dsn: dsnFor(server.origin), release: "rel/1", dir }))
+      .rejects.toThrow(/invalid release/);
+    expect(server.requests).toHaveLength(0);
+  });
+
+  it("strips local .map files even when no DSN is configured if stripSourceMaps is true", async () => {
+    const { server, dir } = await setup();
+    const warnings: string[] = [];
+    const result = await uploadSourceMaps({
+      dsn: undefined,
+      release: "r",
+      dir,
+      stripSourceMaps: true,
+      warn: (message) => warnings.push(message),
+    });
+    expect(result).toEqual({ uploaded: 0, skipped: "no-dsn" });
+    expect(warnings[0]).toMatch(/no DSN/);
+    expect(server.requests).toHaveLength(0);
+    await expect(fs.stat(path.join(dir, "assets", "app.js.map"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(dir, "assets", "app.js"))).resolves.toBeTruthy();
   });
 
   it("deletes the local maps after a successful upload when stripSourceMaps is set", async () => {
@@ -87,5 +121,25 @@ describe("uploadSourceMaps", () => {
     expect(result).toMatchObject({ uploaded: 0, skipped: "no-source-maps" });
     expect(warnings[0]).toMatch(/no \.map files/);
     expect(server.requests).toHaveLength(0);
+  });
+
+  it("aborts upload when timeoutMs elapses", async () => {
+    const { dir } = await setup();
+    const http = await import("node:http");
+    const sockets = new Set<import("node:net").Socket>();
+    const slow = http.createServer((_req, _res) => { /* intentionally never responds */ });
+    slow.on("connection", (socket) => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
+    await new Promise<void>((resolve) => slow.listen(0, "127.0.0.1", resolve));
+    const address = slow.address() as import("node:net").AddressInfo;
+    cleanups.push(() => new Promise<void>((resolve) => {
+      for (const socket of sockets) socket.destroy();
+      slow.close(() => resolve());
+    }));
+    await expect(uploadSourceMaps({
+      dsn: dsnFor(`http://127.0.0.1:${address.port}`),
+      release: "r-timeout",
+      dir,
+      timeoutMs: 50,
+    })).rejects.toThrow(/source map upload to .* failed/);
   });
 });

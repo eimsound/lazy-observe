@@ -92,7 +92,7 @@ try {
 }
 ```
 
-Setting `captureUnhandledErrors: true` installs process listeners. It reports `unhandledRejection`; it observes `uncaughtException` without suppressing Node's normal fatal behavior. Prefer explicit handling when possible.
+Setting `captureUnhandledErrors: true` installs an `uncaughtExceptionMonitor` listener. It observes both `uncaughtException` and unhandled promise rejections (under Node's default throw behavior) without suppressing Node's normal fatal exit semantics. Prefer explicit handling when possible.
 
 ## Continuous profiling and replay
 

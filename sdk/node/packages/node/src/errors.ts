@@ -25,7 +25,60 @@ export interface ErrorEvent {
   url?: string;
 }
 
-const framePattern = /^\s*at\s+(?:(async)\s+)?(?:(.*?)\s+\()?((?:file:\/\/)?[^()]+?):(\d+):(\d+)\)?$/;
+export const MAX_ERROR_EVENT_BYTES: number = 200 * 1024;
+
+const framePattern = /^\s*at\s+(?:(async)\s+)?(?:(.*?)\s+\()?((?:file:\/\/)?[^()]+?):(\d+)(?::(\d+))?\)?$/;
+
+function decodeFilePath(rawFile: string): string {
+  if (!rawFile.startsWith("file://")) return rawFile;
+  let pathname: string;
+  try {
+    pathname = new URL(rawFile).pathname;
+  } catch {
+    return rawFile;
+  }
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
+
+export function safeJsonStringify(value: unknown, maxLength?: number): string {
+  const seen = new WeakSet<object>();
+  try {
+    const serialized = JSON.stringify(value, (_key, current: unknown) => {
+      if (typeof current === "bigint") return current.toString();
+      if (current instanceof Error) {
+        return { name: current.name, message: current.message, stack: current.stack };
+      }
+      if (typeof current === "object" && current !== null) {
+        if (seen.has(current)) return "[Circular]";
+        seen.add(current);
+      }
+      return current;
+    });
+    if (serialized === undefined) return String(value);
+    if (maxLength !== undefined && serialized.length > maxLength) {
+      return `${serialized.slice(0, maxLength)}...`;
+    }
+    return serialized;
+  } catch {
+    return String(value);
+  }
+}
+
+export function formatNonError(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return String(value);
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (typeof record.message === "string" && record.message.trim()) return record.message;
+    const json = safeJsonStringify(value, 1_024);
+    if (json && json !== "{}") return json;
+  }
+  return String(value);
+}
 
 export function parseV8Stack(stack?: string): StackFrame[] {
   if (!stack) return [];
@@ -34,14 +87,15 @@ export function parseV8Stack(stack?: string): StackFrame[] {
     const match = framePattern.exec(line);
     if (!match) continue;
     const rawFile = match[3]!.trim();
-    const filename = rawFile.startsWith("file://") ? decodeURIComponent(new URL(rawFile).pathname) : rawFile;
+    const filename = decodeFilePath(rawFile);
     const fn = `${match[1] ? "async " : ""}${match[2] || "<anonymous>"}`;
     const moduleMatch = /node_modules\/(?:@([^/]+)\/)?([^/]+)/.exec(filename);
+    const colno = match[5] !== undefined ? Number(match[5]) : undefined;
     frames.push({
       function: fn,
       filename,
       lineno: Number(match[4]),
-      colno: Number(match[5]),
+      ...(colno !== undefined ? { colno } : {}),
       abs_path: filename,
       ...(moduleMatch ? { module: moduleMatch[1] ? `@${moduleMatch[1]}/${moduleMatch[2]}` : moduleMatch[2] } : {}),
       in_app: !filename.includes("node_modules") && !filename.startsWith("node:") && !filename.startsWith("internal/"),
@@ -57,7 +111,7 @@ export function errorEvent(error: unknown, options: {
   tags?: Record<string, string>;
   url?: string;
 } = {}): ErrorEvent {
-  const err = error instanceof Error ? error : new Error(String(error));
+  const err = error instanceof Error ? error : new Error(formatNonError(error));
   const sc = options.spanContext;
   return {
     event_id: randomUUID(), timestamp: new Date().toISOString(), platform: "node", level: "error",
@@ -69,4 +123,70 @@ export function errorEvent(error: unknown, options: {
     ...(options.url ? { url: options.url } : {}),
     ...(sc?.traceId && sc.spanId ? { contexts: { trace: { trace_id: sc.traceId, span_id: sc.spanId } } } : {}),
   };
+}
+
+function truncateText(value: string, maxChars: number): string {
+  return value.length > maxChars ? `${value.slice(0, maxChars)}...[truncated]` : value;
+}
+
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+export function trimErrorEventToBudget(
+  event: ErrorEvent,
+  maxBytes: number = MAX_ERROR_EVENT_BYTES,
+): ErrorEvent | undefined {
+  if (jsonByteLength(event) <= maxBytes) return event;
+  const trimmed: ErrorEvent = {
+    ...event,
+    exception: {
+      ...event.exception,
+      stacktrace: { frames: event.exception.stacktrace.frames.map((frame) => ({ ...frame })) },
+    },
+    ...(event.tags ? { tags: { ...event.tags } } : {}),
+  };
+
+  const fits = () => jsonByteLength(trimmed) <= maxBytes;
+
+  if (trimmed.tags) {
+    for (const [key, value] of Object.entries(trimmed.tags)) {
+      if (value.length > 4_096) trimmed.tags[key] = truncateText(value, 4_096);
+    }
+    if (fits()) return trimmed;
+  }
+
+  trimmed.message = truncateText(trimmed.message, 8_192);
+  trimmed.exception.value = truncateText(trimmed.exception.value, 8_192);
+  if (trimmed.url) trimmed.url = truncateText(trimmed.url, 2_048);
+  if (fits()) return trimmed;
+
+  if (trimmed.tags) {
+    for (const [key, value] of Object.entries(trimmed.tags)) {
+      if (value.length > 512) trimmed.tags[key] = truncateText(value, 512);
+    }
+    if (fits()) return trimmed;
+    delete trimmed.tags;
+    if (fits()) return trimmed;
+  }
+
+  if (trimmed.exception.stacktrace.frames.length > 50) {
+    trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-50);
+    if (fits()) return trimmed;
+  }
+
+  trimmed.message = truncateText(trimmed.message, 1_024);
+  trimmed.exception.value = truncateText(trimmed.exception.value, 1_024);
+  for (const frame of trimmed.exception.stacktrace.frames) {
+    frame.filename = truncateText(frame.filename, 512);
+    frame.function = truncateText(frame.function, 256);
+    if (frame.abs_path) frame.abs_path = truncateText(frame.abs_path, 512);
+  }
+  if (fits()) return trimmed;
+
+  trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-10);
+  if (fits()) return trimmed;
+
+  trimmed.exception.stacktrace.frames = [];
+  return fits() ? trimmed : undefined;
 }

@@ -1,4 +1,36 @@
-export type DeliveryDropReason = "queue_full" | "retry_exhausted" | "shutdown_budget";
+export const MAX_RETRY_AFTER_MS: number = 30_000;
+
+export type DeliveryDropReason = "queue_full" | "retry_exhausted" | "shutdown_budget" | "server_rejected";
+
+export class TransportError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = "TransportError";
+  }
+}
+
+export function isServerRejection(error: unknown): boolean {
+  if (!(error instanceof TransportError)) return false;
+  const { status } = error;
+  if (status === 408 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
+
+export function parseRetryAfterMs(header: string | null | undefined, now = Date.now()): number | undefined {
+  const raw = header?.trim();
+  if (!raw) return undefined;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const seconds = Number(raw);
+    return Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1_000)) : undefined;
+  }
+  const timestamp = Date.parse(raw);
+  if (Number.isFinite(timestamp)) return Math.max(0, timestamp - now);
+  return undefined;
+}
 
 export interface DeliveryDrop {
   reason: DeliveryDropReason;
@@ -19,19 +51,31 @@ export interface DeliveryQueueOptions<T> {
   maxAttempts: number;
   retryInitialMs: number;
   retryMaxMs: number;
+  maxRetryAfterMs?: number;
   send: (batch: T[], signal: AbortSignal) => Promise<void>;
   wait?: (delayMs: number, signal: AbortSignal) => Promise<void>;
   onDrop?: (drop: DeliveryDrop) => void;
+  isNonRetryable?: (error: unknown) => boolean;
+  retryAfterMs?: (error: unknown) => number | undefined;
+  random?: () => number;
 }
 
 export interface DeliveryCloseOptions {
   timeoutMs?: number;
 }
 
+export interface DeliveryEnqueueOptions {
+  immediate?: boolean;
+}
+
 export class DeliveryQueue<T> {
   private readonly items: T[] = [];
   private readonly controller = new AbortController();
   private readonly wait: (delayMs: number, signal: AbortSignal) => Promise<void>;
+  private readonly isNonRetryable: (error: unknown) => boolean;
+  private readonly retryAfterMs: (error: unknown) => number | undefined;
+  private readonly random: () => number;
+  private readonly maxRetryAfterMs: number;
   private timer?: ReturnType<typeof setTimeout>;
   private running?: Promise<void>;
   private resident = 0;
@@ -53,9 +97,13 @@ export class DeliveryQueue<T> {
       throw new Error("delivery timing values cannot be negative");
     }
     this.wait = options.wait ?? waitForRetry;
+    this.isNonRetryable = options.isNonRetryable ?? isServerRejection;
+    this.retryAfterMs = options.retryAfterMs ?? defaultRetryAfterMs;
+    this.random = options.random ?? Math.random;
+    this.maxRetryAfterMs = options.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS;
   }
 
-  enqueue(item: T): boolean {
+  enqueue(item: T, options: DeliveryEnqueueOptions = {}): boolean {
     if (this.closed) {
       this.recordDrop({ reason: "shutdown_budget", count: 1 });
       return false;
@@ -66,7 +114,10 @@ export class DeliveryQueue<T> {
     }
     this.items.push(item);
     this.resident++;
-    if (this.items.length >= Math.min(this.options.batchSize, this.options.capacity)) {
+    if (options.immediate) {
+      this.clearTimer();
+      void this.startDrain();
+    } else if (this.items.length >= Math.min(this.options.batchSize, this.options.capacity)) {
       this.clearTimer();
       queueMicrotask(() => { void this.startDrain(); });
     } else if (!this.timer) {
@@ -138,19 +189,25 @@ export class DeliveryQueue<T> {
     for (let attempt = 0; attempt < this.options.maxAttempts; attempt++) {
       try {
         await abortable(this.options.send(batch, this.controller.signal), this.controller.signal);
+        this.lastError = undefined;
         return;
       } catch (error) {
         lastError = error;
-      }
-      if (this.controller.signal.aborted) {
-        this.lastError = lastError;
-        this.recordDrop({ reason: "shutdown_budget", count: batch.length, error: lastError });
-        return;
+        if (this.controller.signal.aborted) {
+          this.lastError = lastError;
+          this.recordDrop({ reason: "shutdown_budget", count: batch.length, error: lastError });
+          return;
+        }
+        if (this.isNonRetryable(error)) {
+          this.lastError = error;
+          this.recordDrop({ reason: "server_rejected", count: batch.length, error });
+          return;
+        }
       }
       if (attempt + 1 < this.options.maxAttempts) {
         try {
           await abortable(
-            this.wait(this.retryDelay(attempt), this.controller.signal),
+            this.wait(this.retryDelay(attempt, lastError), this.controller.signal),
             this.controller.signal,
           );
         } catch (error) {
@@ -165,9 +222,16 @@ export class DeliveryQueue<T> {
     this.recordDrop({ reason: "retry_exhausted", count: batch.length, error: lastError });
   }
 
-  private retryDelay(retryIndex: number): number {
+  private retryDelay(retryIndex: number, error?: unknown): number {
+    const retryAfter = this.retryAfterMs(error);
+    if (retryAfter !== undefined && Number.isFinite(retryAfter) && retryAfter >= 0) {
+      return Math.min(retryAfter, this.maxRetryAfterMs);
+    }
     const scaled = this.options.retryInitialMs * (2 ** retryIndex);
-    return Math.min(Number.isFinite(scaled) ? scaled : this.options.retryMaxMs, this.options.retryMaxMs);
+    const base = Math.min(Number.isFinite(scaled) ? scaled : this.options.retryMaxMs, this.options.retryMaxMs);
+    if (base <= 0) return 0;
+    const factor = 0.5 + 0.5 * Math.min(1, Math.max(0, this.random()));
+    return Math.round(base * factor);
   }
 
   private dropQueued(error: unknown): void {
@@ -188,6 +252,10 @@ export class DeliveryQueue<T> {
     clearTimeout(this.timer);
     this.timer = undefined;
   }
+}
+
+function defaultRetryAfterMs(error: unknown): number | undefined {
+  return error instanceof TransportError ? error.retryAfterMs : undefined;
 }
 
 function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {

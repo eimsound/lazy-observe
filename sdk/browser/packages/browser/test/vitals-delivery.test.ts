@@ -147,3 +147,19 @@ it("does not recurse when the diagnostics report itself is rejected", async () =
   expect(diagnosticsCalls).toHaveLength(1);
   await client.close();
 });
+
+it("sends vitals with keepalive: true and stops reporting after close()", async () => {
+  const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(null, { status: 204 }));
+  const { client } = startClient(fetcher as unknown as typeof fetch);
+
+  webVitalCallbacks[0](metric("CLS"));
+  await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+  expect(fetcher.mock.calls[0]?.[1]?.keepalive).toBe(true);
+
+  await client.close();
+
+  // Late web-vitals callback after close() must be ignored (no duplicate reports / no leaked client).
+  webVitalCallbacks[1](metric("INP"));
+  await Promise.resolve();
+  expect(fetcher).toHaveBeenCalledTimes(1);
+});

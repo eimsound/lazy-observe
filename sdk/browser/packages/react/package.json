@@ -25,13 +25,12 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "@lazy-observe/browser": "workspace:*"
-  },
   "peerDependencies": {
+    "@lazy-observe/browser": "workspace:*",
     "react": ">=18"
   },
   "devDependencies": {
+    "@lazy-observe/browser": "workspace:*",
     "@testing-library/react": "^16.3.3",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
