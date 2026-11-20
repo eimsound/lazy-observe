@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -311,5 +313,130 @@ func TestInjectPromQLPreservesUTF8QuotedMetricName(t *testing.T) {
 				t.Fatalf("selector missing project_id=alpha in %q", got)
 			}
 		}
+	}
+}
+
+func TestLogsAndTracesReadWriteSplitEndpointsAndHealth(t *testing.T) {
+	var logsQueryHits, logsIngestHits, tracesQueryHits, tracesIngestHits atomic.Int32
+	var logsIngestDown atomic.Bool
+	newServer := func(counter *atomic.Int32, down *atomic.Bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			counter.Add(1)
+			if down != nil && down.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+	metricsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer metricsSrv.Close()
+	logsQuery := newServer(&logsQueryHits, nil)
+	defer logsQuery.Close()
+	logsIngest := newServer(&logsIngestHits, &logsIngestDown)
+	defer logsIngest.Close()
+	tracesQuery := newServer(&tracesQueryHits, nil)
+	defer tracesQuery.Close()
+	tracesIngest := newServer(&tracesIngestHits, nil)
+	defer tracesIngest.Close()
+
+	// Partial override: traces falls back to URL for query, overrides ingest.
+	b, err := NewWithOptions(BackendOptions{
+		MetricsKind:     MetricsVM,
+		MetricsQueryURL: metricsSrv.URL,
+		Logs: SignalEndpoint{
+			QueryURL:  logsQuery.URL + "/",
+			IngestURL: logsIngest.URL + "/",
+		},
+		Traces: SignalEndpoint{
+			URL:       tracesQuery.URL + "/",
+			IngestURL: tracesIngest.URL + "/",
+		},
+	}, metricsSrv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.LogsBase() != logsQuery.URL || b.LogsQueryBase() != logsQuery.URL || b.LogsIngestBase() != logsIngest.URL {
+		t.Fatalf("logs bases query=%q ingest=%q", b.LogsQueryBase(), b.LogsIngestBase())
+	}
+	if b.TracesBase() != tracesQuery.URL || b.TracesQueryBase() != tracesQuery.URL ||
+		b.TracesIngestBase() != tracesIngest.URL {
+		t.Fatalf("traces bases query=%q ingest=%q", b.TracesQueryBase(), b.TracesIngestBase())
+	}
+
+	health := b.Health(context.Background())
+	for _, key := range []string{"metrics", "logs", "logs-ingest", "traces", "traces-ingest"} {
+		if err, exists := health[key]; !exists || err != nil {
+			t.Fatalf("health[%q] exists=%v err=%v", key, exists, err)
+		}
+	}
+	if logsQueryHits.Load() != 1 || logsIngestHits.Load() != 1 ||
+		tracesQueryHits.Load() != 1 || tracesIngestHits.Load() != 1 {
+		t.Fatalf(
+			"probe counts logsQ=%d logsI=%d tracesQ=%d tracesI=%d",
+			logsQueryHits.Load(), logsIngestHits.Load(), tracesQueryHits.Load(), tracesIngestHits.Load(),
+		)
+	}
+
+	logsIngestDown.Store(true)
+	degraded := b.Health(context.Background())
+	if degraded["logs"] != nil || degraded["logs-ingest"] == nil {
+		t.Fatalf("degraded health=%v want logs=nil logs-ingest!=nil", degraded)
+	}
+
+	// Missing one side without fallback URL must fail construction.
+	if _, err := NewWithOptions(BackendOptions{
+		MetricsKind:     MetricsVM,
+		MetricsQueryURL: metricsSrv.URL,
+		Logs:            SignalEndpoint{QueryURL: logsQuery.URL},
+		Traces:          SignalEndpoint{URL: tracesQuery.URL},
+	}, nil); err == nil {
+		t.Fatal("expected error when logs ingest URL is missing and fallback URL is empty")
+	}
+}
+
+func TestUnifiedTenantHelpersFailClosed(t *testing.T) {
+	b, err := NewWithMetricsOptions(
+		MetricsVM,
+		"http://127.0.0.1:8428",
+		"http://127.0.0.1:8428",
+		"http://127.0.0.1:9428",
+		"http://127.0.0.1:10428",
+		MetricsOptions{TenantAccountID: "19"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.TenantAccountID() != "19" {
+		t.Fatalf("TenantAccountID=%q want=19", b.TenantAccountID())
+	}
+	hdr := http.Header{"AccountID": {"spoof"}, "ProjectID": {"spoof"}}
+	if err := b.ApplyTenantHeaders(hdr, 0); !errors.Is(err, ErrInvalidTenant) {
+		t.Fatalf("ApplyTenantHeaders(0) err=%v want ErrInvalidTenant", err)
+	}
+	if err := b.ApplyTenantHeaders(hdr, 55); err != nil {
+		t.Fatalf("ApplyTenantHeaders(55): %v", err)
+	}
+	if hdr.Get("AccountID") != "19" || hdr.Get("ProjectID") != "55" {
+		t.Fatalf("headers=%v", hdr)
+	}
+	if _, err := b.MetricsIngestExtraLabel(""); !errors.Is(err, ErrInvalidTenant) {
+		t.Fatalf("MetricsIngestExtraLabel('') err=%v want ErrInvalidTenant", err)
+	}
+	if got, err := b.MetricsIngestExtraLabel("alpha"); err != nil || got != "project_id=alpha" {
+		t.Fatalf("MetricsIngestExtraLabel(alpha)=(%q, %v)", got, err)
+	}
+	values := url.Values{"extra_filters[]": {"evil"}}
+	if err := b.ApplyMetricsQueryIsolation(values, "", true); !errors.Is(err, ErrInvalidTenant) {
+		t.Fatalf("ApplyMetricsQueryIsolation('') err=%v want ErrInvalidTenant", err)
+	}
+	if err := b.ApplyMetricsQueryIsolation(values, "alpha", true); err != nil {
+		t.Fatalf("ApplyMetricsQueryIsolation(alpha): %v", err)
+	}
+	if got := values.Get("extra_filters[]"); got != `{project_id="alpha"}` {
+		t.Fatalf("extra_filters[]=%q", got)
 	}
 }

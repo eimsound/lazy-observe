@@ -1,20 +1,16 @@
 package gateway
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
 	"net"
 	"net/http"
-	"net/url"
 	"path"
 	"runtime/debug"
 	"strconv"
@@ -41,7 +37,6 @@ import (
 	"github.com/eimsound/lazy-observe/internal/webui"
 	"github.com/gofiber/fiber/v3"
 	fiberrecover "github.com/gofiber/fiber/v3/middleware/recover"
-	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -195,10 +190,12 @@ type Config struct {
 	// session-authenticated mutating requests. Production wiring enables it.
 	RequireCSRF bool
 	// ReadTimeout bounds reading one request (headers and body); IdleTimeout
-	// bounds keep-alive waits. Zero selects the defaults. There is deliberately
-	// no write timeout: log tail is a long-lived streaming response.
-	ReadTimeout time.Duration
-	IdleTimeout time.Duration
+	// bounds keep-alive waits; ProxyTimeout bounds unary upstream proxy calls.
+	// Zero selects the defaults. There is deliberately no write timeout: log
+	// tail is a long-lived streaming response.
+	ReadTimeout  time.Duration
+	IdleTimeout  time.Duration
+	ProxyTimeout time.Duration
 	// LiveTailMaxGlobal, LiveTailMaxPerUser, LiveTailMaxPerProject,
 	// LiveTailMaxDuration, and LiveTailHeartbeat bound /api/v1/logs/tail
 	// streaming connections. Zero selects defaults.
@@ -239,6 +236,7 @@ type Gateway struct {
 	shutdownCancel           context.CancelFunc
 	client                   *http.Client
 	tailClient               *http.Client
+	proxyTimeout             time.Duration
 	liveTail                 *liveTailLimiter
 	liveTailMaxDuration      time.Duration
 	liveTailHeartbeat        time.Duration
@@ -384,6 +382,9 @@ func New(cfg Config) *Gateway {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = defaultIdleTimeout
 	}
+	if cfg.ProxyTimeout <= 0 {
+		cfg.ProxyTimeout = defaultUnaryProxyTimeout
+	}
 	if cfg.LiveTailMaxDuration <= 0 {
 		cfg.LiveTailMaxDuration = defaultLiveTailMaxDuration
 	}
@@ -408,6 +409,7 @@ func New(cfg Config) *Gateway {
 		shutdownCancel: shutdownCancel,
 		client:         cfg.Client,
 		tailClient:     newLiveTailClient(cfg.Client),
+		proxyTimeout:   cfg.ProxyTimeout,
 		liveTail: newLiveTailLimiter(
 			cfg.LiveTailMaxGlobal,
 			cfg.LiveTailMaxPerUser,
@@ -649,11 +651,11 @@ func (g *Gateway) registerTelemetryRoutes() {
 	g.app.Post(
 		"/v1/logs",
 		g.auth.Middleware,
-		g.tenantProxy(g.storage.LogsBase(), "/insert/opentelemetry/v1/logs"),
+		g.tenantProxy(g.storage.LogsIngestBase(), "/insert/opentelemetry/v1/logs"),
 	)
 	g.browserIngestRoute(
 		"/v1/traces",
-		g.tenantProxy(g.storage.TracesBase(), "/insert/opentelemetry/v1/traces"),
+		g.tenantProxy(g.storage.TracesIngestBase(), "/insert/opentelemetry/v1/traces"),
 	)
 	g.browserIngestRoute("/api/events/errors", g.errorsIngest)
 	g.browserIngestRoute("/api/events/vitals", g.vitalsIngest)
@@ -676,29 +678,15 @@ func (g *Gateway) registerTelemetryRoutes() {
 		g.app.All(path, g.queryRequired, g.metricsQuery)
 	}
 	g.app.Get("/api/v1/prettify-query", g.queryRequired, g.metricsPrettify)
-	for _, route := range []struct {
-		apiPath      string
-		upstreamPath string
-	}{
-		{"/api/v1/logs/query", "/select/logsql/query"},
-		{"/api/v1/logs/hits", "/select/logsql/hits"},
-		{"/api/v1/logs/stats_query_range", "/select/logsql/stats_query_range"},
-		{"/api/v1/logs/query_time_range", "/select/logsql/query_time_range"},
-		{"/api/v1/logs/field_names", "/select/logsql/field_names"},
-		{"/api/v1/logs/field_values", "/select/logsql/field_values"},
-		{"/api/v1/logs/stream_field_names", "/select/logsql/stream_field_names"},
-		{"/api/v1/logs/stream_field_values", "/select/logsql/stream_field_values"},
-	} {
-		handler := g.tenantProxy(g.storage.LogsBase(), route.upstreamPath)
+	for _, route := range logsProxyRoutes {
+		handler := g.logsProxyHandler(route)
 		g.app.Get(route.apiPath, g.queryRequired, handler)
 		g.app.Post(route.apiPath, g.queryRequired, handler)
 	}
-	g.app.Get("/api/v1/logs/tail", g.queryRequired, g.logsLiveTail)
-	g.app.Post("/api/v1/logs/tail", g.queryRequired, g.logsLiveTail)
 	g.app.Get(
 		"/api/traces/services",
 		g.queryRequired,
-		g.tenantProxy(g.storage.TracesBase(), "/select/jaeger/api/services"),
+		g.tenantProxy(g.storage.TracesQueryBase(), "/select/jaeger/api/services"),
 	)
 	g.app.Get("/api/traces/services/:svc/operations", g.queryRequired, g.traceOperations)
 	g.app.Get("/api/traces/search", g.queryRequired, g.traceSearch)
@@ -1091,300 +1079,6 @@ func (g *Gateway) metricsRemoteWrite(c fiber.Ctx) error {
 	c.Request().Header.Set("Content-Encoding", "snappy")
 	c.Request().Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
 	return g.metricsWriteWithBody(c, "/prometheus/api/v1/write", false, body)
-}
-
-func (g *Gateway) metricsWrite(c fiber.Ctx, path string, addProjectQuery bool) error {
-	return g.metricsWriteWithBody(c, path, addProjectQuery, nil)
-}
-
-func (g *Gateway) metricsWriteWithBody(c fiber.Ctx, path string, addProjectQuery bool, body []byte) error {
-	if !g.storage.MetricsIngestEnabled() {
-		return c.Status(fiber.StatusNotImplemented).
-			JSON(fiber.Map{"error": "metrics ingest is disabled: storage.metrics.ingest_url is not configured"})
-	}
-	p := currentProject(c)
-	base := g.storage.MetricsIngestBase()
-	if !g.storage.MetricsClustered() {
-		path = strings.TrimPrefix(path, "/prometheus")
-	}
-	opts := proxyOptions{reservedParams: true, body: body}
-	if addProjectQuery {
-		opts.addQuery = url.Values{"extra_label": []string{"project_id=" + p.Slug}}
-	}
-	return g.proxy(c, base, path, opts)
-}
-
-func (g *Gateway) metricsQuery(c fiber.Ctx) error {
-	p := currentProject(c)
-	// proxy only isolates when metricsProject is non-empty; fail closed instead of forwarding an unfiltered query.
-	if p.Slug == "" {
-		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
-	}
-	return g.proxy(c, g.storage.MetricsQueryBase(), c.Path(), proxyOptions{metricsProject: p.Slug})
-}
-
-// metricsPrettify exposes VictoriaMetrics' parser-backed formatter without
-// opening a data-read path. It is still project-authenticated, but only the
-// query parameter is forwarded; storage isolation parameters and arbitrary
-// client-supplied options are deliberately discarded.
-func (g *Gateway) metricsPrettify(c fiber.Ctx) error {
-	return g.proxy(c, g.storage.MetricsQueryBase(), "/prettify-query", proxyOptions{
-		allowedParams: map[string]bool{"query": true},
-	})
-}
-
-func (g *Gateway) tenantProxy(base, path string) fiber.Handler {
-	return func(c fiber.Ctx) error {
-		p := currentProject(c)
-		if p.ID <= 0 {
-			return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
-		}
-		return g.proxy(c, base, path, proxyOptions{projectID: p.ID, requireTenant: true})
-	}
-}
-
-type proxyOptions struct {
-	reservedParams bool
-	addQuery       url.Values
-	projectID      int
-	requireTenant  bool
-	allowedParams  map[string]bool
-	metricsProject string
-	body           []byte
-}
-
-func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error {
-	if (opts.requireTenant && opts.projectID <= 0) || opts.projectID < 0 {
-		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
-	}
-	query, err := url.ParseQuery(string(c.RequestCtx().QueryArgs().QueryString()))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid query parameters")
-	}
-	if opts.reservedParams || opts.metricsProject != "" {
-		stripReserved(query)
-	}
-	body := opts.body
-	if body == nil {
-		// When Immutable is enabled (production gateway), requestBody already
-		// returns an owned copy via App.GetBytes; avoid a redundant full copy.
-		if c.App().Config().Immutable {
-			body = requestBody(c)
-		} else {
-			body = append([]byte(nil), requestBody(c)...)
-		}
-	}
-	contentType := string(c.Request().Header.ContentType())
-	mediaType := normalizedMediaType(contentType)
-	hasFormMatch := false
-	if (opts.reservedParams || opts.metricsProject != "") && mediaType == fiber.MIMEApplicationForm {
-		form, formErr := url.ParseQuery(string(body))
-		if formErr != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "invalid form body")
-		}
-		stripReserved(form)
-		if opts.metricsProject != "" && g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
-			if injectErr := injectPromValues(form, opts.metricsProject); injectErr != nil {
-				return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+injectErr.Error())
-			}
-			hasFormMatch = len(form["match[]"]) > 0
-		}
-		body = []byte(form.Encode())
-	} else if opts.metricsProject != "" &&
-		(mediaType == "multipart/form-data" ||
-			((c.Method() == http.MethodPost || c.Method() == http.MethodPut || c.Method() == http.MethodPatch) &&
-				len(body) > 0 && mediaType != fiber.MIMEApplicationForm)) {
-		return fiber.NewError(
-			fiber.StatusUnsupportedMediaType,
-			"metrics requests with a body must use application/x-www-form-urlencoded",
-		)
-	}
-	if opts.metricsProject != "" {
-		defaultMatcher := path != "/api/v1/query" && path != "/api/v1/query_range" && !hasFormMatch
-		if err := g.applyMetricsIsolation(query, opts.metricsProject, defaultMatcher); err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+err.Error())
-		}
-	}
-	if opts.allowedParams != nil {
-		for key := range query {
-			if !opts.allowedParams[key] {
-				query.Del(key)
-			}
-		}
-	}
-	for key, values := range opts.addQuery {
-		query.Del(key)
-		for _, value := range values {
-			query.Add(key, value)
-		}
-	}
-	target := strings.TrimRight(base, "/") + path
-	if encoded := query.Encode(); encoded != "" {
-		target += "?" + encoded
-	}
-	req, err := http.NewRequestWithContext(
-		c.Context(),
-		c.Method(),
-		target,
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		g.logger.Error("build upstream proxy request failed", "path", path, "error", err)
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to construct upstream request")
-	}
-	copyProxyRequestHeaders(req.Header, &c.Request().Header, true)
-	if opts.projectID > 0 {
-		g.storage.SetTenantHeaders(req.Header, opts.projectID)
-	}
-	resp, err := g.client.Do(req)
-	if err != nil {
-		g.logger.Warn("gateway upstream proxy failed", "path", path, "error", err)
-		return fiber.NewError(fiber.StatusBadGateway, "upstream storage unavailable")
-	}
-	copyProxyResponseHeaders(c, resp.Header)
-	c.Status(resp.StatusCode)
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified || resp.ContentLength == 0 {
-		drainAndCloseBody(resp.Body)
-		return nil
-	}
-	statusCode := resp.StatusCode
-	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
-		defer resp.Body.Close()
-		if _, copyErr := io.Copy(w, resp.Body); copyErr != nil {
-			g.recordProxyStreamError(path, statusCode, copyErr)
-		}
-	})
-	return nil
-}
-
-func (g *Gateway) recordProxyStreamError(targetPath string, statusCode int, err error) {
-	g.proxyStreamErrors.Add(1)
-	if g.proxyStreamErrCounter != nil {
-		g.proxyStreamErrCounter.Add(context.Background(), 1)
-	}
-	g.logger.Warn("gateway proxy stream interrupted", "path", targetPath, "status", statusCode, "error", err)
-}
-
-func drainAndCloseBody(body io.ReadCloser) {
-	if body == nil {
-		return
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, proxyDrainBodyLimitBytes))
-	_ = body.Close()
-}
-
-func noFollowRedirects(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
-}
-
-func injectPromValues(values url.Values, project string) error {
-	for _, key := range []string{"query", "match[]"} {
-		original := values[key]
-		if len(original) == 0 {
-			continue
-		}
-		injected := make([]string, len(original))
-		for i, value := range original {
-			var err error
-			injected[i], err = storagepkg.InjectPromQL(value, project)
-			if err != nil {
-				return err
-			}
-		}
-		values[key] = injected
-	}
-	return nil
-}
-
-func (g *Gateway) applyMetricsIsolation(
-	values url.Values,
-	project string,
-	defaultMatcher bool,
-) error {
-	// VictoriaMetrics v1.153+ ignores empty extra_label/extra_filters values instead of rejecting them, so an
-	// empty project would silently become a cross-project query. Refuse it here.
-	if project == "" {
-		return errors.New("project slug is empty")
-	}
-	stripReserved(values)
-	if g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
-		if err := injectPromValues(values, project); err != nil {
-			return err
-		}
-		if defaultMatcher && len(values["match[]"]) == 0 {
-			values.Set("match[]", fmt.Sprintf(`{project_id=%q}`, project))
-		}
-		return nil
-	}
-	values.Set("extra_filters[]", fmt.Sprintf(`{project_id=%q}`, project))
-	return nil
-}
-
-func stripReserved(values url.Values) {
-	values.Del("extra_filters")
-	values.Del("extra_filters[]")
-	values.Del("extra_label")
-}
-
-func normalizedMediaType(contentType string) string {
-	trimmed := strings.TrimSpace(contentType)
-	if trimmed == "" {
-		return ""
-	}
-	mediaType, _, err := mime.ParseMediaType(trimmed)
-	if err != nil {
-		base, _, _ := strings.Cut(trimmed, ";")
-		return strings.ToLower(strings.TrimSpace(base))
-	}
-	return mediaType
-}
-
-func copyProxyRequestHeaders(dst http.Header, src *fasthttp.RequestHeader, allowAcceptEncoding bool) {
-	for key, value := range src.All() {
-		name := string(key)
-		switch strings.ToLower(name) {
-		case "content-type",
-			"content-encoding",
-			"accept",
-			"user-agent",
-			"x-prometheus-remote-write-version",
-			"x-lazy-observe-perf-request":
-			dst.Add(name, string(value))
-		case "accept-encoding":
-			if allowAcceptEncoding {
-				dst.Add(name, string(value))
-			}
-		}
-	}
-}
-
-func copyProxyResponseHeaders(c fiber.Ctx, src http.Header) {
-	for key, values := range src {
-		switch strings.ToLower(key) {
-		case "content-type",
-			"content-encoding",
-			"content-disposition",
-			"cache-control",
-			"vary",
-			"retry-after",
-			"x-prometheus-remote-write-written-samples",
-			"x-prometheus-remote-write-written-histograms",
-			"x-prometheus-remote-write-written-exemplars",
-			"x-lazy-observe-perf-sink",
-			"x-lazy-observe-perf-receipt",
-			"x-lazy-observe-perf-request":
-		default:
-			continue
-		}
-		// Fiber installs a default text/plain Content-Type before a streaming
-		// response is proxied. Replace each upstream header field instead of
-		// comma-appending it to that default; Content-Type is a singleton field,
-		// and a combined value is not a valid media type.
-		c.Response().Header.Del(key)
-		for _, value := range values {
-			c.Response().Header.Add(key, value)
-		}
-	}
 }
 
 func (g *Gateway) queryRequired(c fiber.Ctx) error {

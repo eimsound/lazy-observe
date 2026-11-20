@@ -47,13 +47,21 @@ storage:
     # or vminsert root in cluster mode. Empty disables metrics ingestion and scraping.
     ingest_url: ""
   logs:
-    # Required in standalone. For VictoriaLogs cluster, point this at a vmauth/LB
-    # that routes /insert/* to vlinsert and /select/* to vlselect.
+    # Required in standalone unless both query_url and ingest_url are set.
+    # For VictoriaLogs cluster, point url at a vmauth/LB or split query_url (vlselect)
+    # and ingest_url (vlinsert) directly below.
     url: ""
+    # Optional read/write split overrides; empty values fall back to logs.url.
+    query_url: ""
+    ingest_url: ""
   traces:
-    # Required in standalone. For VictoriaTraces cluster, point this at a vmauth/LB
-    # that routes /insert/* to vtinsert and /select/* to vtselect.
+    # Required in standalone unless both query_url and ingest_url are set.
+    # For VictoriaTraces cluster, point url at a vmauth/LB or split query_url (vtselect)
+    # and ingest_url (vtinsert) directly below.
     url: ""
+    # Optional read/write split overrides; empty values fall back to traces.url.
+    query_url: ""
+    ingest_url: ""
 
 # Global retention by signal. In standalone mode metrics/logs/traces are owned by
 # external storage and these three values are ignored; platform-owned data is still cleaned.
@@ -146,7 +154,9 @@ ai:
 # LO_REDIS_ENABLED, LO_REDIS_ADDR, LO_REDIS_PASSWORD, LO_REDIS_DB, LO_REDIS_KEY_PREFIX,
 # LO_STORAGE_METRICS_KIND, LO_STORAGE_METRICS_QUERY_URL, LO_STORAGE_METRICS_INGEST_URL,
 # LO_STORAGE_METRICS_CLUSTER, LO_STORAGE_METRICS_TENANT_ACCOUNT_ID,
-# LO_STORAGE_LOGS_URL, LO_STORAGE_TRACES_URL, LO_BLOB_BACKEND, LO_BLOB_S3_BUCKET,
+# LO_STORAGE_LOGS_URL, LO_STORAGE_LOGS_QUERY_URL, LO_STORAGE_LOGS_INGEST_URL,
+# LO_STORAGE_TRACES_URL, LO_STORAGE_TRACES_QUERY_URL, LO_STORAGE_TRACES_INGEST_URL,
+# LO_BLOB_BACKEND, LO_BLOB_S3_BUCKET,
 # LO_RETENTION_METRICS, LO_RETENTION_REPLAY, LO_RETENTION_SOURCEMAPS,
 # LO_RETENTION_ALERT_EVENTS, LO_RETENTION_PROFILES, LO_RETENTION_ISSUES_CLOSED,
 # LO_PROCESS_RESTART_INITIAL, LO_PROCESS_RESTART_MAX, LO_PROCESS_DRAIN_TIMEOUT,

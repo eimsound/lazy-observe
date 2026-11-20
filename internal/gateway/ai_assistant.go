@@ -585,9 +585,9 @@ func (g *Gateway) isolatedQueryWithLimit(
 	case "metrics":
 		base = g.storage.MetricsQueryBase()
 	case "logs":
-		base = g.storage.LogsBase()
+		base = g.storage.LogsQueryBase()
 	case "traces":
-		base = g.storage.TracesBase()
+		base = g.storage.TracesQueryBase()
 	default:
 		return nil, errors.New("unsupported query signal")
 	}

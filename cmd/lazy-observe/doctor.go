@@ -150,15 +150,25 @@ func runDoctor(cfg appconfig.Config) error {
 		check("storage-metrics-ingest", errors.New("storage.metrics.ingest_url is not configured"))
 	}
 	probeClient := &http.Client{Timeout: doctorProbeTimeout}
-	backend, backendErr := storage.NewWithMetricsOptions(
-		storage.MetricsKind(cfg.Storage.Metrics.Kind),
-		cfg.Storage.Metrics.QueryURL,
-		cfg.Storage.Metrics.IngestURL,
-		cfg.Storage.Logs.URL,
-		cfg.Storage.Traces.URL,
-		storage.MetricsOptions{
-			Cluster:         cfg.Storage.Metrics.Cluster,
-			TenantAccountID: cfg.Storage.Metrics.TenantAccountID,
+	backend, backendErr := storage.NewWithOptions(
+		storage.BackendOptions{
+			MetricsKind:      storage.MetricsKind(cfg.Storage.Metrics.Kind),
+			MetricsQueryURL:  cfg.Storage.Metrics.QueryURL,
+			MetricsIngestURL: cfg.Storage.Metrics.IngestURL,
+			Metrics: storage.MetricsOptions{
+				Cluster:         cfg.Storage.Metrics.Cluster,
+				TenantAccountID: cfg.Storage.Metrics.TenantAccountID,
+			},
+			Logs: storage.SignalEndpoint{
+				URL:       cfg.Storage.Logs.URL,
+				QueryURL:  cfg.Storage.Logs.QueryURL,
+				IngestURL: cfg.Storage.Logs.IngestURL,
+			},
+			Traces: storage.SignalEndpoint{
+				URL:       cfg.Storage.Traces.URL,
+				QueryURL:  cfg.Storage.Traces.QueryURL,
+				IngestURL: cfg.Storage.Traces.IngestURL,
+			},
 		},
 		probeClient,
 	)
@@ -167,8 +177,18 @@ func runDoctor(cfg appconfig.Config) error {
 		if metricsIngestConfigured {
 			check("storage-metrics-ingest", backendErr)
 		}
-		check("storage-logs", checkEndpoint(ctx, probeClient, cfg.Storage.Logs.URL, "/health"))
-		check("storage-traces", checkEndpoint(ctx, probeClient, cfg.Storage.Traces.URL, "/health"))
+		logsQueryURL := cfg.Storage.Logs.EffectiveQueryURL()
+		logsIngestURL := cfg.Storage.Logs.EffectiveIngestURL()
+		check("storage-logs", checkEndpoint(ctx, probeClient, logsQueryURL, "/health"))
+		if logsIngestURL != "" && logsIngestURL != logsQueryURL {
+			check("storage-logs-ingest", checkEndpoint(ctx, probeClient, logsIngestURL, "/health"))
+		}
+		tracesQueryURL := cfg.Storage.Traces.EffectiveQueryURL()
+		tracesIngestURL := cfg.Storage.Traces.EffectiveIngestURL()
+		check("storage-traces", checkEndpoint(ctx, probeClient, tracesQueryURL, "/health"))
+		if tracesIngestURL != "" && tracesIngestURL != tracesQueryURL {
+			check("storage-traces-ingest", checkEndpoint(ctx, probeClient, tracesIngestURL, "/health"))
+		}
 	} else {
 		probeCtx, cancelProbe := context.WithTimeout(ctx, doctorProbeTimeout)
 		health := backend.Health(probeCtx)
@@ -182,7 +202,13 @@ func runDoctor(cfg appconfig.Config) error {
 			}
 		}
 		check("storage-logs", health["logs"])
+		if logsIngestErr, ok := health["logs-ingest"]; ok {
+			check("storage-logs-ingest", logsIngestErr)
+		}
 		check("storage-traces", health["traces"])
+		if tracesIngestErr, ok := health["traces-ingest"]; ok {
+			check("storage-traces-ingest", tracesIngestErr)
+		}
 	}
 	if len(failures) != 0 {
 		return fmt.Errorf("HA readiness failed: %s", strings.Join(failures, "; "))

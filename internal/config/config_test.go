@@ -774,3 +774,81 @@ func TestSecurityEnvironmentAndValidation(t *testing.T) {
 		t.Fatal("zero audit retention was accepted")
 	}
 }
+
+func TestStandaloneLogsAndTracesSplitURLsPrecedenceAndValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	yamlData := `standalone: true
+storage:
+  metrics:
+    query_url: http://vmselect:8481
+  logs:
+    url: http://vlogs-fallback:9428
+    query_url: http://vlselect-file:9471
+  traces:
+    query_url: http://vtselect-file:10471
+    ingest_url: http://vtinsert-file:10481
+`
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("load split YAML: %v", err)
+	}
+	if cfg.Storage.Logs.EffectiveQueryURL() != "http://vlselect-file:9471" ||
+		cfg.Storage.Logs.EffectiveIngestURL() != "http://vlogs-fallback:9428" ||
+		cfg.Storage.Traces.EffectiveQueryURL() != "http://vtselect-file:10471" ||
+		cfg.Storage.Traces.EffectiveIngestURL() != "http://vtinsert-file:10481" {
+		t.Fatalf("unexpected YAML split endpoints: logs=%+v traces=%+v", cfg.Storage.Logs, cfg.Storage.Traces)
+	}
+
+	env := map[string]string{
+		"LO_STORAGE_LOGS_QUERY_URL":    "http://vlselect-env:9471",
+		"LO_STORAGE_LOGS_INGEST_URL":   "http://vlinsert-env:9481",
+		"LO_STORAGE_TRACES_QUERY_URL":  "http://vtselect-env:10471",
+		"LO_STORAGE_TRACES_INGEST_URL": "http://vtinsert-env:10481",
+	}
+	cfg, _, err = Load(
+		[]string{
+			"--config", path,
+			"--logs-query-url", "http://vlselect-flag:9471",
+			"--traces-ingest-url", "http://vtinsert-flag:10481",
+		},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatalf("load split precedence: %v", err)
+	}
+	if cfg.Storage.Logs.EffectiveQueryURL() != "http://vlselect-flag:9471" ||
+		cfg.Storage.Logs.EffectiveIngestURL() != "http://vlinsert-env:9481" ||
+		cfg.Storage.Traces.EffectiveQueryURL() != "http://vtselect-env:10471" ||
+		cfg.Storage.Traces.EffectiveIngestURL() != "http://vtinsert-flag:10481" {
+		t.Fatalf("unexpected env/flag split endpoints: logs=%+v traces=%+v", cfg.Storage.Logs, cfg.Storage.Traces)
+	}
+
+	// Partial split without fallback url must fail validation in standalone mode.
+	partialLogs := Defaults()
+	partialLogs.Standalone = true
+	partialLogs.Storage.Metrics.QueryURL = "http://metrics:8428"
+	partialLogs.Storage.Logs.QueryURL = "http://vlselect:9471"
+	partialLogs.Storage.Traces.URL = "http://vtraces:10428"
+	if err := partialLogs.Validate(); err == nil {
+		t.Fatal("partial logs split without logs.url should fail validation")
+	}
+
+	partialTraces := Defaults()
+	partialTraces.Standalone = true
+	partialTraces.Storage.Metrics.QueryURL = "http://metrics:8428"
+	partialTraces.Storage.Logs.URL = "http://vlogs:9428"
+	partialTraces.Storage.Traces.IngestURL = "http://vtinsert:10481"
+	if err := partialTraces.Validate(); err == nil {
+		t.Fatal("partial traces split without traces.url should fail validation")
+	}
+
+	// Non-http(s) URL in split override must fail validation.
+	badScheme := Defaults()
+	badScheme.Storage.Logs.QueryURL = "ftp://vlselect:9471"
+	if err := badScheme.Validate(); err == nil {
+		t.Fatal("non-http logs.query_url should fail validation")
+	}
+}

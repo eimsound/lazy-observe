@@ -786,7 +786,11 @@ func (g *Gateway) getIssueEvent(c fiber.Ctx) error {
 	if err != nil {
 		return apiError(c, err)
 	}
-	events, err := g.queryIssueEvents(c, row.Fingerprint, c.Params("event_id"), 1)
+	eventID, err := unescapedPathParam(c, "event_id", validateIssueEventID)
+	if err != nil {
+		return err
+	}
+	events, err := g.queryIssueEvents(c, row.Fingerprint, eventID, 1)
 	if err != nil {
 		return fiber.NewError(http.StatusBadGateway, err.Error())
 	}
@@ -832,7 +836,7 @@ func readVLogsErrorLines(r io.Reader, handle func([]byte)) error {
 func (g *Gateway) queryIssueEvents(c fiber.Ctx, fingerprint, eventID string, limit int) ([]issueEventDTO, error) {
 	query := issueEventsLogsQL(fingerprint, eventID, limit)
 	target := strings.TrimRight(
-		g.storage.LogsBase(),
+		g.storage.LogsQueryBase(),
 		"/",
 	) + "/select/logsql/query?" + url.Values{
 		"query": []string{query},
@@ -995,7 +999,7 @@ func (g *Gateway) queryIssueTrends(
 	end := today.Add(24 * time.Hour)
 	query := `_stream:{event_type="error"} AND fingerprint:in(` +
 		strings.Join(filters, ",") + `) | stats by (fingerprint) count_uniq(event_id) as hits`
-	target := strings.TrimRight(g.storage.LogsBase(), "/") + "/select/logsql/stats_query_range?" + url.Values{
+	target := strings.TrimRight(g.storage.LogsQueryBase(), "/") + "/select/logsql/stats_query_range?" + url.Values{
 		"query": []string{query},
 		"start": []string{firstDay.Format(time.RFC3339Nano)},
 		"end":   []string{end.Format(time.RFC3339Nano)},

@@ -16,7 +16,6 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/scrape"
-	"github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -191,16 +190,9 @@ type queryResponse struct {
 }
 
 func (g *Gateway) instantQuery(ctx context.Context, slug, expr string) ([]metricSample, error) {
-	if slug == "" {
-		return nil, errors.New("project slug is empty")
-	}
 	q := url.Values{"query": {expr}}
-	if g.storage.MetricsMode() == storage.MetricsPrometheus {
-		if err := injectPromValues(q, slug); err != nil {
-			return nil, err
-		}
-	} else {
-		q.Set("extra_filters[]", fmt.Sprintf(`{project_id=%q}`, slug))
+	if err := g.storage.ApplyMetricsQueryIsolation(q, slug, false); err != nil {
+		return nil, err
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, metricsInstantQueryTimeout)
 	defer cancel()

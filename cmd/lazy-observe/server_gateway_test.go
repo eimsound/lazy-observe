@@ -119,7 +119,11 @@ func TestCollectPlatformEndpointsIncludesOffsetLoopbackAndExternalStorage(t *tes
 	cfg.Storage.Metrics.QueryURL = "http://vmselect.internal:8481"
 	cfg.Storage.Metrics.IngestURL = "https://vminsert.internal:443"
 	cfg.Storage.Logs.URL = "http://vlogs.internal:9428"
+	cfg.Storage.Logs.QueryURL = "http://vlselect.internal:9471"
+	cfg.Storage.Logs.IngestURL = "http://vlinsert.internal:9481"
 	cfg.Storage.Traces.URL = "http://vtraces.internal:10428"
+	cfg.Storage.Traces.QueryURL = "http://vtselect.internal:10471"
+	cfg.Storage.Traces.IngestURL = "http://vtinsert.internal:10481"
 
 	loopback := &internalLoopback{baseURL: "http://127.0.0.1:49876"}
 	ports, hostPorts := collectPlatformEndpoints(cfg, loopback, nil)
@@ -128,7 +132,10 @@ func TestCollectPlatformEndpointsIncludesOffsetLoopbackAndExternalStorage(t *tes
 	for _, p := range ports {
 		portSet[p] = true
 	}
-	for _, want := range []int{3100, 4100, 18428, 18528, 19528, 20528, 21528, 22528, 49876, 8481, 9428, 10428} {
+	for _, want := range []int{
+		3100, 4100, 18428, 18528, 19528, 20528, 21528, 22528, 49876, 8481,
+		9428, 9471, 9481, 10428, 10471, 10481,
+	} {
 		if !portSet[want] {
 			t.Errorf("platform ports missing %d: got=%v", want, ports)
 		}
