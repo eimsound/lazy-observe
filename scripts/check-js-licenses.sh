@@ -28,7 +28,8 @@ for workspace in "$@"; do
 
   index=$((index + 1))
   output="$work/licenses-$index.json"
-  if ! (cd "$workspace" && "$pnpm_command" licenses list --prod --json) >"$output"; then
+  # pnpm 11 起 licenses list 在工作区根只列根包，--recursive 才覆盖 packages/*、examples/*（单包工程结果不变）。
+  if ! (cd "$workspace" && "$pnpm_command" licenses list --prod --json --recursive) >"$output"; then
     printf 'failed to list production dependency licenses for %s\n' "$workspace" >&2
     exit 1
   fi
