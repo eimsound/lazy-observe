@@ -30,6 +30,7 @@ import (
 	observemcp "github.com/eimsound/lazy-observe/internal/mcp"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
+	"github.com/eimsound/lazy-observe/internal/query"
 	"github.com/eimsound/lazy-observe/internal/scrape"
 	"github.com/eimsound/lazy-observe/internal/secret"
 	"github.com/eimsound/lazy-observe/internal/state"
@@ -255,6 +256,7 @@ type Gateway struct {
 	storage                  storagepkg.SignalBackend
 	scrapeUnavailableReason  string
 	mcpBaseURL               string
+	querier                  *query.StorageQuerier
 	ai                       *aiManager
 	aiAssistant              *assistantService
 	issueAI                  *issueAIService
@@ -440,6 +442,11 @@ func New(cfg Config) *Gateway {
 		remoteWriteSem:           make(chan struct{}, defaultRemoteWriteConcurrency),
 		remoteWriteRateLimit:     defaultRemoteWriteRateLimit,
 	}
+	g.querier = query.NewStorageQuerier(query.StorageQuerierConfig{
+		Backend:        g.storage,
+		Client:         g.client,
+		IsolateMetrics: g.applyMetricsIsolation,
+	})
 	if cfg.AISettingsStore != nil {
 		// Dynamic mode: the admin UI manages the persisted AI configuration.
 		g.ai = newAIManager(
@@ -451,6 +458,7 @@ func New(cfg Config) *Gateway {
 			cfg.OutboundPolicy,
 			cfg.Now,
 			cfg.Logger,
+			cfg.MeterProvider,
 		)
 		g.ai.loadFromStore(context.Background())
 		g.ai.startSyncLoop()
@@ -465,6 +473,7 @@ func New(cfg Config) *Gateway {
 			cfg.OutboundPolicy,
 			cfg.Now,
 			cfg.Logger,
+			cfg.MeterProvider,
 		)
 		g.ai.current = aiSnapshot{
 			enabled:   cfg.AIEnabled,
@@ -472,7 +481,7 @@ func New(cfg Config) *Gateway {
 			model:     cfg.AIModel,
 			maxTokens: aiDefaultMaxTokens,
 			hasKey:    cfg.AIClient != nil,
-			client:    cfg.AIClient,
+			client:    g.ai.wrapClient(cfg.AIClient, cfg.AIProvider, cfg.AIModel),
 		}
 	}
 	g.aiAssistant = newAssistantService(g)

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/eimsound/lazy-observe/internal/query"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -89,6 +90,12 @@ type flamegraphArgs struct {
 }
 
 func NewServer(api *APIClient) *sdkmcp.Server {
+	return NewServerWithClient(api)
+}
+
+// NewServerWithClient builds an MCP server backed by any project-isolated
+// read-only QueryClient port.
+func NewServerWithClient(api QueryClient) *sdkmcp.Server {
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "lazy-observe", Version: serverVersion}, nil)
 	registerMetricsTools(server, api)
 	registerTraceTools(server, api)
@@ -100,7 +107,7 @@ func NewServer(api *APIClient) *sdkmcp.Server {
 }
 
 // registerMetricsTools adds the metrics and logs queries tools.
-func registerMetricsTools(server *sdkmcp.Server, api *APIClient) {
+func registerMetricsTools(server *sdkmcp.Server, api QueryClient) {
 	sdkmcp.AddTool(
 		server,
 		&sdkmcp.Tool{
@@ -115,7 +122,7 @@ func registerMetricsTools(server *sdkmcp.Server, api *APIClient) {
 			if in.Time != "" {
 				q.Set("time", in.Time)
 			}
-			out, err := api.metrics(ctx, "/api/v1/query", q)
+			out, err := api.Metrics(ctx, "/api/v1/query", q)
 			return nil, out, err
 		},
 	)
@@ -129,7 +136,7 @@ func registerMetricsTools(server *sdkmcp.Server, api *APIClient) {
 			if strings.TrimSpace(in.Query) == "" || in.Start == "" || in.End == "" || in.Step == "" {
 				return nil, nil, fmt.Errorf("query, start, end, and step are required")
 			}
-			out, err := api.metrics(
+			out, err := api.Metrics(
 				ctx,
 				"/api/v1/query_range",
 				url.Values{"query": {in.Query}, "start": {in.Start}, "end": {in.End}, "step": {in.Step}},
@@ -154,7 +161,7 @@ func registerMetricsTools(server *sdkmcp.Server, api *APIClient) {
 			if in.End != "" {
 				q.Set("end", in.End)
 			}
-			out, err := api.logs(ctx, q, in.Limit)
+			out, err := api.Logs(ctx, q, in.Limit)
 			return nil, out, err
 		},
 	)
@@ -168,7 +175,7 @@ func registerMetricsTools(server *sdkmcp.Server, api *APIClient) {
 			if strings.TrimSpace(in.Query) == "" || in.Start == "" || in.End == "" || in.Step == "" {
 				return nil, nil, fmt.Errorf("query, start, end, and step are required")
 			}
-			v, err := api.json(
+			v, err := api.JSON(
 				ctx,
 				"/api/v1/logs/hits",
 				url.Values{"query": {in.Query}, "start": {in.Start}, "end": {in.End}, "step": {in.Step}},
@@ -182,7 +189,7 @@ func registerMetricsTools(server *sdkmcp.Server, api *APIClient) {
 }
 
 // registerTraceTools adds the trace search and detail tools.
-func registerTraceTools(server *sdkmcp.Server, api *APIClient) {
+func registerTraceTools(server *sdkmcp.Server, api QueryClient) {
 	sdkmcp.AddTool(
 		server,
 		&sdkmcp.Tool{
@@ -206,7 +213,7 @@ func registerTraceTools(server *sdkmcp.Server, api *APIClient) {
 			if in.Operation != "" {
 				q.Set("operation", in.Operation)
 			}
-			v, err := api.json(ctx, "/api/traces/search", q)
+			v, err := api.JSON(ctx, "/api/traces/search", q)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -227,7 +234,7 @@ func registerTraceTools(server *sdkmcp.Server, api *APIClient) {
 			if !validTraceID(traceID) {
 				return nil, nil, fmt.Errorf("trace_id must be 1-32 hexadecimal characters")
 			}
-			v, err := api.json(ctx, "/api/traces/"+url.PathEscape(traceID), nil)
+			v, err := api.JSON(ctx, "/api/traces/"+url.PathEscape(traceID), nil)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -238,23 +245,11 @@ func registerTraceTools(server *sdkmcp.Server, api *APIClient) {
 }
 
 func validTraceID(traceID string) bool {
-	if len(traceID) == 0 || len(traceID) > 32 {
-		return false
-	}
-	for i := 0; i < len(traceID); i++ {
-		ch := traceID[i]
-		isDigit := ch >= '0' && ch <= '9'
-		isLowerHex := ch >= 'a' && ch <= 'f'
-		isUpperHex := ch >= 'A' && ch <= 'F'
-		if !isDigit && !isLowerHex && !isUpperHex {
-			return false
-		}
-	}
-	return true
+	return query.ValidateTraceID(traceID)
 }
 
 // registerIssueTools adds the grouped errors tools.
-func registerIssueTools(server *sdkmcp.Server, api *APIClient) {
+func registerIssueTools(server *sdkmcp.Server, api QueryClient) {
 	sdkmcp.AddTool(
 		server,
 		&sdkmcp.Tool{
@@ -272,7 +267,7 @@ func registerIssueTools(server *sdkmcp.Server, api *APIClient) {
 			if in.Query != "" {
 				q.Set("q", in.Query)
 			}
-			v, err := api.json(ctx, "/api/v1/issues", q)
+			v, err := api.JSON(ctx, "/api/v1/issues", q)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -280,7 +275,7 @@ func registerIssueTools(server *sdkmcp.Server, api *APIClient) {
 			if root, _ := v.(map[string]any); root != nil && len(anySlice(root["issues"])) == 50 {
 				nextQuery := cloneValues(q)
 				nextQuery.Set("page", "2")
-				next, nextErr := api.json(ctx, "/api/v1/issues", nextQuery)
+				next, nextErr := api.JSON(ctx, "/api/v1/issues", nextQuery)
 				if nextErr != nil {
 					return nil, nil, nextErr
 				}
@@ -301,7 +296,7 @@ func registerIssueTools(server *sdkmcp.Server, api *APIClient) {
 			if in.IssueID <= 0 {
 				return nil, nil, fmt.Errorf("issue_id must be positive")
 			}
-			v, err := api.json(ctx, "/api/v1/issues/"+strconv.Itoa(in.IssueID), nil)
+			v, err := api.JSON(ctx, "/api/v1/issues/"+strconv.Itoa(in.IssueID), nil)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -311,7 +306,7 @@ func registerIssueTools(server *sdkmcp.Server, api *APIClient) {
 }
 
 // registerReplayTools adds the Session Replay metadata tools.
-func registerReplayTools(server *sdkmcp.Server, api *APIClient) {
+func registerReplayTools(server *sdkmcp.Server, api QueryClient) {
 	sdkmcp.AddTool(
 		server,
 		&sdkmcp.Tool{
@@ -335,7 +330,7 @@ func registerReplayTools(server *sdkmcp.Server, api *APIClient) {
 			if in.Page > 0 {
 				q.Set("page", strconv.Itoa(in.Page))
 			}
-			v, err := api.json(ctx, "/api/replay/sessions", q)
+			v, err := api.JSON(ctx, "/api/replay/sessions", q)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -353,7 +348,7 @@ func registerReplayTools(server *sdkmcp.Server, api *APIClient) {
 			if !validReplayID(sessionID) {
 				return nil, nil, fmt.Errorf("session_id must contain only letters, digits, dot, underscore, or hyphen")
 			}
-			v, err := api.json(ctx, "/api/replay/sessions/"+url.PathEscape(sessionID), nil)
+			v, err := api.JSON(ctx, "/api/replay/sessions/"+url.PathEscape(sessionID), nil)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -363,7 +358,7 @@ func registerReplayTools(server *sdkmcp.Server, api *APIClient) {
 }
 
 // registerInventoryTools adds the services, hosts, and alerts tools.
-func registerInventoryTools(server *sdkmcp.Server, api *APIClient) {
+func registerInventoryTools(server *sdkmcp.Server, api QueryClient) {
 	sdkmcp.AddTool(
 		server,
 		&sdkmcp.Tool{
@@ -371,11 +366,11 @@ func registerInventoryTools(server *sdkmcp.Server, api *APIClient) {
 			Description: "Use to discover valid service names before trace or profile queries. Returns the sorted union of services currently present in traces and profiles, capped at 200 names with truncation metadata.",
 		},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, _ emptyArgs) (*sdkmcp.CallToolResult, any, error) {
-			traces, err := api.json(ctx, "/api/traces/services", nil)
+			traces, err := api.JSON(ctx, "/api/traces/services", nil)
 			if err != nil {
 				return nil, nil, err
 			}
-			profiles, err := api.json(ctx, "/api/profiles/services", nil)
+			profiles, err := api.JSON(ctx, "/api/profiles/services", nil)
 			if err != nil && !strings.Contains(err.Error(), "503") {
 				return nil, nil, err
 			}
@@ -389,7 +384,7 @@ func registerInventoryTools(server *sdkmcp.Server, api *APIClient) {
 			Description: "Use for a compact inventory and current health/resource snapshot of monitored hosts. Returns instance, hostname, up/down state, CPU cores, load, memory, and peak disk usage, capped at 200 hosts.",
 		},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, _ emptyArgs) (*sdkmcp.CallToolResult, any, error) {
-			v, err := api.json(ctx, "/api/v1/hosts", nil)
+			v, err := api.JSON(ctx, "/api/v1/hosts", nil)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -407,7 +402,7 @@ func registerInventoryTools(server *sdkmcp.Server, api *APIClient) {
 			if in.Status != "" {
 				q.Set("status", in.Status)
 			}
-			v, err := api.json(ctx, "/api/v1/alerts", q)
+			v, err := api.JSON(ctx, "/api/v1/alerts", q)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -417,7 +412,7 @@ func registerInventoryTools(server *sdkmcp.Server, api *APIClient) {
 }
 
 // registerProfileTools adds the continuous profiling tools.
-func registerProfileTools(server *sdkmcp.Server, api *APIClient) {
+func registerProfileTools(server *sdkmcp.Server, api QueryClient) {
 	sdkmcp.AddTool(
 		server,
 		&sdkmcp.Tool{
@@ -438,7 +433,7 @@ func registerProfileTools(server *sdkmcp.Server, api *APIClient) {
 			if in.End != "" {
 				q.Set("end", in.End)
 			}
-			v, err := api.json(ctx, "/api/profiles/flamegraph", q)
+			v, err := api.JSON(ctx, "/api/profiles/flamegraph", q)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -625,7 +620,7 @@ func sanitizeIssues(v any, truncated bool) any {
 	return root
 }
 
-func enrichAndSummarizeIssue(ctx context.Context, api *APIClient, issueID int, v any) any {
+func enrichAndSummarizeIssue(ctx context.Context, api QueryClient, issueID int, v any) any {
 	root, _ := v.(map[string]any)
 	if root == nil {
 		return map[string]any{
@@ -638,7 +633,7 @@ func enrichAndSummarizeIssue(ctx context.Context, api *APIClient, issueID int, v
 	if api != nil && issueID > 0 {
 		fetcher = func(eventID string) map[string]any {
 			path := "/api/v1/issues/" + strconv.Itoa(issueID) + "/events/" + url.PathEscape(eventID)
-			raw, err := api.json(ctx, path, nil)
+			raw, err := api.JSON(ctx, path, nil)
 			if err != nil {
 				return nil
 			}

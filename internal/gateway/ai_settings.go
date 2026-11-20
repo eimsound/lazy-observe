@@ -15,6 +15,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/secret"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // AISettingsStore persists the single-row AI configuration. The metadata
@@ -84,6 +85,7 @@ type aiManager struct {
 	outbound        outbound.Policy
 	now             func() time.Time
 	logger          *slog.Logger
+	meterProvider   metric.MeterProvider
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -100,6 +102,7 @@ func newAIManager(
 	outboundPolicy outbound.Policy,
 	now func() time.Time,
 	logger *slog.Logger,
+	meterProvider metric.MeterProvider,
 ) *aiManager {
 	if build == nil {
 		build = ai.New
@@ -124,8 +127,20 @@ func newAIManager(
 		outbound:        outboundPolicy,
 		now:             now,
 		logger:          logger,
+		meterProvider:   meterProvider,
 		doneCh:          doneCh,
 	}
+}
+
+func (m *aiManager) wrapClient(client ai.Client, provider, model string) ai.Client {
+	if client == nil || m == nil || m.meterProvider == nil {
+		return client
+	}
+	return ai.WithUsageMetrics(client, ai.UsageMetricsOptions{
+		Provider:      provider,
+		Model:         model,
+		MeterProvider: m.meterProvider,
+	})
 }
 
 // startSyncLoop periodically reconciles the in-memory AI snapshot with the
@@ -305,7 +320,7 @@ func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot
 		snap.enabled = false
 		return snap, err
 	}
-	snap.client = client
+	snap.client = m.wrapClient(client, stored.Provider, stored.Model)
 	return snap, nil
 }
 
