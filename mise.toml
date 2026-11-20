@@ -11,7 +11,7 @@ node = "26.13.1"
 pnpm = "12.20.0"
 jq = "1.8.2"
 actionlint = "1.7.12"
-rg = "14.1.1"
+rg = "15.2.0"
 air = "1.67.1"
 "go:github.com/golangci/golines" = "0.15.0"
 # uv：check-embedded-artifact.sh、check-release-smoke.sh、e2e-multi-replica.sh 与 sdk-python 任务的受管 Python（scripts/lib/uv-python.sh）。
