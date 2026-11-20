@@ -28,16 +28,18 @@ func startSignalStorage(
 	store *meta.Store,
 	logger *slog.Logger,
 ) (*serverSignalStorage, error) {
-	queryURL, ingestURL, logsURL, tracesURL := signalStorageURLs(cfg, logger)
-	backend, err := storage.NewWithMetricsOptions(
-		storage.MetricsKind(cfg.Storage.Metrics.Kind),
-		queryURL,
-		ingestURL,
-		logsURL,
-		tracesURL,
-		storage.MetricsOptions{
-			Cluster:         cfg.Storage.Metrics.Cluster,
-			TenantAccountID: cfg.Storage.Metrics.TenantAccountID,
+	queryURL, ingestURL, logsEndpoint, tracesEndpoint := signalStorageEndpoints(cfg, logger)
+	backend, err := storage.NewWithOptions(
+		storage.BackendOptions{
+			MetricsKind:      storage.MetricsKind(cfg.Storage.Metrics.Kind),
+			MetricsQueryURL:  queryURL,
+			MetricsIngestURL: ingestURL,
+			Metrics: storage.MetricsOptions{
+				Cluster:         cfg.Storage.Metrics.Cluster,
+				TenantAccountID: cfg.Storage.Metrics.TenantAccountID,
+			},
+			Logs:   logsEndpoint,
+			Traces: tracesEndpoint,
 		},
 		nil,
 	)
@@ -107,16 +109,27 @@ func writeInitialScrapeConfig(ctx context.Context, store *meta.Store, dataDir st
 	return path, nil
 }
 
-func signalStorageURLs(cfg appconfig.Config, logger *slog.Logger) (string, string, string, string) {
+func signalStorageEndpoints(
+	cfg appconfig.Config,
+	logger *slog.Logger,
+) (string, string, storage.SignalEndpoint, storage.SignalEndpoint) {
 	queryURL := embeddedURL(embed.MetricsAddr, cfg.Process.ComponentPortOffset)
 	ingestURL := embeddedURL(embed.MetricsAddr, cfg.Process.ComponentPortOffset)
-	logsURL := embeddedURL(embed.LogsAddr, cfg.Process.ComponentPortOffset)
-	tracesURL := embeddedURL(embed.TracesAddr, cfg.Process.ComponentPortOffset)
+	logsEndpoint := storage.SignalEndpoint{URL: embeddedURL(embed.LogsAddr, cfg.Process.ComponentPortOffset)}
+	tracesEndpoint := storage.SignalEndpoint{URL: embeddedURL(embed.TracesAddr, cfg.Process.ComponentPortOffset)}
 	if cfg.Standalone {
 		queryURL = cfg.Storage.Metrics.QueryURL
 		ingestURL = cfg.Storage.Metrics.IngestURL
-		logsURL = cfg.Storage.Logs.URL
-		tracesURL = cfg.Storage.Traces.URL
+		logsEndpoint = storage.SignalEndpoint{
+			URL:       cfg.Storage.Logs.URL,
+			QueryURL:  cfg.Storage.Logs.QueryURL,
+			IngestURL: cfg.Storage.Logs.IngestURL,
+		}
+		tracesEndpoint = storage.SignalEndpoint{
+			URL:       cfg.Storage.Traces.URL,
+			QueryURL:  cfg.Storage.Traces.QueryURL,
+			IngestURL: cfg.Storage.Traces.IngestURL,
+		}
 		logger.Warn(
 			"signal retention settings ignored in standalone mode; external storage owns retention",
 			"metrics",
@@ -127,7 +140,7 @@ func signalStorageURLs(cfg appconfig.Config, logger *slog.Logger) (string, strin
 			cfg.Retention.Traces,
 		)
 	}
-	return queryURL, ingestURL, logsURL, tracesURL
+	return queryURL, ingestURL, logsEndpoint, tracesEndpoint
 }
 
 func storageBinarySource(cfg appconfig.Config, logger *slog.Logger, names ...string) (embed.BinarySource, error) {

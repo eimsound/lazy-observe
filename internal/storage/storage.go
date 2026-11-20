@@ -28,6 +28,27 @@ type MetricsOptions struct {
 	TenantAccountID string
 }
 
+// SignalEndpoint configures an external VictoriaLogs or VictoriaTraces service.
+// When QueryURL or IngestURL is unset, that side falls back to URL.
+type SignalEndpoint struct {
+	URL       string
+	QueryURL  string
+	IngestURL string
+}
+
+// BackendOptions groups the endpoints and tenant settings for all three signals.
+type BackendOptions struct {
+	MetricsKind      MetricsKind
+	MetricsQueryURL  string
+	MetricsIngestURL string
+	Metrics          MetricsOptions
+	Logs             SignalEndpoint
+	Traces           SignalEndpoint
+}
+
+// ErrInvalidTenant reports a missing or invalid project tenant boundary.
+var ErrInvalidTenant = errors.New("storage: invalid tenant")
+
 // SignalBackend is the storage boundary consumed by the gateway. Both the
 // embedded and standalone process topologies use the same HTTP contract; only
 // the configured endpoints differ. Keeping URL and tenancy decisions behind
@@ -41,9 +62,17 @@ type SignalBackend interface {
 	MetricsIngestEnabled() bool
 	MetricsClustered() bool
 	LogsBase() string
+	LogsQueryBase() string
+	LogsIngestBase() string
 	TracesBase() string
+	TracesQueryBase() string
+	TracesIngestBase() string
 	PrometheusRemoteWriteBase() string
+	TenantAccountID() string
+	ApplyTenantHeaders(http.Header, int) error
 	SetTenantHeaders(http.Header, int)
+	ApplyMetricsQueryIsolation(url.Values, string, bool) error
+	MetricsIngestExtraLabel(string) (string, error)
 }
 
 type Backend struct {
@@ -52,8 +81,10 @@ type Backend struct {
 	metricsIngestURL string
 	metricsCluster   bool
 	tenantAccountID  string
-	logsURL          string
-	tracesURL        string
+	logsQueryURL     string
+	logsIngestURL    string
+	tracesQueryURL   string
+	tracesIngestURL  string
 	client           *http.Client
 }
 
@@ -69,48 +100,88 @@ func NewWithMetricsOptions(
 	opts MetricsOptions,
 	client *http.Client,
 ) (*Backend, error) {
-	if kind != MetricsVM && kind != MetricsPrometheus {
-		return nil, fmt.Errorf("unsupported metrics kind %q", kind)
+	return NewWithOptions(
+		BackendOptions{
+			MetricsKind:      kind,
+			MetricsQueryURL:  queryURL,
+			MetricsIngestURL: ingestURL,
+			Metrics:          opts,
+			Logs:             SignalEndpoint{URL: logsURL},
+			Traces:           SignalEndpoint{URL: tracesURL},
+		},
+		client,
+	)
+}
+
+func NewWithOptions(opts BackendOptions, client *http.Client) (*Backend, error) {
+	if opts.MetricsKind != MetricsVM && opts.MetricsKind != MetricsPrometheus {
+		return nil, fmt.Errorf("unsupported metrics kind %q", opts.MetricsKind)
 	}
-	if opts.TenantAccountID != "" {
-		if _, err := strconv.ParseUint(opts.TenantAccountID, 10, 32); err != nil {
+	if opts.Metrics.TenantAccountID != "" {
+		if _, err := strconv.ParseUint(opts.Metrics.TenantAccountID, 10, 32); err != nil {
 			return nil, fmt.Errorf("metrics tenant account ID must be an unsigned 32-bit integer: %w", err)
 		}
 	}
-	if opts.Cluster {
-		if kind != MetricsVM {
+	if opts.Metrics.Cluster {
+		if opts.MetricsKind != MetricsVM {
 			return nil, errors.New("metrics cluster mode requires kind vm")
 		}
-		if opts.TenantAccountID == "" {
+		if opts.Metrics.TenantAccountID == "" {
 			return nil, errors.New("metrics tenant account ID is required in cluster mode")
 		}
-		if ingestURL == "" {
+		if opts.MetricsIngestURL == "" {
 			return nil, errors.New("metrics ingest URL is required in cluster mode")
 		}
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 2 * time.Second}
 	}
-	for name, raw := range map[string]string{"metrics query": queryURL, "logs": logsURL, "traces": tracesURL} {
-		if err := validateURL(raw); err != nil {
-			return nil, fmt.Errorf("%s URL: %w", name, err)
-		}
+	if err := validateURL(opts.MetricsQueryURL); err != nil {
+		return nil, fmt.Errorf("metrics query URL: %w", err)
 	}
-	if ingestURL != "" {
-		if err := validateURL(ingestURL); err != nil {
+	if opts.MetricsIngestURL != "" {
+		if err := validateURL(opts.MetricsIngestURL); err != nil {
 			return nil, fmt.Errorf("metrics ingest URL: %w", err)
 		}
 	}
+	logsQueryURL, logsIngestURL, err := resolveSignalEndpoint("logs", opts.Logs)
+	if err != nil {
+		return nil, err
+	}
+	tracesQueryURL, tracesIngestURL, err := resolveSignalEndpoint("traces", opts.Traces)
+	if err != nil {
+		return nil, err
+	}
 	return &Backend{
-		metricsKind:      kind,
-		metricsQueryURL:  strings.TrimRight(queryURL, "/"),
-		metricsIngestURL: strings.TrimRight(ingestURL, "/"),
-		metricsCluster:   opts.Cluster,
-		tenantAccountID:  opts.TenantAccountID,
-		logsURL:          strings.TrimRight(logsURL, "/"),
-		tracesURL:        strings.TrimRight(tracesURL, "/"),
+		metricsKind:      opts.MetricsKind,
+		metricsQueryURL:  strings.TrimRight(opts.MetricsQueryURL, "/"),
+		metricsIngestURL: strings.TrimRight(opts.MetricsIngestURL, "/"),
+		metricsCluster:   opts.Metrics.Cluster,
+		tenantAccountID:  opts.Metrics.TenantAccountID,
+		logsQueryURL:     logsQueryURL,
+		logsIngestURL:    logsIngestURL,
+		tracesQueryURL:   tracesQueryURL,
+		tracesIngestURL:  tracesIngestURL,
 		client:           client,
 	}, nil
+}
+
+func resolveSignalEndpoint(signal string, endpoint SignalEndpoint) (string, string, error) {
+	queryURL := strings.TrimSpace(endpoint.QueryURL)
+	if queryURL == "" {
+		queryURL = strings.TrimSpace(endpoint.URL)
+	}
+	ingestURL := strings.TrimSpace(endpoint.IngestURL)
+	if ingestURL == "" {
+		ingestURL = strings.TrimSpace(endpoint.URL)
+	}
+	if err := validateURL(queryURL); err != nil {
+		return "", "", fmt.Errorf("%s query URL: %w", signal, err)
+	}
+	if err := validateURL(ingestURL); err != nil {
+		return "", "", fmt.Errorf("%s ingest URL: %w", signal, err)
+	}
+	return strings.TrimRight(queryURL, "/"), strings.TrimRight(ingestURL, "/"), nil
 }
 
 func (b *Backend) MetricsMode() MetricsKind { return b.metricsKind }
@@ -119,23 +190,110 @@ func (b *Backend) MetricsIngestEnabled() bool { return b.metricsIngestURL != "" 
 
 func (b *Backend) MetricsClustered() bool { return b.metricsCluster }
 
-func (b *Backend) LogsBase() string { return b.logsURL }
+func (b *Backend) LogsBase() string { return b.logsQueryURL }
 
-func (b *Backend) TracesBase() string { return b.tracesURL }
+func (b *Backend) LogsQueryBase() string { return b.logsQueryURL }
+
+func (b *Backend) LogsIngestBase() string { return b.logsIngestURL }
+
+func (b *Backend) TracesBase() string { return b.tracesQueryURL }
+
+func (b *Backend) TracesQueryBase() string { return b.tracesQueryURL }
+
+func (b *Backend) TracesIngestBase() string { return b.tracesIngestURL }
+
+// TenantAccountID returns the effective Victoria account identifier across
+// metrics cluster paths and VictoriaLogs/VictoriaTraces headers.
+func (b *Backend) TenantAccountID() string {
+	if b.tenantAccountID == "" {
+		return "0"
+	}
+	return b.tenantAccountID
+}
+
+// ApplyTenantHeaders validates projectID fail-closed and writes the native
+// VictoriaLogs/VictoriaTraces AccountID and ProjectID headers.
+func (b *Backend) ApplyTenantHeaders(header http.Header, projectID int) error {
+	if projectID <= 0 {
+		return fmt.Errorf("%w: invalid project ID %d for tenant headers", ErrInvalidTenant, projectID)
+	}
+	header.Set("AccountID", b.TenantAccountID())
+	header.Set("ProjectID", strconv.Itoa(projectID))
+	return nil
+}
 
 // SetTenantHeaders applies the native VictoriaLogs/VictoriaTraces tenant
 // boundary. The gateway strips incoming values before calling this method.
 // Non-positive project IDs fail closed instead of silently landing in tenant 0.
 func (b *Backend) SetTenantHeaders(header http.Header, projectID int) {
-	if projectID <= 0 {
+	if err := b.ApplyTenantHeaders(header, projectID); err != nil {
 		panic(fmt.Sprintf("storage: invalid project ID %d for tenant headers", projectID))
 	}
-	accountID := b.tenantAccountID
-	if accountID == "" {
-		accountID = "0"
+}
+
+// MetricsIngestExtraLabel validates the project slug fail-closed and returns
+// the trusted extra_label parameter value for OTLP metrics ingestion.
+func (b *Backend) MetricsIngestExtraLabel(projectSlug string) (string, error) {
+	if projectSlug == "" {
+		return "", fmt.Errorf("%w: project slug is empty", ErrInvalidTenant)
 	}
-	header.Set("AccountID", accountID)
-	header.Set("ProjectID", strconv.Itoa(projectID))
+	return "project_id=" + projectSlug, nil
+}
+
+// ApplyMetricsQueryIsolation strips client-supplied isolation parameters and
+// enforces project scoping using either VictoriaMetrics extra_filters[] or
+// Prometheus PromQL AST injection.
+func (b *Backend) ApplyMetricsQueryIsolation(values url.Values, projectSlug string, defaultMatcher bool) error {
+	// VictoriaMetrics v1.153+ ignores empty extra_label/extra_filters values
+	// instead of rejecting them, so an empty project would silently become a
+	// cross-project query. Refuse it here.
+	if projectSlug == "" {
+		return fmt.Errorf("%w: project slug is empty", ErrInvalidTenant)
+	}
+	StripReservedMetricsParams(values)
+	if b.metricsKind == MetricsPrometheus {
+		if err := InjectPromValues(values, projectSlug); err != nil {
+			return err
+		}
+		if defaultMatcher && len(values["match[]"]) == 0 {
+			values.Set("match[]", fmt.Sprintf(`{project_id=%q}`, projectSlug))
+		}
+		return nil
+	}
+	values.Set("extra_filters[]", fmt.Sprintf(`{project_id=%q}`, projectSlug))
+	return nil
+}
+
+// StripReservedMetricsParams removes client-supplied isolation parameters so
+// callers cannot inject arbitrary VictoriaMetrics filters or labels.
+func StripReservedMetricsParams(values url.Values) {
+	values.Del("extra_filters")
+	values.Del("extra_filters[]")
+	values.Del("extra_label")
+}
+
+// InjectPromValues rewrites every query and match[] expression in values to
+// enforce the trusted project_id equality matcher.
+func InjectPromValues(values url.Values, projectSlug string) error {
+	if projectSlug == "" {
+		return fmt.Errorf("%w: project slug is empty", ErrInvalidTenant)
+	}
+	for _, key := range []string{"query", "match[]"} {
+		original := values[key]
+		if len(original) == 0 {
+			continue
+		}
+		injected := make([]string, len(original))
+		for i, value := range original {
+			var err error
+			injected[i], err = InjectPromQL(value, projectSlug)
+			if err != nil {
+				return err
+			}
+		}
+		values[key] = injected
+	}
+	return nil
 }
 
 // MetricsQueryBase returns the Prometheus API base. Cluster mode uses one
@@ -183,14 +341,20 @@ func (b *Backend) Health(ctx context.Context) map[string]error {
 	}
 	result := map[string]error{
 		"metrics": b.probe(ctx, b.metricsQueryURL, metricsPaths...),
-		"logs":    b.probe(ctx, b.logsURL, "/health"),
-		"traces":  b.probe(ctx, b.tracesURL, "/health"),
+		"logs":    b.probe(ctx, b.logsQueryURL, "/health"),
+		"traces":  b.probe(ctx, b.tracesQueryURL, "/health"),
 	}
 	if b.metricsIngestURL != "" && (b.metricsCluster || b.metricsIngestURL != b.metricsQueryURL) {
 		// A standalone deployment may split Prometheus-compatible reads from a
 		// VictoriaMetrics write endpoint. Probe both common health routes so a
 		// dead write path cannot hide behind a healthy query service.
 		result["metrics-ingest"] = b.probe(ctx, b.metricsIngestURL, "/-/healthy", "/health")
+	}
+	if b.logsIngestURL != "" && b.logsIngestURL != b.logsQueryURL {
+		result["logs-ingest"] = b.probe(ctx, b.logsIngestURL, "/health")
+	}
+	if b.tracesIngestURL != "" && b.tracesIngestURL != b.tracesQueryURL {
+		result["traces-ingest"] = b.probe(ctx, b.tracesIngestURL, "/health")
 	}
 	return result
 }

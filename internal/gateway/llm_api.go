@@ -540,7 +540,7 @@ func (g *Gateway) streamLLMTracesQuery(
 	params := cloneQueryValues(query)
 	const path = "/select/logsql/query"
 	disableTracesLatencyOffset(path, params)
-	target := strings.TrimRight(g.storage.TracesBase(), "/") + path
+	target := strings.TrimRight(g.storage.TracesQueryBase(), "/") + path
 	if encoded := params.Encode(); encoded != "" {
 		target += "?" + encoded
 	}

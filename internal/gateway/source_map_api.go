@@ -35,8 +35,8 @@ func (g *Gateway) uploadSourceMaps(c fiber.Ctx) error {
 	if g.sourceMaps == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "source map storage unavailable"})
 	}
-	release := strings.TrimSpace(c.Params("release"))
-	if !sourceMapComponent.MatchString(release) {
+	release, err := unescapedPathParam(c, "release", validateSourceMapRelease)
+	if err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid release"})
 	}
 	form, err := c.MultipartForm()
@@ -153,16 +153,20 @@ func (g *Gateway) deleteSourceMaps(c fiber.Ctx) error {
 	if g.sourceMaps == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "source map storage unavailable"})
 	}
-	release := strings.TrimSpace(c.Params("release"))
+	release, releaseErr := unescapedPathParam(c, "release", validateSourceMapRelease)
 	p := currentProject(c)
+	auditTarget := release
+	if releaseErr != nil {
+		auditTarget = strings.TrimSpace(c.Params("release"))
+	}
 	audit := auditEvent{
 		Action:      "source_map.delete",
 		TargetType:  "source_map",
-		TargetName:  release,
+		TargetName:  auditTarget,
 		ProjectID:   p.ID,
 		ProjectSlug: p.Slug,
 	}
-	if !sourceMapComponent.MatchString(release) {
+	if releaseErr != nil {
 		audit.FailureReason = "invalid_request"
 		g.auditManagement(c, audit)
 		return badRequest(c)

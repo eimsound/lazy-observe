@@ -53,7 +53,11 @@ func (w *VictoriaLogsWriter) WriteErrorEvent(
 	if err := json.NewEncoder(&body).Encode(record); err != nil {
 		return err
 	}
-	target := strings.TrimRight(w.backend.LogsBase(), "/") + "/insert/jsonline?" + url.Values{
+	base := w.backend.LogsBase()
+	if ingest, ok := w.backend.(interface{ LogsIngestBase() string }); ok && ingest.LogsIngestBase() != "" {
+		base = ingest.LogsIngestBase()
+	}
+	target := strings.TrimRight(base, "/") + "/insert/jsonline?" + url.Values{
 		"_stream_fields": []string{"event_type"}, "_time_field": []string{"timestamp"},
 	}.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, &body)

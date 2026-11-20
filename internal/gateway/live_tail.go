@@ -2,20 +2,14 @@ package gateway
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -25,7 +19,6 @@ const (
 	defaultLiveTailMaxDuration           = 30 * time.Minute
 	defaultLiveTailHeartbeat             = 15 * time.Second
 	defaultLiveTailResponseHeaderTimeout = 30 * time.Second
-	maxLiveTailErrorBodyBytes            = 1 << 20
 )
 
 type liveTailLimiter struct {
@@ -138,197 +131,6 @@ func newLiveTailClient(base *http.Client) *http.Client {
 	return client
 }
 
-func (g *Gateway) logsLiveTail(c fiber.Ctx) error {
-	p := currentProject(c)
-	if p.ID <= 0 {
-		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
-	}
-	if g.shutdownCtx.Err() != nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"code":  "gateway_draining",
-			"error": "gateway is shutting down",
-		})
-	}
-	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	releaseSlot, ok := g.liveTail.acquire(u.ID, p.ID)
-	if !ok {
-		g.logger.Warn(
-			"live tail concurrency limit exceeded",
-			"user_id", u.ID,
-			"project_id", p.ID,
-		)
-		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-			"code":  "live_tail_limit_exceeded",
-			"error": "too many concurrent live tail streams",
-		})
-	}
-
-	query, err := url.ParseQuery(string(c.RequestCtx().QueryArgs().QueryString()))
-	if err != nil {
-		releaseSlot()
-		return fiber.NewError(fiber.StatusBadRequest, "invalid query parameters")
-	}
-	target := strings.TrimRight(g.storage.LogsBase(), "/") + "/select/logsql/tail"
-	if encoded := query.Encode(); encoded != "" {
-		target += "?" + encoded
-	}
-
-	streamCtx, streamCancel := context.WithTimeout(g.shutdownCtx, g.liveTailMaxDuration)
-	body := append([]byte(nil), requestBody(c)...)
-	req, err := http.NewRequestWithContext(streamCtx, c.Method(), target, bytes.NewReader(body))
-	if err != nil {
-		streamCancel()
-		releaseSlot()
-		return fiber.NewError(fiber.StatusInternalServerError, "failed to construct upstream request")
-	}
-	copyProxyRequestHeaders(req.Header, &c.Request().Header, false)
-	req.Header.Del("Accept-Encoding")
-	g.storage.SetTenantHeaders(req.Header, p.ID)
-
-	resp, err := g.tailClient.Do(req)
-	if err != nil {
-		streamCancel()
-		releaseSlot()
-		if g.shutdownCtx.Err() != nil {
-			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-				"code":  "gateway_draining",
-				"error": "gateway is shutting down",
-			})
-		}
-		g.logger.Warn("live tail upstream request failed", "project_id", p.ID, "error", err)
-		return fiber.NewError(fiber.StatusBadGateway, "upstream storage unavailable")
-	}
-
-	copyProxyResponseHeaders(c, resp.Header)
-	c.Set("X-Accel-Buffering", "no")
-	c.Set("Cache-Control", "no-cache")
-	c.Status(resp.StatusCode)
-
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified || resp.ContentLength == 0 {
-		drainAndCloseBody(resp.Body)
-		streamCancel()
-		releaseSlot()
-		return nil
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxLiveTailErrorBodyBytes))
-		drainAndCloseBody(resp.Body)
-		streamCancel()
-		releaseSlot()
-		return c.Send(errBody)
-	}
-
-	c.Response().ImmediateHeaderFlush = true
-	c.Response().Header.SetConnectionClose()
-
-	// Capture only values that are safe outside the Fiber handler lifecycle;
-	// SetBodyStreamWriter callbacks must never touch Ctx or RequestCtx.
-	clientConn := c.RequestCtx().Conn()
-	heartbeatInterval := g.liveTailHeartbeat
-	statusCode := resp.StatusCode
-	projectID := p.ID
-	userID := u.ID
-
-	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
-		var closeBodyOnce sync.Once
-		closeBody := func() {
-			closeBodyOnce.Do(func() {
-				_ = resp.Body.Close()
-			})
-		}
-		defer releaseSlot()
-		defer closeBody()
-		defer streamCancel()
-
-		stopWatcher := startClientDisconnectWatcher(streamCtx, clientConn, streamCancel)
-		defer stopWatcher()
-
-		type tailChunk struct {
-			data []byte
-			err  error
-		}
-		chunks := make(chan tailChunk, 1)
-		readDone := make(chan struct{})
-		go func() {
-			defer close(readDone)
-			defer close(chunks)
-			buf := make([]byte, 32*1024)
-			for {
-				n, readErr := resp.Body.Read(buf)
-				if n > 0 {
-					chunk := make([]byte, n)
-					copy(chunk, buf[:n])
-					select {
-					case chunks <- tailChunk{data: chunk}:
-					case <-streamCtx.Done():
-						return
-					}
-				}
-				if readErr != nil {
-					select {
-					case chunks <- tailChunk{err: readErr}:
-					case <-streamCtx.Done():
-					}
-					return
-				}
-			}
-		}()
-		defer func() {
-			streamCancel()
-			closeBody()
-			<-readDone
-		}()
-
-		var ticker *time.Ticker
-		var heartbeatCh <-chan time.Time
-		if heartbeatInterval > 0 {
-			ticker = time.NewTicker(heartbeatInterval)
-			heartbeatCh = ticker.C
-			defer ticker.Stop()
-		}
-
-		fw := flushingWriter{writer: w}
-		for {
-			select {
-			case <-streamCtx.Done():
-				return
-			case <-heartbeatCh:
-				if _, writeErr := fw.Write([]byte("\n")); writeErr != nil {
-					g.recordProxyStreamError("/select/logsql/tail", statusCode, writeErr)
-					return
-				}
-			case chunk, ok := <-chunks:
-				if !ok {
-					return
-				}
-				if len(chunk.data) > 0 {
-					if _, writeErr := fw.Write(chunk.data); writeErr != nil {
-						g.recordProxyStreamError("/select/logsql/tail", statusCode, writeErr)
-						return
-					}
-					if ticker != nil {
-						ticker.Reset(heartbeatInterval)
-					}
-				}
-				if chunk.err != nil {
-					if !errors.Is(chunk.err, io.EOF) && streamCtx.Err() == nil {
-						g.logger.Warn(
-							"live tail upstream stream interrupted",
-							"project_id", projectID,
-							"user_id", userID,
-							"status", statusCode,
-							"error", chunk.err,
-						)
-						g.recordProxyStreamError("/select/logsql/tail", statusCode, chunk.err)
-					}
-					return
-				}
-			}
-		}
-	})
-	return nil
-}
-
 func isWatchableConn(conn net.Conn) bool {
 	if conn == nil {
 		return false
@@ -346,10 +148,10 @@ func isWatchableConn(conn net.Conn) bool {
 	}
 }
 
-// startClientDisconnectWatcher monitors a live tail TCP/TLS connection for
-// client FIN/RST while fasthttp is writing the response stream. Because live
-// tail sets Connection: close, fasthttp will never read another request from
-// this connection, and stop() synchronously joins the goroutine before the
+// startClientDisconnectWatcher monitors a streaming TCP/TLS connection for
+// client FIN/RST while fasthttp is writing the response stream. Because
+// streamProxy sets Connection: close, fasthttp will never read another request
+// from this connection, and stop() synchronously joins the goroutine before the
 // stream writer returns.
 func startClientDisconnectWatcher(
 	ctx context.Context,

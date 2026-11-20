@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -130,8 +131,25 @@ type Metrics struct {
 	IngestURL       string `yaml:"ingest_url"`
 }
 type Endpoint struct {
-	URL string `yaml:"url"`
+	URL       string `yaml:"url"`
+	QueryURL  string `yaml:"query_url"`
+	IngestURL string `yaml:"ingest_url"`
 }
+
+func (e Endpoint) EffectiveQueryURL() string {
+	if u := strings.TrimSpace(e.QueryURL); u != "" {
+		return u
+	}
+	return strings.TrimSpace(e.URL)
+}
+
+func (e Endpoint) EffectiveIngestURL() string {
+	if u := strings.TrimSpace(e.IngestURL); u != "" {
+		return u
+	}
+	return strings.TrimSpace(e.URL)
+}
+
 type Retention struct {
 	Metrics      Duration `yaml:"metrics"`
 	Logs         Duration `yaml:"logs"`
@@ -460,7 +478,31 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 		"external metrics ingest base URL",
 	)
 	fs.StringVar(&cfg.Storage.Logs.URL, "logs-url", cfg.Storage.Logs.URL, "external VictoriaLogs URL")
+	fs.StringVar(
+		&cfg.Storage.Logs.QueryURL,
+		"logs-query-url",
+		cfg.Storage.Logs.QueryURL,
+		"optional external VictoriaLogs query URL (overrides logs-url for reads)",
+	)
+	fs.StringVar(
+		&cfg.Storage.Logs.IngestURL,
+		"logs-ingest-url",
+		cfg.Storage.Logs.IngestURL,
+		"optional external VictoriaLogs ingest URL (overrides logs-url for writes)",
+	)
 	fs.StringVar(&cfg.Storage.Traces.URL, "traces-url", cfg.Storage.Traces.URL, "external VictoriaTraces URL")
+	fs.StringVar(
+		&cfg.Storage.Traces.QueryURL,
+		"traces-query-url",
+		cfg.Storage.Traces.QueryURL,
+		"optional external VictoriaTraces query URL (overrides traces-url for reads)",
+	)
+	fs.StringVar(
+		&cfg.Storage.Traces.IngestURL,
+		"traces-ingest-url",
+		cfg.Storage.Traces.IngestURL,
+		"optional external VictoriaTraces ingest URL (overrides traces-url for writes)",
+	)
 }
 
 func configFlag(args []string) (string, error) {
@@ -514,7 +556,11 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		"LO_STORAGE_METRICS_INGEST_URL":        &c.Storage.Metrics.IngestURL,
 		"LO_STORAGE_METRICS_TENANT_ACCOUNT_ID": &c.Storage.Metrics.TenantAccountID,
 		"LO_STORAGE_LOGS_URL":                  &c.Storage.Logs.URL,
+		"LO_STORAGE_LOGS_QUERY_URL":            &c.Storage.Logs.QueryURL,
+		"LO_STORAGE_LOGS_INGEST_URL":           &c.Storage.Logs.IngestURL,
 		"LO_STORAGE_TRACES_URL":                &c.Storage.Traces.URL,
+		"LO_STORAGE_TRACES_QUERY_URL":          &c.Storage.Traces.QueryURL,
+		"LO_STORAGE_TRACES_INGEST_URL":         &c.Storage.Traces.IngestURL,
 	}
 	for name, dst := range pathStrings {
 		if v, ok := lookup(name); ok {
@@ -680,8 +726,35 @@ func (c Config) Validate() error {
 		}
 	}
 	if c.Standalone {
-		if c.Storage.Metrics.QueryURL == "" || c.Storage.Logs.URL == "" || c.Storage.Traces.URL == "" {
+		logsQuery := c.Storage.Logs.EffectiveQueryURL()
+		logsIngest := c.Storage.Logs.EffectiveIngestURL()
+		tracesQuery := c.Storage.Traces.EffectiveQueryURL()
+		tracesIngest := c.Storage.Traces.EffectiveIngestURL()
+		if strings.TrimSpace(c.Storage.Metrics.QueryURL) == "" ||
+			(logsQuery == "" && logsIngest == "") ||
+			(tracesQuery == "" && tracesIngest == "") {
 			return errors.New("standalone requires metrics.query_url, logs.url, and traces.url")
+		}
+		if logsQuery == "" || logsIngest == "" {
+			return errors.New("standalone logs requires url or both query_url and ingest_url")
+		}
+		if tracesQuery == "" || tracesIngest == "" {
+			return errors.New("standalone traces requires url or both query_url and ingest_url")
+		}
+	}
+	for _, field := range []struct {
+		name string
+		raw  string
+	}{
+		{"storage.logs.url", c.Storage.Logs.URL},
+		{"storage.logs.query_url", c.Storage.Logs.QueryURL},
+		{"storage.logs.ingest_url", c.Storage.Logs.IngestURL},
+		{"storage.traces.url", c.Storage.Traces.URL},
+		{"storage.traces.query_url", c.Storage.Traces.QueryURL},
+		{"storage.traces.ingest_url", c.Storage.Traces.IngestURL},
+	} {
+		if err := validateOptionalHTTPURL(field.name, field.raw); err != nil {
+			return err
 		}
 	}
 	if c.Meta.MigrationLockTimeout <= 0 || c.Replay.CleanupInterval <= 0 || c.Alert.StormThreshold <= 0 ||
@@ -739,6 +812,18 @@ func (c Config) Validate() error {
 				return fmt.Errorf("security.trusted_proxies entry %q must be a valid IP or CIDR", raw)
 			}
 		}
+	}
+	return nil
+}
+
+func validateOptionalHTTPURL(name, raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s must be an absolute http(s) URL", name)
 	}
 	return nil
 }

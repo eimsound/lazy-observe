@@ -149,13 +149,19 @@ func collectPlatformEndpoints(
 	if signals != nil && signals.backend != nil {
 		addURL(signals.backend.MetricsQueryBase(), false)
 		addURL(signals.backend.MetricsIngestBase(), false)
-		addURL(signals.backend.LogsBase(), false)
-		addURL(signals.backend.TracesBase(), false)
+		addURL(signals.backend.LogsQueryBase(), false)
+		addURL(signals.backend.LogsIngestBase(), false)
+		addURL(signals.backend.TracesQueryBase(), false)
+		addURL(signals.backend.TracesIngestBase(), false)
 	}
 	addURL(cfg.Storage.Metrics.QueryURL, false)
 	addURL(cfg.Storage.Metrics.IngestURL, false)
 	addURL(cfg.Storage.Logs.URL, false)
+	addURL(cfg.Storage.Logs.QueryURL, false)
+	addURL(cfg.Storage.Logs.IngestURL, false)
 	addURL(cfg.Storage.Traces.URL, false)
+	addURL(cfg.Storage.Traces.QueryURL, false)
+	addURL(cfg.Storage.Traces.IngestURL, false)
 
 	ports := make([]int, 0, len(portSet))
 	for port := range portSet {
