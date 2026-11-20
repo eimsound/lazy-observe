@@ -25,35 +25,40 @@ jobs:
       - name: Calculate cache keys
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
+      # mise、gomod、gobuild、pnpm 只读 ci.yml 在 main 上保存的缓存（perf-gates 的工具集与 base 相同）；
+      # 只有 storage-all 由这里在 main 上保存。缓存规矩见 ci.yml 顶部注释。
       - name: Restore mise cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
-          key: mise-bench-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
-          restore-keys: mise-bench-${{ runner.os }}-${{ runner.arch }}-
+          key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
           MISE_CI_PROFILE: perf-gates
-      - name: Restore Go cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Go module cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-bench-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
-          restore-keys: |
-            go-bench-${{ runner.os }}-${{ runner.arch }}-
-            go-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
-            go-${{ runner.os }}-${{ runner.arch }}-
+          path: ~/go/pkg/mod
+          key: gomod-${{ steps.cache-keys.outputs.go }}
+          restore-keys: gomod-
+      - name: Restore Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-
       - name: Restore pnpm cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.pnpm-store
-          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.pnpm-web }}
+          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.pnpm-web }}
           restore-keys: pnpm-web-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cross-platform storage archives
+        id: storage-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             .cache/storage-bin/.archives
@@ -68,3 +73,11 @@ jobs:
         run: mise run perf-ha
       - name: Validate performance result contract
         run: mise run perf-results-check
+      - name: Save cross-platform storage archives
+        if: github.ref == 'refs/heads/main' && steps.storage-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/storage-bin/.archives
+            .cache/storage-bin/*/.archives
+          key: ${{ steps.storage-cache.outputs.cache-primary-key }}

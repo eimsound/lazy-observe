@@ -66,7 +66,8 @@ jobs:
           secrets: |
             github_token=${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha,scope=container-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
+          # mode=max 的层缓存动辄 GB 级；tag 触发时写在 refs/tags/* 下，别的 tag 和 main 都读不到，只在 main 上写。
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=container-{0}', matrix.arch) || '' }}
       # 发版前挡住：CRITICAL/HIGH 且已有修复版本的漏洞让 container-check 失败，archive 与 docker 都不会运行。
       # 扫描器按版本 + sha256 固定，例外写进 .trivyignore.yaml（见 scripts/check-image-vulns.sh）。
       - name: Scan container for fixable CRITICAL/HIGH vulnerabilities
@@ -102,35 +103,40 @@ jobs:
       - name: Calculate cache keys
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
+      # tag 触发时 ref 是 refs/tags/*，写进去的缓存别的 tag 和 main 都读不到，所以这个 workflow 只在 main 上保存
+      # （手动 snapshot 选 main 时）；其余情况只读 ci.yml 在 main 上保存的缓存。缓存规矩见 ci.yml 顶部注释。
       - name: Restore mise cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
-          key: mise-performance-gates-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
-          restore-keys: mise-performance-gates-${{ runner.os }}-${{ runner.arch }}-
+          key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
           MISE_CI_PROFILE: perf-gates
-      - name: Restore Go cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Go module cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-bench-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
-          restore-keys: |
-            go-bench-${{ runner.os }}-${{ runner.arch }}-
-            go-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
-            go-${{ runner.os }}-${{ runner.arch }}-
+          path: ~/go/pkg/mod
+          key: gomod-${{ steps.cache-keys.outputs.go }}
+          restore-keys: gomod-
+      - name: Restore Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-
       - name: Restore pnpm cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.pnpm-store
-          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.pnpm-web }}
+          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.pnpm-web }}
           restore-keys: pnpm-web-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cross-platform storage archives
+        id: storage-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             .cache/storage-bin/.archives
@@ -145,6 +151,14 @@ jobs:
         run: mise run perf-ha
       - name: Validate performance result contract
         run: mise run perf-results-check
+      - name: Save cross-platform storage archives
+        if: github.ref == 'refs/heads/main' && steps.storage-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/storage-bin/.archives
+            .cache/storage-bin/*/.archives
+          key: ${{ steps.storage-cache.outputs.cache-primary-key }}
 
   archive:
     name: ${{ github.event_name == 'workflow_dispatch' && 'Snapshot archives' || 'Publish archives' }}
@@ -160,8 +174,12 @@ jobs:
       - name: Calculate cache keys
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
+      # release 工具集（goreleaser、go-licenses）只有这个 job 用，自己一份 mise 缓存；tag 触发时只读，
+      # 手动 snapshot 选 main 时才保存（原因见上面 performance-gates 的注释）。gomod、gobuild、pnpm、storage
+      # 与 performance-gates 共用同一批 key，只读。
       - name: Restore release mise cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: mise-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
           key: mise-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
@@ -171,28 +189,32 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MISE_CI_PROFILE: release
-      - name: Restore release Go cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Go module cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.go }}
-          restore-keys: go-release-${{ runner.os }}-${{ runner.arch }}-
-      - name: Restore release pnpm cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          path: ~/go/pkg/mod
+          key: gomod-${{ steps.cache-keys.outputs.go }}
+          restore-keys: gomod-
+      - name: Restore Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-${{ steps.cache-keys.outputs.go }}
+          restore-keys: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-
+      - name: Restore pnpm cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.pnpm-store
-          key: pnpm-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}-${{ steps.cache-keys.outputs.pnpm-web }}
-          restore-keys: pnpm-release-${{ runner.os }}-${{ runner.arch }}-
+          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.pnpm-web }}
+          restore-keys: pnpm-web-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore cross-platform storage archives
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             .cache/storage-bin/.archives
             .cache/storage-bin/*/.archives
-          key: storage-all-${{ steps.cache-keys.outputs.storage }}
-          restore-keys: storage-all-
+          key: storage-all-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.storage }}
+          restore-keys: storage-all-${{ runner.os }}-${{ runner.arch }}-
       - name: Validate snapshot configuration
         if: github.event_name == 'workflow_dispatch'
         run: mise run release-snapshot-check
@@ -224,6 +246,15 @@ jobs:
         run: mise run release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prune stale mise tools
+        if: github.ref == 'refs/heads/main' && steps.mise-cache.outputs.cache-hit != 'true'
+        run: mise prune --tools --yes
+      - name: Save release mise cache
+        if: github.ref == 'refs/heads/main' && steps.mise-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: ${{ steps.mise-cache.outputs.cache-primary-key }}
 
   docker:
     name: Publish multi-platform container
@@ -284,10 +315,10 @@ jobs:
             DATE=${{ steps.build-meta.outputs.date }}
           secrets: |
             github_token=${{ secrets.GITHUB_TOKEN }}
+          # docker job 只在 tag push 时跑，refs/tags/* 写出的层缓存别的 tag 和 main 都读不到，所以只读不写。
           cache-from: |
             type=gha,scope=container-amd64
             type=gha,scope=container-arm64
-          cache-to: type=gha,mode=max,scope=container-release
       - name: Verify pushed manifest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
