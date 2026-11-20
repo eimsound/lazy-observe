@@ -316,6 +316,14 @@ func (e *RuleEvaluator) evaluateCycle(ctx context.Context) {
 		}
 		return
 	}
+	e.evaluateRules(ctx, rules, memberIDs)
+}
+
+func (e *RuleEvaluator) evaluateRules(
+	ctx context.Context,
+	rules []meta.AlertRuleView,
+	memberIDs []ownership.MemberID,
+) {
 	type evaluationTask struct {
 		rule    *meta.AlertRuleView
 		project *meta.ProjectInfo
@@ -326,23 +334,22 @@ func (e *RuleEvaluator) evaluateCycle(ctx context.Context) {
 	var dueTasks []evaluationTask
 	for i := range rules {
 		rule := &rules[i]
-		if rule.EvaluationEngine == "paused" {
+		if !rule.Enabled || rule.EvaluationEngine != "native" {
 			continue
 		}
-		project := &rule.Project
 		owner, ownerErr := ownership.Owner(
-			ownership.RuleKey{ProjectID: project.ID, Signal: rule.Signal, RuleID: rule.ID},
+			ownership.RuleKey{ProjectID: rule.Project.ID, Signal: rule.Signal, RuleID: rule.ID},
 			memberIDs,
 		)
 		if ownerErr != nil || string(owner) != e.memberID {
 			continue
 		}
-		owned[rule.ID] = struct{}{}
 		lease, leaseErr := e.store.AcquireAlertRuleLease(ctx, rule.ID, e.memberID, e.leaseTTL)
 		if errors.Is(leaseErr, meta.ErrRuleLeaseHeld) || errors.Is(leaseErr, meta.ErrInactiveAlertEngineMember) {
 			e.mu.Lock()
 			knownEpoch := e.leases[rule.ID].Epoch
 			delete(e.leases, rule.ID)
+			delete(e.next, rule.ID)
 			e.mu.Unlock()
 			slog.Warn("skip alert rule evaluation after lease rejection", "rule_id", rule.ID,
 				"member_id", e.memberID, "lease_epoch", knownEpoch, "error", leaseErr)
@@ -352,19 +359,49 @@ func (e *RuleEvaluator) evaluateCycle(ctx context.Context) {
 			slog.Error("acquire alert rule lease", "rule_id", rule.ID, "member_id", e.memberID, "error", leaseErr)
 			continue
 		}
+		// Reload the rule after acquiring the lease so updates committed
+		// between AlertEvaluationRules and AcquireAlertRuleLease cannot cause
+		// a newly fenced lease to evaluate a stale expression or disabled rule.
+		fresh, loadErr := e.store.AlertRuleByID(ctx, rule.ID)
+		if loadErr != nil {
+			if meta.IsNotFound(loadErr) {
+				e.discardAcquiredLease(ctx, lease, "deleted")
+			} else {
+				e.discardAcquiredLease(ctx, lease, "reload_failed")
+				if !errors.Is(loadErr, context.Canceled) {
+					slog.Error("reload alert rule after acquiring lease", "rule_id", rule.ID,
+						"member_id", e.memberID, "lease_epoch", lease.Epoch, "error", loadErr)
+				}
+			}
+			continue
+		}
+		if !fresh.Enabled || fresh.EvaluationEngine != "native" {
+			e.discardAcquiredLease(ctx, lease, "ineligible")
+			continue
+		}
+		freshOwner, freshOwnerErr := ownership.Owner(
+			ownership.RuleKey{ProjectID: fresh.Project.ID, Signal: fresh.Signal, RuleID: fresh.ID},
+			memberIDs,
+		)
+		if freshOwnerErr != nil || string(freshOwner) != e.memberID {
+			e.discardAcquiredLease(ctx, lease, "ownership_changed")
+			continue
+		}
+		owned[fresh.ID] = struct{}{}
 		e.mu.Lock()
-		e.leases[rule.ID] = lease
-		due := e.next[rule.ID]
+		e.leases[fresh.ID] = lease
+		due := e.next[fresh.ID]
 		now := e.now().UTC()
 		if due.IsZero() || !now.Before(due) {
-			e.next[rule.ID] = now.Add(e.ruleInterval(rule))
+			e.next[fresh.ID] = now.Add(e.ruleInterval(&fresh))
 		} else {
 			now = time.Time{}
 		}
 		e.mu.Unlock()
 		if !now.IsZero() {
+			freshCopy := fresh
 			dueTasks = append(dueTasks, evaluationTask{
-				rule: rule, project: project, lease: lease, now: now,
+				rule: &freshCopy, project: &freshCopy.Project, lease: lease, now: now,
 			})
 		}
 	}
@@ -397,6 +434,23 @@ func (e *RuleEvaluator) evaluateCycle(ctx context.Context) {
 		}(task)
 	}
 	batch.Wait()
+}
+
+func (e *RuleEvaluator) discardAcquiredLease(ctx context.Context, lease meta.AlertRuleLease, reason string) {
+	e.mu.Lock()
+	delete(e.leases, lease.RuleID)
+	delete(e.next, lease.RuleID)
+	e.mu.Unlock()
+	released, err := e.store.ReleaseAlertRuleLease(ctx, lease.RuleID, e.memberID, lease.Epoch)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("release alert rule lease failed", "rule_id", lease.RuleID,
+				"member_id", e.memberID, "lease_epoch", lease.Epoch, "reason", reason, "error", err)
+		}
+	} else if !released {
+		slog.Warn("release alert rule lease rejected after losing ownership", "rule_id", lease.RuleID,
+			"member_id", e.memberID, "lease_epoch", lease.Epoch, "reason", reason)
+	}
 }
 
 func (e *RuleEvaluator) evaluateRule(
