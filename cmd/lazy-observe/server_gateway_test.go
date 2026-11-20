@@ -71,3 +71,20 @@ func TestCombinedHealthPreservesSupervisorRestartState(t *testing.T) {
 		t.Fatalf("combined health=%v", health)
 	}
 }
+
+func TestEffectiveSecureSessionCookieEnablesWithNativeTLS(t *testing.T) {
+	cfg := appconfig.Defaults()
+	if effectiveSecureSessionCookie(cfg) {
+		t.Fatal("plain HTTP without SessionSecureCookie should keep SecureSessionCookie false")
+	}
+	cfg.Security.SessionSecureCookie = true
+	if !effectiveSecureSessionCookie(cfg) {
+		t.Fatal("explicit SessionSecureCookie should be true")
+	}
+	cfg.Security.SessionSecureCookie = false
+	cfg.Security.TLSCert = "/tmp/cert.pem"
+	cfg.Security.TLSKey = "/tmp/key.pem"
+	if !effectiveSecureSessionCookie(cfg) {
+		t.Fatal("native TLS should automatically enable SecureSessionCookie")
+	}
+}

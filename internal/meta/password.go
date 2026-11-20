@@ -1,25 +1,105 @@
 package meta
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 )
 
 const (
-	argonTime    = uint32(1)
-	argonMemory  = uint32(64 * 1024)
-	argonThreads = uint8(4)
-	argonKeyLen  = uint32(32)
+	argonTime                  = uint32(1)
+	argonMemory                = uint32(64 * 1024)
+	argonThreads               = uint8(4)
+	argonKeyLen                = uint32(32)
+	maxArgonMemory             = uint32(512 * 1024)
+	defaultArgonConcurrency    = 4
+	defaultArgonAcquireTimeout = 2 * time.Second
 )
+
+// ErrPasswordVerificationBusy reports that all bounded Argon2id verification
+// slots are occupied. Callers must map it to 503 (never 401 or lockout) so
+// password hashing concurrency stays capped below container memory limits.
+var ErrPasswordVerificationBusy = errors.New("password verification busy")
+
+// IsPasswordVerificationBusy reports whether an error indicates Argon2id
+// concurrency saturation.
+func IsPasswordVerificationBusy(err error) bool {
+	return errors.Is(err, ErrPasswordVerificationBusy)
+}
+
+type argonLimiter struct {
+	sem     chan struct{}
+	timeout time.Duration
+}
+
+var (
+	argonLimiterMu      sync.RWMutex
+	defaultArgonLimiter = &argonLimiter{
+		sem:     make(chan struct{}, defaultArgonConcurrency),
+		timeout: defaultArgonAcquireTimeout,
+	}
+)
+
+func currentArgonLimiter() *argonLimiter {
+	argonLimiterMu.RLock()
+	limiter := defaultArgonLimiter
+	argonLimiterMu.RUnlock()
+	return limiter
+}
+
+func acquireArgonSlot(ctx context.Context) (func(), error) {
+	limiter := currentArgonLimiter()
+	select {
+	case limiter.sem <- struct{}{}:
+		return func() { <-limiter.sem }, nil
+	default:
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(limiter.timeout)
+	defer timer.Stop()
+	select {
+	case limiter.sem <- struct{}{}:
+		return func() { <-limiter.sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrPasswordVerificationBusy
+	}
+}
+
+func acquireArgonSlotBlocking() func() {
+	limiter := currentArgonLimiter()
+	limiter.sem <- struct{}{}
+	return func() { <-limiter.sem }
+}
 
 // HashPassword returns a self-describing Argon2id password hash.
 func HashPassword(password string) (string, error) {
+	return hashPasswordWithRelease(password, acquireArgonSlotBlocking())
+}
+
+// HashPasswordContext returns a self-describing Argon2id password hash while
+// respecting the bounded Argon2id concurrency semaphore and ctx cancellation.
+func HashPasswordContext(ctx context.Context, password string) (string, error) {
+	release, err := acquireArgonSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	return hashPasswordWithRelease(password, release)
+}
+
+func hashPasswordWithRelease(password string, release func()) (string, error) {
+	defer release()
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("generate password salt: %w", err)
@@ -38,11 +118,36 @@ func HashPassword(password string) (string, error) {
 
 // VerifyPassword checks a password against a HashPassword encoding.
 func VerifyPassword(encoded, password string) bool {
-	var memory, iterations uint32
-	var threads uint8
+	memory, iterations, threads, salt, want, ok := parseArgon2Hash(encoded)
+	if !ok {
+		return false
+	}
+	release := acquireArgonSlotBlocking()
+	defer release()
+	got := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(want)))
+	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// VerifyPasswordContext checks a password against a HashPassword encoding while
+// respecting the bounded Argon2id concurrency semaphore and ctx cancellation.
+func VerifyPasswordContext(ctx context.Context, encoded, password string) (bool, error) {
+	memory, iterations, threads, salt, want, ok := parseArgon2Hash(encoded)
+	if !ok {
+		return false, nil
+	}
+	release, err := acquireArgonSlot(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	got := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(want)))
+	return subtle.ConstantTimeCompare(got, want) == 1, nil
+}
+
+func parseArgon2Hash(encoded string) (memory, iterations uint32, threads uint8, salt, want []byte, ok bool) {
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
-		return false
+		return 0, 0, 0, nil, nil, false
 	}
 	if _, err := fmt.Sscanf(
 		parts[3],
@@ -50,21 +155,20 @@ func VerifyPassword(encoded, password string) bool {
 		&memory,
 		&iterations,
 		&threads,
-	); err != nil || memory == 0 || iterations == 0 ||
+	); err != nil || memory == 0 || memory > maxArgonMemory || iterations == 0 ||
 		threads == 0 {
-		return false
+		return 0, 0, 0, nil, nil, false
 	}
 	b64 := base64.RawStdEncoding
 	salt, err := b64.DecodeString(parts[4])
 	if err != nil {
-		return false
+		return 0, 0, 0, nil, nil, false
 	}
-	want, err := b64.DecodeString(parts[5])
+	want, err = b64.DecodeString(parts[5])
 	if err != nil || len(want) == 0 {
-		return false
+		return 0, 0, 0, nil, nil, false
 	}
-	got := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(want)))
-	return subtle.ConstantTimeCompare(got, want) == 1
+	return memory, iterations, threads, salt, want, true
 }
 
 var errInvalidCredentials = errors.New("invalid credentials")
@@ -76,7 +180,12 @@ func IsInvalidCredentials(err error) bool {
 	return errors.Is(err, errInvalidCredentials)
 }
 
-func argon2Dummy(password string) []byte {
+func argon2DummyContext(ctx context.Context, password string) ([]byte, error) {
+	release, err := acquireArgonSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	return argon2.IDKey(
 		[]byte(password),
 		[]byte("lazy-observe-dummy"),
@@ -84,5 +193,5 @@ func argon2Dummy(password string) []byte {
 		argonMemory,
 		argonThreads,
 		argonKeyLen,
-	)
+	), nil
 }

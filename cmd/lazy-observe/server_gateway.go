@@ -67,7 +67,7 @@ func startGateway(
 			UploadTokens:             metadata.store,
 			Store:                    metadata.store,
 			Account:                  accounts,
-			Management:               management.New(metadata.store),
+			Management:               management.New(metadata.store).WithSessions(sessionAdapter),
 			Health:                   combinedHealth{signals.supervisor, signals.backend},
 			Readiness:                readiness,
 			Storage:                  signals.backend,
@@ -92,7 +92,8 @@ func startGateway(
 			SelfMonitoringToken:      metadata.selfToken,
 			Limits:                   shared.limits,
 			RequireCSRF:              cfg.Security.CSRF,
-			SecureSessionCookie:      cfg.Security.SessionSecureCookie,
+			SecureSessionCookie:      effectiveSecureSessionCookie(cfg),
+			TrustedProxies:           cfg.Security.TrustedProxies,
 			InitialAdminPasswordFile: gatewayInitialAdminPasswordFile(cfg),
 			Logger:                   logger,
 			MeterProvider:            meterProvider,
@@ -136,6 +137,10 @@ func startGateway(
 	gw.MarkReady()
 	logGatewayReady(cfg, logger)
 	return &runningServerGateway{gateway: gw, errors: serverErr}, nil
+}
+
+func effectiveSecureSessionCookie(cfg appconfig.Config) bool {
+	return cfg.Security.SessionSecureCookie || (cfg.Security.TLSCert != "" && cfg.Security.TLSKey != "")
 }
 
 func serverReadiness(

@@ -136,3 +136,85 @@ func TestSessionRevokeFailureFactsReportFailure(t *testing.T) {
 		t.Fatalf("revoke facts=%#v", facts)
 	}
 }
+
+type stubAuthMetadata struct {
+	account.Metadata
+	err   error
+	calls int
+}
+
+func (s *stubAuthMetadata) AuthenticateCredentials(context.Context, string, string) (meta.UserInfo, error) {
+	s.calls++
+	return meta.UserInfo{}, s.err
+}
+
+func TestLoginRejectsOversizedInputsBeforeStoreAndTruncatesAuditName(t *testing.T) {
+	store, err := meta.OpenStore(t.Context(), filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	stub := &stubAuthMetadata{Metadata: store, err: errors.New("should not be called")}
+	manager := account.New(stub, account.NewMetadataSessions(store), account.Options{
+		LoginFailureDelay: noDelay,
+	})
+
+	longUsername := strings.Repeat("a", account.MaxUsernameLength+64)
+	_, err = manager.Login(t.Context(), account.LoginInput{
+		Username: longUsername, Password: "password-123", SourceIP: "198.51.100.1",
+	})
+	if account.Code(err) != account.CodeInvalidRequest {
+		t.Fatalf("long username err=%v, want CodeInvalidRequest", err)
+	}
+	if stub.calls != 0 {
+		t.Fatalf("AuthenticateCredentials called %d times for oversized username", stub.calls)
+	}
+	facts := account.Facts(err)
+	if len(facts.ActorUsername) > account.MaxUsernameLength || len(facts.TargetName) > account.MaxUsernameLength {
+		t.Fatalf("audit facts did not bound username length: %d/%d", len(facts.ActorUsername), len(facts.TargetName))
+	}
+
+	longPassword := strings.Repeat("p", account.MaxPasswordLength+32)
+	_, err = manager.Login(t.Context(), account.LoginInput{
+		Username: "normal-user", Password: longPassword, SourceIP: "198.51.100.2",
+	})
+	if account.Code(err) != account.CodeInvalidRequest {
+		t.Fatalf("long password err=%v, want CodeInvalidRequest", err)
+	}
+	if stub.calls != 0 {
+		t.Fatalf("AuthenticateCredentials called %d times for oversized password", stub.calls)
+	}
+}
+
+func TestLoginStorageFailureAndArgonBusyDoNotLockOutAccount(t *testing.T) {
+	store, err := meta.OpenStore(t.Context(), filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for name, injected := range map[string]error{
+		"db_error":   errors.New("postgres connection refused"),
+		"argon_busy": meta.ErrPasswordVerificationBusy,
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub := &stubAuthMetadata{Metadata: store, err: injected}
+			manager := account.New(stub, account.NewMetadataSessions(store), account.Options{
+				LoginFailureDelay: noDelay,
+			})
+			for i := range 6 {
+				_, loginErr := manager.Login(t.Context(), account.LoginInput{
+					Username: "target-user",
+					Password: "any-password",
+					SourceIP: "203.0.113." + string(rune('1'+i)),
+				})
+				if account.Code(loginErr) != account.CodeUnavailable {
+					t.Fatalf("attempt %d: code=%v err=%v, want CodeUnavailable", i+1, account.Code(loginErr), loginErr)
+				}
+				if errors.Is(injected, meta.ErrPasswordVerificationBusy) && account.RetryAfter(loginErr) <= 0 {
+					t.Fatalf("attempt %d: expected RetryAfter for busy argon2", i+1)
+				}
+			}
+		})
+	}
+}

@@ -2,11 +2,15 @@ package management
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/eimsound/lazy-observe/internal/account"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/state"
 )
 
 func testManager(t *testing.T) (*Manager, *meta.Store) {
@@ -205,4 +209,81 @@ func TestCreateProjectValidatesSlugPattern(t *testing.T) {
 			t.Fatalf("slug %q: got=%+v facts=%+v err=%v", slug, got, facts, err)
 		}
 	}
+}
+
+func TestUserManagementRevokesSessionsAndProtectsLastAdmin(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	manager, store := testManager(t)
+	shared := state.NewMemorySessionStore()
+	sessions := account.NewStateSessions(shared)
+	manager.WithSessions(sessions)
+
+	admin, _, err := manager.CreateUser(ctx, CreateUserInput{
+		Username: "sole-admin", Password: "password-123", Role: "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminTok, err := sessions.Create(ctx, admin.ID, now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, facts, err := manager.UpdateUser(ctx, UpdateUserInput{ID: admin.ID, Role: "member"}); !IsErrorKind(
+		err,
+		ErrorProtected,
+	) || facts.FailureReason != "protected_last_admin" {
+		t.Fatalf("demote sole admin err=%v facts=%#v", err, facts)
+	}
+	if facts, err := manager.DeleteUser(ctx, admin.ID); !IsErrorKind(err, ErrorProtected) ||
+		facts.FailureReason != "protected_last_admin" {
+		t.Fatalf("delete sole admin err=%v facts=%#v", err, facts)
+	}
+	if _, err := sessions.Authenticate(ctx, adminTok, now); err != nil {
+		t.Fatalf("protected sole admin session unexpectedly revoked: %v", err)
+	}
+
+	member, _, err := manager.CreateUser(ctx, CreateUserInput{
+		Username: "alice", Password: "password-123", Role: "member",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok1, err := sessions.Create(ctx, member.ID, now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.UpdateUser(
+		ctx,
+		UpdateUserInput{ID: member.ID, Password: "reset-password-456"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Authenticate(ctx, tok1, now); !errors.Is(err, account.ErrSessionNotFound) {
+		t.Fatalf("session survived admin password reset: err=%v", err)
+	}
+
+	tok2, err := sessions.Create(ctx, member.ID, now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.UpdateUser(ctx, UpdateUserInput{ID: member.ID, Role: "viewer"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Authenticate(ctx, tok2, now); !errors.Is(err, account.ErrSessionNotFound) {
+		t.Fatalf("session survived role downgrade: err=%v", err)
+	}
+
+	tok3, err := sessions.Create(ctx, member.ID, now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.DeleteUser(ctx, member.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Authenticate(ctx, tok3, now); !errors.Is(err, account.ErrSessionNotFound) {
+		t.Fatalf("session survived user delete: err=%v", err)
+	}
+	_ = store
 }
