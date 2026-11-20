@@ -230,8 +230,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   four Go binaries recognized, or a report that does not match Trivy's exit
   code. Whether a pin is behind upstream is not decided by this job: before
   tagging a release, check the Renovate Dependency Dashboard (rerun it first)
-  for pending upgrades of the Victoria binaries and Trivy; until Renovate is
-  set up, check the pins by hand. The first version of this scan (#69)
+  for pending upgrades of the Victoria binaries and Trivy (Renovate tracks
+  these pins since #130, ADR 0015). The first version of this scan (#69)
   blocked a release when a pin was behind the latest upstream release that
   was at least 7 days old, or when that lookup failed; ADR 0016 replaced that
   policy (#69, #117). The container image scan is unchanged and still blocks.
@@ -412,20 +412,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     times in a 30,000-series, 90-day test, still tens of milliseconds);
     upstream warns of much higher memory use at larger series counts and
     retention (#72).
-- Versions pinned by hand in scripts, which Dependabot cannot see (the Victoria
-  storage binaries, the e2e cluster images, the bootstrap mise release, and
-  Trivy), now have a minimum release age of 7 days, kept in
-  `scripts/release-age.env`: the `pinned-releases` CI job fails a pull request
-  whose pin points at a release younger than that, a prerelease, or a draft
-  (and fails closed when the GitHub API cannot be read), and the new weekly
-  `pinned-releases` workflow keeps one tracking issue open while a pin is
-  behind the latest eligible release. Dependabot's `cooldown` and the
-  `minimumReleaseAge` of the `web`, `sdk/node`, and `sdk/browser` pnpm
-  workspaces use the same 7 days, so pnpm also holds back a security patch
-  younger than that until it is listed in `minimumReleaseAgeExclude`. `web` is
-  now a single-package pnpm workspace (`pnpm-workspace.yaml`); the lockfile is
-  unchanged. `sdk/python` follows with `[tool.uv] exclude-newer = "7 days"` in
-  its `pyproject.toml` (#70, #119).
+- Dependency upgrades have a minimum release age of 7 days, kept in
+  `scripts/release-age.env`. #70 first applied it to the versions pinned by
+  hand in scripts (the Victoria storage binaries, the e2e cluster images, the
+  bootstrap mise release, and Trivy) with a `pinned-releases` CI job that failed
+  a pull request whose pin pointed at a release younger than that, a prerelease,
+  or a draft, plus a weekly `pinned-releases` workflow with a tracking issue, and
+  with Dependabot's `cooldown`. #130 (ADR 0015) removed all three: Renovate now
+  opens the upgrade PRs and waits 7 days after a release (`minimumReleaseAge` in
+  `.github/renovate.json`, security updates included), and
+  `scripts/check-github-workflows.sh` fails when that value, or the pnpm and uv
+  settings below, differ from `scripts/release-age.env`. The age gate therefore
+  only covers PRs Renovate opens: a pin changed by hand gets no age check, and
+  the dependencies whose registry reports no release time are exempt (the Quay
+  Victoria cluster images, the Docker Hub `seaweedfs`, `postgres`, and `debian`
+  images, GCR distroless, and `govulncheck`). The `minimumReleaseAge` of
+  the `web`, `sdk/node`, and `sdk/browser` pnpm workspaces uses the same 7 days,
+  so pnpm also holds back a security patch younger than that until it is listed
+  in `minimumReleaseAgeExclude`. `web` is now a single-package pnpm workspace
+  (`pnpm-workspace.yaml`); the lockfile is unchanged. `sdk/python` follows with
+  `[tool.uv] exclude-newer = "7 days"` in its `pyproject.toml` (#70, #119,
+  #130).
 - `mise run sdk-journeys` runs the Go, Node, Python, and browser SDK journeys
   (`sdk/*/e2e.sh`) against a freshly started local platform, and changes that
   touch server, SDK, web, or storage-download paths now run it as the
@@ -511,6 +518,83 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and the discard is not counted in `DroppedTelemetry`, the same rule as the
   Python SDK. The heap and goroutine snapshots are still collected, and a
   window that runs its full 10 seconds is not affected (#118).
+- Dependency upgrades are handled by Renovate instead of Dependabot and the
+  hand-written pin tracking (ADR 0015, #130). Renovate runs as the Mend
+  Renovate GitHub App, which has to be installed on the repository
+  (installation steps in `.agents/docs/plans/renovate.md`).
+  `.github/renovate.json` covers the manifests (Go modules including
+  `entc.mod`, the pnpm workspaces, the Python SDK's `pyproject.toml`, GitHub
+  Actions, the Dockerfile, mise tools) and the versions pinned by hand in
+  scripts (the Victoria storage binaries, Trivy, the bootstrap mise release,
+  the e2e and BuildKit images). Most updates are grouped and opened after 3 am
+  on Monday (Asia/Shanghai); the hand-pinned versions are not tied to that
+  schedule. Where a pin carries a sha256, Renovate is configured to update the
+  version and the digest in one PR: every sha line in `scripts/mise-release.env`,
+  `scripts/download-storage-bins.sh`, and `scripts/install-trivy.sh` now ends
+  with a `# <release tag>` comment that Renovate reads, and the scripts that
+  consume those lines are unchanged. `.github/dependabot.yml`,
+  `.github/workflows/pinned-releases.yml`, the `pinned-releases` CI job, and
+  `scripts/check-pinned-releases.sh` (with its test and mise task) are
+  deleted. A new `trivy-pin` CI job downloads Trivy on amd64 and arm64 and
+  checks its sha256 whenever `scripts/install-trivy.sh` changes, and `ci-ok`
+  waits for it, because the Trivy checksum was otherwise only exercised at
+  release time. Trivy upgrades no longer get a manual `gh release verify`:
+  the 7-day age and the sha256 check are the gates. Some Renovate PRs need
+  manual work before merging (the review checklist in
+  `.agents/docs/plans/renovate.md` has the commands): a Go update that changes
+  a module in the binary needs `third_party/go/THIRD_PARTY_NOTICES.txt`
+  regenerated with `mise run third-party-notices`, and a Victoria update needs
+  the version and LICENSE links in `third_party/victoria/SOURCES.txt` moved to
+  the new tag, otherwise `license-check` fails; the `ent` PR needs `entc.sum`
+  filled in by hand, because Renovate cannot update it; a mise tools update
+  has to be copied to the same tools pinned again in `scripts/ci-setup-mise.sh`
+  and in the `mise x go uv@…` step of `ci.yml`, which Renovate does not
+  change; and the diff of the first pin PR and the first GitHub Actions PR
+  should be checked by hand.
+- `internal/db/ent`, the generated Ent client, is now tracked in git (it used
+  to be ignored and generated by every mise task, #128). Renovate clones the
+  repository without generated code, so `go get` for the root module could not
+  resolve the Ent packages. For contributors: after changing
+  `internal/db/schema`, run `mise run ent-generate` and commit the regenerated
+  `internal/db/ent` together with the schema; do not edit the tree by hand.
+  To run `mise run ent-generate-check` locally before committing, stage the
+  tree first (`git add internal/db/ent`), since it compares against the index.
+  `mise run build`, `test`, `vet`, `lint`, `license-check`, and the other
+  tasks no longer regenerate it, and the Air development build no longer does
+  either, so a schema change is not picked up until you regenerate. The files
+  are marked `linguist-generated`, so GitHub collapses them in PR diffs, and
+  `mise run ent-generate-check`, which CI runs, now fails when the tracked
+  tree differs from what the schema generates (edited, missing, extra, or
+  ignored files, or a schema change without regeneration) instead of
+  requiring that the directory stays untracked.
+- The gate scripts that embedded Python (`scripts/check-release-smoke.sh`,
+  `scripts/check-embedded-artifact.sh`, and `scripts/e2e-multi-replica.sh`)
+  no longer use the system `python3`. They install and use a uv-managed
+  CPython (`scripts/lib/uv-python.sh`), `3.13` unless
+  `LO_SCRIPTS_PYTHON_VERSION` selects another. A missing `uv` or a failed
+  install fails the gate rather than skipping it, and the release smoke's
+  `PYTHON` override is gone. Run them through their mise tasks
+  (`dist-cross`, `e2e-ha`, `perf-ha`, `gate-release-artifacts`), which provide
+  uv (#125, #127).
+- The SDK journey examples listen on fixed ports between the gateway range and
+  the platform components instead of in the Linux ephemeral range
+  (32768–60999), where `vite preview` occasionally found its port taken: Go
+  16320 and 16330, Node 16420, 16421, and 16430, Python 16620, and the browser
+  examples in 16520–16550. The `LO_E2E_*_PORT` variables still override them,
+  and the browser journey's `vite` and `vite preview` now run with
+  `--strictPort`, so a busy port fails instead of silently moving. The
+  browser journey and the `sdk-browser` and `sdk-browser-smoke` tasks install
+  and build `@lazy-observe/bundler-plugin` before the full `pnpm install`,
+  which removes the `Failed to create bin … lazy-observe-sourcemaps` warning
+  (#124).
+- Public preview wording reaches the GitHub Release page: for `v0.x` tags
+  GoReleaser puts the same preview notice as the README, the deployment guide,
+  and the Unreleased section at the top of the release body (`release.header`,
+  not rendered from v1.0.0), because that body is generated from `git log` and
+  never contains this file. The documentation now separates "released" (a tag
+  with artifacts) from "supported" (an upgrade path, with the database
+  baseline frozen and append-only migrations), and the first supported
+  release is not v0.1.0 (#126).
 - Made release archives consume the canonical root `LICENSE` file.
 - Made PostgreSQL the correctness boundary for multi-replica alert membership,
   per-rule leases/fencing, durable state, and notification Outbox work; Redis
@@ -555,8 +639,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - CI runs `govulncheck` (`mise run vulncheck`, covering the server module and
   `sdk/go`) as a required gate, pins BuildKit to a multi-architecture digest,
   scans the pre-release image with Trivy before the archive and image release,
-  rejects unpinned workflow references, and keeps Dependabot on every
-  dependency manifest (#11).
+  rejects unpinned workflow references, and kept Dependabot on every
+  dependency manifest (#11; Dependabot has since been replaced by Renovate,
+  #130).
 - Pull requests that touch server Go code now run the multi-replica HA
   functional gate (`mise run e2e-ha`); web, Helm, non-Go SDK, and documentation
   changes do not open it, and the performance gates stay out of PR CI (#2).
@@ -694,7 +779,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pin `unknown`, not outdated, when the release page cannot show that the
   latest release is old enough, and `--latest-eligible` still exits 2 (#86).
   The release-time storage-binary scan no longer calls `--latest-eligible`
-  (ADR 0016, #117).
+  (ADR 0016, #117), and #130 later deleted the gate, its weekly report, and
+  `--latest-eligible` altogether when Renovate took over (ADR 0015).
 - `lazyobserve.Client.shutdown(timeout)` in the Python SDK no longer returns a
   spurious `... has no attribute 'shutdown'` error for a signal that is not
   enabled (or on a degraded client). Its steps (error transport, profiling,
@@ -727,6 +813,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is logged. Until now these drops were only logged, so with metrics enabled a
   Python client shows new `signal="error"` series and a larger
   `dropped_telemetry` than before (#108).
+- Once the Python SDK's `shutdown` budget has run out, the delivery queue for
+  error events and profile uploads starts no new request. Before, a batch the
+  sender thread already held still went out with its first attempt, and a
+  retry went out when the cancel landed just as its delay ended, both after
+  the budget was spent. That batch is now dropped; for error events it is
+  counted like the events still queued, in the `Diagnostics().dropped_telemetry`
+  total and as `reason="shutdown_budget"` of
+  `lazy_observe_sdk_dropped_telemetry`. A request already
+  in flight is not interrupted. Deliveries inside the budget, retries, and
+  `retry_exhausted` are unchanged (#123).
+- `@lazy-observe/bundler-plugin`'s Vite plugin no longer aborts a build with a
+  raw `Command failed: git rev-parse --short=7 HEAD` when it cannot infer the
+  release from Git, for example in a Docker build that excludes `.git`, and no
+  `release` option is set. Without a DSN (or with `upload: false`, or under
+  `vite dev`) the build now continues, nothing is uploaded, and
+  `__LAZY_OBSERVE_RELEASE__` is defined as `undefined`, so events carry no
+  release; declare it as `string | undefined`. With a DSN
+  and no `release` that Git cannot supply, `vite build` fails before bundling
+  with `unable to infer release from git; set release explicitly`, so pass
+  `release` (for example `release: process.env.RELEASE`). The CLI already
+  skipped without a DSN; with a DSN and no release it now exits 1 with the
+  same message (#122).
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
