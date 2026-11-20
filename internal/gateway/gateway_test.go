@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -715,5 +716,93 @@ func TestLegacyPoCLogsQueryRouteIsNotRegistered(t *testing.T) {
 	}
 	if called {
 		t.Fatal("legacy Logs route reached the upstream backend")
+	}
+}
+
+func TestMemberRequiredUsesExplicitRoleWhitelist(t *testing.T) {
+	gw := newTestGateway(Config{})
+	app := fiber.New()
+	app.Get("/protected", func(c fiber.Ctx) error {
+		if role := c.Get("X-Test-Role"); role != "" {
+			c.Locals(userLocal, meta.UserInfo{ID: 1, Username: "u", Role: role})
+		}
+		return c.Next()
+	}, gw.memberRequired, func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	for _, tc := range []struct {
+		name string
+		role string
+		want int
+	}{
+		{"admin allowed", "admin", http.StatusNoContent},
+		{"member allowed", "member", http.StatusNoContent},
+		{"viewer forbidden", "viewer", http.StatusForbidden},
+		{"empty role forbidden", "", http.StatusForbidden},
+		{"unknown role forbidden", "auditor", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+			if tc.role != "" {
+				req.Header.Set("X-Test-Role", tc.role)
+			}
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("role=%q status=%d want=%d", tc.role, resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+func TestMissingOrDeletedProjectReturns404WithProjectNotFoundCode(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if _, err := store.CreateProject(ctx, "Default", "default"); err != nil {
+		t.Fatal(err)
+	}
+	doomed, err := store.CreateProject(ctx, "Doomed", "doomed-proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteProject(ctx, doomed.ID); err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "proj-404-admin", "password", "admin")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store,
+		Metrics: upstream.URL, Logs: upstream.URL, Traces: upstream.URL,
+	}).App()
+
+	for _, slug := range []string{"nonexistent-project", "doomed-proj"} {
+		for _, path := range []string{"/api/issues", "/api/hosts", "/api/v1/query?query=up", "/api/v1/logs/query?query=*"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("X-LO-Project", slug)
+			req.AddCookie(admin)
+			resp, testErr := app.Test(req)
+			if testErr != nil {
+				t.Fatal(testErr)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("slug=%q path=%s status=%d want=404 body=%s", slug, path, resp.StatusCode, body)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("slug=%q path=%s invalid JSON: %v body=%s", slug, path, err, body)
+			}
+			if decoded["code"] != "project_not_found" {
+				t.Fatalf("slug=%q path=%s code=%v want=project_not_found body=%s", slug, path, decoded["code"], body)
+			}
+		}
 	}
 }

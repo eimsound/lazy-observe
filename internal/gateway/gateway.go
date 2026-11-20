@@ -759,7 +759,7 @@ func (g *Gateway) registerSessionAPI() {
 	api.Delete("/alert-rules/:id", g.memberRequired, g.deleteAlertRule)
 	api.Get("/notifications", g.loadSessionProject, g.memberRequired, g.listNotifications)
 	api.Post("/notifications/:id/retry", g.loadSessionProject, g.memberRequired, g.requeueNotification)
-	api.Get("/channels", g.adminRequired, g.listChannels)
+	api.Get("/channels", g.memberRequired, g.listChannels)
 	api.Post("/channels", g.adminRequired, g.createChannel)
 	api.Patch("/channels/:id", g.adminRequired, g.updateChannel)
 	api.Put("/channels/:id", g.adminRequired, g.updateChannel)
@@ -913,7 +913,10 @@ func (g *Gateway) resolveRequestProject(c fiber.Ctx) error {
 	p, err := g.store.ProjectBySlug(c.Context(), slug)
 	if err != nil {
 		if meta.IsNotFound(err) {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "project not found"})
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"code":  "project_not_found",
+				"error": "project not found",
+			})
 		}
 		g.logger.Warn("project lookup failed", "project_slug", slug, "error", err)
 		return c.Status(fiber.StatusServiceUnavailable).
@@ -1187,10 +1190,13 @@ func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error
 			hasFormMatch = len(form["match[]"]) > 0
 		}
 		body = []byte(form.Encode())
-	} else if opts.metricsProject != "" && c.Method() == http.MethodPost && len(body) > 0 && mediaType != "" {
+	} else if opts.metricsProject != "" &&
+		(mediaType == "multipart/form-data" ||
+			((c.Method() == http.MethodPost || c.Method() == http.MethodPut || c.Method() == http.MethodPatch) &&
+				len(body) > 0 && mediaType != fiber.MIMEApplicationForm)) {
 		return fiber.NewError(
 			fiber.StatusUnsupportedMediaType,
-			"metrics POST requests must use application/x-www-form-urlencoded",
+			"metrics requests with a body must use application/x-www-form-urlencoded",
 		)
 	}
 	if opts.metricsProject != "" {
@@ -1551,7 +1557,7 @@ func (g *Gateway) adminRequired(c fiber.Ctx) error {
 
 func (g *Gateway) memberRequired(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	if u.Role == "viewer" {
+	if u.Role != "admin" && u.Role != "member" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 	return c.Next()

@@ -277,3 +277,119 @@ func TestOTLPMetricsIngestEnforcesTrustedProjectExtraLabel(t *testing.T) {
 		t.Fatalf("extra_label=%v want [project_id=alpha]", values)
 	}
 }
+
+func TestMetricsProxyRejectsMultipartAndNormalizesFormContentType(t *testing.T) {
+	for _, mode := range []storage.MetricsKind{storage.MetricsVM, storage.MetricsPrometheus} {
+		t.Run(string(mode), func(t *testing.T) {
+			var upstreamHits atomic.Int32
+			type capturedReq struct {
+				query url.Values
+				form  url.Values
+			}
+			captured := make(chan capturedReq, 4)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHits.Add(1)
+				raw, _ := io.ReadAll(r.Body)
+				form, _ := url.ParseQuery(string(raw))
+				captured <- capturedReq{query: r.URL.Query(), form: form}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"success","data":{"resultType":"vector","result":[]}}`)
+			}))
+			defer upstream.Close()
+			backend, err := storage.New(mode, upstream.URL, upstream.URL, upstream.URL, upstream.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := newTestGateway(Config{
+				Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 7, Slug: "alpha"}},
+				Storage: backend,
+			}).App()
+
+			// 1. Mixed-case application/x-www-form-urlencoded must strip reserved params and isolate PromQL.
+			formBody := url.Values{
+				"query":           {"up"},
+				"extra_filters[]": {`{project_id="victim"}`},
+				"extra_label":     {"project_id=victim"},
+			}.Encode()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(formBody))
+			req.Header.Set("Authorization", "Bearer lou_valid")
+			req.Header.Set("Content-Type", "Application/X-WWW-Form-URLENCODED; charset=UTF-8")
+			resp, err := app.Test(req)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				t.Fatalf("mixed-case form status=%d err=%v", resp.StatusCode, err)
+			}
+			resp.Body.Close()
+			got := <-captured
+			if got.form.Has("extra_filters[]") || got.form.Has("extra_label") {
+				t.Fatalf("reserved form params leaked: %v", got.form)
+			}
+			if mode == storage.MetricsPrometheus {
+				if !strings.Contains(got.form.Get("query"), `project_id="alpha"`) {
+					t.Fatalf("prometheus form query missing isolation: %q", got.form.Get("query"))
+				}
+			} else {
+				if got.query.Get("extra_filters[]") != `{project_id="alpha"}` {
+					t.Fatalf("vm query missing trusted extra_filters[]: %v", got.query)
+				}
+			}
+
+			// 2. multipart/form-data (any case, even empty or non-POST) and body without form Content-Type must be rejected with 415.
+			hitsBefore := upstreamHits.Load()
+			multipartBody := "--boundary\r\nContent-Disposition: form-data; name=\"query\"\r\n\r\nup\r\n--boundary--\r\n"
+			for _, tc := range []struct {
+				name        string
+				method      string
+				contentType string
+				body        string
+			}{
+				{
+					"multipart post",
+					http.MethodPost,
+					"multipart/form-data; boundary=boundary",
+					multipartBody,
+				},
+				{
+					"mixed-case multipart post",
+					http.MethodPost,
+					"Multipart/Form-Data; boundary=boundary",
+					multipartBody,
+				},
+				{
+					"empty multipart post",
+					http.MethodPost,
+					"multipart/form-data; boundary=boundary",
+					"",
+				},
+				{
+					"post body without content-type",
+					http.MethodPost,
+					"",
+					"query=up",
+				},
+				{
+					"put body with multipart",
+					http.MethodPut,
+					"multipart/form-data; boundary=boundary",
+					multipartBody,
+				},
+			} {
+				badReq := httptest.NewRequest(tc.method, "/api/v1/query", strings.NewReader(tc.body))
+				badReq.Header.Set("Authorization", "Bearer lou_valid")
+				if tc.contentType != "" {
+					badReq.Header.Set("Content-Type", tc.contentType)
+				}
+				badResp, badErr := app.Test(badReq)
+				if badErr != nil {
+					t.Fatalf("%s: %v", tc.name, badErr)
+				}
+				badResp.Body.Close()
+				if badResp.StatusCode != http.StatusUnsupportedMediaType {
+					t.Fatalf("%s: status=%d want=415", tc.name, badResp.StatusCode)
+				}
+			}
+			if upstreamHits.Load() != hitsBefore {
+				t.Fatalf("rejected metrics requests reached upstream %d times", upstreamHits.Load()-hitsBefore)
+			}
+		})
+	}
+}

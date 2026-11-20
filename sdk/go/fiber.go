@@ -171,12 +171,12 @@ func fiberRequestURL(c fiber.Ctx) string {
 }
 
 func requestScheme(c fiber.Ctx) string {
-	// Fiber v3 Protocol() is the HTTP version ("HTTP/1.1"); Scheme() is http or https.
-	if c.Scheme() == "https" {
-		return "https"
-	}
-	if forwarded := c.Get(fiber.HeaderXForwardedProto); forwarded != "" {
-		return strings.Clone(forwarded)
+	// Fiber v3 Protocol() is the HTTP version ("HTTP/1.1"); Scheme() returns
+	// "https" for TLS connections and honors forwarded scheme headers only when
+	// the app explicitly trusts the peer via fiber.Config{TrustProxy: true,
+	// TrustProxyConfig: ...}.
+	if scheme := c.Scheme(); scheme != "" {
+		return strings.Clone(scheme)
 	}
 	return "http"
 }

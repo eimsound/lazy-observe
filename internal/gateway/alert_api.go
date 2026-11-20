@@ -101,6 +101,16 @@ type notificationChannelResponse struct {
 	UpdatedAt string         `json:"updated_at"`
 }
 
+// notificationChannelSummaryResponse is the minimal read-only projection exposed
+// to non-admin members who need to bind alert rules or project alert configs to
+// existing channels without seeing any channel config, URLs, hosts, or secrets.
+type notificationChannelSummaryResponse struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+}
+
 type silenceResponse struct {
 	ID        string          `json:"id"`
 	Matchers  []alert.Matcher `json:"matchers"`
@@ -204,6 +214,21 @@ func toNotificationChannelResponses(values []meta.NotificationChannelView) []not
 	out := make([]notificationChannelResponse, 0, len(values))
 	for _, value := range values {
 		out = append(out, toNotificationChannelResponse(value))
+	}
+	return out
+}
+
+func toNotificationChannelSummaryResponses(
+	values []meta.NotificationChannelView,
+) []notificationChannelSummaryResponse {
+	out := make([]notificationChannelSummaryResponse, 0, len(values))
+	for _, value := range values {
+		out = append(out, notificationChannelSummaryResponse{
+			ID:      strconv.Itoa(value.ID),
+			Type:    value.Type,
+			Name:    value.Name,
+			Enabled: value.Enabled,
+		})
 	}
 	return out
 }
@@ -372,6 +397,10 @@ func (g *Gateway) listChannels(c fiber.Ctx) error {
 	v, e := g.alerts.ListChannels(c.Context())
 	if e != nil {
 		return apiError(c, e)
+	}
+	u, _ := c.Locals(userLocal).(meta.UserInfo)
+	if u.Role != "admin" {
+		return c.JSON(toNotificationChannelSummaryResponses(v))
 	}
 	return c.JSON(toNotificationChannelResponses(v))
 }

@@ -673,7 +673,7 @@ func TestErrorTrackingLifecycleRawEventsIsolationAndVitals(t *testing.T) {
 	storage.mu.Lock()
 	samples := storage.metricSamples
 	storage.mu.Unlock()
-	if !strings.Contains(samples, `web_vitals_lcp{project_id="default",page="/checkout?x=1"} 123.4`) {
+	if !strings.Contains(samples, `web_vitals_lcp{project_id="default",page="/checkout"} 123.4`) {
 		t.Fatalf("samples=%q", samples)
 	}
 }
@@ -994,6 +994,98 @@ func TestVitalsIngestIsCaseInsensitive(t *testing.T) {
 	if strings.Count(samples, "web_vitals_fcp{") != 2 {
 		t.Fatalf("samples=%q", samples)
 	}
+}
+
+func TestVitalsIngestBatchLimitPageNormalizationAndTimestampBounds(t *testing.T) {
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	t.Run("rejects batch exceeding max size with 400", func(t *testing.T) {
+		setup := newMetricIngestGateway(t, "vitals-batch-limit")
+		vitals := make([]any, 0, 101)
+		for i := range 101 {
+			vitals = append(vitals, vitalPayload("LCP", float64(i), "/checkout", at))
+		}
+		status, payload := setup.postVitals(t, vitals)
+		if status != http.StatusBadRequest {
+			t.Fatalf("oversized batch status=%d want=400 body=%s", status, payload)
+		}
+		if setup.importCount() != 0 {
+			t.Fatalf("oversized batch reached upstream %d times", setup.importCount())
+		}
+	})
+
+	t.Run("normalizes page strips query hash control chars dynamic segments and bounds length", func(t *testing.T) {
+		setup := newMetricIngestGateway(t, "vitals-page-norm")
+		longPath := "/products/" + strings.Repeat("a", 300)
+		status, payload := setup.postVitals(t, []any{
+			vitalPayload("LCP", 100, "/checkout?session=abc#payment", at),
+			vitalPayload("FCP", 110, "https://shop.example.com/orders/987654321?utm=1#top", at),
+			vitalPayload("INP", 120, "/users/550e8400-e29b-41d4-a716-446655440000/profile", at),
+			vitalPayload("CLS", 0.1, "/items/0123456789abcdef0123456789abcdef/detail", at),
+			vitalPayload("TTFB", 80, "/dash\x00\x1fboard//overview/", at),
+			vitalPayload("LCP", 200, longPath, at),
+		})
+		if status != http.StatusOK {
+			t.Fatalf("status=%d body=%s", status, payload)
+		}
+		samples := setup.samples()
+		for _, want := range []string{
+			`web_vitals_lcp{project_id="vitals-page-norm",page="/checkout"} 100`,
+			`web_vitals_fcp{project_id="vitals-page-norm",page="/orders/:id"} 110`,
+			`web_vitals_inp{project_id="vitals-page-norm",page="/users/:id/profile"} 120`,
+			`web_vitals_cls{project_id="vitals-page-norm",page="/items/:id/detail"} 0.1`,
+			`web_vitals_ttfb{project_id="vitals-page-norm",page="/dashboard/overview"} 80`,
+		} {
+			if !strings.Contains(samples, want) {
+				t.Fatalf("samples missing %q:\n%s", want, samples)
+			}
+		}
+		if strings.Contains(samples, "session=abc") || strings.Contains(samples, "payment") ||
+			strings.Contains(samples, "987654321") || strings.Contains(samples, "550e8400") ||
+			strings.Contains(samples, strings.Repeat("a", 260)) {
+			t.Fatalf("unnormalized/high-cardinality page leaked into samples:\n%s", samples)
+		}
+	})
+
+	t.Run("rejects excessive distinct pages in one batch with 400", func(t *testing.T) {
+		setup := newMetricIngestGateway(t, "vitals-distinct-pages")
+		vitals := make([]any, 0, 40)
+		for i := range 40 {
+			vitals = append(vitals, vitalPayload("LCP", 10, fmt.Sprintf("/route-%c-%c", 'a'+(i/26), 'a'+(i%26)), at))
+		}
+		status, payload := setup.postVitals(t, vitals)
+		if status != http.StatusBadRequest {
+			t.Fatalf("high-cardinality batch status=%d want=400 body=%s", status, payload)
+		}
+		if setup.importCount() != 0 {
+			t.Fatalf("high-cardinality batch reached upstream")
+		}
+	})
+
+	t.Run("rejects invalid and out-of-range metric timestamps", func(t *testing.T) {
+		badTimestamps := []any{
+			0,
+			-1,
+			-1700000000,
+			1e30,
+			9999999999999999999.0,
+			"1969-12-31T23:59:59Z",
+			"0001-01-01T00:00:00Z",
+			"9999-01-01T00:00:00Z",
+		}
+		for _, ts := range badTimestamps {
+			setup := newMetricIngestGateway(t, "vitals-bad-ts")
+			status, payload := setup.postVitals(t, []any{
+				map[string]any{"name": "LCP", "value": 100, "page": "/home", "timestamp": ts},
+			})
+			if status != http.StatusUnprocessableEntity {
+				t.Fatalf("timestamp %#v status=%d want=422 body=%s", ts, status, payload)
+			}
+			if setup.importCount() != 0 {
+				t.Fatalf("invalid timestamp %#v reached upstream", ts)
+			}
+		}
+	})
 }
 
 func diagnosticPayload(signal, reason string, dropped int, at time.Time) map[string]any {
@@ -2147,6 +2239,18 @@ func TestSourceMapUploadRejectsInvalidV3StripsSourcesContentAndPreservesPaths(t 
 }
 
 func TestPrometheusLabelEscapingAvoidsNonStandardGoEscapes(t *testing.T) {
+	// Directly guard formatPromLabelValue against Go-only strconv.Quote escapes (\t, \r, \u....).
+	formatted := formatPromLabelValue("/页\t面\"a\\b\nc\r")
+	if strings.Contains(formatted, `\t`) || strings.Contains(formatted, `\r`) || strings.Contains(formatted, `\u`) {
+		t.Fatalf("formatPromLabelValue produced non-standard Prometheus escape: %q", formatted)
+	}
+	wantFormatted := `"/页` + "\t" + `面\"a\\b\nc"`
+	if formatted != wantFormatted {
+		t.Fatalf("formatPromLabelValue=%q want=%q", formatted, wantFormatted)
+	}
+
+	// End-to-end via vitalsIngest: control characters are stripped during page normalization,
+	// while quotes, backslashes, and UTF-8 survive with standard Prometheus escaping.
 	setup := newMetricIngestGateway(t, "prom-escape")
 	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
 
@@ -2160,7 +2264,7 @@ func TestPrometheusLabelEscapingAvoidsNonStandardGoEscapes(t *testing.T) {
 	if strings.Contains(samples, `\t`) || strings.Contains(samples, `\r`) || strings.Contains(samples, `\u`) {
 		t.Fatalf("non-standard Prometheus escape written: %q", samples)
 	}
-	want := `page="/页` + "\t" + `面\"a\\b\nc"`
+	want := `page="/页面\"a\\bc"`
 	if !strings.Contains(samples, want) {
 		t.Fatalf("samples=%q want substring=%q", samples, want)
 	}

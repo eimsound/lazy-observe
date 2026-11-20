@@ -41,11 +41,15 @@ type fiberAliasingRequest struct {
 }
 
 func fiberAliasingProbe(round int) fiberAliasingRequest {
+	scheme := "http"
+	if round%2 == 1 {
+		scheme = "https"
+	}
 	return fiberAliasingRequest{
 		method:     fiberAliasingMethods[round%len(fiberAliasingMethods)],
 		path:       fmt.Sprintf("/probe/%06d", round),
 		host:       fmt.Sprintf("h%06d.example", round),
-		scheme:     fmt.Sprintf("s%06d", round),
+		scheme:     scheme,
 		traceState: fmt.Sprintf("probe=r%06d", round),
 	}
 }
@@ -78,9 +82,8 @@ func TestFiberTelemetryDoesNotBorrowRequestBuffers(t *testing.T) {
 	wantCounts := map[string]int64{}
 	for round := range fiberAliasingRounds {
 		probe := fiberAliasingProbe(round)
-		req := httptest.NewRequest(probe.method, probe.path, nil)
+		req := httptest.NewRequest(probe.method, probe.scheme+"://"+probe.host+probe.path, nil)
 		req.Host = probe.host
-		req.Header.Set(fiber.HeaderXForwardedProto, probe.scheme)
 		req.Header.Set("traceparent", fmt.Sprintf("00-%032x-%016x-01", round+1, round+1))
 		req.Header.Set("tracestate", probe.traceState)
 		resp, err := app.Test(req, fiber.TestConfig{Timeout: 0})
@@ -169,21 +172,26 @@ func spanStringAttrs(attrs []attribute.KeyValue) map[string]string {
 }
 
 // Fiber v3 moved the scheme to Ctx.Scheme; Ctx.Protocol is now the HTTP version
-// ("HTTP/1.1"). Comparing Protocol against "https" compiles but is never true,
-// so a TLS request would be reported as http.
+// ("HTTP/1.1"). Forwarded scheme headers must only be honored when Fiber trusts
+// the peer via TrustProxy / TrustProxyConfig.
 func TestFiberReportsTLSRequestsAsHTTPS(t *testing.T) {
-	exporter := tracetest.NewInMemoryExporter()
-	traceProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
-	t.Cleanup(func() { _ = traceProvider.Shutdown(context.Background()) })
-	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
-	t.Cleanup(func() { _ = meterProvider.Shutdown(context.Background()) })
-	client := &Client{
-		cfg:        Config{ServiceName: "fiber-scheme"},
-		meter:      meterProvider,
-		tracer:     traceProvider,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		propagator: propagation.TraceContext{},
+	newClient := func() (*Client, *tracetest.InMemoryExporter) {
+		exporter := tracetest.NewInMemoryExporter()
+		traceProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+		t.Cleanup(func() { _ = traceProvider.Shutdown(context.Background()) })
+		meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
+		t.Cleanup(func() { _ = meterProvider.Shutdown(context.Background()) })
+		return &Client{
+			cfg:        Config{ServiceName: "fiber-scheme"},
+			meter:      meterProvider,
+			tracer:     traceProvider,
+			logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+			propagator: propagation.TraceContext{},
+		}, exporter
 	}
+
+	// Default Fiber app (TrustProxy=false): ignore spoofed X-Forwarded-Proto.
+	client, exporter := newClient()
 	app := fiber.New()
 	app.Use(client.Fiber())
 	app.Get("/probe", func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
@@ -191,7 +199,8 @@ func TestFiberReportsTLSRequestsAsHTTPS(t *testing.T) {
 	for _, tt := range []struct{ target, forwarded, want string }{
 		{"https://secure.example/probe", "", "https"},
 		{"http://plain.example/probe", "", "http"},
-		{"http://plain.example/probe", "https", "https"},
+		{"http://plain.example/probe", "https", "http"},
+		{"http://plain.example/probe", "evil-scheme", "http"},
 	} {
 		req := httptest.NewRequest(http.MethodGet, tt.target, nil)
 		if tt.forwarded != "" {
@@ -205,13 +214,68 @@ func TestFiberReportsTLSRequestsAsHTTPS(t *testing.T) {
 	}
 
 	spans := exporter.GetSpans()
-	if len(spans) != 3 {
-		t.Fatalf("spans=%d want 3", len(spans))
+	if len(spans) != 4 {
+		t.Fatalf("untrusted spans=%d want 4", len(spans))
 	}
-	for i, want := range []string{"https", "http", "https"} {
+	for i, want := range []string{"https", "http", "http", "http"} {
 		if got := spanStringAttrs(spans[i].Attributes)["url.scheme"]; got != want {
-			t.Errorf("request %d: url.scheme=%q want %q", i, got, want)
+			t.Errorf("untrusted request %d: url.scheme=%q want %q", i, got, want)
 		}
+	}
+
+	// Trusted proxy config matching the peer honors valid X-Forwarded-Proto.
+	trustedClient, trustedExporter := newClient()
+	trustedApp := fiber.New(fiber.Config{
+		TrustProxy: true,
+		TrustProxyConfig: fiber.TrustProxyConfig{
+			Proxies: []string{"0.0.0.0/0"},
+		},
+	})
+	trustedApp.Use(trustedClient.Fiber())
+	trustedApp.Get("/probe", func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
+
+	for _, tt := range []struct{ forwarded, want string }{
+		{"https", "https"},
+		{"http", "http"},
+		{"evil-scheme", "http"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://plain.example/probe", nil)
+		req.Header.Set(fiber.HeaderXForwardedProto, tt.forwarded)
+		resp, err := trustedApp.Test(req, fiber.TestConfig{Timeout: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	trustedSpans := trustedExporter.GetSpans()
+	if len(trustedSpans) != 3 {
+		t.Fatalf("trusted spans=%d want 3", len(trustedSpans))
+	}
+	for i, want := range []string{"https", "http", "http"} {
+		if got := spanStringAttrs(trustedSpans[i].Attributes)["url.scheme"]; got != want {
+			t.Errorf("trusted request %d: url.scheme=%q want %q", i, got, want)
+		}
+	}
+
+	// TrustProxy=true with a proxy list that does NOT match the peer ignores X-Forwarded-Proto.
+	mismatchClient, mismatchExporter := newClient()
+	mismatchApp := fiber.New(fiber.Config{
+		TrustProxy: true,
+		TrustProxyConfig: fiber.TrustProxyConfig{
+			Proxies: []string{"10.20.30.40"},
+		},
+	})
+	mismatchApp.Use(mismatchClient.Fiber())
+	mismatchApp.Get("/probe", func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
+	req := httptest.NewRequest(http.MethodGet, "http://plain.example/probe", nil)
+	req.Header.Set(fiber.HeaderXForwardedProto, "https")
+	resp, err := mismatchApp.Test(req, fiber.TestConfig{Timeout: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got := spanStringAttrs(mismatchExporter.GetSpans()[0].Attributes)["url.scheme"]; got != "http" {
+		t.Errorf("mismatched proxy url.scheme=%q want http", got)
 	}
 }
 

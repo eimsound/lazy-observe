@@ -642,7 +642,13 @@ func (g *Gateway) getUser(c fiber.Ctx) error {
 }
 
 func (g *Gateway) createUser(c fiber.Ctx) error {
-	var body struct{ Username, Password, Role, DisplayName, Email string }
+	var body struct {
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		Role        string `json:"role"`
+		DisplayName string `json:"display_name"`
+		Email       string `json:"email"`
+	}
 	if c.Bind().Body(&body) != nil {
 		g.auditManagementFacts(c, management.AuditFacts{
 			Action: "user.create", TargetType: "user", Success: false, FailureReason: "invalid_request",

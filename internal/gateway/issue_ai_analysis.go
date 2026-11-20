@@ -1152,6 +1152,10 @@ func (g *Gateway) issueAIEvents(
 }
 
 func (g *Gateway) issueAITrace(ctx context.Context, project meta.ProjectInfo, traceID string) string {
+	traceID = strings.TrimSpace(traceID)
+	if !validateTraceID(traceID) {
+		return "Trace lookup skipped: invalid trace_id."
+	}
 	body, err := g.isolatedQuery(ctx, project, "traces", "/select/jaeger/api/traces/"+url.PathEscape(traceID), nil)
 	if err != nil {
 		return "Trace lookup unavailable."
