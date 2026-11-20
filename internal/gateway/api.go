@@ -482,7 +482,7 @@ func (g *Gateway) deleteProject(c fiber.Ctx) error {
 		}
 	}
 	if g.scrapes != nil {
-		if syncErr := g.scrapes.Sync(c.Context()); syncErr != nil {
+		if syncErr := g.scrapes.NotifyProjectDeleted(c.Context()); syncErr != nil {
 			g.logger.Warn("sync scrape config after project deletion failed", "project_id", id, "error", syncErr)
 		}
 	}

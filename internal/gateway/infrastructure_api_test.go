@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,8 +16,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	alertpkg "github.com/eimsound/lazy-observe/internal/alert"
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/scrape"
+	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 )
 
 func TestScrapeTargetViewerForbidden(t *testing.T) {
@@ -296,5 +300,213 @@ func TestScrapeTargetHealthUsesTimestampAndLatestSeries(t *testing.T) {
 			"health=%+v want status=up last_scrape_at=2023-11-14T22:21:40Z (from timestamp() of latest series)",
 			body,
 		)
+	}
+}
+
+func TestHostsAndScrapeHealthDualModeMetricsBackendParityAndSanitizedErrors(t *testing.T) {
+	for _, mode := range []storagepkg.MetricsKind{storagepkg.MetricsVM, storagepkg.MetricsPrometheus} {
+		t.Run(string(mode), func(t *testing.T) {
+			store := testStore(t)
+			if _, err := store.CreateProject(context.Background(), "Alpha", "alpha"); err != nil {
+				t.Fatal(err)
+			}
+			admin := sessionCookie(t, store, "dual-admin", "password", "admin")
+			service := scrape.NewService(scrape.Config{
+				Store:      store,
+				ConfigPath: filepath.Join(t.TempDir(), "scrape.yml"),
+			})
+			created, err := service.Create(context.Background(), "alpha", scrape.Input{
+				Name: "node-a", URL: "http://exporter.example.com:9100/metrics", Interval: "15s",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var seenQueries atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenQueries.Add(1)
+				q := r.URL.Query()
+				expr := q.Get("query")
+				if mode == storagepkg.MetricsPrometheus {
+					if q.Has("extra_filters[]") {
+						t.Errorf("prometheus mode sent extra_filters[]: %v", q)
+					}
+					if !strings.Contains(expr, `project_id="alpha"`) {
+						t.Errorf("prometheus mode missing project_id injection: %q", expr)
+					}
+				} else if got := q.Get("extra_filters[]"); got != `{project_id="alpha"}` {
+					t.Errorf("vm mode extra_filters[]=%q want {project_id=\"alpha\"}", got)
+				}
+				result := `[]`
+				switch {
+				case strings.HasPrefix(expr, "timestamp("):
+					result = `[{"metric":{"instance":"node-a:9100"},"value":[1700000999,"1700000500"]}]`
+				case strings.Contains(expr, "node_uname_info"):
+					result = `[{"metric":{"instance":"node-a:9100","nodename":"prod-node-1"},"value":[1700000500,"1"]}]`
+				case strings.Contains(expr, "node_cpu_seconds_total"):
+					result = `[{"metric":{"instance":"node-a:9100"},"value":[1700000500,"8"]}]`
+				case strings.Contains(expr, "node_load1"):
+					result = `[{"metric":{"instance":"node-a:9100"},"value":[1700000500,"1.5"]}]`
+				case strings.Contains(expr, "node_memory_MemTotal_bytes"):
+					result = `[{"metric":{"instance":"node-a:9100"},"value":[1700000500,"62.5"]}]`
+				case strings.Contains(expr, "node_filesystem_size_bytes"):
+					result = `[{"metric":{"instance":"node-a:9100"},"value":[1700000500,"40"]}]`
+				case strings.Contains(expr, "up{"):
+					result = `[{"metric":{"instance":"node-a:9100"},"value":[1700000500,"1"]}]`
+				}
+				fmt.Fprintf(w, `{"status":"success","data":{"resultType":"vector","result":%s}}`, result)
+			}))
+			defer upstream.Close()
+
+			backend, err := storagepkg.New(
+				mode,
+				upstream.URL,
+				upstream.URL,
+				upstream.URL,
+				upstream.URL,
+				upstream.Client(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := newMetadataTestGateway(store, Config{
+				Tokens:  store,
+				Store:   store,
+				Scrapes: service,
+				Storage: backend,
+				Client:  upstream.Client(),
+			}).App()
+
+			hostsReq := httptest.NewRequest(http.MethodGet, "/api/hosts", nil)
+			hostsReq.Header.Set("X-LO-Project", "alpha")
+			hostsReq.AddCookie(admin)
+			hostsResp, err := app.Test(hostsReq)
+			if err != nil || hostsResp.StatusCode != http.StatusOK {
+				t.Fatalf("hosts(%s) status=%d err=%v", mode, hostsResp.StatusCode, err)
+			}
+			var hosts []hostDTO
+			if err := json.NewDecoder(hostsResp.Body).Decode(&hosts); err != nil {
+				t.Fatal(err)
+			}
+			hostsResp.Body.Close()
+			if len(hosts) != 1 || hosts[0].Hostname != "prod-node-1" ||
+				hosts[0].Up == nil || !*hosts[0].Up ||
+				hosts[0].CPUCores == nil || *hosts[0].CPUCores != 8 ||
+				hosts[0].Load1 == nil || *hosts[0].Load1 != 1.5 ||
+				hosts[0].MemoryUsedPercent == nil || *hosts[0].MemoryUsedPercent != 62.5 ||
+				hosts[0].DiskUsedPercentMax == nil || *hosts[0].DiskUsedPercentMax != 40 {
+				t.Fatalf("hosts(%s)=%+v", mode, hosts)
+			}
+
+			healthReq := httptest.NewRequest(
+				http.MethodGet,
+				fmt.Sprintf("/api/scrape-targets/%d/health", created.ID),
+				nil,
+			)
+			healthReq.Header.Set("X-LO-Project", "alpha")
+			healthReq.AddCookie(admin)
+			healthResp, err := app.Test(healthReq)
+			if err != nil || healthResp.StatusCode != http.StatusOK {
+				t.Fatalf("health(%s) status=%d err=%v", mode, healthResp.StatusCode, err)
+			}
+			var health struct {
+				Status       string `json:"status"`
+				LastScrapeAt string `json:"last_scrape_at"`
+			}
+			if err := json.NewDecoder(healthResp.Body).Decode(&health); err != nil {
+				t.Fatal(err)
+			}
+			healthResp.Body.Close()
+			if health.Status != "up" || health.LastScrapeAt != "2023-11-14T22:21:40Z" {
+				t.Fatalf("health(%s)=%+v", mode, health)
+			}
+			if seenQueries.Load() != 8 {
+				t.Fatalf("expected 6 hosts + 2 health queries, got %d", seenQueries.Load())
+			}
+		})
+	}
+
+	// Upstream failure must return 502 without leaking internal host/port/URL.
+	t.Run("sanitizes upstream address on error", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		closedAddr := ln.Addr().String()
+		_ = ln.Close()
+
+		store := testStore(t)
+		if _, err := store.CreateProject(context.Background(), "Default", "default"); err != nil {
+			t.Fatal(err)
+		}
+		admin := sessionCookie(t, store, "err-admin", "password", "admin")
+		app := newMetadataTestGateway(store, Config{
+			Tokens:  store,
+			Store:   store,
+			Metrics: "http://" + closedAddr,
+		}).App()
+
+		req := httptest.NewRequest(http.MethodGet, "/api/hosts", nil)
+		req.AddCookie(admin)
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status=%d want=502 body=%s", resp.StatusCode, raw)
+		}
+		for _, forbidden := range []string{closedAddr, "127.0.0.1", "http://", "connection refused"} {
+			if strings.Contains(string(raw), forbidden) {
+				t.Fatalf("hosts error leaked %q: %s", forbidden, raw)
+			}
+		}
+	})
+}
+
+func TestProjectScopedAlertAndMetricsRoutesRequireResolvedProject(t *testing.T) {
+	store := testStore(t)
+	if _, err := store.CreateProject(context.Background(), "Default", "default"); err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "ctx-admin", "password", "admin")
+	alerts := alertpkg.NewService(alertpkg.Config{Store: store})
+	t.Cleanup(alerts.Close)
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store,
+		Store:  store,
+		Alerts: alerts,
+	}).App()
+
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/alert-rules"},
+		{http.MethodPost, "/api/alert-rules"},
+		{http.MethodGet, "/api/silences"},
+		{http.MethodPost, "/api/silences"},
+		{http.MethodGet, "/api/inhibition-rules"},
+		{http.MethodPost, "/api/inhibition-rules"},
+		{http.MethodGet, "/api/alerts"},
+		{http.MethodGet, "/api/v1/alerts"},
+		{http.MethodGet, "/api/v1/hosts"},
+		{http.MethodGet, "/api/v1/performance/endpoints"},
+	}
+	for _, rt := range routes {
+		req := httptest.NewRequest(rt.method, rt.path, nil)
+		req.Header.Set("X-LO-Project", "nonexistent-project")
+		req.AddCookie(admin)
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", rt.method, rt.path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(body), "project_not_found") {
+			t.Fatalf("%s %s unknown project status=%d body=%s want 404 project_not_found",
+				rt.method, rt.path, resp.StatusCode, body)
+		}
 	}
 }
