@@ -152,3 +152,125 @@ func TestAuditRecordingListingAndCleanup(t *testing.T) {
 		}
 	})
 }
+
+func TestArgon2ConcurrencyLimiterRejectsWhenSaturated(t *testing.T) {
+	argonLimiterMu.Lock()
+	prev := defaultArgonLimiter
+	custom := &argonLimiter{
+		sem:     make(chan struct{}, 1),
+		timeout: 30 * time.Millisecond,
+	}
+	defaultArgonLimiter = custom
+	argonLimiterMu.Unlock()
+	t.Cleanup(func() {
+		argonLimiterMu.Lock()
+		defaultArgonLimiter = prev
+		argonLimiterMu.Unlock()
+	})
+
+	hash, err := HashPassword("correct-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Occupy the single verification slot.
+	custom.sem <- struct{}{}
+	defer func() { <-custom.sem }()
+
+	if _, err := VerifyPasswordContext(
+		context.Background(),
+		hash,
+		"correct-password",
+	); !IsPasswordVerificationBusy(
+		err,
+	) {
+		t.Fatalf("VerifyPasswordContext err = %v, want ErrPasswordVerificationBusy", err)
+	}
+	if _, err := HashPasswordContext(context.Background(), "another-password"); !IsPasswordVerificationBusy(err) {
+		t.Fatalf("HashPasswordContext err = %v, want ErrPasswordVerificationBusy", err)
+	}
+}
+
+func TestAuthenticateCredentialsPropagatesStoreError(t *testing.T) {
+	store, err := OpenStore(context.Background(), t.TempDir()+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateUser(context.Background(), "alice", "password-123", "member"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AuthenticateCredentials(context.Background(), "alice", "password-123")
+	if err == nil {
+		t.Fatal("expected error from closed store")
+	}
+	if IsInvalidCredentials(err) {
+		t.Fatalf("closed store error was misclassified as invalid credentials: %v", err)
+	}
+}
+
+func TestLastAdminProtectionAndSessionRevocationInStore(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		firstAdmin, err := store.CreateUser(ctx, "admin-one", "password-123", "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if err := store.CreateAccountSession(ctx, AccountSession{
+			Token: "lss_admin-one-session", UserID: firstAdmin.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Demoting or deleting the sole admin must be rejected.
+		if _, err := store.UpdateManagedUser(ctx, ManagedUserUpdate{
+			ID: firstAdmin.ID, Role: "member",
+		}); !IsLastAdminProtected(err) {
+			t.Fatalf("demoting sole admin err = %v, want ErrLastAdminProtected", err)
+		}
+		if err := store.DeleteUser(ctx, firstAdmin.ID); !IsLastAdminProtected(err) {
+			t.Fatalf("deleting sole admin err = %v, want ErrLastAdminProtected", err)
+		}
+		// Rejected demotion must not revoke the admin's session.
+		if _, err := store.AuthenticateAccountSession(ctx, "lss_admin-one-session", now); err != nil {
+			t.Fatalf("rejected demotion revoked session: %v", err)
+		}
+
+		// Adding a second admin allows demoting the first and revokes its sessions.
+		secondAdmin, err := store.CreateUser(ctx, "admin-two", "password-123", "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpdateManagedUser(ctx, ManagedUserUpdate{
+			ID: firstAdmin.ID, Role: "member",
+		}); err != nil {
+			t.Fatalf("demote first admin with second present: %v", err)
+		}
+		if _, err := store.AuthenticateAccountSession(ctx, "lss_admin-one-session", now); !IsNotFound(err) {
+			t.Fatalf("demoted admin session still active: err=%v", err)
+		}
+
+		// Password reset via UpdateManagedUser revokes persisted sessions.
+		if err := store.CreateAccountSession(ctx, AccountSession{
+			Token: "lss_member-session", UserID: firstAdmin.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpdateManagedUser(ctx, ManagedUserUpdate{
+			ID: firstAdmin.ID, Password: "new-password-456",
+		}); err != nil {
+			t.Fatalf("reset member password: %v", err)
+		}
+		if _, err := store.AuthenticateAccountSession(ctx, "lss_member-session", now); !IsNotFound(err) {
+			t.Fatalf("session survived admin password reset: err=%v", err)
+		}
+
+		// The remaining sole admin is still protected from deletion.
+		if err := store.DeleteUser(ctx, secondAdmin.ID); !IsLastAdminProtected(err) {
+			t.Fatalf("deleting remaining sole admin err = %v, want ErrLastAdminProtected", err)
+		}
+	})
+}
