@@ -10,8 +10,10 @@ set -euo pipefail
 #     二进制被投毒，见 GHSA-69fq-xp46-6x23）。
 #   - 由 Renovate 升级（.github/renovate.json），靠 7 天最小发布年龄和下面的 sha256 校验；`gh release verify` 要调 API，
 #     会被 aquasecurity 的 IP allow list 拦住，不进 CI。改了本文件的 PR 会跑 trivy-pin job（直接执行本脚本）。
-#   - sha256 行行尾的 `# <tag>` 是 Renovate 的 github-release-attachments 用来同步 digest 的标记，
-#     人工升级要同时改 trivy_version、两个 sha256 和两处 `# <tag>`（tag 带 v 前缀，trivy_version 不带）。
+#   - Renovate 只改 trivy_version，不改 sha256：它取 sha 要走 GitHub REST API（github-release-attachments），
+#     同样被 allow list 拦住（403）。所以 Trivy 的升级 PR 由 agent 补两个 sha256，来源是 release 下载地址
+#     https://github.com/aquasecurity/trivy/releases/download/v<X>/trivy_<X>_checksums.txt（不走 API）；
+#     具体命令见 .agents/docs/plans/renovate.md 的审查清单。sha 行没有行尾注释，人工升级同样只改 trivy_version 和两个 sha256。
 #   - 只写仓库内的 .cache/trivy（可用 LO_TRIVY_DIR 覆盖），不装到 PATH 或宿主机全局位置。
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -20,11 +22,11 @@ trivy_version=0.76.2
 case "$(uname -m)" in
 x86_64 | amd64)
   asset=Linux-64bit
-  sha256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf # v0.76.2
+  sha256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
   ;;
 aarch64 | arm64)
   asset=Linux-ARM64
-  sha256=ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3 # v0.76.2
+  sha256=ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3
   ;;
 *)
   printf 'unsupported host architecture for the pinned Trivy: %s\n' "$(uname -m)" >&2
