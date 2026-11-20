@@ -588,7 +588,7 @@ type SilenceInput struct {
 	Matchers []Matcher `json:"matchers"`
 	StartsAt time.Time `json:"starts_at"`
 	EndsAt   time.Time `json:"ends_at"`
-	Comment  string    `json:"comment"`
+	Comment  *string   `json:"comment"`
 	Creator  string    `json:"creator"`
 }
 
@@ -602,12 +602,16 @@ func (s *Service) CreateSilence(ctx context.Context, in SilenceInput) (meta.Sile
 	if in.StartsAt.IsZero() || !in.EndsAt.After(in.StartsAt) {
 		return meta.SilenceView{}, fmt.Errorf("%w: silence ends_at must be after starts_at", ErrInvalidInput)
 	}
+	comment := ""
+	if in.Comment != nil {
+		comment = *in.Comment
+	}
 	return s.store.CreateSilence(ctx, meta.SilenceCreate{
 		ProjectSlug: in.Project,
 		Matchers:    matchersToMaps(in.Matchers),
 		StartsAt:    in.StartsAt,
 		EndsAt:      in.EndsAt,
-		Comment:     in.Comment,
+		Comment:     comment,
 		Creator:     in.Creator,
 	})
 }
@@ -644,8 +648,8 @@ func (s *Service) UpdateSilence(ctx context.Context, id int, in SilenceInput) (m
 	if !in.EndsAt.IsZero() {
 		update.EndsAt = &in.EndsAt
 	}
-	if in.Comment != "" {
-		update.Comment = &in.Comment
+	if in.Comment != nil {
+		update.Comment = in.Comment
 	}
 	return s.store.UpdateSilence(ctx, in.Project, id, update)
 }

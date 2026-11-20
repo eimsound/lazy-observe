@@ -220,10 +220,14 @@ func registerTraceTools(server *sdkmcp.Server, api *APIClient) {
 			Description: "Use after search_traces when one trace needs inspection. Returns a token-efficient chronological span tree with name, service, duration, parent/depth, and error status. At most 200 spans are returned and truncation is explicit.",
 		},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, in traceArgs) (*sdkmcp.CallToolResult, any, error) {
-			if strings.TrimSpace(in.TraceID) == "" {
+			traceID := strings.TrimSpace(in.TraceID)
+			if traceID == "" {
 				return nil, nil, fmt.Errorf("trace_id is required")
 			}
-			v, err := api.json(ctx, "/api/traces/"+url.PathEscape(in.TraceID), nil)
+			if !validTraceID(traceID) {
+				return nil, nil, fmt.Errorf("trace_id must be 1-32 hexadecimal characters")
+			}
+			v, err := api.json(ctx, "/api/traces/"+url.PathEscape(traceID), nil)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -231,6 +235,22 @@ func registerTraceTools(server *sdkmcp.Server, api *APIClient) {
 			return nil, out, err
 		},
 	)
+}
+
+func validTraceID(traceID string) bool {
+	if len(traceID) == 0 || len(traceID) > 32 {
+		return false
+	}
+	for i := 0; i < len(traceID); i++ {
+		ch := traceID[i]
+		isDigit := ch >= '0' && ch <= '9'
+		isLowerHex := ch >= 'a' && ch <= 'f'
+		isUpperHex := ch >= 'A' && ch <= 'F'
+		if !isDigit && !isLowerHex && !isUpperHex {
+			return false
+		}
+	}
+	return true
 }
 
 // registerIssueTools adds the grouped errors tools.

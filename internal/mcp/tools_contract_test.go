@@ -336,3 +336,45 @@ func TestFlamegraphSummaryRanksHotspotsAndCapsTopN(t *testing.T) {
 		t.Fatalf("summary=%q", got["summary"])
 	}
 }
+
+func TestGetTraceRejectsInvalidTraceID(t *testing.T) {
+	validID := "0123456789abcdef0123456789abcdef"
+	h := newToolHarness(t, map[string]func(*http.Request) (int, any){
+		"/api/traces/" + validID: func(*http.Request) (int, any) {
+			return http.StatusOK, map[string]any{
+				"data": []any{
+					map[string]any{
+						"traceID":   validID,
+						"processes": map[string]any{"p1": map[string]any{"serviceName": "api"}},
+						"spans": []any{
+							map[string]any{
+								"spanID": "s1", "operationName": "GET /", "processID": "p1",
+								"startTime": 1000, "duration": 50,
+							},
+						},
+					},
+				},
+			}
+		},
+	})
+	for _, bad := range []string{"", "   ", "services", "search", "../v1/issues", "trace-1", strings.Repeat("a", 33)} {
+		res, err := h.session.CallTool(context.Background(), &sdkmcp.CallToolParams{
+			Name:      "get_trace",
+			Arguments: map[string]any{"trace_id": bad},
+		})
+		if err == nil && (res == nil || !res.IsError) {
+			t.Fatalf("get_trace(%q) unexpectedly succeeded: %#v", bad, res)
+		}
+	}
+	h.mu.Lock()
+	reqs := len(h.requests)
+	h.mu.Unlock()
+	if reqs != 0 {
+		t.Fatalf("invalid trace_ids issued %d upstream requests", reqs)
+	}
+
+	got, _ := h.call("get_trace", map[string]any{"trace_id": validID})
+	if got["trace_id"] != validID {
+		t.Fatalf("valid get_trace returned %#v", got)
+	}
+}

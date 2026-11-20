@@ -108,3 +108,48 @@ func TestAdminUpdateUserRollsBackOnProfileConflict(t *testing.T) {
 		t.Fatalf("failed update changed user: %#v", updated)
 	}
 }
+
+func TestAdminCreateUserPersistsDisplayName(t *testing.T) {
+	store := testStore(t)
+	admin := sessionCookie(t, store, "display-name-admin", "password", "admin")
+	app := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Management: management.New(store)}).App()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/users",
+		strings.NewReader(
+			`{"username":"alice-ops","password":"password-123","role":"member","display_name":"Alice Ops","email":"alice@example.com"}`,
+		),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(admin)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create user status=%d want=201 body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"display_name":"Alice Ops"`) {
+		t.Fatalf("create user response missing display_name: %s", body)
+	}
+
+	users, err := store.ListUsers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, u := range users {
+		if u.Username == "alice-ops" {
+			found = true
+			if u.DisplayName != "Alice Ops" {
+				t.Fatalf("persisted display_name=%q want %q", u.DisplayName, "Alice Ops")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("created user alice-ops not found in store")
+	}
+}

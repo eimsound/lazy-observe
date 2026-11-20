@@ -175,6 +175,7 @@ func TestBoundedRequestDecodingRejectsCorruptAndUnsupportedEncodings(t *testing.
 		{"unknown encoding rejected on logs ingest", "/v1/logs", []string{"lz4"}, []byte("payload"), http.StatusUnsupportedMediaType},
 		{"multi-header unknown encoding rejected", "/v1/logs", []string{"gzip", "lz4"}, gzipBytes(t, []byte("{}")), http.StatusUnsupportedMediaType},
 		{"too many stacked layers rejected", "/v1/logs", []string{"gzip, gzip, gzip, gzip, gzip"}, gzipBytes(t, []byte("{}")), http.StatusUnsupportedMediaType},
+		{"multi-header stacked layers exceeding limit rejected", "/v1/logs", []string{"gzip", "gzip", "gzip", "gzip", "gzip"}, gzipBytes(t, []byte("{}")), http.StatusUnsupportedMediaType},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(test.body))

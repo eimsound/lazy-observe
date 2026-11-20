@@ -669,3 +669,200 @@ func TestAlertAPIValidationDeleteAndChannelPatchNormalization(t *testing.T) {
 		t.Fatalf("legacy smtp_host leaked after typeless PATCH: %#v", patchedCh.Config)
 	}
 }
+
+func TestChannelsRBACMemberReadOnlyRedactedList(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetSecretBox(box)
+	if _, err := store.CreateProject(ctx, "RBAC", "rbac"); err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "ch-rbac-admin", "password", "admin")
+	member := sessionCookie(t, store, "ch-rbac-member", "password", "member")
+	viewer := sessionCookie(t, store, "ch-rbac-viewer", "password", "viewer")
+
+	alerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
+	t.Cleanup(alerts.Close)
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts, Notifications: store})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	// Admin creates a webhook channel with a secret URL & signing secret.
+	resp, createdBody := requestJSON(t, gw, http.MethodPost, "/api/channels", admin, map[string]any{
+		"type":    "webhook",
+		"name":    "OnCall Webhook",
+		"enabled": true,
+		"config":  map[string]any{"url": "https://hooks.example.com/secret-path", "secret": "whsec_topsecret"},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("admin create channel status=%d body=%s", resp.StatusCode, createdBody)
+	}
+	var created notificationChannelResponse
+	if err := json.Unmarshal(createdBody, &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// Viewer is forbidden from listing channels.
+	resp, body := requestJSON(t, gw, http.MethodGet, "/api/channels", viewer, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("viewer GET /api/channels status=%d want=403 body=%s", resp.StatusCode, body)
+	}
+
+	// Member can read minimal redacted list (id/name/type/enabled only, zero config leakage).
+	resp, body = requestJSON(t, gw, http.MethodGet, "/api/channels", member, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("member GET /api/channels status=%d want=200 body=%s", resp.StatusCode, body)
+	}
+	for _, forbidden := range []string{"config", "hooks.example.com", "secret-path", "whsec_topsecret", "has_secret"} {
+		if bytes.Contains(body, []byte(forbidden)) {
+			t.Fatalf("member GET /api/channels leaked %q: %s", forbidden, body)
+		}
+	}
+	var memberList []map[string]any
+	if err := json.Unmarshal(body, &memberList); err != nil || len(memberList) != 1 {
+		t.Fatalf("member list decode err=%v body=%s", err, body)
+	}
+	item := memberList[0]
+	if len(item) != 4 || item["id"] != created.ID || item["name"] != "OnCall Webhook" ||
+		item["type"] != "webhook" || item["enabled"] != true {
+		t.Fatalf("member channel item=%#v want only id/name/type/enabled", item)
+	}
+
+	// Member cannot create, update, delete, or test channels.
+	for _, reqSpec := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodPost, "/api/channels", map[string]any{"type": "webhook", "name": "m", "config": map[string]any{"url": "https://example.com"}}},
+		{http.MethodPatch, "/api/channels/" + created.ID, map[string]any{"name": "hijack"}},
+		{http.MethodPut, "/api/channels/" + created.ID, map[string]any{"name": "hijack"}},
+		{http.MethodDelete, "/api/channels/" + created.ID, nil},
+		{http.MethodPost, "/api/channels/" + created.ID + "/test", nil},
+	} {
+		r, b := requestJSON(t, gw, reqSpec.method, reqSpec.path, member, reqSpec.body)
+		if r.StatusCode != http.StatusForbidden {
+			t.Fatalf("member %s %s status=%d want=403 body=%s", reqSpec.method, reqSpec.path, r.StatusCode, b)
+		}
+	}
+
+	// Admin still receives full redacted config view.
+	resp, body = requestJSON(t, gw, http.MethodGet, "/api/channels", admin, nil)
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"config"`)) ||
+		!bytes.Contains(body, []byte(`"secret":"[REDACTED]"`)) ||
+		bytes.Contains(body, []byte("whsec_topsecret")) {
+		t.Fatalf("admin GET /api/channels status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestUpdateSilenceAllowsClearingComment(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	if _, err := store.CreateProject(ctx, "SilenceProj", "silence-proj"); err != nil {
+		t.Fatal(err)
+	}
+	member := sessionCookie(t, store, "silence-member", "password", "member")
+	alerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
+	t.Cleanup(alerts.Close)
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts, Notifications: store})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	doReq := func(method, path string, payload any) (*http.Response, []byte) {
+		var reader io.Reader
+		if payload != nil {
+			raw, _ := json.Marshal(payload)
+			reader = bytes.NewReader(raw)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-LO-Project", "silence-proj")
+		req.AddCookie(member)
+		resp, err := gw.App().Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, body
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	resp, body := doReq(http.MethodPost, "/api/silences", map[string]any{
+		"matchers":  []map[string]string{{"name": "alertname", "op": "=", "value": "HighCPU"}},
+		"starts_at": now,
+		"ends_at":   now.Add(time.Hour),
+		"comment":   "planned maintenance",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create silence status=%d body=%s", resp.StatusCode, body)
+	}
+	var created silenceResponse
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Comment != "planned maintenance" {
+		t.Fatalf("created comment=%q", created.Comment)
+	}
+
+	// 1. Omitting comment on PATCH must preserve the existing comment.
+	resp, body = doReq(http.MethodPatch, "/api/silences/"+created.ID, map[string]any{
+		"ends_at": now.Add(2 * time.Hour),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch without comment status=%d body=%s", resp.StatusCode, body)
+	}
+	var kept silenceResponse
+	if err := json.Unmarshal(body, &kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept.Comment != "planned maintenance" {
+		t.Fatalf("omitted comment was not preserved: %q", kept.Comment)
+	}
+
+	// 2. Explicitly sending comment: "" on PATCH must clear the comment.
+	resp, body = doReq(http.MethodPatch, "/api/silences/"+created.ID, map[string]any{
+		"comment": "",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch clear comment status=%d body=%s", resp.StatusCode, body)
+	}
+	var cleared silenceResponse
+	if err := json.Unmarshal(body, &cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.Comment != "" {
+		t.Fatalf("PATCH explicit empty comment did not clear comment: %q", cleared.Comment)
+	}
+
+	// 3. Set comment back and clear via PUT as well.
+	resp, body = doReq(http.MethodPut, "/api/silences/"+created.ID, map[string]any{
+		"comment": "temp note",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put restore comment status=%d body=%s", resp.StatusCode, body)
+	}
+	resp, body = doReq(http.MethodPut, "/api/silences/"+created.ID, map[string]any{
+		"comment": "",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put clear comment status=%d body=%s", resp.StatusCode, body)
+	}
+	var putCleared silenceResponse
+	if err := json.Unmarshal(body, &putCleared); err != nil {
+		t.Fatal(err)
+	}
+	if putCleared.Comment != "" {
+		t.Fatalf("PUT explicit empty comment did not clear comment: %q", putCleared.Comment)
+	}
+}

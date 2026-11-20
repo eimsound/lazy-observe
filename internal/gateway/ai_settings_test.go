@@ -212,6 +212,38 @@ func TestAISettingsClearAPIKeyAndDecrypt(t *testing.T) {
 	}
 }
 
+func TestAISettingsRejectsConflictingAPIKeyAndClearFlag(t *testing.T) {
+	_, gw, store, admin, _, key := dynamicAITestApp(t)
+
+	resp, body := requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"enabled": true, "provider": "deepseek", "model": "deepseek-chat", "api_key": key,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial save status=%d body=%s", resp.StatusCode, body)
+	}
+	before, _, err := store.GetAISettings(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Supplying both a non-empty api_key and clear_api_key=true must be rejected with 400.
+	resp, body = requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"enabled":       false,
+		"api_key":       "sk-new-secret-key",
+		"clear_api_key": true,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("conflicting api_key + clear_api_key status=%d want=400 body=%s", resp.StatusCode, body)
+	}
+	after, _, err := store.GetAISettings(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.APIKeyCiphertext != before.APIKeyCiphertext || !after.Enabled {
+		t.Fatalf("conflicting request mutated stored settings: before=%#v after=%#v", before, after)
+	}
+}
+
 func TestAIManagerRestoresPersistedSettingsOnStartup(t *testing.T) {
 	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
 	if err != nil {

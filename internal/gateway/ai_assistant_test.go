@@ -292,8 +292,8 @@ func TestAssistantLogsE2EIsolation(t *testing.T) {
 			return
 		}
 		executionCalls++
-		if r.URL.Query().Get("limit") != "100" {
-			t.Errorf("limit=%q", r.URL.Query().Get("limit"))
+		if r.URL.Query().Get("limit") != "101" {
+			t.Errorf("limit=%q want 101", r.URL.Query().Get("limit"))
 		}
 		_, _ = io.WriteString(w, `{"service_name":"default","message":"only this tenant"}`+"\n")
 	}))
@@ -588,5 +588,82 @@ func TestAssistantPromptIsolationStatsBoundsAndTimeWindow(t *testing.T) {
 	resp, body = assistantRequest(t, app, cookie, "/api/ai/assistant/explain", string(longKeyStats))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("long stats key status=%d want 422 body=%s", resp.StatusCode, body)
+	}
+
+	// Oversized serialized stats payload (> 4096 bytes) must be rejected with 422.
+	oversizedBytesStats := make(map[string]float64, assistantMaxStatsKeys)
+	for i := range assistantMaxStatsKeys {
+		oversizedBytesStats[fmt.Sprintf("k%02d_%s", i, strings.Repeat("x", 58))] = 123456789.123456789
+	}
+	encodedOversizedBytes, _ := json.Marshal(map[string]any{
+		"signal": "metrics", "query": "up", "stats": oversizedBytesStats,
+	})
+	resp, body = assistantRequest(t, app, cookie, "/api/ai/assistant/explain", string(encodedOversizedBytes))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("oversized stats bytes status=%d want 422 body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestAssistantTimeOverflowStepClampingAndLogsTruncation(t *testing.T) {
+	// 1. parseAssistantTime must reject zero, negative, overflow, and out-of-range timestamps.
+	for _, bad := range []string{
+		"0",
+		"-100",
+		"1e20",
+		"1e300",
+		"0001-01-01T00:00:00Z",
+		"9999-01-01T00:00:00Z",
+	} {
+		if _, err := parseAssistantTime(bad); err == nil {
+			t.Fatalf("parseAssistantTime(%q) succeeded, want error", bad)
+		}
+	}
+
+	// 2. assistantStep clamps step to avoid 1s query amplification on bad/short windows.
+	if step := assistantStep("invalid", "invalid"); step == "1" {
+		t.Fatalf("assistantStep on invalid timestamps fell back to %q, want clamped safe step", step)
+	}
+	if step := assistantStep("2026-07-17T00:00:00Z", "2026-07-17T00:00:05Z"); step != "15" {
+		t.Fatalf("assistantStep on 5s window = %q, want 15", step)
+	}
+
+	// 3. Logs truncation uses limit+1 so exactly 100 rows is NOT truncated while 101 rows IS truncated to 100.
+	for _, tc := range []struct {
+		name          string
+		upstreamRows  int
+		wantCount     int
+		wantTruncated bool
+	}{
+		{"exact_limit_not_truncated", 100, 100, false},
+		{"over_limit_truncated", 101, 100, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("limit") != "101" {
+					t.Errorf("logs query limit=%q want 101", r.URL.Query().Get("limit"))
+				}
+				for i := range tc.upstreamRows {
+					_, _ = fmt.Fprintf(w, "{\"_time\":\"2026-07-17T10:00:00Z\",\"idx\":%d}\n", i)
+				}
+			}))
+			defer backend.Close()
+			g := newTestGateway(Config{Metrics: backend.URL, Logs: backend.URL})
+			res, err := g.executeAssistantQuery(
+				context.Background(),
+				meta.ProjectInfo{ID: 7, Slug: "alpha"},
+				assistantGenerated{Signal: "logs", Query: "*", Explanation: "logs"},
+				"2026-07-17T09:00:00Z",
+				"2026-07-17T10:00:00Z",
+			)
+			if err != nil {
+				t.Fatalf("executeAssistantQuery: %v", err)
+			}
+			m := res.(fiber.Map)
+			rows := m["rows"].([]any)
+			if len(rows) != tc.wantCount || m["count"] != tc.wantCount || m["truncated"] != tc.wantTruncated {
+				t.Fatalf("got len=%d count=%v truncated=%v want count=%d truncated=%v",
+					len(rows), m["count"], m["truncated"], tc.wantCount, tc.wantTruncated)
+			}
+		})
 	}
 }

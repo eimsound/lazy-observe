@@ -378,6 +378,12 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 		audit.FailureReason = "invalid_request"
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
+	if body.ClearAPIKey && body.APIKey != nil && strings.TrimSpace(*body.APIKey) != "" {
+		audit.FailureReason = "conflicting_api_key_params"
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "api_key and clear_api_key cannot both be set",
+		})
+	}
 	audit.ChangedFields = aiSettingsChangedFields(body)
 	actor := ""
 	if user, ok := c.Locals(userLocal).(meta.UserInfo); ok {

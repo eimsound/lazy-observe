@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -199,10 +200,10 @@ func (b *issueAIBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if wrote {
 			_, _ = io.WriteString(
 				w,
-				`{"timestamp":"2026-07-17T10:00:00Z","level":"warn","trace_id":"trace-ai","message":"db timeout near checkout"}`+"\n",
+				`{"timestamp":"2026-07-17T10:00:00Z","level":"warn","trace_id":"0123456789abcdef0123456789abcdef","message":"db timeout near checkout"}`+"\n",
 			)
 		}
-	case r.URL.Path == "/select/jaeger/api/traces/trace-ai":
+	case r.URL.Path == "/select/jaeger/api/traces/0123456789abcdef0123456789abcdef":
 		if r.Header.Get("AccountID") != "0" || r.Header.Get("ProjectID") == "" {
 			http.Error(w, "missing trace isolation", http.StatusBadRequest)
 			return
@@ -231,7 +232,7 @@ func (b *issueAIBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 		_ = json.NewEncoder(w).
-			Encode(map[string]any{"data": []any{map[string]any{"traceID": "trace-ai", "spans": spans}}})
+			Encode(map[string]any{"data": []any{map[string]any{"traceID": "0123456789abcdef0123456789abcdef", "spans": spans}}})
 	case r.URL.Path == "/api/v1/query_range":
 		if got := r.URL.Query().
 			Get("extra_filters[]"); got != `{project_id="default"}` ||
@@ -522,8 +523,16 @@ func TestIssueAIAnalysisE2ECacheStaleRefreshIsolationAndGuards(t *testing.T) {
 		}
 		resp.Body.Close()
 	}
-	postSignal("/v1/logs", token1, `{"trace_id":"trace-ai","level":"warn","message":"db timeout near checkout"}`)
-	postSignal("/v1/traces", token1, `{"trace_id":"trace-ai","spans":[{"name":"POST /checkout"}]}`)
+	postSignal(
+		"/v1/logs",
+		token1,
+		`{"trace_id":"0123456789abcdef0123456789abcdef","level":"warn","message":"db timeout near checkout"}`,
+	)
+	postSignal(
+		"/v1/traces",
+		token1,
+		`{"trace_id":"0123456789abcdef0123456789abcdef","spans":[{"name":"POST /checkout"}]}`,
+	)
 
 	event := func(id string, timestamp time.Time, typ string) map[string]any {
 		return map[string]any{
@@ -550,7 +559,7 @@ func TestIssueAIAnalysisE2ECacheStaleRefreshIsolationAndGuards(t *testing.T) {
 			},
 			"tags": map[string]string{"browser": "Chrome 126", "os": "Linux"},
 			"contexts": map[string]any{
-				"trace":   map[string]any{"trace_id": "trace-ai", "span_id": "db"},
+				"trace":   map[string]any{"trace_id": "0123456789abcdef0123456789abcdef", "span_id": "db"},
 				"browser": map[string]any{"name": "Chrome", "version": "126"},
 				"os":      map[string]any{"name": "Linux"},
 			},
@@ -1003,5 +1012,25 @@ func TestIssueAIConcurrentCoalescingManualTimeoutGracefulDrainAndPromptIsolation
 		if row.AIAnalysisAt == nil || row.AIAnalysis == nil {
 			t.Fatalf("queued issue %d dropped on graceful shutdown", ch.IssueID)
 		}
+	}
+}
+
+func TestIssueAITraceRejectsNonHexTraceID(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	gw := newTestGateway(Config{Traces: upstream.URL})
+	project := meta.ProjectInfo{ID: 7, Slug: "alpha"}
+	for _, bad := range []string{"", "services", "search", "../services", "trace-ai", strings.Repeat("a", 33)} {
+		got := gw.issueAITrace(context.Background(), project, bad)
+		if !strings.Contains(strings.ToLower(got), "invalid") {
+			t.Fatalf("issueAITrace(%q) = %q, want invalid trace_id skip message", bad, got)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("invalid trace_ids reached traces upstream %d times", hits.Load())
 	}
 }

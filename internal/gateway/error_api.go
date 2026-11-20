@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +30,15 @@ const (
 	// symbolicated_event as escaped JSON strings plus metadata, which can exceed
 	// 1 MiB after double-escaping and symbolication expansion.
 	maxVLogsErrorLineBytes = 4 << 20
+
+	maxVitalsBatchSize             = 100
+	maxVitalPageBytes              = 256
+	maxVitalsDistinctPagesPerBatch = 32
+)
+
+var (
+	minMetricTimestamp = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxMetricTimestamp = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 )
 
 type errorEnvelope struct {
@@ -116,6 +127,10 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 	if err := json.Unmarshal(requestBody(c), &body); err != nil || body.Vitals == nil {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid vitals batch"})
 	}
+	if len(body.Vitals) > maxVitalsBatchSize {
+		return c.Status(http.StatusBadRequest).
+			JSON(fiber.Map{"error": fmt.Sprintf("vitals batch exceeds %d items", maxVitalsBatchSize)})
+	}
 	project := currentProject(c)
 	var samples strings.Builder
 	// Unknown metric names are a forward-compatibility signal (a newer SDK knows a
@@ -124,9 +139,11 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 	// the whole batch, so nothing is written when any entry is malformed.
 	skippedNames := newUnknownEnumValues()
 	skipped := 0
+	distinctPages := make(map[string]struct{}, min(len(body.Vitals), maxVitalsDistinctPagesPerBatch))
 	for i, vital := range body.Vitals {
 		name := strings.ToLower(strings.TrimSpace(vital.Name))
-		if name == "" || vital.Page == "" {
+		page, pageOK := normalizeVitalPage(vital.Page)
+		if name == "" || !pageOK || math.IsNaN(vital.Value) || math.IsInf(vital.Value, 0) {
 			return c.Status(http.StatusUnprocessableEntity).
 				JSON(fiber.Map{"error": fmt.Sprintf("invalid vital at index %d", i)})
 		}
@@ -134,6 +151,15 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 		if err != nil {
 			return c.Status(http.StatusUnprocessableEntity).
 				JSON(fiber.Map{"error": fmt.Sprintf("invalid vital timestamp at index %d", i)})
+		}
+		if _, seen := distinctPages[page]; !seen {
+			if len(distinctPages) >= maxVitalsDistinctPagesPerBatch {
+				return c.Status(http.StatusBadRequest).
+					JSON(fiber.Map{
+						"error": fmt.Sprintf("vitals batch exceeds %d distinct pages", maxVitalsDistinctPagesPerBatch),
+					})
+			}
+			distinctPages[page] = struct{}{}
 		}
 		if !validVitalName(name) {
 			skippedNames.add(name)
@@ -145,7 +171,7 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 			"web_vitals_%s{project_id=%s,page=%s} %s %d\n",
 			name,
 			formatPromLabelValue(project.Slug),
-			formatPromLabelValue(vital.Page),
+			formatPromLabelValue(page),
 			strconv.FormatFloat(vital.Value, 'g', -1, 64),
 			timestamp.UnixMilli(),
 		)
@@ -408,19 +434,149 @@ func formatPromLabelValue(value string) string {
 	return b.String()
 }
 
+func normalizeVitalPage(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	if strings.Contains(trimmed, "://") {
+		if parsed, err := url.Parse(trimmed); err == nil && parsed.Host != "" {
+			trimmed = parsed.Path
+			if trimmed == "" {
+				trimmed = "/"
+			}
+		}
+	}
+	if cut := strings.IndexAny(trimmed, "?#"); cut >= 0 {
+		trimmed = trimmed[:cut]
+	}
+	trimmed = strings.ToValidUTF8(trimmed, "")
+	var cleaned strings.Builder
+	cleaned.Grow(min(len(trimmed), maxVitalPageBytes))
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if ch < 0x20 || ch == 0x7f {
+			continue
+		}
+		cleaned.WriteByte(ch)
+	}
+	normalized := strings.TrimSpace(cleaned.String())
+	if normalized == "" {
+		return "", false
+	}
+	if !strings.HasPrefix(normalized, "/") {
+		normalized = "/" + normalized
+	}
+	normalized = path.Clean(normalized)
+	if normalized != "/" {
+		segments := strings.Split(strings.TrimPrefix(normalized, "/"), "/")
+		for i, seg := range segments {
+			if isHighCardinalityVitalSegment(seg) {
+				segments[i] = ":id"
+			}
+		}
+		normalized = "/" + strings.Join(segments, "/")
+	}
+	if len(normalized) > maxVitalPageBytes {
+		cut := maxVitalPageBytes
+		for cut > 0 && !utf8.RuneStart(normalized[cut]) {
+			cut--
+		}
+		normalized = normalized[:cut]
+	}
+	if normalized == "" {
+		return "", false
+	}
+	return normalized, true
+}
+
+func isHighCardinalityVitalSegment(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	// Purely numeric IDs (e.g. /orders/987654321).
+	allDigits := true
+	for i := 0; i < len(seg); i++ {
+		if seg[i] < '0' || seg[i] > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return true
+	}
+	// Standard UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+	if len(seg) == 36 && seg[8] == '-' && seg[13] == '-' && seg[18] == '-' && seg[23] == '-' {
+		isUUID := true
+		for i := 0; i < len(seg); i++ {
+			if i == 8 || i == 13 || i == 18 || i == 23 {
+				continue
+			}
+			if !isHexByte(seg[i]) {
+				isUUID = false
+				break
+			}
+		}
+		if isUUID {
+			return true
+		}
+	}
+	// Long hexadecimal tokens/hashes (>= 16 hex chars).
+	if len(seg) >= 16 {
+		allHex := true
+		for i := 0; i < len(seg); i++ {
+			if !isHexByte(seg[i]) {
+				allHex = false
+				break
+			}
+		}
+		if allHex {
+			return true
+		}
+	}
+	return false
+}
+
+func isHexByte(ch byte) bool {
+	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+}
+
 func parseMetricTimestamp(raw json.RawMessage) (time.Time, error) {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
-		return time.Parse(time.RFC3339Nano, text)
+		parsed, err := time.Parse(time.RFC3339Nano, text)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if parsed.Before(minMetricTimestamp) || parsed.After(maxMetricTimestamp) {
+			return time.Time{}, errors.New("timestamp out of range")
+		}
+		return parsed.UTC(), nil
 	}
 	var value float64
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return time.Time{}, err
 	}
-	if value > 1e12 {
-		return time.UnixMilli(int64(value)), nil
+	if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+		return time.Time{}, errors.New("invalid numeric timestamp")
 	}
-	return time.Unix(0, int64(value*float64(time.Second))), nil
+	var parsed time.Time
+	if value >= 1e12 {
+		if value < float64(minMetricTimestamp.UnixMilli()) || value > float64(maxMetricTimestamp.UnixMilli()) {
+			return time.Time{}, errors.New("millisecond timestamp out of range")
+		}
+		parsed = time.UnixMilli(int64(value)).UTC()
+	} else {
+		if value < float64(minMetricTimestamp.Unix()) || value > float64(maxMetricTimestamp.Unix()) {
+			return time.Time{}, errors.New("second timestamp out of range")
+		}
+		sec, frac := math.Modf(value)
+		parsed = time.Unix(int64(sec), int64(frac*float64(time.Second))).UTC()
+	}
+	if parsed.Before(minMetricTimestamp) || parsed.After(maxMetricTimestamp) {
+		return time.Time{}, errors.New("timestamp out of range")
+	}
+	return parsed, nil
 }
 
 const issueTrendBuckets = 14

@@ -31,6 +31,8 @@ const (
 	assistantMaxQuery        = 8192
 	assistantMaxResponseBody = 8 << 20
 	assistantMaxTimeWindow   = 7 * 24 * time.Hour
+	assistantMinStepSeconds  = 15
+	assistantLogsLimit       = 100
 	assistantMaxStatsKeys    = 64
 	assistantMaxStatsKeyLen  = 64
 	assistantMaxStatsBytes   = 4096
@@ -444,22 +446,40 @@ func timeValue(raw json.RawMessage) (string, error) {
 }
 
 func parseAssistantTime(value string) (time.Time, error) {
-	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-		return parsed, nil
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		if parsed.Before(minMetricTimestamp) || parsed.After(maxMetricTimestamp) {
+			return time.Time{}, errors.New("timestamp out of range")
+		}
+		return parsed.UTC(), nil
 	}
 	seconds, err := strconv.ParseFloat(value, 64)
-	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
 		return time.Time{}, errors.New("invalid timestamp")
 	}
-	return time.Unix(int64(seconds), int64((seconds-float64(int64(seconds)))*1e9)), nil
+	if seconds < float64(minMetricTimestamp.Unix()) || seconds > float64(maxMetricTimestamp.Unix()) {
+		return time.Time{}, errors.New("timestamp out of range")
+	}
+	sec, frac := math.Modf(seconds)
+	parsed := time.Unix(int64(sec), int64(frac*1e9)).UTC()
+	if parsed.Before(minMetricTimestamp) || parsed.After(maxMetricTimestamp) {
+		return time.Time{}, errors.New("timestamp out of range")
+	}
+	return parsed, nil
 }
 
 func assistantStep(start, end string) string {
-	startTime, _ := parseAssistantTime(start)
-	endTime, _ := parseAssistantTime(end)
-	seconds := int(endTime.Sub(startTime).Seconds() / 240)
-	if seconds < 1 {
-		seconds = 1
+	startTime, startErr := parseAssistantTime(start)
+	endTime, endErr := parseAssistantTime(end)
+	if startErr != nil || endErr != nil || !endTime.After(startTime) {
+		return strconv.Itoa(assistantMinStepSeconds)
+	}
+	diff := endTime.Sub(startTime)
+	if diff > assistantMaxTimeWindow {
+		diff = assistantMaxTimeWindow
+	}
+	seconds := int(math.Ceil(diff.Seconds() / 240))
+	if seconds < assistantMinStepSeconds {
+		seconds = assistantMinStepSeconds
 	}
 	return strconv.Itoa(seconds)
 }
@@ -476,7 +496,7 @@ func (g *Gateway) executeAssistantQuery(
 		path = "/api/v1/query_range"
 		query.Set("step", assistantStep(start, end))
 	} else {
-		query.Set("limit", "100")
+		query.Set("limit", strconv.Itoa(assistantLogsLimit+1))
 	}
 	body, err := g.isolatedQuery(ctx, project, generated.Signal, path, query)
 	if err != nil {
@@ -502,7 +522,16 @@ func (g *Gateway) executeAssistantQuery(
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	return fiber.Map{"rows": rows, "count": len(rows), "limit": 100, "truncated": len(rows) == 100}, nil
+	truncated := len(rows) > assistantLogsLimit
+	if truncated {
+		rows = rows[:assistantLogsLimit]
+	}
+	return fiber.Map{
+		"rows":      rows,
+		"count":     len(rows),
+		"limit":     assistantLogsLimit,
+		"truncated": truncated,
+	}, nil
 }
 
 func (g *Gateway) isolatedMetricsStringList(
