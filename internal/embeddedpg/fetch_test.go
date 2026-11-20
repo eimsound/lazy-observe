@@ -1,73 +1,50 @@
 package embeddedpg
 
 import (
-	"archive/zip"
-	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
+	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
-
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 )
 
-const (
-	testVersion = "18.3.0"
-	testTxzName = "embedded-postgres-binaries-linux-amd64-18.3.0.txz"
-	testJarPath = "/io/zonky/test/postgres/embedded-postgres-binaries-linux-amd64/18.3.0/" +
-		"embedded-postgres-binaries-linux-amd64-18.3.0.jar"
-)
-
-// fakeMaven serves the jar and its .sha256 sibling. Each path answers with the statuses in
-// script first (one per request, in order) and with the real payload once the script runs out.
-type fakeMaven struct {
-	mu       sync.Mutex
-	script   map[string][]int
-	retry    map[string]string
-	requests map[string]int
-	jar      []byte
-	sha      string
+// scriptedServer answers each request with the next status in script and with 200 and body
+// once the script runs out. It records every request path.
+type scriptedServer struct {
+	mu     sync.Mutex
+	script []int
+	retry  string
+	paths  []string
+	body   string
 }
 
-func newFakeMaven(t *testing.T, txz []byte) (*fakeMaven, *httptest.Server) {
+func newScriptedServer(t *testing.T, script ...int) (*scriptedServer, *httptest.Server) {
 	t.Helper()
 
-	jar := zipWithEntries(t, map[string][]byte{"META-INF/MANIFEST.MF": []byte("x"), testTxzName: txz})
-	sum := sha256.Sum256(jar)
-	maven := &fakeMaven{
-		script:   map[string][]int{},
-		retry:    map[string]string{},
-		requests: map[string]int{},
-		jar:      jar,
-		sha:      hex.EncodeToString(sum[:]),
-	}
-	server := httptest.NewServer(maven)
+	scripted := &scriptedServer{script: script, body: "payload"}
+	server := httptest.NewServer(scripted)
 	t.Cleanup(server.Close)
 
-	return maven, server
+	return scripted, server
 }
 
-func (m *fakeMaven) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	m.mu.Lock()
-	m.requests[request.URL.Path]++
-	var status int
-	if queue := m.script[request.URL.Path]; len(queue) > 0 {
-		status = queue[0]
-		m.script[request.URL.Path] = queue[1:]
+func (s *scriptedServer) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	s.mu.Lock()
+	s.paths = append(s.paths, request.URL.Path)
+	status := http.StatusOK
+	if len(s.script) > 0 {
+		status, s.script = s.script[0], s.script[1:]
 	}
-	retryAfter := m.retry[request.URL.Path]
-	m.mu.Unlock()
+	retryAfter := s.retry
+	s.mu.Unlock()
 
-	if status != 0 && status != http.StatusOK {
+	if status != http.StatusOK {
 		if retryAfter != "" {
 			writer.Header().Set("Retry-After", retryAfter)
 		}
@@ -75,95 +52,70 @@ func (m *fakeMaven) ServeHTTP(writer http.ResponseWriter, request *http.Request)
 
 		return
 	}
-	switch request.URL.Path {
-	case testJarPath:
-		_, _ = writer.Write(m.jar)
-	case testJarPath + ".sha256":
-		_, _ = writer.Write([]byte(m.sha))
-	default:
-		writer.WriteHeader(http.StatusNotFound)
+	_, _ = io.WriteString(writer, s.body)
+}
+
+func (s *scriptedServer) requests() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]string(nil), s.paths...)
+}
+
+// sleepRecorder replaces the real wait: it records the delay and returns at once.
+type sleepRecorder struct{ delays []time.Duration }
+
+func (r *sleepRecorder) sleep(_ context.Context, delay time.Duration) error {
+	r.delays = append(r.delays, delay)
+
+	return nil
+}
+
+func testTransport(recorder *sleepRecorder) retryTransport {
+	return retryTransport{
+		next:     http.DefaultTransport,
+		attempts: 4,
+		backoff:  time.Second,
+		maxDelay: 30 * time.Second,
+		sleep:    recorder.sleep,
+		logf:     func(string, ...any) {},
 	}
 }
 
-func (m *fakeMaven) count(path string) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	return m.requests[path]
-}
-
-func zipWithEntries(t *testing.T, entries map[string][]byte) []byte {
+func get(t *testing.T, transport http.RoundTripper, url string) (*http.Response, error) {
 	t.Helper()
 
-	var buffer bytes.Buffer
-	writer := zip.NewWriter(&buffer)
-	for name, content := range entries {
-		entry, err := writer.Create(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := entry.Write(content); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := writer.Close(); err != nil {
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	return buffer.Bytes()
-}
-
-// sleepRecorder is a fake clock: sleep records the delay and advances now instead of waiting.
-type sleepRecorder struct {
-	delays  []time.Duration
-	elapsed time.Duration
-}
-
-func (r *sleepRecorder) sleep(delay time.Duration) {
-	r.delays = append(r.delays, delay)
-	r.elapsed += delay
-}
-
-func (r *sleepRecorder) now() time.Time { return time.Unix(0, 0).Add(r.elapsed) }
-
-func testFetcher(server *httptest.Server, recorder *sleepRecorder) fetcher {
-	return fetcher{
-		repository: server.URL,
-		client:     server.Client(),
-		attempts:   4,
-		backoff:    time.Second,
-		maxDelay:   30 * time.Second,
-		budget:     time.Hour,
-		now:        recorder.now,
-		sleep:      recorder.sleep,
-		logf:       func(string, ...any) {},
+	response, err := transport.RoundTrip(request)
+	if response != nil {
+		t.Cleanup(func() { _ = response.Body.Close() })
 	}
+
+	return response, err
 }
 
-func TestPrepareRetriesRateLimitAndWritesVerifiedArchive(t *testing.T) {
-	payload := []byte("fake-txz-payload")
-	maven, server := newFakeMaven(t, payload)
-	maven.script[testJarPath] = []int{http.StatusTooManyRequests, http.StatusTooManyRequests}
-	maven.script[testJarPath+".sha256"] = []int{http.StatusServiceUnavailable}
+func TestRetryTransportRetriesRateLimitWithBackoff(t *testing.T) {
+	scripted, server := newScriptedServer(
+		t,
+		http.StatusTooManyRequests,
+		http.StatusServiceUnavailable,
+		http.StatusBadGateway,
+	)
 	recorder := &sleepRecorder{}
-	cache := t.TempDir()
 
-	if err := testFetcher(server, recorder).prepare("linux", "amd64", testVersion, cache); err != nil {
-		t.Fatalf("prepare: %v", err)
+	response, err := get(t, testTransport(recorder), server.URL+"/a")
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("response = %v, %v; want 200", response, err)
 	}
 
-	got, err := os.ReadFile(filepath.Join(cache, testTxzName))
-	if err != nil || !bytes.Equal(got, payload) {
-		t.Fatalf("cached archive = %q, %v; want %q", got, err, payload)
+	if n := len(scripted.requests()); n != 4 {
+		t.Fatalf("requests = %d, want 4 (three failures then 200)", n)
 	}
-	if n := maven.count(testJarPath); n != 3 {
-		t.Fatalf("jar requests = %d, want 3 (two 429 then 200)", n)
-	}
-	if n := maven.count(testJarPath + ".sha256"); n != 2 {
-		t.Fatalf(".sha256 requests = %d, want 2 (one 503 then 200)", n)
-	}
-	// Exponential backoff per request: 1s, 2s for the jar, 1s for the checksum.
-	want := []time.Duration{time.Second, 2 * time.Second, time.Second}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
 	if len(recorder.delays) != len(want) {
 		t.Fatalf("delays = %v, want %v", recorder.delays, want)
 	}
@@ -172,237 +124,149 @@ func TestPrepareRetriesRateLimitAndWritesVerifiedArchive(t *testing.T) {
 			t.Fatalf("delays = %v, want %v", recorder.delays, want)
 		}
 	}
-	leftovers, _ := filepath.Glob(filepath.Join(cache, "temp_*"))
-	if len(leftovers) != 0 {
-		t.Fatalf("temporary files left behind: %v", leftovers)
+}
+
+func TestRetryTransportRecoversFromTransientForbiddenAndNotFound(t *testing.T) {
+	scripted, server := newScriptedServer(t, http.StatusForbidden, http.StatusNotFound, http.StatusRequestTimeout)
+
+	response, err := get(t, testTransport(&sleepRecorder{}), server.URL+"/a")
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("response = %v, %v; want 200", response, err)
+	}
+	if n := len(scripted.requests()); n != 4 {
+		t.Fatalf("requests = %d, want 4", n)
 	}
 }
 
-func TestPrepareFailsClosedWhenArchiveStaysMissing(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.script[testJarPath] = []int{404, 404, 404, 404, 404}
-	cache := t.TempDir()
+func TestRetryTransportReturnsLastStatusWhenAttemptsRunOut(t *testing.T) {
+	scripted, server := newScriptedServer(t, 404, 404, 404, 404, 404)
 
-	err := testFetcher(server, &sleepRecorder{}).prepare("linux", "amd64", testVersion, cache)
+	response, err := get(t, testTransport(&sleepRecorder{}), server.URL+"/a")
 
-	if err == nil || !strings.Contains(err.Error(), "404") {
-		t.Fatalf("prepare error = %v, want a 404 failure", err)
+	if err != nil || response.StatusCode != http.StatusNotFound {
+		t.Fatalf("response = %v, %v; want the final 404 so the caller can report it", response, err)
 	}
-	if n := maven.count(testJarPath); n != 4 {
-		t.Fatalf("jar requests = %d, want the 4 allowed attempts", n)
-	}
-	if _, statErr := os.Stat(filepath.Join(cache, testTxzName)); !os.IsNotExist(statErr) {
-		t.Fatalf("archive must not exist after a failed download, stat err = %v", statErr)
+	if n := len(scripted.requests()); n != 4 {
+		t.Fatalf("requests = %d, want the 4 allowed attempts", n)
 	}
 }
 
-func TestPrepareRecoversFromTransientNotFound(t *testing.T) {
-	// PR #69 saw one 404 for a jar that exists; the next request succeeded.
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.script[testJarPath] = []int{404}
-
-	if err := testFetcher(server, &sleepRecorder{}).prepare("linux", "amd64", testVersion, t.TempDir()); err != nil {
-		t.Fatalf("prepare: %v", err)
-	}
-}
-
-func TestPrepareDoesNotRetryPermanentClientErrors(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.script[testJarPath] = []int{http.StatusBadRequest}
+func TestRetryTransportDoesNotRetryPermanentClientErrors(t *testing.T) {
+	scripted, server := newScriptedServer(t, http.StatusBadRequest)
 	recorder := &sleepRecorder{}
 
-	err := testFetcher(server, recorder).prepare("linux", "amd64", testVersion, t.TempDir())
+	response, err := get(t, testTransport(recorder), server.URL+"/a")
 
-	if err == nil || !strings.Contains(err.Error(), "400") {
-		t.Fatalf("prepare error = %v, want a 400 failure", err)
+	if err != nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("response = %v, %v; want 400", response, err)
 	}
-	if n := maven.count(testJarPath); n != 1 || len(recorder.delays) != 0 {
-		t.Fatalf("jar requests = %d, sleeps = %v; want 1 request and no retry", n, recorder.delays)
-	}
-}
-
-func TestPrepareRejectsChecksumMismatch(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.sha = strings.Repeat("0", 64)
-	cache := t.TempDir()
-
-	err := testFetcher(server, &sleepRecorder{}).prepare("linux", "amd64", testVersion, cache)
-
-	if err == nil || !strings.Contains(err.Error(), "sha256") {
-		t.Fatalf("prepare error = %v, want a sha256 mismatch", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(cache, testTxzName)); !os.IsNotExist(statErr) {
-		t.Fatalf("archive must not be cached after a checksum mismatch, stat err = %v", statErr)
+	if n := len(scripted.requests()); n != 1 || len(recorder.delays) != 0 {
+		t.Fatalf("requests = %d, sleeps = %v; want one request and no retry", n, recorder.delays)
 	}
 }
 
-func TestPrepareFailsWhenChecksumUnavailable(t *testing.T) {
-	// embedded-postgres itself skips verification when the .sha256 request is not a 200;
-	// the prefetch must not.
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.script[testJarPath+".sha256"] = []int{429, 429, 429, 429}
-	cache := t.TempDir()
-
-	err := testFetcher(server, &sleepRecorder{}).prepare("linux", "amd64", testVersion, cache)
-
-	if err == nil || !strings.Contains(err.Error(), "429") {
-		t.Fatalf("prepare error = %v, want a 429 failure", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(cache, testTxzName)); !os.IsNotExist(statErr) {
-		t.Fatalf("unverified archive must not be cached, stat err = %v", statErr)
-	}
-}
-
-func TestPrepareHonorsRetryAfterWithinCap(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.script[testJarPath] = []int{429, 429}
-	maven.retry[testJarPath] = "7"
+func TestRetryTransportHonorsRetryAfterWithinCap(t *testing.T) {
+	scripted, server := newScriptedServer(t, 429, 429)
+	scripted.retry = "7"
 	recorder := &sleepRecorder{}
 
-	if err := testFetcher(server, recorder).prepare("linux", "amd64", testVersion, t.TempDir()); err != nil {
-		t.Fatalf("prepare: %v", err)
+	if _, err := get(t, testTransport(recorder), server.URL+"/a"); err != nil {
+		t.Fatal(err)
 	}
 	if len(recorder.delays) != 2 || recorder.delays[0] != 7*time.Second || recorder.delays[1] != 7*time.Second {
 		t.Fatalf("delays = %v, want Retry-After of 7s twice", recorder.delays)
 	}
 
-	maven.script[testJarPath] = []int{429}
-	maven.retry[testJarPath] = "3600"
+	scripted.mu.Lock()
+	scripted.script, scripted.retry = []int{429}, "3600"
+	scripted.mu.Unlock()
 	recorder = &sleepRecorder{}
-	if err := testFetcher(server, recorder).prepare("linux", "amd64", testVersion, t.TempDir()); err != nil {
-		t.Fatalf("prepare: %v", err)
+	if _, err := get(t, testTransport(recorder), server.URL+"/a"); err != nil {
+		t.Fatal(err)
 	}
 	if len(recorder.delays) != 1 || recorder.delays[0] != 30*time.Second {
 		t.Fatalf("delays = %v, want Retry-After capped at 30s", recorder.delays)
 	}
 }
 
-func TestPrepareStopsRetryingWhenBudgetIsSpent(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.script[testJarPath] = []int{429, 429, 429, 429}
-	maven.retry[testJarPath] = "30"
-	recorder := &sleepRecorder{}
-	fetcher := testFetcher(server, recorder)
-	fetcher.budget = 50 * time.Second
+type roundTripFunc func(*http.Request) (*http.Response, error)
 
-	err := fetcher.prepare("linux", "amd64", testVersion, t.TempDir())
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
-	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "budget") {
-		t.Fatalf("prepare error = %v, want a 429 failure that names the spent budget", err)
+func TestRetryTransportRetriesNetworkErrorsAndReturnsTheLastOne(t *testing.T) {
+	calls := 0
+	transport := testTransport(&sleepRecorder{})
+	transport.next = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+
+		return nil, errors.New("connection reset by peer")
+	})
+
+	_, err := get(t, transport, "http://example.invalid/a")
+
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("err = %v, want the last network error", err)
 	}
-	// 30s fits in the 50s budget; a second 30s wait would end past it.
-	if n := maven.count(testJarPath); n != 2 || len(recorder.delays) != 1 {
-		t.Fatalf("jar requests = %d, sleeps = %v; want 2 requests and one wait", n, recorder.delays)
-	}
-	if n := maven.count(testJarPath + ".sha256"); n != 0 {
-		t.Fatalf(".sha256 requests = %d, want none after the jar failed", n)
-	}
-}
-
-func TestPrepareDoesNotStartChecksumPastBudget(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
-	recorder := &sleepRecorder{}
-	fetcher := testFetcher(server, recorder)
-	fetcher.budget = time.Minute
-	// The jar request itself takes past the deadline (a slow download on the last attempt).
-	client := server.Client()
-	client.Transport = advanceClock{next: client.Transport, recorder: recorder, by: 2 * time.Minute}
-	fetcher.client = client
-
-	err := fetcher.prepare("linux", "amd64", testVersion, t.TempDir())
-
-	if err == nil || !strings.Contains(err.Error(), "budget") {
-		t.Fatalf("prepare error = %v, want the spent budget", err)
-	}
-	if n := maven.count(testJarPath + ".sha256"); n != 0 {
-		t.Fatalf(".sha256 requests = %d, want none once the budget is spent", n)
+	if calls != 4 {
+		t.Fatalf("calls = %d, want the 4 allowed attempts", calls)
 	}
 }
 
-// advanceClock moves the fake clock forward by the given duration on every request.
-type advanceClock struct {
-	next     http.RoundTripper
-	recorder *sleepRecorder
-	by       time.Duration
-}
+func TestRetryTransportStopsWaitingWhenContextIsDone(t *testing.T) {
+	_, server := newScriptedServer(t, 429, 429, 429)
+	transport := testTransport(&sleepRecorder{})
+	ctx, cancel := context.WithCancel(t.Context())
+	transport.sleep = func(ctx context.Context, _ time.Duration) error {
+		cancel()
 
-func (a advanceClock) RoundTrip(request *http.Request) (*http.Response, error) {
-	a.recorder.elapsed += a.by
-
-	return a.next.RoundTrip(request)
-}
-
-// TestPrepareTargetIsEmbeddedPostgresCacheHit pins Prepare's file name to the cache lookup of the
-// embedded-postgres version in go.mod on the platform running the test: with a file at the path
-// Prepare writes, Start must not touch the repository. A mismatch would let Start fall back to
-// its own single-attempt download that skips the checksum when the .sha256 is not a 200.
-func TestPrepareTargetIsEmbeddedPostgresCacheHit(t *testing.T) {
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		requests.Add(1)
-		writer.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(server.Close)
-
-	cache := t.TempDir()
-	operatingSystem, architecture := archivePlatform()
-	target := archivePath(cache, operatingSystem, architecture, embeddedpostgres.V18)
-	if err := os.WriteFile(target, []byte("not an xz archive"), 0o600); err != nil {
-		t.Fatal(err)
+		return ctx.Err()
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/a", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := uint32(listener.Addr().(*net.TCPAddr).Port)
-	_ = listener.Close()
-	root := t.TempDir()
 
-	database := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Port(port).
-		CachePath(cache).
-		RuntimePath(filepath.Join(root, "runtime")).
-		DataPath(filepath.Join(root, "data")).
-		BinaryRepositoryURL(server.URL).
-		Logger(io.Discard))
-	err = database.Start()
-	if err == nil {
-		_ = database.Stop()
-		t.Fatal("Start succeeded with a fake archive; want an extraction error")
-	}
+	_, err = transport.RoundTrip(request)
 
-	if n := requests.Load(); n != 0 {
-		t.Fatalf("Start made %d repository requests (%v); %s is not its cache hit", n, err, target)
-	}
-	if !strings.Contains(err.Error(), "extract") {
-		t.Fatalf("Start error = %v, want it to extract the cached %s", err, target)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("err = %v, want context.Canceled that names the last 429", err)
 	}
 }
 
-func TestPrepareSkipsNetworkWhenArchiveIsCached(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
+// TestPrepareFollowsTheLibraryAssetContract pins that prepare goes through the library's own
+// request (/VERSION/postgresql-VERSION-TARGET.tar.gz under BaseURL) with the retrying client,
+// and fails closed on a payload whose SHA-256 differs from the manifest pin instead of caching it.
+func TestPrepareFollowsTheLibraryAssetContract(t *testing.T) {
+	scripted, server := newScriptedServer(t, http.StatusTooManyRequests)
+	scripted.body = "not the pinned distribution"
 	cache := t.TempDir()
-	if err := os.WriteFile(filepath.Join(cache, testTxzName), []byte("cached"), 0o600); err != nil {
-		t.Fatal(err)
+	provider := newProvider(cache, testTransport(&sleepRecorder{}))
+	provider.BaseURL = server.URL
+
+	err := prepare(provider, Version)
+
+	if err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") {
+		t.Fatalf("prepare error = %v, want a SHA-256 mismatch (fail closed)", err)
+	}
+	requests := scripted.requests()
+	if len(requests) != 2 || requests[0] != requests[1] {
+		t.Fatalf("requests = %v, want the 429 retried once on the same path", requests)
+	}
+	version := string(Version)
+	name := path.Base(requests[0])
+	if path.Dir(requests[0]) != "/"+version ||
+		!strings.HasPrefix(name, "postgresql-"+version+"-") ||
+		!strings.HasSuffix(name, ".tar.gz") {
+		t.Fatalf("requested %s, want /%s/postgresql-%s-<target>.tar.gz", requests[0], version, version)
 	}
 
-	if err := testFetcher(server, &sleepRecorder{}).prepare("linux", "amd64", testVersion, cache); err != nil {
-		t.Fatalf("prepare: %v", err)
+	entries, readErr := os.ReadDir(cache)
+	if readErr != nil {
+		t.Fatal(readErr)
 	}
-	if n := maven.count(testJarPath) + maven.count(testJarPath+".sha256"); n != 0 {
-		t.Fatalf("requests = %d, want none on a cache hit", n)
-	}
-}
-
-func TestPrepareRejectsJarWithoutArchive(t *testing.T) {
-	maven, server := newFakeMaven(t, []byte("x"))
-	maven.jar = zipWithEntries(t, map[string][]byte{"META-INF/MANIFEST.MF": []byte("x")})
-	sum := sha256.Sum256(maven.jar)
-	maven.sha = hex.EncodeToString(sum[:])
-
-	err := testFetcher(server, &sleepRecorder{}).prepare("linux", "amd64", testVersion, t.TempDir())
-
-	if err == nil || !strings.Contains(err.Error(), ".txz") {
-		t.Fatalf("prepare error = %v, want a missing .txz failure", err)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "postgresql-") && !strings.HasSuffix(entry.Name(), ".lock") {
+			t.Fatalf("cache entry %s exists after a failed download", entry.Name())
+		}
 	}
 }

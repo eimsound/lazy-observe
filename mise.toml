@@ -464,10 +464,11 @@ bash scripts/check-js-licenses.sh web
 
 [tasks.test-meta-pg]
 description = "Run PostgreSQL metadata tests against the current baseline"
-# embedded-postgres 现场从 Maven Central 下载 Postgres 归档（18.3.0，约 15 MB），默认缓存路径
-# 保持稳定，避免每次运行都重新下载；CI 用 actions/cache 缓存同一目录。
+# embedded-postgres v2 从 GitHub（theseus-rs/postgresql-binaries）下载固定的 Postgres 18.6.1 发行包，
+# 放在缓存目录；默认路径保持稳定，避免每次运行都重新下载；CI 用 actions/cache 缓存同一目录。
 # 命中缓存时不会有任何下载，设置 LO_TEST_PG_CACHE 到别处即换一个缓存目录。
-# 未命中时由 internal/embeddedpg.Prepare 下载，带退避重试和强制 sha256 校验；重试用尽仍失败即测试失败。
+# 未命中时由 internal/embeddedpg 经带退避重试的 HTTP 客户端下载，sha256 由库内置清单固定并强制校验；
+# 重试用尽仍失败即测试失败。supervisor 不下载，由 go build 从 go.sum 固定的模块源码现编。
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail

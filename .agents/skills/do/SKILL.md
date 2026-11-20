@@ -106,8 +106,8 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 脚本测试与结构断言只守「判错会悄悄放行、且后果重」的规则：安全、供应链、发版放行。实现细节不写断言，报告类和辅助脚本不写测试；改错了 CI 自己会红的东西，不需要再加一道断言。
 
-`mise run test-meta-pg` 从外网 Maven Central 取 Postgres 归档（`LO_TEST_PG_CACHE`，默认 `$HOME/.cache/embedded-postgres`；命中缓存就不联网，CI 也用 actions/cache 缓存同一目录）。缓存未命中时由 `internal/embeddedpg.Prepare` 下载：对 403/404/408/429/5xx 和网络错误最多试 5 次（2/4/8/16 秒退避，遵守不超过 30 秒的 `Retry-After`；整次重试预算 5 分钟，加上单次请求超时最多 7 分钟，低于 `go test` 默认的 10 分钟），必须取到并校验 `.sha256`，仍失败就让测试失败并报出真实 HTTP 状态码，不会跳过。
-actions/cache 只是加速：仓库 cache 总量超过 10 GB 时这个 15 MB 的归档会被淘汰，所以 PR 上未命中是常态之一，不要把「命中缓存」当成前提。看到 `prepare embedded postgres archive: ... failed after 5 attempts` 或 `retry budget ... exhausted` 说明 Maven Central 持续不可用，重跑即可，不要为此跳过测试。
+`mise run test-meta-pg` 从外网取 Postgres：embedded-postgres v2 下载固定版本的发行包（GitHub，theseus-rs/postgresql-binaries；`LO_TEST_PG_CACHE`，默认 `$HOME/.cache/embedded-postgres`，解压后约 117 MB；命中缓存就不联网，CI 也用 actions/cache 缓存同一目录）。缓存未命中时由 `internal/embeddedpg.NewConfig` 经带重试的 HTTP 客户端下载：对 403/404/408/429/5xx 和网络错误每个请求最多试 5 次（2/4/8/16 秒退避，遵守不超过 30 秒的 `Retry-After`）；每次下载尝试限 2 分钟，库最多尝试 3 次，下载整体限 7 分钟，低于 `go test` 默认的 10 分钟。sha256 由库内置清单固定（清单随 go.sum 固定）并强制校验，不匹配即失败；仍失败就让测试失败并报出真实 HTTP 状态码，不会跳过。supervisor 不从库的 GitHub release 下载（那里只有同源 checksums.txt，防损坏不防篡改），由 `go build` 从 go.sum 固定的模块源码现编。
+actions/cache 只是加速：仓库 cache 总量超过 10 GB 时这个缓存会被淘汰，所以 PR 上未命中是常态之一，不要把「命中缓存」当成前提。看到 `acquire postgres ...: download failed: download HTTP <状态码> from ...` 说明 GitHub 持续不可用或限流，重跑即可，不要为此跳过测试。
 
 ### 本地必跑 `mise run e2e-ha` 的改动面
 

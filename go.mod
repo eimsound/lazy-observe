@@ -11,7 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.105.2
 	github.com/aws/smithy-go v1.27.3
 	github.com/eimsound/lazy-observe/sdk/go v0.0.0
-	github.com/fergusstrange/embedded-postgres v1.34.0
+	github.com/fergusstrange/embedded-postgres/v2 v2.0.1
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible
 	github.com/gofiber/fiber/v2 v2.52.16
 	github.com/golang/snappy v1.0.0
@@ -71,7 +71,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.18.7 // indirect
-	github.com/lib/pq v1.10.9 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
@@ -86,7 +86,6 @@ require (
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
-	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

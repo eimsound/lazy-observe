@@ -28,7 +28,7 @@ Normal tests always exercise SQLite and skip PostgreSQL. Run the real PostgreSQL
 mise run test-meta-pg
 ```
 
-The opt-in suite uses `embedded-postgres`, migrates isolated real PostgreSQL databases, compares the migrated table/column/nullability shape with SQLite, and runs CRUD plus Issue batching/lifecycle checks on both dialects. The first run downloads a PostgreSQL binary into the library cache.
+The opt-in suite uses `embedded-postgres`, migrates isolated real PostgreSQL databases, compares the migrated table/column/nullability shape with SQLite, and runs CRUD plus Issue batching/lifecycle checks on both dialects. The first run downloads a pinned PostgreSQL distribution into the cache directory (`LO_TEST_PG_CACHE`); every run builds the library's supervisor from the module source that `go.sum` pins.
 
 ## Pre-release baseline contract
 
