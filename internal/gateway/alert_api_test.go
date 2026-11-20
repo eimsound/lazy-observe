@@ -866,3 +866,314 @@ func TestUpdateSilenceAllowsClearingComment(t *testing.T) {
 		t.Fatalf("PUT explicit empty comment did not clear comment: %q", putCleared.Comment)
 	}
 }
+
+func TestAlertAPISessionProjectAuditAndValidation(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	proj, err := store.CreateProject(ctx, "AuditProj", "audit-proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "audit-alert-admin", "password", "admin")
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+
+	alerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		Sender:         &alertpkg.Sender{Client: receiver.Client()},
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
+	t.Cleanup(alerts.Close)
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts, Notifications: store})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	doReq := func(method, path, projectHeader string, payload any) (*http.Response, []byte) {
+		t.Helper()
+		var reader io.Reader
+		if payload != nil {
+			raw, marshalErr := json.Marshal(payload)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			reader = bytes.NewReader(raw)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		req.AddCookie(admin)
+		if projectHeader != "" {
+			req.Header.Set("X-LO-Project", projectHeader)
+		}
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, reqErr := gw.App().Test(req)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		out, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return resp, out
+	}
+
+	// 1. Project-scoped alert routes must fail closed with 404 for unknown X-LO-Project.
+	for _, ep := range []struct {
+		method, path string
+		body         any
+	}{
+		{http.MethodGet, "/api/alert-rules", nil},
+		{http.MethodPost, "/api/alert-rules", map[string]any{"name": "R", "expr": "up == 0"}},
+		{http.MethodGet, "/api/silences", nil},
+		{http.MethodGet, "/api/inhibition-rules", nil},
+		{http.MethodGet, "/api/alerts", nil},
+	} {
+		resp, body := doReq(ep.method, ep.path, "nonexistent-project", ep.body)
+		if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(body), "project_not_found") {
+			t.Fatalf("%s %s missing project status=%d body=%s", ep.method, ep.path, resp.StatusCode, body)
+		}
+	}
+
+	// 2. Centralized validation rejects invalid PromQL and oversized matcher regexes with 400.
+	resp, body := doReq(http.MethodPost, "/api/alert-rules", proj.Slug, map[string]any{
+		"name": "BadPromQL", "signal": "metrics", "expr": "sum(rate(up[))",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid PromQL status=%d want=400 body=%s", resp.StatusCode, body)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	resp, body = doReq(http.MethodPost, "/api/silences", proj.Slug, map[string]any{
+		"matchers":  []map[string]string{{"name": "alertname", "op": "=~", "value": strings.Repeat("a", 1025)}},
+		"starts_at": now, "ends_at": now.Add(time.Hour),
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("overlong silence regex status=%d want=400 body=%s", resp.StatusCode, body)
+	}
+
+	// 3. Exercise every alert write operation and confirm full audit trail persistence.
+	resp, body = doReq(http.MethodPost, "/api/channels", proj.Slug, map[string]any{
+		"type": "webhook", "name": "audit-hook", "config": map[string]any{"url": receiver.URL},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create channel status=%d body=%s", resp.StatusCode, body)
+	}
+	var ch notificationChannelResponse
+	if err := json.Unmarshal(body, &ch); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = doReq(http.MethodPatch, "/api/channels/"+ch.ID, proj.Slug, map[string]any{"name": "audit-hook-2"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("update channel status=%d", resp.StatusCode)
+	}
+	resp, _ = doReq(http.MethodPost, "/api/channels/"+ch.ID+"/test", proj.Slug, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("test channel status=%d", resp.StatusCode)
+	}
+
+	resp, body = doReq(
+		http.MethodPut,
+		"/api/projects/"+strconv.Itoa(proj.ID)+"/alert-config",
+		proj.Slug,
+		map[string]any{
+			"new_issue": true, "regression": true, "error_rate_threshold_per_min": 5, "channel_ids": []string{ch.ID},
+		},
+	)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put project alert config status=%d body=%s", resp.StatusCode, body)
+	}
+
+	resp, body = doReq(http.MethodPost, "/api/alert-rules", proj.Slug, map[string]any{
+		"name": "AuditRule", "expr": "up == 0", "for": "1m", "channel_ids": []string{ch.ID},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create rule status=%d body=%s", resp.StatusCode, body)
+	}
+	var rule alertRuleResponse
+	if err := json.Unmarshal(body, &rule); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = doReq(http.MethodPatch, "/api/alert-rules/"+rule.ID, proj.Slug, map[string]any{"severity": "critical"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("update rule status=%d", resp.StatusCode)
+	}
+	resp, _ = doReq(http.MethodDelete, "/api/alert-rules/"+rule.ID, proj.Slug, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete rule status=%d", resp.StatusCode)
+	}
+
+	resp, body = doReq(http.MethodPost, "/api/silences", proj.Slug, map[string]any{
+		"matchers":  []map[string]string{{"name": "alertname", "op": "=", "value": "AuditRule"}},
+		"starts_at": now, "ends_at": now.Add(time.Hour), "comment": "audit",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create silence status=%d body=%s", resp.StatusCode, body)
+	}
+	var sil silenceResponse
+	if err := json.Unmarshal(body, &sil); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = doReq(http.MethodPatch, "/api/silences/"+sil.ID, proj.Slug, map[string]any{"comment": "audit-2"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("update silence status=%d", resp.StatusCode)
+	}
+	resp, _ = doReq(http.MethodDelete, "/api/silences/"+sil.ID, proj.Slug, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete silence status=%d", resp.StatusCode)
+	}
+
+	resp, body = doReq(http.MethodPost, "/api/inhibition-rules", proj.Slug, map[string]any{
+		"source_matchers": []map[string]string{{"name": "alertname", "op": "=", "value": "HostDown"}},
+		"target_matchers": []map[string]string{{"name": "alertname", "op": "=", "value": "ServiceDown"}},
+		"equal_labels":    []string{"instance"},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create inhibition rule status=%d body=%s", resp.StatusCode, body)
+	}
+	var inhib meta.InhibitionRuleView
+	if err := json.Unmarshal(body, &inhib); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = doReq(
+		http.MethodPatch,
+		"/api/inhibition-rules/"+strconv.Itoa(inhib.ID),
+		proj.Slug,
+		map[string]any{"comment": "updated"},
+	)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("update inhibition rule status=%d", resp.StatusCode)
+	}
+	resp, _ = doReq(http.MethodDelete, "/api/inhibition-rules/"+strconv.Itoa(inhib.ID), proj.Slug, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete inhibition rule status=%d", resp.StatusCode)
+	}
+
+	// Seed a dead outbox item and exercise requeue audit.
+	chID, _ := strconv.Atoi(ch.ID)
+	outboxID, _, err := store.EnqueueNotification(ctx, meta.NotificationOutboxEnqueue{
+		IdempotencyKey: "audit-requeue", ProjectID: proj.ID, ChannelID: chID,
+		Payload: json.RawMessage(`{"status":"firing"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNotifications(ctx, "audit-worker", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RetryNotification(ctx, outboxID, "audit-worker", "fail", time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = doReq(http.MethodPost, "/api/notifications/"+strconv.FormatInt(outboxID, 10)+"/retry", proj.Slug, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("requeue notification status=%d", resp.StatusCode)
+	}
+
+	resp, _ = doReq(http.MethodDelete, "/api/channels/"+ch.ID, proj.Slug, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete channel status=%d", resp.StatusCode)
+	}
+
+	records, err := store.ListAudit(ctx, meta.AuditListOptions{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenSuccess := make(map[string]bool)
+	for _, rec := range records {
+		if rec.Success {
+			seenSuccess[rec.Action] = true
+		}
+	}
+	wantActions := []string{
+		"notification_channel.create",
+		"notification_channel.update",
+		"notification_channel.test",
+		"notification_channel.delete",
+		"project_alert_config.update",
+		"alert_rule.create",
+		"alert_rule.update",
+		"alert_rule.delete",
+		"silence.create",
+		"silence.update",
+		"silence.delete",
+		"inhibition_rule.create",
+		"inhibition_rule.update",
+		"inhibition_rule.delete",
+		"notification.requeue",
+	}
+	for _, action := range wantActions {
+		if !seenSuccess[action] {
+			t.Errorf("missing successful audit event for action %q (seen=%v)", action, seenSuccess)
+		}
+	}
+
+	// 4. Rule-level last_error is surfaced in GET /api/alert-rules when native evaluation fails.
+	failingAlerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+		Evaluator: alertpkg.RuleEvaluatorConfig{
+			Query:           failingTestRuleQuery{err: &net.OpError{Op: "dial", Net: "tcp", Err: io.EOF}},
+			MemberID:        "api-last-err-member",
+			TickInterval:    10 * time.Millisecond,
+			MetricsInterval: 10 * time.Millisecond,
+			LeaseTTL:        time.Minute,
+			MemberTTL:       time.Minute,
+		},
+	})
+	t.Cleanup(failingAlerts.Close)
+	failGW := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: failingAlerts})
+	t.Cleanup(func() { _ = failGW.Shutdown() })
+
+	createReq := httptest.NewRequest(
+		http.MethodPost,
+		"/api/alert-rules",
+		bytes.NewReader([]byte(`{"name":"BrokenQueryRule","expr":"up == 0","for":"0s"}`)),
+	)
+	createReq.AddCookie(admin)
+	createReq.Header.Set("X-LO-Project", proj.Slug)
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := failGW.App().Test(createReq)
+	if err != nil || createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create failing rule status=%v err=%v", createResp, err)
+	}
+	createResp.Body.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var surfacedLastErr string
+	for time.Now().Before(deadline) {
+		listReq := httptest.NewRequest(http.MethodGet, "/api/alert-rules", nil)
+		listReq.AddCookie(admin)
+		listReq.Header.Set("X-LO-Project", proj.Slug)
+		listResp, listErr := failGW.App().Test(listReq)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		var rules []alertRuleResponse
+		_ = json.NewDecoder(listResp.Body).Decode(&rules)
+		listResp.Body.Close()
+		if len(rules) == 1 && rules[0].LastError != "" {
+			surfacedLastErr = rules[0].LastError
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if surfacedLastErr == "" {
+		t.Fatal("expected GET /api/alert-rules to surface non-empty last_error for failing rule")
+	}
+}
+
+type failingTestRuleQuery struct {
+	err error
+}
+
+func (q failingTestRuleQuery) Evaluate(
+	_ context.Context,
+	_ *meta.AlertRuleView,
+	_ *meta.ProjectInfo,
+	_ time.Time,
+) ([]alertpkg.RuleSample, error) {
+	return nil, q.err
+}

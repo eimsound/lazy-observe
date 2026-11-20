@@ -431,3 +431,29 @@ func (s *Store) RequeueNotification(ctx context.Context, id int64, projectID int
 	}
 	return count > 0, nil
 }
+
+// NotificationOutboxDepth summarizes live queue backlog across outbox states.
+type NotificationOutboxDepth struct {
+	Pending    int64 `json:"pending"`
+	Processing int64 `json:"processing"`
+	Dead       int64 `json:"dead"`
+	Due        int64 `json:"due"`
+}
+
+// NotificationOutboxDepth returns the current pending, processing, dead, and
+// immediately claimable (due) item counts in notification_outbox.
+func (s *Store) NotificationOutboxDepth(ctx context.Context) (NotificationOutboxDepth, error) {
+	var depth NotificationOutboxDepth
+	query := `SELECT
+		COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
+			OR (status = 'processing' AND claim_until <= CURRENT_TIMESTAMP) THEN 1 ELSE 0 END), 0)
+		FROM notification_outbox`
+	if err := s.db.QueryRowContext(ctx, bind(s.dialect, query)).
+		Scan(&depth.Pending, &depth.Processing, &depth.Dead, &depth.Due); err != nil {
+		return NotificationOutboxDepth{}, fmt.Errorf("query notification outbox depth: %w", err)
+	}
+	return depth, nil
+}

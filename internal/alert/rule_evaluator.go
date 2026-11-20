@@ -9,15 +9,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/alert/ownership"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/storage"
 	prommodel "github.com/prometheus/common/model"
 )
@@ -51,6 +52,36 @@ type RuleSample struct {
 
 type RuleQuery interface {
 	Evaluate(context.Context, *meta.AlertRuleView, *meta.ProjectInfo, time.Time) ([]RuleSample, error)
+}
+
+// RuleEvaluationStatus records the latest runtime evaluation outcome for a
+// single native alert rule on this evaluator instance.
+type RuleEvaluationStatus struct {
+	RuleID          int           `json:"rule_id"`
+	LastEvaluatedAt time.Time     `json:"last_evaluated_at,omitempty"`
+	LastDuration    time.Duration `json:"last_duration"`
+	LastError       string        `json:"last_error,omitempty"`
+	LastErrorAt     time.Time     `json:"last_error_at,omitempty"`
+	EvalCount       uint64        `json:"eval_count"`
+	ErrorCount      uint64        `json:"error_count"`
+}
+
+// EvaluatorSnapshot exposes point-in-time observability metrics for a
+// RuleEvaluator instance, including evaluation latencies, lease loss counts,
+// and per-rule last_error state.
+type EvaluatorSnapshot struct {
+	MemberID                  string                       `json:"member_id"`
+	OwnedLeases               int                          `json:"owned_leases"`
+	EvaluationsTotal          uint64                       `json:"evaluations_total"`
+	EvaluationErrorsTotal     uint64                       `json:"evaluation_errors_total"`
+	LeaseLossesTotal          uint64                       `json:"lease_losses_total"`
+	LeaseRenewalsTotal        uint64                       `json:"lease_renewals_total"`
+	LeaseRenewalFailuresTotal uint64                       `json:"lease_renewal_failures_total"`
+	LastCycleDuration         time.Duration                `json:"last_cycle_duration"`
+	LastEvalDuration          time.Duration                `json:"last_eval_duration"`
+	MaxEvalDuration           time.Duration                `json:"max_eval_duration"`
+	TotalEvalDuration         time.Duration                `json:"total_eval_duration"`
+	RuleStatuses              map[int]RuleEvaluationStatus `json:"rule_statuses"`
 }
 
 type RuleEvaluatorConfig struct {
@@ -95,11 +126,22 @@ type RuleEvaluator struct {
 	wakeOutbox        func()
 	now               func() time.Time
 
-	mu     sync.Mutex
-	leases map[int]meta.AlertRuleLease
-	next   map[int]time.Time
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	mu           sync.Mutex
+	leases       map[int]meta.AlertRuleLease
+	next         map[int]time.Time
+	ruleStatuses map[int]RuleEvaluationStatus
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+
+	evaluationsTotal          atomic.Uint64
+	evaluationErrorsTotal     atomic.Uint64
+	leaseLossesTotal          atomic.Uint64
+	leaseRenewalsTotal        atomic.Uint64
+	leaseRenewalFailuresTotal atomic.Uint64
+	lastCycleDuration         atomic.Int64
+	lastEvalDuration          atomic.Int64
+	maxEvalDuration           atomic.Int64
+	totalEvalDuration         atomic.Int64
 }
 
 func NewRuleEvaluator(cfg RuleEvaluatorConfig) *RuleEvaluator {
@@ -159,9 +201,103 @@ func NewRuleEvaluator(cfg RuleEvaluatorConfig) *RuleEvaluator {
 		queryTimeout: cfg.QueryTimeout, now: cfg.Now,
 		groupWait: cfg.GroupWait, repeatInterval: cfg.RepeatInterval,
 		stormThreshold: cfg.StormThreshold, maxConcurrency: cfg.MaxConcurrency,
-		wakeOutbox: cfg.WakeOutbox,
-		leases:     make(map[int]meta.AlertRuleLease), next: make(map[int]time.Time),
+		wakeOutbox:   cfg.WakeOutbox,
+		leases:       make(map[int]meta.AlertRuleLease),
+		next:         make(map[int]time.Time),
+		ruleStatuses: make(map[int]RuleEvaluationStatus),
 	}
+}
+
+// Snapshot returns a thread-safe copy of evaluator observability counters,
+// durations, and per-rule runtime status.
+func (e *RuleEvaluator) Snapshot() EvaluatorSnapshot {
+	if e == nil {
+		return EvaluatorSnapshot{}
+	}
+	e.mu.Lock()
+	ownedCount := len(e.leases)
+	statuses := make(map[int]RuleEvaluationStatus, len(e.ruleStatuses))
+	for id, st := range e.ruleStatuses {
+		statuses[id] = st
+	}
+	e.mu.Unlock()
+	return EvaluatorSnapshot{
+		MemberID:                  e.memberID,
+		OwnedLeases:               ownedCount,
+		EvaluationsTotal:          e.evaluationsTotal.Load(),
+		EvaluationErrorsTotal:     e.evaluationErrorsTotal.Load(),
+		LeaseLossesTotal:          e.leaseLossesTotal.Load(),
+		LeaseRenewalsTotal:        e.leaseRenewalsTotal.Load(),
+		LeaseRenewalFailuresTotal: e.leaseRenewalFailuresTotal.Load(),
+		LastCycleDuration:         time.Duration(e.lastCycleDuration.Load()),
+		LastEvalDuration:          time.Duration(e.lastEvalDuration.Load()),
+		MaxEvalDuration:           time.Duration(e.maxEvalDuration.Load()),
+		TotalEvalDuration:         time.Duration(e.totalEvalDuration.Load()),
+		RuleStatuses:              statuses,
+	}
+}
+
+// RuleStatus returns the latest runtime evaluation status for ruleID.
+func (e *RuleEvaluator) RuleStatus(ruleID int) (RuleEvaluationStatus, bool) {
+	if e == nil {
+		return RuleEvaluationStatus{}, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	st, ok := e.ruleStatuses[ruleID]
+	return st, ok
+}
+
+// RuleLastError returns the sanitized latest evaluation error for ruleID, or ""
+// when the last evaluation succeeded or the rule has not been evaluated here.
+func (e *RuleEvaluator) RuleLastError(ruleID int) string {
+	st, ok := e.RuleStatus(ruleID)
+	if !ok {
+		return ""
+	}
+	return st.LastError
+}
+
+// ClearRuleStatus removes cached runtime status for ruleID when a rule is
+// updated or deleted.
+func (e *RuleEvaluator) ClearRuleStatus(ruleID int) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	delete(e.ruleStatuses, ruleID)
+	e.mu.Unlock()
+}
+
+func (e *RuleEvaluator) recordRuleOutcome(ruleID int, evaluatedAt time.Time, elapsed time.Duration, evalErr error) {
+	e.evaluationsTotal.Add(1)
+	ns := elapsed.Nanoseconds()
+	e.lastEvalDuration.Store(ns)
+	e.totalEvalDuration.Add(ns)
+	for {
+		prev := e.maxEvalDuration.Load()
+		if ns <= prev || e.maxEvalDuration.CompareAndSwap(prev, ns) {
+			break
+		}
+	}
+
+	e.mu.Lock()
+	st := e.ruleStatuses[ruleID]
+	st.RuleID = ruleID
+	st.LastEvaluatedAt = evaluatedAt
+	st.LastDuration = elapsed
+	st.EvalCount++
+	if evalErr != nil {
+		e.evaluationErrorsTotal.Add(1)
+		st.ErrorCount++
+		st.LastError = outbound.SanitizeError(evalErr)
+		st.LastErrorAt = evaluatedAt
+	} else {
+		st.LastError = ""
+		st.LastErrorAt = time.Time{}
+	}
+	e.ruleStatuses[ruleID] = st
+	e.mu.Unlock()
 }
 
 func (e *RuleEvaluator) Start() {
@@ -195,18 +331,25 @@ func (e *RuleEvaluator) runHeartbeat(ctx context.Context) {
 	ticker := time.NewTicker(e.heartbeatInterval)
 	defer ticker.Stop()
 	for {
-		if _, err := e.store.HeartbeatAlertEngine(
-			ctx,
-			e.memberID,
-			e.memberTTL,
-		); err != nil &&
-			!errors.Is(err, context.Canceled) {
-			slog.Error("heartbeat alert evaluator", "member_id", e.memberID, "error", err)
-		}
-		if _, err := e.store.DeleteExpiredAlertEngineMembers(ctx); err != nil &&
-			!errors.Is(err, context.Canceled) {
-			slog.Warn("delete expired alert engine members", "member_id", e.memberID, "error", err)
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("panic recovered in alert evaluator heartbeat", "member_id", e.memberID, "panic", r)
+				}
+			}()
+			if _, err := e.store.HeartbeatAlertEngine(
+				ctx,
+				e.memberID,
+				e.memberTTL,
+			); err != nil &&
+				!errors.Is(err, context.Canceled) {
+				slog.Error("heartbeat alert evaluator", "member_id", e.memberID, "error", err)
+			}
+			if _, err := e.store.DeleteExpiredAlertEngineMembers(ctx); err != nil &&
+				!errors.Is(err, context.Canceled) {
+				slog.Warn("delete expired alert engine members", "member_id", e.memberID, "error", err)
+			}
+		}()
 		select {
 		case <-ctx.Done():
 			return
@@ -228,7 +371,14 @@ func (e *RuleEvaluator) runLeaseRenewal(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			e.renewLeases(ctx)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("panic recovered in alert lease renewal", "member_id", e.memberID, "panic", r)
+					}
+				}()
+				e.renewLeases(ctx)
+			}()
 		}
 	}
 }
@@ -248,10 +398,17 @@ func (e *RuleEvaluator) renewLeases(ctx context.Context) {
 	}
 	renewed, stale, err := e.store.RenewAlertRuleLeases(ctx, e.memberID, snapshot, e.leaseTTL)
 	if err != nil {
+		e.leaseRenewalFailuresTotal.Add(1)
 		if !errors.Is(err, context.Canceled) {
 			slog.Error("renew alert rule leases", "member_id", e.memberID, "count", len(snapshot), "error", err)
 		}
 		return
+	}
+	if len(renewed) > 0 {
+		e.leaseRenewalsTotal.Add(uint64(len(renewed)))
+	}
+	if len(stale) > 0 {
+		e.leaseLossesTotal.Add(uint64(len(stale)))
 	}
 	if len(renewed) == 0 && len(stale) == 0 {
 		return
@@ -279,7 +436,14 @@ func (e *RuleEvaluator) runEvaluations(ctx context.Context) {
 	ticker := time.NewTicker(e.tickInterval)
 	defer ticker.Stop()
 	for {
-		e.evaluateCycle(ctx)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("panic recovered in alert evaluation cycle", "member_id", e.memberID, "panic", r)
+				}
+			}()
+			e.evaluateCycle(ctx)
+		}()
 		select {
 		case <-ctx.Done():
 			return
@@ -292,6 +456,10 @@ func (e *RuleEvaluator) evaluateCycle(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	cycleStart := time.Now()
+	defer func() {
+		e.lastCycleDuration.Store(time.Since(cycleStart).Nanoseconds())
+	}()
 	if _, err := e.store.HeartbeatAlertEngine(ctx, e.memberID, e.memberTTL); err != nil {
 		if !errors.Is(err, context.Canceled) {
 			slog.Error("prepare alert evaluation", "member_id", e.memberID, "error", err)
@@ -346,6 +514,7 @@ func (e *RuleEvaluator) evaluateRules(
 		}
 		lease, leaseErr := e.store.AcquireAlertRuleLease(ctx, rule.ID, e.memberID, e.leaseTTL)
 		if errors.Is(leaseErr, meta.ErrRuleLeaseHeld) || errors.Is(leaseErr, meta.ErrInactiveAlertEngineMember) {
+			e.leaseLossesTotal.Add(1)
 			e.mu.Lock()
 			knownEpoch := e.leases[rule.ID].Epoch
 			delete(e.leases, rule.ID)
@@ -415,7 +584,7 @@ func (e *RuleEvaluator) evaluateRules(
 	}
 	if workers <= 1 {
 		for _, task := range dueTasks {
-			e.evaluateRule(ctx, task.rule, task.project, task.lease, task.now)
+			e.evaluateRuleSafe(ctx, task.rule, task.project, task.lease, task.now)
 		}
 		return
 	}
@@ -430,10 +599,28 @@ func (e *RuleEvaluator) evaluateRules(
 		go func(t evaluationTask) {
 			defer batch.Done()
 			defer func() { <-sem }()
-			e.evaluateRule(ctx, t.rule, t.project, t.lease, t.now)
+			e.evaluateRuleSafe(ctx, t.rule, t.project, t.lease, t.now)
 		}(task)
 	}
 	batch.Wait()
+}
+
+func (e *RuleEvaluator) evaluateRuleSafe(
+	ctx context.Context,
+	rule *meta.AlertRuleView,
+	project *meta.ProjectInfo,
+	lease meta.AlertRuleLease,
+	now time.Time,
+) {
+	start := time.Now()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic recovered evaluating native alert rule", "rule_id", rule.ID,
+				"member_id", e.memberID, "lease_epoch", lease.Epoch, "panic", r)
+			e.recordRuleOutcome(rule.ID, now, time.Since(start), errors.New("alert rule evaluation panicked"))
+		}
+	}()
+	e.evaluateRule(ctx, rule, project, lease, now)
 }
 
 func (e *RuleEvaluator) discardAcquiredLease(ctx context.Context, lease meta.AlertRuleLease, reason string) {
@@ -448,6 +635,7 @@ func (e *RuleEvaluator) discardAcquiredLease(ctx context.Context, lease meta.Ale
 				"member_id", e.memberID, "lease_epoch", lease.Epoch, "reason", reason, "error", err)
 		}
 	} else if !released {
+		e.leaseLossesTotal.Add(1)
 		slog.Warn("release alert rule lease rejected after losing ownership", "rule_id", lease.RuleID,
 			"member_id", e.memberID, "lease_epoch", lease.Epoch, "reason", reason)
 	}
@@ -460,20 +648,25 @@ func (e *RuleEvaluator) evaluateRule(
 	lease meta.AlertRuleLease,
 	now time.Time,
 ) {
+	start := time.Now()
 	queryCtx, cancel := context.WithTimeout(ctx, e.queryTimeout)
 	samples, err := e.query.Evaluate(queryCtx, rule, project, now)
 	cancel()
 	if err != nil {
-		slog.Error("query native alert rule", "rule_id", rule.ID, "error", err)
+		e.recordRuleOutcome(rule.ID, now, time.Since(start), err)
+		slog.Error("query native alert rule", "rule_id", rule.ID, "duration_ms", time.Since(start).Milliseconds(),
+			"error", err)
 		return
 	}
 	previous, err := e.store.AlertRuleStates(ctx, rule.ID)
 	if err != nil {
+		e.recordRuleOutcome(rule.ID, now, time.Since(start), err)
 		slog.Error("read alert rule state", "rule_id", rule.ID, "error", err)
 		return
 	}
 	states, err := advanceRuleStates(rule, previous, samples, now)
 	if err != nil {
+		e.recordRuleOutcome(rule.ID, now, time.Since(start), err)
 		slog.Error("advance native alert state", "rule_id", rule.ID, "error", err)
 		return
 	}
@@ -489,6 +682,7 @@ func (e *RuleEvaluator) evaluateRule(
 	}
 	states, notifications, inhibited, planErr := e.planNativeNotifications(ctx, rule, project, previous, states, now)
 	if planErr != nil {
+		e.recordRuleOutcome(rule.ID, now, time.Since(start), planErr)
 		slog.Error("plan native alert notifications", "rule_id", rule.ID, "error", planErr)
 		return
 	}
@@ -498,6 +692,7 @@ func (e *RuleEvaluator) evaluateRule(
 		InhibitedFingerprints: inhibited, Notifications: notifications,
 	}); err != nil {
 		if errors.Is(err, meta.ErrStaleRuleFence) {
+			e.leaseLossesTotal.Add(1)
 			e.mu.Lock()
 			if current, ok := e.leases[rule.ID]; ok && current.Epoch == lease.Epoch {
 				delete(e.leases, rule.ID)
@@ -506,10 +701,12 @@ func (e *RuleEvaluator) evaluateRule(
 			slog.Warn("discard native alert evaluation after losing rule lease", "rule_id", rule.ID,
 				"member_id", e.memberID, "lease_epoch", lease.Epoch)
 		} else {
+			e.recordRuleOutcome(rule.ID, now, time.Since(start), err)
 			slog.Error("commit native alert evaluation", "rule_id", rule.ID, "error", err)
 		}
 		return
 	}
+	e.recordRuleOutcome(rule.ID, now, time.Since(start), nil)
 	if len(notifications) != 0 && e.wakeOutbox != nil {
 		e.wakeOutbox()
 	}
@@ -530,6 +727,7 @@ func (e *RuleEvaluator) releaseUnowned(ctx context.Context, owned map[int]struct
 			release = append(release, lease)
 			delete(e.leases, ruleID)
 			delete(e.next, ruleID)
+			delete(e.ruleStatuses, ruleID)
 		}
 	}
 	e.mu.Unlock()
@@ -541,6 +739,7 @@ func (e *RuleEvaluator) releaseUnowned(ctx context.Context, owned map[int]struct
 					"member_id", e.memberID, "lease_epoch", lease.Epoch, "error", err)
 			}
 		} else if !released {
+			e.leaseLossesTotal.Add(1)
 			slog.Warn("release alert rule lease rejected after losing ownership", "rule_id", lease.RuleID,
 				"member_id", e.memberID, "lease_epoch", lease.Epoch)
 		}
@@ -563,6 +762,7 @@ func (e *RuleEvaluator) releaseAll(ctx context.Context) {
 					"member_id", e.memberID, "lease_epoch", lease.Epoch, "error", err)
 			}
 		} else if !released {
+			e.leaseLossesTotal.Add(1)
 			slog.Warn("release alert rule lease rejected after losing ownership", "rule_id", lease.RuleID,
 				"member_id", e.memberID, "lease_epoch", lease.Epoch)
 		}
@@ -647,189 +847,71 @@ func (e *RuleEvaluator) planNativeNotifications(
 	for _, state := range previous {
 		prior[state.Fingerprint] = state
 	}
-	hasFiring := false
-	dueFingerprints := make(map[string]bool)
-	var resolvedIndexes []int
+	candidates := make([]AlertCandidate, 0, len(states))
 	for i := range states {
 		state := &states[i]
 		old, existed := prior[state.Fingerprint]
 		switch state.Status {
 		case "firing":
-			hasFiring = true
-			if state.FiringSince == nil || now.Before(state.FiringSince.Add(e.groupWait)) {
-				continue
-			}
-			if !existed || old.Status != "firing" || state.LastNotifiedAt == nil ||
-				!now.Before(state.LastNotifiedAt.Add(e.repeatInterval)) {
-				dueFingerprints[state.Fingerprint] = true
-			}
+			candidates = append(candidates, AlertCandidate{
+				Alert:          alertFromRuleState(*state, "firing", time.Time{}),
+				FiringSince:    state.FiringSince,
+				LastNotifiedAt: state.LastNotifiedAt,
+				WasFiring:      existed && old.Status == "firing",
+			})
 		case "recovered":
 			if existed && old.Status == "firing" {
-				resolvedIndexes = append(resolvedIndexes, i)
+				candidates = append(candidates, AlertCandidate{
+					Alert: alertFromRuleState(*state, "resolved", now),
+				})
 			}
 		}
 	}
-	if !hasFiring && len(resolvedIndexes) == 0 {
+	if len(candidates) == 0 {
 		return states, nil, nil, nil
 	}
-	policy, err := e.store.AlertPolicySnapshot(ctx, p.ID, now)
+	policySnap, err := e.store.AlertPolicySnapshot(ctx, p.ID, now)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	silences := make([][]Matcher, 0, len(policy.Silences))
-	for _, matchers := range policy.Silences {
-		silences = append(silences, mapsToMatchers(matchers))
-	}
-	inhibitions := make([]InhibitionRule, 0, len(policy.InhibitionRules))
-	for _, item := range policy.InhibitionRules {
-		inhibitions = append(inhibitions, InhibitionRule{
-			SourceMatchers: mapsToMatchers(item.SourceMatchers),
-			TargetMatchers: mapsToMatchers(item.TargetMatchers),
-			EqualLabels:    item.EqualLabels,
-		})
 	}
 	stateSources, err := e.store.ProjectFiringAlertRuleStates(ctx, p.ID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	sources := make([]Alert, 0, len(stateSources)+len(policy.FiringEvents)+len(states))
-	for _, state := range stateSources {
-		sources = append(sources, alertFromRuleState(state, "firing", time.Time{}))
+	platformSources, err := e.store.ProjectFiringPlatformAlertStates(ctx, p.ID)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	for _, event := range policy.FiringEvents {
-		sources = append(sources, Alert{
-			Status:      "firing",
-			Labels:      event.Labels,
-			Annotations: event.Annotations,
-			StartsAt:    event.StartsAt,
-			Fingerprint: event.Fingerprint,
-		})
-	}
-	for _, state := range states {
-		if state.Status == "firing" {
-			sources = append(sources, alertFromRuleState(state, "firing", time.Time{}))
-		}
-	}
-	inhibitedFingerprints := make(map[string]bool)
-	var notifications []Notification
-	if hasFiring {
-		kept := make([]Alert, 0, len(states))
-		keptSet := make(map[string]struct{}, len(states))
-		keptHasDue := false
-		for _, state := range states {
-			if state.Status != "firing" {
-				continue
-			}
-			alert := alertFromRuleState(state, "firing", time.Time{})
-			inhibited := IsInhibited(alert, sources, inhibitions)
-			inhibitedFingerprints[alert.Fingerprint] = inhibited
-			if !matchesAny(alert.Labels, silences) && !inhibited {
-				kept = append(kept, alert)
-				keptSet[alert.Fingerprint] = struct{}{}
-				if dueFingerprints[alert.Fingerprint] {
-					keptHasDue = true
-				}
-			}
-		}
-		if keptHasDue {
-			if storm := e.nativeStormSummary(rule, stateSources, kept); storm != nil {
-				notifications = append(
-					notifications,
-					Notification{Project: p.Slug, Rule: "alert_storm", Status: "firing", Storm: storm},
-				)
-			} else {
-				notifications = append(
-					notifications,
-					Notification{Project: p.Slug, Rule: rule.Name, Status: "firing", Alerts: kept},
-				)
-			}
-			// Only mark alerts that actually entered a queued notification;
-			// silenced or inhibited alerts keep LastNotifiedAt untouched so
-			// lifting silence/inhibition triggers prompt delivery.
-			for i := range states {
-				if states[i].Status == "firing" {
-					if _, notified := keptSet[states[i].Fingerprint]; notified {
-						marked := now
-						states[i].LastNotifiedAt = &marked
-					}
-				}
-			}
-		}
-	}
-	if len(resolvedIndexes) != 0 {
-		resolved := make([]Alert, 0, len(resolvedIndexes))
-		for _, index := range resolvedIndexes {
-			alert := alertFromRuleState(states[index], "resolved", now)
-			if !matchesAny(alert.Labels, silences) {
-				resolved = append(resolved, alert)
-				marked := now
-				states[index].LastNotifiedAt = &marked
-			}
-		}
-		if len(resolved) != 0 {
-			notifications = append(
-				notifications,
-				Notification{Project: p.Slug, Rule: rule.Name, Status: "resolved", Alerts: resolved},
-			)
-		}
-	}
-	return states, nativeOutboxEntries(rule, p, notifications, now, e.repeatInterval), inhibitedFingerprints, nil
-}
+	ruleID := rule.ID
+	compiledPolicy := CompilePolicyFromMeta(
+		policySnap,
+		stateSources,
+		platformSources,
+		nil,
+		nil,
+		nativeGroupKey(rule.ID),
+	)
+	plan := PlanNotifications(PlanConfig{
+		ProjectSlug:    p.Slug,
+		ProjectID:      p.ID,
+		RuleName:       rule.Name,
+		RuleID:         &ruleID,
+		GroupKey:       nativeGroupKey(rule.ID),
+		Severity:       rule.Severity,
+		GroupWait:      e.groupWait,
+		RepeatInterval: e.repeatInterval,
+		StormThreshold: e.stormThreshold,
+		Now:            now,
+	}, compiledPolicy, candidates)
 
-func (e *RuleEvaluator) nativeStormSummary(
-	currentRule *meta.AlertRuleView,
-	projectFiring []meta.AlertRuleState,
-	currentKept []Alert,
-) *StormSummary {
-	if e.stormThreshold <= 0 {
-		return nil
-	}
-	type ruleGroup struct {
-		name     string
-		severity string
-	}
-	groups := make(map[int]ruleGroup)
-	for _, state := range projectFiring {
-		if state.RuleID == currentRule.ID {
-			continue
+	for i := range states {
+		if _, notified := plan.NotifiedFingerprints[states[i].Fingerprint]; notified {
+			marked := now
+			states[i].LastNotifiedAt = &marked
 		}
-		if _, exists := groups[state.RuleID]; exists {
-			continue
-		}
-		name := state.Labels["alertname"]
-		if name == "" {
-			name = strconv.Itoa(state.RuleID)
-		}
-		severity := state.Labels["severity"]
-		if severity == "" {
-			severity = "unknown"
-		}
-		groups[state.RuleID] = ruleGroup{name: name, severity: severity}
 	}
-	if len(currentKept) > 0 {
-		severity := currentRule.Severity
-		if currentKept[0].Labels["severity"] != "" {
-			severity = currentKept[0].Labels["severity"]
-		}
-		if severity == "" {
-			severity = "unknown"
-		}
-		groups[currentRule.ID] = ruleGroup{name: currentRule.Name, severity: severity}
-	}
-	if len(groups) <= e.stormThreshold {
-		return nil
-	}
-	severityCounts := make(map[string]int)
-	ruleCounts := make(map[string]int)
-	for _, g := range groups {
-		severityCounts[g.severity]++
-		ruleCounts[g.name]++
-	}
-	return &StormSummary{
-		GroupCount: len(groups),
-		Severities: topCounts(severityCounts),
-		Rules:      topCounts(ruleCounts),
-	}
+	outbox := BuildOutboxEntries(p.ID, &ruleID, rule.EnabledChannelIDs, plan.Notifications, now, e.repeatInterval)
+	return states, outbox, plan.InhibitedFingerprints, nil
 }
 
 func alertFromRuleState(state meta.AlertRuleState, status string, endsAt time.Time) Alert {
@@ -854,39 +936,8 @@ func nativeOutboxEntries(
 	now time.Time,
 	repeat time.Duration,
 ) []meta.NotificationOutboxEnqueue {
-	var out []meta.NotificationOutboxEnqueue
-	for _, notification := range notifications {
-		payload, err := json.Marshal(notification)
-		if err != nil {
-			continue
-		}
-		var keyPayload []byte
-		if notification.Storm != nil {
-			bucket := now.UnixNano()
-			if repeat > 0 {
-				bucket = now.UnixNano() / repeat.Nanoseconds()
-			}
-			keyPayload = []byte(fmt.Sprintf("storm\x00%d\x00%d", p.ID, bucket))
-		} else {
-			generation := now.UnixNano()
-			if notification.Status == "firing" && repeat > 0 && len(notification.Alerts) != 0 {
-				generation = now.Sub(notification.Alerts[0].StartsAt).Nanoseconds() / repeat.Nanoseconds()
-			}
-			keyPayload = append(slices.Clone(payload), []byte(fmt.Sprintf("\x00%d\x00%d", rule.ID, generation))...)
-		}
-		for _, channelID := range rule.EnabledChannelIDs {
-			ruleID := rule.ID
-			priority := 0
-			if notification.Status == "resolved" {
-				priority = 100
-			}
-			out = append(out, meta.NotificationOutboxEnqueue{
-				IdempotencyKey: notificationOutboxKey(channelID, keyPayload), ProjectID: p.ID,
-				RuleID: &ruleID, ChannelID: channelID, Payload: payload, Priority: priority,
-			})
-		}
-	}
-	return out
+	ruleID := rule.ID
+	return BuildOutboxEntries(p.ID, &ruleID, rule.EnabledChannelIDs, notifications, now, repeat)
 }
 
 type HTTPRuleQuery struct {

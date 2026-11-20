@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/backoff"
@@ -42,6 +43,20 @@ type OutboxWorkerConfig struct {
 	Now             func() time.Time
 }
 
+// OutboxSnapshot reports live queue backlog and cumulative delivery metrics for
+// an OutboxWorker instance.
+type OutboxSnapshot struct {
+	WorkerID          string                       `json:"worker_id"`
+	DeliveredTotal    uint64                       `json:"delivered_total"`
+	SkippedTotal      uint64                       `json:"skipped_total"`
+	RetriedTotal      uint64                       `json:"retried_total"`
+	DeadTotal         uint64                       `json:"dead_total"`
+	DeferredTotal     uint64                       `json:"deferred_total"`
+	ClaimLostTotal    uint64                       `json:"claim_lost_total"`
+	LastBatchDuration time.Duration                `json:"last_batch_duration"`
+	Depth             meta.NotificationOutboxDepth `json:"depth"`
+}
+
 // OutboxWorker competes for durable notification claims. Delivery is
 // at-least-once: a process may stop after the receiver accepts a request but
 // before the database claim is completed, so HTTP receivers also get the
@@ -60,6 +75,14 @@ type OutboxWorker struct {
 	wake         chan struct{}
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
+
+	deliveredTotal    atomic.Uint64
+	skippedTotal      atomic.Uint64
+	retriedTotal      atomic.Uint64
+	deadTotal         atomic.Uint64
+	deferredTotal     atomic.Uint64
+	claimLostTotal    atomic.Uint64
+	lastBatchDuration atomic.Int64
 }
 
 func NewOutboxWorker(cfg OutboxWorkerConfig) *OutboxWorker {
@@ -108,6 +131,32 @@ func NewOutboxWorker(cfg OutboxWorkerConfig) *OutboxWorker {
 	}
 }
 
+// Snapshot returns cumulative worker delivery counters along with the current
+// database outbox depth.
+func (w *OutboxWorker) Snapshot(ctx context.Context) (OutboxSnapshot, error) {
+	if w == nil {
+		return OutboxSnapshot{}, nil
+	}
+	snap := OutboxSnapshot{
+		WorkerID:          w.workerID,
+		DeliveredTotal:    w.deliveredTotal.Load(),
+		SkippedTotal:      w.skippedTotal.Load(),
+		RetriedTotal:      w.retriedTotal.Load(),
+		DeadTotal:         w.deadTotal.Load(),
+		DeferredTotal:     w.deferredTotal.Load(),
+		ClaimLostTotal:    w.claimLostTotal.Load(),
+		LastBatchDuration: time.Duration(w.lastBatchDuration.Load()),
+	}
+	if w.store != nil {
+		depth, err := w.store.NotificationOutboxDepth(ctx)
+		if err != nil {
+			return snap, err
+		}
+		snap.Depth = depth
+	}
+	return snap, nil
+}
+
 func (w *OutboxWorker) Start() {
 	if w == nil || w.cancel != nil {
 		return
@@ -145,7 +194,7 @@ func (w *OutboxWorker) run(ctx context.Context) {
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 	for {
-		w.drain(ctx)
+		w.drainSafe(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -155,8 +204,18 @@ func (w *OutboxWorker) run(ctx context.Context) {
 	}
 }
 
+func (w *OutboxWorker) drainSafe(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic recovered in notification outbox worker", "worker_id", w.workerID, "panic", r)
+		}
+	}()
+	w.drain(ctx)
+}
+
 func (w *OutboxWorker) drain(ctx context.Context) {
 	for ctx.Err() == nil {
+		start := time.Now()
 		items, err := w.store.ClaimNotifications(ctx, w.workerID, w.claimBatch, w.claimTTL)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
@@ -173,10 +232,18 @@ func (w *OutboxWorker) drain(ctx context.Context) {
 			item := items[i]
 			go func() {
 				defer batch.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("panic recovered delivering notification", "worker_id", w.workerID,
+							"outbox_id", item.ID, "panic", r)
+						w.retry(ctx, item, errors.New("notification delivery panicked"))
+					}
+				}()
 				w.deliver(ctx, item)
 			}()
 		}
 		batch.Wait()
+		w.lastBatchDuration.Store(time.Since(start).Nanoseconds())
 	}
 }
 
@@ -194,9 +261,16 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 	}
 	if !channelRow.Enabled {
 		if err := w.store.CompleteNotification(ctx, item.ID, w.workerID); err != nil {
-			slog.Error("complete disabled notification", "outbox_id", item.ID, "error", err)
+			if errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+				w.claimLostTotal.Add(1)
+				slog.Warn("notification outbox claim lost while skipping disabled channel", "outbox_id", item.ID,
+					"worker_id", w.workerID, "attempts", item.Attempts)
+			} else {
+				slog.Error("complete disabled notification", "outbox_id", item.ID, "error", err)
+			}
 			return
 		}
+		w.skippedTotal.Add(1)
 		w.recordDelivery(ctx, item, "skipped", "notification channel is disabled")
 		return
 	}
@@ -220,12 +294,15 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 				w.rateWindow,
 			); err != nil {
 				if errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+					w.claimLostTotal.Add(1)
 					slog.Warn("notification outbox claim lost while deferring", "outbox_id", item.ID,
 						"worker_id", w.workerID, "attempts", item.Attempts)
 				} else {
 					slog.Error("defer rate-limited notification", "outbox_id", item.ID, "error", err)
 				}
+				return
 			}
+			w.deferredTotal.Add(1)
 			return
 		}
 	}
@@ -238,6 +315,7 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 	}
 	if err := w.store.CompleteNotification(ctx, item.ID, w.workerID); err != nil {
 		if errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+			w.claimLostTotal.Add(1)
 			slog.Warn("notification outbox claim lost before completion", "outbox_id", item.ID,
 				"worker_id", w.workerID, "attempts", item.Attempts)
 		} else {
@@ -245,6 +323,7 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 		}
 		return
 	}
+	w.deliveredTotal.Add(1)
 	w.recordDelivery(ctx, item, "sent", "")
 }
 
@@ -266,6 +345,7 @@ func (w *OutboxWorker) retry(ctx context.Context, item meta.NotificationOutboxIt
 	status, err := w.store.RetryNotification(ctx, item.ID, w.workerID, safeMessage, delay, w.maxAttempts)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+			w.claimLostTotal.Add(1)
 			slog.Warn("notification outbox claim lost before retry update", "outbox_id", item.ID,
 				"worker_id", w.workerID, "attempts", item.Attempts)
 		} else if !errors.Is(err, context.Canceled) {
@@ -273,7 +353,9 @@ func (w *OutboxWorker) retry(ctx context.Context, item meta.NotificationOutboxIt
 		}
 		return
 	}
+	w.retriedTotal.Add(1)
 	if status == "dead" {
+		w.deadTotal.Add(1)
 		w.recordDelivery(ctx, item, "failed", safeMessage)
 	}
 }

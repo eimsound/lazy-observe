@@ -4,17 +4,24 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
-	"fmt"
 	"regexp"
 	"sort"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/eimsound/lazy-observe/internal/alert/matcher"
 )
 
 type SilenceProvider func(context.Context, string, time.Time) ([][]Matcher, error)
 type InhibitionProvider func(context.Context, string) ([]InhibitionRule, error)
+type PolicyProvider func(
+	ctx context.Context,
+	project string,
+	now time.Time,
+	localSources []Alert,
+	localGroups []GroupSummary,
+	excludeGroupKey string,
+) (CompiledPolicy, error)
 type NotifyFunc func(context.Context, Notification) error
 
 type EngineConfig struct {
@@ -24,6 +31,7 @@ type EngineConfig struct {
 	Now             func() time.Time
 	Silences        SilenceProvider
 	InhibitionRules InhibitionProvider
+	Policy          PolicyProvider
 	Notify          NotifyFunc
 }
 
@@ -187,10 +195,13 @@ func (e *Engine) flushStorm(project string) {
 	summary := e.stormSummaryLocked(project)
 	e.mu.Unlock()
 
+	if summary == nil {
+		return
+	}
 	if e.cfg.Notify == nil ||
 		e.cfg.Notify(
 			context.Background(),
-			Notification{Project: project, Rule: "alert_storm", Status: "firing", Storm: &summary},
+			Notification{Project: project, Rule: "alert_storm", Status: "firing", Storm: summary},
 		) == nil {
 		e.mu.Lock()
 		if current := e.storms[project]; current != nil {
@@ -207,16 +218,12 @@ func (e *Engine) flushStorm(project string) {
 	e.mu.Unlock()
 }
 
-func (e *Engine) stormSummaryLocked(project string) StormSummary {
-	severityCounts := make(map[string]int)
-	ruleCounts := make(map[string]int)
-	groups := 0
+func (e *Engine) projectGroupsLocked(project string) []GroupSummary {
+	groups := make([]GroupSummary, 0)
 	for _, g := range e.groups {
 		if g.project != project || len(g.alerts) == 0 {
 			continue
 		}
-		groups++
-		ruleCounts[g.rule]++
 		severity := "unknown"
 		for _, a := range g.alerts {
 			if a.Labels["severity"] != "" {
@@ -224,26 +231,17 @@ func (e *Engine) stormSummaryLocked(project string) StormSummary {
 			}
 			break
 		}
-		severityCounts[severity]++
+		groups = append(groups, GroupSummary{
+			Key:      platformGroupKey(g.rule),
+			Name:     g.rule,
+			Severity: severity,
+		})
 	}
-	return StormSummary{GroupCount: groups, Severities: topCounts(severityCounts), Rules: topCounts(ruleCounts)}
+	return groups
 }
 
-func topCounts(values map[string]int) []Count {
-	out := make([]Count, 0, len(values))
-	for name, count := range values {
-		out = append(out, Count{Name: name, Count: count})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Count != out[j].Count {
-			return out[i].Count > out[j].Count
-		}
-		return out[i].Name < out[j].Name
-	})
-	if len(out) > 10 {
-		out = out[:10]
-	}
-	return out
+func (e *Engine) stormSummaryLocked(project string) *StormSummary {
+	return BuildStormSummary(e.projectGroupsLocked(project), e.cfg.StormThreshold)
 }
 
 type deliveryResult uint8
@@ -316,57 +314,104 @@ func (e *Engine) deliver(ctx context.Context, n Notification) deliveryResult {
 	if e.cfg.Notify == nil {
 		return deliverySent
 	}
-	if e.cfg.Silences != nil {
-		sets, err := e.cfg.Silences(ctx, n.Project, e.cfg.Now())
-		if err != nil {
-			return deliveryFailed
+	now := e.cfg.Now()
+	groupKey := platformGroupKey(n.Rule)
+	policy, err := e.loadPolicy(ctx, n.Project, now, groupKey)
+	if err != nil {
+		return deliveryFailed
+	}
+
+	candidates := make([]AlertCandidate, 0, len(n.Alerts))
+	for _, a := range n.Alerts {
+		if a.Status == "" {
+			a.Status = n.Status
 		}
-		kept := make([]Alert, 0, len(n.Alerts))
-		for _, a := range n.Alerts {
-			if !matchesAny(a.Labels, sets) {
-				kept = append(kept, a)
-			}
+		candidates = append(candidates, AlertCandidate{
+			Alert:       a,
+			DueOverride: true,
+		})
+	}
+
+	// Only pass storm threshold to planner when backed by a project-wide
+	// PolicyProvider; standalone Engine instances manage local storms via
+	// updateStormLocked/flushStorm.
+	stormThreshold := 0
+	if e.cfg.Policy != nil {
+		stormThreshold = e.cfg.StormThreshold
+	}
+	plan := PlanNotifications(PlanConfig{
+		ProjectSlug:    n.Project,
+		RuleName:       n.Rule,
+		GroupKey:       groupKey,
+		GroupWait:      e.cfg.GroupWait,
+		RepeatInterval: e.cfg.RepeatInterval,
+		StormThreshold: stormThreshold,
+		Now:            now,
+	}, policy, candidates)
+
+	if len(plan.Notifications) == 0 {
+		if n.Status == "resolved" && plan.ResolvedSuppressed {
+			return deliverySuppressed
 		}
-		n.Alerts = kept
-		if len(n.Alerts) == 0 {
+		switch plan.FiringDisposition {
+		case DispositionInhibited:
+			return deliveryInhibited
+		case DispositionSuppressed:
+			return deliverySuppressed
+		default:
 			return deliverySuppressed
 		}
 	}
-	if n.Status == "firing" && e.cfg.InhibitionRules != nil {
-		rules, err := e.cfg.InhibitionRules(ctx, n.Project)
-		if err != nil {
+
+	for _, planned := range plan.Notifications {
+		if err := e.cfg.Notify(ctx, planned); err != nil {
 			return deliveryFailed
 		}
-		sources := e.activeAlerts(n.Project)
-		kept := make([]Alert, 0, len(n.Alerts))
-		for _, a := range n.Alerts {
-			if !IsInhibited(a, sources, rules) {
-				kept = append(kept, a)
-			}
-		}
-		n.Alerts = kept
-		if len(n.Alerts) == 0 {
-			return deliveryInhibited
-		}
-	}
-	if err := e.cfg.Notify(ctx, n); err != nil {
-		return deliveryFailed
 	}
 	return deliverySent
 }
 
-func (e *Engine) activeAlerts(project string) []Alert {
+func (e *Engine) loadPolicy(
+	ctx context.Context,
+	project string,
+	now time.Time,
+	excludeGroupKey string,
+) (CompiledPolicy, error) {
+	sources, groups := e.activeSnapshot(project)
+	if e.cfg.Policy != nil {
+		return e.cfg.Policy(ctx, project, now, sources, groups, excludeGroupKey)
+	}
+	var silences [][]Matcher
+	if e.cfg.Silences != nil {
+		sets, err := e.cfg.Silences(ctx, project, now)
+		if err != nil {
+			return CompiledPolicy{}, err
+		}
+		silences = sets
+	}
+	var inhibitions []InhibitionRule
+	if e.cfg.InhibitionRules != nil {
+		rules, err := e.cfg.InhibitionRules(ctx, project)
+		if err != nil {
+			return CompiledPolicy{}, err
+		}
+		inhibitions = rules
+	}
+	return CompilePolicy(silences, inhibitions, sources, groups), nil
+}
+
+func (e *Engine) activeSnapshot(project string) ([]Alert, []GroupSummary) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	var out []Alert
+	var alerts []Alert
 	for _, g := range e.groups {
 		if g.project == project {
 			for _, a := range g.alerts {
-				out = append(out, a)
+				alerts = append(alerts, a)
 			}
 		}
 	}
-	return out
+	return alerts, e.projectGroupsLocked(project)
 }
 
 // Remove drops a group without delivering a resolved notification. It is used
@@ -393,91 +438,36 @@ func (e *Engine) Reevaluate(project string) {
 }
 
 func IsInhibited(target Alert, sources []Alert, rules []InhibitionRule) bool {
-	for _, rule := range rules {
-		if !MatchLabels(target.Labels, rule.TargetMatchers) {
-			continue
-		}
-		for _, source := range sources {
-			if source.Status == "resolved" || source.Fingerprint == target.Fingerprint ||
-				!MatchLabels(source.Labels, rule.SourceMatchers) {
-				continue
-			}
-			equal := true
-			for _, label := range rule.EqualLabels {
-				sv, sok := source.Labels[label]
-				tv, tok := target.Labels[label]
-				if !sok || !tok || sv != tv {
-					equal = false
-					break
-				}
-			}
-			if equal {
-				return true
-			}
-		}
-	}
-	return false
+	policy := CompilePolicy(nil, rules, sources, nil)
+	return matcher.IsInhibited(
+		matcher.AlertRef{Fingerprint: target.Fingerprint, Status: target.Status, Labels: target.Labels},
+		policy.Sources,
+		policy.Inhibitions,
+	)
 }
 
 func matchesAny(labels map[string]string, sets [][]Matcher) bool {
-	for _, matchers := range sets {
-		if MatchLabels(labels, matchers) {
-			return true
-		}
-	}
-	return false
+	return matcher.MatchesAny(labels, matcher.CompileSetsLenient(sets))
 }
 
 // CompileMatcherRegex compiles a Prometheus/Alertmanager matcher regex anchored
-// to match the entire label value (`^(?:...)$`).
+// to match the entire label value (`^(?:...)$`) via the bounded regex cache.
 func CompileMatcherRegex(pattern string) (*regexp.Regexp, error) {
-	return regexp.Compile("^(?:" + pattern + ")$")
+	return matcher.CompileRegex(pattern)
 }
 
 // ValidateMatchers verifies that a matcher slice is non-empty and every entry
 // has a non-empty label name, supported operator (`=` or `=~`), and valid regex.
 func ValidateMatchers(matchers []Matcher) error {
-	if len(matchers) == 0 {
-		return errors.New("at least one matcher is required")
-	}
-	for i, m := range matchers {
-		if strings.TrimSpace(m.Name) == "" {
-			return fmt.Errorf("matcher %d name is required", i)
-		}
-		switch strings.TrimSpace(m.Op) {
-		case "=":
-		case "=~":
-			if _, err := CompileMatcherRegex(m.Value); err != nil {
-				return fmt.Errorf("matcher %d regex %q is invalid: %w", i, m.Value, err)
-			}
-		default:
-			return fmt.Errorf("matcher %d operator %q is unsupported", i, m.Op)
-		}
-	}
-	return nil
+	return matcher.ValidateSet(matchers)
 }
 
 func MatchLabels(labels map[string]string, matchers []Matcher) bool {
-	for _, m := range matchers {
-		value, ok := labels[m.Name]
-		if !ok {
-			return false
-		}
-		switch strings.TrimSpace(m.Op) {
-		case "=":
-			if value != m.Value {
-				return false
-			}
-		case "=~":
-			re, err := CompileMatcherRegex(m.Value)
-			if err != nil || !re.MatchString(value) {
-				return false
-			}
-		default:
-			return false
-		}
+	set, err := matcher.CompileSet(matchers)
+	if err != nil {
+		return false
 	}
-	return len(matchers) > 0
+	return set.Matches(labels)
 }
 
 func stopTimer(timer *time.Timer) {

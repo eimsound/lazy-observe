@@ -8,17 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/eimsound/lazy-observe/internal/alert/matcher"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/state"
 	prommodel "github.com/prometheus/common/model"
+	promparser "github.com/prometheus/prometheus/promql/parser"
 )
 
 // ErrInvalidChannelConfig reports a rejected notification channel configuration.
@@ -30,12 +31,21 @@ var ErrInvalidInput = errors.New("invalid alert input")
 const (
 	platformConfigCacheTTL        = 5 * time.Second
 	platformRecoveryCheckInterval = 5 * time.Second
+	maxRuleExprLength             = 8192
 )
 
 type cachedPlatformConfig struct {
 	cfg       meta.ProjectAlertConfigView
 	project   meta.ProjectInfo
 	expiresAt time.Time
+}
+
+// AlertDiagnostics aggregates runtime observability across the native rule
+// evaluator, durable notification outbox, and compiled matcher regex cache.
+type AlertDiagnostics struct {
+	Evaluator    EvaluatorSnapshot  `json:"evaluator"`
+	Outbox       OutboxSnapshot     `json:"outbox"`
+	MatcherCache matcher.CacheStats `json:"matcher_cache"`
 }
 
 type Config struct {
@@ -59,6 +69,7 @@ type Service struct {
 	engine         *Engine
 	now            func() time.Time
 	repeatInterval time.Duration
+	stormThreshold int
 	cfgCacheMu     sync.RWMutex
 	cfgCache       map[int]cachedPlatformConfig
 	outbox         *OutboxWorker
@@ -80,11 +91,16 @@ func NewService(cfg Config) *Service {
 	if cfg.RepeatInterval <= 0 {
 		cfg.RepeatInterval = 4 * time.Hour
 	}
+	stormThreshold := cfg.StormThreshold
+	if stormThreshold <= 0 {
+		stormThreshold = defaultEvaluatorStormThreshold
+	}
 	s := &Service{
 		store:          cfg.Store,
 		sender:         cfg.Sender,
 		now:            cfg.Now,
 		repeatInterval: cfg.RepeatInterval,
+		stormThreshold: stormThreshold,
 		cfgCache:       make(map[int]cachedPlatformConfig),
 	}
 	s.engine = NewEngine(
@@ -95,6 +111,7 @@ func NewService(cfg Config) *Service {
 			Now:             cfg.Now,
 			Silences:        s.activeSilences,
 			InhibitionRules: s.activeInhibitionRules,
+			Policy:          s.platformPolicy,
 			Notify:          s.notify,
 		},
 	)
@@ -156,6 +173,50 @@ func (s *Service) WakeOutbox() {
 	}
 }
 
+// RuleLastError returns the sanitized latest evaluation error for ruleID, if any.
+func (s *Service) RuleLastError(ruleID int) string {
+	if s == nil || s.evaluator == nil {
+		return ""
+	}
+	return s.evaluator.RuleLastError(ruleID)
+}
+
+// RuleStatus returns the latest runtime evaluation status for ruleID.
+func (s *Service) RuleStatus(ruleID int) (RuleEvaluationStatus, bool) {
+	if s == nil || s.evaluator == nil {
+		return RuleEvaluationStatus{}, false
+	}
+	return s.evaluator.RuleStatus(ruleID)
+}
+
+// Diagnostics returns live runtime observability across evaluator, outbox, and
+// compiled matcher regex cache.
+func (s *Service) Diagnostics(ctx context.Context) (AlertDiagnostics, error) {
+	diag := AlertDiagnostics{
+		MatcherCache: matcher.DefaultCacheStats(),
+	}
+	if s == nil {
+		return diag, nil
+	}
+	if s.evaluator != nil {
+		diag.Evaluator = s.evaluator.Snapshot()
+	}
+	if s.outbox != nil {
+		outboxSnap, err := s.outbox.Snapshot(ctx)
+		if err != nil {
+			return diag, err
+		}
+		diag.Outbox = outboxSnap
+	} else if s.store != nil {
+		depth, err := s.store.NotificationOutboxDepth(ctx)
+		if err != nil {
+			return diag, err
+		}
+		diag.Outbox.Depth = depth
+	}
+	return diag, nil
+}
+
 type RuleInput struct {
 	Project          string            `json:"project"`
 	Name             string            `json:"name"`
@@ -183,9 +244,59 @@ func ValidateRuleFor(raw string) error {
 	return nil
 }
 
+// ValidateRuleExpr validates a rule expression according to its signal type.
+// Metrics rules are parsed with the PromQL parser; logs rules verify non-empty
+// bounded LogsQL input without control characters.
+func ValidateRuleExpr(signal, expr string) error {
+	trimmed := strings.TrimSpace(expr)
+	if trimmed == "" {
+		return fmt.Errorf("%w: alert expression is required", ErrInvalidInput)
+	}
+	if len(trimmed) > maxRuleExprLength {
+		return fmt.Errorf("%w: alert expression exceeds maximum length of %d bytes", ErrInvalidInput, maxRuleExprLength)
+	}
+	for _, r := range trimmed {
+		if r == 0 || (r < 0x20 && r != '\t' && r != '\n' && r != '\r') {
+			return fmt.Errorf("%w: alert expression contains invalid control characters", ErrInvalidInput)
+		}
+	}
+	if signal == "" || signal == "metrics" {
+		if _, err := promparser.NewParser(promparser.Options{}).ParseExpr(trimmed); err != nil {
+			return fmt.Errorf("%w: invalid PromQL expression: %s", ErrInvalidInput, err.Error())
+		}
+		return nil
+	}
+	if signal == "logs" {
+		return nil
+	}
+	return fmt.Errorf("%w: unsupported alert signal %q", ErrInvalidInput, signal)
+}
+
+// ValidateRuleLabels ensures custom rule label keys are non-empty.
+func ValidateRuleLabels(labels map[string]string) error {
+	for k := range labels {
+		if strings.TrimSpace(k) == "" {
+			return fmt.Errorf("%w: alert label name must not be empty", ErrInvalidInput)
+		}
+	}
+	return nil
+}
+
+// ValidateChannelType verifies that kind (or its canonical alias) is a
+// supported notification channel type.
+func ValidateChannelType(kind string) error {
+	switch NormalizeChannelType(strings.TrimSpace(kind)) {
+	case "webhook", "feishu", "dingtalk", "wecom", "smtp", "slack":
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported channel type %q", ErrInvalidInput, kind)
+	}
+}
+
 // NormalizeChannelType maps legacy aliases (such as "email") to canonical
 // channel types.
 func NormalizeChannelType(v string) string {
+	v = strings.TrimSpace(v)
 	if v == "email" {
 		return "smtp"
 	}
@@ -223,7 +334,12 @@ func NormalizeChannelConfig(kind string, config map[string]any) map[string]any {
 func (s *Service) ListRules(ctx context.Context, slug string) ([]meta.AlertRuleView, error) {
 	return s.store.ListAlertRules(ctx, slug)
 }
+
 func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleView, error) {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return meta.AlertRuleView{}, fmt.Errorf("%w: alert rule name is required", ErrInvalidInput)
+	}
 	if in.EvaluationEngine != "" && in.EvaluationEngine != "native" {
 		return meta.AlertRuleView{}, fmt.Errorf(
 			"%w: unsupported alert evaluation engine %q",
@@ -231,26 +347,35 @@ func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleV
 			in.EvaluationEngine,
 		)
 	}
-	if in.Signal != "" && in.Signal != "metrics" && in.Signal != "logs" {
+	signal := defaultString(strings.TrimSpace(in.Signal), "metrics")
+	if signal != "metrics" && signal != "logs" {
 		return meta.AlertRuleView{}, fmt.Errorf("%w: unsupported alert signal %q", ErrInvalidInput, in.Signal)
 	}
-	forDuration := defaultString(in.For, "0s")
+	expr := strings.TrimSpace(in.Expr)
+	if err := ValidateRuleExpr(signal, expr); err != nil {
+		return meta.AlertRuleView{}, err
+	}
+	forDuration := defaultString(strings.TrimSpace(in.For), "0s")
 	if err := ValidateRuleFor(forDuration); err != nil {
+		return meta.AlertRuleView{}, err
+	}
+	if err := ValidateRuleLabels(in.Labels); err != nil {
 		return meta.AlertRuleView{}, err
 	}
 	return s.store.CreateAlertRule(ctx, meta.AlertRuleCreate{
 		ProjectSlug: in.Project,
-		Name:        in.Name,
-		Signal:      defaultString(in.Signal, "metrics"),
-		Expression:  in.Expr,
+		Name:        name,
+		Signal:      signal,
+		Expression:  expr,
 		For:         forDuration,
-		Severity:    defaultString(in.Severity, "warning"),
+		Severity:    defaultString(strings.TrimSpace(in.Severity), "warning"),
 		Labels:      nonNilMap(in.Labels),
 		Annotations: nonNilMap(in.Annotations),
 		Enabled:     in.Enabled,
 		ChannelIDs:  in.ChannelIDs,
 	})
 }
+
 func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.AlertRuleView, error) {
 	if in.EvaluationEngine != "" && in.EvaluationEngine != "native" {
 		return meta.AlertRuleView{}, fmt.Errorf(
@@ -259,31 +384,50 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 			in.EvaluationEngine,
 		)
 	}
-	if in.Signal != "" && in.Signal != "metrics" && in.Signal != "logs" {
+	trimmedSignal := strings.TrimSpace(in.Signal)
+	if trimmedSignal != "" && trimmedSignal != "metrics" && trimmedSignal != "logs" {
 		return meta.AlertRuleView{}, fmt.Errorf("%w: unsupported alert signal %q", ErrInvalidInput, in.Signal)
 	}
 	if in.For != "" {
-		if err := ValidateRuleFor(in.For); err != nil {
+		if err := ValidateRuleFor(strings.TrimSpace(in.For)); err != nil {
 			return meta.AlertRuleView{}, err
 		}
+	}
+	if in.Labels != nil {
+		if err := ValidateRuleLabels(in.Labels); err != nil {
+			return meta.AlertRuleView{}, err
+		}
+	}
+	if in.Name != "" && strings.TrimSpace(in.Name) == "" {
+		return meta.AlertRuleView{}, fmt.Errorf("%w: alert rule name must not be blank", ErrInvalidInput)
 	}
 	old, err := s.store.AlertRule(ctx, in.Project, id)
 	if err != nil {
 		return meta.AlertRuleView{}, err
 	}
-	resolveFiring := (in.Expr != "" && in.Expr != old.Expression) ||
-		(in.Signal != "" && in.Signal != old.Signal) ||
+	effectiveSignal := old.Signal
+	if trimmedSignal != "" {
+		effectiveSignal = trimmedSignal
+	}
+	effectiveExpr := old.Expression
+	if in.Expr != "" {
+		effectiveExpr = strings.TrimSpace(in.Expr)
+	}
+	if in.Expr != "" || trimmedSignal != "" {
+		if err := ValidateRuleExpr(effectiveSignal, effectiveExpr); err != nil {
+			return meta.AlertRuleView{}, err
+		}
+	}
+	resolveFiring := (in.Expr != "" && effectiveExpr != old.Expression) ||
+		(trimmedSignal != "" && trimmedSignal != old.Signal) ||
 		(in.Enabled != nil && *in.Enabled != old.Enabled)
-	var activeSilences [][]Matcher
+	var activeSilences []matcher.Set
 	if resolveFiring {
 		policy, policyErr := s.store.AlertPolicySnapshot(ctx, old.Project.ID, s.now().UTC())
 		if policyErr != nil {
 			return meta.AlertRuleView{}, policyErr
 		}
-		activeSilences = make([][]Matcher, 0, len(policy.Silences))
-		for _, matchers := range policy.Silences {
-			activeSilences = append(activeSilences, mapsToMatchers(matchers))
-		}
+		activeSilences = matcher.CompileSetsFromMapsLenient(policy.Silences)
 	}
 	var enqueuedResolved bool
 	update := meta.AlertRuleUpdate{
@@ -297,27 +441,30 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 			enabledChannelIDs []int,
 			resolvedAt time.Time,
 		) ([]meta.NotificationOutboxEnqueue, error) {
-			resolvedAlerts := make([]Alert, 0, len(resolvedStates))
-			for _, state := range resolvedStates {
-				a := alertFromRuleState(state, "resolved", resolvedAt)
-				if !matchesAny(a.Labels, activeSilences) {
-					resolvedAlerts = append(resolvedAlerts, a)
-				}
+			candidates := make([]AlertCandidate, 0, len(resolvedStates))
+			for _, st := range resolvedStates {
+				candidates = append(candidates, AlertCandidate{
+					Alert: alertFromRuleState(st, "resolved", resolvedAt),
+				})
 			}
-			if len(resolvedAlerts) == 0 {
+			ruleID := old.ID
+			plan := PlanNotifications(PlanConfig{
+				ProjectSlug:    old.Project.Slug,
+				ProjectID:      old.Project.ID,
+				RuleName:       old.Name,
+				RuleID:         &ruleID,
+				GroupKey:       nativeGroupKey(old.ID),
+				RepeatInterval: s.repeatInterval,
+				Now:            resolvedAt,
+			}, CompiledPolicy{Silences: activeSilences}, candidates)
+			if len(plan.Notifications) == 0 {
 				return nil, nil
 			}
-			ruleView := old
-			ruleView.EnabledChannelIDs = enabledChannelIDs
-			entries := nativeOutboxEntries(
-				&ruleView,
-				&old.Project,
-				[]Notification{{
-					Project: old.Project.Slug,
-					Rule:    old.Name,
-					Status:  "resolved",
-					Alerts:  resolvedAlerts,
-				}},
+			entries := BuildOutboxEntries(
+				old.Project.ID,
+				&ruleID,
+				enabledChannelIDs,
+				plan.Notifications,
 				resolvedAt,
 				s.repeatInterval,
 			)
@@ -328,19 +475,22 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 		},
 	}
 	if in.Name != "" {
-		update.Name = &in.Name
+		trimmedName := strings.TrimSpace(in.Name)
+		update.Name = &trimmedName
 	}
-	if in.Signal != "" {
-		update.Signal = &in.Signal
+	if trimmedSignal != "" {
+		update.Signal = &trimmedSignal
 	}
 	if in.Expr != "" {
-		update.Expression = &in.Expr
+		update.Expression = &effectiveExpr
 	}
 	if in.For != "" {
-		update.For = &in.For
+		trimmedFor := strings.TrimSpace(in.For)
+		update.For = &trimmedFor
 	}
 	if in.Severity != "" {
-		update.Severity = &in.Severity
+		trimmedSeverity := strings.TrimSpace(in.Severity)
+		update.Severity = &trimmedSeverity
 	}
 	if in.ChannelIDs != nil {
 		update.ChannelIDs = &in.ChannelIDs
@@ -349,13 +499,23 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 	if err != nil {
 		return meta.AlertRuleView{}, err
 	}
+	if s.evaluator != nil {
+		s.evaluator.ClearRuleStatus(id)
+	}
 	if enqueuedResolved {
 		s.WakeOutbox()
 	}
 	return updated, nil
 }
+
 func (s *Service) DeleteRule(ctx context.Context, projectSlug string, id int) error {
-	return s.store.DeleteAlertRule(ctx, projectSlug, id)
+	if err := s.store.DeleteAlertRule(ctx, projectSlug, id); err != nil {
+		return err
+	}
+	if s.evaluator != nil {
+		s.evaluator.ClearRuleStatus(id)
+	}
+	return nil
 }
 
 type ChannelInput struct {
@@ -370,8 +530,19 @@ func (s *Service) ListChannels(ctx context.Context) ([]meta.NotificationChannelV
 }
 
 func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (meta.NotificationChannelView, error) {
+	if err := ValidateChannelType(in.Type); err != nil {
+		return meta.NotificationChannelView{}, err
+	}
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return meta.NotificationChannelView{}, fmt.Errorf("%w: notification channel name is required", ErrInvalidInput)
+	}
 	in.Type = NormalizeChannelType(in.Type)
+	in.Name = name
 	in.Config = NormalizeChannelConfig(in.Type, in.Config)
+	if in.Config == nil {
+		in.Config = map[string]any{}
+	}
 	if err := validateChannelConfig(in.Type, in.Config, s.sender.Outbound); err != nil {
 		return meta.NotificationChannelView{}, err
 	}
@@ -381,13 +552,25 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (meta.Noti
 }
 
 func (s *Service) UpdateChannel(ctx context.Context, id int, in ChannelInput) (meta.NotificationChannelView, error) {
-	in.Type = NormalizeChannelType(in.Type)
+	if in.Type != "" {
+		if err := ValidateChannelType(in.Type); err != nil {
+			return meta.NotificationChannelView{}, err
+		}
+		in.Type = NormalizeChannelType(in.Type)
+	}
+	if in.Name != "" && strings.TrimSpace(in.Name) == "" {
+		return meta.NotificationChannelView{}, fmt.Errorf(
+			"%w: notification channel name must not be blank",
+			ErrInvalidInput,
+		)
+	}
 	update := meta.NotificationChannelUpdate{Enabled: in.Enabled}
 	if in.Type != "" {
 		update.Type = &in.Type
 	}
 	if in.Name != "" {
-		update.Name = &in.Name
+		trimmedName := strings.TrimSpace(in.Name)
+		update.Name = &trimmedName
 	}
 	if in.Config != nil {
 		existing, loadErr := s.store.NotificationChannel(ctx, id)
@@ -562,9 +745,11 @@ func isSecretConfigField(key string) bool {
 	}
 	return false
 }
+
 func (s *Service) DeleteChannel(ctx context.Context, id int) error {
 	return s.store.DeleteNotificationChannel(ctx, id)
 }
+
 func (s *Service) TestChannel(ctx context.Context, id int) error {
 	ch, err := s.store.NotificationChannel(ctx, id)
 	if err != nil {
@@ -595,6 +780,7 @@ type SilenceInput struct {
 func (s *Service) ListSilences(ctx context.Context, slug string) ([]meta.SilenceView, error) {
 	return s.store.ListSilences(ctx, slug)
 }
+
 func (s *Service) CreateSilence(ctx context.Context, in SilenceInput) (meta.SilenceView, error) {
 	if err := ValidateMatchers(in.Matchers); err != nil {
 		return meta.SilenceView{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
@@ -615,6 +801,7 @@ func (s *Service) CreateSilence(ctx context.Context, in SilenceInput) (meta.Sile
 		Creator:     in.Creator,
 	})
 }
+
 func (s *Service) UpdateSilence(ctx context.Context, id int, in SilenceInput) (meta.SilenceView, error) {
 	if in.Matchers != nil {
 		if err := ValidateMatchers(in.Matchers); err != nil {
@@ -653,9 +840,11 @@ func (s *Service) UpdateSilence(ctx context.Context, id int, in SilenceInput) (m
 	}
 	return s.store.UpdateSilence(ctx, in.Project, id, update)
 }
+
 func (s *Service) DeleteSilence(ctx context.Context, projectSlug string, id int) error {
 	return s.store.DeleteSilence(ctx, projectSlug, id)
 }
+
 func (s *Service) ListEvents(
 	ctx context.Context,
 	slug, status string,
@@ -680,6 +869,43 @@ func (s *Service) activeSilences(ctx context.Context, slug string, now time.Time
 	return out, nil
 }
 
+func (s *Service) platformPolicy(
+	ctx context.Context,
+	slug string,
+	now time.Time,
+	localSources []Alert,
+	localGroups []GroupSummary,
+	excludeGroupKey string,
+) (CompiledPolicy, error) {
+	if s.store == nil {
+		return CompilePolicy(nil, nil, localSources, localGroups), nil
+	}
+	projectInfo, err := s.store.ProjectBySlug(ctx, slug)
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+	policySnap, err := s.store.AlertPolicySnapshot(ctx, projectInfo.ID, now)
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+	firingRules, err := s.store.ProjectFiringAlertRuleStates(ctx, projectInfo.ID)
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+	firingPlatform, err := s.store.ProjectFiringPlatformAlertStates(ctx, projectInfo.ID)
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+	return CompilePolicyFromMeta(
+		policySnap,
+		firingRules,
+		firingPlatform,
+		localSources,
+		localGroups,
+		excludeGroupKey,
+	), nil
+}
+
 type InhibitionRuleInput struct {
 	Project        string    `json:"project"`
 	SourceMatchers []Matcher `json:"source_matchers"`
@@ -694,17 +920,15 @@ func (s *Service) ListInhibitionRules(ctx context.Context, slug string) ([]meta.
 }
 
 func (s *Service) CreateInhibitionRule(ctx context.Context, in InhibitionRuleInput) (meta.InhibitionRuleView, error) {
-	if err := ValidateMatchers(in.SourceMatchers); err != nil {
-		return meta.InhibitionRuleView{}, fmt.Errorf("%w: source_matchers: %w", ErrInvalidInput, err)
-	}
-	if err := ValidateMatchers(in.TargetMatchers); err != nil {
-		return meta.InhibitionRuleView{}, fmt.Errorf("%w: target_matchers: %w", ErrInvalidInput, err)
+	compiled, err := matcher.CompileInhibitionRule(in.SourceMatchers, in.TargetMatchers, in.EqualLabels)
+	if err != nil {
+		return meta.InhibitionRuleView{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
 	}
 	rule, err := s.store.CreateInhibitionRule(ctx, meta.InhibitionRuleCreate{
 		ProjectSlug:    in.Project,
 		SourceMatchers: matchersToMaps(in.SourceMatchers),
 		TargetMatchers: matchersToMaps(in.TargetMatchers),
-		EqualLabels:    nonNilStrings(in.EqualLabels),
+		EqualLabels:    nonNilStrings(compiled.EqualLabels),
 		Enabled:        in.Enabled,
 		Comment:        in.Comment,
 	})
@@ -730,6 +954,21 @@ func (s *Service) UpdateInhibitionRule(
 			return meta.InhibitionRuleView{}, fmt.Errorf("%w: target_matchers: %w", ErrInvalidInput, err)
 		}
 	}
+	var cleanedEqualLabels []string
+	if in.EqualLabels != nil {
+		cleanedEqualLabels = make([]string, 0, len(in.EqualLabels))
+		for i, label := range in.EqualLabels {
+			trimmed := strings.TrimSpace(label)
+			if trimmed == "" {
+				return meta.InhibitionRuleView{}, fmt.Errorf(
+					"%w: equal_labels[%d] must not be empty",
+					ErrInvalidInput,
+					i,
+				)
+			}
+			cleanedEqualLabels = append(cleanedEqualLabels, trimmed)
+		}
+	}
 	update := meta.InhibitionRuleUpdate{Enabled: in.Enabled}
 	if in.SourceMatchers != nil {
 		update.SourceMatchers = matchersToMaps(in.SourceMatchers)
@@ -738,7 +977,7 @@ func (s *Service) UpdateInhibitionRule(
 		update.TargetMatchers = matchersToMaps(in.TargetMatchers)
 	}
 	if in.EqualLabels != nil {
-		update.EqualLabels = in.EqualLabels
+		update.EqualLabels = cleanedEqualLabels
 	}
 	if in.Comment != "" {
 		update.Comment = &in.Comment
@@ -792,24 +1031,17 @@ func (s *Service) recomputeInhibited(ctx context.Context, slug string) error {
 	if err != nil {
 		return err
 	}
-	rules := make([]InhibitionRule, 0, len(policy.InhibitionRules))
-	for _, item := range policy.InhibitionRules {
-		rules = append(rules, InhibitionRule{
-			SourceMatchers: mapsToMatchers(item.SourceMatchers),
-			TargetMatchers: mapsToMatchers(item.TargetMatchers),
-			EqualLabels:    item.EqualLabels,
-		})
+	firingPlatform, err := s.store.ProjectFiringPlatformAlertStates(ctx, projectInfo.ID)
+	if err != nil {
+		return err
 	}
-	sources := make([]Alert, 0, len(policy.FiringEvents))
-	for _, event := range policy.FiringEvents {
-		sources = append(sources, Alert{Status: "firing", Labels: event.Labels, Fingerprint: event.Fingerprint})
-	}
+	compiled := CompilePolicyFromMeta(policy, nil, firingPlatform, nil, nil, "")
 	updates := make([]meta.AlertEventInhibition, 0, len(policy.FiringEvents))
 	for _, event := range policy.FiringEvents {
-		inhibited := IsInhibited(
-			Alert{Status: "firing", Labels: event.Labels, Fingerprint: event.Fingerprint},
-			sources,
-			rules,
+		inhibited := matcher.IsInhibited(
+			matcher.AlertRef{Fingerprint: event.Fingerprint, Status: "firing", Labels: event.Labels},
+			compiled.Sources,
+			compiled.Inhibitions,
 		)
 		if event.Inhibited != inhibited {
 			updates = append(updates, meta.AlertEventInhibition{EventID: event.ID, Inhibited: inhibited})
@@ -817,6 +1049,7 @@ func (s *Service) recomputeInhibited(ctx context.Context, slug string) error {
 	}
 	return s.store.SetAlertEventInhibition(ctx, updates)
 }
+
 func (s *Service) notify(ctx context.Context, n Notification) error {
 	if n.Storm != nil {
 		return s.notifyStorm(ctx, n)
@@ -827,30 +1060,45 @@ func (s *Service) notify(ctx context.Context, n Notification) error {
 	return nil
 }
 
+func (s *Service) enqueueOutboxEntries(ctx context.Context, entries []meta.NotificationOutboxEnqueue) error {
+	var errs []error
+	wake := false
+	for _, entry := range entries {
+		_, inserted, enqueueErr := s.store.EnqueueNotification(ctx, entry)
+		if enqueueErr != nil {
+			errs = append(errs, fmt.Errorf("enqueue notification for channel %d: %w", entry.ChannelID, enqueueErr))
+			continue
+		}
+		if inserted {
+			wake = true
+		}
+	}
+	if wake {
+		s.WakeOutbox()
+	}
+	return errors.Join(errs...)
+}
+
 func (s *Service) notifyStorm(ctx context.Context, n Notification) error {
 	channels, projectInfo, err := s.store.StormNotificationChannels(ctx, n.Project)
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(n)
-	if err != nil {
-		return err
-	}
-	bucket := s.now().UnixNano() / s.repeatInterval.Nanoseconds()
-	keyPayload := append(append([]byte(nil), payload...), []byte(fmt.Sprintf("\x00storm\x00%d", bucket))...)
-	var errs []error
+	channelIDs := make([]int, 0, len(channels))
 	for _, ch := range channels {
-		_, inserted, enqueueErr := s.store.EnqueueNotification(ctx, meta.NotificationOutboxEnqueue{
-			IdempotencyKey: notificationOutboxKey(ch.ID, keyPayload), ProjectID: projectInfo.ID,
-			ChannelID: ch.ID, Payload: payload,
-		})
-		if enqueueErr != nil {
-			errs = append(errs, enqueueErr)
-		} else if inserted {
-			s.outbox.Wake()
+		if ch.Enabled {
+			channelIDs = append(channelIDs, ch.ID)
 		}
 	}
-	return errors.Join(errs...)
+	entries := BuildOutboxEntries(
+		projectInfo.ID,
+		nil,
+		channelIDs,
+		[]Notification{n},
+		s.now().UTC(),
+		s.repeatInterval,
+	)
+	return s.enqueueOutboxEntries(ctx, entries)
 }
 
 const errorRateWindow = 5 * time.Minute
@@ -895,11 +1143,12 @@ func (s *Service) PutProjectAlertConfig(
 	return cfg, nil
 }
 
-// HandleIssueChange evaluates silence and inhibition policy for a committed
-// issue lifecycle event and durably enqueues matching platform notifications
-// into notification_outbox before returning nil. Returning only after the
-// outbox write commits eliminates the crash window where an in-memory GroupWait
-// timer could be lost after issue_lifecycle_events was marked dispatched.
+// HandleIssueChange evaluates silence, inhibition, and storm policy through
+// the unified compiled planner for a committed issue lifecycle event and
+// durably enqueues matching platform notifications into notification_outbox
+// before returning nil. Returning only after the outbox write commits
+// eliminates the crash window where an in-memory GroupWait timer could be lost
+// after issue_lifecycle_events was marked dispatched (ADR 0007).
 func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.IssueChange) error {
 	cfg, p, err := s.cachedPlatformConfig(ctx, change.ProjectID)
 	if err != nil {
@@ -924,39 +1173,37 @@ func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.Issue
 		Transient: true,
 	}
 	alertItem.Fingerprint = Fingerprint(alertItem.Labels)
-	policy, err := s.store.AlertPolicySnapshot(ctx, change.ProjectID, s.now().UTC())
+	now := s.now().UTC()
+	groupKey := platformGroupKey(change.Kind)
+	compiledPolicy, err := s.platformPolicy(ctx, p.Slug, now, nil, nil, groupKey)
 	if err != nil {
 		return err
 	}
-	for _, silenceMatchers := range policy.Silences {
-		if MatchLabels(alertItem.Labels, mapsToMatchers(silenceMatchers)) {
-			return nil
+	plan := PlanNotifications(PlanConfig{
+		ProjectSlug:    p.Slug,
+		ProjectID:      p.ID,
+		RuleName:       change.Kind,
+		GroupKey:       groupKey,
+		RepeatInterval: s.repeatInterval,
+		StormThreshold: s.stormThreshold,
+		Now:            now,
+	}, compiledPolicy, []AlertCandidate{{Alert: alertItem, DueOverride: true}})
+	if len(plan.Notifications) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, notification := range plan.Notifications {
+		if notification.Storm != nil {
+			if stormErr := s.notifyStorm(ctx, notification); stormErr != nil {
+				errs = append(errs, stormErr)
+			}
+			continue
+		}
+		if notifyErr := s.notifyPlatformLifecycle(ctx, notification, change.LifecycleID); notifyErr != nil {
+			errs = append(errs, notifyErr)
 		}
 	}
-	if len(policy.InhibitionRules) > 0 && len(policy.FiringEvents) > 0 {
-		rules := make([]InhibitionRule, 0, len(policy.InhibitionRules))
-		for _, item := range policy.InhibitionRules {
-			rules = append(rules, InhibitionRule{
-				SourceMatchers: mapsToMatchers(item.SourceMatchers),
-				TargetMatchers: mapsToMatchers(item.TargetMatchers),
-				EqualLabels:    item.EqualLabels,
-			})
-		}
-		sources := make([]Alert, 0, len(policy.FiringEvents))
-		for _, event := range policy.FiringEvents {
-			sources = append(sources, Alert{Status: "firing", Labels: event.Labels, Fingerprint: event.Fingerprint})
-		}
-		if IsInhibited(alertItem, sources, rules) {
-			return nil
-		}
-	}
-	notification := Notification{
-		Project: p.Slug,
-		Rule:    change.Kind,
-		Status:  "firing",
-		Alerts:  []Alert{alertItem},
-	}
-	return s.notifyPlatformLifecycle(ctx, notification, change.LifecycleID)
+	return errors.Join(errs...)
 }
 
 // RecordErrorEvent uses a durable five-minute sliding window. A spike fires
@@ -1062,9 +1309,16 @@ func (s *Service) runPlatformErrorRateMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.CheckErrorRateRecoveries(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				slog.Warn("check platform error rate recoveries", "error", err)
-			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("panic recovered in platform error rate monitor", "panic", r)
+					}
+				}()
+				if err := s.CheckErrorRateRecoveries(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Warn("check platform error rate recoveries", "error", err)
+				}
+			}()
 		}
 	}
 }
@@ -1126,55 +1380,22 @@ func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, l
 		return nil
 	}
 	n = s.attachIssueAIAnalysis(ctx, n)
-	payload, marshalErr := json.Marshal(n)
-	if marshalErr != nil {
-		return fmt.Errorf("encode platform notification: %w", marshalErr)
-	}
-	var keyPayload []byte
-	if lifecycleID > 0 {
-		// Pin durable issue_lifecycle_events deliveries to their committed row ID
-		// so retries after partial failure or worker restart deduplicate cleanly
-		// even if optional AI annotations arrive or time advances between attempts.
-		keyPayload = []byte(fmt.Sprintf("issue-lifecycle\x00%d\x00%s\x00%s", lifecycleID, n.Rule, n.Status))
-	} else {
-		// Include rule, status, and repeat generation in the idempotency key so
-		// concurrent replicas deduplicate the same event while repeat deliveries
-		// and subsequent spike cycles are never permanently swallowed.
-		keyPayload = append(slices.Clone(payload), []byte(fmt.Sprintf("\x00platform\x00%s\x00%s", n.Rule, n.Status))...)
-		if n.Status == "firing" && s.repeatInterval > 0 && len(n.Alerts) > 0 && !n.Alerts[0].StartsAt.IsZero() {
-			elapsed := s.now().UTC().Sub(n.Alerts[0].StartsAt.UTC())
-			var generation int64
-			if elapsed > 0 {
-				generation = elapsed.Nanoseconds() / s.repeatInterval.Nanoseconds()
-			}
-			keyPayload = append(keyPayload, []byte(fmt.Sprintf("\x00%d", generation))...)
-		}
-	}
-	var errs []error
+	channelIDs := make([]int, 0, len(cfg.Channels))
 	for _, ch := range cfg.Channels {
-		if !ch.Enabled {
-			continue
-		}
-		priority := 0
-		if n.Status == "resolved" {
-			priority = 100
-		}
-		_, inserted, enqueueErr := s.store.EnqueueNotification(ctx, meta.NotificationOutboxEnqueue{
-			IdempotencyKey: notificationOutboxKey(ch.ID, keyPayload),
-			ProjectID:      cfg.ProjectID,
-			ChannelID:      ch.ID,
-			Payload:        payload,
-			Priority:       priority,
-		})
-		if enqueueErr != nil {
-			errs = append(errs, fmt.Errorf("enqueue platform notification for channel %d: %w", ch.ID, enqueueErr))
-			continue
-		}
-		if inserted {
-			s.outbox.Wake()
+		if ch.Enabled {
+			channelIDs = append(channelIDs, ch.ID)
 		}
 	}
-	return errors.Join(errs...)
+	entries := BuildOutboxEntriesWithLifecycle(
+		cfg.ProjectID,
+		nil,
+		lifecycleID,
+		channelIDs,
+		[]Notification{n},
+		s.now().UTC(),
+		s.repeatInterval,
+	)
+	return s.enqueueOutboxEntries(ctx, entries)
 }
 
 // attachIssueAIAnalysis is intentionally read-only and best-effort. Automatic
@@ -1250,18 +1471,10 @@ func defaultString(v, d string) string {
 	return v
 }
 func matchersToMaps(ms []Matcher) []map[string]string {
-	out := make([]map[string]string, len(ms))
-	for i, m := range ms {
-		out[i] = map[string]string{"name": m.Name, "value": m.Value, "op": m.Op}
-	}
-	return out
+	return matcher.SpecsToMaps(ms)
 }
 func mapsToMatchers(ms []map[string]string) []Matcher {
-	out := make([]Matcher, len(ms))
-	for i, m := range ms {
-		out[i] = Matcher{Name: m["name"], Value: m["value"], Op: m["op"]}
-	}
-	return out
+	return matcher.SpecsFromMaps(ms)
 }
 func nonNilStrings(values []string) []string {
 	if values == nil {

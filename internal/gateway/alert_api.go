@@ -27,6 +27,7 @@ type alertRuleResponse struct {
 	Annotations      map[string]string `json:"annotations"`
 	Enabled          bool              `json:"enabled"`
 	ChannelIDs       []string          `json:"channel_ids"`
+	LastError        string            `json:"last_error,omitempty"`
 	CreatedAt        string            `json:"created_at"`
 	UpdatedAt        string            `json:"updated_at"`
 }
@@ -160,7 +161,7 @@ func anyMap(value map[string]any) map[string]any {
 	return value
 }
 
-func toAlertRuleResponse(value meta.AlertRuleView) alertRuleResponse {
+func toAlertRuleResponse(value meta.AlertRuleView, lastError string) alertRuleResponse {
 	numericChannelIDs := append([]int(nil), value.ChannelIDs...)
 	sort.Ints(numericChannelIDs)
 	channelIDs := make([]string, 0, len(numericChannelIDs))
@@ -181,15 +182,20 @@ func toAlertRuleResponse(value meta.AlertRuleView) alertRuleResponse {
 		Annotations:      stringMap(value.Annotations),
 		Enabled:          value.Enabled,
 		ChannelIDs:       channelIDs,
+		LastError:        lastError,
 		CreatedAt:        apiTime(value.CreatedAt),
 		UpdatedAt:        apiTime(value.UpdatedAt),
 	}
 }
 
-func toAlertRuleResponses(values []meta.AlertRuleView) []alertRuleResponse {
+func (g *Gateway) toAlertRuleResponses(values []meta.AlertRuleView) []alertRuleResponse {
 	out := make([]alertRuleResponse, 0, len(values))
 	for _, value := range values {
-		out = append(out, toAlertRuleResponse(value))
+		var lastErr string
+		if g.alerts != nil {
+			lastErr = g.alerts.RuleLastError(value.ID)
+		}
+		out = append(out, toAlertRuleResponse(value, lastErr))
 	}
 	return out
 }
@@ -300,6 +306,15 @@ func projectSlug(c fiber.Ctx) string {
 	}
 	return slug
 }
+
+func resolvedProject(c fiber.Ctx) meta.ProjectInfo {
+	p := currentProject(c)
+	if p.Slug == "" {
+		p.Slug = projectSlug(c)
+	}
+	return p
+}
+
 func (g *Gateway) alertingUnavailable(c fiber.Ctx) bool {
 	if g.alerts == nil {
 		_ = c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "alerting unavailable"})
@@ -315,35 +330,63 @@ func alertAPIError(c fiber.Ctx, err error) error {
 	return apiError(c, err)
 }
 
+func alertFailureReason(err error, fallback string) string {
+	if errors.Is(err, alert.ErrInvalidInput) || errors.Is(err, alert.ErrInvalidChannelConfig) {
+		return "invalid_input"
+	}
+	if meta.IsNotFound(err) {
+		return "not_found"
+	}
+	return fallback
+}
+
 func (g *Gateway) listAlertRules(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	v, e := g.alerts.ListRules(c.Context(), projectSlug(c))
+	proj := resolvedProject(c)
+	v, e := g.alerts.ListRules(c.Context(), proj.Slug)
 	if e != nil {
 		return apiError(c, e)
 	}
-	return c.JSON(toAlertRuleResponses(v))
+	return c.JSON(g.toAlertRuleResponses(v))
 }
+
 func (g *Gateway) createAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "alert_rule.create",
+		TargetType:  "alert_rule",
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "create_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var request alertRuleRequest
-	if c.Bind().Body(&request) != nil || strings.TrimSpace(request.Name) == "" ||
-		strings.TrimSpace(request.Expr) == "" ||
-		!validAlertSignal(request.Signal, true) ||
-		(request.EvaluationEngine != "" && request.EvaluationEngine != "native") ||
-		(request.For != "" && alert.ValidateRuleFor(request.For) != nil) {
+	if c.Bind().Body(&request) != nil {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
-	in := request.input(projectSlug(c))
+	audit.TargetName = strings.TrimSpace(request.Name)
+	in := request.input(proj.Slug)
 	v, e := g.alerts.CreateRule(c.Context(), in)
 	if e != nil {
+		audit.FailureReason = alertFailureReason(e, "create_failed")
 		return alertAPIError(c, e)
 	}
-	return c.Status(fiber.StatusCreated).JSON(toAlertRuleResponse(v))
+	audit.TargetID = v.ID
+	audit.TargetName = v.Name
+	audit.Success = true
+	return c.Status(fiber.StatusCreated).JSON(toAlertRuleResponse(v, g.alerts.RuleLastError(v.ID)))
 }
+
 func (g *Gateway) updateAlertRule(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -352,30 +395,38 @@ func (g *Gateway) updateAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "alert_rule.update",
+		TargetType:  "alert_rule",
+		TargetID:    id,
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "update_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var request alertRuleRequest
-	if c.Bind().Body(&request) != nil || !validAlertSignal(request.Signal, true) ||
-		(request.EvaluationEngine != "" && request.EvaluationEngine != "native") ||
-		(request.For != "" && alert.ValidateRuleFor(request.For) != nil) {
+	if c.Bind().Body(&request) != nil {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
-	in := request.input(projectSlug(c))
+	audit.TargetName = strings.TrimSpace(request.Name)
+	in := request.input(proj.Slug)
 	v, e := g.alerts.UpdateRule(c.Context(), id, in)
 	if e != nil {
+		audit.FailureReason = alertFailureReason(e, "update_failed")
 		return alertAPIError(c, e)
 	}
-	return c.JSON(toAlertRuleResponse(v))
+	audit.TargetID = v.ID
+	audit.TargetName = v.Name
+	audit.Success = true
+	return c.JSON(toAlertRuleResponse(v, g.alerts.RuleLastError(v.ID)))
 }
 
-func validAlertSignal(signal string, allowEmpty bool) bool {
-	switch strings.TrimSpace(signal) {
-	case "metrics", "logs":
-		return true
-	case "":
-		return allowEmpty
-	default:
-		return false
-	}
-}
 func (g *Gateway) deleteAlertRule(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -384,9 +435,25 @@ func (g *Gateway) deleteAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	if e := g.alerts.DeleteRule(c.Context(), projectSlug(c), id); e != nil {
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "alert_rule.delete",
+		TargetType:  "alert_rule",
+		TargetID:    id,
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "delete_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
+	if e := g.alerts.DeleteRule(c.Context(), proj.Slug, id); e != nil {
+		audit.FailureReason = alertFailureReason(e, "delete_failed")
 		return apiError(c, e)
 	}
+	audit.Success = true
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -404,6 +471,7 @@ func (g *Gateway) listChannels(c fiber.Ctx) error {
 	}
 	return c.JSON(toNotificationChannelResponses(v))
 }
+
 func (g *Gateway) createChannel(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
@@ -416,19 +484,14 @@ func (g *Gateway) createChannel(c fiber.Ctx) error {
 		g.auditManagement(c, audit)
 	}()
 	var in alert.ChannelInput
-	if c.Bind().Body(&in) != nil || !validChannelType(in.Type) || strings.TrimSpace(in.Name) == "" {
-		audit.TargetName = strings.TrimSpace(in.Name)
+	if c.Bind().Body(&in) != nil {
 		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
 	audit.TargetName = strings.TrimSpace(in.Name)
-	in.Type = alert.NormalizeChannelType(in.Type)
-	in.Config = alert.NormalizeChannelConfig(in.Type, in.Config)
-	if in.Config == nil {
-		in.Config = map[string]any{}
-	}
 	v, e := g.alerts.CreateChannel(c.Context(), in)
 	if e != nil {
+		audit.FailureReason = alertFailureReason(e, "create_failed")
 		return alertAPIError(c, e)
 	}
 	audit.TargetID = v.ID
@@ -436,6 +499,7 @@ func (g *Gateway) createChannel(c fiber.Ctx) error {
 	audit.Success = true
 	return c.Status(fiber.StatusCreated).JSON(toNotificationChannelResponse(v))
 }
+
 func (g *Gateway) updateChannel(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -452,15 +516,14 @@ func (g *Gateway) updateChannel(c fiber.Ctx) error {
 		g.auditManagement(c, audit)
 	}()
 	var in alert.ChannelInput
-	if c.Bind().Body(&in) != nil || (in.Type != "" && !validChannelType(in.Type)) {
+	if c.Bind().Body(&in) != nil {
 		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
 	audit.TargetName = strings.TrimSpace(in.Name)
-	in.Type = alert.NormalizeChannelType(in.Type)
-	in.Config = alert.NormalizeChannelConfig(in.Type, in.Config)
 	v, e := g.alerts.UpdateChannel(c.Context(), id, in)
 	if e != nil {
+		audit.FailureReason = alertFailureReason(e, "update_failed")
 		return alertAPIError(c, e)
 	}
 	audit.TargetID = v.ID
@@ -468,6 +531,7 @@ func (g *Gateway) updateChannel(c fiber.Ctx) error {
 	audit.Success = true
 	return c.JSON(toNotificationChannelResponse(v))
 }
+
 func (g *Gateway) deleteChannel(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -484,11 +548,13 @@ func (g *Gateway) deleteChannel(c fiber.Ctx) error {
 		g.auditManagement(c, audit)
 	}()
 	if e := g.alerts.DeleteChannel(c.Context(), id); e != nil {
+		audit.FailureReason = alertFailureReason(e, "delete_failed")
 		return apiError(c, e)
 	}
 	audit.Success = true
 	return c.SendStatus(fiber.StatusNoContent)
 }
+
 func (g *Gateway) testChannel(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -497,50 +563,72 @@ func (g *Gateway) testChannel(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	audit := auditEvent{Action: "notification_channel.test", TargetType: "notification_channel", TargetID: id}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "test_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	if e := g.alerts.TestChannel(c.Context(), id); e != nil {
 		if meta.IsNotFound(e) {
+			audit.FailureReason = "not_found"
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 		}
+		audit.FailureReason = "delivery_failed"
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": outbound.SanitizeError(e)})
 	}
+	audit.Success = true
 	return c.JSON(channelTestResponse{OK: true, Message: "test notification sent"})
-}
-func validChannelType(v string) bool {
-	switch alert.NormalizeChannelType(v) {
-	case "webhook", "feishu", "dingtalk", "wecom", "smtp", "slack":
-		return true
-	}
-	return false
 }
 
 func (g *Gateway) listSilences(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	v, e := g.alerts.ListSilences(c.Context(), projectSlug(c))
+	proj := resolvedProject(c)
+	v, e := g.alerts.ListSilences(c.Context(), proj.Slug)
 	if e != nil {
 		return apiError(c, e)
 	}
 	return c.JSON(toSilenceResponses(v))
 }
+
 func (g *Gateway) createSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "silence.create",
+		TargetType:  "silence",
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "create_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var in alert.SilenceInput
-	if c.Bind().Body(&in) != nil || !validMatchers(in.Matchers) || in.StartsAt.IsZero() ||
-		!in.EndsAt.After(in.StartsAt) {
+	if c.Bind().Body(&in) != nil {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	in.Creator = u.Username
-	in.Project = projectSlug(c)
+	in.Project = proj.Slug
 	v, e := g.alerts.CreateSilence(c.Context(), in)
 	if e != nil {
+		audit.FailureReason = alertFailureReason(e, "create_failed")
 		return alertAPIError(c, e)
 	}
+	audit.TargetID = v.ID
+	audit.Success = true
 	return c.Status(fiber.StatusCreated).JSON(toSilenceResponse(v))
 }
+
 func (g *Gateway) updateSilence(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -549,17 +637,36 @@ func (g *Gateway) updateSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "silence.update",
+		TargetType:  "silence",
+		TargetID:    id,
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "update_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var in alert.SilenceInput
-	if c.Bind().Body(&in) != nil || (in.Matchers != nil && !validMatchers(in.Matchers)) {
+	if c.Bind().Body(&in) != nil {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
-	in.Project = projectSlug(c)
+	in.Project = proj.Slug
 	v, e := g.alerts.UpdateSilence(c.Context(), id, in)
 	if e != nil {
+		audit.FailureReason = alertFailureReason(e, "update_failed")
 		return alertAPIError(c, e)
 	}
+	audit.TargetID = v.ID
+	audit.Success = true
 	return c.JSON(toSilenceResponse(v))
 }
+
 func (g *Gateway) deleteSilence(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -568,15 +675,33 @@ func (g *Gateway) deleteSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	if e := g.alerts.DeleteSilence(c.Context(), projectSlug(c), id); e != nil {
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "silence.delete",
+		TargetType:  "silence",
+		TargetID:    id,
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "delete_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
+	if e := g.alerts.DeleteSilence(c.Context(), proj.Slug, id); e != nil {
+		audit.FailureReason = alertFailureReason(e, "delete_failed")
 		return apiError(c, e)
 	}
+	audit.Success = true
 	return c.SendStatus(fiber.StatusNoContent)
 }
+
 func (g *Gateway) listAlerts(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	proj := resolvedProject(c)
 	status := c.Query("status")
 	if status != "" && status != "firing" && status != "resolved" {
 		return badRequest(c)
@@ -589,7 +714,7 @@ func (g *Gateway) listAlerts(c fiber.Ctx) error {
 		}
 		inhibited = &value
 	}
-	v, e := g.alerts.ListEvents(c.Context(), projectSlug(c), status, inhibited)
+	v, e := g.alerts.ListEvents(c.Context(), proj.Slug, status, inhibited)
 	if e != nil {
 		return apiError(c, e)
 	}
@@ -600,7 +725,8 @@ func (g *Gateway) listInhibitionRules(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	v, err := g.alerts.ListInhibitionRules(c.Context(), projectSlug(c))
+	proj := resolvedProject(c)
+	v, err := g.alerts.ListInhibitionRules(c.Context(), proj.Slug)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -611,20 +737,33 @@ func (g *Gateway) createInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "inhibition_rule.create",
+		TargetType:  "inhibition_rule",
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "create_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var in alert.InhibitionRuleInput
-	if c.Bind().Body(&in) != nil || !validMatchers(in.SourceMatchers) || !validMatchers(in.TargetMatchers) {
+	if c.Bind().Body(&in) != nil {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
-	in.Project = projectSlug(c)
+	in.Project = proj.Slug
 	v, err := g.alerts.CreateInhibitionRule(c.Context(), in)
 	if err != nil {
+		audit.FailureReason = alertFailureReason(err, "create_failed")
 		return alertAPIError(c, err)
 	}
+	audit.TargetID = v.ID
+	audit.Success = true
 	return c.Status(fiber.StatusCreated).JSON(v)
-}
-
-func validMatchers(matchers []alert.Matcher) bool {
-	return alert.ValidateMatchers(matchers) == nil
 }
 
 func (g *Gateway) updateInhibitionRule(c fiber.Ctx) error {
@@ -635,16 +774,33 @@ func (g *Gateway) updateInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "inhibition_rule.update",
+		TargetType:  "inhibition_rule",
+		TargetID:    id,
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "update_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var in alert.InhibitionRuleInput
-	if c.Bind().Body(&in) != nil || (in.SourceMatchers != nil && !validMatchers(in.SourceMatchers)) ||
-		(in.TargetMatchers != nil && !validMatchers(in.TargetMatchers)) {
+	if c.Bind().Body(&in) != nil {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
-	in.Project = projectSlug(c)
+	in.Project = proj.Slug
 	v, err := g.alerts.UpdateInhibitionRule(c.Context(), id, in)
 	if err != nil {
+		audit.FailureReason = alertFailureReason(err, "update_failed")
 		return alertAPIError(c, err)
 	}
+	audit.TargetID = v.ID
+	audit.Success = true
 	return c.JSON(v)
 }
 
@@ -656,8 +812,24 @@ func (g *Gateway) deleteInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	if err := g.alerts.DeleteInhibitionRule(c.Context(), projectSlug(c), id); err != nil {
+	proj := resolvedProject(c)
+	audit := auditEvent{
+		Action:      "inhibition_rule.delete",
+		TargetType:  "inhibition_rule",
+		TargetID:    id,
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "delete_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
+	if err := g.alerts.DeleteInhibitionRule(c.Context(), proj.Slug, id); err != nil {
+		audit.FailureReason = alertFailureReason(err, "delete_failed")
 		return apiError(c, err)
 	}
+	audit.Success = true
 	return c.SendStatus(fiber.StatusNoContent)
 }

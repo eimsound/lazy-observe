@@ -1,6 +1,10 @@
 package alert
 
-import "time"
+import (
+	"time"
+
+	"github.com/eimsound/lazy-observe/internal/alert/matcher"
+)
 
 func cloneStrings(values map[string]string) map[string]string {
 	cloned := make(map[string]string, len(values))
@@ -40,11 +44,8 @@ type StormSummary struct {
 	Rules      []Count `json:"rules"`
 }
 
-type Matcher struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-	Op    string `json:"op"`
-}
+// Matcher is a strongly typed label matcher spec backed by internal/alert/matcher.
+type Matcher = matcher.Spec
 
 type InhibitionRule struct {
 	SourceMatchers []Matcher
