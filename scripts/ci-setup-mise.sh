@@ -214,6 +214,27 @@ for i in "${!pin_names[@]}"; do
 done
 printf '\n'
 
+# go 后端工具（go:…）是 `go install` 用安装当时的 Go 编出来的；CI 的 mise 缓存按前缀恢复，升 go 后会复用旧 Go 编的二进制。
+# 旧 Go 的 go/types 读不了新标准库（govulncheck 报 "file requires newer Go version go1.27 (application built with go1.26)"），
+# 所以编译它的 Go 与当前 go 不一致就强制重装。
+go_version=
+for tool in "${ci_tools[@]}"; do
+  [[ $tool == go:* ]] || continue
+  [[ -n $go_version ]] || go_version=$("$mise_bin" exec -- go env GOVERSION)
+  tool_dir=$("$mise_bin" where "$tool")
+  built=
+  rebuild=0
+  for bin in "$tool_dir"/bin/*; do
+    [[ -f $bin ]] || continue
+    built=$("$mise_bin" exec -- go version "$bin" | awk '{print $NF}')
+    [[ $built == "$go_version" ]] || rebuild=1
+  done
+  if ((rebuild)); then
+    printf 'ci-setup-mise: %s was built with %s, current go is %s; reinstalling\n' "$tool" "$built" "$go_version"
+    "$mise_bin" install --force "$tool"
+  fi
+done
+
 for tool in "${ci_tools[@]}"; do
   if [[ $tool == pnpm || $tool == pnpm@* ]]; then
     "$mise_bin" exec -- pnpm config set store-dir "${HOME}/.pnpm-store"

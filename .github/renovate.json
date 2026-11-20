@@ -409,6 +409,20 @@
       "groupSlug": "ent"
     },
     {
+      "description": "entc.mod 显式固定的 golang.org/x/tools（ent 自带的 v0.30.0 读不了 go 1.27 的标准库，ent-generate 报 package without types）。entc.sum 同样补不出来，并进 ent 组一起手工补，不进 gomod minor-patch 大组",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "entc.mod"
+      ],
+      "matchPackageNames": [
+        "golang.org/x/tools"
+      ],
+      "groupName": "ent",
+      "groupSlug": "ent"
+    },
+    {
       "description": "pnpm 工程：每个工程（含 examples，同一 lockfile）minor+patch 合一组，major 单独",
       "matchManagers": [
         "npm"
