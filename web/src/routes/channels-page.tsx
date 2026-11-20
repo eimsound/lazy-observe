@@ -30,11 +30,12 @@ import {
   initChannelFormConfig,
 } from "@/lib/alerts/channel-summary";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageChannels } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { formatErrorMessage } from "@/lib/api/errors";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -58,6 +59,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { queryViewState } from "./query-view-state";
 
 function typeLabelKey(type: ChannelType): string {
   if (type === "smtp") return "alerts.typeEmail";
@@ -68,7 +70,7 @@ function typeLabelKey(type: ChannelType): string {
 export function ChannelsPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
-  const canManage = canManageChannels(role);
+  const canManage = hasCapability(role, "channels:write");
   const queryClient = useQueryClient();
 
   const channels = useQuery({
@@ -149,6 +151,14 @@ export function ChannelsPage() {
     setFormOpen(true);
   }
 
+  const rows = channels.data ?? [];
+  const viewState = queryViewState({
+    hasData: channels.data !== undefined,
+    isLoading: channels.isLoading,
+    isError: channels.isError,
+    isEmpty: rows.length === 0,
+  });
+
   return (
     <PageContainer>
       <PageActions>
@@ -158,13 +168,20 @@ export function ChannelsPage() {
         </Button>
       </PageActions>
 
-      {channels.isLoading ? (
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={channels.isFetching}
+          onRetry={() => void channels.refetch()}
+        />
+      )}
+
+      {viewState === "pending" ? (
         <div className="grid gap-3 sm:grid-cols-2">
           {[0, 1, 2, 3].map((i) => (
             <Skeleton key={i} className="h-28 w-full" />
           ))}
         </div>
-      ) : channels.isError ? (
+      ) : viewState === "error" ? (
         <Card>
           <CardContent>
             <QueryErrorState
@@ -174,9 +191,19 @@ export function ChannelsPage() {
             />
           </CardContent>
         </Card>
-      ) : channels.data && channels.data.length > 0 ? (
+      ) : viewState === "empty" ? (
+        <Card>
+          <CardContent>
+            <EmptyState
+              icon={<Send className="size-6" />}
+              title={t("alerts.noChannels")}
+              desc={t("alerts.noChannelsDesc")}
+            />
+          </CardContent>
+        </Card>
+      ) : (
         <div className="grid gap-3 sm:grid-cols-2">
-          {channels.data.map((ch) => {
+          {rows.map((ch) => {
             const result = testResults[ch.id];
             const testing = test.isPending && test.variables === ch.id;
             return (
@@ -249,16 +276,6 @@ export function ChannelsPage() {
             );
           })}
         </div>
-      ) : (
-        <Card>
-          <CardContent>
-            <EmptyState
-              icon={<Send className="size-6" />}
-              title={t("alerts.noChannels")}
-              desc={t("alerts.noChannelsDesc")}
-            />
-          </CardContent>
-        </Card>
       )}
 
       {formOpen && (
@@ -269,20 +286,22 @@ export function ChannelsPage() {
           editing={editing}
         />
       )}
-      <ConfirmDialog
-        open={!!deleting}
-        onOpenChange={(o) => !o && setDeleting(null)}
-        title={t("alerts.deleteChannelConfirm", { name: deleting?.name ?? "" })}
-        description={t("alerts.deleteChannelConfirmDesc")}
-        confirmLabel={t("alerts.deleteChannel")}
-        onConfirm={async () => {
-          if (!deleting) return;
-          await deleteChannel(deleting.id);
-          void queryClient.invalidateQueries({ queryKey: ["channels"] });
-          void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
-          setDeleting(null);
-        }}
-      />
+      {deleting && (
+        <ConfirmDialog
+          key={deleting.id}
+          open
+          onOpenChange={(o) => !o && setDeleting(null)}
+          title={t("alerts.deleteChannelConfirm", { name: deleting.name })}
+          description={t("alerts.deleteChannelConfirmDesc")}
+          confirmLabel={t("alerts.deleteChannel")}
+          onConfirm={async () => {
+            await deleteChannel(deleting.id);
+            void queryClient.invalidateQueries({ queryKey: ["channels"] });
+            void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
+            setDeleting(null);
+          }}
+        />
+      )}
     </PageContainer>
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -25,12 +25,13 @@ import {
   type ProjectAPIToken,
 } from "@/lib/api/projects";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageProjects } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { SnippetBlock } from "@/components/common/snippet-block";
 import { SourceMapUploadTokens } from "@/components/projects/source-map-upload-tokens";
@@ -52,13 +53,14 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { queryViewState } from "./query-view-state";
 
 const fmt = (iso: string) => (iso ? formatDateTime(dayjs(iso).valueOf()) : "—");
 
 export function ProjectsPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
-  const canManage = canManageProjects(role);
+  const canManage = hasCapability(role, "projects:manage");
 
   const projects = useQuery({ queryKey: ["projects"], queryFn: ({ signal }) => listProjects(signal) });
 
@@ -67,6 +69,14 @@ export function ProjectsPage() {
   const [tokensProject, setTokensProject] = useState<Project | null>(null);
   const [deletingProject, setDeletingProject] = useState<Project | null>(null);
   const queryClient = useQueryClient();
+
+  const rows = projects.data ?? [];
+  const viewState = queryViewState({
+    hasData: projects.data !== undefined,
+    isLoading: projects.isLoading,
+    isError: projects.isError,
+    isEmpty: rows.length === 0,
+  });
 
   return (
     <PageContainer>
@@ -79,17 +89,30 @@ export function ProjectsPage() {
         </ManageGate>
       </PageActions>
 
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={projects.isFetching}
+          onRetry={() => void projects.refetch()}
+        />
+      )}
+
       <Card>
         <CardContent className="p-0">
-          {projects.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-4">
               {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
-          ) : projects.isError ? (
+          ) : viewState === "error" ? (
             <QueryErrorState error={projects.error} onRetry={() => void projects.refetch()} />
-          ) : projects.data && projects.data.length > 0 ? (
+          ) : viewState === "empty" ? (
+            <EmptyState
+              icon={<FolderKanban className="size-6" />}
+              title={t("projects.empty")}
+              desc={t("projects.emptyDesc")}
+            />
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -105,7 +128,7 @@ export function ProjectsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {projects.data.map((p) => (
+                  {rows.map((p) => (
                     <tr key={p.id} className="border-b border-border/60 last:border-0">
                       <td className="px-4 py-3 font-medium">{p.name}</td>
                       <td className="px-4 py-3">
@@ -154,17 +177,13 @@ export function ProjectsPage() {
                 </tbody>
               </table>
             </div>
-          ) : (
-            <EmptyState
-              icon={<FolderKanban className="size-6" />}
-              title={t("projects.empty")}
-              desc={t("projects.emptyDesc")}
-            />
           )}
         </CardContent>
       </Card>
 
-      {createOpen && <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} />}
+      {createOpen && (
+        <CreateProjectDialog key="create-project" open={createOpen} onOpenChange={setCreateOpen} />
+      )}
       {editingProject && (
         <UpdateProjectDialog
           key={editingProject.id}
@@ -180,20 +199,22 @@ export function ProjectsPage() {
           canManage={canManage}
         />
       )}
-      <ConfirmDialog
-        open={!!deletingProject}
-        onOpenChange={(open) => !open && setDeletingProject(null)}
-        title={t("projects.deleteConfirm", { name: deletingProject?.name ?? "" })}
-        description={t("projects.deleteConfirmDesc")}
-        confirmLabel={t("projects.deleteProject")}
-        onConfirm={async () => {
-          if (!deletingProject) return;
-          await deleteProject(deletingProject.id);
-          if (tokensProject?.id === deletingProject.id) setTokensProject(null);
-          await queryClient.invalidateQueries({ queryKey: ["projects"] });
-          setDeletingProject(null);
-        }}
-      />
+      {deletingProject && (
+        <ConfirmDialog
+          key={deletingProject.id}
+          open
+          onOpenChange={(open) => !open && setDeletingProject(null)}
+          title={t("projects.deleteConfirm", { name: deletingProject.name })}
+          description={t("projects.deleteConfirmDesc")}
+          confirmLabel={t("projects.deleteProject")}
+          onConfirm={async () => {
+            await deleteProject(deletingProject.id);
+            if (tokensProject?.id === deletingProject.id) setTokensProject(null);
+            await queryClient.invalidateQueries({ queryKey: ["projects"] });
+            setDeletingProject(null);
+          }}
+        />
+      )}
     </PageContainer>
   );
 }
@@ -202,17 +223,17 @@ function UpdateProjectDialog({
   project,
   onOpenChange,
 }: {
-  project: Project | null;
+  project: Project;
   onOpenChange: (open: boolean) => void;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [name, setName] = useState(project?.name ?? "");
-  const slug = project?.slug ?? "";
+  const [name, setName] = useState(project.name);
+  const slug = project.slug;
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
-    mutationFn: () => updateProject(project!.id, name.trim(), slug.trim()),
+    mutationFn: () => updateProject(project.id, name.trim(), slug.trim()),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["projects"] });
       onOpenChange(false);
@@ -221,7 +242,7 @@ function UpdateProjectDialog({
   });
 
   return (
-    <Dialog open={!!project} onOpenChange={onOpenChange}>
+    <Dialog open onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{t("projects.editProject")}</DialogTitle>
@@ -297,41 +318,20 @@ function CreateProjectDialog({
   const [slug, setSlug] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!open) {
-      setName("");
-      setSlug("");
-      setError(null);
-    }
-  }, [open]);
-
   const mutation = useMutation({
     mutationFn: () => createProject(name.trim(), slug.trim()),
     onSuccess: () => {
-      reset();
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("projects.createError")),
   });
 
-  function reset() {
-    setName("");
-    setSlug("");
-    setError(null);
-  }
-
   const slugify = (v: string) =>
     v.toLowerCase().trim().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(o) => {
-        reset();
-        onOpenChange(o);
-      }}
-    >
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{t("projects.newProject")}</DialogTitle>
@@ -371,10 +371,7 @@ function CreateProjectDialog({
         <DialogFooter>
           <Button
             variant="outline"
-            onClick={() => {
-              reset();
-              onOpenChange(false);
-            }}
+            onClick={() => onOpenChange(false)}
             disabled={mutation.isPending}
           >
             {t("common.cancel")}
@@ -397,18 +394,18 @@ function TokensDialog({
   onOpenChange,
   canManage,
 }: {
-  project: Project | null;
+  project: Project;
   onOpenChange: (open: boolean) => void;
   canManage: boolean;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const projectId = project?.id ?? "";
+  const projectId = project.id;
 
   const tokens = useQuery({
     queryKey: ["project-api-tokens", projectId],
     queryFn: ({ signal }) => listProjectAPITokens(projectId, signal),
-    enabled: !!project,
+    retry: false,
   });
 
   const [name, setName] = useState("");
@@ -439,23 +436,21 @@ function TokensDialog({
     }
   }
 
+  const tokenRows = tokens.data ?? [];
+  const tokenState = queryViewState({
+    hasData: tokens.data !== undefined,
+    isLoading: tokens.isLoading,
+    isError: tokens.isError,
+    isEmpty: tokenRows.length === 0,
+  });
+
   return (
-    <Dialog
-      open={!!project}
-      onOpenChange={(o) => {
-        if (!o) {
-          setCreatedToken(null);
-          setName("");
-          setError(null);
-        }
-        onOpenChange(o);
-      }}
-    >
+    <Dialog open onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <KeyRound className="size-4" />
-            {project ? t("projects.tokensFor", { name: project.name }) : t("projects.tokensTitle")}
+            {t("projects.tokensFor", { name: project.name })}
           </DialogTitle>
         </DialogHeader>
 
@@ -485,7 +480,7 @@ function TokensDialog({
             <p className="text-[11px] text-muted-foreground">{t("projects.copyWarning")}</p>
             <SnippetBlock
               label={t("projects.dsnLabel")}
-              value={projectDsn(window.location.origin, project?.slug ?? "", createdToken.value)}
+              value={projectDsn(window.location.origin, project.slug, createdToken.value)}
               hint={t("projects.dsnHint")}
             />
           </div>
@@ -518,16 +513,27 @@ function TokensDialog({
           </p>
         )}
 
+        {tokenState === "stale" && (
+          <QueryStaleNotice
+            isRetrying={tokens.isFetching}
+            onRetry={() => void tokens.refetch()}
+          />
+        )}
+
         {/* Token list */}
         <div className="rounded-lg border border-border">
-          {tokens.isLoading ? (
+          {tokenState === "pending" ? (
             <div className="space-y-2 p-3">
               <Skeleton className="h-8 w-full" />
               <Skeleton className="h-8 w-full" />
             </div>
-          ) : tokens.isError ? (
+          ) : tokenState === "error" ? (
             <QueryErrorState error={tokens.error} onRetry={() => void tokens.refetch()} />
-          ) : tokens.data && tokens.data.length > 0 ? (
+          ) : tokenState === "empty" ? (
+            <p className="px-3 py-6 text-center text-sm text-muted-foreground">
+              {t("projects.noTokens")}
+            </p>
+          ) : (
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs uppercase tracking-wider text-muted-foreground">
@@ -540,7 +546,7 @@ function TokensDialog({
                 </tr>
               </thead>
               <tbody>
-                {tokens.data.map((tok) => (
+                {tokenRows.map((tok) => (
                   <tr key={tok.id} className="border-b border-border/60 last:border-0">
                     <td className="px-3 py-2 font-medium">
                       <span className={tok.revoked ? "text-muted-foreground line-through" : ""}>
@@ -575,14 +581,10 @@ function TokensDialog({
                 ))}
               </tbody>
             </table>
-          ) : (
-            <p className="px-3 py-6 text-center text-sm text-muted-foreground">
-              {t("projects.noTokens")}
-            </p>
           )}
         </div>
 
-        {canManage && project && <SourceMapUploadTokens key={project.id} project={project} />}
+        {canManage && <SourceMapUploadTokens key={project.id} project={project} />}
 
         {!canManage && (
           <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -592,20 +594,22 @@ function TokensDialog({
         )}
       </DialogContent>
 
-      <ConfirmDialog
-        open={!!revoking}
-        onOpenChange={(o) => !o && setRevoking(null)}
-        title={t("projects.revokeConfirm", { name: revoking?.name ?? "" })}
-        description={t("projects.revokeConfirmDesc")}
-        confirmLabel={t("projects.revokeToken")}
-        onConfirm={async () => {
-          if (!revoking) return;
-          await revokeProjectAPIToken(projectId, revoking.id);
-          void queryClient.invalidateQueries({ queryKey: ["project-api-tokens", projectId] });
-          void queryClient.invalidateQueries({ queryKey: ["projects"] });
-          setRevoking(null);
-        }}
-      />
+      {revoking && (
+        <ConfirmDialog
+          key={revoking.id}
+          open
+          onOpenChange={(o) => !o && setRevoking(null)}
+          title={t("projects.revokeConfirm", { name: revoking.name })}
+          description={t("projects.revokeConfirmDesc")}
+          confirmLabel={t("projects.revokeToken")}
+          onConfirm={async () => {
+            await revokeProjectAPIToken(projectId, revoking.id);
+            void queryClient.invalidateQueries({ queryKey: ["project-api-tokens", projectId] });
+            void queryClient.invalidateQueries({ queryKey: ["projects"] });
+            setRevoking(null);
+          }}
+        />
+      )}
     </Dialog>
   );
 }

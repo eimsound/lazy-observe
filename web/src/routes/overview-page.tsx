@@ -1,6 +1,5 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import {
   Activity,
@@ -14,17 +13,17 @@ import {
   Timer,
 } from "lucide-react";
 import { queryRange } from "@/lib/api/metrics";
-import dayjs from "@/lib/dayjs";
 import { logsHits, type LogsHistogram } from "@/lib/api/logs";
 import { listAlerts, eventSeverity } from "@/lib/api/alerts";
 import { listIssues, type IssueListResult } from "@/lib/api/issues";
-import { rangeById, resolveRange } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useTimeWindow, type ResolvedTimeWindow } from "@/hooks/use-time-window";
 import { formatRelativeTime } from "@/lib/format";
 import type { TimeSeries } from "@/lib/api/types";
 import { PageActions, PageContainer } from "@/components/layout/page";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
 import { LogsHistogramChart } from "@/components/charts/logs-histogram";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -42,16 +41,12 @@ import {
   OVERVIEW_UNIT_SCALES,
   scaleTimeSeries,
 } from "@/routes/overview-metrics";
+import { queryViewState } from "./query-view-state";
 
 export function OverviewPage() {
   const { t } = useTranslation();
   const { currentSlug: project } = useProject();
-
-  // Capture a single window for the whole overview so every panel aligns.
-  const window = useMemo(() => {
-    const preset = rangeById("1h");
-    return { preset, ...resolveRange(preset, dayjs().valueOf()) };
-  }, []);
+  const { window } = useTimeWindow("1h");
 
   return (
     <PageContainer>
@@ -101,12 +96,6 @@ export function OverviewPage() {
   );
 }
 
-interface Window {
-  start: number;
-  end: number;
-  step: number;
-}
-
 function MetricPanel({
   icon,
   title,
@@ -122,7 +111,7 @@ function MetricPanel({
   unit: string;
   scale?: number;
   project: string;
-  window: Window;
+  window: ResolvedTimeWindow;
 }) {
   const { t } = useTranslation();
   const result = useProjectQuery<TimeSeries[]>({
@@ -134,6 +123,7 @@ function MetricPanel({
         signal,
         activeProject,
       ),
+    retry: false,
   });
 
   const scaledSeries = useMemo(
@@ -141,6 +131,12 @@ function MetricPanel({
     [result.data, scale],
   );
   const value = lastSeriesValue(scaledSeries);
+  const viewState = queryViewState({
+    hasData: result.data !== undefined,
+    isLoading: result.isLoading,
+    isError: result.isError,
+    isEmpty: (scaledSeries?.length ?? 0) === 0,
+  });
 
   return (
     <Card>
@@ -150,10 +146,10 @@ function MetricPanel({
           {title}
         </CardTitle>
         <div className="flex items-baseline gap-1.5">
-          {result.isLoading ? (
+          {viewState === "pending" ? (
             <Skeleton className="h-8 w-24" />
-          ) : result.isError ? (
-            <span className="text-sm text-destructive">{t("overview.errorTitle")}</span>
+          ) : viewState === "error" ? (
+            <span className="text-sm text-destructive" role="alert">{t("overview.errorTitle")}</span>
           ) : (
             <>
               <span className="text-2xl font-semibold tabular-nums">
@@ -165,10 +161,22 @@ function MetricPanel({
         </div>
       </CardHeader>
       <CardContent className="p-2 pt-1">
-        {result.isLoading ? (
+        {viewState === "stale" && (
+          <QueryStaleNotice
+            isRetrying={result.isFetching}
+            onRetry={() => void result.refetch()}
+          />
+        )}
+        {viewState === "pending" ? (
           <Skeleton className="h-[120px] w-full" />
-        ) : scaledSeries && scaledSeries.length > 0 ? (
-          <TimeSeriesChart series={scaledSeries.slice(0, 1)} height={120} />
+        ) : viewState === "error" ? (
+          <div className="flex h-[120px] items-center justify-center">
+            <Button variant="outline" size="sm" onClick={() => void result.refetch()}>
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : viewState === "ready" || viewState === "stale" ? (
+          <TimeSeriesChart series={(scaledSeries ?? []).slice(0, 1)} height={120} />
         ) : (
           <div className="h-[120px]" />
         )}
@@ -179,15 +187,23 @@ function MetricPanel({
 
 function ActiveAlertsCard({ project }: { project: string }) {
   const { t } = useTranslation();
-  const alerts = useQuery({
-    queryKey: ["overview", project, "alerts"],
-    queryFn: ({ signal }) => listAlerts("firing", signal),
+  const alerts = useProjectQuery({
+    project,
+    queryKey: ["overview", "alerts"],
+    queryFn: ({ signal, project: activeProject }) => listAlerts("firing", signal, activeProject),
     refetchInterval: 30_000,
+    retry: false,
   });
 
   const firing = alerts.data ?? [];
   const critical = firing.filter((e) => eventSeverity(e) === "critical").length;
   const warning = firing.filter((e) => eventSeverity(e) === "warning").length;
+  const viewState = queryViewState({
+    hasData: alerts.data !== undefined,
+    isLoading: alerts.isLoading,
+    isError: alerts.isError,
+    isEmpty: firing.length === 0,
+  });
 
   return (
     <Card>
@@ -200,13 +216,26 @@ function ActiveAlertsCard({ project }: { project: string }) {
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-3 p-4 pt-2">
-        {alerts.isLoading ? (
+        {viewState === "stale" && (
+          <QueryStaleNotice
+            isRetrying={alerts.isFetching}
+            onRetry={() => void alerts.refetch()}
+          />
+        )}
+        {viewState === "pending" ? (
           <Skeleton className="h-8 w-16" />
+        ) : viewState === "error" ? (
+          <div className="flex flex-col items-start gap-2" role="alert">
+            <span className="text-sm text-destructive">{t("overview.errorTitle")}</span>
+            <Button variant="outline" size="sm" onClick={() => void alerts.refetch()}>
+              {t("common.retry")}
+            </Button>
+          </div>
         ) : (
           <>
             <div className="flex items-baseline gap-2">
               <span className="text-3xl font-semibold tabular-nums">{firing.length}</span>
-              {firing.length === 0 && (
+              {viewState === "empty" && (
                 <span className="text-sm text-muted-foreground">
                   {t("overview.activeAlertsHealthy")}
                 </span>
@@ -239,13 +268,21 @@ function ActiveAlertsCard({ project }: { project: string }) {
   );
 }
 
-function LogVolumeCard({ project, window }: { project: string; window: Window }) {
+function LogVolumeCard({ project, window }: { project: string; window: ResolvedTimeWindow }) {
   const { t } = useTranslation();
   const hits = useProjectQuery<LogsHistogram>({
     project,
     queryKey: ["overview", "logs-hits", window.end],
     queryFn: ({ signal, project: activeProject }) =>
       logsHits({ query: "*", start: window.start, end: window.end, step: 60, project: activeProject }, signal),
+    retry: false,
+  });
+
+  const viewState = queryViewState({
+    hasData: hits.data !== undefined,
+    isLoading: hits.isLoading,
+    isError: hits.isError,
+    isEmpty: (hits.data?.timestamps.length ?? 0) === 0,
   });
 
   return (
@@ -260,14 +297,27 @@ function LogVolumeCard({ project, window }: { project: string; window: Window })
         <p className="text-xs text-muted-foreground">{t("overview.logVolumeSubtitle")}</p>
       </CardHeader>
       <CardContent className="p-2 pt-1">
-        {hits.isLoading ? (
+        {viewState === "stale" && (
+          <QueryStaleNotice
+            isRetrying={hits.isFetching}
+            onRetry={() => void hits.refetch()}
+          />
+        )}
+        {viewState === "pending" ? (
           <Skeleton className="h-[160px] w-full" />
-        ) : hits.data && hits.data.timestamps.length > 0 ? (
-          <LogsHistogramChart data={hits.data} height={160} />
-        ) : (
+        ) : viewState === "error" ? (
+          <div className="flex h-[160px] flex-col items-center justify-center gap-2 text-center" role="alert">
+            <span className="text-sm text-destructive">{t("overview.errorTitle")}</span>
+            <Button variant="outline" size="sm" onClick={() => void hits.refetch()}>
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : viewState === "empty" || !hits.data ? (
           <div className="flex h-[160px] items-center justify-center text-sm text-muted-foreground">
             {t("common.empty")}
           </div>
+        ) : (
+          <LogsHistogramChart data={hits.data} height={160} />
         )}
       </CardContent>
     </Card>
@@ -285,6 +335,12 @@ function IssuesCard({ project }: { project: string }) {
     refetchInterval: 30_000,
   });
   const view = recentIssuesView(query);
+  const viewState = queryViewState({
+    hasData: query.data !== undefined,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    isEmpty: (query.data?.issues.length ?? 0) === 0,
+  });
 
   return (
     <Card className="flex flex-col">
@@ -297,13 +353,19 @@ function IssuesCard({ project }: { project: string }) {
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-1 flex-col p-4 pt-2">
+        {viewState === "stale" && (
+          <QueryStaleNotice
+            isRetrying={query.isFetching}
+            onRetry={() => void query.refetch()}
+          />
+        )}
         {view.status === "pending" ? (
           <div className="space-y-2" role="status" aria-label={t("overview.loading")}>
             {[0, 1, 2].map((index) => (
               <Skeleton key={index} className="h-12 w-full" />
             ))}
           </div>
-        ) : view.status === "error" ? (
+        ) : view.status === "error" && viewState !== "stale" ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-2 py-5 text-center" role="alert">
             <AlertCircle className="size-6 text-destructive" />
             <div className="text-sm font-medium">{t("overview.errorTitle")}</div>
@@ -326,7 +388,7 @@ function IssuesCard({ project }: { project: string }) {
           </div>
         ) : (
           <ul className="divide-y divide-border/60">
-            {view.issues.map((issue) => (
+            {(view.status === "ready" ? view.issues : (query.data?.issues.slice(0, 3) ?? [])).map((issue) => (
               <li key={issue.id}>
                 <Link
                   to="/issues/$issueId"
@@ -347,7 +409,7 @@ function IssuesCard({ project }: { project: string }) {
           </ul>
         )}
 
-        {view.status !== "pending" && view.status !== "error" && (
+        {view.status !== "pending" && (view.status !== "error" || viewState === "stale") && (
           <Button asChild variant="outline" size="sm" className="mt-3 w-fit gap-1.5">
             <Link to="/issues">
               <Bug className="size-3.5" />

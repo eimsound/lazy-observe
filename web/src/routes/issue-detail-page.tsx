@@ -25,13 +25,14 @@ import {
 } from "@/lib/api/issues";
 import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageIssues } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
 import { projectQueryKey } from "@/lib/project/project-scope";
 import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatErrorMessage } from "@/lib/api/errors";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import { PageContainer } from "@/components/layout/page";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { StacktraceViewer } from "@/components/issues/stacktrace-viewer";
 import { EventJsonDrawer } from "@/components/issues/event-json-drawer";
 import { IssueLevelBadge } from "@/components/issues/issue-level-badge";
@@ -39,12 +40,13 @@ import { IssueAiAnalysisCard } from "@/components/ai/issue-ai-analysis-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { queryViewState, type QueryViewState } from "./query-view-state";
 
 export function IssueDetailPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
   const { currentSlug: project } = useProject();
-  const canManage = canManageIssues(role);
+  const canManage = hasCapability(role, "issues:write");
   const navigate = useNavigate();
   const { issueId } = useParams({ strict: false }) as { issueId: string };
   const search = useSearch({ strict: false }) as { event?: string };
@@ -97,6 +99,19 @@ export function IssueDetailPage() {
     [events, selectedEventId],
   );
 
+  const issueState = queryViewState({
+    hasData: issueQuery.data !== undefined,
+    isLoading: issueQuery.isLoading,
+    isError: issueQuery.isError,
+    isEmpty: false,
+  });
+  const eventState = queryViewState({
+    hasData: eventQuery.data !== undefined,
+    isLoading: eventQuery.isLoading,
+    isError: eventQuery.isError,
+    isEmpty: !selectedEventId,
+  });
+
   return (
     <PageContainer>
       <div className="mb-4">
@@ -106,7 +121,14 @@ export function IssueDetailPage() {
         </Button>
       </div>
 
-      {issueQuery.isLoading ? (
+      {issueState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={issueQuery.isFetching}
+          onRetry={() => void issueQuery.refetch()}
+        />
+      )}
+
+      {issueState === "pending" ? (
         <Card>
           <CardContent className="space-y-3 p-4">
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -117,10 +139,10 @@ export function IssueDetailPage() {
             <Skeleton className="h-40 w-full" />
           </CardContent>
         </Card>
-      ) : issueQuery.error || !issueQuery.data ? (
+      ) : issueState === "error" || !issueQuery.data ? (
         <Card>
           <CardContent className="py-24">
-            <div className="flex flex-col items-center gap-3 text-center">
+            <div className="flex flex-col items-center gap-3 text-center" role="alert">
               <div className="flex size-12 items-center justify-center rounded-full bg-muted text-destructive">
                 <AlertCircle className="size-6" />
               </div>
@@ -138,8 +160,10 @@ export function IssueDetailPage() {
         <IssueDetailBody
           issue={issueQuery.data}
           event={eventQuery.data}
-          eventLoading={eventQuery.isLoading}
+          eventState={eventState}
           eventError={eventQuery.error ?? null}
+          eventFetching={eventQuery.isFetching}
+          onRetryEvent={() => void eventQuery.refetch()}
           selectedIndex={selectedIndex}
           canManage={canManage}
           statusError={statusError}
@@ -152,7 +176,14 @@ export function IssueDetailPage() {
         />
       )}
 
-      <EventJsonDrawer event={eventQuery.data ?? null} open={jsonOpen} onOpenChange={setJsonOpen} />
+      {jsonOpen && eventQuery.data && (
+        <EventJsonDrawer
+          key={eventQuery.data.event_id}
+          event={eventQuery.data}
+          open={jsonOpen}
+          onOpenChange={setJsonOpen}
+        />
+      )}
     </PageContainer>
   );
 }
@@ -160,8 +191,10 @@ export function IssueDetailPage() {
 function IssueDetailBody({
   issue,
   event,
-  eventLoading,
+  eventState,
   eventError,
+  eventFetching,
+  onRetryEvent,
   selectedIndex,
   canManage,
   statusError,
@@ -174,8 +207,10 @@ function IssueDetailBody({
 }: {
   issue: IssueDetail;
   event: ErrorEvent | undefined;
-  eventLoading: boolean;
+  eventState: QueryViewState;
   eventError: ApiError | null;
+  eventFetching: boolean;
+  onRetryEvent: () => void;
   selectedIndex: number;
   canManage: boolean;
   statusError: string | null;
@@ -313,7 +348,10 @@ function IssueDetailBody({
       </Card>
 
       {/* Event body */}
-      {eventLoading ? (
+      {eventState === "stale" && (
+        <QueryStaleNotice isRetrying={eventFetching} onRetry={onRetryEvent} />
+      )}
+      {eventState === "pending" ? (
         <Card>
           <CardContent className="space-y-3 p-4">
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -323,13 +361,18 @@ function IssueDetailBody({
             <Skeleton className="h-48 w-full" />
           </CardContent>
         </Card>
-      ) : eventError ? (
+      ) : eventState === "error" ? (
         <Card>
           <CardContent className="py-12">
-            <div className="flex flex-col items-center gap-2 text-center">
+            <div className="flex flex-col items-center gap-2 text-center" role="alert">
               <AlertCircle className="size-6 text-destructive" />
               <div className="text-sm font-medium">{t("issues.eventLoadError")}</div>
-              <p className="text-sm text-muted-foreground">{eventError.message}</p>
+              <p className="text-sm text-muted-foreground">
+                {eventError?.message ?? t("common.queryErrorDesc")}
+              </p>
+              <Button variant="outline" size="sm" onClick={onRetryEvent}>
+                {t("common.retry")}
+              </Button>
             </div>
           </CardContent>
         </Card>

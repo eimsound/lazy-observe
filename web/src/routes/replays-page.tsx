@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
 import { AlertCircle, Database, Loader2, MonitorPlay, TriangleAlert } from "lucide-react";
@@ -8,7 +8,6 @@ import {
 } from "@/lib/api/replay";
 import { IS_MOCK } from "@/lib/settings";
 import { ApiError } from "@/lib/api/client";
-import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatBytes, formatClockDuration, formatDateTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -25,17 +24,8 @@ import { queryViewState } from "./query-view-state";
 export function ReplaysPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { currentSlug } = useProject();
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [page, setPage] = useState(1);
-  const prevProjectRef = useRef(currentSlug);
-
-  useEffect(() => {
-    if (prevProjectRef.current !== currentSlug) {
-      prevProjectRef.current = currentSlug;
-      setPage(1);
-    }
-  }, [currentSlug]);
 
   const query = useProjectQuery<ReplayListResult, ApiError>({
     queryKey: ["replays", errorsOnly, page],

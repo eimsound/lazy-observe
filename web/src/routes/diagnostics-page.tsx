@@ -3,20 +3,22 @@ import { AlertCircle, Database, Loader2, RefreshCw, ShieldAlert, Stethoscope } f
 import { useTranslation } from "react-i18next";
 
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageUsers } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { formatBytes, formatDateTime } from "@/lib/format";
 import { getHealthDiagnostics, getInboxDiagnostics } from "@/lib/api/system";
+import { queryViewState } from "./query-view-state";
 
 export function DiagnosticsPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
-  const enabled = canManageUsers(role);
+  const enabled = hasCapability(role, "diagnostics:read");
   const health = useQuery({
     queryKey: ["system-diagnostics", "health"],
     queryFn: ({ signal }) => getHealthDiagnostics(signal),
@@ -51,6 +53,19 @@ export function DiagnosticsPage() {
     );
   }
 
+  const healthState = queryViewState({
+    hasData: health.data !== undefined,
+    isLoading: health.isLoading,
+    isError: health.isError,
+    isEmpty: (health.data?.components.length ?? 0) === 0,
+  });
+  const inboxState = queryViewState({
+    hasData: inbox.data !== undefined,
+    isLoading: inbox.isLoading,
+    isError: inbox.isError,
+    isEmpty: false,
+  });
+
   return (
     <PageContainer className="space-y-4">
       <PageActions>
@@ -68,10 +83,18 @@ export function DiagnosticsPage() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {health.isLoading ? (
+          {healthState === "stale" && (
+            <QueryStaleNotice
+              isRetrying={health.isFetching}
+              onRetry={() => void health.refetch()}
+            />
+          )}
+          {healthState === "pending" ? (
             <DiagnosticsSkeleton />
-          ) : health.isError || !health.data ? (
+          ) : healthState === "error" ? (
             <DiagnosticsError onRetry={() => void health.refetch()} />
+          ) : healthState === "empty" || !health.data ? (
+            <EmptyState icon={<Stethoscope className="size-6" />} title={t("common.empty")} />
           ) : (
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
               {health.data.components.map((component) => (
@@ -98,9 +121,15 @@ export function DiagnosticsPage() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {inbox.isLoading ? (
+          {inboxState === "stale" && (
+            <QueryStaleNotice
+              isRetrying={inbox.isFetching}
+              onRetry={() => void inbox.refetch()}
+            />
+          )}
+          {inboxState === "pending" ? (
             <DiagnosticsSkeleton />
-          ) : inbox.isError || !inbox.data ? (
+          ) : inboxState === "error" || !inbox.data ? (
             <DiagnosticsError onRetry={() => void inbox.refetch()} />
           ) : (
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -146,7 +175,7 @@ function DiagnosticsSkeleton() {
 function DiagnosticsError({ onRetry }: { onRetry: () => void }) {
   const { t } = useTranslation();
   return (
-    <div className="flex flex-col items-center gap-2 py-8 text-center">
+    <div className="flex flex-col items-center gap-2 py-8 text-center" role="alert">
       <AlertCircle className="size-5 text-destructive" />
       <div className="text-sm font-medium">{t("diagnostics.errorTitle")}</div>
       <p className="text-xs text-muted-foreground">{t("common.queryErrorDesc")}</p>

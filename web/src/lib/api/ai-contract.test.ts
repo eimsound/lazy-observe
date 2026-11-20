@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
+import { afterEach, test, vi } from "vitest";
 
 import {
   buildAssistantQueryPayload,
@@ -11,7 +11,33 @@ import {
   normalizeAssistantLogs,
   normalizeIssueAiAnalysis,
   resolveAssistantTimeRange,
+  validateAiSettingsUpdate,
 } from "./ai-contract.ts";
+import { updateAiSettings } from "./ai.ts";
+import { ApiError } from "./client.ts";
+
+const originalWindow = globalThis.window;
+const originalDocument = globalThis.document;
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  if (originalWindow === undefined) {
+    Reflect.deleteProperty(globalThis, "window");
+  } else {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: originalWindow,
+    });
+  }
+  if (originalDocument === undefined) {
+    Reflect.deleteProperty(globalThis, "document");
+  } else {
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: originalDocument,
+    });
+  }
+});
 
 test("assistant query payload encodes preset time ranges as backend {start, end} RFC3339 objects", () => {
   const nowMs = Date.UTC(2026, 10, 21, 10, 0, 0);
@@ -230,5 +256,70 @@ test("normalizeIssueAiAnalysis matches Go issueAIResponse (RFC3339 ai_analysis_a
         probable_causes: [{ cause: "x", confidence: "certain", evidence: "e" }],
       }),
     /confidence/,
+  );
+});
+
+test("PUT /api/ai/settings rejects conflicting api_key + clear_api_key and surfaces Go 400/409 errors", async () => {
+  assert.throws(
+    () =>
+      validateAiSettingsUpdate({
+        enabled: true,
+        api_key: "sk-live-secret",
+        clear_api_key: true,
+      }),
+    /api_key and clear_api_key cannot both be set/,
+  );
+
+  // Valid non-conflicting payloads pass client validation.
+  assert.doesNotThrow(() =>
+    validateAiSettingsUpdate({ enabled: true, api_key: "sk-live-secret", clear_api_key: false }),
+  );
+  assert.doesNotThrow(() =>
+    validateAiSettingsUpdate({ enabled: false, clear_api_key: true }),
+  );
+
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { location: { origin: "http://localhost:5173" } },
+  });
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: { cookie: "lo_csrf=tok" },
+  });
+
+  // Exact Go 400 Bad Request from aiSettingsPut:
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () =>
+      new Response(JSON.stringify({ error: "api_key and clear_api_key cannot both be set" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }),
+    ),
+  );
+  await assert.rejects(
+    () => updateAiSettings({ enabled: true, model: "gpt-4o-mini" }),
+    (err: unknown) =>
+      err instanceof ApiError &&
+      err.status === 400 &&
+      err.message === "api_key and clear_api_key cannot both be set",
+  );
+
+  // Exact Go 409 Conflict when expected_revision mismatches:
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () =>
+      new Response(
+        JSON.stringify({ error: "AI settings were modified concurrently", revision: 4 }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      ),
+    ),
+  );
+  await assert.rejects(
+    () => updateAiSettings({ enabled: true, expected_revision: 3 }),
+    (err: unknown) =>
+      err instanceof ApiError &&
+      err.status === 409 &&
+      err.message === "AI settings were modified concurrently",
   );
 });

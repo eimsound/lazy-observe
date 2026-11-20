@@ -1,19 +1,19 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useParams } from "@tanstack/react-router";
 import { ArrowLeft, RefreshCw, Server } from "lucide-react";
 import { listHosts } from "@/lib/api/hosts";
 import { queryRange } from "@/lib/api/metrics";
 import { useProjectQueries, useProjectQuery } from "@/lib/project/use-project-query";
+import { useTimeWindow, type ResolvedTimeWindow } from "@/hooks/use-time-window";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-
-const WINDOW_SECONDS = 3600;
-const STEP_SECONDS = 60;
+import { queryViewState } from "./query-view-state";
 
 function promString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -63,18 +63,12 @@ function hostMetricPanels(instance: string): MetricPanelDefinition[] {
   ];
 }
 
-interface HostMetricWindow {
-  start: number;
-  end: number;
-  step: number;
-}
-
 function MetricPanel({
   instance,
   titleKey,
   queries,
   window,
-}: MetricPanelDefinition & { instance: string; window: HostMetricWindow }) {
+}: MetricPanelDefinition & { instance: string; window: ResolvedTimeWindow }) {
   const { t } = useTranslation();
   const results = useProjectQueries({
     queries: queries.map((query) => ({
@@ -85,18 +79,40 @@ function MetricPanel({
     })),
   });
   const series = results.flatMap((result) => result.data ?? []);
+  const hasData = results.some((result) => result.data !== undefined);
   const isLoading = results.some((result) => result.isLoading);
   const isError = results.some((result) => result.isError);
+  const isFetching = results.some((result) => result.isFetching);
+  const viewState = queryViewState({
+    hasData,
+    isLoading,
+    isError,
+    isEmpty: series.length === 0,
+  });
+
+  function retryPanel() {
+    for (const result of results) {
+      if (result.isError) void result.refetch();
+    }
+  }
 
   return (
     <Card>
       <CardContent className="p-4">
         <h2 className="mb-2 text-sm font-medium">{t(titleKey)}</h2>
-        {isLoading ? (
+        {viewState === "stale" && (
+          <QueryStaleNotice isRetrying={isFetching} onRetry={retryPanel} />
+        )}
+        {viewState === "pending" ? (
           <Skeleton className="h-[260px] w-full" />
-        ) : isError ? (
-          <p className="text-sm text-destructive">{t("hosts.metricsError")}</p>
-        ) : series.length === 0 ? (
+        ) : viewState === "error" ? (
+          <div className="flex h-[260px] flex-col items-center justify-center gap-2 text-center" role="alert">
+            <p className="text-sm text-destructive">{t("hosts.metricsError")}</p>
+            <Button variant="outline" size="sm" onClick={retryPanel}>
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : viewState === "empty" ? (
           <p className="text-sm text-muted-foreground">{t("hosts.metricsEmpty")}</p>
         ) : (
           <TimeSeriesChart
@@ -113,22 +129,18 @@ function MetricPanel({
 export function HostDetailPage() {
   const { t } = useTranslation();
   const { instance } = useParams({ from: "/app/infrastructure/hosts/$instance" });
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  const window = useMemo<HostMetricWindow>(() => {
-    const end = Math.floor(nowMs / 1000);
-    return { start: end - WINDOW_SECONDS, end, step: STEP_SECONDS };
-  }, [nowMs]);
+  const { window, advance } = useTimeWindow("1h");
 
   const hosts = useProjectQuery({
     queryKey: ["hosts"],
     queryFn: ({ signal, project }) => listHosts(signal, project),
+    retry: false,
   });
   const host = hosts.data?.find((h) => h.instance === instance);
   const panels = useMemo(() => hostMetricPanels(instance), [instance]);
 
   function refresh() {
-    setNowMs((prev) => Math.max(prev + 1000, Date.now()));
+    advance();
     void hosts.refetch();
   }
 

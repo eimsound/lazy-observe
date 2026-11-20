@@ -115,8 +115,18 @@ export function revokeMockUploadToken(projectId: string, tokenId: string): void 
 
 // ── user ops ─────────────────────────────────────────────────────────────────
 
-export function createMockUser(username: string, role: Role): ManagedUser {
-  const u: ManagedUser = { id: nextId("usr"), username, role, created_at: nowIso() };
+export function createMockUser(
+  username: string,
+  role: Role,
+  displayName?: string,
+): ManagedUser {
+  const u: ManagedUser = {
+    id: nextId("usr"),
+    username,
+    role,
+    ...(displayName ? { display_name: displayName } : {}),
+    created_at: nowIso(),
+  };
   mockUsers.push(u);
   return u;
 }

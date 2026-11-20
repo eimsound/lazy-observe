@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type UseQueryResult } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
@@ -26,8 +26,8 @@ import {
   resolveRangeMicros,
 } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
-import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useResetOnProjectChange } from "@/hooks/use-reset-on-project-change";
 import { useRouterLocationSync } from "@/lib/router-url-sync";
 import { ApiError } from "@/lib/api/client";
 import { formatDateTime, formatDurationMicros } from "@/lib/format";
@@ -61,9 +61,7 @@ const ALL_OPERATIONS = "__all__";
 export function TracesPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { currentSlug: project } = useProject();
   const { routeLocation, recordSelfAuthored, classifyLocationChange } = useRouterLocationSync();
-  const previousProject = useRef(project);
   const routeSearch = useSearch({ strict: false }) as TraceSearchURL;
   const {
     service: urlService, operation: urlOperation, start: urlStart, end: urlEnd,
@@ -87,9 +85,7 @@ export function TracesPage() {
   const [tags, setTags] = useState(initialSearch?.tags ?? "");
   const [executed, setExecuted] = useState<TraceSearchParams | null>(initialSearch);
 
-  useEffect(() => {
-    if (previousProject.current === project) return;
-    previousProject.current = project;
+  useResetOnProjectChange(() => {
     setService("");
     setOperation(ALL_OPERATIONS);
     setMinDuration("");
@@ -97,7 +93,7 @@ export function TracesPage() {
     setExecuted(null);
     recordSelfAuthored("/traces");
     void navigate({ to: "/traces", search: {}, replace: true });
-  }, [project, navigate, recordSelfAuthored]);
+  });
 
   // Only resync form drafts and executed state on genuine external navigations
   // (deep links, browser Back/Forward), never clobbering local drafts after a

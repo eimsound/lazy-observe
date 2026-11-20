@@ -19,12 +19,15 @@ import {
   readProjectSlug,
 } from "@/lib/tokens/token-usage";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { SnippetBlock } from "@/components/common/snippet-block";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { queryViewState } from "@/routes/query-view-state";
 
 const fmt = (iso: string) => formatDateTime(dayjs(iso).valueOf());
 
@@ -42,6 +45,7 @@ export function UserAPITokensCard() {
   const tokens = useQuery({
     queryKey: ["user-api-tokens"],
     queryFn: ({ signal }) => listUserAPITokens(signal),
+    retry: false,
   });
   const issue = useMutation({
     mutationFn: () => createUserAPIToken(name.trim()),
@@ -64,6 +68,14 @@ export function UserAPITokensCard() {
       setError(t("userTokens.copyFailed"));
     }
   }
+
+  const rows = tokens.data ?? [];
+  const viewState = queryViewState({
+    hasData: tokens.data !== undefined,
+    isLoading: tokens.isLoading,
+    isError: tokens.isError,
+    isEmpty: rows.length === 0,
+  });
 
   return (
     <Card>
@@ -135,15 +147,26 @@ export function UserAPITokensCard() {
             {t("userTokens.create")}
           </Button>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+
+        {viewState === "stale" && (
+          <QueryStaleNotice
+            isRetrying={tokens.isFetching}
+            onRetry={() => void tokens.refetch()}
+          />
+        )}
 
         <div className="rounded-lg border border-border">
-          {tokens.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-3">
               <Skeleton className="h-8 w-full" />
               <Skeleton className="h-8 w-full" />
             </div>
-          ) : tokens.data && tokens.data.length > 0 ? (
+          ) : viewState === "error" ? (
+            <QueryErrorState error={tokens.error} onRetry={() => void tokens.refetch()} />
+          ) : viewState === "empty" ? (
+            <p className="px-3 py-6 text-center text-sm text-muted-foreground">{t("userTokens.empty")}</p>
+          ) : (
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs uppercase tracking-wider text-muted-foreground">
@@ -154,7 +177,7 @@ export function UserAPITokensCard() {
                 </tr>
               </thead>
               <tbody>
-                {tokens.data.map((token) => (
+                {rows.map((token) => (
                   <tr key={token.id} className="border-b border-border/60 last:border-0">
                     <td className="px-3 py-2 font-medium">
                       <span className={token.revoked ? "text-muted-foreground line-through" : ""}>{token.name}</span>
@@ -179,25 +202,25 @@ export function UserAPITokensCard() {
                 ))}
               </tbody>
             </table>
-          ) : (
-            <p className="px-3 py-6 text-center text-sm text-muted-foreground">{t("userTokens.empty")}</p>
           )}
         </div>
       </CardContent>
 
-      <ConfirmDialog
-        open={!!revoking}
-        onOpenChange={(open) => !open && setRevoking(null)}
-        title={t("userTokens.revokeConfirm", { name: revoking?.name ?? "" })}
-        description={t("userTokens.revokeDescription")}
-        confirmLabel={t("userTokens.revoke")}
-        onConfirm={async () => {
-          if (!revoking) return;
-          await revokeUserAPIToken(revoking.id);
-          await queryClient.invalidateQueries({ queryKey: ["user-api-tokens"] });
-          setRevoking(null);
-        }}
-      />
+      {revoking && (
+        <ConfirmDialog
+          key={revoking.id}
+          open
+          onOpenChange={(open) => !open && setRevoking(null)}
+          title={t("userTokens.revokeConfirm", { name: revoking.name })}
+          description={t("userTokens.revokeDescription")}
+          confirmLabel={t("userTokens.revoke")}
+          onConfirm={async () => {
+            await revokeUserAPIToken(revoking.id);
+            await queryClient.invalidateQueries({ queryKey: ["user-api-tokens"] });
+            setRevoking(null);
+          }}
+        />
+      )}
     </Card>
   );
 }

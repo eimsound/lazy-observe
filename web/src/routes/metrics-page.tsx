@@ -508,20 +508,24 @@ function QueryCard({
         </Tabs>
       </CardContent>
 
-      <MetricsExplorer
-        open={explorerOpen}
-        range={autocompleteRange}
-        onOpenChange={setExplorerOpen}
-        onInsert={(selector) => editorRef.current?.insertText(selector)}
-      />
-      <QueryHistoryDialog
-        open={historyOpen}
-        history={history}
-        localTime={localTime}
-        onOpenChange={setHistoryOpen}
-        onPick={(query) => onChange({ query })}
-        onClear={onClearHistory}
-      />
+      {explorerOpen && (
+        <MetricsExplorer
+          open={explorerOpen}
+          range={autocompleteRange}
+          onOpenChange={setExplorerOpen}
+          onInsert={(selector) => editorRef.current?.insertText(selector)}
+        />
+      )}
+      {historyOpen && (
+        <QueryHistoryDialog
+          open={historyOpen}
+          history={history}
+          localTime={localTime}
+          onOpenChange={setHistoryOpen}
+          onPick={(query) => onChange({ query })}
+          onClear={onClearHistory}
+        />
+      )}
     </Card>
   );
 }

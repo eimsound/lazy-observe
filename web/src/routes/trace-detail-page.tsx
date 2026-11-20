@@ -14,6 +14,7 @@ import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDurationMicros } from "@/lib/format";
 import { PageContainer } from "@/components/layout/page";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { TraceWaterfall } from "@/components/traces/trace-waterfall";
 import { SpanDetailDrawer } from "@/components/traces/span-detail-drawer";
 import { Button } from "@/components/ui/button";
@@ -21,6 +22,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { buildTraceEvidenceLinks } from "./trace-evidence-links";
+import { queryViewState } from "./query-view-state";
 
 export function TraceDetailPage() {
   const { t } = useTranslation();
@@ -62,6 +64,13 @@ export function TraceDetailPage() {
     void navigate({ to: link.to, search: link.search });
   }
 
+  const viewState = queryViewState({
+    hasData: traceQuery.data !== undefined,
+    isLoading: traceQuery.isLoading,
+    isError: traceQuery.isError,
+    isEmpty: false,
+  });
+
   return (
     <PageContainer>
       <div className="mb-4 flex items-center gap-3">
@@ -71,7 +80,14 @@ export function TraceDetailPage() {
         </Button>
       </div>
 
-      {traceQuery.isLoading ? (
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={traceQuery.isFetching}
+          onRetry={() => void traceQuery.refetch()}
+        />
+      )}
+
+      {viewState === "pending" ? (
         <Card>
           <CardContent className="space-y-3 p-4">
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -81,9 +97,9 @@ export function TraceDetailPage() {
             <Skeleton className="h-40 w-full" />
           </CardContent>
         </Card>
-      ) : traceQuery.error || !traceQuery.data ? (
+      ) : viewState === "error" || !traceQuery.data ? (
         <Card>
-          <CardContent className="flex flex-col items-center justify-center gap-3 py-24 text-center">
+          <CardContent className="flex flex-col items-center justify-center gap-3 py-24 text-center" role="alert">
             <div className="flex size-12 items-center justify-center rounded-full bg-muted text-destructive">
               <AlertCircle className="size-6" />
             </div>
@@ -176,13 +192,16 @@ function TraceDetailBody({
         onSelectSpan={onSelectSpan}
       />
 
-      <SpanDetailDrawer
-        span={selected}
-        trace={trace}
-        open={drawerOpen}
-        onOpenChange={onOpenChange}
-        onViewLogs={() => onViewLogs(trace)}
-      />
+      {drawerOpen && selected && (
+        <SpanDetailDrawer
+          key={selected.spanID}
+          span={selected}
+          trace={trace}
+          open={drawerOpen}
+          onOpenChange={onOpenChange}
+          onViewLogs={() => onViewLogs(trace)}
+        />
+      )}
     </>
   );
 }

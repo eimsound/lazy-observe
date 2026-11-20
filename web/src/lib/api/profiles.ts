@@ -1,7 +1,9 @@
 import { apiGet, apiGetResponse, ApiError, API_ROOT, IS_MOCK } from "./client";
 import {
+  normalizeFlameNode,
   normalizeProfileListResponse,
   normalizeProfileServicesResponse,
+  type FlameNode,
   type ProfileListResponseDTO,
   type ProfileRecord,
   type ProfileServicesResponseDTO,
@@ -14,6 +16,7 @@ const loadMockProfiles = () => import("./mock-profiles");
 
 export { PROFILE_TYPES } from "./profile-contract";
 export type {
+  FlameNode,
   ProfileListResponseDTO,
   ProfileRecord,
   ProfileRecordDTO,
@@ -32,18 +35,6 @@ export type {
  *   GET /api/profiles/flamegraph?service=&type=&start=&end=    -> FlameNode (tree)
  *   GET /api/profiles/:id/raw                                  -> pprof download
  */
-
-/**
- * Recursive flamegraph tree. `value` is the aggregated sample count for the
- * subtree (the root's value == the profile total); children partition it. A
- * node may carry `truncated` when the backend clipped its subtree for size.
- */
-export interface FlameNode {
-  name: string;
-  value: number;
-  children?: FlameNode[];
-  truncated?: boolean;
-}
 
 export interface ProfileQuery {
   service: string;
@@ -98,12 +89,13 @@ export async function getFlamegraph(
 ): Promise<FlameNode | null> {
   if (IS_MOCK) return (await loadMockProfiles()).mockFlamegraph(q);
   try {
-    return await apiGet<FlameNode>("/profiles/flamegraph", {
+    const raw = await apiGet<unknown>("/profiles/flamegraph", {
       base: API_ROOT,
       params: profileQueryParams(q),
       signal,
       project,
     });
+    return normalizeFlameNode(raw);
   } catch (err) {
     // Gateway returns 404 when no profiles exist in the queried window; map to
     // null so the UI transitions cleanly into the empty state instead of keeping

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { type UseQueryResult } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -22,18 +22,18 @@ import {
   type LLMSummary,
   type LLMTimeseriesResult,
   type LLMTrendMetric,
-  type LLMWindow,
 } from "@/lib/api/llm";
-import { RANGE_PRESETS, rangeById, resolveRange } from "@/lib/api/ranges";
+import { RANGE_PRESETS } from "@/lib/api/ranges";
 import { ApiError } from "@/lib/api/client";
 import { IS_MOCK } from "@/lib/settings";
-import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useTimeWindow } from "@/hooks/use-time-window";
 import { formatDurationMicros } from "@/lib/format";
 import dayjs, { dayjsLocale } from "@/lib/dayjs";
 import type { TimeSeries } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { Badge } from "@/components/ui/badge";
@@ -41,44 +41,34 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { queryViewState } from "./query-view-state";
 
 const ALL = "__all__";
 
 export function LLMObservabilityPage() {
   const { t } = useTranslation();
-  const { currentSlug } = useProject();
-  const [rangeId, setRangeId] = useState("24h");
-  const [nowMs, setNowMs] = useState(() => dayjs().valueOf());
+  const { rangeId, setRangeId, window, advance } = useTimeWindow("24h");
   const [trendMetric, setTrendMetric] = useState<LLMTrendMetric>("calls");
   const [service, setService] = useState(ALL);
   const [model, setModel] = useState(ALL);
 
-  const window = useMemo<LLMWindow>(() => {
-    const resolved = resolveRange(rangeById(rangeId), nowMs);
-    return { start: resolved.start, end: resolved.end };
-  }, [rangeId, nowMs]);
-  const scope = currentSlug || "token";
-
-  useEffect(() => {
-    setService(ALL);
-    setModel(ALL);
-  }, [scope]);
+  const llmWindow = { start: window.start, end: window.end };
 
   const summaryQuery = useProjectQuery<LLMSummary, ApiError>({
-    queryKey: ["llm-summary", window.start, window.end],
-    queryFn: ({ signal, project }) => getLLMSummary(window, signal, project),
+    queryKey: ["llm-summary", llmWindow.start, llmWindow.end],
+    queryFn: ({ signal, project }) => getLLMSummary(llmWindow, signal, project),
     retry: false,
   });
   const trendQuery = useProjectQuery<LLMTimeseriesResult, ApiError>({
-    queryKey: ["llm-timeseries", trendMetric, window.start, window.end],
-    queryFn: ({ signal, project }) => getLLMTimeseries(window, trendMetric, signal, project),
+    queryKey: ["llm-timeseries", trendMetric, llmWindow.start, llmWindow.end],
+    queryFn: ({ signal, project }) => getLLMTimeseries(llmWindow, trendMetric, signal, project),
     retry: false,
   });
   const callsQuery = useProjectQuery<LLMCallsResult, ApiError>({
-    queryKey: ["llm-calls", service, model, window.start, window.end],
+    queryKey: ["llm-calls", service, model, llmWindow.start, llmWindow.end],
     queryFn: ({ signal, project }) =>
       getLLMCalls(
-        window,
+        llmWindow,
         {
           service: service === ALL ? undefined : service,
           model: model === ALL ? undefined : model,
@@ -91,9 +81,12 @@ export function LLMObservabilityPage() {
   });
 
   const refreshing = summaryQuery.isFetching || trendQuery.isFetching || callsQuery.isFetching;
-  function refresh() {
-    setNowMs((previous) => Math.max(dayjs().valueOf(), previous + 1));
-  }
+  const summaryState = queryViewState({
+    hasData: summaryQuery.data !== undefined,
+    isLoading: summaryQuery.isLoading,
+    isError: summaryQuery.isError,
+    isEmpty: (summaryQuery.data?.calls ?? 0) === 0,
+  });
 
   return (
     <PageContainer>
@@ -104,13 +97,7 @@ export function LLMObservabilityPage() {
             {t("llm.mockBadge")}
           </Badge>
         )}
-        <Select
-          value={rangeId}
-          onValueChange={(value) => {
-            setRangeId(value);
-            setNowMs(dayjs().valueOf());
-          }}
-        >
+        <Select value={rangeId} onValueChange={setRangeId}>
           <SelectTrigger className="w-40" aria-label={t("llm.timeRange")}>
             <SelectValue />
           </SelectTrigger>
@@ -122,21 +109,28 @@ export function LLMObservabilityPage() {
             ))}
           </SelectContent>
         </Select>
-        <Button variant="outline" size="sm" onClick={refresh} disabled={refreshing}>
+        <Button variant="outline" size="sm" onClick={() => advance()} disabled={refreshing}>
           <RefreshCw className={cn("size-4", refreshing && "animate-spin")} />
           {t("common.refresh")}
         </Button>
       </PageActions>
 
-      {summaryQuery.isLoading ? (
+      {summaryState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={summaryQuery.isFetching}
+          onRetry={() => void summaryQuery.refetch()}
+        />
+      )}
+
+      {summaryState === "pending" ? (
         <LLMPageSkeleton />
-      ) : summaryQuery.error ? (
+      ) : summaryState === "error" ? (
         <Card>
           <CardContent className="p-6">
             <EmptyState
               icon={<AlertCircle className="size-6 text-destructive" />}
               title={t("llm.errorTitle")}
-              desc={summaryQuery.error.message}
+              desc={summaryQuery.error?.message ?? t("common.queryErrorDesc")}
               action={
                 <Button variant="outline" size="sm" onClick={() => void summaryQuery.refetch()}>
                   {t("common.retry")}
@@ -145,7 +139,7 @@ export function LLMObservabilityPage() {
             />
           </CardContent>
         </Card>
-      ) : !summaryQuery.data || summaryQuery.data.calls === 0 ? (
+      ) : summaryState === "empty" || !summaryQuery.data ? (
         <Card>
           <CardContent className="p-6">
             <EmptyState
@@ -195,6 +189,13 @@ function LLMContent({
 }) {
   const { t } = useTranslation();
   const totalTokens = summary.input_tokens + summary.output_tokens;
+  const trendState = queryViewState({
+    hasData: trendQuery.data !== undefined,
+    isLoading: trendQuery.isLoading || (trendQuery.isFetching && !trendQuery.data),
+    isError: trendQuery.isError,
+    isEmpty: (trendQuery.data?.points.length ?? 0) === 0,
+  });
+
   return (
     <div className="space-y-4">
       {(summary.truncated || trendQuery.data?.truncated || callsQuery.data?.truncated) && (
@@ -233,16 +234,25 @@ function LLMContent({
               </SelectContent>
             </Select>
           </div>
-          {trendQuery.isLoading || trendQuery.isFetching && !trendQuery.data ? (
+          {trendState === "stale" && (
+            <QueryStaleNotice
+              isRetrying={trendQuery.isFetching}
+              onRetry={() => void trendQuery.refetch()}
+            />
+          )}
+          {trendState === "pending" ? (
             <Skeleton className="h-[260px] w-full" />
-          ) : trendQuery.error ? (
-            <QueryError message={trendQuery.error.message} onRetry={() => void trendQuery.refetch()} />
-          ) : trendQuery.data && trendQuery.data.points.length > 0 ? (
-            <TimeSeriesChart series={trendSeries(trendQuery.data.metric, trendQuery.data.points)} height={260} />
-          ) : (
+          ) : trendState === "error" ? (
+            <QueryError
+              message={trendQuery.error?.message ?? t("common.queryErrorDesc")}
+              onRetry={() => void trendQuery.refetch()}
+            />
+          ) : trendState === "empty" || !trendQuery.data ? (
             <div className="flex h-[260px] items-center justify-center text-sm text-muted-foreground">
               {t("llm.emptyTrend")}
             </div>
+          ) : (
+            <TimeSeriesChart series={trendSeries(trendQuery.data.metric, trendQuery.data.points)} height={260} />
           )}
         </CardContent>
       </Card>
@@ -339,6 +349,14 @@ function CallsTable({
 }) {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+  const rows = query.data?.calls ?? [];
+  const viewState = queryViewState({
+    hasData: query.data !== undefined,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    isEmpty: rows.length === 0,
+  });
+
   return (
     <Card>
       <CardContent className="p-0">
@@ -364,11 +382,22 @@ function CallsTable({
             </Select>
           </div>
         </div>
-        {query.isLoading ? (
+        {viewState === "stale" && (
+          <div className="p-4 pb-0">
+            <QueryStaleNotice
+              isRetrying={query.isFetching}
+              onRetry={() => void query.refetch()}
+            />
+          </div>
+        )}
+        {viewState === "pending" ? (
           <div className="space-y-2 p-4">{Array.from({ length: 6 }).map((_, index) => <Skeleton key={index} className="h-9 w-full" />)}</div>
-        ) : query.error ? (
-          <QueryError message={query.error.message} onRetry={() => void query.refetch()} />
-        ) : (query.data?.calls.length ?? 0) === 0 ? (
+        ) : viewState === "error" ? (
+          <QueryError
+            message={query.error?.message ?? t("common.queryErrorDesc")}
+            onRetry={() => void query.refetch()}
+          />
+        ) : viewState === "empty" ? (
           <div className="p-8 text-center text-sm text-muted-foreground">{t("llm.noMatchingCalls")}</div>
         ) : (
           <div className="overflow-x-auto">
@@ -385,7 +414,7 @@ function CallsTable({
                 </tr>
               </thead>
               <tbody>
-                {(query.data?.calls ?? []).map((call) => (
+                {rows.map((call) => (
                   <CallRow
                     key={`${call.trace_id}-${call.time}`}
                     call={call}

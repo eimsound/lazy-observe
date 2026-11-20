@@ -24,13 +24,18 @@ import {
 } from "lucide-react";
 
 import type { Role } from "@/lib/api/auth";
-import { hasMinimumRole } from "@/lib/auth/permissions";
+import {
+  hasCapability,
+  hasMinimumRole,
+  minRoleForCapability,
+  type Capability,
+} from "@/lib/auth/permissions";
 
 /**
  * Primary navigation model (GitLab-style grouped sidebar). Adding a section =
- * one entry here + a route in src/router.tsx. Items may be gated by role
- * (`minRole`) — the sidebar and command palette hide those the current user
- * can't reach.
+ * one entry here + a route in src/router.tsx. Items may be gated by
+ * capability (`capability`) and/or role (`minRole`) — the sidebar, command
+ * palette, and route guard all share the same RBAC capability matrix.
  */
 
 export interface NavItem {
@@ -41,7 +46,9 @@ export interface NavItem {
   icon: LucideIcon;
   /** Not yet implemented — shows a placeholder page + a muted style. */
   placeholder?: boolean;
-  /** Minimum role required to access this route (matches backend RBAC). */
+  /** Fine-grained capability required to access this route (matches backend RBAC). */
+  capability?: Capability;
+  /** Minimum role derived from capability or set explicitly. */
   minRole?: Role;
 }
 
@@ -49,6 +56,15 @@ export interface NavGroup {
   /** i18n key under `nav.*`. */
   labelKey: string;
   items: NavItem[];
+}
+
+function gated(
+  item: Omit<NavItem, "minRole"> & { capability: Capability },
+): NavItem {
+  return {
+    ...item,
+    minRole: minRoleForCapability(item.capability),
+  };
 }
 
 export const NAV_GROUPS: NavGroup[] = [
@@ -77,27 +93,33 @@ export const NAV_GROUPS: NavGroup[] = [
     labelKey: "nav.groupAlerts",
     items: [
       { to: "/alerts", labelKey: "nav.alertEvents", icon: BellRing },
-      { to: "/alerts/rules", labelKey: "nav.alertRules", icon: ListChecks, minRole: "member" },
-      { to: "/alerts/silences", labelKey: "nav.silences", icon: BellOff, minRole: "member" },
-      { to: "/alerts/channels", labelKey: "nav.channels", icon: Send, minRole: "admin" },
-      { to: "/alerts/notifications", labelKey: "nav.notifications", icon: History, minRole: "member" },
+      gated({ to: "/alerts/rules", labelKey: "nav.alertRules", icon: ListChecks, capability: "alerts:read" }),
+      gated({ to: "/alerts/silences", labelKey: "nav.silences", icon: BellOff, capability: "alerts:read" }),
+      gated({ to: "/alerts/channels", labelKey: "nav.channels", icon: Send, capability: "channels:write" }),
+      gated({ to: "/alerts/notifications", labelKey: "nav.notifications", icon: History, capability: "alerts:read" }),
     ],
   },
   {
     labelKey: "nav.groupManage",
     items: [
       { to: "/settings/projects", labelKey: "nav.projects", icon: FolderKanban },
-      { to: "/settings/users", labelKey: "nav.users", icon: Users, minRole: "admin" },
-      { to: "/settings/audit", labelKey: "nav.audit", icon: ScrollText, minRole: "admin" },
-      { to: "/settings/diagnostics", labelKey: "nav.diagnostics", icon: Stethoscope, minRole: "admin" },
-      { to: "/settings/ai", labelKey: "nav.aiSettings", icon: Sparkles, minRole: "admin" },
+      gated({ to: "/settings/users", labelKey: "nav.users", icon: Users, capability: "users:manage" }),
+      gated({ to: "/settings/audit", labelKey: "nav.audit", icon: ScrollText, capability: "audit:read" }),
+      gated({ to: "/settings/diagnostics", labelKey: "nav.diagnostics", icon: Stethoscope, capability: "diagnostics:read" }),
+      gated({ to: "/settings/ai", labelKey: "nav.aiSettings", icon: Sparkles, capability: "ai:manage" }),
       { to: "/settings", labelKey: "nav.settings", icon: Settings },
     ],
   },
 ];
 
 /** Whether a role can access a navigation entry (shared by sidebar & command palette). */
-export function canAccessNavItem(item: Pick<NavItem, "minRole">, role: Role | null): boolean {
+export function canAccessNavItem(
+  item: Pick<NavItem, "capability" | "minRole">,
+  role: Role | null,
+): boolean {
+  if (item.capability && !hasCapability(role, item.capability)) {
+    return false;
+  }
   return hasMinimumRole(role, item.minRole);
 }
 

@@ -14,11 +14,14 @@ import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { projectDsn } from "@/lib/tokens/token-usage";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { SnippetBlock } from "@/components/common/snippet-block";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { queryViewState } from "@/routes/query-view-state";
 
 const fmt = (iso: string) => (iso ? formatDateTime(dayjs(iso).valueOf()) : "—");
 
@@ -35,6 +38,7 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
   const tokens = useQuery({
     queryKey,
     queryFn: ({ signal }) => listSourceMapUploadTokens(projectId, signal),
+    retry: false,
   });
 
   const [name, setName] = useState("");
@@ -64,6 +68,14 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
       /* clipboard unavailable */
     }
   }
+
+  const rows = tokens.data ?? [];
+  const viewState = queryViewState({
+    hasData: tokens.data !== undefined,
+    isLoading: tokens.isLoading,
+    isError: tokens.isError,
+    isEmpty: rows.length === 0,
+  });
 
   return (
     <section className="space-y-3" aria-label={t("projects.smUploadTitle")}>
@@ -121,12 +133,23 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
         </p>
       )}
 
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={tokens.isFetching}
+          onRetry={() => void tokens.refetch()}
+        />
+      )}
+
       <div className="rounded-lg border border-border">
-        {tokens.isLoading ? (
+        {viewState === "pending" ? (
           <div className="space-y-2 p-3">
             <Skeleton className="h-8 w-full" />
           </div>
-        ) : tokens.data && tokens.data.length > 0 ? (
+        ) : viewState === "error" ? (
+          <QueryErrorState error={tokens.error} onRetry={() => void tokens.refetch()} />
+        ) : viewState === "empty" ? (
+          <p className="px-3 py-6 text-center text-sm text-muted-foreground">{t("projects.smUploadNone")}</p>
+        ) : (
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs uppercase tracking-wider text-muted-foreground">
@@ -139,7 +162,7 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
               </tr>
             </thead>
             <tbody>
-              {tokens.data.map((tok) => (
+              {rows.map((tok) => (
                 <tr key={tok.id} className="border-b border-border/60 last:border-0">
                   <td className="px-3 py-2 font-medium">
                     <span className={tok.revoked ? "text-muted-foreground line-through" : ""}>
@@ -172,24 +195,24 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
               ))}
             </tbody>
           </table>
-        ) : (
-          <p className="px-3 py-6 text-center text-sm text-muted-foreground">{t("projects.smUploadNone")}</p>
         )}
       </div>
 
-      <ConfirmDialog
-        open={!!revoking}
-        onOpenChange={(o) => !o && setRevoking(null)}
-        title={t("projects.smUploadRevokeConfirm", { name: revoking?.name ?? "" })}
-        description={t("projects.smUploadRevokeConfirmDesc")}
-        confirmLabel={t("projects.smUploadRevoke")}
-        onConfirm={async () => {
-          if (!revoking) return;
-          await revokeSourceMapUploadToken(projectId, revoking.id);
-          void queryClient.invalidateQueries({ queryKey });
-          setRevoking(null);
-        }}
-      />
+      {revoking && (
+        <ConfirmDialog
+          key={revoking.id}
+          open
+          onOpenChange={(o) => !o && setRevoking(null)}
+          title={t("projects.smUploadRevokeConfirm", { name: revoking.name })}
+          description={t("projects.smUploadRevokeConfirmDesc")}
+          confirmLabel={t("projects.smUploadRevoke")}
+          onConfirm={async () => {
+            await revokeSourceMapUploadToken(projectId, revoking.id);
+            void queryClient.invalidateQueries({ queryKey });
+            setRevoking(null);
+          }}
+        />
+      )}
     </section>
   );
 }
