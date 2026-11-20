@@ -437,3 +437,93 @@ func assertPostgresSchemaVersionAbsent(t *testing.T, db *sql.DB) {
 		t.Fatalf("schema_version unexpectedly exists as %q", relation.String)
 	}
 }
+
+func TestPostgresPoolLimitsReadOnlyDiagnosisAndAdvisoryLocks(t *testing.T) {
+	if os.Getenv("LO_TEST_PG") != "1" {
+		t.Skip("set LO_TEST_PG=1 to run PostgreSQL metadata tests")
+	}
+	ctx := context.Background()
+	dbURL := newPostgresTestDatabase(t)
+
+	// 1. Read-only diagnosis on an empty database must NOT create tables or run migrations.
+	diag, err := DiagnosePostgresReadOnly(ctx, dbURL, OpenOptions{})
+	if err != nil {
+		t.Fatalf("DiagnosePostgresReadOnly on empty DB: %v", err)
+	}
+	if diag.Initialized || diag.HasBootstrapAdmin || diag.PlatformKeyFingerprint != "" {
+		t.Fatalf("unexpected empty DB diagnostics: %+v", diag)
+	}
+	rawDB, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawDB.Close()
+	assertPostgresSchemaVersionAbsent(t, rawDB)
+
+	// 2. OpenStore configures bounded connection pool limits.
+	storeA, err := OpenStore(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeA.Close()
+	if got := storeA.db.Stats().MaxOpenConnections; got != DefaultPostgresMaxOpenConns {
+		t.Fatalf("PG MaxOpenConnections=%d want=%d", got, DefaultPostgresMaxOpenConns)
+	}
+
+	// 3. After bootstrap + key fingerprint, read-only diagnosis reports them.
+	if _, _, err := storeA.EnsurePlatformKeyFingerprint(ctx, "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storeA.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), InitialAdminPasswordFileName)},
+	); err != nil {
+		t.Fatal(err)
+	}
+	diag, err = DiagnosePostgresReadOnly(ctx, dbURL, OpenOptions{})
+	if err != nil {
+		t.Fatalf("DiagnosePostgresReadOnly on initialized DB: %v", err)
+	}
+	if !diag.Initialized || !diag.HasBootstrapAdmin ||
+		diag.PlatformKeyFingerprint != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("unexpected initialized DB diagnostics: %+v", diag)
+	}
+
+	// 4. Janitor and scrape advisory locks are mutually exclusive across replicas.
+	storeB, err := OpenStore(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeB.Close()
+	releaseA, acquiredA, err := storeA.TryAcquireJanitorLock(ctx)
+	if err != nil || !acquiredA {
+		t.Fatalf("storeA janitor lock acquired=%v err=%v", acquiredA, err)
+	}
+	_, acquiredB, err := storeB.TryAcquireJanitorLock(ctx)
+	if err != nil || acquiredB {
+		t.Fatalf("storeB unexpectedly acquired janitor lock: acquired=%v err=%v", acquiredB, err)
+	}
+	if err := releaseA(); err != nil {
+		t.Fatal(err)
+	}
+	releaseB, acquiredB, err := storeB.TryAcquireJanitorLock(ctx)
+	if err != nil || !acquiredB {
+		t.Fatalf("storeB failed to acquire janitor lock after release: acquired=%v err=%v", acquiredB, err)
+	}
+	if err := releaseB(); err != nil {
+		t.Fatal(err)
+	}
+
+	scrapeRelA, scrapeAcqA, err := storeA.TryAcquireScrapeLeader(ctx)
+	if err != nil || !scrapeAcqA {
+		t.Fatalf("storeA scrape leader acquired=%v err=%v", scrapeAcqA, err)
+	}
+	_, scrapeAcqB, err := storeB.TryAcquireScrapeLeader(ctx)
+	if err != nil || scrapeAcqB {
+		t.Fatalf("storeB unexpectedly acquired scrape leader: acquired=%v err=%v", scrapeAcqB, err)
+	}
+	if err := scrapeRelA(); err != nil {
+		t.Fatal(err)
+	}
+}

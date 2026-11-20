@@ -39,6 +39,9 @@ func runServer(cfg appconfig.Config) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	drainSig := make(chan os.Signal, 1)
+	signal.Notify(drainSig, syscall.SIGUSR1)
+	defer signal.Stop(drainSig)
 
 	shared, err := openServerSharedState(ctx, cfg)
 	if err != nil {
@@ -56,6 +59,7 @@ func runServer(cfg appconfig.Config) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = signals.supervisor.Shutdown() }()
 
 	loopback, err := openInternalLoopback(cfg)
 	if err != nil {
@@ -85,7 +89,7 @@ func runServer(cfg appconfig.Config) error {
 	if err != nil {
 		return err
 	}
-	return waitForServerExit(ctx, cfg, monitoring, signals.supervisor, runningGateway)
+	return waitForServerExit(ctx, drainSig, cfg, monitoring, signals.supervisor, runningGateway)
 }
 
 func loadServerEssentials(cfg appconfig.Config) (serverEssentials, error) {

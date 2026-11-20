@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/account"
@@ -207,27 +208,44 @@ func logGatewayReady(cfg appconfig.Config, logger *slog.Logger) {
 
 func waitForServerExit(
 	ctx context.Context,
+	drainSig <-chan os.Signal,
 	cfg appconfig.Config,
 	monitoring *selfMonitoring,
 	supervisor managedComponentSupervisor,
 	runningGateway *runningServerGateway,
 ) error {
-	select {
-	case <-ctx.Done():
-		return drainServer(cfg, monitoring, supervisor, runningGateway.gateway)
-	case fatalErr := <-supervisor.Done():
-		_ = runningGateway.gateway.Shutdown()
-		shutdownErr := supervisor.Shutdown()
-		if fatalErr == nil {
-			fatalErr = errors.New("managed component supervisor stopped without an error")
+	alreadyDraining := false
+	for {
+		select {
+		case <-drainSig:
+			if !alreadyDraining {
+				monitoring.logger.Info("pre-stop drain requested; marking readiness unavailable")
+				runningGateway.gateway.BeginDrain()
+				alreadyDraining = true
+			}
+		case <-ctx.Done():
+			return drainServer(cfg, monitoring, supervisor, runningGateway.gateway, alreadyDraining)
+		case fatalErr := <-supervisor.Done():
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.Process.DrainTimeout.Value())
+			monitoring.Shutdown()
+			_ = runningGateway.gateway.Drain(drainCtx)
+			cancelDrain()
+			shutdownErr := supervisor.Shutdown()
+			if fatalErr == nil {
+				fatalErr = errors.New("managed component supervisor stopped without an error")
+			}
+			return errors.Join(fmt.Errorf("managed component supervisor failed: %w", fatalErr), shutdownErr)
+		case err := <-runningGateway.errors:
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.Process.DrainTimeout.Value())
+			monitoring.Shutdown()
+			_ = runningGateway.gateway.Drain(drainCtx)
+			cancelDrain()
+			shutdownErr := supervisor.Shutdown()
+			if err == nil {
+				err = errors.New("gateway stopped unexpectedly")
+			}
+			return errors.Join(err, shutdownErr)
 		}
-		return errors.Join(fmt.Errorf("managed component supervisor failed: %w", fatalErr), shutdownErr)
-	case err := <-runningGateway.errors:
-		shutdownErr := supervisor.Shutdown()
-		if err == nil {
-			err = errors.New("gateway stopped unexpectedly")
-		}
-		return errors.Join(err, shutdownErr)
 	}
 }
 
@@ -236,13 +254,17 @@ func drainServer(
 	monitoring *selfMonitoring,
 	supervisor managedComponentSupervisor,
 	gw serverGatewayLifecycle,
+	alreadyDraining bool,
 ) error {
 	monitoring.logger.Info("shutdown requested")
 	gw.BeginDrain()
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.Process.DrainTimeout.Value())
-	// Keep the listener available briefly so kube-proxy/Ingress readiness
-	// polling can observe 503 before connection acceptance stops.
-	time.Sleep(250 * time.Millisecond)
+	if !alreadyDraining {
+		// Keep the listener available briefly when SIGTERM arrived directly
+		// (without a preceding pre-stop SIGUSR1 window) so readiness polling can
+		// observe 503 before connection acceptance stops.
+		time.Sleep(250 * time.Millisecond)
+	}
 	// Flush while the in-process OTLP endpoint and storage are still alive.
 	monitoring.Shutdown()
 	if err := gw.Drain(drainCtx); err != nil {

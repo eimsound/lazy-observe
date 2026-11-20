@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -19,8 +17,8 @@ func (ScrapeTarget) Fields() []ent.Field {
 		field.String("interval").Default("30s"),
 		field.JSON("labels", map[string]string{}).Default(map[string]string{}),
 		field.Bool("enabled").Default(true),
-		field.Time("created_at").Default(time.Now).Immutable(),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("created_at").Default(UTCNow).Immutable(),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 		field.Int("project_id"),
 	}
 }

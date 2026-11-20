@@ -72,9 +72,23 @@ func (s *Local) Get(_ context.Context, key string) (io.ReadCloser, error) {
 }
 
 func (s *Local) List(ctx context.Context, prefix string) ([]Object, error) {
-	base, err := s.path(prefix, true)
+	normalized, err := normalizePrefix(prefix)
 	if err != nil {
 		return nil, err
+	}
+	base, err := s.path(normalized, true)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(base)
+	if errors.Is(err, os.ErrNotExist) {
+		return []Object{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list blobs: %w", err)
+	}
+	if !info.IsDir() {
+		return []Object{}, nil
 	}
 	objects := []Object{}
 	err = filepath.WalkDir(base, func(path string, d os.DirEntry, walkErr error) error {
@@ -123,9 +137,23 @@ func (s *Local) Delete(_ context.Context, key string) error {
 }
 
 func (s *Local) DeletePrefix(_ context.Context, prefix string) error {
-	path, err := s.path(prefix, true)
+	normalized, err := normalizePrefix(prefix)
 	if err != nil {
 		return err
+	}
+	path, err := s.path(normalized, true)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("delete blob prefix: %w", err)
+	}
+	if !info.IsDir() {
+		return nil
 	}
 	if err := os.RemoveAll(path); err != nil {
 		return fmt.Errorf("delete blob prefix: %w", err)

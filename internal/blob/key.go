@@ -22,3 +22,16 @@ func validateKey(key string, prefix bool) error {
 	}
 	return nil
 }
+
+// normalizePrefix validates a prefix and canonicalizes it to a directory
+// boundary (trailing slash) so Local and S3 backends share identical semantics
+// and never match or delete sibling prefixes (e.g. "replay/a" vs "replay/ab").
+func normalizePrefix(prefix string) (string, error) {
+	if err := validateKey(prefix, true); err != nil {
+		return "", err
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return prefix, nil
+}

@@ -59,6 +59,18 @@ func TestExtractVerifiesAndRepairsPayload(t *testing.T) {
 	if _, err := extract(assets, dir); err != nil {
 		t.Fatalf("reuse verified payload: %v", err)
 	}
+
+	onlyDir := t.TempDir()
+	if _, err := extract(assets, onlyDir, "vmagent-prod"); err != nil {
+		t.Fatalf("extract only vmagent-prod: %v", err)
+	}
+	entries, err := os.ReadDir(onlyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "vmagent-prod" {
+		t.Fatalf("extract only entries=%v want [vmagent-prod]", entries)
+	}
 }
 
 func TestExtractRejectsBadDigest(t *testing.T) {

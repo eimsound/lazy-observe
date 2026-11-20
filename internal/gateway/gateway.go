@@ -63,8 +63,10 @@ const (
 )
 
 const (
-	defaultReadTimeout = 60 * time.Second
-	defaultIdleTimeout = 120 * time.Second
+	defaultReadTimeout     = 60 * time.Second
+	defaultIdleTimeout     = 120 * time.Second
+	defaultShutdownTimeout = 15 * time.Second
+	defaultProbeTimeout    = 5 * time.Second
 )
 
 const (
@@ -532,7 +534,9 @@ func (g *Gateway) Drain(ctx context.Context) error {
 }
 
 func (g *Gateway) Shutdown() error {
-	return g.Drain(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+	defer cancel()
+	return g.Drain(ctx)
 }
 
 // routes registers handlers in the exact order Fiber must match them:
@@ -908,10 +912,12 @@ func probeComponentStatus(err error) string {
 	return "unavailable"
 }
 func (g *Gateway) healthz(c fiber.Ctx) error {
+	probeCtx, cancel := context.WithTimeout(c.Context(), defaultProbeTimeout)
+	defer cancel()
 	status := fiber.StatusOK
 	components := map[string]string{"gateway": "ok"}
 	if g.health != nil {
-		for name, err := range g.health.Health(c.Context()) {
+		for name, err := range g.health.Health(probeCtx) {
 			if err != nil {
 				status = fiber.StatusServiceUnavailable
 				g.logger.Warn("health probe component unhealthy", "component", name, "error", err)
@@ -922,7 +928,7 @@ func (g *Gateway) healthz(c fiber.Ctx) error {
 		}
 	}
 	if g.errorTracker != nil {
-		summary, err := g.errorTracker.Summary(c.Context())
+		summary, err := g.errorTracker.Summary(probeCtx)
 		if err != nil {
 			status = fiber.StatusServiceUnavailable
 			components["error_inbox"] = "diagnostics unavailable"
@@ -952,12 +958,14 @@ func (g *Gateway) readyz(c fiber.Ctx) error {
 		return c.Status(fiber.StatusServiceUnavailable).
 			JSON(fiber.Map{"status": "not_ready", "components": components})
 	}
+	probeCtx, cancel := context.WithTimeout(c.Context(), defaultProbeTimeout)
+	defer cancel()
 	checker := g.readiness
 	if checker == nil {
 		checker = g.health
 	}
 	if checker != nil {
-		for name, err := range checker.Health(c.Context()) {
+		for name, err := range checker.Health(probeCtx) {
 			if err != nil {
 				g.logger.Warn("readiness probe component not ready", "component", name, "error", err)
 				components[name] = probeComponentStatus(err)
@@ -968,7 +976,7 @@ func (g *Gateway) readyz(c fiber.Ctx) error {
 		}
 	}
 	if g.errorTracker != nil {
-		if err := g.errorTracker.Readiness(c.Context()); err != nil {
+		if err := g.errorTracker.Readiness(probeCtx); err != nil {
 			g.logger.Warn("readiness probe error inbox not ready", "error", err)
 			components["error_inbox"] = "unavailable"
 			ready = false

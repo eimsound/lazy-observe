@@ -92,7 +92,8 @@ func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 }
 
 func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
-	if err := validateKey(prefix, true); err != nil {
+	normalized, err := normalizePrefix(prefix)
+	if err != nil {
 		return nil, err
 	}
 	var result []Object
@@ -100,7 +101,11 @@ func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
 	for {
 		out, err := s.client.ListObjectsV2(
 			ctx,
-			&s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), ContinuationToken: token},
+			&s3.ListObjectsV2Input{
+				Bucket:            aws.String(s.bucket),
+				Prefix:            aws.String(normalized),
+				ContinuationToken: token,
+			},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("list S3 blobs: %w", err)

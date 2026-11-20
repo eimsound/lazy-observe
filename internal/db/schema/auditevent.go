@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/field"
 	"entgo.io/ent/schema/index"
@@ -32,7 +30,7 @@ func (AuditEvent) Fields() []ent.Field {
 		field.String("failure_reason").Default(""),
 		field.String("http_method").Default(""),
 		field.String("http_path").Default(""),
-		field.Time("created_at").Default(time.Now).Immutable(),
+		field.Time("created_at").Default(UTCNow).Immutable(),
 	}
 }
 

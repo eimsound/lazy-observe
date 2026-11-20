@@ -933,32 +933,33 @@ func (s *Store) FailIssueLifecycleEvent(
 }
 
 func (s *Store) DeleteCompletedErrorReceipts(ctx context.Context, cutoff time.Time) (int, error) {
-	cutoff = cutoff.UTC()
-	tx, err := s.db.BeginTx(ctx, nil)
+	cutoff = cutoff.UTC().Round(0)
+	deleted, err := s.deleteInBatches(
+		ctx,
+		"completed error receipts",
+		`DELETE FROM telemetry_inbox WHERE id IN (
+			SELECT id FROM telemetry_inbox
+			WHERE status IN ('completed', 'terminal') AND completed_at < ?
+			ORDER BY id LIMIT ?
+		)`,
+		cutoff,
+	)
 	if err != nil {
-		return 0, fmt.Errorf("begin completed error receipt cleanup: %w", err)
+		return deleted, err
 	}
-	defer tx.Rollback()
-	if _, err := s.lockErrorInboxStateTx(ctx, tx); err != nil {
-		return 0, fmt.Errorf("lock completed error receipt cleanup: %w", err)
+	if _, err := s.deleteInBatches(
+		ctx,
+		"completed issue lifecycle events",
+		`DELETE FROM issue_lifecycle_events WHERE id IN (
+			SELECT id FROM issue_lifecycle_events
+			WHERE status IN ('dispatched', 'failed') AND dispatched_at < ?
+			ORDER BY id LIMIT ?
+		)`,
+		cutoff,
+	); err != nil {
+		return deleted, err
 	}
-	result, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM telemetry_inbox
-		WHERE status IN ('completed', 'terminal') AND completed_at < ?`), cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("delete completed error receipts: %w", err)
-	}
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("count deleted error receipts: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM issue_lifecycle_events
-		WHERE status IN ('dispatched', 'failed') AND dispatched_at < ?`), cutoff); err != nil {
-		return 0, fmt.Errorf("delete completed issue lifecycle events: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit completed error receipt cleanup: %w", err)
-	}
-	return int(deleted), nil
+	return deleted, nil
 }
 
 type errorInboxRows interface {

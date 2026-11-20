@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/meta"
@@ -84,16 +85,19 @@ func (c *SourceMaps) sweepRevisions(ctx context.Context) error {
 		byProject[parts[1]] = append(byProject[parts[1]], strings.TrimSuffix(parts[3], ".map"))
 	}
 	for slug, digests := range byProject {
+		var referenced map[string]bool
 		project, err := c.Metadata.ProjectBySlug(ctx, slug)
 		if err != nil {
-			if meta.IsNotFound(err) {
-				continue
+			if !meta.IsNotFound(err) {
+				return fmt.Errorf("resolve source map project %s: %w", slug, err)
 			}
-			return fmt.Errorf("resolve source map project %s: %w", slug, err)
-		}
-		referenced, err := c.Metadata.ReferencedSourceMapDigests(ctx, project.ID)
-		if err != nil {
-			return fmt.Errorf("list referenced source map revisions for %s: %w", slug, err)
+			// Project no longer exists; every past-grace revision under this
+			// slug is orphaned and must be reclaimed.
+		} else {
+			referenced, err = c.Metadata.ReferencedSourceMapDigests(ctx, project.ID)
+			if err != nil {
+				return fmt.Errorf("list referenced source map revisions for %s: %w", slug, err)
+			}
 		}
 		for _, digest := range digests {
 			if referenced[digest] {
@@ -209,4 +213,126 @@ func (c *Profiles) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 			return deleted, errors.Join(errs...)
 		}
 	}
+}
+
+type SessionStore interface {
+	DeleteExpiredSessions(context.Context, time.Time) (int, error)
+}
+
+type Sessions struct{ Metadata SessionStore }
+
+func (c Sessions) Clean(ctx context.Context, cutoff time.Time) (int, error) {
+	if c.Metadata == nil {
+		return 0, nil
+	}
+	return c.Metadata.DeleteExpiredSessions(ctx, cutoff)
+}
+
+type NotificationDeliveryStore interface {
+	DeleteExpiredNotificationDeliveries(context.Context, time.Time) (int, error)
+}
+
+type NotificationDeliveries struct{ Metadata NotificationDeliveryStore }
+
+func (c NotificationDeliveries) Clean(ctx context.Context, cutoff time.Time) (int, error) {
+	if c.Metadata == nil {
+		return 0, nil
+	}
+	return c.Metadata.DeleteExpiredNotificationDeliveries(ctx, cutoff)
+}
+
+type NotificationOutboxStore interface {
+	DeleteExpiredNotificationOutbox(context.Context, time.Time) (int, error)
+}
+
+type NotificationOutbox struct{ Metadata NotificationOutboxStore }
+
+func (c NotificationOutbox) Clean(ctx context.Context, cutoff time.Time) (int, error) {
+	if c.Metadata == nil {
+		return 0, nil
+	}
+	return c.Metadata.DeleteExpiredNotificationOutbox(ctx, cutoff)
+}
+
+type DeletedProjectBlobStore interface {
+	ListPendingDeletedProjectBlobs(context.Context, int) ([]string, error)
+	MarkDeletedProjectBlobsCleaned(context.Context, string, time.Time) error
+}
+
+// DeletedProjectBlobs retries blob prefix removal for deleted projects so
+// transient S3 or process failures never leave orphaned project blobs behind.
+type DeletedProjectBlobs struct {
+	Metadata DeletedProjectBlobStore
+	Blobs    blob.Store
+	Now      func() time.Time
+}
+
+func (c *DeletedProjectBlobs) Clean(ctx context.Context, _ time.Time) (int, error) {
+	if c.Metadata == nil || c.Blobs == nil {
+		return 0, nil
+	}
+	nowFn := c.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	cleaned := 0
+	failed := make(map[string]struct{})
+	var errs []error
+	for {
+		slugs, err := c.Metadata.ListPendingDeletedProjectBlobs(ctx, 100)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("list deleted project blob cleanups: %w", err))
+			return cleaned, errors.Join(errs...)
+		}
+		if len(slugs) == 0 {
+			return cleaned, errors.Join(errs...)
+		}
+		progressed := false
+		for _, slug := range slugs {
+			if _, skip := failed[slug]; skip {
+				continue
+			}
+			var slugErr error
+			for _, prefix := range []string{
+				"profiles/" + safeBlobSegment(slug) + "/",
+				"replay/" + slug + "/",
+				"sourcemaps/" + slug + "/",
+			} {
+				if err := c.Blobs.DeletePrefix(ctx, prefix); err != nil && !errors.Is(err, blob.ErrNotFound) {
+					slugErr = errors.Join(slugErr, fmt.Errorf("delete %s: %w", prefix, err))
+				}
+			}
+			if slugErr != nil {
+				failed[slug] = struct{}{}
+				errs = append(errs, slugErr)
+				continue
+			}
+			if err := c.Metadata.MarkDeletedProjectBlobsCleaned(ctx, slug, nowFn().UTC()); err != nil {
+				failed[slug] = struct{}{}
+				errs = append(errs, fmt.Errorf("mark deleted project blobs cleaned for %s: %w", slug, err))
+				continue
+			}
+			cleaned++
+			progressed = true
+		}
+		if !progressed || len(slugs) < 100 {
+			return cleaned, errors.Join(errs...)
+		}
+	}
+}
+
+func safeBlobSegment(value string) string {
+	value = strings.TrimSpace(value)
+	var b strings.Builder
+	for _, r := range value {
+		if r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r)) || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 || b.String() == "." || b.String() == ".." {
+		return "unknown"
+	}
+	return b.String()
 }

@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -332,6 +333,10 @@ func TestSupervisorHelperProcess(t *testing.T) {
 	signal.Notify(stopping, syscall.SIGTERM, syscall.SIGINT)
 	go func() { _ = server.Serve(listener) }()
 	<-stopping
+	if mode == "hang-sigterm" {
+		// Ignore SIGTERM until SIGKILL terminates this helper process.
+		select {}
+	}
 	if eventFile := os.Getenv("LO_SUPERVISOR_EVENT_FILE"); eventFile != "" {
 		file, err := os.OpenFile(eventFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err == nil {
@@ -438,5 +443,87 @@ func TestReloadVMAgentReportsHTTPStatusErrors(t *testing.T) {
 	statusCode = http.StatusInternalServerError
 	if err := sup.ReloadVMAgent(); err == nil || !strings.Contains(err.Error(), "invalid scrape.yml") {
 		t.Fatalf("expected HTTP 500 reload error with body, got err=%v", err)
+	}
+}
+
+func TestSupervisorGivesStorageIndependentBudgetWhenVMAgentHangs(t *testing.T) {
+	factory := newHelperCommandFactory()
+	factory.eventFile = filepath.Join(t.TempDir(), "shutdown-hang.log")
+	factory.setMode("vmagent", "hang-sigterm")
+	supervisor := startTestSupervisor(t, 1_400, factory, func(cfg *Config) {
+		cfg.ShutdownTimeout = 600 * time.Millisecond
+	})
+	err := supervisor.Shutdown()
+	if err == nil || !strings.Contains(err.Error(), "agent shutdown timed out") {
+		t.Fatalf("shutdown err=%v want agent timeout error", err)
+	}
+	events, readErr := os.ReadFile(factory.eventFile)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	got := strings.Fields(string(events))
+	for _, storeName := range []string{"metrics", "logs", "traces"} {
+		if !slices.Contains(got, storeName) {
+			t.Fatalf(
+				"storage component %s did not receive graceful SIGTERM when vmagent hung; events=%v",
+				storeName,
+				got,
+			)
+		}
+	}
+}
+
+func TestSupervisorRejectsOccupiedComponentPort(t *testing.T) {
+	addr := offsetAddress(MetricsAddr, 1_500)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	factory := newHelperCommandFactory()
+	_, err = Start(context.Background(), Config{
+		Source:         testBinarySource{},
+		DataDir:        t.TempDir(),
+		StartupTimeout: time.Second,
+		Output:         io.Discard,
+		PortOffset:     1_500,
+		command:        factory.command,
+	})
+	if err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("Start with occupied port err=%v want already in use", err)
+	}
+}
+
+func TestQueryOnlyStandaloneStartsWithoutBinarySource(t *testing.T) {
+	supervisor, err := Start(context.Background(), Config{
+		DataDir:    t.TempDir(),
+		Output:     io.Discard,
+		Standalone: true,
+	})
+	if err != nil {
+		t.Fatalf("query-only standalone Start failed: %v", err)
+	}
+	if err := supervisor.Shutdown(); err != nil {
+		t.Fatalf("query-only standalone Shutdown failed: %v", err)
+	}
+}
+
+func TestLinePrefixWriterBoundsUnboundedLineMemory(t *testing.T) {
+	var out bytes.Buffer
+	var mu sync.Mutex
+	w := &linePrefixWriter{prefix: "[test] ", dst: &out, dstMu: &mu}
+	payload := bytes.Repeat([]byte("a"), maxLinePrefixBytes*2+10)
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if w.buf.Len() > maxLinePrefixBytes {
+		t.Fatalf("linePrefixWriter buffer grew to %d > %d", w.buf.Len(), maxLinePrefixBytes)
+	}
+	w.Flush()
+	if strings.Count(out.String(), "[test] ") < 3 {
+		t.Fatalf(
+			"expected forced line splits for oversized line, got %d prefixes",
+			strings.Count(out.String(), "[test] "),
+		)
 	}
 }

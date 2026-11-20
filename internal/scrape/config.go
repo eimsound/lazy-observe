@@ -3,6 +3,7 @@ package scrape
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,6 +46,8 @@ var (
 	promDurationPattern   = regexp.MustCompile(`^(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?$`)
 )
 
+const DefaultLeaderSyncInterval = 5 * time.Second
+
 type ReloadFunc func() error
 
 type Config struct {
@@ -70,6 +73,11 @@ type Service struct {
 	maxTargetsPerProject int
 	resolver             outbound.Resolver
 	logger               *slog.Logger
+
+	leaderMu sync.RWMutex
+	isLeader bool
+	hasHash  bool
+	lastHash [sha256.Size]byte
 }
 
 type Input struct {
@@ -113,6 +121,7 @@ func NewService(cfg Config) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	clustered := cfg.Store != nil && cfg.Store.IsClustered()
 	return &Service{
 		store:                cfg.Store,
 		configPath:           cfg.ConfigPath,
@@ -123,10 +132,23 @@ func NewService(cfg Config) *Service {
 		maxTargetsPerProject: maxTargets,
 		resolver:             cfg.Resolver,
 		logger:               logger,
+		isLeader:             !clustered,
 	}
 }
 
 func JobName(t meta.ScrapeTargetView) string { return fmt.Sprintf("scrape-%d", t.ID) }
+
+func (s *Service) IsLeader() bool {
+	s.leaderMu.RLock()
+	defer s.leaderMu.RUnlock()
+	return s.isLeader
+}
+
+func (s *Service) setLeader(leader bool) {
+	s.leaderMu.Lock()
+	s.isLeader = leader
+	s.leaderMu.Unlock()
+}
 
 func (s *Service) Sync(ctx context.Context) error {
 	s.mu.Lock()
@@ -135,13 +157,128 @@ func (s *Service) Sync(ctx context.Context) error {
 }
 
 func (s *Service) syncLocked(ctx context.Context) error {
-	if err := WriteConfigWithLogger(ctx, s.store, s.configPath, s.logger); err != nil {
+	if s.store != nil && s.store.IsClustered() && !s.IsLeader() {
+		// In HA mode, only the replica holding the scrape leader lock renders
+		// targets to vmagent. The leader's sync loop picks up DB changes written
+		// by non-leader replicas automatically.
+		return nil
+	}
+	return s.syncActiveLocked(ctx, true)
+}
+
+func (s *Service) syncActiveLocked(ctx context.Context, forceReload bool) error {
+	data, err := renderConfig(ctx, s.store, s.logger)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	if !forceReload && s.hasHash && s.lastHash == sum {
+		return nil
+	}
+	if err := writeAtomicFile(s.configPath, data); err != nil {
 		return err
 	}
 	if s.reload != nil {
-		return s.reload()
+		if err := s.reload(); err != nil {
+			return err
+		}
 	}
+	s.lastHash = sum
+	s.hasHash = true
 	return nil
+}
+
+func (s *Service) syncStandbyLocked() error {
+	data := []byte("scrape_configs: []\n")
+	sum := sha256.Sum256(data)
+	if s.hasHash && s.lastHash == sum {
+		return nil
+	}
+	if err := writeAtomicFile(s.configPath, data); err != nil {
+		return err
+	}
+	if s.reload != nil {
+		if err := s.reload(); err != nil {
+			return err
+		}
+	}
+	s.lastHash = sum
+	s.hasHash = true
+	return nil
+}
+
+// RunLeaderLoop coordinates single-owner scraping across HA PostgreSQL replicas
+// and periodically reconciles target changes written through other replicas.
+func (s *Service) RunLeaderLoop(ctx context.Context, logger *slog.Logger, interval time.Duration) {
+	if s.store == nil || !s.store.IsClustered() {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if interval <= 0 {
+		interval = DefaultLeaderSyncInterval
+	}
+	var release func() error
+	releaseLeader := func() {
+		s.setLeader(false)
+		if release != nil {
+			if err := release(); err != nil {
+				logger.Warn("release scrape leader lock failed", "error", err)
+			}
+			release = nil
+		}
+	}
+	defer releaseLeader()
+
+	step := func() {
+		if !s.IsLeader() {
+			rel, acquired, err := s.store.TryAcquireScrapeLeader(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					logger.Warn("acquire scrape leader lock failed", "error", err)
+				}
+				return
+			}
+			if !acquired {
+				s.mu.Lock()
+				err = s.syncStandbyLocked()
+				s.mu.Unlock()
+				if err != nil {
+					logger.Warn("clear standby scrape config failed", "error", err)
+				}
+				return
+			}
+			release = rel
+			s.setLeader(true)
+			logger.Info("acquired HA scrape leader lock")
+			s.mu.Lock()
+			err = s.syncActiveLocked(ctx, true)
+			s.mu.Unlock()
+			if err != nil {
+				logger.Warn("initial leader scrape sync failed", "error", err)
+			}
+			return
+		}
+		s.mu.Lock()
+		err := s.syncActiveLocked(ctx, false)
+		s.mu.Unlock()
+		if err != nil && ctx.Err() == nil {
+			logger.Warn("reconcile leader scrape config failed", "error", err)
+		}
+	}
+
+	step()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			step()
+		}
+	}
 }
 
 func (s *Service) List(ctx context.Context, slug string) ([]meta.ScrapeTargetView, error) {
@@ -529,12 +666,24 @@ func WriteConfig(ctx context.Context, store *meta.Store, path string) error {
 // skipping corrupt rows with a warning so one bad record cannot poison global
 // vmagent scraping or prevent startup.
 func WriteConfigWithLogger(ctx context.Context, store *meta.Store, path string, logger *slog.Logger) error {
+	data, err := renderConfig(ctx, store, logger)
+	if err != nil {
+		return err
+	}
+	return writeAtomicFile(path, data)
+}
+
+func WriteEmptyConfig(path string) error {
+	return writeAtomicFile(path, []byte("scrape_configs: []\n"))
+}
+
+func renderConfig(ctx context.Context, store *meta.Store, logger *slog.Logger) ([]byte, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	targets, err := store.ScrapeConfigSnapshot(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cfg := vmagentConfig{ScrapeConfigs: make([]scrapeConfig, 0, len(targets))}
 	for _, target := range targets {
@@ -608,10 +757,10 @@ func WriteConfigWithLogger(ctx context.Context, store *meta.Store, path string, 
 			},
 		)
 	}
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		return err
-	}
+	return yaml.Marshal(cfg)
+}
+
+func writeAtomicFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err

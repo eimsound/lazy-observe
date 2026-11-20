@@ -28,11 +28,6 @@ func startSignalStorage(
 	store *meta.Store,
 	logger *slog.Logger,
 ) (*serverSignalStorage, error) {
-	scrapeConfigPath, err := writeInitialScrapeConfig(ctx, store, cfg.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("write initial scrape config: %w", err)
-	}
-
 	queryURL, ingestURL, logsURL, tracesURL := signalStorageURLs(cfg, logger)
 	backend, err := storage.NewWithMetricsOptions(
 		storage.MetricsKind(cfg.Storage.Metrics.Kind),
@@ -50,9 +45,32 @@ func startSignalStorage(
 		return nil, fmt.Errorf("configure storage: %w", err)
 	}
 
-	binarySource, err := storageBinarySource(cfg, logger)
-	if err != nil {
-		return nil, err
+	var scrapeConfigPath string
+	var binarySource embed.BinarySource
+	needsManagedComponents := !cfg.Standalone || ingestURL != ""
+	if needsManagedComponents {
+		if store.IsClustered() {
+			// HA replicas start vmagent with an empty scrape config until the
+			// PostgreSQL advisory-lock leader loop elects the single active
+			// scraper, preventing duplicate target scrapes across replicas.
+			scrapeConfigPath = filepath.Join(cfg.DataDir, "scrape", "scrape.yml")
+			if err := scrape.WriteEmptyConfig(scrapeConfigPath); err != nil {
+				return nil, fmt.Errorf("write initial standby scrape config: %w", err)
+			}
+		} else {
+			scrapeConfigPath, err = writeInitialScrapeConfig(ctx, store, cfg.DataDir)
+			if err != nil {
+				return nil, fmt.Errorf("write initial scrape config: %w", err)
+			}
+		}
+		var requiredBins []string
+		if cfg.Standalone {
+			requiredBins = []string{"vmagent-prod"}
+		}
+		binarySource, err = storageBinarySource(cfg, logger, requiredBins...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	supervisor, err := embed.Start(ctx, embed.Config{
 		Source:           binarySource,
@@ -112,12 +130,12 @@ func signalStorageURLs(cfg appconfig.Config, logger *slog.Logger) (string, strin
 	return queryURL, ingestURL, logsURL, tracesURL
 }
 
-func storageBinarySource(cfg appconfig.Config, logger *slog.Logger) (embed.BinarySource, error) {
+func storageBinarySource(cfg appconfig.Config, logger *slog.Logger, names ...string) (embed.BinarySource, error) {
 	if cfg.StorageBinDir != "" {
 		logger.Info("using storage binary directory override", "directory", cfg.StorageBinDir)
 		return embed.DirectorySource(cfg.StorageBinDir), nil
 	}
-	extractedDir, err := embedbins.Extract(filepath.Join(cfg.DataDir, "bin"))
+	extractedDir, err := embedbins.ExtractOnly(filepath.Join(cfg.DataDir, "bin"), names...)
 	if err != nil {
 		return nil, fmt.Errorf("prepare embedded storage binaries: %w", err)
 	}

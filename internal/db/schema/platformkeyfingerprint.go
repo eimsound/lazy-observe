@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/field"
 )
@@ -20,7 +18,7 @@ func (PlatformKeyFingerprint) Fields() []ent.Field {
 	return []ent.Field{
 		field.Int("id").Immutable(), // fixed row id 1
 		field.String("fingerprint").NotEmpty(),
-		field.Time("created_at").Immutable().Default(time.Now),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("created_at").Immutable().Default(UTCNow),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 	}
 }

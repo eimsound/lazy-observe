@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -18,7 +16,7 @@ func (SourceMapArtifact) Fields() []ent.Field {
 		field.String("filename").NotEmpty(),
 		field.Int64("size").NonNegative(),
 		field.String("sha256").NotEmpty(),
-		field.Time("created_at").Default(time.Now).Immutable(),
+		field.Time("created_at").Default(UTCNow).Immutable(),
 		field.Int("project_id"),
 	}
 }

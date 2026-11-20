@@ -29,12 +29,18 @@ var requiredBinaries = []string{
 // Extract verifies and expands embedded gzip payloads into dir. Existing
 // binaries with the expected size and digest are reused.
 func Extract(dir string) (string, error) {
+	return ExtractOnly(dir)
+}
+
+// ExtractOnly verifies and expands only the named embedded gzip payloads into
+// dir. An empty names list extracts every binary in the manifest.
+func ExtractOnly(dir string, names ...string) (string, error) {
 	if platformAssets == nil {
 		return "", errors.New(
 			"storage binaries are not embedded for this platform; use --storage-bin-dir or mise run dist",
 		)
 	}
-	return extract(platformAssets, dir)
+	return extract(platformAssets, dir, names...)
 }
 
 type manifestEntry struct {
@@ -43,7 +49,7 @@ type manifestEntry struct {
 	digest [sha256.Size]byte
 }
 
-func extract(assets fs.FS, dir string) (string, error) {
+func extract(assets fs.FS, dir string, names ...string) (string, error) {
 	data, err := fs.ReadFile(assets, manifestName)
 	if err != nil {
 		return "", fmt.Errorf("read embedded storage manifest: %w (use --storage-bin-dir or mise run dist)", err)
@@ -51,6 +57,21 @@ func extract(assets fs.FS, dir string) (string, error) {
 	entries, err := parseManifest(data)
 	if err != nil {
 		return "", err
+	}
+	selected := make(map[string]bool, len(names))
+	for _, name := range names {
+		selected[name] = true
+	}
+	if len(selected) > 0 {
+		known := make(map[string]bool, len(entries))
+		for _, entry := range entries {
+			known[entry.name] = true
+		}
+		for name := range selected {
+			if !known[name] {
+				return "", fmt.Errorf("requested embedded storage binary %q is not in manifest", name)
+			}
+		}
 	}
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -60,6 +81,9 @@ func extract(assets fs.FS, dir string) (string, error) {
 		return "", fmt.Errorf("create embedded binary directory: %w", err)
 	}
 	for _, entry := range entries {
+		if len(selected) > 0 && !selected[entry.name] {
+			continue
+		}
 		dst := filepath.Join(absDir, entry.name)
 		if matches(dst, entry) {
 			if err := os.Chmod(dst, 0o755); err != nil {

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -68,6 +70,73 @@ func TestStoreContract(t *testing.T) {
 				t.Fatalf("List after DeletePrefix = %v, %v", objects, err)
 			}
 		})
+	}
+}
+
+func TestPrefixOperationsMatchDirectoryBoundariesAcrossBackends(t *testing.T) {
+	factories := map[string]func(*testing.T) Store{
+		"local": func(t *testing.T) Store {
+			s, err := NewLocal(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+		"s3-fake": func(*testing.T) Store { return NewS3WithClient(&memoryS3{objects: map[string][]byte{}}, "test") },
+	}
+	for name, factory := range factories {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := factory(t)
+			if err := store.Put(ctx, "replay/a/1.json.gz", strings.NewReader("a")); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Put(ctx, "replay/ab/1.json.gz", strings.NewReader("ab")); err != nil {
+				t.Fatal(err)
+			}
+			// Prefix without trailing slash must not match sibling prefix "replay/ab/".
+			objects, err := store.List(ctx, "replay/a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(objects) != 1 || objects[0].Key != "replay/a/1.json.gz" {
+				t.Fatalf("List(replay/a) = %+v", objects)
+			}
+			if err := store.DeletePrefix(ctx, "replay/a"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Get(ctx, "replay/a/1.json.gz"); err != ErrNotFound {
+				t.Fatalf("replay/a/1.json.gz should be deleted, err=%v", err)
+			}
+			if r, err := store.Get(ctx, "replay/ab/1.json.gz"); err != nil {
+				t.Fatalf("sibling prefix replay/ab/1.json.gz was deleted: %v", err)
+			} else {
+				_ = r.Close()
+			}
+		})
+	}
+}
+
+func TestLocalListSkipsTempFiles(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewLocal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.Put(ctx, "replay/p/s/0.json.gz", strings.NewReader("ok")); err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := filepath.Join(root, "replay", "p", "s", ".blob-12345")
+	if err := os.WriteFile(tmpPath, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	objects, err := store.List(ctx, "replay/p/s/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 1 || objects[0].Key != "replay/p/s/0.json.gz" {
+		t.Fatalf("Local.List exposed temp file: %+v", objects)
 	}
 }
 

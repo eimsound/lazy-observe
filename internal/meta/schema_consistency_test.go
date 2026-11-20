@@ -2,6 +2,7 @@ package meta
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"reflect"
@@ -133,8 +134,213 @@ func TestMigratedSchemaEquivalent(t *testing.T) {
 	if !reflect.DeepEqual(want, got) {
 		t.Fatalf("migrated table/column/nullability shape differs:\nsqlite: %v\npostgres: %v", want, got)
 	}
+	wantIndexes := schemaIndexes(t, sqlite)
+	gotIndexes := schemaIndexes(t, postgres)
+	if !reflect.DeepEqual(wantIndexes, gotIndexes) {
+		t.Fatalf("migrated indexes differ:\nsqlite: %v\npostgres: %v", wantIndexes, gotIndexes)
+	}
+	wantFKs := schemaForeignKeys(t, sqlite)
+	gotFKs := schemaForeignKeys(t, postgres)
+	if !reflect.DeepEqual(wantFKs, gotFKs) {
+		t.Fatalf("migrated foreign keys differ:\nsqlite: %v\npostgres: %v", wantFKs, gotFKs)
+	}
 	assertSchemaCRUD(t, sqlite)
 	assertSchemaCRUD(t, postgres)
+}
+
+func schemaIndexes(t *testing.T, store *Store) []string {
+	t.Helper()
+	ctx := context.Background()
+	var result []string
+	if store.dialect == "postgres" {
+		rows, err := store.db.QueryContext(ctx, `
+			SELECT t.relname, i.relname, ix.indisunique,
+				array_to_string(array(
+					SELECT a.attname || CASE WHEN (ix.indoption[k.ord - 1] & 1) = 1 THEN ' DESC' ELSE '' END
+					FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+					JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+					ORDER BY k.ord
+				), ',')
+			FROM pg_index ix
+			JOIN pg_class t ON t.oid = ix.indrelid
+			JOIN pg_class i ON i.oid = ix.indexrelid
+			JOIN pg_namespace n ON n.oid = t.relnamespace
+			LEFT JOIN pg_constraint c ON c.conindid = ix.indexrelid
+			WHERE n.nspname = 'public'
+			  AND t.relname <> 'schema_version'
+			  AND NOT ix.indisprimary
+			  AND c.oid IS NULL
+			ORDER BY t.relname, i.relname`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var table, name, cols string
+			var unique bool
+			if err := rows.Scan(&table, &name, &unique, &cols); err != nil {
+				t.Fatal(err)
+			}
+			result = append(result, fmt.Sprintf("%s.%s:unique=%t(%s)", table, name, unique, cols))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		sort.Strings(result)
+		return result
+	}
+	tables, err := store.db.QueryContext(
+		ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	_ = tables.Close()
+	for _, table := range names {
+		idxRows, err := store.db.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type sqliteIndex struct {
+			name   string
+			unique bool
+		}
+		var indexes []sqliteIndex
+		for idxRows.Next() {
+			var seq, unique, partial int
+			var name, origin string
+			if err := idxRows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+				t.Fatal(err)
+			}
+			if origin != "c" {
+				continue
+			}
+			indexes = append(indexes, sqliteIndex{name: name, unique: unique == 1})
+		}
+		_ = idxRows.Close()
+		for _, idx := range indexes {
+			infoRows, err := store.db.QueryContext(ctx, `PRAGMA index_xinfo("`+idx.name+`")`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cols []string
+			for infoRows.Next() {
+				var seqno, cid, desc, key int
+				var colName sql.NullString
+				var coll string
+				if err := infoRows.Scan(&seqno, &cid, &colName, &desc, &coll, &key); err != nil {
+					t.Fatal(err)
+				}
+				if key == 0 || !colName.Valid {
+					continue
+				}
+				if desc == 1 {
+					cols = append(cols, colName.String+" DESC")
+				} else {
+					cols = append(cols, colName.String)
+				}
+			}
+			_ = infoRows.Close()
+			result = append(
+				result,
+				fmt.Sprintf("%s.%s:unique=%t(%s)", table, idx.name, idx.unique, strings.Join(cols, ",")),
+			)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func schemaForeignKeys(t *testing.T, store *Store) []string {
+	t.Helper()
+	ctx := context.Background()
+	var result []string
+	if store.dialect == "postgres" {
+		rows, err := store.db.QueryContext(ctx, `
+			SELECT
+				src.relname,
+				sa.attname,
+				dst.relname,
+				da.attname,
+				CASE c.confdeltype
+					WHEN 'a' THEN 'NO ACTION'
+					WHEN 'r' THEN 'RESTRICT'
+					WHEN 'c' THEN 'CASCADE'
+					WHEN 'n' THEN 'SET NULL'
+					WHEN 'd' THEN 'SET DEFAULT'
+					ELSE c.confdeltype::text
+				END
+			FROM pg_constraint c
+			JOIN pg_class src ON src.oid = c.conrelid
+			JOIN pg_namespace n ON n.oid = src.relnamespace
+			JOIN pg_class dst ON dst.oid = c.confrelid
+			JOIN LATERAL unnest(c.conkey, c.confkey) AS cols(src_att, dst_att) ON TRUE
+			JOIN pg_attribute sa ON sa.attrelid = src.oid AND sa.attnum = cols.src_att
+			JOIN pg_attribute da ON da.attrelid = dst.oid AND da.attnum = cols.dst_att
+			WHERE c.contype = 'f' AND n.nspname = 'public' AND src.relname <> 'schema_version'
+			ORDER BY src.relname, sa.attname`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var srcTable, srcCol, dstTable, dstCol, onDelete string
+			if err := rows.Scan(&srcTable, &srcCol, &dstTable, &dstCol, &onDelete); err != nil {
+				t.Fatal(err)
+			}
+			result = append(result, fmt.Sprintf("%s.%s->%s.%s:%s", srcTable, srcCol, dstTable, dstCol, onDelete))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		sort.Strings(result)
+		return result
+	}
+	tables, err := store.db.QueryContext(
+		ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	_ = tables.Close()
+	for _, table := range names {
+		fkRows, err := store.db.QueryContext(ctx, `PRAGMA foreign_key_list("`+table+`")`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for fkRows.Next() {
+			var id, seq int
+			var refTable, fromCol, toCol, onUpdate, onDelete, match string
+			if err := fkRows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
+				t.Fatal(err)
+			}
+			result = append(
+				result,
+				fmt.Sprintf("%s.%s->%s.%s:%s", table, fromCol, refTable, toCol, strings.ToUpper(onDelete)),
+			)
+		}
+		_ = fkRows.Close()
+	}
+	sort.Strings(result)
+	return result
 }
 
 func schemaColumns(t *testing.T, store *Store) []string {
