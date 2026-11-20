@@ -1,7 +1,7 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { Activity, Check, ChevronsUpDown, PanelLeftClose, PanelLeftOpen } from "lucide-react";
-import { NAV_GROUPS, resolveNavItem, type NavItem } from "@/config/nav";
+import { canAccessNavItem, NAV_GROUPS, resolveNavItem, type NavItem } from "@/config/nav";
 import { useSidebar } from "@/hooks/use-sidebar";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { useProject } from "@/lib/project/project-provider";
@@ -38,7 +38,7 @@ export function Sidebar() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const activeTo = resolveNavItem(pathname)?.to;
 
-  const visible = (item: NavItem) => !item.adminOnly || role === "admin";
+  const visible = (item: NavItem) => canAccessNavItem(item, role);
 
   return (
     <aside

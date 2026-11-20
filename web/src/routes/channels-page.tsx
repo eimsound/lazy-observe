@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -7,6 +7,7 @@ import {
   Pencil,
   Plus,
   Send,
+  ShieldAlert,
   Trash2,
   X,
 } from "lucide-react";
@@ -22,10 +23,18 @@ import {
   type ChannelType,
   type ChannelTestResult,
 } from "@/lib/api/alerts";
+import {
+  CHANNEL_FIELDS,
+  buildChannelConfigPayload,
+  formatChannelSummary,
+  initChannelFormConfig,
+} from "@/lib/alerts/channel-summary";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageAlerts } from "@/lib/auth/permissions";
+import { canManageChannels } from "@/lib/auth/permissions";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { formatErrorMessage } from "@/lib/api/errors";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -50,36 +59,6 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 
-/** Config field descriptors per channel type — labelKey + required + type. */
-interface FieldSpec {
-  key: string;
-  labelKey: string;
-  required?: boolean;
-  password?: boolean;
-}
-
-const CHANNEL_FIELDS: Record<ChannelType, FieldSpec[]> = {
-  webhook: [
-    { key: "url", labelKey: "alerts.cfgUrl", required: true },
-    { key: "secret", labelKey: "alerts.cfgSecret", password: true },
-  ],
-  feishu: [{ key: "url", labelKey: "alerts.cfgWebhookUrl", required: true }],
-  dingtalk: [
-    { key: "url", labelKey: "alerts.cfgWebhookUrl", required: true },
-    { key: "secret", labelKey: "alerts.cfgSecret", password: true },
-  ],
-  wecom: [{ key: "url", labelKey: "alerts.cfgWebhookUrl", required: true }],
-  slack: [{ key: "url", labelKey: "alerts.cfgWebhookUrl", required: true }],
-  smtp: [
-    { key: "to", labelKey: "alerts.cfgTo", required: true },
-    { key: "from", labelKey: "alerts.cfgFrom", required: true },
-    { key: "host", labelKey: "alerts.cfgSmtpHost", required: true },
-    { key: "port", labelKey: "alerts.cfgSmtpPort", required: true },
-    { key: "username", labelKey: "alerts.cfgUsername" },
-    { key: "password", labelKey: "alerts.cfgPassword", password: true },
-  ],
-};
-
 function typeLabelKey(type: ChannelType): string {
   if (type === "smtp") return "alerts.typeEmail";
   if (type === "slack") return "alerts.typeSlack";
@@ -89,27 +68,77 @@ function typeLabelKey(type: ChannelType): string {
 export function ChannelsPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
-  const canManage = canManageAlerts(role);
+  const canManage = canManageChannels(role);
   const queryClient = useQueryClient();
 
-  const channels = useQuery({ queryKey: ["channels"], queryFn: ({ signal }) => listChannels(signal) });
+  const channels = useQuery({
+    queryKey: ["channels"],
+    queryFn: ({ signal }) => listChannels(signal),
+    enabled: canManage,
+    retry: false,
+  });
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<NotificationChannel | null>(null);
   const [deleting, setDeleting] = useState<NotificationChannel | null>(null);
   const [testResults, setTestResults] = useState<Record<string, ChannelTestResult>>({});
+  const testTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  useEffect(() => {
+    const timers = testTimersRef.current;
+    return () => {
+      for (const timer of timers.values()) {
+        clearTimeout(timer);
+      }
+      timers.clear();
+    };
+  }, []);
+
+  function recordTestResult(id: string, result: ChannelTestResult) {
+    const prevTimer = testTimersRef.current.get(id);
+    if (prevTimer !== undefined) {
+      clearTimeout(prevTimer);
+    }
+    setTestResults((prev) => ({ ...prev, [id]: result }));
+    const timer = setTimeout(() => {
+      testTimersRef.current.delete(id);
+      setTestResults((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }, 4000);
+    testTimersRef.current.set(id, timer);
+  }
 
   const test = useMutation({
     mutationFn: (id: string) => testChannel(id),
     onSuccess: (res, id) => {
-      setTestResults((prev) => ({ ...prev, [id]: res }));
-      setTimeout(() => setTestResults((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      }), 4000);
+      recordTestResult(id, res);
+    },
+    onError: (err, id) => {
+      recordTestResult(id, {
+        ok: false,
+        message: formatErrorMessage(err, t("alerts.testFailed")),
+      });
     },
   });
+
+  if (!canManage) {
+    return (
+      <PageContainer>
+        <Card>
+          <CardContent>
+            <EmptyState
+              icon={<ShieldAlert className="size-6" />}
+              title={t("common.forbiddenTitle")}
+              desc={t("alerts.channelsForbiddenDesc")}
+            />
+          </CardContent>
+        </Card>
+      </PageContainer>
+    );
+  }
 
   function openNew() {
     setEditing(null);
@@ -122,14 +151,12 @@ export function ChannelsPage() {
 
   return (
     <PageContainer>
-      {canManage && (
-        <PageActions>
-          <Button onClick={openNew} className="gap-1.5">
-            <Plus className="size-4" />
-            {t("alerts.newChannel")}
-          </Button>
-        </PageActions>
-      )}
+      <PageActions>
+        <Button onClick={openNew} className="gap-1.5">
+          <Plus className="size-4" />
+          {t("alerts.newChannel")}
+        </Button>
+      </PageActions>
 
       {channels.isLoading ? (
         <div className="grid gap-3 sm:grid-cols-2">
@@ -137,6 +164,16 @@ export function ChannelsPage() {
             <Skeleton key={i} className="h-28 w-full" />
           ))}
         </div>
+      ) : channels.isError ? (
+        <Card>
+          <CardContent>
+            <QueryErrorState
+              error={channels.error}
+              forbiddenDesc={t("alerts.channelsForbiddenDesc")}
+              onRetry={() => void channels.refetch()}
+            />
+          </CardContent>
+        </Card>
       ) : channels.data && channels.data.length > 0 ? (
         <div className="grid gap-3 sm:grid-cols-2">
           {channels.data.map((ch) => {
@@ -159,28 +196,26 @@ export function ChannelsPage() {
                         {t(typeLabelKey(ch.type))}
                       </Badge>
                     </div>
-                    {canManage && (
-                      <div className="flex shrink-0 items-center gap-1">
-                        <Button variant="ghost" size="icon" aria-label={t("common.edit")} onClick={() => openEdit(ch)}>
-                          <Pencil className="size-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label={t("alerts.deleteChannel")}
-                          onClick={() => setDeleting(ch)}
-                        >
-                          <Trash2 className="size-4 text-destructive" />
-                        </Button>
-                      </div>
-                    )}
+                    <div className="flex shrink-0 items-center gap-1">
+                      <Button variant="ghost" size="icon" aria-label={t("common.edit")} onClick={() => openEdit(ch)}>
+                        <Pencil className="size-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={t("alerts.deleteChannel")}
+                        onClick={() => setDeleting(ch)}
+                      >
+                        <Trash2 className="size-4 text-destructive" />
+                      </Button>
+                    </div>
                   </div>
 
                   <div className="truncate font-mono text-xs text-muted-foreground">
-                    {Object.values(ch.config)[0] || "—"}
+                    {formatChannelSummary(ch)}
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Button
                       variant="outline"
                       size="sm"
@@ -194,14 +229,18 @@ export function ChannelsPage() {
                     {result && (
                       <span
                         className={cn(
-                          "inline-flex items-center gap-1 text-xs font-medium",
+                          "inline-flex min-w-0 items-center gap-1 text-xs font-medium",
                           result.ok ? "text-level-info" : "text-destructive",
                         )}
-                        role="status"
+                        role={result.ok ? "status" : "alert"}
                       >
-                        {result.ok ? <Check className="size-3.5" /> : <X className="size-3.5" />}
-                        {result.ok ? t("alerts.testSuccess") : t("alerts.testFailed")}
-                        <span className="font-normal text-muted-foreground">· {result.message}</span>
+                        {result.ok ? <Check className="size-3.5 shrink-0" /> : <X className="size-3.5 shrink-0" />}
+                        <span className="shrink-0">
+                          {result.ok ? t("alerts.testSuccess") : t("alerts.testFailed")}
+                        </span>
+                        <span className="truncate font-normal text-muted-foreground" title={result.message}>
+                          · {result.message}
+                        </span>
                       </span>
                     )}
                   </div>
@@ -223,7 +262,12 @@ export function ChannelsPage() {
       )}
 
       {formOpen && (
-        <ChannelFormDialog open={formOpen} onOpenChange={setFormOpen} editing={editing} />
+        <ChannelFormDialog
+          key={editing?.id ?? "new"}
+          open={formOpen}
+          onOpenChange={setFormOpen}
+          editing={editing}
+        />
       )}
       <ConfirmDialog
         open={!!deleting}
@@ -255,9 +299,11 @@ function ChannelFormDialog({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
+  const initial = initChannelFormConfig(editing);
   const [name, setName] = useState(editing?.name ?? "");
   const [type, setType] = useState<ChannelType>(editing?.type ?? "webhook");
-  const [config, setConfig] = useState<Record<string, string>>(editing?.config ?? {});
+  const [config, setConfig] = useState<Record<string, string>>(initial.values);
+  const [storedSecrets, setStoredSecrets] = useState<Record<string, boolean>>(initial.storedSecrets);
   const [enabled, setEnabled] = useState<boolean>(editing?.enabled ?? true);
   const [error, setError] = useState<string | null>(null);
 
@@ -276,17 +322,14 @@ function ChannelFormDialog({
   function submit() {
     if (!name.trim()) return setError(t("alerts.channelNameRequired"));
     for (const f of fields) {
-      if (f.required && !(config[f.key] ?? "").trim()) {
+      const hasValue = (config[f.key] ?? "").trim() !== "";
+      const hasStoredSecret = Boolean(editing && f.password && storedSecrets[f.key]);
+      if (f.required && !hasValue && !hasStoredSecret) {
         return setError(t("alerts.configRequired"));
       }
     }
     setError(null);
-    // Keep only fields relevant to the selected type.
-    const cleanConfig: Record<string, string> = {};
-    for (const f of fields) {
-      const v = (config[f.key] ?? "").trim();
-      if (v) cleanConfig[f.key] = v;
-    }
+    const cleanConfig = buildChannelConfigPayload(type, config, storedSecrets, Boolean(editing));
     mutation.mutate({ name: name.trim(), type, config: cleanConfig, enabled });
   }
 
@@ -311,7 +354,16 @@ function ChannelFormDialog({
             </div>
             <div className="space-y-1.5">
               <Label>{t("alerts.channelType")}</Label>
-              <Select value={type} onValueChange={(v) => setType(v as ChannelType)}>
+              <Select
+                value={type}
+                onValueChange={(v) => {
+                  const nextType = v as ChannelType;
+                  setType(nextType);
+                  if (editing && nextType !== editing.type) {
+                    setStoredSecrets({});
+                  }
+                }}
+              >
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -341,6 +393,11 @@ function ChannelFormDialog({
                   id={`c-${f.key}`}
                   type={f.password ? "password" : "text"}
                   value={config[f.key] ?? ""}
+                  placeholder={
+                    f.password && storedSecrets[f.key]
+                      ? t("alerts.secretStoredPlaceholder")
+                      : undefined
+                  }
                   onChange={(e) => setConfig((prev) => ({ ...prev, [f.key]: e.target.value }))}
                   className="font-mono text-sm"
                   spellCheck={false}

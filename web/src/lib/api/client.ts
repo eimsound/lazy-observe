@@ -143,6 +143,38 @@ export async function apiGet<T>(path: string, opts: RequestOptions = {}): Promis
   return body as T;
 }
 
+/**
+ * GET an endpoint and leave a successful response untouched (e.g. binary blob
+ * downloads such as raw pprof profiles that still require `X-LO-Project`).
+ */
+export async function apiGetResponse(
+  path: string,
+  opts: RequestOptions & { accept?: string } = {},
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    ...identityHeaders(opts.project),
+  };
+  if (opts.accept) headers.Accept = opts.accept;
+
+  let res: Response;
+  try {
+    res = await fetch(buildUrl(opts.base ?? API_BASE, path, opts.params), {
+      method: "GET",
+      headers,
+      credentials: "include",
+      signal: opts.signal,
+    });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    throw new ApiError((e as Error).message || "network error", 0);
+  }
+
+  if (!res.ok) {
+    handleTransportError(toError(await parse(res), res.status), opts.skipSessionExpiry);
+  }
+  return res;
+}
+
 /** Send a JSON body with an arbitrary method (POST/PATCH/PUT/DELETE). */
 export async function apiSend<T>(
   method: "POST" | "PATCH" | "PUT" | "DELETE",

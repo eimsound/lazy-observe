@@ -134,10 +134,21 @@ function epochMillis(value: unknown, label: string): number {
 }
 
 function issueLevel(value: unknown): IssueLevel {
-  if (value !== "error" && value !== "warning" && value !== "info") {
+  if (typeof value !== "string" || value.trim() === "") {
     throw new TypeError("issue level is invalid");
   }
-  return value;
+  switch (value.trim().toLowerCase()) {
+    case "error":
+    case "err":
+    case "fatal":
+    case "critical":
+      return "error";
+    case "warning":
+    case "warn":
+      return "warning";
+    default:
+      return "info";
+  }
 }
 
 function issueStatus(value: unknown): IssueStatus {

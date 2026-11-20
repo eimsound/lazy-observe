@@ -12,6 +12,7 @@ import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import {
   SeverityBadge,
   StatusBadge,
@@ -83,6 +84,8 @@ export function AlertEventsPage() {
                 <Skeleton key={i} className="h-14 w-full" />
               ))}
             </div>
+          ) : events.isError ? (
+            <QueryErrorState error={events.error} onRetry={() => void events.refetch()} />
           ) : rows.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">

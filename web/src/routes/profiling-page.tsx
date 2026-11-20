@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
 import { useSearch } from "@tanstack/react-router";
@@ -34,6 +34,7 @@ import {
 import { countMatches } from "@/lib/flamegraph";
 import { IS_MOCK } from "@/lib/settings";
 import { ApiError } from "@/lib/api/client";
+import { useProject } from "@/lib/project/project-provider";
 import { formatDateTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
@@ -64,6 +65,7 @@ function isProfileType(v: string | undefined): v is ProfileType {
 
 export function ProfilingPage() {
   const { t } = useTranslation();
+  const { currentSlug } = useProject();
   const search = useSearch({ strict: false }) as ProfilingEvidenceSearch;
   const hasCustomWindow = search.start !== undefined && search.end !== undefined;
 
@@ -82,9 +84,21 @@ export function ProfilingPage() {
   const [nowMs, setNowMs] = useState(() => dayjs().valueOf());
   const [query, setQuery] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const prevProjectRef = useRef(currentSlug);
+
+  // Reset service selection, drawer, and search when switching projects so the
+  // prior project's service name never leaks into the newly selected project.
+  useEffect(() => {
+    if (prevProjectRef.current !== currentSlug) {
+      prevProjectRef.current = currentSlug;
+      setService("");
+      setDrawerOpen(false);
+      setQuery("");
+    }
+  }, [currentSlug]);
 
   const servicesQuery = useQuery<string[], ApiError>({
-    queryKey: ["profile-services"],
+    queryKey: ["profile-services", currentSlug],
     queryFn: ({ signal }) => getProfileServices(signal),
     retry: false,
   });
@@ -110,20 +124,18 @@ export function ProfilingPage() {
     return { start, end };
   }, [rangeId, customWindow, nowMs]);
 
-  const flameQuery = useQuery<FlameNode, ApiError>({
-    queryKey: ["flamegraph", service, type, window.start, window.end],
+  const flameQuery = useQuery<FlameNode | null, ApiError>({
+    queryKey: ["flamegraph", currentSlug, service, type, window.start, window.end],
     enabled: !!service,
     retry: false,
-    placeholderData: (previous) => previous,
     queryFn: ({ signal }) =>
       getFlamegraph({ service, type, start: window.start, end: window.end }, signal),
   });
 
   const profilesQuery = useQuery<ProfileRecord[], ApiError>({
-    queryKey: ["profiles-list", service, type, window.start, window.end],
+    queryKey: ["profiles-list", currentSlug, service, type, window.start, window.end],
     enabled: !!service && drawerOpen,
     retry: false,
-    placeholderData: (previous) => previous,
     queryFn: ({ signal }) =>
       listProfiles({ service, type, start: window.start, end: window.end }, signal),
   });
@@ -267,6 +279,7 @@ export function ProfilingPage() {
       <ProfileListDrawer
         open={drawerOpen}
         onOpenChange={setDrawerOpen}
+        projectSlug={currentSlug}
         records={profilesQuery.data ?? []}
         isLoading={profilesQuery.isFetching && profilesQuery.data === undefined}
         hasError={profilesQuery.isError && profilesQuery.data === undefined}
@@ -284,7 +297,7 @@ function FlamegraphSection({
   onRetry,
 }: {
   query: string;
-  flameQuery: ReturnType<typeof useQuery<FlameNode, ApiError>>;
+  flameQuery: ReturnType<typeof useQuery<FlameNode | null, ApiError>>;
   onRetry: () => void;
 }) {
   const { t } = useTranslation();
