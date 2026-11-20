@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -266,5 +267,66 @@ func TestRedisSessionsStoreTokenDigests(t *testing.T) {
 	refs, err := store.ListByUser(context.Background(), 9, token)
 	if err != nil || len(refs) != 1 || !refs[0].Current || refs[0].ID != sessionRefID(token) {
 		t.Fatalf("refs=%+v err=%v", refs, err)
+	}
+}
+
+func TestMemoryLimiterBoundsCapacityAndReclaimsExpired(t *testing.T) {
+	now := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	limiter := newMemoryLimiterWithMax(func() time.Time { return now }, 4)
+	ctx := context.Background()
+
+	for i := range 10 {
+		if _, err := limiter.Allow(ctx, fmt.Sprintf("ip-%d", i), 5, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(limiter.limits); got != 4 {
+		t.Fatalf("limiter map size = %d, want bounded 4", got)
+	}
+
+	now = now.Add(2 * time.Minute)
+	if _, err := limiter.Allow(ctx, "fresh", 5, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(limiter.limits); got != 1 {
+		t.Fatalf("expired limiter entries were not reclaimed: size = %d, want 1", got)
+	}
+}
+
+func TestMemoryLoginGateBoundsCapacityPreservesLocksAndReclaimsExpired(t *testing.T) {
+	now := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	gate := newMemoryLoginGateWithMax(func() time.Time { return now }, 4)
+	ctx := context.Background()
+
+	for range 3 {
+		if _, err := gate.ConsumeFailure(ctx, "admin", 3, 15*time.Minute, 15*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 12 {
+		if _, err := gate.ConsumeFailure(
+			ctx,
+			fmt.Sprintf("probe-%d", i),
+			5,
+			15*time.Minute,
+			15*time.Minute,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(gate.entries); got != 4 {
+		t.Fatalf("login gate map size = %d, want bounded 4", got)
+	}
+	locked, err := gate.Locked(ctx, "admin")
+	if err != nil || !locked {
+		t.Fatalf("active lockout was evicted by unlocked probes: locked=%v err=%v", locked, err)
+	}
+
+	now = now.Add(20 * time.Minute)
+	if _, err := gate.ConsumeFailure(ctx, "after-expiry", 5, 15*time.Minute, 15*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(gate.entries); got != 1 {
+		t.Fatalf("expired login gate entries were not reclaimed: size = %d, want 1", got)
 	}
 }

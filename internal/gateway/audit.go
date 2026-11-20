@@ -162,6 +162,6 @@ func (g *Gateway) persistAudit(c fiber.Ctx, event auditEvent, actor meta.UserInf
 		HTTPPath:      c.Path(),
 	}
 	if err := g.store.RecordAudit(c.Context(), record); err != nil {
-		g.logger.Debug("audit persistence failed", "action", event.Action, "error", err)
+		g.logger.Warn("audit persistence failed", "action", event.Action, "error", err)
 	}
 }

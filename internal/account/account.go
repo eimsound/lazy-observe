@@ -15,15 +15,18 @@ import (
 )
 
 const (
-	sessionTTL            = 7 * 24 * time.Hour
-	loginAttemptLimit     = 10
-	loginAttemptWindow    = time.Minute
-	loginLockoutThreshold = 5
-	loginLockoutWindow    = 15 * time.Minute
-	loginLockoutFor       = 15 * time.Minute
-	minPasswordLength     = 8
-	loginFailureMinDelay  = 500 * time.Millisecond
-	loginFailureMaxDelay  = time.Second
+	sessionTTL                 = 7 * 24 * time.Hour
+	loginAttemptLimit          = 10
+	loginAttemptWindow         = time.Minute
+	loginLockoutThreshold      = 5
+	loginLockoutWindow         = 15 * time.Minute
+	loginLockoutFor            = 15 * time.Minute
+	minPasswordLength          = 8
+	MaxUsernameLength          = 128
+	MaxPasswordLength          = 1024
+	loginFailureMinDelay       = 500 * time.Millisecond
+	loginFailureMaxDelay       = time.Second
+	passwordBusyRetryAfterHint = 2 * time.Second
 )
 
 type ErrorCode string
@@ -216,8 +219,10 @@ func New(metadata Metadata, sessions Sessions, options Options) *Manager {
 
 func (m *Manager) Login(ctx context.Context, input LoginInput) (LoginResult, error) {
 	username := strings.TrimSpace(input.Username)
+	auditUsername := truncateAuditValue(username, MaxUsernameLength)
 	facts := AuditFacts{
-		Action: "auth.login", ActorUsername: username, TargetType: "user", TargetName: username, Success: false,
+		Action: "auth.login", ActorUsername: auditUsername, TargetType: "user", TargetName: auditUsername,
+		Success: false,
 	}
 	allowed, err := m.limits.Allow(ctx, "login:ip:"+input.SourceIP, loginAttemptLimit, loginAttemptWindow)
 	if err != nil {
@@ -226,6 +231,10 @@ func (m *Manager) Login(ctx context.Context, input LoginInput) (LoginResult, err
 	if !allowed {
 		facts.FailureReason = "rate_limited"
 		return LoginResult{}, &Error{Code: CodeRateLimited, RetryAfter: time.Minute, Facts: facts}
+	}
+	if len(username) > MaxUsernameLength || len(input.Password) > MaxPasswordLength {
+		facts.FailureReason = "invalid_request"
+		return LoginResult{}, &Error{Code: CodeInvalidRequest, Stage: "validate_login", Facts: facts}
 	}
 	if username == "" || input.Password == "" {
 		return LoginResult{}, m.invalidLogin(ctx, username, facts)
@@ -251,6 +260,16 @@ func (m *Manager) Login(ctx context.Context, input LoginInput) (LoginResult, err
 	if err != nil {
 		if meta.IsInvalidCredentials(err) {
 			return LoginResult{}, m.invalidLogin(ctx, username, facts)
+		}
+		if meta.IsPasswordVerificationBusy(err) {
+			facts.FailureReason = "service_unavailable"
+			return LoginResult{}, &Error{
+				Code:       CodeUnavailable,
+				RetryAfter: passwordBusyRetryAfterHint,
+				Stage:      "credentials_busy",
+				Facts:      facts,
+				Cause:      err,
+			}
 		}
 		return LoginResult{}, unavailable("credentials", facts, err)
 	}
@@ -344,7 +363,8 @@ func (m *Manager) ChangePassword(
 	currentPassword, newPassword, currentToken string,
 ) (AuditFacts, error) {
 	facts := userFacts("auth.password_change", user, "user")
-	if currentPassword == "" || newPassword == "" {
+	if currentPassword == "" || newPassword == "" ||
+		len(currentPassword) > MaxPasswordLength || len(newPassword) > MaxPasswordLength {
 		return failure(facts, CodeInvalidRequest, "invalid_request", nil)
 	}
 	if len(newPassword) < minPasswordLength {
@@ -542,6 +562,13 @@ func tokenFromMeta(token meta.UserAPITokenInfo) Token {
 		ID: token.ID, Name: token.Name, Prefix: token.Prefix, Revoked: token.Revoked, CreatedAt: token.CreatedAt,
 		LastUsedAt: token.LastUsedAt,
 	}
+}
+
+func truncateAuditValue(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	return value[:maxBytes]
 }
 
 func timePointer(value time.Time) *time.Time { return &value }

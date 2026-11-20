@@ -12,7 +12,11 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 )
 
-const minimumPasswordLength = 8
+const (
+	minimumPasswordLength = 8
+	maxUsernameLength     = 128
+	maxPasswordLength     = 1024
+)
 
 type ErrorKind string
 
@@ -107,8 +111,16 @@ type IssuedProjectToken struct {
 	Value string
 }
 
+// SessionRevoker revokes a user's active sessions across the configured
+// session backend (metadata store or Redis). Passing an empty keepToken
+// revokes every session of the target user.
+type SessionRevoker interface {
+	RevokeOthers(ctx context.Context, userID int, keepToken string) error
+}
+
 type Manager struct {
-	store *meta.Store
+	store    *meta.Store
+	sessions SessionRevoker
 }
 
 func New(store *meta.Store) *Manager {
@@ -116,6 +128,14 @@ func New(store *meta.Store) *Manager {
 		panic("management: metadata store is required")
 	}
 	return &Manager{store: store}
+}
+
+// WithSessions binds the active session backend so administrator password
+// resets, role downgrades, and user deletions revoke sessions in Redis as well
+// as the metadata database.
+func (m *Manager) WithSessions(sessions SessionRevoker) *Manager {
+	m.sessions = sessions
+	return m
 }
 
 func (m *Manager) CreateUser(ctx context.Context, input CreateUserInput) (meta.UserInfo, AuditFacts, error) {
@@ -128,7 +148,9 @@ func (m *Manager) CreateUser(ctx context.Context, input CreateUserInput) (meta.U
 		TargetName: input.Username,
 		TargetRole: input.Role,
 	}
-	if input.Username == "" || len(input.Password) < minimumPasswordLength || !validRole(input.Role) {
+	if input.Username == "" || len(input.Username) > maxUsernameLength ||
+		len(input.Password) < minimumPasswordLength || len(input.Password) > maxPasswordLength ||
+		!validRole(input.Role) {
 		facts, err := failed(facts, ErrorInvalidInput, "bad request")
 		return meta.UserInfo{}, facts, err
 	}
@@ -166,10 +188,18 @@ func (m *Manager) UpdateUser(ctx context.Context, input UpdateUserInput) (meta.U
 	}
 	if input.ID <= 0 ||
 		(rawUsername == "" && input.Password == "" && input.Role == "" && input.DisplayName == nil && input.Email == nil) ||
+		(rawUsername != "" && (input.Username == "" || len(input.Username) > maxUsernameLength)) ||
 		(input.Role != "" && !validRole(input.Role)) ||
-		(input.Password != "" && len(input.Password) < minimumPasswordLength) {
+		(input.Password != "" && (len(input.Password) < minimumPasswordLength || len(input.Password) > maxPasswordLength)) {
 		facts, err := failed(facts, ErrorInvalidInput, "bad request")
 		return meta.UserInfo{}, facts, err
+	}
+
+	revokeSessions := input.Password != ""
+	if !revokeSessions && input.Role != "" && m.sessions != nil {
+		if existing, getErr := m.store.GetUser(ctx, input.ID); getErr == nil {
+			revokeSessions = roleRank(input.Role) < roleRank(existing.Role)
+		}
 	}
 
 	updated, err := m.store.UpdateManagedUser(ctx, meta.ManagedUserUpdate{
@@ -182,6 +212,17 @@ func (m *Manager) UpdateUser(ctx context.Context, input UpdateUserInput) (meta.U
 	}
 	facts.TargetName = updated.Username
 	facts.TargetRole = updated.Role
+	if revokeSessions && m.sessions != nil {
+		if err := m.sessions.RevokeOthers(ctx, updated.ID, ""); err != nil {
+			facts, managementErr := failedWithReason(
+				facts,
+				ErrorUnavailable,
+				"session revocation failed",
+				"session_revoke_failed",
+			)
+			return updated, facts, managementErr
+		}
+	}
 	facts.Success = true
 	return updated, facts, nil
 }
@@ -211,6 +252,11 @@ func (m *Manager) DeleteUser(ctx context.Context, id int) (AuditFacts, error) {
 	}
 	if err := m.store.DeleteUser(ctx, id); err != nil {
 		return failedFromMetadata(facts, err)
+	}
+	if m.sessions != nil {
+		if err := m.sessions.RevokeOthers(ctx, id, ""); err != nil {
+			return failedWithReason(facts, ErrorUnavailable, "session revocation failed", "session_revoke_failed")
+		}
 	}
 	facts.Success = true
 	return facts, nil
@@ -482,6 +528,13 @@ func failedFromMetadata(facts AuditFacts, err error) (AuditFacts, error) {
 		return failed(facts, ErrorNotFound, "not found")
 	case meta.IsConstraintError(err):
 		return failed(facts, ErrorConflict, "conflict")
+	case meta.IsLastAdminProtected(err):
+		return failedWithReason(
+			facts,
+			ErrorProtected,
+			"cannot remove or demote the last admin",
+			"protected_last_admin",
+		)
 	default:
 		return failed(facts, ErrorUnavailable, "internal error")
 	}
@@ -503,3 +556,16 @@ func failureReason(kind ErrorKind) string {
 }
 
 func validRole(role string) bool { return role == "admin" || role == "member" || role == "viewer" }
+
+func roleRank(role string) int {
+	switch role {
+	case "admin":
+		return 3
+	case "member":
+		return 2
+	case "viewer":
+		return 1
+	default:
+		return 0
+	}
+}

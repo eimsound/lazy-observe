@@ -234,3 +234,129 @@ func TestAuthenticatorRevisionCannotRollBackAcrossTokens(t *testing.T) {
 		t.Fatalf("new-token store calls=%d, want one lookup", calls)
 	}
 }
+
+type panicOnceTokenStore struct {
+	mu       sync.Mutex
+	panicked bool
+	started  chan struct{}
+	release  chan struct{}
+	project  meta.ProjectInfo
+}
+
+func (s *panicOnceTokenStore) AuthenticateProjectAPIToken(context.Context, string) (meta.ProjectInfo, error) {
+	s.mu.Lock()
+	shouldPanic := !s.panicked
+	s.panicked = true
+	s.mu.Unlock()
+	if shouldPanic {
+		close(s.started)
+		<-s.release
+		panic("injected lookup panic")
+	}
+	return s.project, nil
+}
+
+func (*panicOnceTokenStore) Revision() uint64 { return 0 }
+
+func TestAuthenticatorPanicCleansInflightAndWakesWaiters(t *testing.T) {
+	store := &panicOnceTokenStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		project: meta.ProjectInfo{ID: 11, Slug: "recovered"},
+	}
+	authenticator := NewAuthenticator(store)
+
+	leaderPanicked := make(chan any, 1)
+	go func() {
+		defer func() {
+			leaderPanicked <- recover()
+		}()
+		_, _ = authenticator.authenticate(context.Background(), "panic-token")
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for leader lookup start")
+	}
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		_, err := authenticator.authenticate(context.Background(), "panic-token")
+		waiterErr <- err
+	}()
+	// Give the waiter a moment to attach to inflight before triggering the panic.
+	time.Sleep(20 * time.Millisecond)
+	close(store.release)
+
+	select {
+	case r := <-leaderPanicked:
+		if r == nil {
+			t.Fatal("leader did not observe lookup panic")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader hung after lookup panic")
+	}
+
+	select {
+	case err := <-waiterErr:
+		if err == nil {
+			t.Fatal("waiter unexpectedly succeeded on panicked lookup")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter deadlocked after leader lookup panic")
+	}
+
+	// Subsequent lookups for the same token must not hang and must succeed.
+	project, err := authenticator.authenticate(context.Background(), "panic-token")
+	if err != nil || project.Slug != "recovered" {
+		t.Fatalf("post-panic authenticate project=%#v err=%v", project, err)
+	}
+}
+
+func TestAuthenticatorLeaderCancelDoesNotFailWaiters(t *testing.T) {
+	store := newBlockingTokenStore()
+	authenticator := NewAuthenticator(store)
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := authenticator.authenticate(leaderCtx, "shared-cancel-token")
+		leaderErr <- err
+	}()
+	waitAuthenticationStart(t, store.started)
+
+	waiterResult := make(chan struct {
+		project meta.ProjectInfo
+		err     error
+	}, 1)
+	go func() {
+		p, err := authenticator.authenticate(context.Background(), "shared-cancel-token")
+		waiterResult <- struct {
+			project meta.ProjectInfo
+			err     error
+		}{project: p, err: err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// Cancel leader before store lookup completes.
+	cancelLeader()
+	select {
+	case err := <-leaderErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("leader error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled leader did not return promptly")
+	}
+
+	// Release lookup: waiter with healthy context must succeed.
+	close(store.release)
+	select {
+	case got := <-waiterResult:
+		if got.err != nil || got.project.Slug != "alpha" {
+			t.Fatalf("waiter result=%#v, want valid project", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not finish after leader canceled")
+	}
+}

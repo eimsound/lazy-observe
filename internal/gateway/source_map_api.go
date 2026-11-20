@@ -154,13 +154,26 @@ func (g *Gateway) deleteSourceMaps(c fiber.Ctx) error {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "source map storage unavailable"})
 	}
 	release := strings.TrimSpace(c.Params("release"))
+	p := currentProject(c)
+	audit := auditEvent{
+		Action:      "source_map.delete",
+		TargetType:  "source_map",
+		TargetName:  release,
+		ProjectID:   p.ID,
+		ProjectSlug: p.Slug,
+	}
 	if !sourceMapComponent.MatchString(release) {
+		audit.FailureReason = "invalid_request"
+		g.auditManagement(c, audit)
 		return badRequest(c)
 	}
-	p := currentProject(c)
 	if err := g.sourceMaps.DeleteSourceMapArtifacts(c.Context(), p.ID, release); err != nil {
+		audit.FailureReason = "delete_failed"
+		g.auditManagement(c, audit)
 		return apiError(c, err)
 	}
+	audit.Success = true
+	g.auditManagement(c, audit)
 	return c.SendStatus(http.StatusNoContent)
 }
 
