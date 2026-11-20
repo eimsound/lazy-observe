@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { BellOff, Loader2, Pencil, Plus, X } from "lucide-react";
+import { BellOff, Loader2, Pencil, Plus, ShieldAlert, X } from "lucide-react";
 import {
   listSilences,
   createSilence,
@@ -17,6 +17,7 @@ import { formatDateTime, formatDurationShort } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -57,7 +58,12 @@ export function SilencesPage() {
   const canManage = canManageAlerts(role);
   const queryClient = useQueryClient();
 
-  const silences = useQuery({ queryKey: ["silences"], queryFn: ({ signal }) => listSilences(signal) });
+  const silences = useQuery({
+    queryKey: ["silences"],
+    queryFn: ({ signal }) => listSilences(signal),
+    enabled: canManage,
+    retry: false,
+  });
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Silence | null>(null);
@@ -71,6 +77,22 @@ export function SilencesPage() {
     };
   }, [silences.data]);
 
+  if (!canManage) {
+    return (
+      <PageContainer>
+        <Card>
+          <CardContent>
+            <EmptyState
+              icon={<ShieldAlert className="size-6" />}
+              title={t("common.forbiddenTitle")}
+              desc={t("alerts.silencesForbiddenDesc")}
+            />
+          </CardContent>
+        </Card>
+      </PageContainer>
+    );
+  }
+
   function openNew() {
     setEditing(null);
     setFormOpen(true);
@@ -82,20 +104,28 @@ export function SilencesPage() {
 
   return (
     <PageContainer>
-      {canManage && (
-        <PageActions>
-          <Button onClick={openNew} className="gap-1.5">
-            <Plus className="size-4" />
-            {t("alerts.newSilence")}
-          </Button>
-        </PageActions>
-      )}
+      <PageActions>
+        <Button onClick={openNew} className="gap-1.5">
+          <Plus className="size-4" />
+          {t("alerts.newSilence")}
+        </Button>
+      </PageActions>
 
       {silences.isLoading ? (
         <div className="space-y-3">
           <Skeleton className="h-24 w-full" />
           <Skeleton className="h-24 w-full" />
         </div>
+      ) : silences.isError ? (
+        <Card>
+          <CardContent>
+            <QueryErrorState
+              error={silences.error}
+              forbiddenDesc={t("alerts.silencesForbiddenDesc")}
+              onRetry={() => void silences.refetch()}
+            />
+          </CardContent>
+        </Card>
       ) : (silences.data?.length ?? 0) === 0 ? (
         <Card>
           <CardContent>
@@ -136,7 +166,12 @@ export function SilencesPage() {
       )}
 
       {formOpen && (
-        <SilenceFormDialog open={formOpen} onOpenChange={setFormOpen} editing={editing} />
+        <SilenceFormDialog
+          key={editing?.id ?? "new"}
+          open={formOpen}
+          onOpenChange={setFormOpen}
+          editing={editing}
+        />
       )}
       <ConfirmDialog
         open={!!deleting}

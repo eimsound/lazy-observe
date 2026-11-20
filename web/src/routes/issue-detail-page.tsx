@@ -24,6 +24,9 @@ import {
   type IssueStatus,
 } from "@/lib/api/issues";
 import { ApiError } from "@/lib/api/client";
+import { useAuth } from "@/lib/auth/auth-provider";
+import { canManageIssues } from "@/lib/auth/permissions";
+import { formatErrorMessage } from "@/lib/api/errors";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import { PageContainer } from "@/components/layout/page";
 import { StacktraceViewer } from "@/components/issues/stacktrace-viewer";
@@ -36,6 +39,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 
 export function IssueDetailPage() {
   const { t } = useTranslation();
+  const { role } = useAuth();
+  const canManage = canManageIssues(role);
   const navigate = useNavigate();
   const { issueId } = useParams({ strict: false }) as { issueId: string };
   const search = useSearch({ strict: false }) as { event?: string };
@@ -43,6 +48,7 @@ export function IssueDetailPage() {
 
   const [selectedEventId, setSelectedEventId] = useState<string | undefined>(search.event);
   const [jsonOpen, setJsonOpen] = useState(false);
+  const [statusError, setStatusError] = useState<string | null>(null);
 
   const issueQuery = useQuery<IssueDetail, ApiError>({
     queryKey: ["issue", issueId],
@@ -71,12 +77,14 @@ export function IssueDetailPage() {
 
   const statusMutation = useMutation({
     mutationFn: (next: IssueStatus) => updateIssueStatus(issueId, next),
+    onMutate: () => setStatusError(null),
     onSuccess: (updated) => {
       queryClient.setQueryData<IssueDetail>(["issue", issueId], (old) =>
         old ? { ...old, status: updated.status } : old,
       );
       void queryClient.invalidateQueries({ queryKey: ["issues"] });
     },
+    onError: (err) => setStatusError(formatErrorMessage(err, t("issues.statusUpdateError"))),
   });
 
   const selectedIndex = useMemo(
@@ -128,6 +136,8 @@ export function IssueDetailPage() {
           eventLoading={eventQuery.isLoading}
           eventError={eventQuery.error ?? null}
           selectedIndex={selectedIndex}
+          canManage={canManage}
+          statusError={statusError}
           onSelectEvent={setSelectedEventId}
           onStatus={(s) => statusMutation.mutate(s)}
           statusBusy={statusMutation.isPending}
@@ -148,6 +158,8 @@ function IssueDetailBody({
   eventLoading,
   eventError,
   selectedIndex,
+  canManage,
+  statusError,
   onSelectEvent,
   onStatus,
   statusBusy,
@@ -160,6 +172,8 @@ function IssueDetailBody({
   eventLoading: boolean;
   eventError: ApiError | null;
   selectedIndex: number;
+  canManage: boolean;
+  statusError: string | null;
   onSelectEvent: (id: string) => void;
   onStatus: (next: IssueStatus) => void;
   statusBusy: boolean;
@@ -193,27 +207,39 @@ function IssueDetailBody({
             </div>
             <p className="font-mono text-xs text-muted-foreground">{issue.culprit}</p>
           </div>
-          <div className="flex shrink-0 gap-2">
-            {issue.status !== "resolved" && (
-              <Button size="sm" variant="outline" disabled={statusBusy} onClick={() => onStatus("resolved")}>
-                <CheckCircle2 className="size-4" />
-                {t("issues.resolve")}
-              </Button>
-            )}
-            {issue.status !== "ignored" && (
-              <Button size="sm" variant="outline" disabled={statusBusy} onClick={() => onStatus("ignored")}>
-                <VolumeX className="size-4" />
-                {t("issues.ignore")}
-              </Button>
-            )}
-            {issue.status !== "open" && (
-              <Button size="sm" variant="outline" disabled={statusBusy} onClick={() => onStatus("open")}>
-                <RotateCcw className="size-4" />
-                {t("issues.reopen")}
-              </Button>
-            )}
-          </div>
+          {canManage && (
+            <div className="flex shrink-0 gap-2">
+              {issue.status !== "resolved" && (
+                <Button size="sm" variant="outline" disabled={statusBusy} onClick={() => onStatus("resolved")}>
+                  <CheckCircle2 className="size-4" />
+                  {t("issues.resolve")}
+                </Button>
+              )}
+              {issue.status !== "ignored" && (
+                <Button size="sm" variant="outline" disabled={statusBusy} onClick={() => onStatus("ignored")}>
+                  <VolumeX className="size-4" />
+                  {t("issues.ignore")}
+                </Button>
+              )}
+              {issue.status !== "open" && (
+                <Button size="sm" variant="outline" disabled={statusBusy} onClick={() => onStatus("open")}>
+                  <RotateCcw className="size-4" />
+                  {t("issues.reopen")}
+                </Button>
+              )}
+            </div>
+          )}
         </div>
+
+        {statusError && (
+          <div
+            className="flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            role="alert"
+          >
+            <AlertCircle className="size-4 shrink-0" />
+            <span>{statusError}</span>
+          </div>
+        )}
 
         {/* Count cards */}
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">

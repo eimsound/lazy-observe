@@ -124,6 +124,8 @@ function nonNegativeNumber(value: unknown, path: string): number {
 
 function rateValue(value: unknown, path: string): number {
   const rate = nonNegativeNumber(value, path);
-  if (rate > 1) throw new TypeError(`performance response ${path} must be at most 1`);
-  return rate;
+  // Metrics rate() extrapolation across bucket boundaries can slightly exceed
+  // 1.0 (e.g. 1.05). Clamp finite values above 1 to 1 instead of crashing the
+  // entire endpoints table.
+  return Math.min(1, rate);
 }

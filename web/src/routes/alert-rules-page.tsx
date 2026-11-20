@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ListChecks, Loader2, Pencil, Plus, Trash2 } from "lucide-react";
+import { ListChecks, Loader2, Pencil, Plus, ShieldAlert, Trash2 } from "lucide-react";
 import {
   listRules,
   createRule,
@@ -19,6 +19,8 @@ import { useAuth } from "@/lib/auth/auth-provider";
 import { canManageAlerts } from "@/lib/auth/permissions";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { isForbiddenError } from "@/lib/api/errors";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { SeverityBadge } from "@/components/alerts/severity";
 import { KvEditor } from "@/components/common/kv-editor";
@@ -55,7 +57,12 @@ export function AlertRulesPage() {
   const canManage = canManageAlerts(role);
   const queryClient = useQueryClient();
 
-  const rules = useQuery({ queryKey: ["alert-rules"], queryFn: ({ signal }) => listRules(signal) });
+  const rules = useQuery({
+    queryKey: ["alert-rules"],
+    queryFn: ({ signal }) => listRules(signal),
+    enabled: canManage,
+    retry: false,
+  });
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<AlertRule | null>(null);
@@ -79,6 +86,22 @@ export function AlertRulesPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alert-rules"] }),
   });
 
+  if (!canManage) {
+    return (
+      <PageContainer>
+        <Card>
+          <CardContent>
+            <EmptyState
+              icon={<ShieldAlert className="size-6" />}
+              title={t("common.forbiddenTitle")}
+              desc={t("alerts.rulesForbiddenDesc")}
+            />
+          </CardContent>
+        </Card>
+      </PageContainer>
+    );
+  }
+
   function openNew() {
     setEditing(null);
     setFormOpen(true);
@@ -90,14 +113,12 @@ export function AlertRulesPage() {
 
   return (
     <PageContainer>
-      {canManage && (
-        <PageActions>
-          <Button onClick={openNew} className="gap-1.5">
-            <Plus className="size-4" />
-            {t("alerts.newRule")}
-          </Button>
-        </PageActions>
-      )}
+      <PageActions>
+        <Button onClick={openNew} className="gap-1.5">
+          <Plus className="size-4" />
+          {t("alerts.newRule")}
+        </Button>
+      </PageActions>
 
       <Card>
         <CardContent className="p-0">
@@ -107,6 +128,12 @@ export function AlertRulesPage() {
                 <Skeleton key={i} className="h-14 w-full" />
               ))}
             </div>
+          ) : rules.isError ? (
+            <QueryErrorState
+              error={rules.error}
+              forbiddenDesc={t("alerts.rulesForbiddenDesc")}
+              onRetry={() => void rules.refetch()}
+            />
           ) : rules.data && rules.data.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -194,6 +221,7 @@ export function AlertRulesPage() {
 
       {formOpen && (
         <RuleFormDialog
+          key={editing?.id ?? "new"}
           open={formOpen}
           onOpenChange={setFormOpen}
           editing={editing}
@@ -228,7 +256,11 @@ function RuleFormDialog({
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const channels = useQuery({ queryKey: ["channels"], queryFn: ({ signal }) => listChannels(signal) });
+  const channels = useQuery({
+    queryKey: ["channels"],
+    queryFn: ({ signal }) => listChannels(signal),
+    retry: false,
+  });
 
   const [name, setName] = useState(editing?.name ?? "");
   const [signal, setSignal] = useState<AlertSignal>(editing?.signal ?? "metrics");
@@ -387,7 +419,28 @@ function RuleFormDialog({
 
           <div className="space-y-1.5">
             <Label>{t("alerts.channelsField")}</Label>
-            {channels.data && channels.data.length > 0 ? (
+            {channels.isLoading ? (
+              <Skeleton className="h-8 w-48" />
+            ) : channels.isError ? (
+              <div className="flex flex-wrap items-center gap-2 text-xs text-destructive" role="alert">
+                <span>
+                  {isForbiddenError(channels.error)
+                    ? t("alerts.channelsLoadForbidden")
+                    : t("alerts.channelsLoadError")}
+                </span>
+                {!isForbiddenError(channels.error) && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-2 text-xs"
+                    onClick={() => void channels.refetch()}
+                  >
+                    {t("common.retry")}
+                  </Button>
+                )}
+              </div>
+            ) : channels.data && channels.data.length > 0 ? (
               <div className="flex flex-wrap gap-2">
                 {channels.data.map((ch) => {
                   const selected = channelIds.includes(ch.id);

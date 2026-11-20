@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Loader2, Plus, ShieldAlert, Trash2, Users as UsersIcon } from "lucide-react";
@@ -17,6 +17,8 @@ import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { formatErrorMessage } from "@/lib/api/errors";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -49,15 +51,19 @@ export function UsersPage() {
     queryKey: ["users"],
     queryFn: ({ signal }) => listUsers(signal),
     enabled: canManageUsers(role),
+    retry: false,
   });
 
   const [createOpen, setCreateOpen] = useState(false);
   const [deleting, setDeleting] = useState<ManagedUser | null>(null);
   const [resetting, setResetting] = useState<ManagedUser | null>(null);
+  const [roleError, setRoleError] = useState<string | null>(null);
 
   const roleMutation = useMutation({
     mutationFn: ({ id, newRole }: { id: string; newRole: Role }) => updateUserRole(id, newRole),
+    onMutate: () => setRoleError(null),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["users"] }),
+    onError: (err) => setRoleError(formatErrorMessage(err, t("common.loadFailed"))),
   });
 
   // Admin-only page: block non-admins with a clear message.
@@ -86,6 +92,12 @@ export function UsersPage() {
         </Button>
       </PageActions>
 
+      {roleError && (
+        <p className="mb-3 text-sm text-destructive" role="alert">
+          {roleError}
+        </p>
+      )}
+
       <Card>
         <CardContent className="p-0">
           {users.isLoading ? (
@@ -94,6 +106,13 @@ export function UsersPage() {
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
+          ) : users.isError ? (
+            <QueryErrorState
+              error={users.error}
+              forbiddenTitle={t("users.forbiddenTitle")}
+              forbiddenDesc={t("users.forbiddenDesc")}
+              onRetry={() => void users.refetch()}
+            />
           ) : users.data && users.data.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -175,8 +194,10 @@ export function UsersPage() {
         </CardContent>
       </Card>
 
-      <CreateUserDialog open={createOpen} onOpenChange={setCreateOpen} />
-      <ResetPasswordDialog user={resetting} onOpenChange={setResetting} />
+      {createOpen && <CreateUserDialog open={createOpen} onOpenChange={setCreateOpen} />}
+      {resetting && (
+        <ResetPasswordDialog key={resetting.id} user={resetting} onOpenChange={setResetting} />
+      )}
       <ConfirmDialog
         open={!!deleting}
         onOpenChange={(o) => !o && setDeleting(null)}
@@ -208,9 +229,19 @@ function CreateUserDialog({
   const [roleValue, setRoleValue] = useState<Role>("member");
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!open) {
+      setUsername("");
+      setPassword("");
+      setRoleValue("member");
+      setError(null);
+    }
+  }, [open]);
+
   const mutation = useMutation({
     mutationFn: () => createUser(username.trim(), password, roleValue),
     onSuccess: () => {
+      reset();
       void queryClient.invalidateQueries({ queryKey: ["users"] });
       onOpenChange(false);
     },
@@ -228,7 +259,7 @@ function CreateUserDialog({
     <Dialog
       open={open}
       onOpenChange={(o) => {
-        if (o) reset();
+        reset();
         onOpenChange(o);
       }}
     >
@@ -281,7 +312,14 @@ function CreateUserDialog({
           )}
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={mutation.isPending}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              reset();
+              onOpenChange(false);
+            }}
+            disabled={mutation.isPending}
+          >
             {t("common.cancel")}
           </Button>
           <Button
@@ -309,6 +347,11 @@ function ResetPasswordDialog({
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    setPassword("");
+    setError(null);
+  }, [user?.id]);
+
   const mutation = useMutation({
     mutationFn: () => resetUserPassword(user!.id, password),
     onSuccess: () => {
@@ -319,15 +362,17 @@ function ResetPasswordDialog({
     onError: (e) => setError((e as Error).message || t("users.resetError")),
   });
 
+  function close() {
+    setPassword("");
+    setError(null);
+    onOpenChange(null);
+  }
+
   return (
     <Dialog
       open={!!user}
       onOpenChange={(o) => {
-        if (!o) {
-          setPassword("");
-          setError(null);
-          onOpenChange(null);
-        }
+        if (!o) close();
       }}
     >
       <DialogContent>
@@ -356,7 +401,7 @@ function ResetPasswordDialog({
         <DialogFooter>
           <Button
             variant="outline"
-            onClick={() => onOpenChange(null)}
+            onClick={close}
             disabled={mutation.isPending}
           >
             {t("common.cancel")}

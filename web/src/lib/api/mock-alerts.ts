@@ -26,7 +26,7 @@ export const mockChannels: NotificationChannel[] = [
     id: "chn_ops_webhook",
     type: "webhook",
     name: "Ops Webhook",
-    config: { url: "https://hooks.example.com/lo/ops", secret: "whsec_demo" },
+    config: { url: "https://hooks.example.com/lo/ops", secret: "[REDACTED]" },
     enabled: true,
     created_at: ago(60 * 24 * 30),
     updated_at: ago(60 * 24 * 2),

@@ -88,17 +88,21 @@ export function ReplayPlayer({
   const [currentTime, setCurrentTime] = useState(0);
   const [totalTime, setTotalTime] = useState(durationMs);
   const [speed, setSpeed] = useState(1);
-  const [error, setError] = useState<string | null>(null);
+  const speedRef = useRef(speed);
+  const [playerUnavailable, setPlayerUnavailable] = useState(false);
   const [visibleTypes, setVisibleTypes] = useState<Set<ReplayMarkerType>>(
     () => new Set(MARKER_TYPES),
   );
 
-  // Create the replayer once for the loaded event stream.
+  // Create the replayer once for the loaded event stream (do not depend on `t`
+  // so switching UI language does not destroy/rebuild the engine).
   useEffect(() => {
     const host = hostRef.current;
     if (!host || events.length < 2) return;
     host.innerHTML = "";
-    setError(null);
+    setPlayerUnavailable(false);
+    setPlaying(false);
+    setCurrentTime(0);
     let cancelled = false;
     let replayer: ReplayEngine | null = null;
     let ro: ResizeObserver | null = null;
@@ -110,7 +114,7 @@ export function ReplayPlayer({
         if (cancelled) return;
         replayer = new rrweb.Replayer(events, {
           root: host,
-          speed: 1,
+          speed: speedRef.current,
           skipInactive: false,
           showWarning: false,
           showDebug: false,
@@ -136,7 +140,7 @@ export function ReplayPlayer({
         replayer.on("finish", () => setPlaying(false));
       } catch {
         if (cancelled) return;
-        setError(t("replays.playerUnavailable"));
+        setPlayerUnavailable(true);
       }
     })();
 
@@ -151,7 +155,7 @@ export function ReplayPlayer({
       replayerRef.current = null;
       host.innerHTML = "";
     };
-  }, [events, durationMs, t]);
+  }, [events, durationMs]);
 
   // Track playback position with a rAF loop while playing.
   useEffect(() => {
@@ -188,6 +192,7 @@ export function ReplayPlayer({
   }
 
   function changeSpeed(next: number) {
+    speedRef.current = next;
     setSpeed(next);
     replayerRef.current?.setConfig({ speed: next });
   }
@@ -219,8 +224,12 @@ export function ReplayPlayer({
     });
   }
 
-  if (error) {
-    return <div className="py-8 text-center text-sm text-destructive">{error}</div>;
+  if (playerUnavailable) {
+    return (
+      <div className="py-8 text-center text-sm text-destructive">
+        {t("replays.playerUnavailable")}
+      </div>
+    );
   }
 
   return (
