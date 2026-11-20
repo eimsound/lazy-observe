@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v3"
 )
@@ -83,6 +84,10 @@ type Security struct {
 	// writes it to <data_dir>/initial-admin-password (mode 0600) on the replica
 	// that creates the admin. HA deployments should set this.
 	AdminPasswordFile string `yaml:"admin_password_file"`
+	// OutboundAllowlist authorizes explicit private/loopback CIDRs, hosts, or
+	// host:port endpoints (such as local Ollama 127.0.0.1:11434 or internal
+	// webhooks) for outbound notification and BYO AI requests.
+	OutboundAllowlist []string `yaml:"outbound_allowlist"`
 }
 
 // SelfMonitoring controls the platform's use of its own Go SDK.
@@ -372,6 +377,12 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 	fs.Var(&cfg.Security.AuditRetention, "audit-retention", "management audit event retention")
 	fs.StringVar(&cfg.Security.TLSCert, "tls-cert", cfg.Security.TLSCert, "TLS certificate file (enables HTTPS)")
 	fs.StringVar(&cfg.Security.TLSKey, "tls-key", cfg.Security.TLSKey, "TLS private key file")
+	fs.StringSliceVar(
+		&cfg.Security.OutboundAllowlist,
+		"security-outbound-allowlist",
+		cfg.Security.OutboundAllowlist,
+		"comma-separated CIDRs, hosts, or host:port entries allowed for outbound notification and AI requests",
+	)
 	fs.BoolVar(
 		&cfg.Retention.IssuesClosed,
 		"issues-closed-retention",
@@ -468,6 +479,16 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		if v, ok := lookup(name); ok {
 			*dst = v
 		}
+	}
+	if v, ok := lookup("LO_SECURITY_OUTBOUND_ALLOWLIST"); ok {
+		parts := strings.Split(v, ",")
+		allowlist := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				allowlist = append(allowlist, trimmed)
+			}
+		}
+		c.Security.OutboundAllowlist = allowlist
 	}
 	if v, ok := lookup("LO_STANDALONE"); ok {
 		parsed, err := strconv.ParseBool(v)
@@ -646,6 +667,9 @@ func (c Config) Validate() error {
 	}
 	if c.Redis.DB < 0 {
 		return errors.New("redis.db must not be negative")
+	}
+	if _, err := outbound.ParseAllowlist(c.Security.OutboundAllowlist); err != nil {
+		return err
 	}
 	return nil
 }

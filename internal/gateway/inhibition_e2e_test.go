@@ -12,6 +12,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/alert"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
 func TestInhibitionPipelineRealStoreAndRBAC(t *testing.T) {
@@ -37,6 +38,7 @@ func TestInhibitionPipelineRealStoreAndRBAC(t *testing.T) {
 
 	alerts := alert.NewService(alert.Config{
 		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
 		GroupWait:      10 * time.Millisecond,
 		RepeatInterval: time.Hour,
 		Evaluator: alert.RuleEvaluatorConfig{

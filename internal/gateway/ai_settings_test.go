@@ -11,6 +11,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/ai"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/secret"
 )
 
@@ -44,6 +45,7 @@ func dynamicAITestApp(t *testing.T) (*httptest.Server, *Gateway, *meta.Store, *h
 		AISecretBox:     box,
 		AIBuildClient:   ai.New,
 		AITimeout:       time.Second,
+		OutboundPolicy:  outbound.Policy{AllowPrivate: true},
 	})
 	t.Cleanup(func() { _ = gw.Shutdown() })
 	return provider, gw, store, admin, viewer, apiKey
@@ -231,6 +233,7 @@ func TestAIManagerRestoresPersistedSettingsOnStartup(t *testing.T) {
 		AISecretBox:     box,
 		AIBuildClient:   ai.New,
 		AITimeout:       time.Second,
+		OutboundPolicy:  outbound.Policy{AllowPrivate: true},
 	})
 	state := gw.aiState()
 	if !state.enabled || state.provider != "deepseek" || state.model != "deepseek-chat" || !state.hasKey ||
@@ -261,6 +264,7 @@ func TestAIManagerCorruptCiphertextKeepsAIDisabled(t *testing.T) {
 		AISecretBox:     box,
 		AIBuildClient:   ai.New,
 		AITimeout:       time.Second,
+		OutboundPolicy:  outbound.Policy{AllowPrivate: true},
 	})
 	state := gw.aiState()
 	if state.enabled || state.hasKey || state.client != nil {
@@ -287,5 +291,135 @@ func TestAISettingsDeepSeekDefaults(t *testing.T) {
 		ai.Config{Provider: "deepseek", APIKey: key, Model: "deepseek-chat", MaxTokens: 1024, Timeout: time.Second},
 	); err != nil {
 		t.Fatalf("deepseek client: %v", err)
+	}
+}
+
+func TestAISettingsOllamaWithoutAPIKey(t *testing.T) {
+	var authHeader string
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader = r.Header.Get("Authorization")
+		if r.URL.Path != "/api/chat" {
+			t.Fatalf("ollama path=%q", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model":   "qwen2.5",
+			"message": map[string]any{"role": "assistant", "content": "pong"},
+			"done":    true,
+		})
+	}))
+	defer ollama.Close()
+
+	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := testStore(t)
+	admin := sessionCookie(t, store, "ollama-admin", "password", "admin")
+	gw := newMetadataTestGateway(store, Config{
+		Tokens:          store,
+		Store:           store,
+		AISettingsStore: store,
+		AISecretBox:     box,
+		AIBuildClient:   ai.New,
+		AITimeout:       time.Second,
+		OutboundPolicy:  outbound.Policy{AllowPrivate: true},
+	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	// Production mode (box != nil) allows enabling ollama with no API key.
+	resp, body := requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"enabled":  true,
+		"provider": "ollama",
+		"base_url": ollama.URL,
+		"model":    "qwen2.5",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("enable ollama without key status=%d body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"enabled":true`)) || !bytes.Contains(body, []byte(`"has_api_key":false`)) {
+		t.Fatalf("ollama settings body=%s", body)
+	}
+
+	resp, body = requestJSON(t, gw, http.MethodPost, "/api/ai/test", admin, nil)
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"echo":"pong"`)) {
+		t.Fatalf("ollama test status=%d body=%s", resp.StatusCode, body)
+	}
+	if authHeader != "" {
+		t.Fatalf("ollama request sent unexpected Authorization header: %q", authHeader)
+	}
+}
+
+func TestAISettingsCorruptCiphertextAllowsDisable(t *testing.T) {
+	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := testStore(t)
+	admin := sessionCookie(t, store, "corrupt-admin", "password", "admin")
+	if err := store.UpsertAISettings(t.Context(), meta.AISettings{
+		Enabled:          true,
+		Provider:         "deepseek",
+		Model:            "deepseek-chat",
+		APIKeyCiphertext: "corrupt-unreadable-ciphertext",
+		UpdatedAt:        time.Now().UTC(),
+		UpdatedBy:        "admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gw := newMetadataTestGateway(store, Config{
+		Tokens:          store,
+		Store:           store,
+		AISettingsStore: store,
+		AISecretBox:     box,
+		AIBuildClient:   ai.New,
+		AITimeout:       time.Second,
+	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	// Admin must be able to disable AI without first decrypting corrupt ciphertext.
+	resp, body := requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"enabled": false,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("disable with corrupt ciphertext status=%d body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"enabled":false`)) || !bytes.Contains(body, []byte(`"has_api_key":false`)) {
+		t.Fatalf("disabled settings body=%s", body)
+	}
+}
+
+func TestAISettingsRejectsSSRFBaseURL(t *testing.T) {
+	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := testStore(t)
+	admin := sessionCookie(t, store, "ssrf-ai-admin", "password", "admin")
+	gw := newMetadataTestGateway(store, Config{
+		Tokens:          store,
+		Store:           store,
+		AISettingsStore: store,
+		AISecretBox:     box,
+		AIBuildClient:   ai.New,
+		AITimeout:       time.Second,
+	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	for _, badURL := range []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://127.0.0.1:18428",
+		"http://10.0.0.5:8080",
+		"http://api.openai.com:0443",
+	} {
+		resp, body := requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+			"enabled":  true,
+			"provider": "openai",
+			"base_url": badURL,
+			"model":    "gpt-4o",
+			"api_key":  "sk-secret",
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("base_url=%q status=%d want 400 body=%s", badURL, resp.StatusCode, body)
+		}
 	}
 }

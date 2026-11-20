@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/storage"
 )
 
@@ -337,6 +338,7 @@ func TestNativeEvaluatorCommitsFiringAndResolvedNotifications(t *testing.T) {
 	)
 	service := NewService(Config{
 		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
 		Sender:         &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
 		GroupWait:      time.Millisecond,
 		RepeatInterval: time.Hour,

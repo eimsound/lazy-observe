@@ -66,7 +66,7 @@ func runServer(cfg appconfig.Config) error {
 	monitoring := startSelfMonitoring(cfg, loopback.baseURL, metadata.selfProject, metadata.selfToken, logger)
 	defer monitoring.Shutdown()
 
-	services := startServerServices(ctx, cfg, monitoring.logger, metadata, signals, shared.limits)
+	services := startServerServices(ctx, cfg, monitoring.logger, essentials, metadata, signals, shared.limits)
 	defer services.Close()
 
 	runningGateway, err := startGateway(
@@ -95,5 +95,9 @@ func loadServerEssentials(cfg appconfig.Config) (serverEssentials, error) {
 	if err != nil {
 		return serverEssentials{}, fmt.Errorf("load platform encryption key: %w", err)
 	}
-	return serverEssentials{llmPricing: llmPricing, secretBox: secretBox}, nil
+	outboundPolicy, err := serverOutboundPolicy(cfg)
+	if err != nil {
+		return serverEssentials{}, fmt.Errorf("configure outbound security policy: %w", err)
+	}
+	return serverEssentials{llmPricing: llmPricing, secretBox: secretBox, outboundPolicy: outboundPolicy}, nil
 }

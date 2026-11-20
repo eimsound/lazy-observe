@@ -86,6 +86,32 @@ func TestLoadFlagSetReadsFlagsChangedAfterAddFlagSet(t *testing.T) {
 	}
 }
 
+func TestSecurityOutboundAllowlistConfigAndValidation(t *testing.T) {
+	cfg, _, err := Load(nil, func(key string) (string, bool) {
+		if key == "LO_SECURITY_OUTBOUND_ALLOWLIST" {
+			return "127.0.0.1:11434, 10.0.0.0/8", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.OutboundAllowlist) != 2 ||
+		cfg.Security.OutboundAllowlist[0] != "127.0.0.1:11434" ||
+		cfg.Security.OutboundAllowlist[1] != "10.0.0.0/8" {
+		t.Fatalf("outbound allowlist=%#v", cfg.Security.OutboundAllowlist)
+	}
+
+	if _, _, err := Load(nil, func(key string) (string, bool) {
+		if key == "LO_SECURITY_OUTBOUND_ALLOWLIST" {
+			return "127.0.0.1:080", true
+		}
+		return "", false
+	}); err == nil {
+		t.Fatal("invalid outbound allowlist port should fail validation")
+	}
+}
+
 func TestRetentionDefaults(t *testing.T) {
 	cfg := Defaults()
 	if !cfg.ServeWebUI {

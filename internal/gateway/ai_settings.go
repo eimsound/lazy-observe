@@ -13,6 +13,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/ai"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/secret"
 )
 
@@ -60,6 +61,7 @@ type aiManager struct {
 	box       *secret.Box
 	build     func(ai.Config) (ai.Client, error)
 	timeout   time.Duration
+	outbound  outbound.Policy
 	now       func() time.Time
 	logger    *slog.Logger
 	updatedBy string // actor of the last successful write (dynamic mode)
@@ -70,6 +72,7 @@ func newAIManager(
 	box *secret.Box,
 	build func(ai.Config) (ai.Client, error),
 	timeout time.Duration,
+	outboundPolicy outbound.Policy,
 	now func() time.Time,
 	logger *slog.Logger,
 ) *aiManager {
@@ -82,7 +85,9 @@ func newAIManager(
 	if now == nil {
 		now = time.Now
 	}
-	return &aiManager{store: store, box: box, build: build, timeout: timeout, now: now, logger: logger}
+	return &aiManager{
+		store: store, box: box, build: build, timeout: timeout, outbound: outboundPolicy, now: now, logger: logger,
+	}
 }
 
 // snapshot returns the current runtime configuration.
@@ -119,6 +124,27 @@ func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot
 	if !ok {
 		return aiSnapshot{}, nil
 	}
+	maxTokens := stored.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = aiDefaultMaxTokens
+	}
+	snap := aiSnapshot{
+		enabled:   stored.Enabled,
+		provider:  stored.Provider,
+		baseURL:   stored.BaseURL,
+		model:     stored.Model,
+		maxTokens: maxTokens,
+	}
+	if !snap.enabled {
+		if stored.APIKeyCiphertext != "" {
+			if m.box == nil {
+				snap.hasKey = true
+			} else if decrypted, err := m.box.Decrypt(stored.APIKeyCiphertext); err == nil {
+				snap.hasKey = decrypted != ""
+			}
+		}
+		return snap, nil
+	}
 	apiKey := ""
 	if stored.APIKeyCiphertext != "" {
 		if m.box == nil {
@@ -132,21 +158,7 @@ func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot
 		}
 		apiKey = decrypted
 	}
-	maxTokens := stored.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = aiDefaultMaxTokens
-	}
-	snap := aiSnapshot{
-		enabled:   stored.Enabled,
-		provider:  stored.Provider,
-		baseURL:   stored.BaseURL,
-		model:     stored.Model,
-		hasKey:    apiKey != "",
-		maxTokens: maxTokens,
-	}
-	if !snap.enabled {
-		return snap, nil
-	}
+	snap.hasKey = apiKey != ""
 	client, err := m.build(ai.Config{
 		Provider:  stored.Provider,
 		BaseURL:   stored.BaseURL,
@@ -154,6 +166,7 @@ func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot
 		Model:     stored.Model,
 		MaxTokens: maxTokens,
 		Timeout:   m.timeout,
+		Outbound:  m.outbound,
 	})
 	if err != nil {
 		return snap, err
@@ -262,8 +275,8 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 		next.APIKeyCiphertext = sealed
 	}
 
-	if err := validateAISettings(next, m); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	if err := validateAISettings(next, m, body.BaseURL != nil); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(err)})
 	}
 
 	// Build the client before persisting: invalid configurations must not be
@@ -272,7 +285,7 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 	// (no client is constructed), so it cannot fail here.
 	snap, err := m.buildFromStored(next, true)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(err)})
 	}
 	next.UpdatedAt = m.now().UTC()
 	next.UpdatedBy = actor
@@ -301,10 +314,19 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 	})
 }
 
-func validateAISettings(s meta.AISettings, m *aiManager) error {
+func providerRequiresAPIKey(provider string) bool {
+	return provider != "ollama"
+}
+
+func validateAISettings(s meta.AISettings, m *aiManager, validateBaseURL bool) error {
 	if !s.Enabled {
 		if s.Provider != "" && !aiProviders[s.Provider] {
 			return errors.New("unsupported AI provider")
+		}
+		if validateBaseURL && s.BaseURL != "" {
+			if _, err := outbound.ValidateURL(s.BaseURL, m.outbound); err != nil {
+				return fmt.Errorf("invalid base_url: %w", err)
+			}
 		}
 		return nil
 	}
@@ -314,8 +336,13 @@ func validateAISettings(s meta.AISettings, m *aiManager) error {
 	if strings.TrimSpace(s.Model) == "" {
 		return errors.New("model is required when AI is enabled")
 	}
-	if m.box != nil && s.APIKeyCiphertext == "" {
+	if providerRequiresAPIKey(s.Provider) && m.box != nil && s.APIKeyCiphertext == "" {
 		return errors.New("API key is required when AI is enabled")
+	}
+	if s.BaseURL != "" {
+		if _, err := outbound.ValidateURL(s.BaseURL, m.outbound); err != nil {
+			return fmt.Errorf("invalid base_url: %w", err)
+		}
 	}
 	if s.MaxTokens < 0 {
 		return errors.New("max_tokens must not be negative")

@@ -31,6 +31,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/management"
 	observemcp "github.com/eimsound/lazy-observe/internal/mcp"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/scrape"
 	"github.com/eimsound/lazy-observe/internal/secret"
 	"github.com/eimsound/lazy-observe/internal/state"
@@ -158,7 +159,9 @@ type Config struct {
 	// AIBuildClient constructs the provider client; defaults to ai.New.
 	AIBuildClient func(ai.Config) (ai.Client, error)
 	// AITimeout bounds provider calls; defaults to 60s when unset.
-	AITimeout           time.Duration
+	AITimeout time.Duration
+	// OutboundPolicy restricts outbound destinations for BYO AI requests.
+	OutboundPolicy      outbound.Policy
 	LLMPricing          *llmcost.Table
 	WebUI               fs.FS
 	DisableWebUI        bool
@@ -364,13 +367,14 @@ func New(cfg Config) *Gateway {
 			cfg.AISecretBox,
 			cfg.AIBuildClient,
 			cfg.AITimeout,
+			cfg.OutboundPolicy,
 			cfg.Now,
 			cfg.Logger,
 		)
 		g.ai.loadFromStore(context.Background())
 	} else {
 		// Static mode: constructor-provided AI state (tests, embedders).
-		g.ai = newAIManager(nil, nil, cfg.AIBuildClient, cfg.AITimeout, cfg.Now, cfg.Logger)
+		g.ai = newAIManager(nil, nil, cfg.AIBuildClient, cfg.AITimeout, cfg.OutboundPolicy, cfg.Now, cfg.Logger)
 		g.ai.current = aiSnapshot{
 			enabled:   cfg.AIEnabled,
 			provider:  cfg.AIProvider,

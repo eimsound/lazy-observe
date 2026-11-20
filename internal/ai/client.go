@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
 type Message struct {
@@ -58,6 +60,7 @@ type Config struct {
 	MaxTokens int
 	Timeout   time.Duration
 	Client    *http.Client
+	Outbound  outbound.Policy
 }
 
 func New(cfg Config) (Client, error) {
@@ -70,17 +73,26 @@ func New(cfg Config) (Client, error) {
 	if strings.TrimSpace(cfg.Model) == "" {
 		return nil, errors.New("model is required")
 	}
+	rawBaseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: cfg.Timeout}
+		if rawBaseURL != "" {
+			if _, err := outbound.ValidateURL(rawBaseURL, cfg.Outbound); err != nil {
+				return nil, fmt.Errorf("invalid AI base_url: %w", err)
+			}
+		}
+		cfg.Client = outbound.NewHTTPClient(cfg.Timeout, cfg.Outbound)
 	} else {
 		clientCopy := *cfg.Client
 		clientCopy.Timeout = cfg.Timeout
+		if clientCopy.CheckRedirect == nil {
+			clientCopy.CheckRedirect = outbound.RejectRedirects
+		}
 		cfg.Client = &clientCopy
 	}
 	b := &providerClient{
-		baseURL:   strings.TrimRight(cfg.BaseURL, "/"),
-		apiKey:    cfg.APIKey,
-		model:     cfg.Model,
+		baseURL:   rawBaseURL,
+		apiKey:    strings.TrimSpace(cfg.APIKey),
+		model:     strings.TrimSpace(cfg.Model),
 		maxTokens: cfg.MaxTokens,
 		client:    cfg.Client,
 	}

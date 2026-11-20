@@ -5,14 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	alertpkg "github.com/eimsound/lazy-observe/internal/alert"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
+	"github.com/eimsound/lazy-observe/internal/secret"
 )
 
 func TestAlertAPIUsesStableWireContract(t *testing.T) {
@@ -32,8 +36,11 @@ func TestAlertAPIUsesStableWireContract(t *testing.T) {
 	defer receiver.Close()
 
 	alerts := alertpkg.NewService(alertpkg.Config{
-		Store: store, Sender: &alertpkg.Sender{Client: receiver.Client()},
-		GroupWait: time.Millisecond, RepeatInterval: time.Hour,
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		Sender:         &alertpkg.Sender{Client: receiver.Client()},
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
 	})
 	t.Cleanup(alerts.Close)
 	app := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts}).App()
@@ -290,6 +297,188 @@ func assertNoEntFields(t *testing.T, object map[string]any, fields ...string) {
 	for _, field := range fields {
 		if value, exists := object[field]; exists {
 			t.Errorf("ent-only field %q leaked into API response with value %#v", field, value)
+		}
+	}
+}
+
+func TestChannelCredentialsRedactedAndSSRFBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetSecretBox(box)
+	if _, err := store.CreateProject(ctx, "Sec", "sec"); err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "sec-admin", "password", "admin")
+
+	alerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
+	t.Cleanup(alerts.Close)
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts, Notifications: store})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	// SSRF / bad port / SMTP header injection are rejected on create with 400.
+	badPayloads := []map[string]any{
+		{
+			"type":   "webhook",
+			"name":   "meta-ssrf",
+			"config": map[string]any{"url": "http://169.254.169.254/latest/meta-data/"},
+		},
+		{"type": "webhook", "name": "loopback-ssrf", "config": map[string]any{"url": "http://127.0.0.1:18428/metrics"}},
+		{
+			"type":   "webhook",
+			"name":   "leading-zero-port",
+			"config": map[string]any{"url": "https://example.com:0443/hook"},
+		},
+		{
+			"type":   "smtp",
+			"name":   "smtp-loopback",
+			"config": map[string]any{"host": "127.0.0.1", "port": "25", "from": "a@example.com", "to": "b@example.com"},
+		},
+		{
+			"type": "smtp",
+			"name": "smtp-crlf",
+			"config": map[string]any{
+				"host": "smtp.example.com",
+				"port": "587",
+				"from": "a@example.com\r\nBcc: evil@example.com",
+				"to":   "b@example.com",
+			},
+		},
+	}
+	for _, payload := range badPayloads {
+		resp, body := requestJSON(t, gw, http.MethodPost, "/api/channels", admin, payload)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("bad channel %v status=%d want 400 body=%s", payload["name"], resp.StatusCode, body)
+		}
+	}
+
+	// Create DingTalk and SMTP channels containing secrets.
+	resp, dingBody := requestJSON(t, gw, http.MethodPost, "/api/channels", admin, map[string]any{
+		"type": "dingtalk",
+		"name": "ding-sec",
+		"config": map[string]any{
+			"url":     "https://oapi.dingtalk.com/robot/send?access_token=ding-api-secret-value",
+			"secret":  "ding-sign-secret",
+			"headers": map[string]any{"Authorization": "Bearer custom-hdr-secret"},
+		},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create dingtalk status=%d body=%s", resp.StatusCode, dingBody)
+	}
+	for _, leaked := range []string{"ding-api-secret-value", "ding-sign-secret", "custom-hdr-secret"} {
+		if strings.Contains(string(dingBody), leaked) {
+			t.Fatalf("POST /api/channels leaked %q: %s", leaked, dingBody)
+		}
+	}
+	var createdDing notificationChannelResponse
+	if err := json.Unmarshal(dingBody, &createdDing); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, smtpBody := requestJSON(t, gw, http.MethodPost, "/api/channels", admin, map[string]any{
+		"type": "smtp",
+		"name": "smtp-sec",
+		"config": map[string]any{
+			"host":     "smtp.example.com",
+			"port":     "587",
+			"from":     "alerts@example.com",
+			"to":       "ops@example.com",
+			"username": "mailer",
+			"password": "smtp-top-secret-password",
+		},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create smtp status=%d body=%s", resp.StatusCode, smtpBody)
+	}
+	if strings.Contains(string(smtpBody), "smtp-top-secret-password") {
+		t.Fatalf("POST /api/channels leaked smtp password: %s", smtpBody)
+	}
+
+	// GET /api/channels must return redacted values only.
+	resp, listBody := requestJSON(t, gw, http.MethodGet, "/api/channels", admin, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list channels status=%d body=%s", resp.StatusCode, listBody)
+	}
+	for _, leaked := range []string{"ding-api-secret-value", "ding-sign-secret", "custom-hdr-secret", "smtp-top-secret-password"} {
+		if strings.Contains(string(listBody), leaked) {
+			t.Fatalf("GET /api/channels leaked %q: %s", leaked, listBody)
+		}
+	}
+
+	// Updating channel name while echoing back the redacted config preserves real secrets.
+	resp, patchBody := requestJSON(t, gw, http.MethodPatch, "/api/channels/"+createdDing.ID, admin, map[string]any{
+		"name":   "ding-sec-renamed",
+		"type":   "dingtalk",
+		"config": createdDing.Config,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch channel status=%d body=%s", resp.StatusCode, patchBody)
+	}
+	if strings.Contains(string(patchBody), "ding-api-secret-value") ||
+		strings.Contains(string(patchBody), "ding-sign-secret") {
+		t.Fatalf("PATCH /api/channels leaked secret: %s", patchBody)
+	}
+	dingID, _ := strconv.Atoi(createdDing.ID)
+	stored, err := store.NotificationChannel(ctx, dingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Config["url"] != "https://oapi.dingtalk.com/robot/send?access_token=ding-api-secret-value" ||
+		stored.Config["secret"] != "ding-sign-secret" {
+		t.Fatalf("echoing redacted config corrupted stored secrets: %#v", stored.Config)
+	}
+
+	// TestChannel must sanitize transport errors and never leak tokens or raw dial details.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := ln.Addr().String()
+	_ = ln.Close()
+	allowAlerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		Sender: &alertpkg.Sender{
+			Outbound: outbound.Policy{AllowPrivate: true},
+			Timeout:  200 * time.Millisecond,
+		},
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
+	t.Cleanup(allowAlerts.Close)
+	allowGW := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: allowAlerts})
+	t.Cleanup(func() { _ = allowGW.Shutdown() })
+	failCh, err := allowAlerts.CreateChannel(ctx, alertpkg.ChannelInput{
+		Type: "wecom",
+		Name: "wecom-fail",
+		Config: map[string]any{
+			"url": "http://" + closedAddr + "/cgi-bin/webhook/send?key=wecom-test-secret",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, testBody := requestJSON(
+		t,
+		allowGW,
+		http.MethodPost,
+		"/api/channels/"+strconv.Itoa(failCh.ID)+"/test",
+		admin,
+		nil,
+	)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("test failing channel status=%d want 502 body=%s", resp.StatusCode, testBody)
+	}
+	for _, leaked := range []string{"wecom-test-secret", closedAddr, "connection refused"} {
+		if strings.Contains(string(testBody), leaked) {
+			t.Fatalf("testChannel response leaked %q: %s", leaked, testBody)
 		}
 	}
 }

@@ -87,10 +87,15 @@ func TestLogsAlertE2E(t *testing.T) {
 		"--storage-startup-timeout",
 		"30s",
 	)
+	webhookParsed, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cmd.Env = append(os.Environ(),
 		"LO_META_DB_URL="+metaDBURL,
 		"LO_SELF_MONITORING_ENABLED=false",
 		"LO_ALERT_GROUP_WAIT=250ms",
+		"LO_SECURITY_OUTBOUND_ALLOWLIST="+webhookParsed.Host,
 	)
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err := cmd.Start(); err != nil {

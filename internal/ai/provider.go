@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
 type protocol uint8
@@ -70,7 +72,9 @@ func (p *providerClient) do(ctx context.Context, body []byte) (*http.Response, e
 	req.Header.Set("Content-Type", "application/json")
 	switch p.protocol {
 	case protocolAnthropic:
-		req.Header.Set("x-api-key", p.apiKey)
+		if p.apiKey != "" {
+			req.Header.Set("x-api-key", p.apiKey)
+		}
 		req.Header.Set("anthropic-version", "2023-06-01")
 	default:
 		if p.apiKey != "" {
@@ -79,6 +83,9 @@ func (p *providerClient) do(ctx context.Context, body []byte) (*http.Response, e
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		return nil, normalizeTransport(err)
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -132,19 +139,41 @@ func (p *providerClient) requestBody(request ChatRequest, stream bool) ([]byte, 
 			Options  map[string]any `json:"options"`
 		}{p.model, messages, stream, map[string]any{"temperature": request.Temperature, "num_predict": p.maxTokens}}
 	default:
-		payload = struct {
-			Model       string    `json:"model"`
-			Messages    []Message `json:"messages"`
-			MaxTokens   int       `json:"max_tokens"`
-			Temperature float64   `json:"temperature"`
-			Stream      bool      `json:"stream"`
-		}{p.model, withSystem(request), p.maxTokens, request.Temperature, stream}
+		if isOpenAIReasoningModel(p.model) {
+			payload = struct {
+				Model               string    `json:"model"`
+				Messages            []Message `json:"messages"`
+				MaxCompletionTokens int       `json:"max_completion_tokens"`
+				Stream              bool      `json:"stream"`
+			}{p.model, withSystem(request), p.maxTokens, stream}
+		} else {
+			payload = struct {
+				Model       string    `json:"model"`
+				Messages    []Message `json:"messages"`
+				MaxTokens   int       `json:"max_tokens"`
+				Temperature float64   `json:"temperature"`
+				Stream      bool      `json:"stream"`
+			}{p.model, withSystem(request), p.maxTokens, request.Temperature, stream}
+		}
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, &Error{Kind: ErrorProtocol, Message: "encode provider request", Err: err}
 	}
 	return data, nil
+}
+
+func isOpenAIReasoningModel(model string) bool {
+	name := strings.ToLower(strings.TrimSpace(model))
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	for _, prefix := range []string{"o1", "o3", "o4", "gpt-5"} {
+		if name == prefix || strings.HasPrefix(name, prefix+"-") || strings.HasPrefix(name, prefix+".") {
+			return true
+		}
+	}
+	return false
 }
 
 func withSystem(request ChatRequest) []Message {
@@ -226,6 +255,10 @@ func (p *providerClient) parseResponse(data []byte) (ChatResponse, error) {
 func normalizeTransport(err error) error {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, outbound.ErrBlockedAddress) || errors.Is(err, outbound.ErrRedirectBlocked) ||
+		errors.Is(err, outbound.ErrInvalidTarget) {
+		return &Error{Kind: ErrorProvider, Message: outbound.SanitizeError(err), Err: err}
 	}
 	var netErr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {

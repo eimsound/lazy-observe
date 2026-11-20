@@ -2,7 +2,10 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	dbent "github.com/eimsound/lazy-observe/internal/db/ent"
@@ -13,6 +16,8 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/silence"
+	"github.com/eimsound/lazy-observe/internal/outbound"
+	"github.com/eimsound/lazy-observe/internal/secret"
 )
 
 type NotificationChannelView struct {
@@ -145,6 +150,8 @@ type AlertEventInhibition struct {
 	Inhibited bool
 }
 
+const channelConfigCipherPrefix = "enc:v1:"
+
 func (s *Store) ListNotificationChannels(ctx context.Context) ([]NotificationChannelView, error) {
 	rows, err := s.client.NotificationChannel.Query().Order(orderAsc(notificationchannel.FieldID)).All(ctx)
 	if err != nil {
@@ -152,7 +159,11 @@ func (s *Store) ListNotificationChannels(ctx context.Context) ([]NotificationCha
 	}
 	views := make([]NotificationChannelView, 0, len(rows))
 	for _, row := range rows {
-		views = append(views, notificationChannelView(row))
+		view, err := s.notificationChannelView(row, false)
+		if err != nil {
+			return nil, err
+		}
+		views = append(views, view)
 	}
 	return views, nil
 }
@@ -162,17 +173,21 @@ func (s *Store) NotificationChannel(ctx context.Context, id int) (NotificationCh
 	if err != nil {
 		return NotificationChannelView{}, err
 	}
-	return notificationChannelView(row), nil
+	return s.notificationChannelView(row, true)
 }
 
 func (s *Store) CreateNotificationChannel(
 	ctx context.Context,
 	input NotificationChannelCreate,
 ) (NotificationChannelView, error) {
+	sealed, err := sealChannelConfig(s.secretBox.Load(), input.Config)
+	if err != nil {
+		return NotificationChannelView{}, err
+	}
 	create := s.client.NotificationChannel.Create().
 		SetType(notificationchannel.Type(input.Type)).
 		SetName(input.Name).
-		SetConfig(input.Config)
+		SetConfig(sealed)
 	if input.Enabled != nil {
 		create.SetEnabled(*input.Enabled)
 	}
@@ -180,7 +195,7 @@ func (s *Store) CreateNotificationChannel(
 	if err != nil {
 		return NotificationChannelView{}, err
 	}
-	return notificationChannelView(row), nil
+	return s.notificationChannelView(row, false)
 }
 
 func (s *Store) UpdateNotificationChannel(
@@ -196,7 +211,11 @@ func (s *Store) UpdateNotificationChannel(
 		update.SetName(*input.Name)
 	}
 	if input.Config != nil {
-		update.SetConfig(input.Config)
+		sealed, err := sealChannelConfig(s.secretBox.Load(), input.Config)
+		if err != nil {
+			return NotificationChannelView{}, err
+		}
+		update.SetConfig(sealed)
 	}
 	if input.Enabled != nil {
 		update.SetEnabled(*input.Enabled)
@@ -205,23 +224,139 @@ func (s *Store) UpdateNotificationChannel(
 	if err != nil {
 		return NotificationChannelView{}, err
 	}
-	return notificationChannelView(row), nil
+	return s.notificationChannelView(row, false)
 }
 
 func (s *Store) DeleteNotificationChannel(ctx context.Context, id int) error {
 	return s.client.NotificationChannel.DeleteOneID(id).Exec(ctx)
 }
 
-func notificationChannelView(row *dbent.NotificationChannel) NotificationChannelView {
+func (s *Store) notificationChannelView(row *dbent.NotificationChannel, strict bool) (NotificationChannelView, error) {
+	cfg, err := openChannelConfig(s.secretBox.Load(), row.Config, strict, row.ID)
+	if err != nil {
+		return NotificationChannelView{}, err
+	}
 	return NotificationChannelView{
 		ID:        row.ID,
 		Type:      string(row.Type),
 		Name:      row.Name,
-		Config:    row.Config,
+		Config:    cfg,
 		Enabled:   row.Enabled,
 		CreatedAt: row.CreatedAt,
 		UpdatedAt: row.UpdatedAt,
+	}, nil
+}
+
+func isSensitiveChannelKey(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	if lower == "url" {
+		return true
 	}
+	for _, marker := range []string{"secret", "password", "passwd", "token", "key", "auth", "credential", "cookie"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func sealChannelConfig(box *secret.Box, cfg map[string]any) (map[string]any, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	out := make(map[string]any, len(cfg))
+	for k, v := range cfg {
+		if k == "headers" {
+			if headers, ok := v.(map[string]any); ok {
+				sealedHeaders := make(map[string]any, len(headers))
+				for hk, hv := range headers {
+					sealedVal, err := sealChannelStringValue(box, hv)
+					if err != nil {
+						return nil, fmt.Errorf("encrypt notification channel header %q: %w", hk, err)
+					}
+					sealedHeaders[hk] = sealedVal
+				}
+				out[k] = sealedHeaders
+				continue
+			}
+		}
+		if isSensitiveChannelKey(k) {
+			sealedVal, err := sealChannelStringValue(box, v)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt notification channel field %q: %w", k, err)
+			}
+			out[k] = sealedVal
+			continue
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+func sealChannelStringValue(box *secret.Box, value any) (any, error) {
+	if box == nil {
+		return value, nil
+	}
+	str, ok := value.(string)
+	if !ok || str == "" || strings.HasPrefix(str, channelConfigCipherPrefix) {
+		return value, nil
+	}
+	sealed, err := box.Encrypt(str)
+	if err != nil {
+		return nil, err
+	}
+	return channelConfigCipherPrefix + sealed, nil
+}
+
+func openChannelConfig(box *secret.Box, cfg map[string]any, strict bool, channelID int) (map[string]any, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	out := make(map[string]any, len(cfg))
+	for k, v := range cfg {
+		if k == "headers" {
+			if headers, ok := v.(map[string]any); ok {
+				openedHeaders := make(map[string]any, len(headers))
+				for hk, hv := range headers {
+					openedVal, err := openChannelStringValue(box, hv, strict, channelID, "headers."+hk)
+					if err != nil {
+						return nil, err
+					}
+					openedHeaders[hk] = openedVal
+				}
+				out[k] = openedHeaders
+				continue
+			}
+		}
+		openedVal, err := openChannelStringValue(box, v, strict, channelID, k)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = openedVal
+	}
+	return out, nil
+}
+
+func openChannelStringValue(box *secret.Box, value any, strict bool, channelID int, field string) (any, error) {
+	str, ok := value.(string)
+	if !ok || !strings.HasPrefix(str, channelConfigCipherPrefix) {
+		return value, nil
+	}
+	if box == nil {
+		if strict {
+			return nil, errors.New("notification channel encryption key is unavailable")
+		}
+		return outbound.RedactedValue, nil
+	}
+	plaintext, err := box.Decrypt(strings.TrimPrefix(str, channelConfigCipherPrefix))
+	if err != nil {
+		if strict {
+			return nil, fmt.Errorf("decrypt notification channel %d field %q: %w", channelID, field, err)
+		}
+		slog.Warn("decrypt notification channel field failed", "channel_id", channelID, "field", field, "error", err)
+		return outbound.RedactedValue, nil
+	}
+	return plaintext, nil
 }
 
 func (s *Store) ProjectAlertConfig(ctx context.Context, projectID int) (ProjectAlertConfigView, error) {
@@ -244,7 +379,7 @@ func (s *Store) ProjectAlertConfig(ctx context.Context, projectID int) (ProjectA
 	if err != nil {
 		return ProjectAlertConfigView{}, err
 	}
-	return projectAlertConfigView(row), nil
+	return s.projectAlertConfigView(row)
 }
 
 func (s *Store) PutProjectAlertConfig(
@@ -283,10 +418,10 @@ func (s *Store) PutProjectAlertConfig(
 	if err != nil {
 		return ProjectAlertConfigView{}, err
 	}
-	return projectAlertConfigView(row), nil
+	return s.projectAlertConfigView(row)
 }
 
-func projectAlertConfigView(row *dbent.ProjectAlertConfig) ProjectAlertConfigView {
+func (s *Store) projectAlertConfigView(row *dbent.ProjectAlertConfig) (ProjectAlertConfigView, error) {
 	view := ProjectAlertConfigView{
 		ProjectID:                   row.ProjectID,
 		NewIssue:                    row.NewIssue,
@@ -296,10 +431,14 @@ func projectAlertConfigView(row *dbent.ProjectAlertConfig) ProjectAlertConfigVie
 		Channels:                    make([]NotificationChannelView, 0, len(row.Edges.Channels)),
 	}
 	for _, channel := range row.Edges.Channels {
+		channelView, err := s.notificationChannelView(channel, false)
+		if err != nil {
+			return ProjectAlertConfigView{}, err
+		}
 		view.ChannelIDs = append(view.ChannelIDs, channel.ID)
-		view.Channels = append(view.Channels, notificationChannelView(channel))
+		view.Channels = append(view.Channels, channelView)
 	}
-	return view
+	return view, nil
 }
 
 func (s *Store) ProjectAlertPolicy(
@@ -354,7 +493,11 @@ func (s *Store) StormNotificationChannels(
 	for _, rule := range rules {
 		for _, channel := range rule.Edges.Channels {
 			if channel.Enabled {
-				channels[channel.ID] = notificationChannelView(channel)
+				channelView, viewErr := s.notificationChannelView(channel, false)
+				if viewErr != nil {
+					return nil, ProjectInfo{}, viewErr
+				}
+				channels[channel.ID] = channelView
 			}
 		}
 	}

@@ -3,12 +3,15 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
 func TestProviderRequestConstructionAndResponseParsing(t *testing.T) {
@@ -119,6 +122,7 @@ func TestProviderRequestConstructionAndResponseParsing(t *testing.T) {
 					Model:     "configured-model",
 					MaxTokens: 77,
 					Timeout:   time.Second,
+					Client:    server.Client(),
 				},
 			)
 			if err != nil {
@@ -174,7 +178,14 @@ func TestProviderStreamingFraming(t *testing.T) {
 			}))
 			defer server.Close()
 			client, err := New(
-				Config{Provider: tc.provider, BaseURL: server.URL, Model: "test", MaxTokens: 20, Timeout: time.Second},
+				Config{
+					Provider:  tc.provider,
+					BaseURL:   server.URL,
+					Model:     "test",
+					MaxTokens: 20,
+					Timeout:   time.Second,
+					Client:    server.Client(),
+				},
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -255,6 +266,7 @@ func TestErrorNormalizationAndSecretRedaction(t *testing.T) {
 					Model:     "test",
 					MaxTokens: 20,
 					Timeout:   time.Second,
+					Client:    server.Client(),
 				},
 			)
 			_, err := client.Chat(context.Background(), ChatRequest{})
@@ -274,7 +286,14 @@ func TestTimeoutNormalization(t *testing.T) {
 	)
 	defer server.Close()
 	client, _ := New(
-		Config{Provider: "openai", BaseURL: server.URL, Model: "test", MaxTokens: 20, Timeout: 20 * time.Millisecond},
+		Config{
+			Provider:  "openai",
+			BaseURL:   server.URL,
+			Model:     "test",
+			MaxTokens: 20,
+			Timeout:   20 * time.Millisecond,
+			Client:    server.Client(),
+		},
 	)
 	_, err := client.Chat(context.Background(), ChatRequest{})
 	if !IsKind(err, ErrorTimeout) {
@@ -299,6 +318,7 @@ func TestSecretIsRedactedFromModelResponses(t *testing.T) {
 			Model:     "test",
 			MaxTokens: 20,
 			Timeout:   time.Second,
+			Client:    server.Client(),
 		},
 	)
 	response, err := client.Chat(context.Background(), ChatRequest{})
@@ -307,5 +327,140 @@ func TestSecretIsRedactedFromModelResponses(t *testing.T) {
 	}
 	if strings.Contains(response.Content, secret) || response.Content != "echo [REDACTED]" {
 		t.Fatalf("response was not redacted: %q", response.Content)
+	}
+}
+
+func TestProviderBlocksSSRFByDefault(t *testing.T) {
+	for _, baseURL := range []string{
+		"http://127.0.0.1:18428",
+		"http://169.254.169.254",
+		"http://10.0.0.1:8080",
+		"http://example.com:080",
+	} {
+		if _, err := New(Config{
+			Provider:  "openai",
+			BaseURL:   baseURL,
+			APIKey:    "sk-test",
+			Model:     "gpt-4o",
+			MaxTokens: 32,
+			Timeout:   time.Second,
+		}); err == nil {
+			t.Errorf("New(%q) succeeded, want SSRF/port validation error", baseURL)
+		}
+	}
+}
+
+func TestProviderBlocksRedirectsAndNeverLeaksAnthropicAPIKey(t *testing.T) {
+	var leakedKey string
+	var secondHit bool
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHit = true
+		leakedKey = r.Header.Get("x-api-key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer attacker.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	client, err := New(Config{
+		Provider:  "anthropic",
+		BaseURL:   redirector.URL,
+		APIKey:    "sk-ant-top-secret",
+		Model:     "claude-3-7-sonnet",
+		MaxTokens: 32,
+		Timeout:   time.Second,
+		Outbound:  outbound.Policy{AllowPrivate: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Chat(context.Background(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "ping"}},
+	})
+	if !errors.Is(err, outbound.ErrRedirectBlocked) {
+		t.Fatalf("err=%v want ErrRedirectBlocked", err)
+	}
+	if secondHit || leakedKey != "" {
+		t.Fatalf("redirect target hit=%v leakedKey=%q", secondHit, leakedKey)
+	}
+}
+
+func TestOpenAIReasoningModelParameters(t *testing.T) {
+	reasoningModels := []string{"o1", "o1-mini", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini", "openai/gpt-5.1"}
+	for _, model := range reasoningModels {
+		t.Run(model, func(t *testing.T) {
+			var captured map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+					t.Fatal(err)
+				}
+				_, _ = io.WriteString(
+					w,
+					`{"model":"`+model+`","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+				)
+			}))
+			defer srv.Close()
+
+			client, err := New(Config{
+				Provider:  "openai",
+				BaseURL:   srv.URL,
+				APIKey:    "sk-test",
+				Model:     model,
+				MaxTokens: 256,
+				Timeout:   time.Second,
+				Client:    srv.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Chat(context.Background(), ChatRequest{
+				Messages:    []Message{{Role: "user", Content: "hi"}},
+				Temperature: 0,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if captured["max_completion_tokens"] != float64(256) {
+				t.Fatalf("max_completion_tokens=%#v want 256", captured["max_completion_tokens"])
+			}
+			if _, hasMaxTokens := captured["max_tokens"]; hasMaxTokens {
+				t.Fatalf("reasoning model must not send max_tokens: %#v", captured)
+			}
+			if _, hasTemp := captured["temperature"]; hasTemp {
+				t.Fatalf("reasoning model must not send fixed temperature: %#v", captured)
+			}
+		})
+	}
+}
+
+func TestOllamaOmitsAuthorizationHeaderWhenKeyWhitespace(t *testing.T) {
+	var authHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader = r.Header.Get("Authorization")
+		_, _ = io.WriteString(w, `{"model":"llama3","message":{"role":"assistant","content":"pong"},"done":true}`)
+	}))
+	defer srv.Close()
+
+	client, err := New(Config{
+		Provider:  "ollama",
+		BaseURL:   srv.URL,
+		APIKey:    "   ",
+		Model:     "llama3",
+		MaxTokens: 32,
+		Timeout:   time.Second,
+		Client:    srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Chat(context.Background(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "ping"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if authHeader != "" {
+		t.Fatalf("unexpected Authorization header %q", authHeader)
 	}
 }

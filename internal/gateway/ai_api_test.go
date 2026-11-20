@@ -35,7 +35,7 @@ func TestAIStatusTestAndRBAC(t *testing.T) {
 	defer provider.Close()
 	client, err := ai.New(ai.Config{
 		Provider: "openai", BaseURL: provider.URL, APIKey: secret,
-		Model: "configured-model", MaxTokens: 1024, Timeout: time.Second,
+		Model: "configured-model", MaxTokens: 1024, Timeout: time.Second, Client: provider.Client(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -128,6 +128,7 @@ func TestAIKeyNeverAppearsInErrorResponseOrLogs(t *testing.T) {
 			Model:     "test",
 			MaxTokens: 20,
 			Timeout:   time.Second,
+			Client:    provider.Client(),
 		},
 	)
 	store := testStore(t)

@@ -3,15 +3,19 @@ package alert
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
 func TestOutboxWorkerRetriesThenDead(t *testing.T) {
@@ -52,8 +56,112 @@ func TestOutboxWorkerRetriesThenDead(t *testing.T) {
 	if item.Attempts != 2 || item.LastError == "" {
 		t.Fatalf("dead item attempts=%d last_error=%q", item.Attempts, item.LastError)
 	}
-	if got := requests.Load(); got != 6 {
-		t.Fatalf("HTTP attempts=%d want=6", got)
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("HTTP attempts=%d want=2 (no nested retries)", got)
+	}
+}
+
+type failingLimiter struct {
+	err error
+}
+
+func (f failingLimiter) Allow(_ context.Context, _ string, _ int, _ time.Duration) (bool, error) {
+	return false, f.err
+}
+
+func TestOutboxWorkerRateLimiterErrorConsumesAttemptsAndSanitizesError(t *testing.T) {
+	ctx := context.Background()
+	store := openOutboxTestStore(t)
+	project, err := store.CreateProject(ctx, "Alpha", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
+		Type: "dingtalk", Name: "limiter-fail",
+		Config: map[string]any{"url": "https://oapi.dingtalk.com/robot/send?access_token=ding-secret-token"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(Notification{Project: "alpha", Rule: "new_issue", Status: "firing"})
+	id, _, err := store.EnqueueNotification(ctx, meta.NotificationOutboxEnqueue{
+		IdempotencyKey: "limiter-fail-key", ProjectID: project.ID, ChannelID: channel.ID, Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := NewOutboxWorker(OutboxWorkerConfig{
+		Store:        store,
+		WorkerID:     "limiter-fail-worker",
+		PollInterval: 5 * time.Millisecond,
+		RetryBase:    time.Millisecond,
+		MaxAttempts:  2,
+		ClaimBatch:   1,
+		Limiter:      failingLimiter{err: errors.New("dial tcp 10.0.0.9:6379: redis password=redis-secret failed")},
+	})
+	worker.Start()
+	defer worker.Close()
+	worker.Wake()
+
+	item := waitOutboxStatus(t, store, id, "dead", 2*time.Second)
+	if item.Attempts != 2 {
+		t.Fatalf("attempts=%d want 2", item.Attempts)
+	}
+	if strings.Contains(item.LastError, "redis-secret") || strings.Contains(item.LastError, "10.0.0.9") {
+		t.Fatalf("last_error leaked limiter internals: %q", item.LastError)
+	}
+}
+
+func TestOutboxWorkerSanitizesWebhookSecretsInLastError(t *testing.T) {
+	ctx := context.Background()
+	store := openOutboxTestStore(t)
+	project, err := store.CreateProject(ctx, "Alpha", "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Closed local listener triggers a transport *url.Error carrying the full URL.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	channel, err := store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
+		Type: "dingtalk", Name: "secret-err",
+		Config: map[string]any{"url": "http://" + deadAddr + "/robot/send?access_token=ding-top-secret-xyz"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(Notification{Project: "alpha", Rule: "new_issue", Status: "firing"})
+	id, _, err := store.EnqueueNotification(ctx, meta.NotificationOutboxEnqueue{
+		IdempotencyKey: "secret-err-key", ProjectID: project.ID, ChannelID: channel.ID, Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := NewOutboxWorker(OutboxWorkerConfig{
+		Store:        store,
+		Sender:       &Sender{Outbound: outbound.Policy{AllowPrivate: true}, Timeout: 200 * time.Millisecond},
+		WorkerID:     "secret-err-worker",
+		PollInterval: 5 * time.Millisecond,
+		RetryBase:    time.Millisecond,
+		MaxAttempts:  1,
+		ClaimBatch:   1,
+	})
+	worker.Start()
+	defer worker.Close()
+	worker.Wake()
+
+	item := waitOutboxStatus(t, store, id, "dead", 2*time.Second)
+	if item.LastError == "" {
+		t.Fatal("expected non-empty last_error")
+	}
+	for _, forbidden := range []string{"ding-top-secret-xyz", deadAddr, "access_token"} {
+		if strings.Contains(item.LastError, forbidden) {
+			t.Fatalf("last_error leaked %q: %q", forbidden, item.LastError)
+		}
 	}
 }
 
@@ -124,16 +232,18 @@ func TestPlatformNotificationsUseOneOutboxItemAcrossReplicas(t *testing.T) {
 	services := []*Service{
 		NewService(
 			Config{
-				Store:  store,
-				Sender: &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
-				Outbox: OutboxWorkerConfig{WorkerID: "replica-a", PollInterval: 5 * time.Millisecond},
+				Store:          store,
+				OutboundPolicy: outbound.Policy{AllowPrivate: true},
+				Sender:         &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
+				Outbox:         OutboxWorkerConfig{WorkerID: "replica-a", PollInterval: 5 * time.Millisecond},
 			},
 		),
 		NewService(
 			Config{
-				Store:  store,
-				Sender: &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
-				Outbox: OutboxWorkerConfig{WorkerID: "replica-b", PollInterval: 5 * time.Millisecond},
+				Store:          store,
+				OutboundPolicy: outbound.Policy{AllowPrivate: true},
+				Sender:         &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
+				Outbox:         OutboxWorkerConfig{WorkerID: "replica-b", PollInterval: 5 * time.Millisecond},
 			},
 		),
 	}
