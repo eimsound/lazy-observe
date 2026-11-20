@@ -72,7 +72,7 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 ### release
 
 1. 打 tag 前，在 Renovate Dependency Dashboard 勾选重跑，确认 Victoria、Trivy 等手工固定点没有待合并的升级；有就先合并或明确放过。
-   版本是否落后只看这一步，`storage-bin-scan` 不查（ADR 0016）。依赖升级统一由 Renovate 提 PR（ADR 0015、`.agents/docs/plans/renovate.md`）；人工改 pin 时版本、sha 与 sha 行尾的 `# <tag>` 一起改。
+   版本是否落后只看这一步，`storage-bin-scan` 不查（ADR 0016）。依赖升级统一由 Renovate 提 PR（ADR 0015、`.agents/docs/plans/renovate.md`）；人工改 pin 时版本、sha 与 sha 行尾的 `# <tag>` 一起改（Trivy 没有行尾 `# <tag>`，Renovate 只改 `trivy_version`，两个 sha 由 agent 按 `.agents/docs/plans/renovate.md` 审查清单补）。
 2. 更新 `docs/version-matrix.md`（先矩阵、后发布），确认该提交的 CI 为绿，更新 `CHANGELOG.md`。
 3. 打 tag 属于「必须停下来等人」的动作：由负责人确认后再打。`release.yml` 的 `storage-bin-scan` 命中只警告，
    发版后看 run 的 step summary 里的警告表即可；扫描失败才会挡住出包。
@@ -236,6 +236,7 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
    合并被拒、报错含 ``without `workflow` scope``：PR 的 base 之后 `main` 上有别的提交改了 `.github/workflows/*`，
    本环境的 PAT 又没有 workflow scope。处理：`git fetch origin && git rebase origin/main`，重跑本地门禁，再按第 6 步的 1–3 换新分支、开新 PR、关旧 PR，
    回到第 5 步。PAT 的 scope 由负责人决定，不换别的 API 或令牌绕过。
+   Renovate 的 PR 不走上面的换分支：改了 `.github/workflows/*` 的 Renovate PR 合并前，先确认 base 是最新 `main`；落后就勾 PR 正文里的「rebase/retry」复选框，等 Renovate 重建分支、CI 变绿后再合并（#137 已实测可行；`rebaseWhen` 默认 auto 在本仓库等同 conflicted，没有冲突时不会自己 rebase。重建会丢掉 agent 补在分支上的提交，见 `.agents/docs/plans/renovate.md` 审查清单）。
 8. 合并后在 `base` 上确认一次 CI：`gh run list --workflow ci.yml --branch <base> --event push --limit 1 --json databaseId,headSha,status,conclusion` 的 `headSha` 应等于合并后的 tip；用 `gh run watch <id>` 等它结束，再用 `gh run view <id> --json jobs` 的失败 job 比对第 0 步基线。出现基线外的新失败 job 就停下、不要继续下一个切片，并在报告里写明是哪个 job。
 
 CI 是第二道门，不能替代本地门禁。本地没跑绿就推上去等 CI 算违规。

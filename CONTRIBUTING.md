@@ -181,7 +181,7 @@ outdated either. Dependency upgrades, including the hand-pinned points (Victoria
 images), come from Renovate (`.github/renovate.json`, ADR 0015), which waits 7 days after a release is published
 (`scripts/release-age.env`; registries that publish no timestamps are exempt, see ADR 0015). Before tagging a release, re-run Renovate from its Dependency Dashboard and
 confirm that no upgrade for a hand-pinned point is waiting to be merged. When bumping a pin by hand, change the version
-and every sha256 line together, including the trailing `# <tag>` marker Renovate uses to sync digests; Renovate does
+and every sha256 line together, including the trailing `# <tag>` marker Renovate uses to sync digests (Trivy has no marker: Renovate only bumps `trivy_version` there, and the two sha256 values are filled in from the release's `*_checksums.txt`, see `.agents/docs/plans/renovate.md`); Renovate does
 not run `gh release verify`, so review the diff of the first pin PR and the first Actions PR yourself
 (`.agents/docs/plans/renovate.md`).
 

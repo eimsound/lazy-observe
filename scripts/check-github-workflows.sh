@@ -248,7 +248,7 @@ if [[ -f $release_wf ]]; then
   done
   grep -Eq '^trivy_version=[0-9]+\.[0-9]+\.[0-9]+$' scripts/install-trivy.sh ||
     fail 'scripts/install-trivy.sh must pin trivy_version=X.Y.Z'
-  [[ $(grep -Ec '^[[:space:]]+sha256=[0-9a-f]{64}( # v[0-9][^[:space:]]*)?$' scripts/install-trivy.sh) -eq 2 ]] ||
+  [[ $(grep -Ec '^[[:space:]]+sha256=[0-9a-f]{64}$' scripts/install-trivy.sh) -eq 2 ]] ||
     fail 'scripts/install-trivy.sh must pin one sha256 per architecture (amd64, arm64)'
 
   # 发版附带的 digest 固定 Helm values 片段由 helm-values job 上传。最小权限：docker job 会把 GITHUB_TOKEN 当

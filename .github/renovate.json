@@ -47,7 +47,8 @@
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "internalChecksFilter": "strict",
   "postUpdateOptions": [
-    "gomodTidy"
+    "gomodTidy",
+    "gomodUpdateImportPaths"
   ],
   "vulnerabilityAlerts": {
     "enabled": true,
@@ -181,20 +182,6 @@
     },
     {
       "customType": "regex",
-      "description": "scripts/install-trivy.sh: 两个架构的 sha256",
-      "managerFilePatterns": [
-        "/^scripts/install-trivy\\.sh$/"
-      ],
-      "matchStrings": [
-        "sha256=(?<currentDigest>[0-9a-f]{64}) # (?<currentValue>v[0-9][^\\s]*)"
-      ],
-      "datasourceTemplate": "github-release-attachments",
-      "depNameTemplate": "aquasecurity/trivy",
-      "packageNameTemplate": "aquasecurity/trivy",
-      "versioningTemplate": "semver"
-    },
-    {
-      "customType": "regex",
       "description": "scripts/e2e-multi-replica.sh: ${LO_E2E_*_IMAGE:-name:tag@sha256:digest} 的默认镜像（VM 集群三件套、seaweedfs、valkey、postgres）",
       "managerFilePatterns": [
         "/^scripts/e2e-multi-replica\\.sh$/"
@@ -248,7 +235,7 @@
       "groupSlug": "mise-bootstrap"
     },
     {
-      "description": "Trivy：版本变量与两个 sha 同一 PR",
+      "description": "Trivy：只有版本变量一个依赖（sha256 由 agent 在 PR 里补，见 ADR 0015）",
       "matchManagers": [
         "custom.regex"
       ],
@@ -355,7 +342,8 @@
       ],
       "matchUpdateTypes": [
         "minor",
-        "patch"
+        "patch",
+        "digest"
       ],
       "groupName": "gomod minor-patch",
       "groupSlug": "gomod-minor-patch"
@@ -517,6 +505,21 @@
       "groupSlug": "mise-tools-minor-patch"
     },
     {
+      "description": "mise.toml 的 go 工具（go 1.26 → 1.27 是 minor）单独成 PR：工具链升级出问题不拖住 air、uv 等同组工具。必须排在 mise tools minor-patch 规则之后（后者会覆盖 groupName）。只限 mise manager：gomod 的 go 指令（depType golang）由上面的规则关掉，与这里无关",
+      "matchManagers": [
+        "mise"
+      ],
+      "matchDepNames": [
+        "go"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "mise go",
+      "groupSlug": "mise-go"
+    },
+    {
       "description": "pnpm 版本：mise.toml 与三个 package.json 的 packageManager 同一 PR。必须排在 npm 与 mise 的 minor-patch 规则之后，否则 mise.toml 里的 pnpm 被并进 mise tools 组",
       "matchPackageNames": [
         "pnpm"
@@ -529,7 +532,7 @@
       "groupSlug": "pnpm"
     },
     {
-      "description": "Quay、GCR 不返回 release 时间戳；Docker Hub 只能翻到前 1000 个标签（Renovate 请求 page_size=1000，Hub 每页只给 100 条，第 11 页起返回 403），标签超过 1000 的仓库（seaweedfs、postgres、debian、Victoria 集群镜像）整次查询回退成无时间戳；mise 的 go 后端 govulncheck 同样拿不到。默认的 timestamp-required 会让它们被无限期搁置，所以改为 timestamp-optional：有新版就开 PR，不受 7 天限制，也不设 dependencyDashboardApproval（ADR 0015「后果」）。每个依赖单独成 PR（不并入任何组）",
+      "description": "timestamp-optional 只是兜底：Quay（vm*）、GCR（distroless）、mise 的 go 后端（govulncheck）拿不到发布时间，默认的 timestamp-required 会让它们被无限期搁置，所以有新版就开 PR，不受 7 天限制，也不设 dependencyDashboardApproval（ADR 0015「后果」）。托管 Renovate 上实测 Docker Hub（seaweedfs、postgres 标签都超过 1000 个）能拿到时间戳、照样等满 7 天；本地 44.253.4 抓 Hub 标签时第 11 页起 403、回退成无时间戳，两者不一致，以托管环境为准，所以 seaweedfs、postgres、debian 留在名单里作兜底（拿得到时间戳时仍受 7 天限制）。每个依赖单独成 PR（不并入任何组）",
       "matchManagers": [
         "custom.regex",
         "mise",
