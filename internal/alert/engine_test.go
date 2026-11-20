@@ -58,6 +58,63 @@ func TestSilenceHitAndExpired(t *testing.T) {
 	if MatchLabels(map[string]string{"severity": "warning", "instance": "web-1"}, active.matchers) {
 		t.Fatal("non-matching labels were silenced")
 	}
+	// Regex matchers must be fully anchored as ^(?:...)$ per Alertmanager semantics.
+	if MatchLabels(map[string]string{"instance": "web-1"}, []Matcher{{Name: "instance", Op: "=~", Value: "web"}}) {
+		t.Fatal("unanchored regex unexpectedly matched substring")
+	}
+	if !MatchLabels(
+		map[string]string{"instance": "web-1"},
+		[]Matcher{{Name: "instance", Op: "=~", Value: "web-\\d+"}},
+	) {
+		t.Fatal("anchored full regex did not match")
+	}
+	if err := ValidateMatchers(nil); err == nil {
+		t.Fatal("empty matchers should fail validation")
+	}
+	if err := ValidateMatchers([]Matcher{{Name: "instance", Op: "=~", Value: "[unclosed"}}); err == nil {
+		t.Fatal("invalid regex matcher should fail validation")
+	}
+}
+
+func TestSilencedTransientAlertRemovedWhenSiblingDelivers(t *testing.T) {
+	got := make(chan Notification, 4)
+	e := NewEngine(EngineConfig{
+		GroupWait: 10 * time.Millisecond,
+		Silences: func(context.Context, string, time.Time) ([][]Matcher, error) {
+			return [][]Matcher{{{Name: "issue_id", Op: "=", Value: "silenced"}}}, nil
+		},
+		Notify: func(_ context.Context, n Notification) error { got <- n; return nil },
+	})
+	defer e.Close()
+	e.Add(context.Background(), "alpha", "new_issue", Alert{
+		Status: "firing", Labels: map[string]string{"issue_id": "silenced"}, Fingerprint: "a-silenced", Transient: true,
+	})
+	e.Add(context.Background(), "alpha", "new_issue", Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"issue_id": "delivered"},
+		Fingerprint: "b-delivered",
+		Transient:   true,
+	})
+	select {
+	case n := <-got:
+		if len(n.Alerts) != 1 || n.Alerts[0].Labels["issue_id"] != "delivered" {
+			t.Fatalf("unexpected notification: %#v", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notification timeout")
+	}
+	// Wait briefly for flush post-delivery cleanup to remove both transient alerts.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		e.mu.Lock()
+		_, exists := e.groups["alpha\x00new_issue"]
+		e.mu.Unlock()
+		if !exists {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("silenced transient alert leaked in group due to aliased slice filtering")
 }
 
 func TestResolvedIsImmediateAndCancelsPendingFiring(t *testing.T) {

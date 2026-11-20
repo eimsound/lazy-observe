@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -190,9 +189,11 @@ func toNotificationChannelResponse(value meta.NotificationChannelView) notificat
 		ID: strconv.Itoa(
 			value.ID,
 		),
-		Type:      value.Type,
-		Name:      value.Name,
-		Config:    anyMap(alert.RedactChannelConfig(value.Type, normalizeChannelConfig(value.Type, value.Config))),
+		Type: value.Type,
+		Name: value.Name,
+		Config: anyMap(
+			alert.RedactChannelConfig(value.Type, alert.NormalizeChannelConfig(value.Type, value.Config)),
+		),
 		Enabled:   value.Enabled,
 		CreatedAt: apiTime(value.CreatedAt),
 		UpdatedAt: apiTime(value.UpdatedAt),
@@ -282,6 +283,13 @@ func (g *Gateway) alertingUnavailable(c fiber.Ctx) bool {
 	return false
 }
 
+func alertAPIError(c fiber.Ctx, err error) error {
+	if errors.Is(err, alert.ErrInvalidInput) || errors.Is(err, alert.ErrInvalidChannelConfig) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(err)})
+	}
+	return apiError(c, err)
+}
+
 func (g *Gateway) listAlertRules(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
@@ -299,13 +307,15 @@ func (g *Gateway) createAlertRule(c fiber.Ctx) error {
 	var request alertRuleRequest
 	if c.Bind().Body(&request) != nil || strings.TrimSpace(request.Name) == "" ||
 		strings.TrimSpace(request.Expr) == "" ||
-		!validAlertSignal(request.Signal, true) {
+		!validAlertSignal(request.Signal, true) ||
+		(request.EvaluationEngine != "" && request.EvaluationEngine != "native") ||
+		(request.For != "" && alert.ValidateRuleFor(request.For) != nil) {
 		return badRequest(c)
 	}
 	in := request.input(projectSlug(c))
 	v, e := g.alerts.CreateRule(c.Context(), in)
 	if e != nil {
-		return apiError(c, e)
+		return alertAPIError(c, e)
 	}
 	return c.Status(fiber.StatusCreated).JSON(toAlertRuleResponse(v))
 }
@@ -318,13 +328,15 @@ func (g *Gateway) updateAlertRule(c fiber.Ctx) error {
 		return nil
 	}
 	var request alertRuleRequest
-	if c.Bind().Body(&request) != nil || !validAlertSignal(request.Signal, true) {
+	if c.Bind().Body(&request) != nil || !validAlertSignal(request.Signal, true) ||
+		(request.EvaluationEngine != "" && request.EvaluationEngine != "native") ||
+		(request.For != "" && alert.ValidateRuleFor(request.For) != nil) {
 		return badRequest(c)
 	}
 	in := request.input(projectSlug(c))
 	v, e := g.alerts.UpdateRule(c.Context(), id, in)
 	if e != nil {
-		return apiError(c, e)
+		return alertAPIError(c, e)
 	}
 	return c.JSON(toAlertRuleResponse(v))
 }
@@ -371,17 +383,14 @@ func (g *Gateway) createChannel(c fiber.Ctx) error {
 	if c.Bind().Body(&in) != nil || !validChannelType(in.Type) || strings.TrimSpace(in.Name) == "" {
 		return badRequest(c)
 	}
-	in.Type = normalizeChannelType(in.Type)
-	in.Config = normalizeChannelConfig(in.Type, in.Config)
+	in.Type = alert.NormalizeChannelType(in.Type)
+	in.Config = alert.NormalizeChannelConfig(in.Type, in.Config)
 	if in.Config == nil {
 		in.Config = map[string]any{}
 	}
 	v, e := g.alerts.CreateChannel(c.Context(), in)
 	if e != nil {
-		if errors.Is(e, alert.ErrInvalidChannelConfig) {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(e)})
-		}
-		return apiError(c, e)
+		return alertAPIError(c, e)
 	}
 	return c.Status(fiber.StatusCreated).JSON(toNotificationChannelResponse(v))
 }
@@ -397,14 +406,11 @@ func (g *Gateway) updateChannel(c fiber.Ctx) error {
 	if c.Bind().Body(&in) != nil || (in.Type != "" && !validChannelType(in.Type)) {
 		return badRequest(c)
 	}
-	in.Type = normalizeChannelType(in.Type)
-	in.Config = normalizeChannelConfig(in.Type, in.Config)
+	in.Type = alert.NormalizeChannelType(in.Type)
+	in.Config = alert.NormalizeChannelConfig(in.Type, in.Config)
 	v, e := g.alerts.UpdateChannel(c.Context(), id, in)
 	if e != nil {
-		if errors.Is(e, alert.ErrInvalidChannelConfig) {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(e)})
-		}
-		return apiError(c, e)
+		return alertAPIError(c, e)
 	}
 	return c.JSON(toNotificationChannelResponse(v))
 }
@@ -438,44 +444,11 @@ func (g *Gateway) testChannel(c fiber.Ctx) error {
 	return c.JSON(channelTestResponse{OK: true, Message: "test notification sent"})
 }
 func validChannelType(v string) bool {
-	switch normalizeChannelType(v) {
+	switch alert.NormalizeChannelType(v) {
 	case "webhook", "feishu", "dingtalk", "wecom", "smtp", "slack":
 		return true
 	}
 	return false
-}
-
-func normalizeChannelType(v string) string {
-	if v == "email" {
-		return "smtp"
-	}
-	return v
-}
-
-func normalizeChannelConfig(kind string, config map[string]any) map[string]any {
-	if config == nil {
-		return nil
-	}
-	if kind != "smtp" {
-		return config
-	}
-	out := make(map[string]any, len(config))
-	for key, value := range config {
-		out[key] = value
-	}
-	if _, ok := out["host"]; !ok {
-		if value, exists := out["smtp_host"]; exists {
-			out["host"] = value
-		}
-	}
-	if _, ok := out["port"]; !ok {
-		if value, exists := out["smtp_port"]; exists {
-			out["port"] = value
-		}
-	}
-	delete(out, "smtp_host")
-	delete(out, "smtp_port")
-	return out
 }
 
 func (g *Gateway) listSilences(c fiber.Ctx) error {
@@ -493,7 +466,8 @@ func (g *Gateway) createSilence(c fiber.Ctx) error {
 		return nil
 	}
 	var in alert.SilenceInput
-	if c.Bind().Body(&in) != nil || len(in.Matchers) == 0 || in.StartsAt.IsZero() || !in.EndsAt.After(in.StartsAt) {
+	if c.Bind().Body(&in) != nil || !validMatchers(in.Matchers) || in.StartsAt.IsZero() ||
+		!in.EndsAt.After(in.StartsAt) {
 		return badRequest(c)
 	}
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
@@ -501,7 +475,7 @@ func (g *Gateway) createSilence(c fiber.Ctx) error {
 	in.Project = projectSlug(c)
 	v, e := g.alerts.CreateSilence(c.Context(), in)
 	if e != nil {
-		return apiError(c, e)
+		return alertAPIError(c, e)
 	}
 	return c.Status(fiber.StatusCreated).JSON(toSilenceResponse(v))
 }
@@ -514,13 +488,13 @@ func (g *Gateway) updateSilence(c fiber.Ctx) error {
 		return nil
 	}
 	var in alert.SilenceInput
-	if c.Bind().Body(&in) != nil {
+	if c.Bind().Body(&in) != nil || (in.Matchers != nil && !validMatchers(in.Matchers)) {
 		return badRequest(c)
 	}
 	in.Project = projectSlug(c)
 	v, e := g.alerts.UpdateSilence(c.Context(), id, in)
 	if e != nil {
-		return apiError(c, e)
+		return alertAPIError(c, e)
 	}
 	return c.JSON(toSilenceResponse(v))
 }
@@ -582,30 +556,13 @@ func (g *Gateway) createInhibitionRule(c fiber.Ctx) error {
 	in.Project = projectSlug(c)
 	v, err := g.alerts.CreateInhibitionRule(c.Context(), in)
 	if err != nil {
-		return apiError(c, err)
+		return alertAPIError(c, err)
 	}
 	return c.Status(fiber.StatusCreated).JSON(v)
 }
 
 func validMatchers(matchers []alert.Matcher) bool {
-	if len(matchers) == 0 {
-		return false
-	}
-	for _, matcher := range matchers {
-		if strings.TrimSpace(matcher.Name) == "" {
-			return false
-		}
-		switch matcher.Op {
-		case "=":
-		case "=~":
-			if _, err := regexp.Compile(matcher.Value); err != nil {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
+	return alert.ValidateMatchers(matchers) == nil
 }
 
 func (g *Gateway) updateInhibitionRule(c fiber.Ctx) error {
@@ -624,7 +581,7 @@ func (g *Gateway) updateInhibitionRule(c fiber.Ctx) error {
 	in.Project = projectSlug(c)
 	v, err := g.alerts.UpdateInhibitionRule(c.Context(), id, in)
 	if err != nil {
-		return apiError(c, err)
+		return alertAPIError(c, err)
 	}
 	return c.JSON(v)
 }
