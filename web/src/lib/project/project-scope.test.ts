@@ -4,6 +4,7 @@ import { QueryClient } from "@tanstack/react-query";
 
 import {
   createProjectScope,
+  projectQueryKey,
   resolveProjectSelection,
   switchProjectQueries,
   type SlugStorage,
@@ -77,4 +78,20 @@ test("resolveProjectSelection defers rendering until a stale or missing project 
     resolvedSlug: "",
     changed: false,
   });
+});
+
+test("projectQueryKey preserves domain root at index 0 and isolates cache entries by project", () => {
+  const alphaKey = projectQueryKey("alpha", ["issues", "open", 1]);
+  const betaKey = projectQueryKey("beta", ["issues", "open", 1]);
+
+  assert.deepEqual(alphaKey, ["issues", "alpha", "open", 1]);
+  assert.deepEqual(betaKey, ["issues", "beta", "open", 1]);
+  assert.equal(alphaKey[0], "issues");
+  assert.notDeepEqual(alphaKey, betaKey);
+
+  const client = new QueryClient();
+  client.setQueryData(alphaKey, ["alpha-only"]);
+  client.setQueryData(betaKey, ["beta-only"]);
+  assert.deepEqual(client.getQueryData(alphaKey), ["alpha-only"]);
+  assert.deepEqual(client.getQueryData(betaKey), ["beta-only"]);
 });

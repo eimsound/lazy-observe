@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -26,6 +26,9 @@ import {
 import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { canManageIssues } from "@/lib/auth/permissions";
+import { useProject } from "@/lib/project/project-provider";
+import { projectQueryKey } from "@/lib/project/project-scope";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatErrorMessage } from "@/lib/api/errors";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import { PageContainer } from "@/components/layout/page";
@@ -40,6 +43,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 export function IssueDetailPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
+  const { currentSlug: project } = useProject();
   const canManage = canManageIssues(role);
   const navigate = useNavigate();
   const { issueId } = useParams({ strict: false }) as { issueId: string };
@@ -50,9 +54,9 @@ export function IssueDetailPage() {
   const [jsonOpen, setJsonOpen] = useState(false);
   const [statusError, setStatusError] = useState<string | null>(null);
 
-  const issueQuery = useQuery<IssueDetail, ApiError>({
+  const issueQuery = useProjectQuery<IssueDetail, ApiError>({
     queryKey: ["issue", issueId],
-    queryFn: ({ signal }) => getIssue(issueId, signal),
+    queryFn: ({ signal, project: activeProject }) => getIssue(issueId, signal, activeProject),
     retry: false,
   });
 
@@ -68,21 +72,22 @@ export function IssueDetailPage() {
     }
   }, [events, selectedEventId, search.event]);
 
-  const eventQuery = useQuery<ErrorEvent, ApiError>({
+  const eventQuery = useProjectQuery<ErrorEvent, ApiError>({
     queryKey: ["issue-event", issueId, selectedEventId],
     enabled: !!selectedEventId,
-    queryFn: ({ signal }) => getIssueEvent(issueId, selectedEventId!, signal),
+    queryFn: ({ signal, project: activeProject }) =>
+      getIssueEvent(issueId, selectedEventId!, signal, activeProject),
     retry: false,
   });
 
   const statusMutation = useMutation({
-    mutationFn: (next: IssueStatus) => updateIssueStatus(issueId, next),
+    mutationFn: (next: IssueStatus) => updateIssueStatus(issueId, next, project),
     onMutate: () => setStatusError(null),
     onSuccess: (updated) => {
-      queryClient.setQueryData<IssueDetail>(["issue", issueId], (old) =>
+      queryClient.setQueryData<IssueDetail>(projectQueryKey(project, ["issue", issueId]), (old) =>
         old ? { ...old, status: updated.status } : old,
       );
-      void queryClient.invalidateQueries({ queryKey: ["issues"] });
+      void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["issues"]) });
     },
     onError: (err) => setStatusError(formatErrorMessage(err, t("issues.statusUpdateError"))),
   });

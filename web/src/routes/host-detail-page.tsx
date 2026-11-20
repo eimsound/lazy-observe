@@ -1,10 +1,10 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useQueries, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { ArrowLeft, RefreshCw, Server } from "lucide-react";
 import { listHosts } from "@/lib/api/hosts";
 import { queryRange } from "@/lib/api/metrics";
+import { useProjectQueries, useProjectQuery } from "@/lib/project/use-project-query";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
 import { Badge } from "@/components/ui/badge";
@@ -76,10 +76,10 @@ function MetricPanel({
   window,
 }: MetricPanelDefinition & { instance: string; window: HostMetricWindow }) {
   const { t } = useTranslation();
-  const results = useQueries({
+  const results = useProjectQueries({
     queries: queries.map((query) => ({
-      queryKey: ["host-metric", instance, query, window.start, window.end, window.step],
-      queryFn: ({ signal }) => queryRange({ query, ...window }, signal),
+      queryKey: ["host-metric", instance, query, window.start, window.end, window.step] as const,
+      queryFn: ({ signal, project }) => queryRange({ query, ...window }, signal, project),
       retry: false,
       staleTime: 30_000,
     })),
@@ -120,7 +120,10 @@ export function HostDetailPage() {
     return { start: end - WINDOW_SECONDS, end, step: STEP_SECONDS };
   }, [nowMs]);
 
-  const hosts = useQuery({ queryKey: ["hosts"], queryFn: ({ signal }) => listHosts(signal) });
+  const hosts = useProjectQuery({
+    queryKey: ["hosts"],
+    queryFn: ({ signal, project }) => listHosts(signal, project),
+  });
   const host = hosts.data?.find((h) => h.instance === instance);
   const panels = useMemo(() => hostMetricPanels(instance), [instance]);
 

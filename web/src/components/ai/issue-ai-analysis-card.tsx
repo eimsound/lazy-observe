@@ -10,6 +10,9 @@ import {
 import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { canUseAi } from "@/lib/auth/permissions";
+import { useProject } from "@/lib/project/project-provider";
+import { projectQueryKey } from "@/lib/project/project-scope";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatRelativeTime } from "@/lib/format";
 import { ConfidenceBadge } from "@/components/ai/confidence-badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -30,6 +33,7 @@ import {
 export function IssueAiAnalysisCard({ issueId }: { issueId: string }) {
   const { t } = useTranslation();
   const { role } = useAuth();
+  const { currentSlug: project } = useProject();
   const queryClient = useQueryClient();
 
   const statusQuery = useQuery({
@@ -38,15 +42,16 @@ export function IssueAiAnalysisCard({ issueId }: { issueId: string }) {
     staleTime: 10_000,
   });
 
-  const analysisQuery = useQuery<IssueAiAnalysis | null, ApiError>({
+  const analysisQuery = useProjectQuery<IssueAiAnalysis | null, ApiError>({
     queryKey: ["issue-ai", issueId],
-    queryFn: ({ signal }) => getIssueAiAnalysis(issueId, signal),
+    queryFn: ({ signal, project: activeProject }) =>
+      getIssueAiAnalysis(issueId, signal, activeProject),
     retry: false,
   });
 
   const generate = useMutation({
-    mutationFn: (refresh: boolean) => generateIssueAiAnalysis(issueId, refresh),
-    onSuccess: (data) => queryClient.setQueryData(["issue-ai", issueId], data),
+    mutationFn: (refresh: boolean) => generateIssueAiAnalysis(issueId, refresh, project),
+    onSuccess: (data) => queryClient.setQueryData(projectQueryKey(project, ["issue-ai", issueId]), data),
   });
 
   const aiEnabled = statusQuery.data?.enabled ?? true;

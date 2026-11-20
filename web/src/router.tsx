@@ -7,10 +7,8 @@ import {
 import { AppLayout } from "@/components/layout/app-layout";
 import { lazyRouteComponent } from "@/components/router/lazy-route";
 import { parseTraceSearchURL } from "@/routes/traces-search";
-import {
-  parseMetricsEvidenceSearch,
-  parseProfilingEvidenceSearch,
-} from "@/routes/trace-evidence-links";
+import { parseMetricsSearch } from "@/routes/metrics-search";
+import { parseProfilingEvidenceSearch } from "@/routes/trace-evidence-links";
 
 const LoginPage = lazyRouteComponent(() => import("@/routes/login-page"), "LoginPage");
 const ChangePasswordPage = lazyRouteComponent(
@@ -191,7 +189,7 @@ const overviewRoute = createRoute({
 const metricsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/metrics",
-  validateSearch: parseMetricsEvidenceSearch,
+  validateSearch: parseMetricsSearch,
   component: MetricsPage,
 });
 

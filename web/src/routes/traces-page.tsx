@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
+import { type UseQueryResult } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -27,6 +27,8 @@ import {
 } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useRouterLocationSync } from "@/lib/router-url-sync";
 import { ApiError } from "@/lib/api/client";
 import { formatDateTime, formatDurationMicros } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -60,6 +62,7 @@ export function TracesPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { currentSlug: project } = useProject();
+  const { routeLocation, recordSelfAuthored, classifyLocationChange } = useRouterLocationSync();
   const previousProject = useRef(project);
   const routeSearch = useSearch({ strict: false }) as TraceSearchURL;
   const {
@@ -92,10 +95,15 @@ export function TracesPage() {
     setMinDuration("");
     setTags("");
     setExecuted(null);
+    recordSelfAuthored("/traces");
     void navigate({ to: "/traces", search: {}, replace: true });
-  }, [project, navigate]);
+  }, [project, navigate, recordSelfAuthored]);
 
+  // Only resync form drafts and executed state on genuine external navigations
+  // (deep links, browser Back/Forward), never clobbering local drafts after a
+  // self-authored search submission.
   useEffect(() => {
+    if (classifyLocationChange(routeLocation) === "self") return;
     setExecuted(urlSearch);
     if (!urlSearch) return;
     setService(urlSearch.service);
@@ -103,11 +111,11 @@ export function TracesPage() {
     setMinDuration(urlSearch.minDuration ?? "");
     setLimit(urlSearch.limit);
     setTags(urlSearch.tags ?? "");
-  }, [urlSearch]);
+  }, [routeLocation, urlSearch, classifyLocationChange]);
 
-  const servicesQuery = useQuery<string[], ApiError>({
-    queryKey: ["trace-services", project],
-    queryFn: ({ signal }) => getServices(signal, project),
+  const servicesQuery = useProjectQuery<string[], ApiError>({
+    queryKey: ["trace-services"],
+    queryFn: ({ signal, project: activeProject }) => getServices(signal, activeProject),
     retry: false,
   });
 
@@ -118,10 +126,10 @@ export function TracesPage() {
     }
   }, [service, servicesQuery.data]);
 
-  const operationsQuery = useQuery<string[], ApiError>({
-    queryKey: ["trace-operations", project, service],
+  const operationsQuery = useProjectQuery<string[], ApiError>({
+    queryKey: ["trace-operations", service],
     enabled: !!service,
-    queryFn: ({ signal }) => getOperations(service, signal, project),
+    queryFn: ({ signal, project: activeProject }) => getOperations(service, signal, activeProject),
     retry: false,
   });
   const serviceOptions = useMemo(
@@ -153,16 +161,20 @@ export function TracesPage() {
       limit,
       tags: tags.trim() || undefined,
     };
+    const nextSearch = traceSearchToURL(params);
+    const nextQuery = new URLSearchParams(
+      Object.entries(nextSearch).map(([key, value]) => [key, String(value)]),
+    ).toString();
+    recordSelfAuthored(nextQuery ? `/traces?${nextQuery}` : "/traces");
     setExecuted(params);
-    void navigate({ to: "/traces", search: traceSearchToURL(params) });
+    void navigate({ to: "/traces", search: nextSearch });
   }
 
   const minDurationValid = !minDuration.trim() || durationMicros(minDuration) !== null;
 
-  const searchQuery = useQuery<JaegerTrace[], ApiError>({
+  const searchQuery = useProjectQuery<JaegerTrace[], ApiError>({
     queryKey: [
       "trace-search",
-      project,
       executed?.service,
       executed?.operation,
       executed?.start,
@@ -174,7 +186,7 @@ export function TracesPage() {
     enabled: executed !== null,
     retry: false,
     placeholderData: (previous) => previous,
-    queryFn: ({ signal }) => searchTraces(executed!, signal, project),
+    queryFn: ({ signal, project: activeProject }) => searchTraces(executed!, signal, activeProject),
   });
 
   const summaries = useMemo<TraceSummary[]>(
@@ -342,7 +354,7 @@ function TraceSearchResults({
   onOpen,
 }: {
   executed: TraceSearchParams | null;
-  query: ReturnType<typeof useQuery<JaegerTrace[], ApiError>>;
+  query: UseQueryResult<JaegerTrace[], ApiError>;
   summaries: TraceSummary[];
   maxDuration: number;
   onRetry: () => void;

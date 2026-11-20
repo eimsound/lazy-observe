@@ -10,8 +10,11 @@ import {
   normalizeFieldValuesResponse,
   normalizeHits,
   normalizeHitsSeries,
+  normalizeQueryTimeRange,
   normalizeStatsQueryRange,
   parseJsonLines,
+  parseLogsTimestamp,
+  parseNdjsonStream,
 } from "./logs-contract.ts";
 
 test("parses and normalizes JSON-lines while preserving the original fields", () => {
@@ -165,4 +168,65 @@ test("builds grouped regular and stream extra-filter expressions safely", () => 
       '{app=~"api.*"}',
     ],
   });
+});
+
+test("parseLogsTimestamp, normalizeQueryTimeRange, legacy flat hits, and stats error envelopes", () => {
+  assert.equal(parseLogsTimestamp("2026-07-24T10:00:00Z").ms, 1784887200000);
+  assert.equal(parseLogsTimestamp(1753351200).ms, 1753351200000);
+  assert.equal(parseLogsTimestamp(1753351200000).ms, 1753351200000);
+  assert.equal(parseLogsTimestamp(1753351200000000000).ms, 1753351200000);
+  assert.equal(parseLogsTimestamp("not-a-date").ms, 0);
+
+  assert.deepEqual(
+    normalizeQueryTimeRange({
+      start: "2026-07-24T09:00:00Z",
+      end: "2026-07-24T10:00:00Z",
+      hasTimeFilter: true,
+    }),
+    { start: "2026-07-24T09:00:00Z", end: "2026-07-24T10:00:00Z", hasTimeFilter: true },
+  );
+  assert.deepEqual(normalizeQueryTimeRange(null), { start: "", end: "", hasTimeFilter: false });
+
+  assert.deepEqual(
+    normalizeHits({
+      timestamps: ["2026-07-24T10:01:00Z", "2026-07-24T10:00:00Z"],
+      values: [9, 4],
+    }),
+    { timestamps: [1784887200000, 1784887260000], values: [4, 9] },
+  );
+
+  assert.deepEqual(
+    normalizeStatsQueryRange({
+      status: "error",
+      errorType: "bad_data",
+      error: "missing stats pipe",
+    }),
+    {
+      status: "error",
+      data: { resultType: "matrix", result: [] },
+      error: "missing stats pipe",
+      errorType: "bad_data",
+    },
+  );
+});
+
+test("parseNdjsonStream yields records incrementally and stops promptly on AbortSignal", async () => {
+  const encoder = new TextEncoder();
+  const controller = new AbortController();
+  const stream = new ReadableStream<Uint8Array>({
+    start(ctrl) {
+      ctrl.enqueue(encoder.encode('{"_msg":"first"}\n{"_msg":"sec'));
+      ctrl.enqueue(encoder.encode('ond"}\n{"_msg":"third"}\n'));
+      ctrl.close();
+    },
+  });
+
+  const received: string[] = [];
+  for await (const item of parseNdjsonStream<{ _msg: string }>(stream, {
+    signal: controller.signal,
+  })) {
+    received.push(item._msg);
+    if (received.length === 2) controller.abort();
+  }
+  assert.deepEqual(received, ["first", "second"]);
 });

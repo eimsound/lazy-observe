@@ -13,6 +13,7 @@ const SESSION_EXPIRED_CODES = new Set([
 const SENSITIVE_EXACT_KEYS = new Set([
   PROJECT_STORAGE_KEY,
   "lo-assistant-history",
+  "lo-mock-session",
 ]);
 
 const SENSITIVE_KEY_PREFIXES = [
@@ -89,13 +90,24 @@ export function isSessionExpired(error: unknown): boolean {
 
 /**
  * True when the backend reports that the selected project no longer exists
- * (HTTP 404 `project_not_found`). Instead of signing the user out, refresh the
- * project list so ProjectProvider can fall back to an active project.
+ * (HTTP 404 `project_not_found`, or current gateway's uncoded 404
+ * `"project not found"`). Instead of signing the user out, refresh the project
+ * list so ProjectProvider can fall back to an active project.
  */
 export function isProjectNotFoundError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
-  const { status, code } = error as { status?: unknown; code?: unknown };
-  return status === 404 && code === "project_not_found";
+  const { status, code, message } = error as {
+    status?: unknown;
+    code?: unknown;
+    message?: unknown;
+  };
+  if (status !== 404) return false;
+  if (code === "project_not_found") return true;
+  return (
+    (code === undefined || code === null || code === "") &&
+    typeof message === "string" &&
+    message.trim().toLowerCase() === "project not found"
+  );
 }
 
 /**

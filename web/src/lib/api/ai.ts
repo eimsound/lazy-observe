@@ -1,73 +1,55 @@
 import { apiGet, apiSend, ApiError, IS_MOCK, API_ROOT } from "./client";
 import {
+  AI_CONFIDENCES,
   buildAssistantQueryPayload,
+  normalizeAiSettings,
+  normalizeAiStatus,
+  normalizeAiTestResult,
   normalizeAssistantAnswer,
+  normalizeAssistantExplain,
+  normalizeIssueAiAnalysis,
+  type AiConfidence,
+  type AiSettings,
+  type AiSettingsUpdate,
   type AiSignal,
+  type AiStatus,
+  type AiTestResult,
   type AssistantAnswer,
   type AssistantQueryRequest,
-  type AssistantQueryWire,
   type AssistantResult,
   type AssistantTimeRange,
+  type IssueAiAnalysis,
+  type ProbableCause,
 } from "./ai-contract";
 
 // Mock data is only for VITE_MOCK builds; load it lazily so it never ships with real chunks.
 const loadMockAi = () => import("./mock-ai");
 
+export { AI_CONFIDENCES };
 export type {
+  AiConfidence,
+  AiSettings,
+  AiSettingsUpdate,
   AiSignal,
+  AiStatus,
+  AiTestResult,
   AssistantAnswer,
   AssistantQueryRequest,
   AssistantResult,
   AssistantTimeRange,
+  IssueAiAnalysis,
+  ProbableCause,
 };
 
 /**
  * AI features API. All endpoints live under /api (platform scope, not /api/v1):
  *   GET  /api/ai/status                       -> { enabled, provider, model }
- *   POST /api/ai/test           (admin)       -> { latency_ms, echo }   (409 when disabled)
+ *   POST /api/ai/test           (admin)       -> { latency_ms, model?, echo } (409 when disabled)
  *   POST /api/ai/assistant/query              -> generated query + explanation + inline result
  *   POST /api/ai/assistant/explain            -> { explanation }
  *   GET  /api/issues/:id/ai-analysis          -> analysis | 404 (not generated)
  *   POST /api/issues/:id/ai-analysis[?refresh]-> generate + return analysis
- *
- * The raw backend result for an assistant query is isomorphic to the
- * /query_range (Prometheus) or logs contract; this domain layer normalizes both
- * into the same `AssistantResult` union the panel renders, so the UI never has
- * to branch on the wire shape. VITE_MOCK serves a deterministic offline store.
  */
-
-export interface AiStatus {
-  enabled: boolean;
-  /** Provider name (never a key). Empty when disabled/unconfigured. */
-  provider: string;
-  /** Model id. Empty when disabled/unconfigured. */
-  model: string;
-}
-
-/** Full admin view of the persisted AI configuration. The key is never
- *  returned; `has_api_key` reports whether one is stored. */
-export interface AiSettings {
-  enabled: boolean;
-  provider: string;
-  base_url: string;
-  model: string;
-  max_tokens: number;
-  has_api_key: boolean;
-  source: string;
-  updated_by: string;
-}
-
-/** Admin write model. Absent fields keep their stored values; an absent or
- *  empty `api_key` keeps the stored key; `clear_api_key` removes it. */
-export interface AiSettingsUpdate {
-  enabled?: boolean;
-  provider?: string;
-  base_url?: string;
-  model?: string;
-  api_key?: string;
-  max_tokens?: number;
-  clear_api_key?: boolean;
-}
 
 /** Providers the admin UI offers; each has a default base URL. */
 export const AI_PROVIDERS: { id: string; label: string; defaultBaseUrl: string }[] = [
@@ -81,31 +63,28 @@ export function providerDefaultBaseUrl(provider: string): string {
   return AI_PROVIDERS.find((p) => p.id === provider)?.defaultBaseUrl ?? "";
 }
 
-export interface AiTestResult {
-  latency_ms: number;
-  echo: string;
-}
-
 export async function getAiStatus(signal?: AbortSignal): Promise<AiStatus> {
   if (IS_MOCK) return (await loadMockAi()).mockAiStatus();
-  return apiGet<AiStatus>("/ai/status", { base: API_ROOT, signal });
+  return normalizeAiStatus(await apiGet<unknown>("/ai/status", { base: API_ROOT, signal }));
 }
 
 export async function testAi(): Promise<AiTestResult> {
   if (IS_MOCK) return (await loadMockAi()).mockAiTest();
-  return apiSend<AiTestResult>("POST", "/ai/test", undefined, { base: API_ROOT });
+  return normalizeAiTestResult(
+    await apiSend<unknown>("POST", "/ai/test", undefined, { base: API_ROOT }),
+  );
 }
 
 /** Admin: read the persisted AI configuration (never includes the key). */
 export async function getAiSettings(signal?: AbortSignal): Promise<AiSettings> {
   if (IS_MOCK) return (await loadMockAi()).mockAiSettingsGet();
-  return apiGet<AiSettings>("/ai/settings", { base: API_ROOT, signal });
+  return normalizeAiSettings(await apiGet<unknown>("/ai/settings", { base: API_ROOT, signal }));
 }
 
 /** Admin: save the AI configuration; the provider client hot-swaps server-side. */
 export async function updateAiSettings(req: AiSettingsUpdate): Promise<AiSettings> {
   if (IS_MOCK) return (await loadMockAi()).mockAiSettingsPut(req);
-  return apiSend<AiSettings>("PUT", "/ai/settings", req, { base: API_ROOT });
+  return normalizeAiSettings(await apiSend<unknown>("PUT", "/ai/settings", req, { base: API_ROOT }));
 }
 
 export async function assistantQuery(
@@ -115,7 +94,7 @@ export async function assistantQuery(
 ): Promise<AssistantAnswer> {
   if (IS_MOCK) return (await loadMockAi()).mockAssistantQuery(req);
   const payload = buildAssistantQueryPayload(req);
-  const wire = await apiSend<AssistantQueryWire>(
+  const wire = await apiSend<unknown>(
     "POST",
     "/ai/assistant/query",
     payload,
@@ -129,46 +108,27 @@ export async function assistantExplain(
   project?: string,
 ): Promise<{ explanation: string }> {
   if (IS_MOCK) return (await loadMockAi()).mockAssistantExplain(req);
-  return apiSend<{ explanation: string }>("POST", "/ai/assistant/explain", req, {
-    base: API_ROOT,
-    project,
-  });
-}
-
-// ---- Issue AI analysis ----------------------------------------------------
-
-export type AiConfidence = "high" | "medium" | "low";
-export const AI_CONFIDENCES: AiConfidence[] = ["high", "medium", "low"];
-
-export interface ProbableCause {
-  cause: string;
-  confidence: AiConfidence;
-  evidence: string;
-}
-
-export interface IssueAiAnalysis {
-  summary: string;
-  probable_causes: ProbableCause[];
-  suggested_actions: string[];
-  /** True when served from a stored analysis (not freshly generated). */
-  cached: boolean;
-  /** True when newer events arrived after the analysis was produced. */
-  stale: boolean;
-  /** Epoch ms the analysis was generated at. */
-  ai_analysis_at: number;
+  return normalizeAssistantExplain(
+    await apiSend<unknown>("POST", "/ai/assistant/explain", req, {
+      base: API_ROOT,
+      project,
+    }),
+  );
 }
 
 /** Returns the stored analysis, or null (HTTP 404) when none has been generated. */
 export async function getIssueAiAnalysis(
   id: string,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<IssueAiAnalysis | null> {
   if (IS_MOCK) return (await loadMockAi()).mockGetIssueAnalysis(id);
   try {
-    return await apiGet<IssueAiAnalysis>(
+    const raw = await apiGet<unknown>(
       `/issues/${encodeURIComponent(id)}/ai-analysis`,
-      { base: API_ROOT, signal },
+      { base: API_ROOT, signal, project },
     );
+    return normalizeIssueAiAnalysis(raw);
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return null;
     throw e;
@@ -178,12 +138,14 @@ export async function getIssueAiAnalysis(
 export async function generateIssueAiAnalysis(
   id: string,
   refresh = false,
+  project?: string,
 ): Promise<IssueAiAnalysis> {
   if (IS_MOCK) return (await loadMockAi()).mockGenerateIssueAnalysis(id, refresh);
-  return apiSend<IssueAiAnalysis>(
+  const raw = await apiSend<unknown>(
     "POST",
     `/issues/${encodeURIComponent(id)}/ai-analysis`,
     undefined,
-    { base: API_ROOT, params: refresh ? { refresh: "1" } : undefined },
+    { base: API_ROOT, params: refresh ? { refresh: "1" } : undefined, project },
   );
+  return normalizeIssueAiAnalysis(raw);
 }

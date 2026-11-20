@@ -7,11 +7,9 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { assistantQuery, type AiSignal } from "@/lib/api/ai";
 import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { handleSessionExpiry } from "@/lib/auth/session-expiry";
 import { useProject } from "@/lib/project/project-provider";
 import dayjs from "@/lib/dayjs";
 import {
@@ -48,7 +46,6 @@ interface ScopedTurnsState {
 }
 
 export function AssistantProvider({ children }: { children: ReactNode }) {
-  const queryClient = useQueryClient();
   const { user } = useAuth();
   const { currentSlug } = useProject();
   const scopeKey = assistantHistoryKey(user, currentSlug);
@@ -142,7 +139,6 @@ export function AssistantProvider({ children }: { children: ReactNode }) {
           ) {
             return;
           }
-          handleSessionExpiry(queryClient, e);
           const status = e instanceof ApiError ? e.status : 0;
           const message = e instanceof Error ? e.message : String(e);
           patchTurn(requestScope, id, { status: "error", errorStatus: status, errorMessage: message });
@@ -153,7 +149,7 @@ export function AssistantProvider({ children }: { children: ReactNode }) {
           }
         });
     },
-    [currentSlug, patchTurn, queryClient],
+    [currentSlug, patchTurn],
   );
 
   const clear = useCallback(() => {

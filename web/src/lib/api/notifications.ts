@@ -33,6 +33,7 @@ export interface NotificationQuery {
 export async function listNotifications(
   query: NotificationQuery = {},
   signal?: AbortSignal,
+  project?: string,
 ): Promise<NotificationItem[]> {
   const params: Record<string, string | number | undefined> = {
     status: query.status,
@@ -40,9 +41,9 @@ export async function listNotifications(
     before_id: query.before_id,
     limit: query.limit ?? 100,
   };
-  return apiGet<NotificationItem[]>("/notifications", { base: API_ROOT, params, signal });
+  return apiGet<NotificationItem[]>("/notifications", { base: API_ROOT, params, signal, project });
 }
 
-export async function retryNotification(id: number): Promise<void> {
-  await apiSend<void>("POST", `/notifications/${id}/retry`, undefined, { base: API_ROOT });
+export async function retryNotification(id: number, project?: string): Promise<void> {
+  await apiSend<void>("POST", `/notifications/${id}/retry`, undefined, { base: API_ROOT, project });
 }

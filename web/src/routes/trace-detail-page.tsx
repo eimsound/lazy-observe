@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { AlertCircle, ArrowLeft, BarChart3, Flame, Loader2 } from "lucide-react";
 import {
@@ -12,6 +11,7 @@ import {
 import { buildTree, maxDepth } from "@/lib/trace-tree";
 import { ApiError } from "@/lib/api/client";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDurationMicros } from "@/lib/format";
 import { PageContainer } from "@/components/layout/page";
 import { TraceWaterfall } from "@/components/traces/trace-waterfall";
@@ -36,9 +36,9 @@ export function TraceDetailPage() {
     setDrawerOpen(false);
   }, [project, traceID]);
 
-  const traceQuery = useQuery<JaegerTrace, ApiError>({
-    queryKey: ["trace", project, traceID],
-    queryFn: ({ signal }) => getTrace(traceID, signal, project),
+  const traceQuery = useProjectQuery<JaegerTrace, ApiError>({
+    queryKey: ["trace", traceID],
+    queryFn: ({ signal, project: activeProject }) => getTrace(traceID, signal, activeProject),
     retry: false,
   });
 

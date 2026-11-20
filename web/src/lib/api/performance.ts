@@ -126,11 +126,12 @@ export async function queryVitalSeries(
   page: string | undefined,
   window: PerfWindow,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<TimeSeries[]> {
   if (IS_MOCK) return (await loadMockPerformance()).mockVitalSeries(key, page, window);
   const m = vitalByKey(key);
   const query = page ? `${m.metric}{page=${JSON.stringify(page)}}` : m.metric;
-  return queryRange({ query, start: window.start, end: window.end, step: window.step }, signal);
+  return queryRange({ query, start: window.start, end: window.end, step: window.step }, signal, project);
 }
 
 export interface PageVitals {
@@ -144,6 +145,7 @@ const VITAL_SERIES_SELECTOR = `{__name__=~"web_vitals_(lcp|inp|cls|ttfb|fcp)"}`;
 export async function getVitalPages(
   window: PerfWindow,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<string[]> {
   if (IS_MOCK) return (await loadMockPerformance()).mockVitalPages(window, signal);
   return requestVitalPages(
@@ -155,6 +157,7 @@ export async function getVitalPages(
           end: window.end,
         },
         signal: requestSignal,
+        project,
       }),
     signal,
   );
@@ -164,6 +167,7 @@ export async function getVitalPages(
 export async function getVitalsByPage(
   window: PerfWindow,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<PageVitals[]> {
   if (IS_MOCK) return (await loadMockPerformance()).mockVitalsByPage(window);
 
@@ -173,6 +177,7 @@ export async function getVitalsByPage(
       const series = await queryRange(
         { query: m.metric, start: window.start, end: window.end, step: window.step },
         signal,
+        project,
       );
       return { key: m.key, series };
     }),
@@ -198,6 +203,7 @@ export type { EndpointPoint, EndpointStat, EndpointStatsResult } from "./perform
 export async function getEndpointStats(
   window: PerfWindow,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<EndpointStatsResult> {
   if (IS_MOCK) return (await loadMockPerformance()).mockEndpointStats(window);
   const response = await apiGet<unknown>("/performance/endpoints", {
@@ -207,6 +213,7 @@ export async function getEndpointStats(
       step: window.step,
     },
     signal,
+    project,
   });
   return normalizeEndpointStatsResponse(response);
 }

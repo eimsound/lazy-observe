@@ -45,6 +45,7 @@ test("a bare 401 or explicit session-expiry code signs out and clears user/proje
   const client = signedInClient();
   const storage = memoryStorage({
     "lo-project": "deleted-project",
+    "lo-mock-session": '{"username":"alice","role":"admin"}',
     "lo-assistant-history": '[{"id":"legacy"}]',
     "lo-assistant-history:u%3Aalice:alpha": '[{"id":"scoped"}]',
     "lo-logs-explorer-history:alpha": '[{"query":"secret"}]',
@@ -53,13 +54,21 @@ test("a bare 401 or explicit session-expiry code signs out and clears user/proje
     "lo-theme": "dark",
   });
   let scopeCleared = false;
-  const unregister = registerLocalSignOutCleanup(() => {
+  let secondCleanupRan = false;
+  const unregisterThrowing = registerLocalSignOutCleanup(() => {
+    throw new Error("cleanup boom");
+  });
+  const unregisterFirst = registerLocalSignOutCleanup(() => {
     scopeCleared = true;
+  });
+  const unregisterSecond = registerLocalSignOutCleanup(() => {
+    secondCleanupRan = true;
   });
 
   try {
     handleSessionExpiry(client, { status: 401 }, storage);
     assert.equal(scopeCleared, true);
+    assert.equal(secondCleanupRan, true);
     assert.equal(client.getQueryData(AUTH_QUERY_KEY), null);
     assert.equal(client.getQueryData(["issues"]), undefined);
     assert.equal(client.getQueryData(PROJECTS_QUERY_KEY), undefined);
@@ -70,8 +79,11 @@ test("a bare 401 or explicit session-expiry code signs out and clears user/proje
 
     assert.equal(isSessionExpired({ status: 401, code: "session_expired" }), true);
     assert.equal(isSessionExpired({ status: 401, code: "unauthorized" }), true);
+    assert.equal(isSessionExpired({ status: 401, code: "unauthenticated" }), true);
   } finally {
-    unregister();
+    unregisterThrowing();
+    unregisterFirst();
+    unregisterSecond();
   }
 });
 
@@ -82,16 +94,25 @@ test("coded business 401s, 403s, and 404 project_not_found do not sign the user 
   handleSessionExpiry(client, { status: 401, code: "invalid_current_password" }, storage);
   handleSessionExpiry(client, { status: 401, code: "project_not_found" }, storage);
   handleSessionExpiry(client, { status: 403 }, storage);
+  handleSessionExpiry(client, { status: 404, message: "AI analysis not found" }, storage);
   handleSessionExpiry(client, new Error("network"), storage);
 
   assert.deepEqual(client.getQueryData(AUTH_QUERY_KEY), { username: "previous-user" });
   assert.deepEqual(client.getQueryData(["issues"]), ["private issue"]);
   assert.deepEqual(storage.snapshot(), { "lo-project": "alpha" });
+  assert.equal(client.getQueryState(PROJECTS_QUERY_KEY)?.isInvalidated, false);
 
   assert.equal(isProjectNotFoundError({ status: 404, code: "project_not_found" }), true);
+  assert.equal(isProjectNotFoundError({ status: 404, message: "project not found" }), true);
+  assert.equal(isProjectNotFoundError({ status: 404, message: "AI analysis not found" }), false);
   handleSessionExpiry(client, { status: 404, code: "project_not_found" }, storage);
   assert.deepEqual(client.getQueryData(AUTH_QUERY_KEY), { username: "previous-user" });
   assert.equal(client.getQueryState(PROJECTS_QUERY_KEY)?.isInvalidated, true);
+
+  const clientUncoded = signedInClient();
+  handleSessionExpiry(clientUncoded, { status: 404, message: "project not found" }, storage);
+  assert.deepEqual(clientUncoded.getQueryData(AUTH_QUERY_KEY), { username: "previous-user" });
+  assert.equal(clientUncoded.getQueryState(PROJECTS_QUERY_KEY)?.isInvalidated, true);
 });
 
 test("performLogout recovers from 401 expired session and 403 CSRF failure without trapping user", async () => {

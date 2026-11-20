@@ -1,6 +1,14 @@
 import { apiGet, ApiError, IS_MOCK } from "./client";
 import { estimateClockDriftSeconds } from "@/lib/metrics-query";
 import dayjs from "../dayjs.ts";
+import {
+  formatPromSeriesLabel,
+  MetricsContractError,
+  normalizePrettifyResponse,
+  normalizePromInstantResponse,
+  normalizePromRangeResponse,
+  normalizePromStringsResponse,
+} from "./metrics-contract";
 import type {
   MetricSample,
   MetricTableResult,
@@ -20,6 +28,13 @@ const loadMock = () => import("./mock");
  * In VITE_MOCK mode it returns built-in sine-wave data instead of hitting HTTP.
  */
 
+function rethrowContractError(error: unknown): never {
+  if (error instanceof MetricsContractError) {
+    throw new ApiError(error.message, error.status, error.errorType);
+  }
+  throw error;
+}
+
 export async function queryRange(
   params: QueryRangeParams,
   signal?: AbortSignal,
@@ -34,9 +49,9 @@ export async function queryRangeDetailed(
   project?: string,
 ): Promise<MetricsQueryEnvelope<TimeSeries[]>> {
   const started = performance.now();
-  const resp: PromQueryRangeResponse = IS_MOCK
+  const resp: unknown = IS_MOCK
     ? await simulate(params)
-    : await apiGet<PromQueryRangeResponse>("/query_range", {
+    : await apiGet<unknown>("/query_range", {
         params: {
           query: params.query,
           start: params.start,
@@ -47,13 +62,16 @@ export async function queryRangeDetailed(
         project,
       });
 
-  if (resp.status === "error") {
-    throw new ApiError(resp.error || "query failed", 400);
+  let normalized;
+  try {
+    normalized = normalizePromRangeResponse(resp);
+  } catch (error) {
+    rethrowContractError(error);
   }
   return {
-    data: toTimeSeries(resp),
-    warnings: resp.warnings ?? [],
-    infos: resp.infos ?? [],
+    data: normalized.data,
+    warnings: normalized.warnings,
+    infos: normalized.infos,
     durationMs: Math.max(0, performance.now() - started),
   };
 }
@@ -62,8 +80,9 @@ export async function queryInstant(
   query: string,
   time: number,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<MetricSample[]> {
-  const detailed = await queryInstantDetailed(query, time, signal);
+  const detailed = await queryInstantDetailed(query, time, signal, project);
   return detailed.data.rows.flatMap((row) => {
     const value = row.values.at(-1);
     return value ? [{ name: row.name, labels: row.labels, timestamp: value.timestamp, value: value.value }] : [];
@@ -81,19 +100,21 @@ export async function queryServerClock(
   project?: string,
 ): Promise<ServerClockSample> {
   const requestStartedMs = dayjs().valueOf();
-  const resp = await apiGet<PromInstantResponse>("/query", {
+  const resp = await apiGet<unknown>("/query", {
     params: { query: "time()" },
     signal,
     project,
   });
   const responseReceivedMs = dayjs().valueOf();
-  if (resp.status === "error") throw new ApiError(resp.error || "server time query failed", 400);
 
-  const raw = resp.data.resultType === "scalar" || resp.data.resultType === "string"
-    ? resp.data.result[1]
-    : resp.data.resultType === "vector"
-      ? resp.data.result[0]?.value[1]
-      : resp.data.result[0]?.values.at(-1)?.[1];
+  let normalized;
+  try {
+    normalized = normalizePromInstantResponse(resp);
+  } catch (error) {
+    rethrowContractError(error);
+  }
+
+  const raw = normalized.data.rows[0]?.values.at(-1)?.raw;
   const serverSeconds = Number(raw);
   if (!Number.isFinite(serverSeconds)) throw new ApiError("metrics server returned an invalid time", 502);
 
@@ -110,59 +131,24 @@ export async function queryInstantDetailed(
   project?: string,
 ): Promise<MetricsQueryEnvelope<MetricTableResult>> {
   const started = performance.now();
-  const resp: PromInstantResponse = IS_MOCK
+  const resp: unknown = IS_MOCK
     ? instantFromRange(await simulate({ query, start: time - 60, end: time, step: 60 }))
-    : await apiGet<PromInstantResponse>("/query", {
+    : await apiGet<unknown>("/query", {
         params: { query, time },
         signal,
         project,
       });
 
-  if (resp.status === "error") {
-    throw new ApiError(resp.error || "query failed", 400);
-  }
-  let result: MetricTableResult;
-  if (resp.data.resultType === "scalar" || resp.data.resultType === "string") {
-    const [timestamp, raw] = resp.data.result;
-    result = {
-      resultType: resp.data.resultType,
-      rows: [{
-        name: resp.data.resultType === "scalar" ? "scalar" : "string",
-        labels: {},
-        values: [{ timestamp: timestamp * 1000, raw, value: finiteValue(raw) }],
-      }],
-    };
-  } else if (resp.data.resultType === "matrix") {
-    result = {
-      resultType: "matrix",
-      rows: resp.data.result.map((item) => ({
-        name: seriesLabel(item.metric),
-        labels: item.metric,
-        values: item.values.map(([timestamp, raw]) => ({
-          timestamp: timestamp * 1000,
-          raw,
-          value: finiteValue(raw),
-        })),
-      })),
-    };
-  } else {
-    result = {
-      resultType: "vector",
-      rows: resp.data.result.map((item) => ({
-        name: seriesLabel(item.metric),
-        labels: item.metric,
-        values: [{
-          timestamp: item.value[0] * 1000,
-          raw: item.value[1],
-          value: finiteValue(item.value[1]),
-        }],
-      })),
-    };
+  let normalized;
+  try {
+    normalized = normalizePromInstantResponse(resp);
+  } catch (error) {
+    rethrowContractError(error);
   }
   return {
-    data: result,
-    warnings: resp.warnings ?? [],
-    infos: resp.infos ?? [],
+    data: normalized.data,
+    warnings: normalized.warnings,
+    infos: normalized.infos,
     durationMs: Math.max(0, performance.now() - started),
   };
 }
@@ -175,12 +161,6 @@ export interface MetricsMetadataParams {
   project?: string;
 }
 
-interface PromStringsResponse {
-  status: "success" | "error";
-  data?: string[];
-  error?: string;
-}
-
 async function metadataValues(
   path: string,
   params: MetricsMetadataParams,
@@ -191,7 +171,7 @@ async function metadataValues(
     if (path.includes("__name__")) return ["http.server.request.duration_count", "http.server.active_requests", "example.work.requests"];
     return ["lazy-observe-fiber-example", "GET", "200", "503"];
   }
-  const resp = await apiGet<PromStringsResponse>(path, {
+  const resp = await apiGet<unknown>(path, {
     params: {
       start: params.start,
       end: params.end,
@@ -201,8 +181,11 @@ async function metadataValues(
     signal,
     project: params.project,
   });
-  if (resp.status === "error") throw new ApiError(resp.error || "metadata query failed", 400);
-  return (resp.data ?? []).filter((item): item is string => typeof item === "string");
+  try {
+    return normalizePromStringsResponse(resp);
+  } catch (error) {
+    rethrowContractError(error);
+  }
 }
 
 export function metricNames(params: MetricsMetadataParams, signal?: AbortSignal) {
@@ -217,27 +200,22 @@ export function labelValues(label: string, params: MetricsMetadataParams, signal
   return metadataValues(`/label/${encodeURIComponent(label)}/values`, params, signal);
 }
 
-interface PrettifyResponse {
-  status: "success" | "error";
-  query?: string;
-  msg?: string;
-}
-
 export async function prettifyPromQL(
   query: string,
   signal?: AbortSignal,
   project?: string,
 ): Promise<string> {
   if (IS_MOCK) return query.trim();
-  const resp = await apiGet<PrettifyResponse>("/prettify-query", {
+  const resp = await apiGet<unknown>("/prettify-query", {
     params: { query },
     signal,
     project,
   });
-  if (resp.status !== "success" || typeof resp.query !== "string") {
-    throw new ApiError(resp.msg || "invalid PromQL", 400);
+  try {
+    return normalizePrettifyResponse(resp);
+  } catch (error) {
+    rethrowContractError(error);
   }
-  return resp.query;
 }
 
 /** Small delay so loading states are observable in mock mode. */
@@ -260,31 +238,7 @@ function instantFromRange(resp: PromQueryRangeResponse): PromInstantResponse {
   };
 }
 
-function finiteValue(raw: string): number | null {
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : null;
-}
-
 /** Build a stable, readable series label from Prometheus labels. */
 export function seriesLabel(metric: Record<string, string>): string {
-  const name = metric.__name__ ?? "";
-  const rest = Object.entries(metric)
-    .filter(([k]) => k !== "__name__")
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}="${v}"`)
-    .join(", ");
-  if (!rest) return name || "{}";
-  return name ? `${name}{${rest}}` : `{${rest}}`;
-}
-
-function toTimeSeries(resp: Extract<PromQueryRangeResponse, { status: "success" }>): TimeSeries[] {
-  return resp.data.result.map((r) => ({
-    name: seriesLabel(r.metric),
-    labels: r.metric,
-    points: r.values.map(([t, v]) => {
-      const n = Number(v);
-      // Prometheus encodes NaN/Inf as strings; render them as gaps.
-      return [t * 1000, Number.isFinite(n) ? n : null] as [number, number | null];
-    }),
-  }));
+  return formatPromSeriesLabel(metric);
 }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
+import { type UseQueryResult } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -28,6 +28,7 @@ import { RANGE_PRESETS, rangeById, resolveRange } from "@/lib/api/ranges";
 import { ApiError } from "@/lib/api/client";
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDurationMicros } from "@/lib/format";
 import dayjs, { dayjsLocale } from "@/lib/dayjs";
 import type { TimeSeries } from "@/lib/api/types";
@@ -63,19 +64,19 @@ export function LLMObservabilityPage() {
     setModel(ALL);
   }, [scope]);
 
-  const summaryQuery = useQuery<LLMSummary, ApiError>({
-    queryKey: ["llm-summary", scope, window.start, window.end],
-    queryFn: ({ signal }) => getLLMSummary(window, signal),
+  const summaryQuery = useProjectQuery<LLMSummary, ApiError>({
+    queryKey: ["llm-summary", window.start, window.end],
+    queryFn: ({ signal, project }) => getLLMSummary(window, signal, project),
     retry: false,
   });
-  const trendQuery = useQuery<LLMTimeseriesResult, ApiError>({
-    queryKey: ["llm-timeseries", scope, trendMetric, window.start, window.end],
-    queryFn: ({ signal }) => getLLMTimeseries(window, trendMetric, signal),
+  const trendQuery = useProjectQuery<LLMTimeseriesResult, ApiError>({
+    queryKey: ["llm-timeseries", trendMetric, window.start, window.end],
+    queryFn: ({ signal, project }) => getLLMTimeseries(window, trendMetric, signal, project),
     retry: false,
   });
-  const callsQuery = useQuery<LLMCallsResult, ApiError>({
-    queryKey: ["llm-calls", scope, service, model, window.start, window.end],
-    queryFn: ({ signal }) =>
+  const callsQuery = useProjectQuery<LLMCallsResult, ApiError>({
+    queryKey: ["llm-calls", service, model, window.start, window.end],
+    queryFn: ({ signal, project }) =>
       getLLMCalls(
         window,
         {
@@ -84,6 +85,7 @@ export function LLMObservabilityPage() {
           limit: 100,
         },
         signal,
+        project,
       ),
     retry: false,
   });
@@ -184,8 +186,8 @@ function LLMContent({
   summary: LLMSummary;
   trendMetric: LLMTrendMetric;
   setTrendMetric: (metric: LLMTrendMetric) => void;
-  trendQuery: ReturnType<typeof useQuery<Awaited<ReturnType<typeof getLLMTimeseries>>, ApiError>>;
-  callsQuery: ReturnType<typeof useQuery<Awaited<ReturnType<typeof getLLMCalls>>, ApiError>>;
+  trendQuery: UseQueryResult<Awaited<ReturnType<typeof getLLMTimeseries>>, ApiError>;
+  callsQuery: UseQueryResult<Awaited<ReturnType<typeof getLLMCalls>>, ApiError>;
   service: string;
   setService: (service: string) => void;
   model: string;
@@ -327,7 +329,7 @@ function CallsTable({
   service,
   setService,
 }: {
-  query: ReturnType<typeof useQuery<Awaited<ReturnType<typeof getLLMCalls>>, ApiError>>;
+  query: UseQueryResult<Awaited<ReturnType<typeof getLLMCalls>>, ApiError>;
   models: string[];
   services: string[];
   model: string;

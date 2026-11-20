@@ -6,15 +6,8 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
-import {
-  useNavigate,
-  useRouter,
-  useRouterState,
-} from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import {
   AlertCircle,
   BarChart3,
@@ -68,6 +61,8 @@ import {
 } from "@/lib/metrics-query";
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useRouterLocationSync } from "@/lib/router-url-sync";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import {
   LogsHitsChart,
@@ -202,12 +197,8 @@ function queryColumnWidths(value: string | null): Record<string, number> {
   }
 }
 
-function initialLogsState(locationHref?: string): InitialLogsState {
-  const params = locationHref !== undefined
-    ? new URL(locationHref, "https://lazy-observe.invalid").searchParams
-    : typeof window === "undefined"
-      ? new URLSearchParams()
-      : new URLSearchParams(window.location.search);
+function initialLogsState(locationHref: string): InitialLogsState {
+  const params = new URL(locationHref, "https://lazy-observe.invalid").searchParams;
   const query = params.get("q")?.trim() || DEFAULT_LOGS_QUERY;
   const viewValue = params.get("view");
   const view: LogsViewMode = ["group", "table", "json", "live"].includes(viewValue ?? "")
@@ -294,15 +285,17 @@ function errorMessage(error: unknown): string {
 export function LogsPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const router = useRouter();
   const queryClient = useQueryClient();
   const { currentSlug: project } = useProject();
-  // Re-read the raw history href whenever the router commits a navigation.
-  const routeLocation = useRouterState({ select: () => router.history.location.href });
+  const {
+    routeLocation,
+    currentHistoryHref,
+    replaceLocation,
+    classifyLocationChange,
+  } = useRouterLocationSync();
   const initialRef = useRef<InitialLogsState | null>(null);
   if (!initialRef.current) initialRef.current = initialLogsState(routeLocation);
   const initial = initialRef.current;
-  const selfAuthoredLocationsRef = useRef<Set<string>>(new Set([routeLocation]));
   const [localTime, setLocalTime] = useState(localTimePreference);
   const [autocomplete, setAutocomplete] = useState(initial.autocomplete);
   const [hideLogs, setHideLogs] = useState(initial.hideLogs);
@@ -347,10 +340,7 @@ export function LogsPage() {
     project,
     location: routeLocation,
     auxiliaryConfig,
-    replaceLocation: (location) => {
-      selfAuthoredLocationsRef.current.add(location);
-      router.history.replace(location, router.history.location.state);
-    },
+    replaceLocation,
   });
   const { intent, executed, finite, live, history } = snapshot;
   const queryText = intent.draft;
@@ -415,10 +405,9 @@ export function LogsPage() {
   useEffect(() => () => downloadController.current?.abort(), []);
 
   useEffect(() => {
-    // TanStack queues history writes for a microtask, so window.location can
-    // still hold a superseded URL here. Read the router's pending location
-    // instead, or a stale snapshot would clobber the canonical one.
-    const url = new URL(router.history.location.href, window.location.origin);
+    // TanStack queues history writes for a microtask, so read the router's
+    // pending location instead of window.location to avoid clobbering.
+    const url = new URL(currentHistoryHref(), "https://lazy-observe.invalid");
     const params = url.searchParams;
     const setOptional = (key: string, value: string | number | undefined) => {
       if (value === undefined || value === "") params.delete(key);
@@ -462,12 +451,11 @@ export function LogsPage() {
       setOptional("rows_per_page", rowsPerPage === 100 ? undefined : rowsPerPage);
     }
     const target = `${url.pathname}${url.search}${url.hash}`;
-    if (target === router.history.location.href) return;
-    selfAuthoredLocationsRef.current.add(target);
-    router.history.replace(target, router.history.location.state);
+    replaceLocation(target);
   }, [
     autocomplete,
     chart,
+    currentHistoryHref,
     groupSettings.compactHeader,
     groupSettings.displayFields,
     groupSettings.disableHover,
@@ -477,21 +465,19 @@ export function LogsPage() {
     groupSettings.pageSize,
     groupSettings.singleLine,
     hideLogs,
+    replaceLocation,
     tableSettings.visibleFields,
     tableSettings.columnWidths,
     tableSettings.pageSize,
-    router,
     view,
   ]);
 
   // Only resync presentation state on genuine external navigations (back/forward
   // or deep links), never in response to URL writes authored by this page itself.
   useEffect(() => {
-    if (selfAuthoredLocationsRef.current.has(routeLocation)) {
-      selfAuthoredLocationsRef.current.delete(routeLocation);
+    if (classifyLocationChange(routeLocation) === "self") {
       return;
     }
-    selfAuthoredLocationsRef.current.clear();
     const next = initialLogsState(routeLocation);
     setAutocomplete(next.autocomplete);
     setHideLogs(next.hideLogs);
@@ -508,7 +494,7 @@ export function LogsPage() {
     setSelected(null);
     setDrawerOpen(false);
     setContextAnchor(null);
-  }, [routeLocation]);
+  }, [routeLocation, classifyLocationChange]);
 
   const execute = useCallback((query = queryText) => {
     if (
@@ -592,10 +578,9 @@ export function LogsPage() {
     isFetching: finite.stats.status === "loading",
   };
 
-  const fieldNamesResult = useQuery({
+  const fieldNamesResult = useProjectQuery({
     queryKey: [
       "logs-explorer",
-      project,
       "field-names",
       metadataQuery,
       metadataRange,
@@ -604,20 +589,19 @@ export function LogsPage() {
     enabled: autocomplete || sidebarOpen || readyForQuery,
     staleTime: 30_000,
     retry: false,
-    queryFn: ({ signal }) => queryLogFieldNames({
+    queryFn: ({ signal, project: activeProject }) => queryLogFieldNames({
       query: metadataQuery,
       start: metadataRange.start,
       end: metadataRange.end,
       limit: 1_000,
-      project,
+      project: activeProject,
       ...metadataFilters,
     }, signal),
   });
 
-  const streamFieldsResult = useQuery({
+  const streamFieldsResult = useProjectQuery({
     queryKey: [
       "logs-explorer",
-      project,
       "stream-fields",
       metadataQuery,
       metadataRange,
@@ -626,12 +610,12 @@ export function LogsPage() {
     enabled: autocomplete || sidebarOpen || readyForQuery,
     staleTime: 30_000,
     retry: false,
-    queryFn: ({ signal }) => queryLogStreamFieldNames({
+    queryFn: ({ signal, project: activeProject }) => queryLogStreamFieldNames({
       query: metadataQuery,
       start: metadataRange.start,
       end: metadataRange.end,
       limit: 1_000,
-      project,
+      project: activeProject,
       ...metadataFilters,
     }, signal),
   });

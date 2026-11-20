@@ -30,44 +30,52 @@ function delay<T>(value: T, ms = 200): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(value), ms));
 }
 
-export async function listScrapeTargets(signal?: AbortSignal): Promise<ScrapeTarget[]> {
+export async function listScrapeTargets(
+  signal?: AbortSignal,
+  project?: string,
+): Promise<ScrapeTarget[]> {
   if (IS_MOCK) return delay([...(await loadMockInfra()).mockScrapeTargets]);
   return normalizeScrapeTargetListResponse(
-    await apiGet<unknown>("/scrape-targets", { base: API_ROOT, signal }),
+    await apiGet<unknown>("/scrape-targets", { base: API_ROOT, signal, project }),
   );
 }
 
-export async function createScrapeTarget(input: ScrapeTargetInput): Promise<ScrapeTarget> {
+export async function createScrapeTarget(
+  input: ScrapeTargetInput,
+  project?: string,
+): Promise<ScrapeTarget> {
   if (IS_MOCK) return delay((await loadMockInfra()).createMockTarget(input), 250);
   return normalizeScrapeTargetResponse(
-    await apiSend<unknown>("POST", "/scrape-targets", input, { base: API_ROOT }),
+    await apiSend<unknown>("POST", "/scrape-targets", input, { base: API_ROOT, project }),
   );
 }
 
 export async function updateScrapeTarget(
   id: string,
   input: ScrapeTargetInput,
+  project?: string,
 ): Promise<ScrapeTarget> {
   if (IS_MOCK) return delay((await loadMockInfra()).updateMockTarget(id, input), 250);
   return normalizeScrapeTargetResponse(
-    await apiSend<unknown>("PATCH", `/scrape-targets/${id}`, input, { base: API_ROOT }),
+    await apiSend<unknown>("PATCH", `/scrape-targets/${id}`, input, { base: API_ROOT, project }),
   );
 }
 
-export async function deleteScrapeTarget(id: string): Promise<void> {
+export async function deleteScrapeTarget(id: string, project?: string): Promise<void> {
   if (IS_MOCK) {
     (await loadMockInfra()).deleteMockTarget(id);
     return delay(undefined);
   }
-  await apiSend<void>("DELETE", `/scrape-targets/${id}`, undefined, { base: API_ROOT });
+  await apiSend<void>("DELETE", `/scrape-targets/${id}`, undefined, { base: API_ROOT, project });
 }
 
 export async function getTargetHealth(
   id: string,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<TargetHealth> {
   if (IS_MOCK) return delay((await loadMockInfra()).mockTargetHealth(id), 150);
   return normalizeTargetHealthResponse(
-    await apiGet<unknown>(`/scrape-targets/${id}/health`, { base: API_ROOT, signal }),
+    await apiGet<unknown>(`/scrape-targets/${id}/health`, { base: API_ROOT, signal, project }),
   );
 }

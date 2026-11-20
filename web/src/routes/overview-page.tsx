@@ -21,6 +21,7 @@ import { listIssues, type IssueListResult } from "@/lib/api/issues";
 import { rangeById, resolveRange } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatRelativeTime } from "@/lib/format";
 import type { TimeSeries } from "@/lib/api/types";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -124,13 +125,14 @@ function MetricPanel({
   window: Window;
 }) {
   const { t } = useTranslation();
-  const result = useQuery<TimeSeries[]>({
-    queryKey: ["overview", project, query, window.end],
-    queryFn: ({ signal }) =>
+  const result = useProjectQuery<TimeSeries[]>({
+    project,
+    queryKey: ["overview", query, window.end],
+    queryFn: ({ signal, project: activeProject }) =>
       queryRange(
         { query, start: window.start, end: window.end, step: window.step },
         signal,
-        project,
+        activeProject,
       ),
   });
 
@@ -239,10 +241,11 @@ function ActiveAlertsCard({ project }: { project: string }) {
 
 function LogVolumeCard({ project, window }: { project: string; window: Window }) {
   const { t } = useTranslation();
-  const hits = useQuery<LogsHistogram>({
-    queryKey: ["overview", project, "logs-hits", window.end],
-    queryFn: ({ signal }) =>
-      logsHits({ query: "*", start: window.start, end: window.end, step: 60, project }, signal),
+  const hits = useProjectQuery<LogsHistogram>({
+    project,
+    queryKey: ["overview", "logs-hits", window.end],
+    queryFn: ({ signal, project: activeProject }) =>
+      logsHits({ query: "*", start: window.start, end: window.end, step: 60, project: activeProject }, signal),
   });
 
   return (
@@ -273,9 +276,11 @@ function LogVolumeCard({ project, window }: { project: string; window: Window })
 
 function IssuesCard({ project }: { project: string }) {
   const { t, i18n } = useTranslation();
-  const query = useQuery<IssueListResult>({
-    queryKey: ["overview", project, "issues", RECENT_ISSUES_PARAMS],
-    queryFn: ({ signal }) => listIssues(RECENT_ISSUES_PARAMS, signal),
+  const query = useProjectQuery<IssueListResult>({
+    project,
+    queryKey: ["overview", "issues", RECENT_ISSUES_PARAMS],
+    queryFn: ({ signal, project: activeProject }) =>
+      listIssues(RECENT_ISSUES_PARAMS, signal, activeProject),
     retry: false,
     refetchInterval: 30_000,
   });
