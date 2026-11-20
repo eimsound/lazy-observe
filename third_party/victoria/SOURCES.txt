@@ -14,7 +14,7 @@ repositories carries a NOTICE file at the pinned tag.
 Component        Version    Binaries                     License     Source of LICENSE
 VictoriaMetrics  v1.156.0   victoria-metrics-prod,       Apache-2.0  https://raw.githubusercontent.com/VictoriaMetrics/VictoriaMetrics/v1.156.0/LICENSE
                             vmagent-prod (vmutils)
-VictoriaLogs     v1.53.0    victoria-logs-prod           Apache-2.0  https://raw.githubusercontent.com/VictoriaMetrics/VictoriaLogs/v1.53.0/LICENSE
+VictoriaLogs     v1.54.0    victoria-logs-prod           Apache-2.0  https://raw.githubusercontent.com/VictoriaMetrics/VictoriaLogs/v1.54.0/LICENSE
 VictoriaTraces   v0.13.0    victoria-traces-prod         Apache-2.0  https://raw.githubusercontent.com/VictoriaMetrics/VictoriaTraces/v0.13.0/LICENSE
 
 Upstream source code: https://github.com/VictoriaMetrics/VictoriaMetrics,
