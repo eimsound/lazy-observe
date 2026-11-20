@@ -24,6 +24,9 @@ type InhibitionRule func(*sql.Selector)
 // Issue is the predicate function for issue builders.
 type Issue func(*sql.Selector)
 
+// IssueLifecycleEvent is the predicate function for issuelifecycleevent builders.
+type IssueLifecycleEvent func(*sql.Selector)
+
 // NotificationChannel is the predicate function for notificationchannel builders.
 type NotificationChannel func(*sql.Selector)
 

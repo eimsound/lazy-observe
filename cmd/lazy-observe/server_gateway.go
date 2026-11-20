@@ -98,6 +98,7 @@ func startGateway(
 		},
 	)
 	inboxOptions := errortrack.InboxOptions{
+		Logger: logger,
 		Capacity: errortrack.InboxCapacity{
 			MaxItems: cfg.ErrorInbox.MaxItems, MaxBytes: cfg.ErrorInbox.MaxBytes,
 			ReadinessItems: cfg.ErrorInbox.ReadinessItems, ReadinessBytes: cfg.ErrorInbox.ReadinessBytes,

@@ -106,7 +106,11 @@ func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
 			return nil, fmt.Errorf("list S3 blobs: %w", err)
 		}
 		for _, obj := range out.Contents {
-			result = append(result, Object{Key: aws.ToString(obj.Key), Size: aws.ToInt64(obj.Size)})
+			item := Object{Key: aws.ToString(obj.Key), Size: aws.ToInt64(obj.Size)}
+			if obj.LastModified != nil {
+				item.ModTime = obj.LastModified.UTC()
+			}
+			result = append(result, item)
 		}
 		if !aws.ToBool(out.IsTruncated) {
 			break

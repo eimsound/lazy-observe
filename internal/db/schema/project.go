@@ -35,5 +35,6 @@ func (Project) Edges() []ent.Edge {
 		edge.To("scrape_targets", ScrapeTarget.Type),
 		edge.To("profile_metas", ProfileMeta.Type),
 		edge.To("telemetry_inbox", TelemetryInbox.Type),
+		edge.To("issue_lifecycle_events", IssueLifecycleEvent.Type),
 	}
 }

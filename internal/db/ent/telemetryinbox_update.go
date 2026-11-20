@@ -186,6 +186,27 @@ func (_u *TelemetryInboxUpdate) ClearClaimUntil() *TelemetryInboxUpdate {
 	return _u
 }
 
+// SetClaimEpoch sets the "claim_epoch" field.
+func (_u *TelemetryInboxUpdate) SetClaimEpoch(v int64) *TelemetryInboxUpdate {
+	_u.mutation.ResetClaimEpoch()
+	_u.mutation.SetClaimEpoch(v)
+	return _u
+}
+
+// SetNillableClaimEpoch sets the "claim_epoch" field if the given value is not nil.
+func (_u *TelemetryInboxUpdate) SetNillableClaimEpoch(v *int64) *TelemetryInboxUpdate {
+	if v != nil {
+		_u.SetClaimEpoch(*v)
+	}
+	return _u
+}
+
+// AddClaimEpoch adds value to the "claim_epoch" field.
+func (_u *TelemetryInboxUpdate) AddClaimEpoch(v int64) *TelemetryInboxUpdate {
+	_u.mutation.AddClaimEpoch(v)
+	return _u
+}
+
 // SetAttempts sets the "attempts" field.
 func (_u *TelemetryInboxUpdate) SetAttempts(v int) *TelemetryInboxUpdate {
 	_u.mutation.ResetAttempts()
@@ -369,6 +390,11 @@ func (_u *TelemetryInboxUpdate) check() error {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "TelemetryInbox.status": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.ClaimEpoch(); ok {
+		if err := telemetryinbox.ClaimEpochValidator(v); err != nil {
+			return &ValidationError{Name: "claim_epoch", err: fmt.Errorf(`ent: validator failed for field "TelemetryInbox.claim_epoch": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Attempts(); ok {
 		if err := telemetryinbox.AttemptsValidator(v); err != nil {
 			return &ValidationError{Name: "attempts", err: fmt.Errorf(`ent: validator failed for field "TelemetryInbox.attempts": %w`, err)}
@@ -433,6 +459,12 @@ func (_u *TelemetryInboxUpdate) sqlSave(ctx context.Context) (_node int, err err
 	}
 	if _u.mutation.ClaimUntilCleared() {
 		_spec.ClearField(telemetryinbox.FieldClaimUntil, field.TypeTime)
+	}
+	if value, ok := _u.mutation.ClaimEpoch(); ok {
+		_spec.SetField(telemetryinbox.FieldClaimEpoch, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedClaimEpoch(); ok {
+		_spec.AddField(telemetryinbox.FieldClaimEpoch, field.TypeInt64, value)
 	}
 	if value, ok := _u.mutation.Attempts(); ok {
 		_spec.SetField(telemetryinbox.FieldAttempts, field.TypeInt, value)
@@ -667,6 +699,27 @@ func (_u *TelemetryInboxUpdateOne) ClearClaimUntil() *TelemetryInboxUpdateOne {
 	return _u
 }
 
+// SetClaimEpoch sets the "claim_epoch" field.
+func (_u *TelemetryInboxUpdateOne) SetClaimEpoch(v int64) *TelemetryInboxUpdateOne {
+	_u.mutation.ResetClaimEpoch()
+	_u.mutation.SetClaimEpoch(v)
+	return _u
+}
+
+// SetNillableClaimEpoch sets the "claim_epoch" field if the given value is not nil.
+func (_u *TelemetryInboxUpdateOne) SetNillableClaimEpoch(v *int64) *TelemetryInboxUpdateOne {
+	if v != nil {
+		_u.SetClaimEpoch(*v)
+	}
+	return _u
+}
+
+// AddClaimEpoch adds value to the "claim_epoch" field.
+func (_u *TelemetryInboxUpdateOne) AddClaimEpoch(v int64) *TelemetryInboxUpdateOne {
+	_u.mutation.AddClaimEpoch(v)
+	return _u
+}
+
 // SetAttempts sets the "attempts" field.
 func (_u *TelemetryInboxUpdateOne) SetAttempts(v int) *TelemetryInboxUpdateOne {
 	_u.mutation.ResetAttempts()
@@ -863,6 +916,11 @@ func (_u *TelemetryInboxUpdateOne) check() error {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "TelemetryInbox.status": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.ClaimEpoch(); ok {
+		if err := telemetryinbox.ClaimEpochValidator(v); err != nil {
+			return &ValidationError{Name: "claim_epoch", err: fmt.Errorf(`ent: validator failed for field "TelemetryInbox.claim_epoch": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Attempts(); ok {
 		if err := telemetryinbox.AttemptsValidator(v); err != nil {
 			return &ValidationError{Name: "attempts", err: fmt.Errorf(`ent: validator failed for field "TelemetryInbox.attempts": %w`, err)}
@@ -944,6 +1002,12 @@ func (_u *TelemetryInboxUpdateOne) sqlSave(ctx context.Context) (_node *Telemetr
 	}
 	if _u.mutation.ClaimUntilCleared() {
 		_spec.ClearField(telemetryinbox.FieldClaimUntil, field.TypeTime)
+	}
+	if value, ok := _u.mutation.ClaimEpoch(); ok {
+		_spec.SetField(telemetryinbox.FieldClaimEpoch, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedClaimEpoch(); ok {
+		_spec.AddField(telemetryinbox.FieldClaimEpoch, field.TypeInt64, value)
 	}
 	if value, ok := _u.mutation.Attempts(); ok {
 		_spec.SetField(telemetryinbox.FieldAttempts, field.TypeInt, value)

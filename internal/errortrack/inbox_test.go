@@ -1,10 +1,14 @@
 package errortrack_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -302,5 +306,406 @@ func waitInbox(
 			t.Fatalf("Inbox condition timed out: %#v", diagnostics)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestInboxGeneratesUniqueOwnersAcrossInstances(t *testing.T) {
+	store, _ := newInboxTestStore(t, "unique-owner")
+	writer := &inboxTestWriter{}
+	a, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{PollInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Close(context.Background()) }()
+	b, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{PollInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close(context.Background()) }()
+	if a.Owner() == "" || b.Owner() == "" || a.Owner() == b.Owner() {
+		t.Fatalf("expected distinct non-empty owners, got a=%q b=%q", a.Owner(), b.Owner())
+	}
+}
+
+func TestInboxClampsOccurredAtClockSkew(t *testing.T) {
+	store, project := newInboxTestStore(t, "clock-skew")
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	writer := &inboxTestWriter{}
+	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		Now:          func() time.Time { return fixedNow },
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	mkEvent := func(id, typ string, ts time.Time) errortrack.AcceptedEvent {
+		e := errortrack.Event{
+			EventID: id, Timestamp: ts, Platform: "go", Level: "error",
+			Exception: errortrack.Exception{
+				Type:  typ,
+				Value: "skew",
+				Stacktrace: errortrack.Stacktrace{
+					Frames: []errortrack.Frame{{Function: typ, Filename: "a.go", InApp: true}},
+				},
+			},
+		}
+		raw, _ := json.Marshal(e)
+		return errortrack.AcceptedEvent{Raw: raw, Event: e}
+	}
+	farFuture := fixedNow.Add(10 * 365 * 24 * time.Hour)
+	farPast := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	validPast := fixedNow.Add(-2 * time.Minute)
+	if err := inbox.Accept(context.Background(), project, []errortrack.AcceptedEvent{
+		mkEvent("future", "FutureErr", farFuture),
+		mkEvent("past", "PastErr", farPast),
+		mkEvent("normal", "NormalErr", validPast),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool { return d.ActiveItems == 0 })
+	issues, err := store.ListIssues(context.Background(), project.ID, meta.IssueListOptions{})
+	if err != nil || len(issues) != 3 {
+		t.Fatalf("issues=%#v err=%v", issues, err)
+	}
+	byEvent := make(map[string]meta.IssueView)
+	for _, iss := range issues {
+		byEvent[iss.LastEventID] = iss
+	}
+	if !byEvent["future"].LastSeen.Equal(fixedNow) {
+		t.Fatalf("far future occurred_at was not clamped: got %s want %s", byEvent["future"].LastSeen, fixedNow)
+	}
+	if !byEvent["past"].LastSeen.Equal(fixedNow) {
+		t.Fatalf("far past occurred_at was not clamped: got %s want %s", byEvent["past"].LastSeen, fixedNow)
+	}
+	if !byEvent["normal"].LastSeen.Equal(validPast) {
+		t.Fatalf("valid occurred_at was unexpectedly modified: got %s want %s", byEvent["normal"].LastSeen, validPast)
+	}
+}
+
+type panicSymbolicator struct {
+	calls atomic.Int64
+}
+
+func (p *panicSymbolicator) Symbolicate(
+	_ context.Context,
+	_ string,
+	_ json.RawMessage,
+	event errortrack.Event,
+) (errortrack.Event, error) {
+	p.calls.Add(1)
+	panic("simulated go-sourcemap panic")
+}
+
+func TestInboxWorkerRecoversFromPanicAndMarksTerminal(t *testing.T) {
+	store, project := newInboxTestStore(t, "panic-recover")
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	sym := &panicSymbolicator{}
+	inbox, err := errortrack.NewInbox(store, &inboxTestWriter{}, errortrack.InboxOptions{
+		Logger:       logger,
+		Symbolicator: sym,
+		MaxAttempts:  2,
+		RetryInitial: time.Millisecond,
+		RetryCap:     time.Millisecond,
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	if err := inbox.Accept(
+		context.Background(),
+		project,
+		[]errortrack.AcceptedEvent{inboxEvent("poison")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool { return d.TerminalFailuresTotal == 1 })
+	if diagnostics.ActiveItems != 0 || diagnostics.DropsTotal != 1 || sym.calls.Load() != 2 {
+		t.Fatalf("diagnostics=%#v calls=%d", diagnostics, sym.calls.Load())
+	}
+	if !strings.Contains(logBuf.String(), "recovered panic") {
+		t.Fatalf("expected structured panic recovery log, got: %s", logBuf.String())
+	}
+}
+
+type flakySymbolicator struct {
+	failOnce atomic.Bool
+	calls    atomic.Int64
+}
+
+func (f *flakySymbolicator) Symbolicate(
+	_ context.Context,
+	_ string,
+	_ json.RawMessage,
+	event errortrack.Event,
+) (errortrack.Event, error) {
+	f.calls.Add(1)
+	if f.failOnce.CompareAndSwap(true, false) {
+		return event, errors.New("transient s3 timeout")
+	}
+	event.Exception.Stacktrace.Frames[0].Symbolicated = true
+	return event, nil
+}
+
+func TestInboxRetriesTransientSymbolicationError(t *testing.T) {
+	store, project := newInboxTestStore(t, "sym-retry")
+	sym := &flakySymbolicator{}
+	sym.failOnce.Store(true)
+	writer := &inboxTestWriter{}
+	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		Symbolicator: sym,
+		RetryInitial: time.Millisecond,
+		RetryCap:     time.Millisecond,
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	if err := inbox.Accept(
+		context.Background(),
+		project,
+		[]errortrack.AcceptedEvent{inboxEvent("sym-ev")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool { return d.ActiveItems == 0 })
+	if diagnostics.RetriesTotal != 1 || sym.calls.Load() != 2 || writer.calls.Load() != 1 {
+		t.Fatalf("diagnostics=%#v symCalls=%d writerCalls=%d", diagnostics, sym.calls.Load(), writer.calls.Load())
+	}
+}
+
+type blockingSymbolicator struct {
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	calls        atomic.Int64
+}
+
+func (b *blockingSymbolicator) Symbolicate(
+	ctx context.Context,
+	_ string,
+	_ json.RawMessage,
+	event errortrack.Event,
+) (errortrack.Event, error) {
+	n := b.calls.Add(1)
+	if n == 1 {
+		close(b.firstStarted)
+		select {
+		case <-b.releaseFirst:
+		case <-ctx.Done():
+			return event, ctx.Err()
+		}
+	}
+	return event, nil
+}
+
+func TestInboxCloseStopsRemainingClaimedBatchAndReleasesItems(t *testing.T) {
+	store, project := newInboxTestStore(t, "close-release")
+	sym := &blockingSymbolicator{firstStarted: make(chan struct{}), releaseFirst: make(chan struct{})}
+	inbox, err := errortrack.NewInbox(store, &inboxTestWriter{}, errortrack.InboxOptions{
+		Symbolicator: sym,
+		ClaimBatch:   4,
+		ClaimTTL:     time.Minute,
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := inbox.Accept(context.Background(), project, []errortrack.AcceptedEvent{
+		inboxEvent("shut-1"), inboxEvent("shut-2"), inboxEvent("shut-3"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sym.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first item did not start")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := inbox.Close(closeCtx); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+	if calls := sym.calls.Load(); calls != 1 {
+		t.Fatalf("symbolicator ran %d times after Close, want 1", calls)
+	}
+	// All 3 items must be released back to pending so a new worker can claim
+	// them immediately without waiting for ClaimTTL.
+	claimed, err := store.ClaimErrorEvents(context.Background(), "next-worker", 10, time.Now().UTC(), time.Minute)
+	if err != nil || len(claimed) != 3 {
+		t.Fatalf("expected 3 immediately claimable items after shutdown release, got %d err=%v", len(claimed), err)
+	}
+}
+
+func TestInboxLogsWarningOnClaimLost(t *testing.T) {
+	store, project := newInboxTestStore(t, "claim-lost-log")
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, buf: &logBuf}, nil))
+	writer := &inboxTestWriter{started: make(chan struct{}, 1), release: make(chan struct{})}
+	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		Owner:        "replica-a",
+		Logger:       logger,
+		ClaimTTL:     50 * time.Millisecond,
+		PollInterval: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	if err := inbox.Accept(
+		context.Background(),
+		project,
+		[]errortrack.AcceptedEvent{inboxEvent("fenced-ev")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("replica-a did not claim event")
+	}
+	// Replica B steals the expired lease while replica-a is blocked in writer.
+	recovered, err := store.ClaimErrorEvents(
+		context.Background(),
+		"replica-b",
+		1,
+		time.Now().UTC().Add(time.Second),
+		time.Minute,
+	)
+	if err != nil || len(recovered) != 1 || recovered[0].ClaimEpoch != 2 {
+		t.Fatalf("replica-b steal=%#v err=%v", recovered, err)
+	}
+	close(writer.release)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		logMu.Lock()
+		logged := logBuf.String()
+		logMu.Unlock()
+		if strings.Contains(logged, "losing claim lease") &&
+			strings.Contains(logged, "owner=replica-a") &&
+			strings.Contains(logged, "claim_epoch=1") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	t.Fatalf("expected slog.Warn with owner and claim_epoch on ErrClaimLost, got: %s", logBuf.String())
+}
+
+type lockedWriter struct {
+	mu  *sync.Mutex
+	buf *bytes.Buffer
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+type summaryOnlySpyStore struct {
+	errortrack.InboxStore
+	summaryCalls     atomic.Int64
+	diagnosticsCalls atomic.Int64
+}
+
+func (s *summaryOnlySpyStore) ErrorInboxSummary(ctx context.Context) (errortrack.InboxSummary, error) {
+	s.summaryCalls.Add(1)
+	return s.InboxStore.ErrorInboxSummary(ctx)
+}
+
+func (s *summaryOnlySpyStore) ErrorInboxDiagnostics(
+	ctx context.Context,
+	limit int,
+) (errortrack.InboxDiagnostics, error) {
+	s.diagnosticsCalls.Add(1)
+	return s.InboxStore.ErrorInboxDiagnostics(ctx, limit)
+}
+
+func TestInboxReadinessUsesO1SummaryOnly(t *testing.T) {
+	store, _ := newInboxTestStore(t, "o1-ready")
+	spy := &summaryOnlySpyStore{InboxStore: store}
+	inbox, err := errortrack.NewInbox(spy, &inboxTestWriter{}, errortrack.InboxOptions{PollInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+	if err := inbox.Readiness(context.Background()); err != nil {
+		t.Fatalf("Readiness error: %v", err)
+	}
+	if spy.summaryCalls.Load() != 1 || spy.diagnosticsCalls.Load() != 0 {
+		t.Fatalf("Readiness summaryCalls=%d diagnosticsCalls=%d, want 1 and 0",
+			spy.summaryCalls.Load(), spy.diagnosticsCalls.Load())
+	}
+}
+
+func TestInboxPersistsAndRedeliversIssueLifecycleAcrossRestarts(t *testing.T) {
+	store, project := newInboxTestStore(t, "durable-lifecycle")
+	// First worker completes the Inbox item without an OnChange callback
+	// (simulating a crash right after CompleteErrorEvent commits).
+	first, err := errortrack.NewInbox(store, &inboxTestWriter{}, errortrack.InboxOptions{
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Accept(
+		context.Background(),
+		project,
+		[]errortrack.AcceptedEvent{inboxEvent("life-1")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitInbox(t, first, func(d errortrack.InboxDiagnostics) bool { return d.ActiveItems == 0 })
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second worker starts with a flaky OnChange that fails once, then succeeds.
+	var delivered []errortrack.IssueChange
+	var mu sync.Mutex
+	var attempts atomic.Int64
+	second, err := errortrack.NewInbox(store, &inboxTestWriter{}, errortrack.InboxOptions{
+		RetryInitial: time.Millisecond,
+		RetryCap:     time.Millisecond,
+		PollInterval: time.Millisecond,
+		OnChange: func(_ context.Context, change errortrack.IssueChange) error {
+			if attempts.Add(1) == 1 {
+				return errors.New("temporary downstream failure")
+			}
+			mu.Lock()
+			delivered = append(delivered, change)
+			mu.Unlock()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close(context.Background()) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(delivered)
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != 1 || delivered[0].Kind != "new_issue" || delivered[0].ProjectID != project.ID {
+		t.Fatalf("delivered lifecycle changes=%#v attempts=%d", delivered, attempts.Load())
 	}
 }

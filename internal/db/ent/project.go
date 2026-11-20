@@ -56,9 +56,11 @@ type ProjectEdges struct {
 	ProfileMetas []*ProfileMeta `json:"profile_metas,omitempty"`
 	// TelemetryInbox holds the value of the telemetry_inbox edge.
 	TelemetryInbox []*TelemetryInbox `json:"telemetry_inbox,omitempty"`
+	// IssueLifecycleEvents holds the value of the issue_lifecycle_events edge.
+	IssueLifecycleEvents []*IssueLifecycleEvent `json:"issue_lifecycle_events,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [12]bool
+	loadedTypes [13]bool
 }
 
 // APITokensOrErr returns the APITokens value or an error if the edge
@@ -169,6 +171,15 @@ func (e ProjectEdges) TelemetryInboxOrErr() ([]*TelemetryInbox, error) {
 		return e.TelemetryInbox, nil
 	}
 	return nil, &NotLoadedError{edge: "telemetry_inbox"}
+}
+
+// IssueLifecycleEventsOrErr returns the IssueLifecycleEvents value or an error if the edge
+// was not loaded in eager-loading.
+func (e ProjectEdges) IssueLifecycleEventsOrErr() ([]*IssueLifecycleEvent, error) {
+	if e.loadedTypes[12] {
+		return e.IssueLifecycleEvents, nil
+	}
+	return nil, &NotLoadedError{edge: "issue_lifecycle_events"}
 }
 
 // scanValues returns the types for scanning values from sql.Rows.
@@ -292,6 +303,11 @@ func (_m *Project) QueryProfileMetas() *ProfileMetaQuery {
 // QueryTelemetryInbox queries the "telemetry_inbox" edge of the Project entity.
 func (_m *Project) QueryTelemetryInbox() *TelemetryInboxQuery {
 	return NewProjectClient(_m.config).QueryTelemetryInbox(_m)
+}
+
+// QueryIssueLifecycleEvents queries the "issue_lifecycle_events" edge of the Project entity.
+func (_m *Project) QueryIssueLifecycleEvents() *IssueLifecycleEventQuery {
+	return NewProjectClient(_m.config).QueryIssueLifecycleEvents(_m)
 }
 
 // Update returns a builder for updating this Project.

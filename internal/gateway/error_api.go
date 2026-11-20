@@ -22,7 +22,13 @@ import (
 	"github.com/gofiber/fiber/v3"
 )
 
-const maxErrorEventSize = 200 << 10
+const (
+	maxErrorEventSize = 200 << 10
+	// A 200 KiB error event stored in VictoriaLogs contains both raw_event and
+	// symbolicated_event as escaped JSON strings plus metadata, which can exceed
+	// 1 MiB after double-escaping and symbolication expansion.
+	maxVLogsErrorLineBytes = 4 << 20
+)
 
 type errorEnvelope struct {
 	Events []json.RawMessage `json:"events"`
@@ -138,8 +144,8 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 			&samples,
 			"web_vitals_%s{project_id=%s,page=%s} %s %d\n",
 			name,
-			strconv.Quote(project.Slug),
-			strconv.Quote(vital.Page),
+			formatPromLabelValue(project.Slug),
+			formatPromLabelValue(vital.Page),
 			strconv.FormatFloat(vital.Value, 'g', -1, 64),
 			timestamp.UnixMilli(),
 		)
@@ -282,14 +288,17 @@ func (g *Gateway) sdkDiagnosticsIngest(c fiber.Ctx) error {
 			skipped++
 			continue
 		}
+		// Browser diagnostics report per-batch drop deltas rather than a
+		// monotonic cumulative OTel counter, so they use a dedicated _delta
+		// metric name to avoid corrupting cumulative counter queries.
 		fmt.Fprintf(
 			&samples,
-			"lazy_observe_sdk_dropped_telemetry{project_id=%s,service_name=%s,"+
+			"lazy_observe_sdk_dropped_telemetry_delta{project_id=%s,service_name=%s,"+
 				"sdk_language=\"browser\",signal=%s,reason=%s} %d %d\n",
-			strconv.Quote(project.Slug),
-			strconv.Quote(measurement.Service),
-			strconv.Quote(measurement.Signal),
-			strconv.Quote(measurement.Reason),
+			formatPromLabelValue(project.Slug),
+			formatPromLabelValue(measurement.Service),
+			formatPromLabelValue(measurement.Signal),
+			formatPromLabelValue(measurement.Reason),
 			measurement.Dropped,
 			timestamp.UnixMilli(),
 		)
@@ -369,6 +378,34 @@ func validVitalName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// formatPromLabelValue formats a Prometheus text exposition label value using
+// only the three escapes allowed by the Prometheus exposition spec (\, ", \n),
+// preventing Go-only strconv.Quote escapes (\t, \r, \x.., \u....) from causing
+// VictoriaMetrics 400 -> Gateway 502 rejections.
+func formatPromLabelValue(value string) string {
+	valid := strings.ToValidUTF8(value, "\ufffd")
+	var b strings.Builder
+	b.Grow(len(valid) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(valid); i++ {
+		switch valid[i] {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			// Prometheus text format does not define \r escaping; strip CR so
+			// it cannot split the line exposition record.
+		default:
+			b.WriteByte(valid[i])
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func parseMetricTimestamp(raw json.RawMessage) (time.Time, error) {
@@ -585,6 +622,11 @@ func (g *Gateway) batchUpdateIssues(c fiber.Ctx) error {
 		(body.Status != "open" && body.Status != "resolved" && body.Status != "ignored") {
 		return badRequest(c)
 	}
+	for _, id := range body.IDs {
+		if id <= 0 {
+			return badRequest(c)
+		}
+	}
 	updated, err := g.issues.SetIssuesStatus(
 		c.Context(),
 		currentProject(c).ID,
@@ -628,11 +670,33 @@ func (g *Gateway) ensureIssues(c fiber.Ctx) bool {
 	return true
 }
 
-func (g *Gateway) queryIssueEvents(c fiber.Ctx, fingerprint, eventID string, limit int) ([]issueEventDTO, error) {
+func issueEventsLogsQL(fingerprint, eventID string, limit int) string {
 	query := `_stream:{event_type="error"} AND fingerprint:=` + strconv.Quote(fingerprint)
 	if eventID != "" {
 		query += ` AND event_id:=` + strconv.Quote(eventID)
 	}
+	query += ` | uniq by (event_id, _time, raw_event, symbolicated_event) | sort by (_time) desc`
+	if limit > 0 {
+		query += ` | limit ` + strconv.Itoa(limit)
+	}
+	return query
+}
+
+func readVLogsErrorLines(r io.Reader, handle func([]byte)) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64<<10), maxVLogsErrorLineBytes)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		handle(line)
+	}
+	return scanner.Err()
+}
+
+func (g *Gateway) queryIssueEvents(c fiber.Ctx, fingerprint, eventID string, limit int) ([]issueEventDTO, error) {
+	query := issueEventsLogsQL(fingerprint, eventID, limit)
 	target := strings.TrimRight(
 		g.storage.LogsBase(),
 		"/",
@@ -654,18 +718,23 @@ func (g *Gateway) queryIssueEvents(c fiber.Ctx, fingerprint, eventID string, lim
 		return nil, fmt.Errorf("VLogs query status %d", resp.StatusCode)
 	}
 	result := make([]issueEventDTO, 0)
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 4096), maxErrorEventSize*2)
-	for scanner.Scan() {
+	seen := make(map[string]struct{})
+	err = readVLogsErrorLines(resp.Body, func(line []byte) {
 		var record map[string]json.RawMessage
-		if json.Unmarshal(scanner.Bytes(), &record) != nil {
-			continue
+		if json.Unmarshal(line, &record) != nil {
+			return
 		}
-		if event, ok := decodeIssueEvent(record); ok {
-			result = append(result, event)
+		event, ok := decodeIssueEvent(record)
+		if !ok {
+			return
 		}
-	}
-	return result, scanner.Err()
+		if _, dup := seen[event.EventID]; dup {
+			return
+		}
+		seen[event.EventID] = struct{}{}
+		result = append(result, event)
+	})
+	return result, err
 }
 
 func decodeIssueEvent(record map[string]json.RawMessage) (issueEventDTO, bool) {
@@ -728,7 +797,9 @@ func sameStacktrace(a, b errortrack.Stacktrace) bool {
 
 func issueCulprit(row meta.IssueView, events []issueEventDTO) string {
 	for _, event := range events {
-		for _, frame := range event.Exception.Stacktrace.Frames {
+		frames := event.Exception.Stacktrace.Frames
+		for i := len(frames) - 1; i >= 0; i-- {
+			frame := frames[i]
 			if !frame.InApp {
 				continue
 			}
@@ -746,11 +817,14 @@ func issueCulprit(row meta.IssueView, events []issueEventDTO) string {
 	return row.Title
 }
 
-type issueHitsResponse struct {
-	Hits []struct {
-		Fields map[string]string `json:"fields"`
-		Values []json.Number     `json:"values"`
-	} `json:"hits"`
+type issueTrendRangeResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		Result []struct {
+			Metric map[string]string   `json:"metric"`
+			Values [][]json.RawMessage `json:"values"`
+		} `json:"result"`
+	} `json:"data"`
 }
 
 func (g *Gateway) queryIssueTrends(
@@ -768,14 +842,16 @@ func (g *Gateway) queryIssueTrends(
 		return result, nil
 	}
 	now := g.now().UTC()
-	query := `_stream:{event_type="error"} AND fingerprint:in(` + strings.Join(filters, ",") + `)`
-	target := strings.TrimRight(g.storage.LogsBase(), "/") + "/select/logsql/hits?" + url.Values{
-		"query":        []string{query},
-		"start":        []string{now.Add(-issueTrendBuckets * 24 * time.Hour).Format(time.RFC3339Nano)},
-		"end":          []string{now.Format(time.RFC3339Nano)},
-		"step":         []string{"24h"},
-		"field":        []string{"fingerprint"},
-		"fields_limit": []string{strconv.Itoa(len(rows))},
+	today := now.Truncate(24 * time.Hour)
+	firstDay := today.Add(-(issueTrendBuckets - 1) * 24 * time.Hour)
+	end := today.Add(24 * time.Hour)
+	query := `_stream:{event_type="error"} AND fingerprint:in(` +
+		strings.Join(filters, ",") + `) | stats by (fingerprint) count_uniq(event_id) as hits`
+	target := strings.TrimRight(g.storage.LogsBase(), "/") + "/select/logsql/stats_query_range?" + url.Values{
+		"query": []string{query},
+		"start": []string{firstDay.Format(time.RFC3339Nano)},
+		"end":   []string{end.Format(time.RFC3339Nano)},
+		"step":  []string{"24h"},
 	}.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
@@ -788,32 +864,43 @@ func (g *Gateway) queryIssueTrends(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("VLogs hits status %d", resp.StatusCode)
+		return nil, fmt.Errorf("VLogs stats_query_range status %d", resp.StatusCode)
 	}
-	var payload issueHitsResponse
+	var payload issueTrendRangeResponse
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, 4<<20))
 	decoder.UseNumber()
 	if err := decoder.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode VLogs hits: %w", err)
+		return nil, fmt.Errorf("decode VLogs trend stats: %w", err)
 	}
-	for _, hit := range payload.Hits {
-		fingerprint := hit.Fields["fingerprint"]
+	for _, series := range payload.Data.Result {
+		fingerprint := series.Metric["fingerprint"]
 		trend, exists := result[fingerprint]
 		if !exists {
 			continue
 		}
-		values := make([]int64, 0, len(hit.Values))
-		for _, value := range hit.Values {
-			count, err := value.Int64()
-			if err != nil || count < 0 {
-				return nil, fmt.Errorf("invalid VLogs hit count %q", value)
+		for _, pair := range series.Values {
+			if len(pair) < 2 {
+				continue
 			}
-			values = append(values, count)
+			var tsNum float64
+			if err := json.Unmarshal(pair[0], &tsNum); err != nil {
+				return nil, fmt.Errorf("invalid VLogs trend timestamp %s", pair[0])
+			}
+			var countText string
+			if err := json.Unmarshal(pair[1], &countText); err != nil {
+				return nil, fmt.Errorf("invalid VLogs trend count %s", pair[1])
+			}
+			count, err := strconv.ParseInt(countText, 10, 64)
+			if err != nil || count < 0 {
+				return nil, fmt.Errorf("invalid VLogs trend count %q", countText)
+			}
+			sampleDay := time.Unix(int64(tsNum), 0).UTC().Truncate(24 * time.Hour)
+			bucket := int(sampleDay.Sub(firstDay) / (24 * time.Hour))
+			if bucket < 0 || bucket >= issueTrendBuckets {
+				continue
+			}
+			trend[bucket] = count
 		}
-		if len(values) > issueTrendBuckets {
-			values = values[len(values)-issueTrendBuckets:]
-		}
-		copy(trend[issueTrendBuckets-len(values):], values)
 	}
 	return result, nil
 }

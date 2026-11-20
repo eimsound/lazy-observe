@@ -11,6 +11,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/auditevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/inhibitionrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
+	"github.com/eimsound/lazy-observe/internal/db/ent/issuelifecycleevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/notificationchannel"
 	"github.com/eimsound/lazy-observe/internal/db/ent/platformkeyfingerprint"
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
@@ -222,6 +223,42 @@ func init() {
 	issueDescLastEventID := issueFields[11].Descriptor()
 	// issue.LastEventIDValidator is a validator for the "last_event_id" field. It is called by the builders before save.
 	issue.LastEventIDValidator = issueDescLastEventID.Validators[0].(func(string) error)
+	issuelifecycleeventFields := schema.IssueLifecycleEvent{}.Fields()
+	_ = issuelifecycleeventFields
+	// issuelifecycleeventDescInboxItemID is the schema descriptor for inbox_item_id field.
+	issuelifecycleeventDescInboxItemID := issuelifecycleeventFields[2].Descriptor()
+	// issuelifecycleevent.InboxItemIDValidator is a validator for the "inbox_item_id" field. It is called by the builders before save.
+	issuelifecycleevent.InboxItemIDValidator = issuelifecycleeventDescInboxItemID.Validators[0].(func(int64) error)
+	// issuelifecycleeventDescClaimOwner is the schema descriptor for claim_owner field.
+	issuelifecycleeventDescClaimOwner := issuelifecycleeventFields[9].Descriptor()
+	// issuelifecycleevent.DefaultClaimOwner holds the default value on creation for the claim_owner field.
+	issuelifecycleevent.DefaultClaimOwner = issuelifecycleeventDescClaimOwner.Default.(string)
+	// issuelifecycleeventDescClaimEpoch is the schema descriptor for claim_epoch field.
+	issuelifecycleeventDescClaimEpoch := issuelifecycleeventFields[11].Descriptor()
+	// issuelifecycleevent.DefaultClaimEpoch holds the default value on creation for the claim_epoch field.
+	issuelifecycleevent.DefaultClaimEpoch = issuelifecycleeventDescClaimEpoch.Default.(int64)
+	// issuelifecycleevent.ClaimEpochValidator is a validator for the "claim_epoch" field. It is called by the builders before save.
+	issuelifecycleevent.ClaimEpochValidator = issuelifecycleeventDescClaimEpoch.Validators[0].(func(int64) error)
+	// issuelifecycleeventDescAttempts is the schema descriptor for attempts field.
+	issuelifecycleeventDescAttempts := issuelifecycleeventFields[12].Descriptor()
+	// issuelifecycleevent.DefaultAttempts holds the default value on creation for the attempts field.
+	issuelifecycleevent.DefaultAttempts = issuelifecycleeventDescAttempts.Default.(int)
+	// issuelifecycleevent.AttemptsValidator is a validator for the "attempts" field. It is called by the builders before save.
+	issuelifecycleevent.AttemptsValidator = issuelifecycleeventDescAttempts.Validators[0].(func(int) error)
+	// issuelifecycleeventDescLastError is the schema descriptor for last_error field.
+	issuelifecycleeventDescLastError := issuelifecycleeventFields[13].Descriptor()
+	// issuelifecycleevent.DefaultLastError holds the default value on creation for the last_error field.
+	issuelifecycleevent.DefaultLastError = issuelifecycleeventDescLastError.Default.(string)
+	// issuelifecycleeventDescCreatedAt is the schema descriptor for created_at field.
+	issuelifecycleeventDescCreatedAt := issuelifecycleeventFields[15].Descriptor()
+	// issuelifecycleevent.DefaultCreatedAt holds the default value on creation for the created_at field.
+	issuelifecycleevent.DefaultCreatedAt = issuelifecycleeventDescCreatedAt.Default.(func() time.Time)
+	// issuelifecycleeventDescUpdatedAt is the schema descriptor for updated_at field.
+	issuelifecycleeventDescUpdatedAt := issuelifecycleeventFields[16].Descriptor()
+	// issuelifecycleevent.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	issuelifecycleevent.DefaultUpdatedAt = issuelifecycleeventDescUpdatedAt.Default.(func() time.Time)
+	// issuelifecycleevent.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	issuelifecycleevent.UpdateDefaultUpdatedAt = issuelifecycleeventDescUpdatedAt.UpdateDefault.(func() time.Time)
 	notificationchannelFields := schema.NotificationChannel{}.Fields()
 	_ = notificationchannelFields
 	// notificationchannelDescName is the schema descriptor for name field.
@@ -496,26 +533,32 @@ func init() {
 	telemetryinboxDescClaimOwner := telemetryinboxFields[9].Descriptor()
 	// telemetryinbox.DefaultClaimOwner holds the default value on creation for the claim_owner field.
 	telemetryinbox.DefaultClaimOwner = telemetryinboxDescClaimOwner.Default.(string)
+	// telemetryinboxDescClaimEpoch is the schema descriptor for claim_epoch field.
+	telemetryinboxDescClaimEpoch := telemetryinboxFields[11].Descriptor()
+	// telemetryinbox.DefaultClaimEpoch holds the default value on creation for the claim_epoch field.
+	telemetryinbox.DefaultClaimEpoch = telemetryinboxDescClaimEpoch.Default.(int64)
+	// telemetryinbox.ClaimEpochValidator is a validator for the "claim_epoch" field. It is called by the builders before save.
+	telemetryinbox.ClaimEpochValidator = telemetryinboxDescClaimEpoch.Validators[0].(func(int64) error)
 	// telemetryinboxDescAttempts is the schema descriptor for attempts field.
-	telemetryinboxDescAttempts := telemetryinboxFields[11].Descriptor()
+	telemetryinboxDescAttempts := telemetryinboxFields[12].Descriptor()
 	// telemetryinbox.DefaultAttempts holds the default value on creation for the attempts field.
 	telemetryinbox.DefaultAttempts = telemetryinboxDescAttempts.Default.(int)
 	// telemetryinbox.AttemptsValidator is a validator for the "attempts" field. It is called by the builders before save.
 	telemetryinbox.AttemptsValidator = telemetryinboxDescAttempts.Validators[0].(func(int) error)
 	// telemetryinboxDescLastError is the schema descriptor for last_error field.
-	telemetryinboxDescLastError := telemetryinboxFields[12].Descriptor()
+	telemetryinboxDescLastError := telemetryinboxFields[13].Descriptor()
 	// telemetryinbox.DefaultLastError holds the default value on creation for the last_error field.
 	telemetryinbox.DefaultLastError = telemetryinboxDescLastError.Default.(string)
 	// telemetryinboxDescOutcome is the schema descriptor for outcome field.
-	telemetryinboxDescOutcome := telemetryinboxFields[13].Descriptor()
+	telemetryinboxDescOutcome := telemetryinboxFields[14].Descriptor()
 	// telemetryinbox.DefaultOutcome holds the default value on creation for the outcome field.
 	telemetryinbox.DefaultOutcome = telemetryinboxDescOutcome.Default.(string)
 	// telemetryinboxDescCreatedAt is the schema descriptor for created_at field.
-	telemetryinboxDescCreatedAt := telemetryinboxFields[16].Descriptor()
+	telemetryinboxDescCreatedAt := telemetryinboxFields[17].Descriptor()
 	// telemetryinbox.DefaultCreatedAt holds the default value on creation for the created_at field.
 	telemetryinbox.DefaultCreatedAt = telemetryinboxDescCreatedAt.Default.(func() time.Time)
 	// telemetryinboxDescUpdatedAt is the schema descriptor for updated_at field.
-	telemetryinboxDescUpdatedAt := telemetryinboxFields[17].Descriptor()
+	telemetryinboxDescUpdatedAt := telemetryinboxFields[18].Descriptor()
 	// telemetryinbox.DefaultUpdatedAt holds the default value on creation for the updated_at field.
 	telemetryinbox.DefaultUpdatedAt = telemetryinboxDescUpdatedAt.Default.(func() time.Time)
 	// telemetryinbox.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.

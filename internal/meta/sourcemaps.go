@@ -9,14 +9,25 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
 	"github.com/eimsound/lazy-observe/internal/db/ent/sourcemapartifact"
 )
+
+const sourceMapAdvisoryLockNamespace = 7301
+
+var ErrSourceMapQuotaExceeded = errors.New("source map release archive limit exceeded")
 
 type SourceMapRelease struct {
 	Release   string    `json:"release"`
 	Files     int       `json:"files"`
 	Size      int64     `json:"size"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type SourceMapArtifactInput struct {
+	Filename string
+	Size     int64
+	SHA256   string
 }
 
 func (s *Store) UpsertSourceMapArtifact(
@@ -27,21 +38,111 @@ func (s *Store) UpsertSourceMapArtifact(
 	sha256 string,
 	createdAt time.Time,
 ) error {
-	row, err := s.client.SourceMapArtifact.Query().Where(
-		sourcemapartifact.ProjectIDEQ(projectID),
-		sourcemapartifact.ReleaseEQ(release), sourcemapartifact.FilenameEQ(filename),
-	).
-		Only(ctx)
-	if err == nil {
-		_, err = row.Update().SetSize(size).SetSha256(sha256).Save(ctx)
-		return err
-	}
-	if !IsNotFound(err) {
-		return err
-	}
-	_, err = s.client.SourceMapArtifact.Create().SetProjectID(projectID).SetRelease(release).SetFilename(filename).
-		SetSize(size).SetSha256(sha256).SetCreatedAt(createdAt).Save(ctx)
+	_, err := s.db.ExecContext(ctx, bind(s.dialect, `INSERT INTO source_map_artifacts(
+		release, filename, size, sha256, created_at, project_id
+	) VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT(project_id, release, filename) DO UPDATE SET
+		size = excluded.size,
+		sha256 = excluded.sha256`),
+		release, filename, size, sha256, createdAt.UTC(), projectID)
 	return err
+}
+
+// UpsertSourceMapArtifacts atomically validates per-release file count and byte
+// quotas and upserts all artifacts in one transaction, eliminating quota TOCTOU
+// races and concurrent duplicate-key 500s.
+func (s *Store) UpsertSourceMapArtifacts(
+	ctx context.Context,
+	projectID int,
+	release string,
+	items []SourceMapArtifactInput,
+	maxFiles int,
+	maxBytes int64,
+	createdAt time.Time,
+) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if s.dialect != dialect.Postgres {
+		s.sourceMapMu.Lock()
+		defer s.sourceMapMu.Unlock()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin source map upsert: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if s.dialect == dialect.Postgres {
+		if _, err := tx.ExecContext(
+			ctx,
+			`SELECT pg_advisory_xact_lock($1, $2)`,
+			sourceMapAdvisoryLockNamespace,
+			projectID,
+		); err != nil {
+			return fmt.Errorf("lock source map release quota: %w", err)
+		}
+	}
+	incoming := make(map[string]SourceMapArtifactInput, len(items))
+	var incomingBytes int64
+	for _, item := range items {
+		if prev, dup := incoming[item.Filename]; dup {
+			incomingBytes -= prev.Size
+		}
+		incoming[item.Filename] = item
+		incomingBytes += item.Size
+	}
+	rows, err := tx.QueryContext(ctx, bind(s.dialect, `SELECT filename, size FROM source_map_artifacts
+		WHERE project_id = ? AND release = ?`), projectID, release)
+	if err != nil {
+		return fmt.Errorf("read existing source map release quota: %w", err)
+	}
+	existingCount := 0
+	var existingBytes int64
+	for rows.Next() {
+		var filename string
+		var size int64
+		if err := rows.Scan(&filename, &size); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan source map release quota: %w", err)
+		}
+		if _, replaced := incoming[filename]; replaced {
+			continue
+		}
+		existingCount++
+		existingBytes += size
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("iterate source map release quota: %w", err)
+	}
+	if (maxFiles > 0 && existingCount+len(incoming) > maxFiles) ||
+		(maxBytes > 0 && existingBytes+incomingBytes > maxBytes) {
+		return ErrSourceMapQuotaExceeded
+	}
+	now := createdAt.UTC()
+	upsertQuery := bind(s.dialect, `INSERT INTO source_map_artifacts(
+		release, filename, size, sha256, created_at, project_id
+	) VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT(project_id, release, filename) DO UPDATE SET
+		size = excluded.size,
+		sha256 = excluded.sha256`)
+	for _, item := range items {
+		if _, err := tx.ExecContext(
+			ctx,
+			upsertQuery,
+			release,
+			item.Filename,
+			item.Size,
+			item.SHA256,
+			now,
+			projectID,
+		); err != nil {
+			return fmt.Errorf("upsert source map artifact %q: %w", item.Filename, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit source map upsert: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) SourceMapArtifacts(ctx context.Context, projectID int, release string) ([]*SourceMapArtifact, error) {
@@ -87,9 +188,13 @@ func (s *Store) DeleteSourceMapArtifacts(ctx context.Context, projectID int, rel
 // ReferencedSourceMapDigests returns every revision digest of a project that is
 // still needed: referenced by a stored artifact, or captured in the snapshot of
 // Inbox work that may still be symbolicated (ADR 0007). Both reads share one
-// transaction so retention sees a single consistent view.
+// repeatable-read snapshot transaction so retention sees a single consistent view.
 func (s *Store) ReferencedSourceMapDigests(ctx context.Context, projectID int) (map[string]bool, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	txOpts := &sql.TxOptions{ReadOnly: true}
+	if s.dialect == dialect.Postgres {
+		txOpts.Isolation = sql.LevelRepeatableRead
+	}
+	tx, err := s.db.BeginTx(ctx, txOpts)
 	if err != nil {
 		return nil, err
 	}

@@ -38,6 +38,7 @@ func (s *errorStorage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/insert/jsonline":
 		scanner := bufio.NewScanner(r.Body)
+		scanner.Buffer(make([]byte, 64<<10), maxVLogsErrorLineBytes)
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.logs == nil {
@@ -55,12 +56,39 @@ func (s *errorStorage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		records := append([]map[string]any(nil), s.logs[tenant]...)
 		s.mu.Unlock()
+		if strings.Contains(query, "sort by (_time) desc") {
+			// Sort matched records by timestamp descending so the mock reflects
+			// LogsQL's sort pipe.
+			for i := 0; i < len(records); i++ {
+				for j := i + 1; j < len(records); j++ {
+					ti, _ := records[i]["timestamp"].(string)
+					tj, _ := records[j]["timestamp"].(string)
+					if tj > ti {
+						records[i], records[j] = records[j], records[i]
+					}
+				}
+			}
+		} else {
+			// Reverse to keep legacy insertion order when unsorted.
+			for i, j := 0, len(records)-1; i < j; i, j = i+1, j-1 {
+				records[i], records[j] = records[j], records[i]
+			}
+		}
 		encoder := json.NewEncoder(w)
 		written := 0
-		for i := len(records) - 1; i >= 0; i-- {
-			record := records[i]
+		dedup := strings.Contains(query, "uniq by (event_id")
+		seen := make(map[string]struct{})
+		for _, record := range records {
 			if !queryMatchesRecord(query, record) {
 				continue
+			}
+			if dedup {
+				if eid, _ := record["event_id"].(string); eid != "" {
+					if _, dup := seen[eid]; dup {
+						continue
+					}
+					seen[eid] = struct{}{}
+				}
 			}
 			_ = encoder.Encode(record)
 			written++
@@ -68,6 +96,66 @@ func (s *errorStorage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+	case "/select/logsql/stats_query_range":
+		query := r.URL.Query().Get("query")
+		start, startErr := time.Parse(time.RFC3339Nano, r.URL.Query().Get("start"))
+		end, endErr := time.Parse(time.RFC3339Nano, r.URL.Query().Get("end"))
+		if startErr != nil || endErr != nil || !end.After(start) {
+			http.Error(w, "invalid range", http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		records := append([]map[string]any(nil), s.logs[tenant]...)
+		s.mu.Unlock()
+		dedup := strings.Contains(query, "count_uniq(event_id)")
+		type bucketKey struct {
+			fingerprint string
+			dayUnix     int64
+		}
+		counts := make(map[bucketKey]int64)
+		seenEvents := make(map[string]struct{})
+		byFP := make(map[string]map[int64]int64)
+		for _, record := range records {
+			fingerprint, _ := record["fingerprint"].(string)
+			if fingerprint == "" || !strings.Contains(query, strconv.Quote(fingerprint)) {
+				continue
+			}
+			atText, _ := record["timestamp"].(string)
+			at, err := time.Parse(time.RFC3339Nano, atText)
+			if err != nil || at.Before(start) || at.After(end) {
+				continue
+			}
+			dayUnix := at.UTC().Truncate(24 * time.Hour).Unix()
+			if dedup {
+				if eid, _ := record["event_id"].(string); eid != "" {
+					key := fmt.Sprintf("%s|%d|%s", fingerprint, dayUnix, eid)
+					if _, dup := seenEvents[key]; dup {
+						continue
+					}
+					seenEvents[key] = struct{}{}
+				}
+			}
+			counts[bucketKey{fingerprint: fingerprint, dayUnix: dayUnix}]++
+			if byFP[fingerprint] == nil {
+				byFP[fingerprint] = make(map[int64]int64)
+			}
+			byFP[fingerprint][dayUnix] = counts[bucketKey{fingerprint: fingerprint, dayUnix: dayUnix}]
+		}
+		result := make([]map[string]any, 0, len(byFP))
+		for fingerprint, days := range byFP {
+			values := make([][]any, 0, len(days))
+			for dayUnix, count := range days {
+				values = append(values, []any{dayUnix, strconv.FormatInt(count, 10)})
+			}
+			result = append(result, map[string]any{
+				"metric": map[string]string{"__name__": "hits", "fingerprint": fingerprint},
+				"values": values,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"data":   map[string]any{"resultType": "matrix", "result": result},
+		})
 	case "/select/logsql/hits":
 		query := r.URL.Query().Get("query")
 		start, startErr := time.Parse(time.RFC3339Nano, r.URL.Query().Get("start"))
@@ -948,7 +1036,7 @@ func TestSDKDiagnosticsIngestWritesLowCardinalityCounter(t *testing.T) {
 	if result.Accepted != 1 || result.Rejected != 0 {
 		t.Fatalf("response=%s want accepted=1 rejected=0", payload)
 	}
-	want := `lazy_observe_sdk_dropped_telemetry{project_id="browser-diagnostics",` +
+	want := `lazy_observe_sdk_dropped_telemetry_delta{project_id="browser-diagnostics",` +
 		`service_name="checkout-browser",sdk_language="browser",signal="replay",` +
 		`reason="retry_exhausted"} 3 1787488496789`
 	if samples := setup.samples(); !strings.Contains(samples, want) {
@@ -1894,4 +1982,225 @@ func issueWithCount(rows []map[string]any, count float64) map[string]any {
 		}
 	}
 	return nil
+}
+
+func TestLargeErrorEventRoundTripsThroughVLogsAndDeduplicates(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	project, err := store.CreateProject(ctx, "Large", "large")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := store.CreateProjectAPIToken(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := sessionCookie(t, store, "large-admin", "password", "admin")
+	storage := &errorStorage{}
+	upstream := httptest.NewServer(storage)
+	defer upstream.Close()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	gw := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Logs: upstream.URL,
+		Now: func() time.Time { return now },
+	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	// 150 KiB valid event with quotes that expand past 400 KiB once stored in
+	// VLogs as both raw_event and symbolicated_event escaped strings.
+	largeMsg := strings.Repeat(`"quoted\segment"`, 9000)
+	event := map[string]any{
+		"event_id":  "large-valid-event",
+		"timestamp": now.Add(-time.Minute).Format(time.RFC3339Nano),
+		"platform":  "go",
+		"level":     "error",
+		"message":   largeMsg,
+		"exception": map[string]any{
+			"type":  "LargePayloadError",
+			"value": "still valid under 200 KiB",
+			"stacktrace": map[string]any{
+				"frames": []map[string]any{{"function": "svc.Big", "filename": "big.go", "in_app": true}},
+			},
+		},
+	}
+	postErrorsTest(t, gw.App(), token, []any{event}, http.StatusOK)
+	issues := waitForIssueLengthTest(t, gw.App(), cookie, project.Slug, 1)
+	issueID := int(issues[0]["id"].(float64))
+
+	// Duplicate the same physical record in VLogs (simulating at-least-once
+	// retry recovery) and add an older event to test dedup + _time desc sort.
+	storage.mu.Lock()
+	tenant := strconv.Itoa(project.ID)
+	if len(storage.logs[tenant]) == 1 {
+		dup := make(map[string]any, len(storage.logs[tenant][0]))
+		for k, v := range storage.logs[tenant][0] {
+			dup[k] = v
+		}
+		storage.logs[tenant] = append(storage.logs[tenant], dup)
+	}
+	storage.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/issues/"+strconv.Itoa(issueID), nil)
+	req.AddCookie(cookie)
+	req.Header.Set("X-LO-Project", project.Slug)
+	resp, err := gw.App().Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("large event issue detail status=%d body=%s", resp.StatusCode, body)
+	}
+	var detail struct {
+		Trend  []int64 `json:"trend"`
+		Events []struct {
+			EventID string `json:"event_id"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(body, &detail); err != nil {
+		t.Fatalf("decode detail: %v body=%s", err, body)
+	}
+	if len(detail.Events) != 1 || detail.Events[0].EventID != "large-valid-event" {
+		t.Fatalf("expected deduplicated single event, got %#v", detail.Events)
+	}
+	var trendSum int64
+	for _, n := range detail.Trend {
+		trendSum += n
+	}
+	if trendSum != 1 {
+		t.Fatalf("expected deduplicated trend sum=1, got %d (%v)", trendSum, detail.Trend)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/issues/"+strconv.Itoa(issueID)+"/events/large-valid-event", nil)
+	req.AddCookie(cookie)
+	req.Header.Set("X-LO-Project", project.Slug)
+	resp, err = gw.App().Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"event_id":"large-valid-event"`)) {
+		t.Fatalf("large event detail status=%d len=%d", resp.StatusCode, len(body))
+	}
+}
+
+func TestSourceMapUploadRejectsInvalidV3StripsSourcesContentAndPreservesPaths(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	p, _ := store.CreateProject(ctx, "Maps", "maps")
+	uploadToken := createUploadTokenTest(t, store, p.ID)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Blobs: blobs})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	// Malformed v3 maps that trigger go-sourcemap panics must be rejected at upload time.
+	for _, bad := range []string{
+		`{"version":3,"sections":[{}]}`,
+		`{"version":3,"sources":["a.js"],"names":[],"mappings":"ACAA"}`,
+		`not-json`,
+	} {
+		uploadSourceMapTest(t, gw.App(), uploadToken, "bad-rel", "app.js", []byte(bad), http.StatusBadRequest)
+	}
+
+	// Upload two files with the same basename under different paths and with sourcesContent.
+	mapWithContent := []byte(
+		`{"version":3,"sources":["src/a.ts"],"sourcesContent":["secret source"],"names":["fn"],"mappings":"AAAAA"}`,
+	)
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	p1, _ := w.CreateFormFile("chunks/index.js", "index.js.map")
+	_, _ = p1.Write(mapWithContent)
+	p2, _ := w.CreateFormFile("pages/index.js", "index.js.map")
+	_, _ = p2.Write(mapWithContent)
+	_ = w.Close()
+	req := httptest.NewRequest(http.MethodPost, "/api/releases/paths-v1/sourcemaps", &body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+uploadToken)
+	resp, err := gw.App().Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("multi-path upload status=%d body=%s", resp.StatusCode, respBody)
+	}
+	artifacts, err := store.SourceMapArtifacts(ctx, p.ID, "paths-v1")
+	if err != nil || len(artifacts) != 2 ||
+		artifacts[0].Filename != "chunks/index.js" || artifacts[1].Filename != "pages/index.js" {
+		t.Fatalf("artifacts=%#v err=%v", artifacts, err)
+	}
+	r, err := blobs.Get(ctx, sourceMapRevisionKey(p.Slug, artifacts[0].Sha256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := io.ReadAll(r)
+	_ = r.Close()
+	if bytes.Contains(stored, []byte("sourcesContent")) || bytes.Contains(stored, []byte("secret source")) {
+		t.Fatalf("stored source map retained sourcesContent: %s", stored)
+	}
+}
+
+func TestPrometheusLabelEscapingAvoidsNonStandardGoEscapes(t *testing.T) {
+	setup := newMetricIngestGateway(t, "prom-escape")
+	at := time.Date(2026, 8, 23, 12, 34, 56, 789_000_000, time.UTC)
+
+	status, payload := setup.postVitals(t, []any{
+		vitalPayload("lcp", 12, "/页\t面\"a\\b\nc\r", at),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, payload)
+	}
+	samples := setup.samples()
+	if strings.Contains(samples, `\t`) || strings.Contains(samples, `\r`) || strings.Contains(samples, `\u`) {
+		t.Fatalf("non-standard Prometheus escape written: %q", samples)
+	}
+	want := `page="/页` + "\t" + `面\"a\\b\nc"`
+	if !strings.Contains(samples, want) {
+		t.Fatalf("samples=%q want substring=%q", samples, want)
+	}
+}
+
+func TestBatchUpdateIssuesRejectsZeroIDAndListIssuesHandlesOverflowPage(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	p, _ := store.CreateProject(ctx, "Batch", "batch")
+	cookie := sessionCookie(t, store, "batch-admin", "password", "admin")
+	storage := &errorStorage{}
+	upstream := httptest.NewServer(storage)
+	defer upstream.Close()
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Logs: upstream.URL})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	body := []byte(`{"ids":[0,1],"status":"resolved"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/batch", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-LO-Project", p.Slug)
+	req.AddCookie(cookie)
+	resp, err := gw.App().Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("batch with zero id status=%d want 400", resp.StatusCode)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/issues?page=9223372036854775807", nil)
+	req.Header.Set("X-LO-Project", p.Slug)
+	req.AddCookie(cookie)
+	resp, err = gw.App().Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(respBody, []byte(`"issues":[]`)) {
+		t.Fatalf("overflow page status=%d body=%s", resp.StatusCode, respBody)
+	}
 }

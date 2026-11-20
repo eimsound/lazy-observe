@@ -37,6 +37,8 @@ const (
 	FieldClaimOwner = "claim_owner"
 	// FieldClaimUntil holds the string denoting the claim_until field in the database.
 	FieldClaimUntil = "claim_until"
+	// FieldClaimEpoch holds the string denoting the claim_epoch field in the database.
+	FieldClaimEpoch = "claim_epoch"
 	// FieldAttempts holds the string denoting the attempts field in the database.
 	FieldAttempts = "attempts"
 	// FieldLastError holds the string denoting the last_error field in the database.
@@ -80,6 +82,7 @@ var Columns = []string{
 	FieldAvailableAt,
 	FieldClaimOwner,
 	FieldClaimUntil,
+	FieldClaimEpoch,
 	FieldAttempts,
 	FieldLastError,
 	FieldOutcome,
@@ -109,6 +112,10 @@ var (
 	PayloadBytesValidator func(int64) error
 	// DefaultClaimOwner holds the default value on creation for the "claim_owner" field.
 	DefaultClaimOwner string
+	// DefaultClaimEpoch holds the default value on creation for the "claim_epoch" field.
+	DefaultClaimEpoch int64
+	// ClaimEpochValidator is a validator for the "claim_epoch" field. It is called by the builders before save.
+	ClaimEpochValidator func(int64) error
 	// DefaultAttempts holds the default value on creation for the "attempts" field.
 	DefaultAttempts int
 	// AttemptsValidator is a validator for the "attempts" field. It is called by the builders before save.
@@ -204,6 +211,11 @@ func ByClaimOwner(opts ...sql.OrderTermOption) OrderOption {
 // ByClaimUntil orders the results by the claim_until field.
 func ByClaimUntil(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldClaimUntil, opts...).ToFunc()
+}
+
+// ByClaimEpoch orders the results by the claim_epoch field.
+func ByClaimEpoch(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldClaimEpoch, opts...).ToFunc()
 }
 
 // ByAttempts orders the results by the attempts field.

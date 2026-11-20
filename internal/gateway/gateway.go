@@ -110,6 +110,7 @@ type NotificationStore interface {
 
 type SourceMapStore interface {
 	UpsertSourceMapArtifact(context.Context, int, string, string, int64, string, time.Time) error
+	UpsertSourceMapArtifacts(context.Context, int, string, []meta.SourceMapArtifactInput, int, int64, time.Time) error
 	SourceMapArtifacts(context.Context, int, string) ([]*meta.SourceMapArtifact, error)
 	ListSourceMapReleases(context.Context, int, int) ([]meta.SourceMapRelease, error)
 	DeleteSourceMapArtifacts(context.Context, int, string) error
@@ -846,15 +847,15 @@ func (g *Gateway) healthz(c fiber.Ctx) error {
 		}
 	}
 	if g.errorTracker != nil {
-		diagnostics, err := g.errorTracker.Diagnostics(c.Context())
+		summary, err := g.errorTracker.Summary(c.Context())
 		if err != nil {
 			status = fiber.StatusServiceUnavailable
 			components["error_inbox"] = "diagnostics unavailable"
 		} else {
 			components["error_inbox"] = fmt.Sprintf(
 				"active_items=%d active_bytes=%d",
-				diagnostics.ActiveItems,
-				diagnostics.ActiveBytes,
+				summary.ActiveItems,
+				summary.ActiveBytes,
 			)
 		}
 	}

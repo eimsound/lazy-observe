@@ -139,7 +139,11 @@ func TestSourceMapsDeleteOnlyExpiredWholeReleases(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	deleted, err := (&SourceMaps{Metadata: store, Blobs: blobs}).Clean(ctx, now.Add(-90*24*time.Hour))
+	deleted, err := (&SourceMaps{
+		Metadata: store,
+		Blobs:    blobs,
+		Now:      func() time.Time { return time.Now().UTC().Add(time.Hour) },
+	}).Clean(ctx, now.Add(-90*24*time.Hour))
 	if err != nil || deleted != 3 {
 		t.Fatalf("deleted=%d err=%v", deleted, err)
 	}
@@ -155,6 +159,39 @@ func TestSourceMapsDeleteOnlyExpiredWholeReleases(t *testing.T) {
 		if rows, err := store.SourceMapArtifacts(ctx, project.ID, release); err != nil || len(rows) != want {
 			t.Errorf("%s metadata count=%d want %d err=%v", release, len(rows), want, err)
 		}
+	}
+}
+
+func TestSourceMapsSweepRespectsGracePeriod(t *testing.T) {
+	ctx := context.Background()
+	store, _ := openTestStore(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inFlight := digestOf('9')
+	if err := blobs.Put(ctx, revisionKey(inFlight), strings.NewReader("map")); err != nil {
+		t.Fatal(err)
+	}
+	cutoff := time.Now().UTC().Add(-90 * 24 * time.Hour)
+	// Within grace period: an in-flight upload whose DB upsert has not committed
+	// yet must not be deleted by sweepRevisions.
+	if _, err := (&SourceMaps{Metadata: store, Blobs: blobs}).Clean(ctx, cutoff); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blobs.Get(ctx, revisionKey(inFlight)); err != nil {
+		t.Fatalf("recently uploaded blob was deleted during grace period: %v", err)
+	}
+	// Past grace period: unreferenced orphan blob is reclaimed.
+	if _, err := (&SourceMaps{
+		Metadata: store,
+		Blobs:    blobs,
+		Now:      func() time.Time { return time.Now().UTC().Add(DefaultSourceMapGracePeriod + time.Minute) },
+	}).Clean(ctx, cutoff); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blobs.Get(ctx, revisionKey(inFlight)); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("orphan blob past grace period was not deleted: err=%v", err)
 	}
 }
 

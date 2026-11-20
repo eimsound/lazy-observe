@@ -118,7 +118,14 @@ func testErrorInboxCompletionReceiptIsAtomicAndDurable(t *testing.T, store *Stor
 		ProjectID: project.ID, Fingerprint: "receipt-fingerprint", Title: "ReceiptError: boom", Level: "error",
 		Count: 1, FirstSeen: occurredAt, LastSeen: occurredAt, LastEventID: entry.EventID,
 	}
-	changes, err := store.CompleteErrorEvent(ctx, claimed[0].ID, "receipt-worker", delta, acceptedAt.Add(time.Second))
+	changes, err := store.CompleteErrorEvent(
+		ctx,
+		claimed[0].ID,
+		"receipt-worker",
+		claimed[0].ClaimEpoch,
+		delta,
+		acceptedAt.Add(time.Second),
+	)
 	if err != nil || len(changes) != 1 || changes[0].Kind != "new_issue" {
 		t.Fatalf("changes=%#v err=%v", changes, err)
 	}
@@ -174,6 +181,7 @@ func testErrorInboxCompletionReceiptIsAtomicAndDurable(t *testing.T, store *Stor
 		ctx,
 		claimed[0].ID,
 		"receipt-worker",
+		claimed[0].ClaimEpoch,
 		delta,
 		acceptedAt.Add(2*time.Second),
 	); !errors.Is(err, errortrack.ErrClaimLost) {
@@ -195,4 +203,172 @@ func testErrorInboxCompletionReceiptIsAtomicAndDurable(t *testing.T, store *Stor
 	if err := store.AcceptErrorEvents(ctx, []errortrack.InboxEntry{entry}, capacity); err != nil {
 		t.Fatalf("reuse event ID after receipt expiry: %v", err)
 	}
+}
+
+func TestErrorInboxFencingRejectsStaleOwnerAndEpochAcrossDialects(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "Fence", "fence")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		payload := []byte(`{"event_id":"fence-1"}`)
+		capacity := errortrack.InboxCapacity{MaxItems: 10, MaxBytes: 1 << 20}
+		if err := store.AcceptErrorEvents(ctx, []errortrack.InboxEntry{{
+			ProjectID: project.ID, EventID: "fence-1", CanonicalDigest: "fence-digest",
+			Payload: payload, PayloadBytes: int64(len(payload)), OccurredAt: now, AcceptedAt: now,
+		}}, capacity); err != nil {
+			t.Fatal(err)
+		}
+		first, err := store.ClaimErrorEvents(ctx, "owner-a", 1, now, time.Second)
+		if err != nil || len(first) != 1 || first[0].ClaimEpoch != 1 {
+			t.Fatalf("first claim=%#v err=%v", first, err)
+		}
+		// Lease expires; owner-a itself (or another owner) re-claims with epoch 2.
+		second, err := store.ClaimErrorEvents(ctx, "owner-a", 1, now.Add(2*time.Second), time.Second)
+		if err != nil || len(second) != 1 || second[0].ClaimEpoch != 2 {
+			t.Fatalf("second claim=%#v err=%v", second, err)
+		}
+		delta := errortrack.IssueDelta{
+			ProjectID: project.ID, Fingerprint: "fp-fence", Title: "FenceErr", Level: "error",
+			Count: 1, FirstSeen: now, LastSeen: now, LastEventID: "fence-1",
+		}
+		if _, err := store.CompleteErrorEvent(
+			ctx,
+			first[0].ID,
+			"owner-a",
+			first[0].ClaimEpoch,
+			delta,
+			now.Add(3*time.Second),
+		); !errors.Is(
+			err,
+			errortrack.ErrClaimLost,
+		) {
+			t.Fatalf("stale epoch CompleteErrorEvent err=%v want ErrClaimLost", err)
+		}
+		if err := store.RetryErrorEvent(
+			ctx,
+			first[0].ID,
+			"owner-a",
+			first[0].ClaimEpoch,
+			now.Add(3*time.Second),
+			now.Add(4*time.Second),
+			"stale",
+		); !errors.Is(
+			err,
+			errortrack.ErrClaimLost,
+		) {
+			t.Fatalf("stale epoch RetryErrorEvent err=%v want ErrClaimLost", err)
+		}
+		if err := store.ReleaseErrorEvent(
+			ctx,
+			first[0].ID,
+			"owner-a",
+			first[0].ClaimEpoch,
+			now.Add(3*time.Second),
+		); !errors.Is(
+			err,
+			errortrack.ErrClaimLost,
+		) {
+			t.Fatalf("stale epoch ReleaseErrorEvent err=%v want ErrClaimLost", err)
+		}
+		if err := store.TerminalErrorEvent(
+			ctx,
+			first[0].ID,
+			"owner-a",
+			first[0].ClaimEpoch,
+			now.Add(3*time.Second),
+			2,
+			"stale",
+		); !errors.Is(
+			err,
+			errortrack.ErrClaimLost,
+		) {
+			t.Fatalf("stale epoch TerminalErrorEvent err=%v want ErrClaimLost", err)
+		}
+		// Current epoch succeeds and persists lifecycle event atomically.
+		changes, err := store.CompleteErrorEvent(
+			ctx,
+			second[0].ID,
+			"owner-a",
+			second[0].ClaimEpoch,
+			delta,
+			now.Add(3*time.Second),
+		)
+		if err != nil || len(changes) != 1 || changes[0].Kind != "new_issue" {
+			t.Fatalf("valid epoch CompleteErrorEvent changes=%#v err=%v", changes, err)
+		}
+		lifecycles, err := store.ClaimIssueLifecycleEvents(ctx, "owner-a", 10, now.Add(3*time.Second), time.Minute)
+		if err != nil || len(lifecycles) != 1 || lifecycles[0].Kind != "new_issue" ||
+			lifecycles[0].IssueID != changes[0].IssueID {
+			t.Fatalf("persisted lifecycle events=%#v err=%v", lifecycles, err)
+		}
+		if err := store.CompleteIssueLifecycleEvent(
+			ctx,
+			lifecycles[0].ID,
+			"owner-a",
+			lifecycles[0].ClaimEpoch,
+			now.Add(4*time.Second),
+		); err != nil {
+			t.Fatalf("complete lifecycle event: %v", err)
+		}
+	})
+}
+
+func TestErrorInboxConcurrentRetryAndCompleteAvoidDeadlockAcrossDialects(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "LockOrder", "lock-order")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		capacity := errortrack.InboxCapacity{MaxItems: 100, MaxBytes: 1 << 20}
+		const n = 20
+		entries := make([]errortrack.InboxEntry, 0, n)
+		for i := 0; i < n; i++ {
+			payload := []byte(fmt.Sprintf(`{"event_id":"lock-%d"}`, i))
+			entries = append(entries, errortrack.InboxEntry{
+				ProjectID: project.ID, EventID: fmt.Sprintf("lock-%d", i),
+				CanonicalDigest: fmt.Sprintf("lock-digest-%d", i), Payload: payload,
+				PayloadBytes: int64(len(payload)), OccurredAt: now, AcceptedAt: now,
+			})
+		}
+		if err := store.AcceptErrorEvents(ctx, entries, capacity); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := store.ClaimErrorEvents(ctx, "lock-worker", n, now, time.Minute)
+		if err != nil || len(claimed) != n {
+			t.Fatalf("claimed=%d err=%v", len(claimed), err)
+		}
+		var wg sync.WaitGroup
+		errs := make(chan error, n)
+		for idx, item := range claimed {
+			wg.Add(1)
+			go func(idx int, item errortrack.InboxItem) {
+				defer wg.Done()
+				if idx%2 == 0 {
+					errs <- store.RetryErrorEvent(ctx, item.ID, "lock-worker", item.ClaimEpoch, now.Add(time.Second), now.Add(2*time.Second), "retry")
+					return
+				}
+				_, err := store.CompleteErrorEvent(ctx, item.ID, "lock-worker", item.ClaimEpoch, errortrack.IssueDelta{
+					ProjectID: project.ID, Fingerprint: fmt.Sprintf("fp-%d", idx), Title: "LockErr", Level: "error",
+					Count: 1, FirstSeen: now, LastSeen: now, LastEventID: item.EventID,
+				}, now.Add(time.Second))
+				errs <- err
+			}(idx, item)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent retry/complete failed (possible AB-BA deadlock): %v", err)
+			}
+		}
+		summary, err := store.ErrorInboxSummary(ctx)
+		if err != nil || summary.ActiveItems != n/2 || summary.RetriesTotal != n/2 {
+			t.Fatalf("summary=%#v err=%v", summary, err)
+		}
+	})
 }

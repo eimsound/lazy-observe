@@ -17,6 +17,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/auditevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/inhibitionrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
+	"github.com/eimsound/lazy-observe/internal/db/ent/issuelifecycleevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/notificationchannel"
 	"github.com/eimsound/lazy-observe/internal/db/ent/platformkeyfingerprint"
 	"github.com/eimsound/lazy-observe/internal/db/ent/predicate"
@@ -51,6 +52,7 @@ const (
 	TypeAuditEvent             = "AuditEvent"
 	TypeInhibitionRule         = "InhibitionRule"
 	TypeIssue                  = "Issue"
+	TypeIssueLifecycleEvent    = "IssueLifecycleEvent"
 	TypeNotificationChannel    = "NotificationChannel"
 	TypePlatformKeyFingerprint = "PlatformKeyFingerprint"
 	TypeProfileMeta            = "ProfileMeta"
@@ -6319,6 +6321,1426 @@ func (m *IssueMutation) ResetEdge(name string) error {
 	return fmt.Errorf("unknown Issue edge %s", name)
 }
 
+// IssueLifecycleEventMutation represents an operation that mutates the IssueLifecycleEvent nodes in the graph.
+type IssueLifecycleEventMutation struct {
+	config
+	op               Op
+	typ              string
+	id               *int
+	issue_id         *int
+	addissue_id      *int
+	inbox_item_id    *int64
+	addinbox_item_id *int64
+	kind             *issuelifecycleevent.Kind
+	title            *string
+	level            *string
+	seen_at          *time.Time
+	status           *issuelifecycleevent.Status
+	available_at     *time.Time
+	claim_owner      *string
+	claim_until      *time.Time
+	claim_epoch      *int64
+	addclaim_epoch   *int64
+	attempts         *int
+	addattempts      *int
+	last_error       *string
+	dispatched_at    *time.Time
+	created_at       *time.Time
+	updated_at       *time.Time
+	clearedFields    map[string]struct{}
+	project          *int
+	clearedproject   bool
+	done             bool
+	oldValue         func(context.Context) (*IssueLifecycleEvent, error)
+	predicates       []predicate.IssueLifecycleEvent
+}
+
+var _ ent.Mutation = (*IssueLifecycleEventMutation)(nil)
+
+// issuelifecycleeventOption allows management of the mutation configuration using functional options.
+type issuelifecycleeventOption func(*IssueLifecycleEventMutation)
+
+// newIssueLifecycleEventMutation creates new mutation for the IssueLifecycleEvent entity.
+func newIssueLifecycleEventMutation(c config, op Op, opts ...issuelifecycleeventOption) *IssueLifecycleEventMutation {
+	m := &IssueLifecycleEventMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeIssueLifecycleEvent,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withIssueLifecycleEventID sets the ID field of the mutation.
+func withIssueLifecycleEventID(id int) issuelifecycleeventOption {
+	return func(m *IssueLifecycleEventMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *IssueLifecycleEvent
+		)
+		m.oldValue = func(ctx context.Context) (*IssueLifecycleEvent, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().IssueLifecycleEvent.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withIssueLifecycleEvent sets the old IssueLifecycleEvent of the mutation.
+func withIssueLifecycleEvent(node *IssueLifecycleEvent) issuelifecycleeventOption {
+	return func(m *IssueLifecycleEventMutation) {
+		m.oldValue = func(context.Context) (*IssueLifecycleEvent, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m IssueLifecycleEventMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m IssueLifecycleEventMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *IssueLifecycleEventMutation) ID() (id int, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *IssueLifecycleEventMutation) IDs(ctx context.Context) ([]int, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []int{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().IssueLifecycleEvent.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetProjectID sets the "project_id" field.
+func (m *IssueLifecycleEventMutation) SetProjectID(i int) {
+	m.project = &i
+}
+
+// ProjectID returns the value of the "project_id" field in the mutation.
+func (m *IssueLifecycleEventMutation) ProjectID() (r int, exists bool) {
+	v := m.project
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldProjectID returns the old "project_id" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldProjectID(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldProjectID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldProjectID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldProjectID: %w", err)
+	}
+	return oldValue.ProjectID, nil
+}
+
+// ResetProjectID resets all changes to the "project_id" field.
+func (m *IssueLifecycleEventMutation) ResetProjectID() {
+	m.project = nil
+}
+
+// SetIssueID sets the "issue_id" field.
+func (m *IssueLifecycleEventMutation) SetIssueID(i int) {
+	m.issue_id = &i
+	m.addissue_id = nil
+}
+
+// IssueID returns the value of the "issue_id" field in the mutation.
+func (m *IssueLifecycleEventMutation) IssueID() (r int, exists bool) {
+	v := m.issue_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldIssueID returns the old "issue_id" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldIssueID(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldIssueID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldIssueID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldIssueID: %w", err)
+	}
+	return oldValue.IssueID, nil
+}
+
+// AddIssueID adds i to the "issue_id" field.
+func (m *IssueLifecycleEventMutation) AddIssueID(i int) {
+	if m.addissue_id != nil {
+		*m.addissue_id += i
+	} else {
+		m.addissue_id = &i
+	}
+}
+
+// AddedIssueID returns the value that was added to the "issue_id" field in this mutation.
+func (m *IssueLifecycleEventMutation) AddedIssueID() (r int, exists bool) {
+	v := m.addissue_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetIssueID resets all changes to the "issue_id" field.
+func (m *IssueLifecycleEventMutation) ResetIssueID() {
+	m.issue_id = nil
+	m.addissue_id = nil
+}
+
+// SetInboxItemID sets the "inbox_item_id" field.
+func (m *IssueLifecycleEventMutation) SetInboxItemID(i int64) {
+	m.inbox_item_id = &i
+	m.addinbox_item_id = nil
+}
+
+// InboxItemID returns the value of the "inbox_item_id" field in the mutation.
+func (m *IssueLifecycleEventMutation) InboxItemID() (r int64, exists bool) {
+	v := m.inbox_item_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldInboxItemID returns the old "inbox_item_id" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldInboxItemID(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldInboxItemID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldInboxItemID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldInboxItemID: %w", err)
+	}
+	return oldValue.InboxItemID, nil
+}
+
+// AddInboxItemID adds i to the "inbox_item_id" field.
+func (m *IssueLifecycleEventMutation) AddInboxItemID(i int64) {
+	if m.addinbox_item_id != nil {
+		*m.addinbox_item_id += i
+	} else {
+		m.addinbox_item_id = &i
+	}
+}
+
+// AddedInboxItemID returns the value that was added to the "inbox_item_id" field in this mutation.
+func (m *IssueLifecycleEventMutation) AddedInboxItemID() (r int64, exists bool) {
+	v := m.addinbox_item_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetInboxItemID resets all changes to the "inbox_item_id" field.
+func (m *IssueLifecycleEventMutation) ResetInboxItemID() {
+	m.inbox_item_id = nil
+	m.addinbox_item_id = nil
+}
+
+// SetKind sets the "kind" field.
+func (m *IssueLifecycleEventMutation) SetKind(i issuelifecycleevent.Kind) {
+	m.kind = &i
+}
+
+// Kind returns the value of the "kind" field in the mutation.
+func (m *IssueLifecycleEventMutation) Kind() (r issuelifecycleevent.Kind, exists bool) {
+	v := m.kind
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldKind returns the old "kind" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldKind(ctx context.Context) (v issuelifecycleevent.Kind, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldKind is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldKind requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldKind: %w", err)
+	}
+	return oldValue.Kind, nil
+}
+
+// ResetKind resets all changes to the "kind" field.
+func (m *IssueLifecycleEventMutation) ResetKind() {
+	m.kind = nil
+}
+
+// SetTitle sets the "title" field.
+func (m *IssueLifecycleEventMutation) SetTitle(s string) {
+	m.title = &s
+}
+
+// Title returns the value of the "title" field in the mutation.
+func (m *IssueLifecycleEventMutation) Title() (r string, exists bool) {
+	v := m.title
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldTitle returns the old "title" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldTitle(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldTitle is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldTitle requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldTitle: %w", err)
+	}
+	return oldValue.Title, nil
+}
+
+// ResetTitle resets all changes to the "title" field.
+func (m *IssueLifecycleEventMutation) ResetTitle() {
+	m.title = nil
+}
+
+// SetLevel sets the "level" field.
+func (m *IssueLifecycleEventMutation) SetLevel(s string) {
+	m.level = &s
+}
+
+// Level returns the value of the "level" field in the mutation.
+func (m *IssueLifecycleEventMutation) Level() (r string, exists bool) {
+	v := m.level
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldLevel returns the old "level" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldLevel(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldLevel is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldLevel requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldLevel: %w", err)
+	}
+	return oldValue.Level, nil
+}
+
+// ResetLevel resets all changes to the "level" field.
+func (m *IssueLifecycleEventMutation) ResetLevel() {
+	m.level = nil
+}
+
+// SetSeenAt sets the "seen_at" field.
+func (m *IssueLifecycleEventMutation) SetSeenAt(t time.Time) {
+	m.seen_at = &t
+}
+
+// SeenAt returns the value of the "seen_at" field in the mutation.
+func (m *IssueLifecycleEventMutation) SeenAt() (r time.Time, exists bool) {
+	v := m.seen_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldSeenAt returns the old "seen_at" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldSeenAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldSeenAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldSeenAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldSeenAt: %w", err)
+	}
+	return oldValue.SeenAt, nil
+}
+
+// ResetSeenAt resets all changes to the "seen_at" field.
+func (m *IssueLifecycleEventMutation) ResetSeenAt() {
+	m.seen_at = nil
+}
+
+// SetStatus sets the "status" field.
+func (m *IssueLifecycleEventMutation) SetStatus(i issuelifecycleevent.Status) {
+	m.status = &i
+}
+
+// Status returns the value of the "status" field in the mutation.
+func (m *IssueLifecycleEventMutation) Status() (r issuelifecycleevent.Status, exists bool) {
+	v := m.status
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldStatus returns the old "status" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldStatus(ctx context.Context) (v issuelifecycleevent.Status, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldStatus is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldStatus requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldStatus: %w", err)
+	}
+	return oldValue.Status, nil
+}
+
+// ResetStatus resets all changes to the "status" field.
+func (m *IssueLifecycleEventMutation) ResetStatus() {
+	m.status = nil
+}
+
+// SetAvailableAt sets the "available_at" field.
+func (m *IssueLifecycleEventMutation) SetAvailableAt(t time.Time) {
+	m.available_at = &t
+}
+
+// AvailableAt returns the value of the "available_at" field in the mutation.
+func (m *IssueLifecycleEventMutation) AvailableAt() (r time.Time, exists bool) {
+	v := m.available_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldAvailableAt returns the old "available_at" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldAvailableAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldAvailableAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldAvailableAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldAvailableAt: %w", err)
+	}
+	return oldValue.AvailableAt, nil
+}
+
+// ResetAvailableAt resets all changes to the "available_at" field.
+func (m *IssueLifecycleEventMutation) ResetAvailableAt() {
+	m.available_at = nil
+}
+
+// SetClaimOwner sets the "claim_owner" field.
+func (m *IssueLifecycleEventMutation) SetClaimOwner(s string) {
+	m.claim_owner = &s
+}
+
+// ClaimOwner returns the value of the "claim_owner" field in the mutation.
+func (m *IssueLifecycleEventMutation) ClaimOwner() (r string, exists bool) {
+	v := m.claim_owner
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldClaimOwner returns the old "claim_owner" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldClaimOwner(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldClaimOwner is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldClaimOwner requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldClaimOwner: %w", err)
+	}
+	return oldValue.ClaimOwner, nil
+}
+
+// ResetClaimOwner resets all changes to the "claim_owner" field.
+func (m *IssueLifecycleEventMutation) ResetClaimOwner() {
+	m.claim_owner = nil
+}
+
+// SetClaimUntil sets the "claim_until" field.
+func (m *IssueLifecycleEventMutation) SetClaimUntil(t time.Time) {
+	m.claim_until = &t
+}
+
+// ClaimUntil returns the value of the "claim_until" field in the mutation.
+func (m *IssueLifecycleEventMutation) ClaimUntil() (r time.Time, exists bool) {
+	v := m.claim_until
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldClaimUntil returns the old "claim_until" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldClaimUntil(ctx context.Context) (v *time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldClaimUntil is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldClaimUntil requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldClaimUntil: %w", err)
+	}
+	return oldValue.ClaimUntil, nil
+}
+
+// ClearClaimUntil clears the value of the "claim_until" field.
+func (m *IssueLifecycleEventMutation) ClearClaimUntil() {
+	m.claim_until = nil
+	m.clearedFields[issuelifecycleevent.FieldClaimUntil] = struct{}{}
+}
+
+// ClaimUntilCleared returns if the "claim_until" field was cleared in this mutation.
+func (m *IssueLifecycleEventMutation) ClaimUntilCleared() bool {
+	_, ok := m.clearedFields[issuelifecycleevent.FieldClaimUntil]
+	return ok
+}
+
+// ResetClaimUntil resets all changes to the "claim_until" field.
+func (m *IssueLifecycleEventMutation) ResetClaimUntil() {
+	m.claim_until = nil
+	delete(m.clearedFields, issuelifecycleevent.FieldClaimUntil)
+}
+
+// SetClaimEpoch sets the "claim_epoch" field.
+func (m *IssueLifecycleEventMutation) SetClaimEpoch(i int64) {
+	m.claim_epoch = &i
+	m.addclaim_epoch = nil
+}
+
+// ClaimEpoch returns the value of the "claim_epoch" field in the mutation.
+func (m *IssueLifecycleEventMutation) ClaimEpoch() (r int64, exists bool) {
+	v := m.claim_epoch
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldClaimEpoch returns the old "claim_epoch" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldClaimEpoch(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldClaimEpoch is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldClaimEpoch requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldClaimEpoch: %w", err)
+	}
+	return oldValue.ClaimEpoch, nil
+}
+
+// AddClaimEpoch adds i to the "claim_epoch" field.
+func (m *IssueLifecycleEventMutation) AddClaimEpoch(i int64) {
+	if m.addclaim_epoch != nil {
+		*m.addclaim_epoch += i
+	} else {
+		m.addclaim_epoch = &i
+	}
+}
+
+// AddedClaimEpoch returns the value that was added to the "claim_epoch" field in this mutation.
+func (m *IssueLifecycleEventMutation) AddedClaimEpoch() (r int64, exists bool) {
+	v := m.addclaim_epoch
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetClaimEpoch resets all changes to the "claim_epoch" field.
+func (m *IssueLifecycleEventMutation) ResetClaimEpoch() {
+	m.claim_epoch = nil
+	m.addclaim_epoch = nil
+}
+
+// SetAttempts sets the "attempts" field.
+func (m *IssueLifecycleEventMutation) SetAttempts(i int) {
+	m.attempts = &i
+	m.addattempts = nil
+}
+
+// Attempts returns the value of the "attempts" field in the mutation.
+func (m *IssueLifecycleEventMutation) Attempts() (r int, exists bool) {
+	v := m.attempts
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldAttempts returns the old "attempts" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldAttempts(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldAttempts is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldAttempts requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldAttempts: %w", err)
+	}
+	return oldValue.Attempts, nil
+}
+
+// AddAttempts adds i to the "attempts" field.
+func (m *IssueLifecycleEventMutation) AddAttempts(i int) {
+	if m.addattempts != nil {
+		*m.addattempts += i
+	} else {
+		m.addattempts = &i
+	}
+}
+
+// AddedAttempts returns the value that was added to the "attempts" field in this mutation.
+func (m *IssueLifecycleEventMutation) AddedAttempts() (r int, exists bool) {
+	v := m.addattempts
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetAttempts resets all changes to the "attempts" field.
+func (m *IssueLifecycleEventMutation) ResetAttempts() {
+	m.attempts = nil
+	m.addattempts = nil
+}
+
+// SetLastError sets the "last_error" field.
+func (m *IssueLifecycleEventMutation) SetLastError(s string) {
+	m.last_error = &s
+}
+
+// LastError returns the value of the "last_error" field in the mutation.
+func (m *IssueLifecycleEventMutation) LastError() (r string, exists bool) {
+	v := m.last_error
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldLastError returns the old "last_error" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldLastError(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldLastError is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldLastError requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldLastError: %w", err)
+	}
+	return oldValue.LastError, nil
+}
+
+// ResetLastError resets all changes to the "last_error" field.
+func (m *IssueLifecycleEventMutation) ResetLastError() {
+	m.last_error = nil
+}
+
+// SetDispatchedAt sets the "dispatched_at" field.
+func (m *IssueLifecycleEventMutation) SetDispatchedAt(t time.Time) {
+	m.dispatched_at = &t
+}
+
+// DispatchedAt returns the value of the "dispatched_at" field in the mutation.
+func (m *IssueLifecycleEventMutation) DispatchedAt() (r time.Time, exists bool) {
+	v := m.dispatched_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldDispatchedAt returns the old "dispatched_at" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldDispatchedAt(ctx context.Context) (v *time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldDispatchedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldDispatchedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldDispatchedAt: %w", err)
+	}
+	return oldValue.DispatchedAt, nil
+}
+
+// ClearDispatchedAt clears the value of the "dispatched_at" field.
+func (m *IssueLifecycleEventMutation) ClearDispatchedAt() {
+	m.dispatched_at = nil
+	m.clearedFields[issuelifecycleevent.FieldDispatchedAt] = struct{}{}
+}
+
+// DispatchedAtCleared returns if the "dispatched_at" field was cleared in this mutation.
+func (m *IssueLifecycleEventMutation) DispatchedAtCleared() bool {
+	_, ok := m.clearedFields[issuelifecycleevent.FieldDispatchedAt]
+	return ok
+}
+
+// ResetDispatchedAt resets all changes to the "dispatched_at" field.
+func (m *IssueLifecycleEventMutation) ResetDispatchedAt() {
+	m.dispatched_at = nil
+	delete(m.clearedFields, issuelifecycleevent.FieldDispatchedAt)
+}
+
+// SetCreatedAt sets the "created_at" field.
+func (m *IssueLifecycleEventMutation) SetCreatedAt(t time.Time) {
+	m.created_at = &t
+}
+
+// CreatedAt returns the value of the "created_at" field in the mutation.
+func (m *IssueLifecycleEventMutation) CreatedAt() (r time.Time, exists bool) {
+	v := m.created_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldCreatedAt returns the old "created_at" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldCreatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldCreatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldCreatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldCreatedAt: %w", err)
+	}
+	return oldValue.CreatedAt, nil
+}
+
+// ResetCreatedAt resets all changes to the "created_at" field.
+func (m *IssueLifecycleEventMutation) ResetCreatedAt() {
+	m.created_at = nil
+}
+
+// SetUpdatedAt sets the "updated_at" field.
+func (m *IssueLifecycleEventMutation) SetUpdatedAt(t time.Time) {
+	m.updated_at = &t
+}
+
+// UpdatedAt returns the value of the "updated_at" field in the mutation.
+func (m *IssueLifecycleEventMutation) UpdatedAt() (r time.Time, exists bool) {
+	v := m.updated_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUpdatedAt returns the old "updated_at" field's value of the IssueLifecycleEvent entity.
+// If the IssueLifecycleEvent object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *IssueLifecycleEventMutation) OldUpdatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUpdatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUpdatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUpdatedAt: %w", err)
+	}
+	return oldValue.UpdatedAt, nil
+}
+
+// ResetUpdatedAt resets all changes to the "updated_at" field.
+func (m *IssueLifecycleEventMutation) ResetUpdatedAt() {
+	m.updated_at = nil
+}
+
+// ClearProject clears the "project" edge to the Project entity.
+func (m *IssueLifecycleEventMutation) ClearProject() {
+	m.clearedproject = true
+	m.clearedFields[issuelifecycleevent.FieldProjectID] = struct{}{}
+}
+
+// ProjectCleared reports if the "project" edge to the Project entity was cleared.
+func (m *IssueLifecycleEventMutation) ProjectCleared() bool {
+	return m.clearedproject
+}
+
+// ProjectIDs returns the "project" edge IDs in the mutation.
+// Note that IDs always returns len(IDs) <= 1 for unique edges, and you should use
+// ProjectID instead. It exists only for internal usage by the builders.
+func (m *IssueLifecycleEventMutation) ProjectIDs() (ids []int) {
+	if id := m.project; id != nil {
+		ids = append(ids, *id)
+	}
+	return
+}
+
+// ResetProject resets all changes to the "project" edge.
+func (m *IssueLifecycleEventMutation) ResetProject() {
+	m.project = nil
+	m.clearedproject = false
+}
+
+// Where appends a list predicates to the IssueLifecycleEventMutation builder.
+func (m *IssueLifecycleEventMutation) Where(ps ...predicate.IssueLifecycleEvent) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the IssueLifecycleEventMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *IssueLifecycleEventMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.IssueLifecycleEvent, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *IssueLifecycleEventMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *IssueLifecycleEventMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (IssueLifecycleEvent).
+func (m *IssueLifecycleEventMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *IssueLifecycleEventMutation) Fields() []string {
+	fields := make([]string, 0, 17)
+	if m.project != nil {
+		fields = append(fields, issuelifecycleevent.FieldProjectID)
+	}
+	if m.issue_id != nil {
+		fields = append(fields, issuelifecycleevent.FieldIssueID)
+	}
+	if m.inbox_item_id != nil {
+		fields = append(fields, issuelifecycleevent.FieldInboxItemID)
+	}
+	if m.kind != nil {
+		fields = append(fields, issuelifecycleevent.FieldKind)
+	}
+	if m.title != nil {
+		fields = append(fields, issuelifecycleevent.FieldTitle)
+	}
+	if m.level != nil {
+		fields = append(fields, issuelifecycleevent.FieldLevel)
+	}
+	if m.seen_at != nil {
+		fields = append(fields, issuelifecycleevent.FieldSeenAt)
+	}
+	if m.status != nil {
+		fields = append(fields, issuelifecycleevent.FieldStatus)
+	}
+	if m.available_at != nil {
+		fields = append(fields, issuelifecycleevent.FieldAvailableAt)
+	}
+	if m.claim_owner != nil {
+		fields = append(fields, issuelifecycleevent.FieldClaimOwner)
+	}
+	if m.claim_until != nil {
+		fields = append(fields, issuelifecycleevent.FieldClaimUntil)
+	}
+	if m.claim_epoch != nil {
+		fields = append(fields, issuelifecycleevent.FieldClaimEpoch)
+	}
+	if m.attempts != nil {
+		fields = append(fields, issuelifecycleevent.FieldAttempts)
+	}
+	if m.last_error != nil {
+		fields = append(fields, issuelifecycleevent.FieldLastError)
+	}
+	if m.dispatched_at != nil {
+		fields = append(fields, issuelifecycleevent.FieldDispatchedAt)
+	}
+	if m.created_at != nil {
+		fields = append(fields, issuelifecycleevent.FieldCreatedAt)
+	}
+	if m.updated_at != nil {
+		fields = append(fields, issuelifecycleevent.FieldUpdatedAt)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *IssueLifecycleEventMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case issuelifecycleevent.FieldProjectID:
+		return m.ProjectID()
+	case issuelifecycleevent.FieldIssueID:
+		return m.IssueID()
+	case issuelifecycleevent.FieldInboxItemID:
+		return m.InboxItemID()
+	case issuelifecycleevent.FieldKind:
+		return m.Kind()
+	case issuelifecycleevent.FieldTitle:
+		return m.Title()
+	case issuelifecycleevent.FieldLevel:
+		return m.Level()
+	case issuelifecycleevent.FieldSeenAt:
+		return m.SeenAt()
+	case issuelifecycleevent.FieldStatus:
+		return m.Status()
+	case issuelifecycleevent.FieldAvailableAt:
+		return m.AvailableAt()
+	case issuelifecycleevent.FieldClaimOwner:
+		return m.ClaimOwner()
+	case issuelifecycleevent.FieldClaimUntil:
+		return m.ClaimUntil()
+	case issuelifecycleevent.FieldClaimEpoch:
+		return m.ClaimEpoch()
+	case issuelifecycleevent.FieldAttempts:
+		return m.Attempts()
+	case issuelifecycleevent.FieldLastError:
+		return m.LastError()
+	case issuelifecycleevent.FieldDispatchedAt:
+		return m.DispatchedAt()
+	case issuelifecycleevent.FieldCreatedAt:
+		return m.CreatedAt()
+	case issuelifecycleevent.FieldUpdatedAt:
+		return m.UpdatedAt()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *IssueLifecycleEventMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case issuelifecycleevent.FieldProjectID:
+		return m.OldProjectID(ctx)
+	case issuelifecycleevent.FieldIssueID:
+		return m.OldIssueID(ctx)
+	case issuelifecycleevent.FieldInboxItemID:
+		return m.OldInboxItemID(ctx)
+	case issuelifecycleevent.FieldKind:
+		return m.OldKind(ctx)
+	case issuelifecycleevent.FieldTitle:
+		return m.OldTitle(ctx)
+	case issuelifecycleevent.FieldLevel:
+		return m.OldLevel(ctx)
+	case issuelifecycleevent.FieldSeenAt:
+		return m.OldSeenAt(ctx)
+	case issuelifecycleevent.FieldStatus:
+		return m.OldStatus(ctx)
+	case issuelifecycleevent.FieldAvailableAt:
+		return m.OldAvailableAt(ctx)
+	case issuelifecycleevent.FieldClaimOwner:
+		return m.OldClaimOwner(ctx)
+	case issuelifecycleevent.FieldClaimUntil:
+		return m.OldClaimUntil(ctx)
+	case issuelifecycleevent.FieldClaimEpoch:
+		return m.OldClaimEpoch(ctx)
+	case issuelifecycleevent.FieldAttempts:
+		return m.OldAttempts(ctx)
+	case issuelifecycleevent.FieldLastError:
+		return m.OldLastError(ctx)
+	case issuelifecycleevent.FieldDispatchedAt:
+		return m.OldDispatchedAt(ctx)
+	case issuelifecycleevent.FieldCreatedAt:
+		return m.OldCreatedAt(ctx)
+	case issuelifecycleevent.FieldUpdatedAt:
+		return m.OldUpdatedAt(ctx)
+	}
+	return nil, fmt.Errorf("unknown IssueLifecycleEvent field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *IssueLifecycleEventMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case issuelifecycleevent.FieldProjectID:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetProjectID(v)
+		return nil
+	case issuelifecycleevent.FieldIssueID:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetIssueID(v)
+		return nil
+	case issuelifecycleevent.FieldInboxItemID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetInboxItemID(v)
+		return nil
+	case issuelifecycleevent.FieldKind:
+		v, ok := value.(issuelifecycleevent.Kind)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetKind(v)
+		return nil
+	case issuelifecycleevent.FieldTitle:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetTitle(v)
+		return nil
+	case issuelifecycleevent.FieldLevel:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetLevel(v)
+		return nil
+	case issuelifecycleevent.FieldSeenAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetSeenAt(v)
+		return nil
+	case issuelifecycleevent.FieldStatus:
+		v, ok := value.(issuelifecycleevent.Status)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetStatus(v)
+		return nil
+	case issuelifecycleevent.FieldAvailableAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetAvailableAt(v)
+		return nil
+	case issuelifecycleevent.FieldClaimOwner:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetClaimOwner(v)
+		return nil
+	case issuelifecycleevent.FieldClaimUntil:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetClaimUntil(v)
+		return nil
+	case issuelifecycleevent.FieldClaimEpoch:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetClaimEpoch(v)
+		return nil
+	case issuelifecycleevent.FieldAttempts:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetAttempts(v)
+		return nil
+	case issuelifecycleevent.FieldLastError:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetLastError(v)
+		return nil
+	case issuelifecycleevent.FieldDispatchedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetDispatchedAt(v)
+		return nil
+	case issuelifecycleevent.FieldCreatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCreatedAt(v)
+		return nil
+	case issuelifecycleevent.FieldUpdatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUpdatedAt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown IssueLifecycleEvent field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *IssueLifecycleEventMutation) AddedFields() []string {
+	var fields []string
+	if m.addissue_id != nil {
+		fields = append(fields, issuelifecycleevent.FieldIssueID)
+	}
+	if m.addinbox_item_id != nil {
+		fields = append(fields, issuelifecycleevent.FieldInboxItemID)
+	}
+	if m.addclaim_epoch != nil {
+		fields = append(fields, issuelifecycleevent.FieldClaimEpoch)
+	}
+	if m.addattempts != nil {
+		fields = append(fields, issuelifecycleevent.FieldAttempts)
+	}
+	return fields
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *IssueLifecycleEventMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case issuelifecycleevent.FieldIssueID:
+		return m.AddedIssueID()
+	case issuelifecycleevent.FieldInboxItemID:
+		return m.AddedInboxItemID()
+	case issuelifecycleevent.FieldClaimEpoch:
+		return m.AddedClaimEpoch()
+	case issuelifecycleevent.FieldAttempts:
+		return m.AddedAttempts()
+	}
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *IssueLifecycleEventMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	case issuelifecycleevent.FieldIssueID:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddIssueID(v)
+		return nil
+	case issuelifecycleevent.FieldInboxItemID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddInboxItemID(v)
+		return nil
+	case issuelifecycleevent.FieldClaimEpoch:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddClaimEpoch(v)
+		return nil
+	case issuelifecycleevent.FieldAttempts:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddAttempts(v)
+		return nil
+	}
+	return fmt.Errorf("unknown IssueLifecycleEvent numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *IssueLifecycleEventMutation) ClearedFields() []string {
+	var fields []string
+	if m.FieldCleared(issuelifecycleevent.FieldClaimUntil) {
+		fields = append(fields, issuelifecycleevent.FieldClaimUntil)
+	}
+	if m.FieldCleared(issuelifecycleevent.FieldDispatchedAt) {
+		fields = append(fields, issuelifecycleevent.FieldDispatchedAt)
+	}
+	return fields
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *IssueLifecycleEventMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *IssueLifecycleEventMutation) ClearField(name string) error {
+	switch name {
+	case issuelifecycleevent.FieldClaimUntil:
+		m.ClearClaimUntil()
+		return nil
+	case issuelifecycleevent.FieldDispatchedAt:
+		m.ClearDispatchedAt()
+		return nil
+	}
+	return fmt.Errorf("unknown IssueLifecycleEvent nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *IssueLifecycleEventMutation) ResetField(name string) error {
+	switch name {
+	case issuelifecycleevent.FieldProjectID:
+		m.ResetProjectID()
+		return nil
+	case issuelifecycleevent.FieldIssueID:
+		m.ResetIssueID()
+		return nil
+	case issuelifecycleevent.FieldInboxItemID:
+		m.ResetInboxItemID()
+		return nil
+	case issuelifecycleevent.FieldKind:
+		m.ResetKind()
+		return nil
+	case issuelifecycleevent.FieldTitle:
+		m.ResetTitle()
+		return nil
+	case issuelifecycleevent.FieldLevel:
+		m.ResetLevel()
+		return nil
+	case issuelifecycleevent.FieldSeenAt:
+		m.ResetSeenAt()
+		return nil
+	case issuelifecycleevent.FieldStatus:
+		m.ResetStatus()
+		return nil
+	case issuelifecycleevent.FieldAvailableAt:
+		m.ResetAvailableAt()
+		return nil
+	case issuelifecycleevent.FieldClaimOwner:
+		m.ResetClaimOwner()
+		return nil
+	case issuelifecycleevent.FieldClaimUntil:
+		m.ResetClaimUntil()
+		return nil
+	case issuelifecycleevent.FieldClaimEpoch:
+		m.ResetClaimEpoch()
+		return nil
+	case issuelifecycleevent.FieldAttempts:
+		m.ResetAttempts()
+		return nil
+	case issuelifecycleevent.FieldLastError:
+		m.ResetLastError()
+		return nil
+	case issuelifecycleevent.FieldDispatchedAt:
+		m.ResetDispatchedAt()
+		return nil
+	case issuelifecycleevent.FieldCreatedAt:
+		m.ResetCreatedAt()
+		return nil
+	case issuelifecycleevent.FieldUpdatedAt:
+		m.ResetUpdatedAt()
+		return nil
+	}
+	return fmt.Errorf("unknown IssueLifecycleEvent field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *IssueLifecycleEventMutation) AddedEdges() []string {
+	edges := make([]string, 0, 1)
+	if m.project != nil {
+		edges = append(edges, issuelifecycleevent.EdgeProject)
+	}
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *IssueLifecycleEventMutation) AddedIDs(name string) []ent.Value {
+	switch name {
+	case issuelifecycleevent.EdgeProject:
+		if id := m.project; id != nil {
+			return []ent.Value{*id}
+		}
+	}
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *IssueLifecycleEventMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 1)
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *IssueLifecycleEventMutation) RemovedIDs(name string) []ent.Value {
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *IssueLifecycleEventMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 1)
+	if m.clearedproject {
+		edges = append(edges, issuelifecycleevent.EdgeProject)
+	}
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *IssueLifecycleEventMutation) EdgeCleared(name string) bool {
+	switch name {
+	case issuelifecycleevent.EdgeProject:
+		return m.clearedproject
+	}
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *IssueLifecycleEventMutation) ClearEdge(name string) error {
+	switch name {
+	case issuelifecycleevent.EdgeProject:
+		m.ClearProject()
+		return nil
+	}
+	return fmt.Errorf("unknown IssueLifecycleEvent unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *IssueLifecycleEventMutation) ResetEdge(name string) error {
+	switch name {
+	case issuelifecycleevent.EdgeProject:
+		m.ResetProject()
+		return nil
+	}
+	return fmt.Errorf("unknown IssueLifecycleEvent edge %s", name)
+}
+
 // NotificationChannelMutation represents an operation that mutates the NotificationChannel nodes in the graph.
 type NotificationChannelMutation struct {
 	config
@@ -8478,6 +9900,9 @@ type ProjectMutation struct {
 	telemetry_inbox                 map[int]struct{}
 	removedtelemetry_inbox          map[int]struct{}
 	clearedtelemetry_inbox          bool
+	issue_lifecycle_events          map[int]struct{}
+	removedissue_lifecycle_events   map[int]struct{}
+	clearedissue_lifecycle_events   bool
 	done                            bool
 	oldValue                        func(context.Context) (*Project, error)
 	predicates                      []predicate.Project
@@ -9322,6 +10747,60 @@ func (m *ProjectMutation) ResetTelemetryInbox() {
 	m.removedtelemetry_inbox = nil
 }
 
+// AddIssueLifecycleEventIDs adds the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity by ids.
+func (m *ProjectMutation) AddIssueLifecycleEventIDs(ids ...int) {
+	if m.issue_lifecycle_events == nil {
+		m.issue_lifecycle_events = make(map[int]struct{})
+	}
+	for i := range ids {
+		m.issue_lifecycle_events[ids[i]] = struct{}{}
+	}
+}
+
+// ClearIssueLifecycleEvents clears the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity.
+func (m *ProjectMutation) ClearIssueLifecycleEvents() {
+	m.clearedissue_lifecycle_events = true
+}
+
+// IssueLifecycleEventsCleared reports if the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity was cleared.
+func (m *ProjectMutation) IssueLifecycleEventsCleared() bool {
+	return m.clearedissue_lifecycle_events
+}
+
+// RemoveIssueLifecycleEventIDs removes the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity by IDs.
+func (m *ProjectMutation) RemoveIssueLifecycleEventIDs(ids ...int) {
+	if m.removedissue_lifecycle_events == nil {
+		m.removedissue_lifecycle_events = make(map[int]struct{})
+	}
+	for i := range ids {
+		delete(m.issue_lifecycle_events, ids[i])
+		m.removedissue_lifecycle_events[ids[i]] = struct{}{}
+	}
+}
+
+// RemovedIssueLifecycleEvents returns the removed IDs of the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity.
+func (m *ProjectMutation) RemovedIssueLifecycleEventsIDs() (ids []int) {
+	for id := range m.removedissue_lifecycle_events {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// IssueLifecycleEventsIDs returns the "issue_lifecycle_events" edge IDs in the mutation.
+func (m *ProjectMutation) IssueLifecycleEventsIDs() (ids []int) {
+	for id := range m.issue_lifecycle_events {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// ResetIssueLifecycleEvents resets all changes to the "issue_lifecycle_events" edge.
+func (m *ProjectMutation) ResetIssueLifecycleEvents() {
+	m.issue_lifecycle_events = nil
+	m.clearedissue_lifecycle_events = false
+	m.removedissue_lifecycle_events = nil
+}
+
 // Where appends a list predicates to the ProjectMutation builder.
 func (m *ProjectMutation) Where(ps ...predicate.Project) {
 	m.predicates = append(m.predicates, ps...)
@@ -9489,7 +10968,7 @@ func (m *ProjectMutation) ResetField(name string) error {
 
 // AddedEdges returns all edge names that were set/added in this mutation.
 func (m *ProjectMutation) AddedEdges() []string {
-	edges := make([]string, 0, 12)
+	edges := make([]string, 0, 13)
 	if m.api_tokens != nil {
 		edges = append(edges, project.EdgeAPITokens)
 	}
@@ -9525,6 +11004,9 @@ func (m *ProjectMutation) AddedEdges() []string {
 	}
 	if m.telemetry_inbox != nil {
 		edges = append(edges, project.EdgeTelemetryInbox)
+	}
+	if m.issue_lifecycle_events != nil {
+		edges = append(edges, project.EdgeIssueLifecycleEvents)
 	}
 	return edges
 }
@@ -9603,13 +11085,19 @@ func (m *ProjectMutation) AddedIDs(name string) []ent.Value {
 			ids = append(ids, id)
 		}
 		return ids
+	case project.EdgeIssueLifecycleEvents:
+		ids := make([]ent.Value, 0, len(m.issue_lifecycle_events))
+		for id := range m.issue_lifecycle_events {
+			ids = append(ids, id)
+		}
+		return ids
 	}
 	return nil
 }
 
 // RemovedEdges returns all edge names that were removed in this mutation.
 func (m *ProjectMutation) RemovedEdges() []string {
-	edges := make([]string, 0, 12)
+	edges := make([]string, 0, 13)
 	if m.removedapi_tokens != nil {
 		edges = append(edges, project.EdgeAPITokens)
 	}
@@ -9642,6 +11130,9 @@ func (m *ProjectMutation) RemovedEdges() []string {
 	}
 	if m.removedtelemetry_inbox != nil {
 		edges = append(edges, project.EdgeTelemetryInbox)
+	}
+	if m.removedissue_lifecycle_events != nil {
+		edges = append(edges, project.EdgeIssueLifecycleEvents)
 	}
 	return edges
 }
@@ -9716,13 +11207,19 @@ func (m *ProjectMutation) RemovedIDs(name string) []ent.Value {
 			ids = append(ids, id)
 		}
 		return ids
+	case project.EdgeIssueLifecycleEvents:
+		ids := make([]ent.Value, 0, len(m.removedissue_lifecycle_events))
+		for id := range m.removedissue_lifecycle_events {
+			ids = append(ids, id)
+		}
+		return ids
 	}
 	return nil
 }
 
 // ClearedEdges returns all edge names that were cleared in this mutation.
 func (m *ProjectMutation) ClearedEdges() []string {
-	edges := make([]string, 0, 12)
+	edges := make([]string, 0, 13)
 	if m.clearedapi_tokens {
 		edges = append(edges, project.EdgeAPITokens)
 	}
@@ -9759,6 +11256,9 @@ func (m *ProjectMutation) ClearedEdges() []string {
 	if m.clearedtelemetry_inbox {
 		edges = append(edges, project.EdgeTelemetryInbox)
 	}
+	if m.clearedissue_lifecycle_events {
+		edges = append(edges, project.EdgeIssueLifecycleEvents)
+	}
 	return edges
 }
 
@@ -9790,6 +11290,8 @@ func (m *ProjectMutation) EdgeCleared(name string) bool {
 		return m.clearedprofile_metas
 	case project.EdgeTelemetryInbox:
 		return m.clearedtelemetry_inbox
+	case project.EdgeIssueLifecycleEvents:
+		return m.clearedissue_lifecycle_events
 	}
 	return false
 }
@@ -9844,6 +11346,9 @@ func (m *ProjectMutation) ResetEdge(name string) error {
 		return nil
 	case project.EdgeTelemetryInbox:
 		m.ResetTelemetryInbox()
+		return nil
+	case project.EdgeIssueLifecycleEvents:
+		m.ResetIssueLifecycleEvents()
 		return nil
 	}
 	return fmt.Errorf("unknown Project edge %s", name)
@@ -15755,6 +17260,8 @@ type TelemetryInboxMutation struct {
 	available_at        *time.Time
 	claim_owner         *string
 	claim_until         *time.Time
+	claim_epoch         *int64
+	addclaim_epoch      *int64
 	attempts            *int
 	addattempts         *int
 	last_error          *string
@@ -16311,6 +17818,62 @@ func (m *TelemetryInboxMutation) ResetClaimUntil() {
 	delete(m.clearedFields, telemetryinbox.FieldClaimUntil)
 }
 
+// SetClaimEpoch sets the "claim_epoch" field.
+func (m *TelemetryInboxMutation) SetClaimEpoch(i int64) {
+	m.claim_epoch = &i
+	m.addclaim_epoch = nil
+}
+
+// ClaimEpoch returns the value of the "claim_epoch" field in the mutation.
+func (m *TelemetryInboxMutation) ClaimEpoch() (r int64, exists bool) {
+	v := m.claim_epoch
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldClaimEpoch returns the old "claim_epoch" field's value of the TelemetryInbox entity.
+// If the TelemetryInbox object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *TelemetryInboxMutation) OldClaimEpoch(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldClaimEpoch is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldClaimEpoch requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldClaimEpoch: %w", err)
+	}
+	return oldValue.ClaimEpoch, nil
+}
+
+// AddClaimEpoch adds i to the "claim_epoch" field.
+func (m *TelemetryInboxMutation) AddClaimEpoch(i int64) {
+	if m.addclaim_epoch != nil {
+		*m.addclaim_epoch += i
+	} else {
+		m.addclaim_epoch = &i
+	}
+}
+
+// AddedClaimEpoch returns the value that was added to the "claim_epoch" field in this mutation.
+func (m *TelemetryInboxMutation) AddedClaimEpoch() (r int64, exists bool) {
+	v := m.addclaim_epoch
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetClaimEpoch resets all changes to the "claim_epoch" field.
+func (m *TelemetryInboxMutation) ResetClaimEpoch() {
+	m.claim_epoch = nil
+	m.addclaim_epoch = nil
+}
+
 // SetAttempts sets the "attempts" field.
 func (m *TelemetryInboxMutation) SetAttempts(i int) {
 	m.attempts = &i
@@ -16706,7 +18269,7 @@ func (m *TelemetryInboxMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *TelemetryInboxMutation) Fields() []string {
-	fields := make([]string, 0, 19)
+	fields := make([]string, 0, 20)
 	if m.event_id != nil {
 		fields = append(fields, telemetryinbox.FieldEventID)
 	}
@@ -16739,6 +18302,9 @@ func (m *TelemetryInboxMutation) Fields() []string {
 	}
 	if m.claim_until != nil {
 		fields = append(fields, telemetryinbox.FieldClaimUntil)
+	}
+	if m.claim_epoch != nil {
+		fields = append(fields, telemetryinbox.FieldClaimEpoch)
 	}
 	if m.attempts != nil {
 		fields = append(fields, telemetryinbox.FieldAttempts)
@@ -16794,6 +18360,8 @@ func (m *TelemetryInboxMutation) Field(name string) (ent.Value, bool) {
 		return m.ClaimOwner()
 	case telemetryinbox.FieldClaimUntil:
 		return m.ClaimUntil()
+	case telemetryinbox.FieldClaimEpoch:
+		return m.ClaimEpoch()
 	case telemetryinbox.FieldAttempts:
 		return m.Attempts()
 	case telemetryinbox.FieldLastError:
@@ -16841,6 +18409,8 @@ func (m *TelemetryInboxMutation) OldField(ctx context.Context, name string) (ent
 		return m.OldClaimOwner(ctx)
 	case telemetryinbox.FieldClaimUntil:
 		return m.OldClaimUntil(ctx)
+	case telemetryinbox.FieldClaimEpoch:
+		return m.OldClaimEpoch(ctx)
 	case telemetryinbox.FieldAttempts:
 		return m.OldAttempts(ctx)
 	case telemetryinbox.FieldLastError:
@@ -16943,6 +18513,13 @@ func (m *TelemetryInboxMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetClaimUntil(v)
 		return nil
+	case telemetryinbox.FieldClaimEpoch:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetClaimEpoch(v)
+		return nil
 	case telemetryinbox.FieldAttempts:
 		v, ok := value.(int)
 		if !ok {
@@ -17010,6 +18587,9 @@ func (m *TelemetryInboxMutation) AddedFields() []string {
 	if m.addpayload_bytes != nil {
 		fields = append(fields, telemetryinbox.FieldPayloadBytes)
 	}
+	if m.addclaim_epoch != nil {
+		fields = append(fields, telemetryinbox.FieldClaimEpoch)
+	}
 	if m.addattempts != nil {
 		fields = append(fields, telemetryinbox.FieldAttempts)
 	}
@@ -17023,6 +18603,8 @@ func (m *TelemetryInboxMutation) AddedField(name string) (ent.Value, bool) {
 	switch name {
 	case telemetryinbox.FieldPayloadBytes:
 		return m.AddedPayloadBytes()
+	case telemetryinbox.FieldClaimEpoch:
+		return m.AddedClaimEpoch()
 	case telemetryinbox.FieldAttempts:
 		return m.AddedAttempts()
 	}
@@ -17040,6 +18622,13 @@ func (m *TelemetryInboxMutation) AddField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.AddPayloadBytes(v)
+		return nil
+	case telemetryinbox.FieldClaimEpoch:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddClaimEpoch(v)
 		return nil
 	case telemetryinbox.FieldAttempts:
 		v, ok := value.(int)
@@ -17134,6 +18723,9 @@ func (m *TelemetryInboxMutation) ResetField(name string) error {
 		return nil
 	case telemetryinbox.FieldClaimUntil:
 		m.ResetClaimUntil()
+		return nil
+	case telemetryinbox.FieldClaimEpoch:
+		m.ResetClaimEpoch()
 		return nil
 	case telemetryinbox.FieldAttempts:
 		m.ResetAttempts()

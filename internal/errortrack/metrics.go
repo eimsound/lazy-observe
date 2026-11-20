@@ -63,24 +63,30 @@ func newInboxMetrics(
 	}
 	registration, err := meter.RegisterCallback(
 		func(ctx context.Context, observer metric.Observer) error {
-			diagnostics, diagnosticsErr := store.ErrorInboxDiagnostics(ctx, 1)
-			if diagnosticsErr != nil {
-				return diagnosticsErr
+			summary, summaryErr := store.ErrorInboxSummary(ctx)
+			if summaryErr != nil {
+				return summaryErr
 			}
-			observer.ObserveInt64(activeItems, diagnostics.ActiveItems)
-			observer.ObserveInt64(activeBytes, diagnostics.ActiveBytes)
 			var age int64
-			if diagnostics.OldestAcceptedAt != nil {
-				age = int64(now().UTC().Sub(diagnostics.OldestAcceptedAt.UTC()).Seconds())
-				if age < 0 {
-					age = 0
+			if summary.ActiveItems > 0 {
+				oldestAcceptedAt, oldestErr := store.OldestActiveErrorAcceptedAt(ctx)
+				if oldestErr != nil {
+					return oldestErr
+				}
+				if oldestAcceptedAt != nil {
+					age = int64(now().UTC().Sub(oldestAcceptedAt.UTC()).Seconds())
+					if age < 0 {
+						age = 0
+					}
 				}
 			}
+			observer.ObserveInt64(activeItems, summary.ActiveItems)
+			observer.ObserveInt64(activeBytes, summary.ActiveBytes)
 			observer.ObserveInt64(oldestAge, age)
-			observer.ObserveInt64(retries, diagnostics.RetriesTotal)
-			observer.ObserveInt64(rejections, diagnostics.RejectionsTotal)
-			observer.ObserveInt64(terminalFailures, diagnostics.TerminalFailuresTotal)
-			observer.ObserveInt64(drops, diagnostics.DropsTotal)
+			observer.ObserveInt64(retries, summary.RetriesTotal)
+			observer.ObserveInt64(rejections, summary.RejectionsTotal)
+			observer.ObserveInt64(terminalFailures, summary.TerminalFailuresTotal)
+			observer.ObserveInt64(drops, summary.DropsTotal)
 			return nil
 		},
 		activeItems,

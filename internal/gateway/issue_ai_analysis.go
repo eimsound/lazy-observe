@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -678,7 +677,7 @@ func (g *Gateway) issueAIEvents(
 	fingerprint string,
 	limit int,
 ) ([]issueAIEvent, error) {
-	query := `_stream:{event_type="error"} AND fingerprint:=` + strconv.Quote(fingerprint)
+	query := issueEventsLogsQL(fingerprint, "", limit)
 	body, err := g.isolatedQuery(
 		ctx,
 		project,
@@ -690,26 +689,31 @@ func (g *Gateway) issueAIEvents(
 		return nil, err
 	}
 	result := make([]issueAIEvent, 0, limit)
-	scanner := bufio.NewScanner(bytes.NewReader(body))
-	scanner.Buffer(make([]byte, 4096), maxErrorEventSize*2)
-	for scanner.Scan() {
+	seen := make(map[string]struct{})
+	err = readVLogsErrorLines(bytes.NewReader(body), func(line []byte) {
 		var record map[string]json.RawMessage
-		if json.Unmarshal(scanner.Bytes(), &record) != nil {
-			continue
+		if json.Unmarshal(line, &record) != nil {
+			return
 		}
 		var symbolicated, rawText string
 		_ = json.Unmarshal(record["symbolicated_event"], &symbolicated)
 		_ = json.Unmarshal(record["raw_event"], &rawText)
 		var event errortrack.Event
 		if json.Unmarshal([]byte(symbolicated), &event) != nil {
-			continue
+			return
+		}
+		if event.EventID != "" {
+			if _, dup := seen[event.EventID]; dup {
+				return
+			}
+			seen[event.EventID] = struct{}{}
 		}
 		var raw map[string]any
 		_ = json.Unmarshal([]byte(rawText), &raw)
 		contexts, _ := raw["contexts"].(map[string]any)
 		result = append(result, issueAIEvent{Event: event, Raw: raw, Contexts: contexts})
-	}
-	return result, scanner.Err()
+	})
+	return result, err
 }
 
 func (g *Gateway) issueAITrace(ctx context.Context, project meta.ProjectInfo, traceID string) string {
