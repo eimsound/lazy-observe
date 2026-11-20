@@ -10,8 +10,14 @@ Direct production dependencies:
 | `@opentelemetry/resources` | telemetry resource | Apache-2.0 |
 | `@opentelemetry/sdk-{logs,metrics,trace}` | manually assembled providers | Apache-2.0 |
 | `@opentelemetry/semantic-conventions` | HTTP/resource attribute names | Apache-2.0 |
-| `pino` | explicit logger integration | MIT |
 | `pprof-format` | pure-JavaScript pprof encoding | MIT |
-| `winston-transport` | explicit Winston transport | MIT |
+
+Optional peer dependencies (loaded lazily only when the corresponding integration is invoked):
+
+| Package | Use | License |
+|---|---|---|
+| `express` | optional Express middleware integration (`lo.express()`, `lo.expressError()`) | MIT |
+| `pino` | optional Pino logger integration (`lo.pino()`) | MIT |
+| `winston` / `winston-transport` | optional Winston transport integration (`lo.winston()`) | MIT |
 
 Development-only dependencies are not shipped with the package. Run `pnpm licenses list --prod` from this directory to audit the resolved dependency tree.

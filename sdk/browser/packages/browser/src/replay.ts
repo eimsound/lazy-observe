@@ -1,5 +1,11 @@
 import { ReplayRingBuffer, type TimedReplayEvent } from "./replay-buffer";
-import { DeliveryQueue, type DeliveryDiagnostics, type DeliveryDrop } from "./delivery";
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  DeliveryQueue,
+  type DeliveryCloseOptions,
+  type DeliveryDiagnostics,
+  type DeliveryDrop,
+} from "./delivery";
 import type { ErrorEventPayload, ReplayConfig, ReplayVitalSample } from "./types";
 import type { Transport } from "./transport";
 
@@ -32,6 +38,7 @@ interface ReplayTransport {
     compressed: boolean,
     error: boolean,
     keepalive?: boolean,
+    signal?: AbortSignal,
   ): Promise<void>;
 }
 
@@ -40,7 +47,8 @@ export interface ReplayDeliveryOptions {
   maxAttempts?: number;
   retryInitialMs?: number;
   retryMaxMs?: number;
-  wait?: (delayMs: number) => Promise<void>;
+  requestTimeoutMs?: number;
+  wait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   onDrop?: (drop: DeliveryDrop) => void;
   storage?: Storage;
   loadRrweb?: () => Promise<typeof import("rrweb")>;
@@ -95,6 +103,7 @@ export class ReplaySegmentDelivery {
       maxAttempts: options.maxAttempts ?? 3,
       retryInitialMs: options.retryInitialMs ?? 100,
       retryMaxMs: options.retryMaxMs ?? 2_000,
+      requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       wait: options.wait,
       onDrop: options.onDrop,
       send: async ([segment], sendOptions) => {
@@ -110,6 +119,7 @@ export class ReplaySegmentDelivery {
           encoded.compressed,
           segment.error,
           sendOptions.keepalive,
+          sendOptions.signal,
         );
       },
     });
@@ -134,8 +144,8 @@ export class ReplaySegmentDelivery {
     return this.queue.flush(keepalive);
   }
 
-  close(): Promise<void> {
-    return this.queue.close();
+  close(options?: DeliveryCloseOptions): Promise<void> {
+    return this.queue.close(options);
   }
 
   diagnostics(): DeliveryDiagnostics {
@@ -222,7 +232,18 @@ export class ReplayController {
   async start(): Promise<void> {
     if (this.closed || typeof window === "undefined") return;
     if (!this.sampled && !this.config.onErrorFullCapture) return;
-    const rrweb = await this.loadRrweb();
+    let rrweb: typeof import("rrweb");
+    try {
+      rrweb = await this.loadRrweb();
+    } catch (error) {
+      if (!this.closed) {
+        console.warn(
+          "[lazy-observe] session replay disabled: optional peer dependency \"rrweb\" is unavailable",
+          error,
+        );
+      }
+      return;
+    }
     if (this.closed) return;
     const stop = rrweb.record({
       emit: (event, isCheckout) => {
@@ -308,7 +329,7 @@ export class ReplayController {
     await this.delivery.flush(keepalive);
   }
 
-  async close(): Promise<void> {
+  async close(options?: DeliveryCloseOptions): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     if (this.timer) {
@@ -320,7 +341,7 @@ export class ReplayController {
     this.addCustomEvent = undefined;
     this.pendingCustomEvents = [];
     await this.flush();
-    await this.delivery.close();
+    await this.delivery.close(options);
   }
 }
 

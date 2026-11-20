@@ -95,6 +95,8 @@ export interface StartSpanOptions {
   name: string;
 }
 
+export type Dispose = () => void;
+
 export interface ActiveSpan {
   readonly name: string;
   readonly context: TraceContext;

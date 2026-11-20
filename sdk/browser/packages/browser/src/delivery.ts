@@ -1,6 +1,45 @@
-import { isServerRejection, MAX_RETRY_AFTER_MS, TransportError } from "./transport";
+export const MAX_KEEPALIVE_BYTES: number = 60 * 1024;
+export const DEFAULT_REQUEST_TIMEOUT_MS: number = 10_000;
+export const MAX_RETRY_AFTER_MS: number = 30_000;
 
 export type DeliveryDropReason = "queue_full" | "retry_exhausted" | "shutdown_budget" | "server_rejected";
+
+/** Parse an HTTP Retry-After header (delta-seconds or HTTP-date) into milliseconds. */
+export function parseRetryAfterMs(header: string | null | undefined, now: number = Date.now()): number | undefined {
+  const raw = header?.trim();
+  if (!raw) return undefined;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const seconds = Number(raw);
+    return Number.isFinite(seconds) && seconds >= 0 ? Math.max(0, Math.round(seconds * 1_000)) : undefined;
+  }
+  const timestamp = Date.parse(raw);
+  if (Number.isFinite(timestamp)) return Math.max(0, timestamp - now);
+  return undefined;
+}
+
+/** A non-2xx ingest response, so callers can tell a refusal from a network failure. */
+export class TransportError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = "TransportError";
+  }
+}
+
+/**
+ * A 4xx (except 408 and 429) means the server will never accept this payload as-is: retrying the
+ * same body is pointless. 408 (request timeout) and 429 (rate limited) are transient — the same
+ * payload may well be accepted later — so they are treated like a network error instead.
+ */
+export function isServerRejection(error: unknown): boolean {
+  if (!(error instanceof TransportError)) return false;
+  const { status } = error;
+  if (status === 408 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
 
 export interface DeliveryDrop {
   reason: DeliveryDropReason;
@@ -16,6 +55,11 @@ export interface DeliveryDiagnostics {
 
 export interface DeliverySendOptions {
   keepalive: boolean;
+  signal: AbortSignal;
+}
+
+export interface DeliveryCloseOptions {
+  timeoutMs?: number;
 }
 
 export interface DeliveryQueueOptions<T> {
@@ -26,23 +70,40 @@ export interface DeliveryQueueOptions<T> {
   retryInitialMs: number;
   retryMaxMs: number;
   maxRetryAfterMs?: number;
+  requestTimeoutMs?: number;
+  maxBatchBytes?: number;
+  keepaliveMaxBatchBytes?: number;
+  batchOverheadBytes?: number;
+  estimateItemBytes?: (item: T) => number;
   send: (batch: T[], options: DeliverySendOptions) => Promise<void>;
-  wait?: (delayMs: number) => Promise<void>;
+  wait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   onDrop?: (drop: DeliveryDrop) => void;
   isNonRetryable?: (error: unknown) => boolean;
   retryAfterMs?: (error: unknown) => number | undefined;
   random?: () => number;
 }
 
+interface QueuedEntry<T> {
+  item: T;
+  bytes: number;
+}
+
 export class DeliveryQueue<T> {
-  private readonly items: T[] = [];
-  private readonly wait: (delayMs: number) => Promise<void>;
+  private readonly items: Array<QueuedEntry<T>> = [];
+  private readonly controller = new AbortController();
+  private readonly wait: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   private readonly isNonRetryable: (error: unknown) => boolean;
   private readonly retryAfterMs: (error: unknown) => number | undefined;
   private readonly random: () => number;
   private readonly maxRetryAfterMs: number;
+  private readonly requestTimeoutMs: number;
+  private readonly maxBatchBytes?: number;
+  private readonly keepaliveMaxBatchBytes?: number;
+  private readonly batchOverheadBytes: number;
+  private readonly estimateItemBytes?: (item: T) => number;
   private timer?: ReturnType<typeof setTimeout>;
   private running?: Promise<void>;
+  private queuedBytes = 0;
   private resident = 0;
   private dropped = 0;
   private lastError?: unknown;
@@ -61,11 +122,31 @@ export class DeliveryQueue<T> {
     if (options.flushIntervalMs < 0 || options.retryInitialMs < 0 || options.retryMaxMs < 0) {
       throw new Error("delivery timing values cannot be negative");
     }
+    if (options.maxRetryAfterMs !== undefined && (!Number.isFinite(options.maxRetryAfterMs) || options.maxRetryAfterMs < 0)) {
+      throw new Error("delivery maxRetryAfterMs cannot be negative");
+    }
+    if (options.requestTimeoutMs !== undefined && (!Number.isFinite(options.requestTimeoutMs) || options.requestTimeoutMs < 0)) {
+      throw new Error("delivery requestTimeoutMs cannot be negative");
+    }
+    if (options.maxBatchBytes !== undefined && (!Number.isFinite(options.maxBatchBytes) || options.maxBatchBytes <= 0)) {
+      throw new Error("delivery maxBatchBytes must be positive");
+    }
+    if (options.keepaliveMaxBatchBytes !== undefined && (!Number.isFinite(options.keepaliveMaxBatchBytes) || options.keepaliveMaxBatchBytes <= 0)) {
+      throw new Error("delivery keepaliveMaxBatchBytes must be positive");
+    }
+    if (options.batchOverheadBytes !== undefined && (!Number.isFinite(options.batchOverheadBytes) || options.batchOverheadBytes < 0)) {
+      throw new Error("delivery batchOverheadBytes cannot be negative");
+    }
     this.wait = options.wait ?? waitForRetry;
     this.isNonRetryable = options.isNonRetryable ?? isServerRejection;
     this.retryAfterMs = options.retryAfterMs ?? defaultRetryAfterMs;
     this.random = options.random ?? Math.random;
     this.maxRetryAfterMs = options.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 0;
+    this.maxBatchBytes = options.maxBatchBytes;
+    this.keepaliveMaxBatchBytes = options.keepaliveMaxBatchBytes;
+    this.batchOverheadBytes = options.batchOverheadBytes ?? 0;
+    this.estimateItemBytes = options.estimateItemBytes;
   }
 
   enqueue(item: T): boolean {
@@ -77,9 +158,15 @@ export class DeliveryQueue<T> {
       this.recordDrop({ reason: "queue_full", count: 1 });
       return false;
     }
-    this.items.push(item);
+    const bytes = this.estimateItemBytes ? Math.max(0, this.estimateItemBytes(item)) : 0;
+    this.items.push({ item, bytes });
+    this.queuedBytes += bytes;
     this.resident++;
-    if (this.items.length >= Math.min(this.options.batchSize, this.options.capacity)) {
+    const effectiveBatchSize = Math.min(this.options.batchSize, this.options.capacity);
+    const bytesFull = this.maxBatchBytes !== undefined
+      && this.estimateItemBytes !== undefined
+      && (this.batchOverheadBytes + this.queuedBytes + Math.max(0, this.items.length - 1)) >= this.maxBatchBytes;
+    if (this.items.length >= effectiveBatchSize || bytesFull) {
       this.clearTimer();
       queueMicrotask(() => { void this.startDrain(false); });
     } else if (!this.timer) {
@@ -99,13 +186,23 @@ export class DeliveryQueue<T> {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) {
-      await this.flush();
-      return;
+  async close(options: DeliveryCloseOptions = {}): Promise<void> {
+    if (!this.closed) {
+      this.closed = true;
+      this.clearTimer();
     }
-    this.closed = true;
-    await this.flush();
+    const timeoutMs = options.timeoutMs ?? 10_000;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        this.controller.abort(new Error(`delivery shutdown timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+    try {
+      await this.flush();
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   }
 
   diagnostics(): DeliveryDiagnostics {
@@ -124,9 +221,35 @@ export class DeliveryQueue<T> {
     return run;
   }
 
+  private takeBatch(keepalive: boolean): T[] {
+    const limit = Math.min(this.options.batchSize, this.options.capacity, this.items.length);
+    if (limit <= 0) return [];
+    const budget = keepalive && this.keepaliveMaxBatchBytes !== undefined
+      ? Math.min(this.keepaliveMaxBatchBytes, this.maxBatchBytes ?? Number.POSITIVE_INFINITY)
+      : this.maxBatchBytes;
+    let count = limit;
+    if (budget !== undefined && this.estimateItemBytes) {
+      let batchBytes = this.batchOverheadBytes + this.items[0].bytes;
+      count = 1;
+      while (count < limit) {
+        const nextBytes = this.items[count].bytes + 1;
+        if (batchBytes + nextBytes > budget) break;
+        batchBytes += nextBytes;
+        count++;
+      }
+    }
+    const entries = this.items.splice(0, count);
+    for (const entry of entries) this.queuedBytes -= entry.bytes;
+    return entries.map((entry) => entry.item);
+  }
+
   private async drain(keepalive: boolean): Promise<void> {
     while (this.items.length > 0) {
-      const batch = this.items.splice(0, Math.min(this.options.batchSize, this.options.capacity));
+      if (this.controller.signal.aborted) {
+        this.dropQueued(abortReason(this.controller.signal));
+        return;
+      }
+      const batch = this.takeBatch(keepalive);
       await this.deliver(batch, keepalive);
       this.resident -= batch.length;
     }
@@ -135,23 +258,45 @@ export class DeliveryQueue<T> {
   private async deliver(batch: T[], keepalive: boolean): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt < this.options.maxAttempts; attempt++) {
+      const attemptScope = createAttemptSignal(
+        this.controller.signal,
+        keepalive ? 0 : this.requestTimeoutMs,
+      );
       try {
-        await this.options.send(batch, { keepalive });
+        await abortable(
+          this.options.send(batch, { keepalive, signal: attemptScope.signal }),
+          attemptScope.signal,
+        );
         this.lastError = undefined;
         return;
       } catch (error) {
         lastError = error;
+        if (this.controller.signal.aborted) {
+          this.lastError = lastError;
+          this.recordDrop({ reason: "shutdown_budget", count: batch.length, error: lastError });
+          return;
+        }
         if (this.isNonRetryable(error)) {
           this.lastError = error;
           this.recordDrop({ reason: "server_rejected", count: batch.length, error });
           return;
         }
+      } finally {
+        attemptScope.cleanup();
       }
       if (attempt + 1 < this.options.maxAttempts) {
         try {
-          await this.wait(this.retryDelay(attempt, lastError));
+          await abortable(
+            this.wait(this.retryDelay(attempt, lastError), this.controller.signal),
+            this.controller.signal,
+          );
         } catch (error) {
           lastError = error;
+          if (this.controller.signal.aborted) {
+            this.lastError = error;
+            this.recordDrop({ reason: "shutdown_budget", count: batch.length, error });
+            return;
+          }
           break;
         }
       }
@@ -168,8 +313,18 @@ export class DeliveryQueue<T> {
     const scaled = this.options.retryInitialMs * (2 ** retryIndex);
     const base = Math.min(Number.isFinite(scaled) ? scaled : this.options.retryMaxMs, this.options.retryMaxMs);
     if (base <= 0) return 0;
-    const factor = 0.5 + 0.5 * Math.min(1, Math.max(0, this.random()));
-    return Math.round(base * factor);
+    // Full Jitter: uniform [0, min(retryMaxMs, retryInitialMs * 2^attempt)].
+    const jitter = Math.min(1, Math.max(0, this.random()));
+    return Math.round(base * jitter);
+  }
+
+  private dropQueued(error: unknown): void {
+    const count = this.items.length;
+    this.items.length = 0;
+    this.queuedBytes = 0;
+    this.resident -= count;
+    this.lastError = error;
+    if (count > 0) this.recordDrop({ reason: "shutdown_budget", count, error });
   }
 
   private recordDrop(drop: DeliveryDrop): void {
@@ -184,10 +339,64 @@ export class DeliveryQueue<T> {
   }
 }
 
+function createAttemptSignal(
+  shutdownSignal: AbortSignal,
+  timeoutMs: number,
+): { signal: AbortSignal; cleanup: () => void } {
+  if (timeoutMs <= 0) return { signal: shutdownSignal, cleanup: () => {} };
+  const attemptController = new AbortController();
+  if (shutdownSignal.aborted) {
+    attemptController.abort(abortReason(shutdownSignal));
+    return { signal: attemptController.signal, cleanup: () => {} };
+  }
+  const onShutdown = () => attemptController.abort(abortReason(shutdownSignal));
+  shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+  const timer = setTimeout(() => {
+    attemptController.abort(new Error(`delivery request timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  return {
+    signal: attemptController.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      shutdownSignal.removeEventListener("abort", onShutdown);
+    },
+  };
+}
+
 function defaultRetryAfterMs(error: unknown): number | undefined {
   return error instanceof TransportError ? error.retryAfterMs : undefined;
 }
 
-function waitForRetry(delayMs: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, delayMs));
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, delayMs);
+    signal?.addEventListener("abort", aborted, { once: true });
+    function done() {
+      signal?.removeEventListener("abort", aborted);
+      resolve();
+    }
+    function aborted() {
+      clearTimeout(timer);
+      reject(abortReason(signal!));
+    }
+  });
+}
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    signal.addEventListener("abort", aborted, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", aborted); resolve(value); },
+      (error) => { signal.removeEventListener("abort", aborted); reject(error); },
+    );
+    function aborted() {
+      reject(abortReason(signal));
+    }
+  });
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error("delivery aborted");
 }

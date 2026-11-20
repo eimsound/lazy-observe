@@ -1,13 +1,13 @@
 import { onCLS, onFCP, onINP, onLCP, onTTFB, type Metric } from "web-vitals";
 import type { Transport } from "./transport";
-import type { ReplayVitalSample, VitalName, VitalRating } from "./types";
+import type { Dispose, ReplayVitalSample, VitalName, VitalRating } from "./types";
 
 export function startVitals(
   transport: Transport,
   page: () => string,
   onReplayVital?: (sample: ReplayVitalSample) => void,
   onDeliveryFailure?: (error: unknown) => void,
-): () => void {
+): Dispose {
   // Hold references in a mutable container cleared on dispose() so long-lived web-vitals
   // observers neither report after close() nor retain the closed Client and Replay buffer.
   let active: {

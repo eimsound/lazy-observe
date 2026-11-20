@@ -58,11 +58,82 @@ describe("DeliveryQueue", () => {
     expect(send.mock.calls.map(([batch]) => batch)).toEqual([[7, 8], [7, 8], [7, 8]]);
     const delays = wait.mock.calls.map(([delay]) => delay);
     expect(delays).toHaveLength(2);
-    expect(delays[0]).toBeGreaterThanOrEqual(5);
+    expect(delays[0]).toBeGreaterThanOrEqual(0);
     expect(delays[0]).toBeLessThanOrEqual(10);
-    expect(delays[1]).toBeGreaterThanOrEqual(7);
+    expect(delays[1]).toBeGreaterThanOrEqual(0);
     expect(delays[1]).toBeLessThanOrEqual(15);
     expect(drops).toEqual([{ reason: "retry_exhausted", count: 2 }]);
+  });
+
+  it("applies Full Jitter backoff in [0, min(retryMaxMs, retryInitialMs * 2^attempt)]", async () => {
+    const samples = [0, 0.5, 1];
+    let idx = 0;
+    const wait = vi.fn(async (_delay: number, _signal: AbortSignal) => undefined);
+    const queue = new DeliveryQueue<number>({
+      capacity: 2,
+      batchSize: 1,
+      flushIntervalMs: 1,
+      maxAttempts: 4,
+      retryInitialMs: 100,
+      retryMaxMs: 250,
+      random: () => samples[idx++] ?? 0.5,
+      send: async () => { throw new TransportError(503, "unavailable"); },
+      wait,
+    });
+
+    queue.enqueue(1);
+    await expect(queue.close({ timeoutMs: 100 })).rejects.toThrow("unavailable");
+    // attempt 0 base=100 * 0 = 0; attempt 1 base=200 * 0.5 = 100; attempt 2 base=min(400,250)=250 * 1 = 250
+    expect(wait.mock.calls.map(([delay]) => delay)).toEqual([0, 100, 250]);
+  });
+
+  it("splits batches by byte budget and retries per-attempt request timeouts without triggering shutdown_budget", async () => {
+    const batches: string[][] = [];
+    const queue = new DeliveryQueue<string>({
+      capacity: 10,
+      batchSize: 10,
+      flushIntervalMs: 60_000,
+      maxAttempts: 1,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      maxBatchBytes: 100,
+      batchOverheadBytes: 16,
+      estimateItemBytes: (item) => Buffer.byteLength(item, "utf8"),
+      send: async (batch) => { batches.push(batch); },
+    });
+
+    // Each item is 40 bytes -> 16 + 40 = 56 <= 100, + 1 + 40 = 97 <= 100, + 1 + 40 = 138 > 100 => split [2, 1]
+    queue.enqueue("a".repeat(40));
+    queue.enqueue("b".repeat(40));
+    queue.enqueue("c".repeat(40));
+    await queue.close({ timeoutMs: 200 });
+    expect(batches).toEqual([["a".repeat(40), "b".repeat(40)], ["c".repeat(40)]]);
+
+    let attempts = 0;
+    const drops: Array<{ reason: string; count: number }> = [];
+    const timeoutQueue = new DeliveryQueue<number>({
+      capacity: 2,
+      batchSize: 1,
+      flushIntervalMs: 1,
+      maxAttempts: 2,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      requestTimeoutMs: 20,
+      wait: async () => undefined,
+      onDrop: (drop) => drops.push({ reason: drop.reason, count: drop.count }),
+      send: async (_batch, signal) => {
+        attempts++;
+        if (attempts === 1) {
+          await new Promise<void>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+      },
+    });
+    timeoutQueue.enqueue(1);
+    await expect(timeoutQueue.close({ timeoutMs: 500 })).resolves.toBeUndefined();
+    expect(attempts).toBe(2);
+    expect(drops).toEqual([]);
   });
 
   it.each([400, 401, 403, 404, 413, 422])("drops permanent HTTP %s immediately as server_rejected without retrying", async (status) => {

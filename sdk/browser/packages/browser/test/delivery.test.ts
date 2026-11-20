@@ -31,7 +31,7 @@ describe("DeliveryQueue", () => {
 
     release();
     await queue.flush();
-    expect(send).toHaveBeenCalledWith([1], { keepalive: false });
+    expect(send).toHaveBeenCalledWith([1], { keepalive: false, signal: expect.any(AbortSignal) });
     expect(queue.diagnostics().pending).toBe(0);
   });
 
@@ -60,12 +60,122 @@ describe("DeliveryQueue", () => {
     expect(send.mock.calls.map(([batch]) => batch)).toEqual([[7, 8], [7, 8], [7, 8]]);
     const delays = wait.mock.calls.map(([delay]) => delay);
     expect(delays).toHaveLength(2);
-    expect(delays[0]).toBeGreaterThanOrEqual(5);
+    expect(delays[0]).toBeGreaterThanOrEqual(0);
     expect(delays[0]).toBeLessThanOrEqual(10);
-    expect(delays[1]).toBeGreaterThanOrEqual(7);
+    expect(delays[1]).toBeGreaterThanOrEqual(0);
     expect(delays[1]).toBeLessThanOrEqual(15);
     expect(drops).toEqual([{ reason: "retry_exhausted", count: 2, error: failure }]);
     expect(queue.diagnostics()).toMatchObject({ pending: 0, dropped: 2, lastError: failure });
+  });
+
+  it("applies Full Jitter backoff in [0, min(retryMaxMs, retryInitialMs * 2^attempt)]", async () => {
+    const samples = [0, 0.5, 1];
+    let idx = 0;
+    const wait = vi.fn(async (_delay: number) => undefined);
+    const queue = new DeliveryQueue<number>({
+      capacity: 2,
+      batchSize: 1,
+      flushIntervalMs: 1,
+      maxAttempts: 4,
+      retryInitialMs: 100,
+      retryMaxMs: 250,
+      random: () => samples[idx++] ?? 0.5,
+      send: async () => { throw new TransportError(503, "unavailable"); },
+      wait,
+    });
+
+    queue.enqueue(1);
+    await queue.flush();
+    expect(wait.mock.calls.map(([delay]) => delay)).toEqual([0, 100, 250]);
+  });
+
+  it("splits batches by keepalive (64KB) and normal (200KB) byte budgets and retries per-attempt timeouts", async () => {
+    const keepaliveBatches: string[][] = [];
+    const keepaliveQueue = new DeliveryQueue<string>({
+      capacity: 10,
+      batchSize: 10,
+      flushIntervalMs: 60_000,
+      maxAttempts: 1,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      maxBatchBytes: 200 * 1024,
+      keepaliveMaxBatchBytes: MAX_KEEPALIVE_BYTES,
+      batchOverheadBytes: 16,
+      estimateItemBytes: (item) => new TextEncoder().encode(item).byteLength,
+      send: async (batch) => { keepaliveBatches.push(batch); },
+    });
+
+    // Three 35KB items fit inside one 200KB normal batch, but under keepalive (60KB) must split into 3 batches.
+    keepaliveQueue.enqueue("a".repeat(35 * 1024));
+    keepaliveQueue.enqueue("b".repeat(35 * 1024));
+    keepaliveQueue.enqueue("c".repeat(35 * 1024));
+    await keepaliveQueue.flush(true);
+    expect(keepaliveBatches.map((batch) => batch.length)).toEqual([1, 1, 1]);
+
+    const normalBatches: string[][] = [];
+    const normalQueue = new DeliveryQueue<string>({
+      capacity: 10,
+      batchSize: 10,
+      flushIntervalMs: 60_000,
+      maxAttempts: 1,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      maxBatchBytes: 200 * 1024,
+      batchOverheadBytes: 16,
+      estimateItemBytes: (item) => new TextEncoder().encode(item).byteLength,
+      send: async (batch) => { normalBatches.push(batch); },
+    });
+    // Three 90KB items exceed 200KB together -> split into [2, 1]
+    normalQueue.enqueue("x".repeat(90 * 1024));
+    normalQueue.enqueue("y".repeat(90 * 1024));
+    normalQueue.enqueue("z".repeat(90 * 1024));
+    await normalQueue.flush(false);
+    expect(normalBatches.map((batch) => batch.length)).toEqual([2, 1]);
+
+    let attempts = 0;
+    const timeoutQueue = new DeliveryQueue<number>({
+      capacity: 2,
+      batchSize: 1,
+      flushIntervalMs: 1,
+      maxAttempts: 2,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      requestTimeoutMs: 20,
+      wait: async () => undefined,
+      send: async (_batch, options) => {
+        attempts++;
+        if (attempts === 1) {
+          await new Promise<void>((_resolve, reject) => {
+            options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+          });
+        }
+      },
+    });
+    timeoutQueue.enqueue(1);
+    await timeoutQueue.close({ timeoutMs: 500 });
+    expect(attempts).toBe(2);
+    expect(timeoutQueue.diagnostics().dropped).toBe(0);
+  });
+
+  it("aborts a hung delivery when close({ timeoutMs }) expires without throwing into page code", async () => {
+    const drops: Array<{ reason: string; count: number }> = [];
+    const queue = new DeliveryQueue<number>({
+      capacity: 1,
+      batchSize: 1,
+      flushIntervalMs: 1,
+      maxAttempts: 3,
+      retryInitialMs: 10,
+      retryMaxMs: 20,
+      send: async () => new Promise<void>(() => {}),
+      onDrop: (drop) => drops.push({ reason: drop.reason, count: drop.count }),
+    });
+    queue.enqueue(1);
+
+    const started = Date.now();
+    await expect(queue.close({ timeoutMs: 25 })).resolves.toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(drops).toEqual([{ reason: "shutdown_budget", count: 1 }]);
+    expect(queue.diagnostics()).toMatchObject({ pending: 0, dropped: 1 });
   });
 
   it.each([400, 401, 403, 404, 413, 422])("drops permanent HTTP %s immediately as server_rejected without retrying", async (status) => {
@@ -289,7 +399,7 @@ describe("DeliveryQueue", () => {
     queue.enqueue(1);
     await queue.flush(true);
 
-    expect(send).toHaveBeenCalledWith([1], { keepalive: true });
+    expect(send).toHaveBeenCalledWith([1], { keepalive: true, signal: expect.any(AbortSignal) });
   });
 
   it("exports a low-cardinality diagnostic when the browser error queue is full", async () => {

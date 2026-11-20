@@ -4,6 +4,15 @@ import path from "node:path";
 
 const SOURCE_MAP_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const DEFAULT_UPLOAD_TIMEOUT_MS = 30_000;
+const CONTROL_OR_WHITESPACE = /[\u0000-\u001f\u007f\s]/;
+const SOURCE_MAP_TOKEN_PREFIX = "los_";
+const EXPECTED_DSN = "lazy-observe: DSN must match http(s)://<host>/p/<project>@<token>";
+
+export interface ParsedUploadDsn {
+  origin: string;
+  project: string;
+  token: string;
+}
 
 export interface UploadSourceMapsOptions {
   /** `<origin>/p/<project>@<token>`。缺失或为空时打一条警告并跳过上传（不算失败）。 */
@@ -115,16 +124,57 @@ export async function collectSourceMaps(outputDir: string): Promise<SourceMapOut
   return found;
 }
 
-export function parseDsn(value: string): { origin: string; token: string } {
+export function parseDsn(value: string): ParsedUploadDsn {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(EXPECTED_DSN);
+  }
   let url: URL;
-  try { url = new URL(value); }
-  catch { throw new Error("lazy-observe: DSN must match <origin>/p/<project>@<token>"); }
-  const match = url.pathname.match(/^\/p\/[^/@]+@([^/]+)\/?$/);
-  if (!match || url.search || url.hash) throw new Error("lazy-observe: DSN must match <origin>/p/<project>@<token>");
+  try {
+    url = new URL(value);
+  } catch {
+    // Do not attach cause or echo the raw DSN so los_ tokens never leak into CI logs.
+    throw new Error(EXPECTED_DSN);
+  }
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:")
+    || !url.host
+    || url.username
+    || url.password
+    || url.search
+    || url.hash
+  ) {
+    throw new Error(EXPECTED_DSN);
+  }
+  const match = url.pathname.match(/^\/p\/([^/@]+)@([^/@]+)\/?$/);
+  if (!match) {
+    throw new Error(EXPECTED_DSN);
+  }
+  let project: string;
   let token: string;
-  try { token = decodeURIComponent(match[1]); }
-  catch { throw new Error("lazy-observe: DSN must match <origin>/p/<project>@<token>"); }
-  return { origin: url.origin, token };
+  try {
+    project = decodeURIComponent(match[1]);
+    token = decodeURIComponent(match[2]);
+  } catch {
+    throw new Error(EXPECTED_DSN);
+  }
+  if (!project.trim() || !token.trim() || CONTROL_OR_WHITESPACE.test(token)) {
+    throw new Error(EXPECTED_DSN);
+  }
+  if (!token.startsWith(SOURCE_MAP_TOKEN_PREFIX) || token.length <= SOURCE_MAP_TOKEN_PREFIX.length) {
+    throw new Error(
+      "lazy-observe: source map upload requires a source map upload token (los_...); project API tokens (lo_...) are rejected",
+    );
+  }
+  return { origin: url.origin, project, token };
+}
+
+export function redactDsn(value: string): string {
+  try {
+    const parsed = parseDsn(value);
+    return `${parsed.origin}/p/${encodeURIComponent(parsed.project)}@[redacted]`;
+  } catch {
+    return "[invalid DSN]";
+  }
 }
 
 /**

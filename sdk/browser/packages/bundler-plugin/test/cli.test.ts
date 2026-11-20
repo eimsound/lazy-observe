@@ -37,7 +37,7 @@ describe("lazy-observe-sourcemaps upload", () => {
     expect(result).toMatchObject({ code: 0, stderr: "" });
     expect(result.stdout).toContain("uploaded 2 source map(s) for release next-1");
     expect(server.requests).toHaveLength(1);
-    expect(server.requests[0]).toMatchObject({ method: "POST", url: "/api/releases/next-1/sourcemaps", authorization: "Bearer secret-token" });
+    expect(server.requests[0]).toMatchObject({ method: "POST", url: "/api/releases/next-1/sourcemaps", authorization: "Bearer los_secret-token" });
     expect(server.requests[0].body).toContain('filename="app.js.map"');
   });
 

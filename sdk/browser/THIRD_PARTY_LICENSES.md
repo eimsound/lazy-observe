@@ -2,8 +2,8 @@
 
 | Package | License |
 |---|---|
-| `rrweb`, `@rrweb/types`, `@rrweb/utils`, `rrweb-snapshot`, `rrdom`, `mitt`, `base64-arraybuffer`, `@xstate/fsm`, `@types/css-font-loading-module`, `postcss`, `nanoid` | MIT |
 | `web-vitals` | Apache-2.0 |
+| `rrweb` (optional peer for Session Replay / workspace examples), `@rrweb/types`, `@rrweb/utils`, `rrweb-snapshot`, `rrdom`, `mitt`, `base64-arraybuffer`, `@xstate/fsm`, `@types/css-font-loading-module`, `postcss`, `nanoid` | MIT |
 | `source-map-js` | BSD-3-Clause |
 | `picocolors` | ISC (the simplified BSD-family license) |
 | `react`, `react-dom`, `scheduler` (React adapter peer/demo) | MIT |
