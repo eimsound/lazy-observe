@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { keepPreviousData, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -20,7 +20,7 @@ import {
   type NotificationStatus,
 } from "@/lib/api/notifications";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageAlerts } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
 import { projectQueryKey } from "@/lib/project/project-scope";
 import { useProjectQuery } from "@/lib/project/use-project-query";
@@ -37,6 +37,7 @@ import { PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { formatErrorMessage } from "@/lib/api/errors";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -47,6 +48,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { queryViewState } from "./query-view-state";
 
 const PAGE_SIZE = 100;
 const ALL_STATUS = "__all__";
@@ -63,21 +65,13 @@ export function NotificationHistoryPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
   const { currentSlug } = useProject();
-  const canManage = canManageAlerts(role);
+  const canRead = hasCapability(role, "alerts:read");
+  const canWrite = hasCapability(role, "alerts:write");
   const queryClient = useQueryClient();
 
   const [status, setStatus] = useState<NotificationStatus | typeof ALL_STATUS>(ALL_STATUS);
   const [pagination, setPagination] = useState<CursorPaginationState>(INITIAL_CURSOR_PAGINATION);
   const [retryError, setRetryError] = useState<string | null>(null);
-  const prevProjectRef = useRef(currentSlug);
-
-  useEffect(() => {
-    if (prevProjectRef.current !== currentSlug) {
-      prevProjectRef.current = currentSlug;
-      setPagination(INITIAL_CURSOR_PAGINATION);
-      setRetryError(null);
-    }
-  }, [currentSlug]);
 
   const statusParam = status === ALL_STATUS ? undefined : status;
 
@@ -90,7 +84,7 @@ export function NotificationHistoryPage() {
         project,
       ),
     placeholderData: keepPreviousData,
-    enabled: canManage,
+    enabled: canRead,
     retry: false,
   });
 
@@ -102,7 +96,7 @@ export function NotificationHistoryPage() {
     onError: (err) => setRetryError(formatErrorMessage(err, t("notifications.retryError"))),
   });
 
-  if (!canManage) {
+  if (!canRead) {
     return (
       <PageContainer>
         <Card>
@@ -120,6 +114,12 @@ export function NotificationHistoryPage() {
 
   const rows: NotificationItem[] = items.data ?? [];
   const hasMore = rows.length === PAGE_SIZE;
+  const viewState = queryViewState({
+    hasData: items.data !== undefined,
+    isLoading: items.isLoading,
+    isError: items.isError,
+    isEmpty: rows.length === 0,
+  });
 
   function goBack() {
     setPagination((prev) => popCursorPage(prev));
@@ -158,21 +158,31 @@ export function NotificationHistoryPage() {
           </p>
         )}
       </div>
+
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={items.isFetching}
+          onRetry={() => void items.refetch()}
+        />
+      )}
+
       <Card>
         <CardContent className="p-0">
-          {items.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-4">
               {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-10 w-full" />
               ))}
             </div>
-          ) : items.isError ? (
+          ) : viewState === "error" ? (
             <QueryErrorState
               error={items.error}
               forbiddenDesc={t("notifications.forbiddenDesc")}
               onRetry={() => void items.refetch()}
             />
-          ) : rows.length > 0 ? (
+          ) : viewState === "empty" ? (
+            <EmptyState icon={<History className="size-6" />} title={t("notifications.empty")} />
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -211,7 +221,7 @@ export function NotificationHistoryPage() {
                         {item.attempts}
                       </td>
                       <td className="px-4 py-2.5 text-right">
-                        {item.status === "dead" && (
+                        {canWrite && item.status === "dead" && (
                           <Button
                             variant="outline"
                             size="sm"
@@ -233,8 +243,6 @@ export function NotificationHistoryPage() {
                 </tbody>
               </table>
             </div>
-          ) : (
-            <EmptyState icon={<History className="size-6" />} title={t("notifications.empty")} />
           )}
         </CardContent>
       </Card>

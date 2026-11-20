@@ -24,7 +24,7 @@ import {
 import { ApiError } from "@/lib/api/client";
 import { IS_MOCK } from "@/lib/settings";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageUsers } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import {
   INITIAL_AI_SETTINGS_FORM,
   applySavedAiSettings,
@@ -37,6 +37,8 @@ import {
 } from "./ai-settings-state";
 import { PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import {
   Card,
   CardContent,
@@ -56,6 +58,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { queryViewState } from "./query-view-state";
 
 /**
  * AI settings (/settings/ai, admin). Administrators can enable AI, pick a
@@ -68,17 +71,21 @@ import {
 export function AiSettingsPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
+  const canManage = hasCapability(role, "ai:manage");
   const queryClient = useQueryClient();
 
   const statusQuery = useQuery({
     queryKey: ["ai-status"],
     queryFn: ({ signal }) => getAiStatus(signal),
+    enabled: canManage,
+    retry: false,
   });
   const settingsQuery = useQuery({
     queryKey: ["ai-settings"],
     queryFn: ({ signal }) => getAiSettings(signal),
-    enabled: canManageUsers(role),
+    enabled: canManage,
     refetchOnWindowFocus: false,
+    retry: false,
   });
 
   const [form, setForm] = useState<AiSettingsFormState>(INITIAL_AI_SETTINGS_FORM);
@@ -113,7 +120,7 @@ export function AiSettingsPage() {
     onError: () => setTestResult(null),
   });
 
-  if (!canManageUsers(role)) {
+  if (!canManage) {
     return (
       <PageContainer className="max-w-3xl">
         <Card>
@@ -131,7 +138,18 @@ export function AiSettingsPage() {
 
   const status = statusQuery.data;
   const enabled = status?.enabled ?? draft?.enabled ?? false;
-  const settingsLoading = settingsQuery.isLoading && !draft;
+  const statusState = queryViewState({
+    hasData: statusQuery.data !== undefined,
+    isLoading: statusQuery.isLoading,
+    isError: statusQuery.isError,
+    isEmpty: false,
+  });
+  const settingsState = queryViewState({
+    hasData: draft !== null,
+    isLoading: settingsQuery.isLoading,
+    isError: settingsQuery.isError,
+    isEmpty: false,
+  });
 
   function setProvider(provider: string) {
     if (!draft) return;
@@ -158,18 +176,19 @@ export function AiSettingsPage() {
           <CardDescription>{t("aiSettings.subtitle")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {statusQuery.isLoading ? (
+          {statusState === "stale" && (
+            <QueryStaleNotice
+              isRetrying={statusQuery.isFetching}
+              onRetry={() => void statusQuery.refetch()}
+            />
+          )}
+          {statusState === "pending" ? (
             <div className="space-y-2">
               <Skeleton className="h-5 w-40" />
               <Skeleton className="h-5 w-56" />
             </div>
-          ) : statusQuery.error ? (
-            <div className="flex items-center gap-2 text-sm text-destructive">
-              <AlertCircle className="size-4" />
-              {statusQuery.error instanceof ApiError
-                ? statusQuery.error.message
-                : t("common.loadFailed")}
-            </div>
+          ) : statusState === "error" ? (
+            <QueryErrorState error={statusQuery.error} onRetry={() => void statusQuery.refetch()} />
           ) : (
             <dl className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <Field label={t("aiSettings.statusLabel")}>
@@ -215,7 +234,7 @@ export function AiSettingsPage() {
                 {test.isPending ? t("aiSettings.testing") : t("aiSettings.testConnection")}
               </Button>
               {test.isError && (
-                <div className="flex items-center gap-2 text-sm text-destructive">
+                <div className="flex items-center gap-2 text-sm text-destructive" role="alert">
                   <AlertCircle className="size-4" />
                   {test.error instanceof ApiError ? test.error.message : t("aiSettings.testError")}
                 </div>
@@ -249,19 +268,25 @@ export function AiSettingsPage() {
           <CardDescription>{t("aiSettings.configDesc")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {settingsLoading ? (
+          {settingsState === "stale" && (
+            <QueryStaleNotice
+              isRetrying={settingsQuery.isFetching}
+              onRetry={() => void settingsQuery.refetch()}
+            />
+          )}
+          {settingsState === "pending" ? (
             <div className="space-y-2">
               <Skeleton className="h-9 w-full" />
               <Skeleton className="h-9 w-full" />
               <Skeleton className="h-9 w-full" />
             </div>
-          ) : settingsQuery.error ? (
-            <div className="flex items-center gap-2 text-sm text-destructive">
-              <AlertCircle className="size-4" />
-              {settingsQuery.error instanceof ApiError
-                ? settingsQuery.error.message
-                : t("common.loadFailed")}
-            </div>
+          ) : settingsState === "error" ? (
+            <QueryErrorState
+              error={settingsQuery.error}
+              forbiddenTitle={t("aiSettings.forbiddenTitle")}
+              forbiddenDesc={t("aiSettings.forbiddenDesc")}
+              onRetry={() => void settingsQuery.refetch()}
+            />
           ) : draft ? (
             <>
               <div className="flex items-center justify-between gap-4">
@@ -373,7 +398,7 @@ export function AiSettingsPage() {
                 )}
               </div>
               {save.isError && (
-                <div className="flex items-center gap-2 text-sm text-destructive">
+                <div className="flex items-center gap-2 text-sm text-destructive" role="alert">
                   <AlertCircle className="size-4" />
                   {save.error instanceof ApiError ? save.error.message : t("aiSettings.saveError")}
                 </div>
@@ -390,7 +415,7 @@ export function AiSettingsPage() {
       </Card>
 
       {/* Disabled guidance */}
-      {!statusQuery.isLoading && !enabled && (
+      {statusState !== "pending" && !enabled && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">

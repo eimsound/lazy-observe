@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
 import { BellRing } from "lucide-react";
 import {
   listAlerts,
@@ -8,11 +7,13 @@ import {
   type AlertStatus,
   type AlertEvent,
 } from "@/lib/api/alerts";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import {
   SeverityBadge,
   StatusBadge,
@@ -23,6 +24,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { queryViewState } from "./query-view-state";
 
 type Filter = "all" | AlertStatus;
 
@@ -38,15 +40,22 @@ export function AlertEventsPage() {
   const { t } = useTranslation();
   const [filter, setFilter] = useState<Filter>("all");
 
-  const events = useQuery({
+  const events = useProjectQuery({
     queryKey: ["alerts", "events"],
-    queryFn: ({ signal }) => listAlerts(undefined, signal),
+    queryFn: ({ signal, project }) => listAlerts(undefined, signal, project),
     refetchInterval: 30_000,
+    retry: false,
   });
 
   const all = events.data ?? [];
   const firingCount = all.filter((e) => e.status === "firing").length;
   const rows = filter === "all" ? all : all.filter((e) => e.status === filter);
+  const viewState = queryViewState({
+    hasData: events.data !== undefined,
+    isLoading: events.isLoading,
+    isError: events.isError,
+    isEmpty: rows.length === 0,
+  });
 
   return (
     <PageContainer>
@@ -76,17 +85,30 @@ export function AlertEventsPage() {
         ))}
       </div>
 
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={events.isFetching}
+          onRetry={() => void events.refetch()}
+        />
+      )}
+
       <Card>
         <CardContent className="p-0">
-          {events.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-4">
               {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-14 w-full" />
               ))}
             </div>
-          ) : events.isError ? (
+          ) : viewState === "error" ? (
             <QueryErrorState error={events.error} onRetry={() => void events.refetch()} />
-          ) : rows.length > 0 ? (
+          ) : viewState === "empty" ? (
+            <EmptyState
+              icon={<BellRing className="size-6" />}
+              title={t("alerts.noEvents")}
+              desc={t("alerts.noEventsDesc")}
+            />
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -136,12 +158,6 @@ export function AlertEventsPage() {
                 </tbody>
               </table>
             </div>
-          ) : (
-            <EmptyState
-              icon={<BellRing className="size-6" />}
-              title={t("alerts.noEvents")}
-              desc={t("alerts.noEventsDesc")}
-            />
           )}
         </CardContent>
       </Card>

@@ -1,165 +1,60 @@
 import { apiGet, apiSend, IS_MOCK, API_ROOT } from "./client";
+import {
+  ALERT_SIGNALS,
+  CHANNEL_TYPES,
+  SEVERITIES,
+  normalizeAlertEventList,
+  normalizeAlertRule,
+  normalizeAlertRuleList,
+  normalizeChannel,
+  normalizeChannelList,
+  normalizeChannelTestResult,
+  normalizeSilence,
+  normalizeSilenceList,
+  type AlertEvent,
+  type AlertRule,
+  type AlertRuleInput,
+  type AlertSignal,
+  type AlertStatus,
+  type ChannelInput,
+  type ChannelTestResult,
+  type ChannelType,
+  type Matcher,
+  type NotificationChannel,
+  type Severity,
+  type Silence,
+  type SilenceInput,
+} from "./alerts-contract";
 
 // Mock data is only for VITE_MOCK builds; load it lazily so it never ships with real chunks.
 const loadMockAlerts = () => import("./mock-alerts");
 
+export { ALERT_SIGNALS, CHANNEL_TYPES, SEVERITIES };
+export type {
+  AlertEvent,
+  AlertRule,
+  AlertRuleInput,
+  AlertSignal,
+  AlertStatus,
+  ChannelInput,
+  ChannelTestResult,
+  ChannelType,
+  Matcher,
+  NotificationChannel,
+  Severity,
+  Silence,
+  SilenceInput,
+};
+
 /**
  * Alerting API (A1). Fixed contract, endpoints under /api:
- *   /api/alert-rules  CRUD
- *   /api/channels     CRUD + POST /api/channels/:id/test
- *   /api/silences     CRUD
- *   GET /api/alerts?status=firing|resolved  -> event list
+ *   /api/alert-rules  CRUD (project-scoped, member+)
+ *   /api/channels     GET (member+ summary / admin redacted), write+test (admin)
+ *   /api/silences     CRUD (project-scoped, member+)
+ *   GET /api/alerts?status=firing|resolved  -> event list (project-scoped, viewer+)
  * In VITE_MOCK mode an in-memory store backs every operation so the whole
  * alerting surface is interactive offline.
  */
-
-export type Severity = "critical" | "warning" | "info";
-export const SEVERITIES: Severity[] = ["critical", "warning", "info"];
-
-export type AlertSignal = "metrics" | "logs";
-export const ALERT_SIGNALS: AlertSignal[] = ["metrics", "logs"];
-
-export type ChannelType = "webhook" | "feishu" | "dingtalk" | "wecom" | "smtp" | "slack";
-export const CHANNEL_TYPES: ChannelType[] = [
-  "webhook",
-  "feishu",
-  "dingtalk",
-  "wecom",
-  "smtp",
-  "slack",
-];
-
-export interface AlertRule {
-  id: string;
-  name: string;
-  signal: AlertSignal;
-  evaluation_engine: "paused" | "native";
-  /** MetricsQL/PromQL or LogsQL expression the alert fires on. */
-  expr: string;
-  /** Duration the condition must hold before firing, e.g. "5m". */
-  for: string;
-  severity: Severity;
-  labels: Record<string, string>;
-  annotations: Record<string, string>;
-  enabled: boolean;
-  channel_ids: string[];
-  created_at: string;
-  updated_at: string;
-}
-
-/** Payload for create/update (server assigns identity and timestamps). */
-export type AlertRuleInput = Pick<
-  AlertRule,
-  "name" | "signal" | "expr" | "for" | "severity" | "labels" | "annotations" | "enabled" | "channel_ids"
-> & { evaluation_engine?: "native" };
-
-export interface NotificationChannel {
-  id: string;
-  type: ChannelType;
-  name: string;
-  config: Record<string, string>;
-  enabled: boolean;
-  created_at: string;
-  updated_at: string;
-}
-
-export type ChannelInput = Pick<NotificationChannel, "type" | "name" | "config" | "enabled">;
-
-export interface Matcher {
-  name: string;
-  op: "=" | "=~";
-  value: string;
-}
-
-export interface Silence {
-  id: string;
-  matchers: Matcher[];
-  starts_at: string;
-  ends_at: string;
-  comment: string;
-  creator: string;
-  created_at: string;
-}
-
-export type SilenceInput = Pick<Silence, "matchers" | "starts_at" | "ends_at" | "comment">;
-
-export type AlertStatus = "firing" | "resolved";
-
-export interface AlertEvent {
-  id: string;
-  fingerprint: string;
-  rule: string;
-  status: AlertStatus;
-  labels: Record<string, string>;
-  annotations: Record<string, string>;
-  starts_at: string;
-  ends_at?: string;
-  inhibited: boolean;
-  updated_at: string;
-}
-
-function stringRecord(value: unknown): Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [
-      key,
-      typeof item === "string" ? item : Array.isArray(item) ? item.join(",") : String(item ?? ""),
-    ]),
-  );
-}
-
-function normalizeRule(value: AlertRule): AlertRule {
-  return {
-    ...value,
-    id: String(value.id),
-    signal: value.signal === "logs" ? "logs" : "metrics",
-    evaluation_engine: value.evaluation_engine === "paused" ? "paused" : "native",
-    labels: value.labels ?? {},
-    annotations: value.annotations ?? {},
-    channel_ids: Array.isArray(value.channel_ids) ? value.channel_ids.map(String) : [],
-    created_at: value.created_at ?? "",
-    updated_at: value.updated_at ?? "",
-  };
-}
-
-function normalizeChannel(value: NotificationChannel): NotificationChannel {
-  const wireType = value.type as string;
-  return {
-    ...value,
-    id: String(value.id),
-    type: (wireType === "email" ? "smtp" : wireType) as ChannelType,
-    config: stringRecord(value.config),
-    created_at: value.created_at ?? "",
-    updated_at: value.updated_at ?? "",
-  };
-}
-
-function normalizeSilence(value: Silence): Silence {
-  const legacy = value as Silence & { created_by?: string };
-  return {
-    ...value,
-    id: String(value.id),
-    matchers: Array.isArray(value.matchers) ? value.matchers : [],
-    creator: value.creator ?? legacy.created_by ?? "",
-    created_at: value.created_at ?? "",
-  };
-}
-
-function normalizeEvent(value: AlertEvent): AlertEvent {
-  const legacyRule = value.rule as unknown;
-  return {
-    ...value,
-    id: String(value.id ?? value.fingerprint),
-    rule:
-      typeof legacyRule === "string"
-        ? legacyRule
-        : ((legacyRule as { name?: string } | null)?.name ?? value.labels?.alertname ?? ""),
-    labels: value.labels ?? {},
-    annotations: value.annotations ?? {},
-    inhibited: value.inhibited ?? false,
-    updated_at: value.updated_at ?? "",
-  };
-}
 
 function delay<T>(value: T, ms = 200): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(value), ms));
@@ -167,41 +62,51 @@ function delay<T>(value: T, ms = 200): Promise<T> {
 
 // ── rules ────────────────────────────────────────────────────────────────────
 
-export async function listRules(signal?: AbortSignal): Promise<AlertRule[]> {
+export async function listRules(signal?: AbortSignal, project?: string): Promise<AlertRule[]> {
   if (IS_MOCK) return delay([...(await loadMockAlerts()).mockRules]);
-  const values = await apiGet<AlertRule[]>("/alert-rules", { base: API_ROOT, signal });
-  return (values ?? []).map(normalizeRule);
+  const values = await apiGet<unknown>("/alert-rules", { base: API_ROOT, signal, project });
+  return normalizeAlertRuleList(values);
 }
 
-export async function createRule(input: AlertRuleInput): Promise<AlertRule> {
+export async function createRule(input: AlertRuleInput, project?: string): Promise<AlertRule> {
   if (IS_MOCK) return delay((await loadMockAlerts()).createMockRule(input), 250);
-  return normalizeRule(await apiSend<AlertRule>("POST", "/alert-rules", input, { base: API_ROOT }));
+  return normalizeAlertRule(
+    await apiSend<unknown>("POST", "/alert-rules", input, { base: API_ROOT, project }),
+  );
 }
 
-export async function updateRule(id: string, input: AlertRuleInput): Promise<AlertRule> {
+export async function updateRule(
+  id: string,
+  input: AlertRuleInput,
+  project?: string,
+): Promise<AlertRule> {
   if (IS_MOCK) return delay((await loadMockAlerts()).updateMockRule(id, input), 250);
-  return normalizeRule(await apiSend<AlertRule>("PATCH", `/alert-rules/${id}`, input, { base: API_ROOT }));
+  return normalizeAlertRule(
+    await apiSend<unknown>("PATCH", `/alert-rules/${id}`, input, { base: API_ROOT, project }),
+  );
 }
 
-export async function deleteRule(id: string): Promise<void> {
+export async function deleteRule(id: string, project?: string): Promise<void> {
   if (IS_MOCK) {
     (await loadMockAlerts()).deleteMockRule(id);
     return delay(undefined);
   }
-  await apiSend<void>("DELETE", `/alert-rules/${id}`, undefined, { base: API_ROOT });
+  await apiSend<void>("DELETE", `/alert-rules/${id}`, undefined, { base: API_ROOT, project });
 }
 
 // ── channels ─────────────────────────────────────────────────────────────────
 
 export async function listChannels(signal?: AbortSignal): Promise<NotificationChannel[]> {
   if (IS_MOCK) return delay([...(await loadMockAlerts()).mockChannels]);
-  const values = await apiGet<NotificationChannel[]>("/channels", { base: API_ROOT, signal });
-  return (values ?? []).map(normalizeChannel);
+  const values = await apiGet<unknown>("/channels", { base: API_ROOT, signal });
+  return normalizeChannelList(values);
 }
 
 export async function createChannel(input: ChannelInput): Promise<NotificationChannel> {
   if (IS_MOCK) return delay((await loadMockAlerts()).createMockChannel(input), 250);
-  return normalizeChannel(await apiSend<NotificationChannel>("POST", "/channels", input, { base: API_ROOT }));
+  return normalizeChannel(
+    await apiSend<unknown>("POST", "/channels", input, { base: API_ROOT }),
+  );
 }
 
 export async function updateChannel(
@@ -210,7 +115,7 @@ export async function updateChannel(
 ): Promise<NotificationChannel> {
   if (IS_MOCK) return delay((await loadMockAlerts()).updateMockChannel(id, input), 250);
   return normalizeChannel(
-    await apiSend<NotificationChannel>("PATCH", `/channels/${id}`, input, { base: API_ROOT }),
+    await apiSend<unknown>("PATCH", `/channels/${id}`, input, { base: API_ROOT }),
   );
 }
 
@@ -220,11 +125,6 @@ export async function deleteChannel(id: string): Promise<void> {
     return delay(undefined);
   }
   await apiSend<void>("DELETE", `/channels/${id}`, undefined, { base: API_ROOT });
-}
-
-export interface ChannelTestResult {
-  ok: boolean;
-  message: string;
 }
 
 export async function testChannel(id: string): Promise<ChannelTestResult> {
@@ -242,35 +142,45 @@ export async function testChannel(id: string): Promise<ChannelTestResult> {
       700,
     );
   }
-  return apiSend<ChannelTestResult>("POST", `/channels/${id}/test`, undefined, {
-    base: API_ROOT,
-  });
+  return normalizeChannelTestResult(
+    await apiSend<unknown>("POST", `/channels/${id}/test`, undefined, {
+      base: API_ROOT,
+    }),
+  );
 }
 
 // ── silences ─────────────────────────────────────────────────────────────────
 
-export async function listSilences(signal?: AbortSignal): Promise<Silence[]> {
+export async function listSilences(signal?: AbortSignal, project?: string): Promise<Silence[]> {
   if (IS_MOCK) return delay([...(await loadMockAlerts()).mockSilences]);
-  const values = await apiGet<Silence[]>("/silences", { base: API_ROOT, signal });
-  return (values ?? []).map(normalizeSilence);
+  const values = await apiGet<unknown>("/silences", { base: API_ROOT, signal, project });
+  return normalizeSilenceList(values);
 }
 
-export async function createSilence(input: SilenceInput): Promise<Silence> {
+export async function createSilence(input: SilenceInput, project?: string): Promise<Silence> {
   if (IS_MOCK) return delay((await loadMockAlerts()).createMockSilence(input), 250);
-  return normalizeSilence(await apiSend<Silence>("POST", "/silences", input, { base: API_ROOT }));
+  return normalizeSilence(
+    await apiSend<unknown>("POST", "/silences", input, { base: API_ROOT, project }),
+  );
 }
 
-export async function updateSilence(id: string, input: SilenceInput): Promise<Silence> {
+export async function updateSilence(
+  id: string,
+  input: SilenceInput,
+  project?: string,
+): Promise<Silence> {
   if (IS_MOCK) return delay((await loadMockAlerts()).updateMockSilence(id, input), 250);
-  return normalizeSilence(await apiSend<Silence>("PATCH", `/silences/${id}`, input, { base: API_ROOT }));
+  return normalizeSilence(
+    await apiSend<unknown>("PATCH", `/silences/${id}`, input, { base: API_ROOT, project }),
+  );
 }
 
-export async function deleteSilence(id: string): Promise<void> {
+export async function deleteSilence(id: string, project?: string): Promise<void> {
   if (IS_MOCK) {
     (await loadMockAlerts()).deleteMockSilence(id);
     return delay(undefined);
   }
-  await apiSend<void>("DELETE", `/silences/${id}`, undefined, { base: API_ROOT });
+  await apiSend<void>("DELETE", `/silences/${id}`, undefined, { base: API_ROOT, project });
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -278,17 +188,19 @@ export async function deleteSilence(id: string): Promise<void> {
 export async function listAlerts(
   status?: AlertStatus,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<AlertEvent[]> {
   if (IS_MOCK) {
     const all = (await loadMockAlerts()).mockEvents();
     return delay(status ? all.filter((e) => e.status === status) : all, 250);
   }
-  const values = await apiGet<AlertEvent[]>("/alerts", {
+  const values = await apiGet<unknown>("/alerts", {
     base: API_ROOT,
     params: status ? { status } : undefined,
     signal,
+    project,
   });
-  return (values ?? []).map(normalizeEvent);
+  return normalizeAlertEventList(values);
 }
 
 /** Severity of an event, derived from its `severity` label (defaults to info). */

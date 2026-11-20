@@ -158,6 +158,19 @@ export function normalizeAiStatus(value: unknown): AiStatus {
   };
 }
 
+/**
+ * Validates `PUT /api/ai/settings` client payload against the Go gateway rule
+ * (`internal/gateway/ai_settings.go`): setting both a non-empty `api_key` and
+ * `clear_api_key: true` is rejected with HTTP 400.
+ */
+export function validateAiSettingsUpdate(req: AiSettingsUpdate): AiSettingsUpdate {
+  const trimmedKey = typeof req.api_key === "string" ? req.api_key.trim() : "";
+  if (req.clear_api_key && trimmedKey !== "") {
+    throw new TypeError("api_key and clear_api_key cannot both be set");
+  }
+  return req;
+}
+
 /** Validate `GET`/`PUT /api/ai/settings` (`internal/gateway/ai_settings.go`). */
 export function normalizeAiSettings(value: unknown): AiSettings {
   const raw = assertRecord(value, "ai settings response");

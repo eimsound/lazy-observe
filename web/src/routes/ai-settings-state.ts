@@ -102,5 +102,8 @@ export function buildAiSettingsUpdatePayload(
     max_tokens: state.draft.max_tokens,
     api_key: hasNewKey ? trimmedKey : undefined,
     clear_api_key: hasNewKey ? false : state.clearKey,
+    ...(state.draft.revision !== undefined
+      ? { expected_revision: state.draft.revision }
+      : {}),
   };
 }

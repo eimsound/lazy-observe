@@ -9,12 +9,14 @@ import {
 } from "@/lib/api/ai";
 import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canUseAi } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
 import { projectQueryKey } from "@/lib/project/project-scope";
 import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatRelativeTime } from "@/lib/format";
 import { ConfidenceBadge } from "@/components/ai/confidence-badge";
+import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -23,6 +25,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { queryViewState } from "@/routes/query-view-state";
 
 /**
  * Minimal-footprint AI analysis card for the Issue detail page. When no analysis
@@ -55,8 +58,14 @@ export function IssueAiAnalysisCard({ issueId }: { issueId: string }) {
   });
 
   const aiEnabled = statusQuery.data?.enabled ?? true;
-  const allowed = canUseAi(role);
+  const allowed = hasCapability(role, "ai:analyze");
   const analysis = analysisQuery.data;
+  const viewState = queryViewState({
+    hasData: analysis !== undefined,
+    isLoading: analysisQuery.isLoading,
+    isError: analysisQuery.isError,
+    isEmpty: analysis === null,
+  });
 
   return (
     <Card>
@@ -81,18 +90,27 @@ export function IssueAiAnalysisCard({ issueId }: { issueId: string }) {
           )}
         </div>
 
+        {viewState === "stale" && (
+          <QueryStaleNotice
+            isRetrying={analysisQuery.isFetching}
+            onRetry={() => void analysisQuery.refetch()}
+          />
+        )}
+
         {/* Loading existing analysis */}
-        {analysisQuery.isLoading ? (
+        {viewState === "pending" ? (
           <div className="space-y-2">
             <Skeleton className="h-4 w-2/3" />
             <Skeleton className="h-16 w-full" />
           </div>
+        ) : viewState === "error" ? (
+          <QueryErrorState error={analysisQuery.error} onRetry={() => void analysisQuery.refetch()} />
         ) : generate.isPending && !analysis ? (
           <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" />
             {t("aiAnalysis.generating")}
           </div>
-        ) : !analysis ? (
+        ) : viewState === "empty" || !analysis ? (
           <NotGenerated
             aiEnabled={aiEnabled}
             allowed={allowed}

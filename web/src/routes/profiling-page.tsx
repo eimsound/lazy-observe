@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type UseQueryResult } from "@tanstack/react-query";
 import { useSearch } from "@tanstack/react-router";
@@ -24,18 +24,13 @@ import {
   type ProfileRecord,
   type ProfileType,
 } from "@/lib/api/profiles";
-import dayjs from "@/lib/dayjs";
-import {
-  RANGE_PRESETS,
-  DEFAULT_RANGE_ID,
-  rangeById,
-  resolveRange,
-} from "@/lib/api/ranges";
+import { RANGE_PRESETS, DEFAULT_RANGE_ID } from "@/lib/api/ranges";
 import { countMatches } from "@/lib/flamegraph";
 import { IS_MOCK } from "@/lib/settings";
 import { ApiError } from "@/lib/api/client";
-import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useResetOnProjectChange } from "@/hooks/use-reset-on-project-change";
+import { CUSTOM_TIME_RANGE_ID, useTimeWindow } from "@/hooks/use-time-window";
 import { formatDateTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
@@ -58,7 +53,7 @@ import { cn } from "@/lib/utils";
 import type { ProfilingEvidenceSearch } from "./trace-evidence-links";
 import { queryViewState } from "./query-view-state";
 
-const CUSTOM_RANGE = "__custom__";
+const CUSTOM_RANGE = CUSTOM_TIME_RANGE_ID;
 
 function isProfileType(v: string | undefined): v is ProfileType {
   return v === "cpu" || v === "heap" || v === "goroutine";
@@ -66,7 +61,6 @@ function isProfileType(v: string | undefined): v is ProfileType {
 
 export function ProfilingPage() {
   const { t } = useTranslation();
-  const { currentSlug } = useProject();
   const search = useSearch({ strict: false }) as ProfilingEvidenceSearch;
   const hasCustomWindow = search.start !== undefined && search.end !== undefined;
 
@@ -76,27 +70,23 @@ export function ProfilingPage() {
   const [type, setType] = useState<ProfileType>(
     isProfileType(search.type) ? search.type : "cpu",
   );
-  const [rangeId, setRangeId] = useState(
-    hasCustomWindow ? CUSTOM_RANGE : search.range ?? DEFAULT_RANGE_ID,
-  );
   const [customWindow] = useState<{ start: number; end: number } | null>(
     hasCustomWindow ? { start: search.start!, end: search.end! } : null,
   );
-  const [nowMs, setNowMs] = useState(() => dayjs().valueOf());
+  const { rangeId, setRangeId, window, advance } = useTimeWindow(
+    hasCustomWindow ? CUSTOM_RANGE : search.range ?? DEFAULT_RANGE_ID,
+    { customWindow },
+  );
   const [query, setQuery] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const prevProjectRef = useRef(currentSlug);
 
   // Reset service selection, drawer, and search when switching projects so the
   // prior project's service name never leaks into the newly selected project.
-  useEffect(() => {
-    if (prevProjectRef.current !== currentSlug) {
-      prevProjectRef.current = currentSlug;
-      setService("");
-      setDrawerOpen(false);
-      setQuery("");
-    }
-  }, [currentSlug]);
+  const currentSlug = useResetOnProjectChange(() => {
+    setService("");
+    setDrawerOpen(false);
+    setQuery("");
+  });
 
   const servicesQuery = useProjectQuery<string[], ApiError>({
     queryKey: ["profile-services"],
@@ -119,12 +109,6 @@ export function ProfilingPage() {
     return [...set];
   }, [servicesQuery.data, service]);
 
-  const window = useMemo(() => {
-    if (rangeId === CUSTOM_RANGE && customWindow) return customWindow;
-    const { start, end } = resolveRange(rangeById(rangeId), nowMs);
-    return { start, end };
-  }, [rangeId, customWindow, nowMs]);
-
   const flameQuery = useProjectQuery<FlameNode | null, ApiError>({
     queryKey: ["flamegraph", service, type, window.start, window.end],
     enabled: !!service,
@@ -141,6 +125,13 @@ export function ProfilingPage() {
       listProfiles({ service, type, start: window.start, end: window.end }, signal, project),
   });
 
+  const profilesState = queryViewState({
+    hasData: profilesQuery.data !== undefined,
+    isLoading: profilesQuery.isLoading || (profilesQuery.isFetching && profilesQuery.data === undefined),
+    isError: profilesQuery.isError,
+    isEmpty: (profilesQuery.data?.length ?? 0) === 0,
+  });
+
   const tree = flameQuery.data;
   const matchCount = useMemo(
     () => (tree && query.trim() ? countMatches(tree, query) : 0),
@@ -148,7 +139,7 @@ export function ProfilingPage() {
   );
 
   function refresh() {
-    setNowMs(dayjs().valueOf());
+    advance();
   }
 
   return (
@@ -282,9 +273,9 @@ export function ProfilingPage() {
         onOpenChange={setDrawerOpen}
         projectSlug={currentSlug}
         records={profilesQuery.data ?? []}
-        isLoading={profilesQuery.isFetching && profilesQuery.data === undefined}
-        hasError={profilesQuery.isError && profilesQuery.data === undefined}
-        stale={profilesQuery.isError && profilesQuery.data !== undefined}
+        isLoading={profilesState === "pending"}
+        hasError={profilesState === "error"}
+        stale={profilesState === "stale"}
         isRetrying={profilesQuery.isFetching}
         onRetry={() => void profilesQuery.refetch()}
       />

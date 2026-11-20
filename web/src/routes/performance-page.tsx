@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -19,11 +19,9 @@ import {
   type VitalMeta,
   type VitalRating,
 } from "@/lib/api/performance";
-import dayjs from "@/lib/dayjs";
-import { rangeById, resolveRange } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
-import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useTimeWindow } from "@/hooks/use-time-window";
 import type { TimeSeries } from "@/lib/api/types";
 import { formatPercent } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -74,16 +72,14 @@ const PERFORMANCE_QUERY_ROOTS = new Set([
 export function PerformancePage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const windowRef = useRef<PerfWindow>(resolveRange(rangeById("1h"), dayjs().valueOf()));
-  const getWindow = useCallback(() => windowRef.current, []);
+  const { getWindow, advance } = useTimeWindow("1h");
   const isFetching =
     useIsFetching({
       predicate: (query) => PERFORMANCE_QUERY_ROOTS.has(String(query.queryKey[0])),
     }) > 0;
 
   function advanceWindow() {
-    const nextNowMs = Math.max((windowRef.current.end + 1) * 1000, dayjs().valueOf());
-    windowRef.current = resolveRange(rangeById("1h"), nextNowMs);
+    advance();
     void queryClient.invalidateQueries({
       predicate: (query) => PERFORMANCE_QUERY_ROOTS.has(String(query.queryKey[0])),
     });
@@ -125,17 +121,8 @@ export function PerformancePage() {
 
 function WebVitalsTab({ getWindow }: { getWindow: () => PerfWindow }) {
   const { t } = useTranslation();
-  const { currentSlug } = useProject();
   const [page, setPage] = useState(ALL_PAGES);
   const [selectedVital, setSelectedVital] = useState<VitalKey>("lcp");
-  const prevProjectRef = useRef(currentSlug);
-
-  useEffect(() => {
-    if (prevProjectRef.current !== currentSlug) {
-      prevProjectRef.current = currentSlug;
-      setPage(ALL_PAGES);
-    }
-  }, [currentSlug]);
 
   const pageParam = page === ALL_PAGES ? undefined : page;
   const pagesQuery = useProjectQuery<string[]>({

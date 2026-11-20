@@ -8,6 +8,7 @@ import {
   normalizeAssistantAnswer,
   normalizeAssistantExplain,
   normalizeIssueAiAnalysis,
+  validateAiSettingsUpdate,
   type AiConfidence,
   type AiSettings,
   type AiSettingsUpdate,
@@ -83,6 +84,7 @@ export async function getAiSettings(signal?: AbortSignal): Promise<AiSettings> {
 
 /** Admin: save the AI configuration; the provider client hot-swaps server-side. */
 export async function updateAiSettings(req: AiSettingsUpdate): Promise<AiSettings> {
+  validateAiSettingsUpdate(req);
   if (IS_MOCK) return (await loadMockAi()).mockAiSettingsPut(req);
   return normalizeAiSettings(await apiSend<unknown>("PUT", "/ai/settings", req, { base: API_ROOT }));
 }

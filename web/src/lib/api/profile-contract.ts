@@ -99,6 +99,49 @@ export function normalizeProfileServicesResponse(
   return response.services;
 }
 
+export interface FlameNode {
+  name: string;
+  value: number;
+  unit?: string;
+  children?: FlameNode[];
+  truncated?: boolean;
+}
+
+export function normalizeFlameNode(value: unknown, label = "flamegraph"): FlameNode {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.name !== "string") {
+    throw new TypeError(`${label}.name must be a string`);
+  }
+  if (typeof raw.value !== "number" || !Number.isFinite(raw.value) || raw.value < 0) {
+    throw new TypeError(`${label}.value must be a non-negative number`);
+  }
+  if (raw.unit !== undefined && typeof raw.unit !== "string") {
+    throw new TypeError(`${label}.unit must be a string`);
+  }
+  if (raw.truncated !== undefined && typeof raw.truncated !== "boolean") {
+    throw new TypeError(`${label}.truncated must be a boolean`);
+  }
+  let children: FlameNode[] | undefined;
+  if (raw.children !== undefined) {
+    if (!Array.isArray(raw.children)) {
+      throw new TypeError(`${label}.children must be an array`);
+    }
+    children = raw.children.map((child, idx) =>
+      normalizeFlameNode(child, `${label}.children[${idx}]`),
+    );
+  }
+  return {
+    name: raw.name,
+    value: raw.value,
+    ...(raw.unit !== undefined ? { unit: raw.unit } : {}),
+    ...(children !== undefined ? { children } : {}),
+    ...(raw.truncated !== undefined ? { truncated: raw.truncated } : {}),
+  };
+}
+
 export function normalizeProfileListResponse(response: ProfileListResponseDTO): ProfileRecord[] {
   if (!response || !Array.isArray(response.profiles)) {
     throw new TypeError("profile list response must contain profiles");

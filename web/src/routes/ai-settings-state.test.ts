@@ -67,3 +67,12 @@ test("clicking clear API key clears any previously typed key draft", () => {
   assert.equal(payload.api_key, undefined);
   assert.equal(payload.clear_api_key, true);
 });
+
+test("buildAiSettingsUpdatePayload propagates expected_revision when server supplied revision", () => {
+  const state = syncServerAiSettings(INITIAL_AI_SETTINGS_FORM, {
+    ...SERVER_SETTINGS,
+    revision: 7,
+  });
+  const payload = buildAiSettingsUpdatePayload(state);
+  assert.equal(payload.expected_revision, 7);
+});

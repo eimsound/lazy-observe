@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Loader2, Plus, ShieldAlert, Trash2, Users as UsersIcon } from "lucide-react";
@@ -12,13 +12,14 @@ import {
 } from "@/lib/api/users";
 import { ROLES, type Role } from "@/lib/api/auth";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageUsers } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { formatErrorMessage } from "@/lib/api/errors";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -39,18 +40,20 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { queryViewState } from "./query-view-state";
 
 const fmt = (iso: string) => (iso ? formatDateTime(dayjs(iso).valueOf()) : "—");
 
 export function UsersPage() {
   const { t } = useTranslation();
   const { role, user } = useAuth();
+  const canManage = hasCapability(role, "users:manage");
   const queryClient = useQueryClient();
 
   const users = useQuery({
     queryKey: ["users"],
     queryFn: ({ signal }) => listUsers(signal),
-    enabled: canManageUsers(role),
+    enabled: canManage,
     retry: false,
   });
 
@@ -67,7 +70,7 @@ export function UsersPage() {
   });
 
   // Admin-only page: block non-admins with a clear message.
-  if (!canManageUsers(role)) {
+  if (!canManage) {
     return (
       <PageContainer>
         <Card>
@@ -82,6 +85,14 @@ export function UsersPage() {
       </PageContainer>
     );
   }
+
+  const rows = users.data ?? [];
+  const viewState = queryViewState({
+    hasData: users.data !== undefined,
+    isLoading: users.isLoading,
+    isError: users.isError,
+    isEmpty: rows.length === 0,
+  });
 
   return (
     <PageContainer>
@@ -98,22 +109,31 @@ export function UsersPage() {
         </p>
       )}
 
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={users.isFetching}
+          onRetry={() => void users.refetch()}
+        />
+      )}
+
       <Card>
         <CardContent className="p-0">
-          {users.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-4">
               {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
-          ) : users.isError ? (
+          ) : viewState === "error" ? (
             <QueryErrorState
               error={users.error}
               forbiddenTitle={t("users.forbiddenTitle")}
               forbiddenDesc={t("users.forbiddenDesc")}
               onRetry={() => void users.refetch()}
             />
-          ) : users.data && users.data.length > 0 ? (
+          ) : viewState === "empty" ? (
+            <EmptyState icon={<UsersIcon className="size-6" />} title={t("users.empty")} />
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -127,12 +147,17 @@ export function UsersPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {users.data.map((u) => {
+                  {rows.map((u) => {
                     const isSelf = u.username === user?.username;
                     return (
                       <tr key={u.id} className="border-b border-border/60 last:border-0">
                         <td className="px-4 py-3 font-medium">
-                          {u.username}
+                          <span>{u.username}</span>
+                          {u.display_name && u.display_name !== u.username && (
+                            <span className="ml-2 text-xs font-normal text-muted-foreground">
+                              {u.display_name}
+                            </span>
+                          )}
                           {isSelf && (
                             <span className="ml-2 rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[11px] font-normal text-muted-foreground">
                               {t("users.you")}
@@ -188,29 +213,29 @@ export function UsersPage() {
                 </tbody>
               </table>
             </div>
-          ) : (
-            <EmptyState icon={<UsersIcon className="size-6" />} title={t("users.empty")} />
           )}
         </CardContent>
       </Card>
 
-      {createOpen && <CreateUserDialog open={createOpen} onOpenChange={setCreateOpen} />}
+      {createOpen && <CreateUserDialog key="create-user" open={createOpen} onOpenChange={setCreateOpen} />}
       {resetting && (
         <ResetPasswordDialog key={resetting.id} user={resetting} onOpenChange={setResetting} />
       )}
-      <ConfirmDialog
-        open={!!deleting}
-        onOpenChange={(o) => !o && setDeleting(null)}
-        title={t("users.deleteConfirm", { name: deleting?.username ?? "" })}
-        description={t("users.deleteConfirmDesc")}
-        confirmLabel={t("users.deleteUser")}
-        onConfirm={async () => {
-          if (!deleting) return;
-          await deleteUser(deleting.id);
-          void queryClient.invalidateQueries({ queryKey: ["users"] });
-          setDeleting(null);
-        }}
-      />
+      {deleting && (
+        <ConfirmDialog
+          key={deleting.id}
+          open
+          onOpenChange={(o) => !o && setDeleting(null)}
+          title={t("users.deleteConfirm", { name: deleting.username })}
+          description={t("users.deleteConfirmDesc")}
+          confirmLabel={t("users.deleteUser")}
+          onConfirm={async () => {
+            await deleteUser(deleting.id);
+            void queryClient.invalidateQueries({ queryKey: ["users"] });
+            setDeleting(null);
+          }}
+        />
+      )}
     </PageContainer>
   );
 }
@@ -225,44 +250,25 @@ function CreateUserDialog({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [roleValue, setRoleValue] = useState<Role>("member");
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!open) {
-      setUsername("");
-      setPassword("");
-      setRoleValue("member");
-      setError(null);
-    }
-  }, [open]);
-
   const mutation = useMutation({
-    mutationFn: () => createUser(username.trim(), password, roleValue),
+    mutationFn: () =>
+      createUser(username.trim(), password, roleValue, {
+        display_name: displayName.trim() || undefined,
+      }),
     onSuccess: () => {
-      reset();
       void queryClient.invalidateQueries({ queryKey: ["users"] });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("users.createError")),
   });
 
-  function reset() {
-    setUsername("");
-    setPassword("");
-    setRoleValue("member");
-    setError(null);
-  }
-
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(o) => {
-        reset();
-        onOpenChange(o);
-      }}
-    >
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{t("users.newUser")}</DialogTitle>
@@ -277,6 +283,21 @@ function CreateUserDialog({
               placeholder={t("users.usernamePlaceholder")}
               autoComplete="off"
               autoFocus
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="u-display-name">
+              {t("profile.displayName")}
+              <span className="ml-1 text-xs font-normal text-muted-foreground">
+                ({t("common.optional")})
+              </span>
+            </Label>
+            <Input
+              id="u-display-name"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder={username || t("users.usernamePlaceholder")}
+              autoComplete="off"
             />
           </div>
           <div className="space-y-1.5">
@@ -314,10 +335,7 @@ function CreateUserDialog({
         <DialogFooter>
           <Button
             variant="outline"
-            onClick={() => {
-              reset();
-              onOpenChange(false);
-            }}
+            onClick={() => onOpenChange(false)}
             disabled={mutation.isPending}
           >
             {t("common.cancel")}
@@ -335,49 +353,33 @@ function CreateUserDialog({
   );
 }
 
-
 function ResetPasswordDialog({
   user,
   onOpenChange,
 }: {
-  user: ManagedUser | null;
+  user: ManagedUser;
   onOpenChange: (user: ManagedUser | null) => void;
 }) {
   const { t } = useTranslation();
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    setPassword("");
-    setError(null);
-  }, [user?.id]);
-
   const mutation = useMutation({
-    mutationFn: () => resetUserPassword(user!.id, password),
-    onSuccess: () => {
-      setPassword("");
-      setError(null);
-      onOpenChange(null);
-    },
+    mutationFn: () => resetUserPassword(user.id, password),
+    onSuccess: () => onOpenChange(null),
     onError: (e) => setError((e as Error).message || t("users.resetError")),
   });
 
-  function close() {
-    setPassword("");
-    setError(null);
-    onOpenChange(null);
-  }
-
   return (
     <Dialog
-      open={!!user}
+      open
       onOpenChange={(o) => {
-        if (!o) close();
+        if (!o) onOpenChange(null);
       }}
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{t("users.resetTitle", { name: user?.username ?? "" })}</DialogTitle>
+          <DialogTitle>{t("users.resetTitle", { name: user.username })}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
           <div className="space-y-1.5">
@@ -401,7 +403,7 @@ function ResetPasswordDialog({
         <DialogFooter>
           <Button
             variant="outline"
-            onClick={close}
+            onClick={() => onOpenChange(null)}
             disabled={mutation.isPending}
           >
             {t("common.cancel")}

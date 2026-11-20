@@ -12,10 +12,13 @@ import { IS_MOCK } from "@/lib/settings";
 import { useProjectQuery } from "@/lib/project/use-project-query";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { queryViewState } from "./query-view-state";
 
 const RATING_TEXT: Record<UsageRating, string> = {
   good: "text-vital-good",
@@ -34,11 +37,20 @@ export function HostsPage() {
   const hosts = useProjectQuery({
     queryKey: ["hosts"],
     queryFn: ({ signal, project }) => listHosts(signal, project),
+    retry: false,
   });
 
   function openHost(instance: string) {
     void navigate({ to: "/infrastructure/hosts/$instance", params: { instance } });
   }
+
+  const rows = hosts.data ?? [];
+  const viewState = queryViewState({
+    hasData: hosts.data !== undefined,
+    isLoading: hosts.isLoading,
+    isError: hosts.isError,
+    isEmpty: rows.length === 0,
+  });
 
   return (
     <PageContainer>
@@ -51,29 +63,30 @@ export function HostsPage() {
         </PageActions>
       )}
 
-      {hosts.isLoading ? (
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={hosts.isFetching}
+          onRetry={() => void hosts.refetch()}
+        />
+      )}
+
+      {viewState === "pending" ? (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {[0, 1, 2, 3, 4, 5].map((i) => (
             <Skeleton key={i} className="h-44 w-full" />
           ))}
         </div>
-      ) : hosts.isError ? (
+      ) : viewState === "error" ? (
         <Card>
           <CardContent>
-            <EmptyState
-              icon={<Server className="size-6" />}
-              title={t("hosts.errorTitle")}
-              desc={(hosts.error as Error).message}
+            <QueryErrorState
+              error={hosts.error}
+              errorTitle={t("hosts.errorTitle")}
+              onRetry={() => void hosts.refetch()}
             />
           </CardContent>
         </Card>
-      ) : hosts.data && hosts.data.length > 0 ? (
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {hosts.data.map((h) => (
-            <HostCard key={h.instance} host={h} onOpen={() => openHost(h.instance)} />
-          ))}
-        </div>
-      ) : (
+      ) : viewState === "empty" ? (
         <Card>
           <CardContent>
             <EmptyState
@@ -83,6 +96,12 @@ export function HostsPage() {
             />
           </CardContent>
         </Card>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {rows.map((h) => (
+            <HostCard key={h.instance} host={h} onOpen={() => openHost(h.instance)} />
+          ))}
+        </div>
       )}
     </PageContainer>
   );

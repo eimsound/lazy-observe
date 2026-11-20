@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
+import { afterEach, test, vi } from "vitest";
 
 import {
   normalizeHealthDiagnostics,
   normalizeInboxDiagnostics,
 } from "./system-contract.ts";
+import { getHealthDiagnostics } from "./system.ts";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 test("system health diagnostics expose only known components and stable states", () => {
   assert.deepEqual(normalizeHealthDiagnostics({
@@ -86,4 +91,53 @@ test("Inbox diagnostics discard payloads, event identities, and raw errors", () 
     dropsTotal: 7,
   });
   assert.equal(JSON.stringify(diagnostics).includes("private"), false);
+});
+
+test("getHealthDiagnostics accepts real Go /healthz HTTP 200 ok and HTTP 503 degraded responses", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          status: "ok",
+          components: {
+            gateway: "ok",
+            metrics: "ok",
+            logs: "ok",
+            traces: "ok",
+            vmagent: "ok",
+            error_inbox: "active_items=0 active_bytes=0",
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    ),
+  );
+  const okDiag = await getHealthDiagnostics();
+  assert.equal(okDiag.status, "ok");
+  assert.equal(okDiag.components.every((c) => c.state === "ok"), true);
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          status: "degraded",
+          components: {
+            gateway: "ok",
+            logs: "component restarting",
+            error_inbox: "diagnostics unavailable",
+          },
+        }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      ),
+    ),
+  );
+  const degradedDiag = await getHealthDiagnostics();
+  assert.equal(degradedDiag.status, "degraded");
+  assert.deepEqual(degradedDiag.components, [
+    { name: "gateway", state: "ok" },
+    { name: "logs", state: "restarting" },
+    { name: "error_inbox", state: "unavailable" },
+  ]);
 });

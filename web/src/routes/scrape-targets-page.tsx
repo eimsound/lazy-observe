@@ -13,16 +13,17 @@ import {
   type TargetHealthStatus,
 } from "@/lib/api/scrape-targets";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageAlerts } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
 import { projectQueryKey } from "@/lib/project/project-scope";
 import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useOptimisticList } from "@/hooks/use-optimistic-list";
 import { formatRelativeTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
-import { formatErrorMessage } from "@/lib/api/errors";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { KvEditor } from "@/components/common/kv-editor";
 import { pairsToRecord, recordToPairs, type Pair } from "@/components/common/kv-pairs";
@@ -41,6 +42,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { queryViewState } from "./query-view-state";
 
 const STATUS_DOT: Record<TargetHealthStatus, string> = {
   up: "bg-vital-good",
@@ -61,7 +63,7 @@ export function ScrapeTargetsPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
   const { currentSlug: project } = useProject();
-  const canManage = canManageAlerts(role);
+  const canManage = hasCapability(role, "scrape:write");
   const queryClient = useQueryClient();
 
   const targets = useProjectQuery({
@@ -75,21 +77,31 @@ export function ScrapeTargetsPage() {
   const [deleting, setDeleting] = useState<ScrapeTarget | null>(null);
   const [toggleError, setToggleError] = useState<string | null>(null);
 
-  const toggle = useMutation({
+  const targetsQueryKey = projectQueryKey(project, ["scrape-targets"]);
+  const toggle = useOptimisticList<ScrapeTarget[], ScrapeTarget, ScrapeTarget>({
+    queryKey: targetsQueryKey,
     mutationFn: (target: ScrapeTarget) => {
       const { id, ...rest } = target;
       return updateScrapeTarget(id, { ...rest, enabled: !target.enabled }, project);
     },
-    onMutate: () => setToggleError(null),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["scrape-targets"]) }),
-    onError: (err) => setToggleError(formatErrorMessage(err, t("scrapeTargets.saveError"))),
+    optimisticUpdate: (previous, target) =>
+      previous.map((item) => (item.id === target.id ? { ...item, enabled: !item.enabled } : item)),
+    onErrorMessage: setToggleError,
+    fallbackError: t("scrapeTargets.saveError"),
   });
 
   function refreshAll() {
-    void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["scrape-targets"]) });
+    void queryClient.invalidateQueries({ queryKey: targetsQueryKey });
     void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["target-health"]) });
   }
+
+  const rows = targets.data ?? [];
+  const viewState = queryViewState({
+    hasData: targets.data !== undefined,
+    isLoading: targets.isLoading,
+    isError: targets.isError,
+    isEmpty: rows.length === 0,
+  });
 
   return (
     <PageContainer>
@@ -118,17 +130,30 @@ export function ScrapeTargetsPage() {
         </p>
       )}
 
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={targets.isFetching}
+          onRetry={() => void targets.refetch()}
+        />
+      )}
+
       <Card>
         <CardContent className="p-0">
-          {targets.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-4">
               {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
-          ) : targets.isError ? (
+          ) : viewState === "error" ? (
             <QueryErrorState error={targets.error} onRetry={() => void targets.refetch()} />
-          ) : targets.data && targets.data.length > 0 ? (
+          ) : viewState === "empty" ? (
+            <EmptyState
+              icon={<Target className="size-6" />}
+              title={t("scrapeTargets.empty")}
+              desc={canManage ? t("scrapeTargets.emptyDesc") : undefined}
+            />
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -143,7 +168,7 @@ export function ScrapeTargetsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {targets.data.map((target) => (
+                  {rows.map((target) => (
                     <tr
                       key={target.id}
                       className="border-b border-border/60 align-top last:border-0"
@@ -207,12 +232,6 @@ export function ScrapeTargetsPage() {
                 </tbody>
               </table>
             </div>
-          ) : (
-            <EmptyState
-              icon={<Target className="size-6" />}
-              title={t("scrapeTargets.empty")}
-              desc={canManage ? t("scrapeTargets.emptyDesc") : undefined}
-            />
           )}
         </CardContent>
       </Card>
@@ -229,19 +248,21 @@ export function ScrapeTargetsPage() {
           editing={editing}
         />
       )}
-      <ConfirmDialog
-        open={!!deleting}
-        onOpenChange={(o) => !o && setDeleting(null)}
-        title={t("scrapeTargets.deleteConfirm", { name: deleting?.name ?? "" })}
-        description={t("scrapeTargets.deleteConfirmDesc")}
-        confirmLabel={t("scrapeTargets.deleteTarget")}
-        onConfirm={async () => {
-          if (!deleting) return;
-          await deleteScrapeTarget(deleting.id, project);
-          void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["scrape-targets"]) });
-          setDeleting(null);
-        }}
-      />
+      {deleting && (
+        <ConfirmDialog
+          key={deleting.id}
+          open
+          onOpenChange={(o) => !o && setDeleting(null)}
+          title={t("scrapeTargets.deleteConfirm", { name: deleting.name })}
+          description={t("scrapeTargets.deleteConfirmDesc")}
+          confirmLabel={t("scrapeTargets.deleteTarget")}
+          onConfirm={async () => {
+            await deleteScrapeTarget(deleting.id, project);
+            void queryClient.invalidateQueries({ queryKey: targetsQueryKey });
+            setDeleting(null);
+          }}
+        />
+      )}
     </PageContainer>
   );
 }

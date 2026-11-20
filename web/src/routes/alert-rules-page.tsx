@@ -16,11 +16,16 @@ import {
   type Severity,
 } from "@/lib/api/alerts";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageAlerts } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
+import { useProject } from "@/lib/project/project-provider";
+import { projectQueryKey } from "@/lib/project/project-scope";
+import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useOptimisticList } from "@/hooks/use-optimistic-list";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { isForbiddenError } from "@/lib/api/errors";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { SeverityBadge } from "@/components/alerts/severity";
 import { KvEditor } from "@/components/common/kv-editor";
@@ -50,25 +55,31 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { queryViewState } from "./query-view-state";
 
 export function AlertRulesPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
-  const canManage = canManageAlerts(role);
+  const { currentSlug: project } = useProject();
+  const canRead = hasCapability(role, "alerts:read");
+  const canWrite = hasCapability(role, "alerts:write");
   const queryClient = useQueryClient();
 
-  const rules = useQuery({
+  const rules = useProjectQuery({
     queryKey: ["alert-rules"],
-    queryFn: ({ signal }) => listRules(signal),
-    enabled: canManage,
+    queryFn: ({ signal, project: activeProject }) => listRules(signal, activeProject),
+    enabled: canRead,
     retry: false,
   });
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<AlertRule | null>(null);
   const [deleting, setDeleting] = useState<AlertRule | null>(null);
+  const [toggleError, setToggleError] = useState<string | null>(null);
 
-  const toggle = useMutation({
+  const rulesQueryKey = projectQueryKey(project, ["alert-rules"]);
+  const toggle = useOptimisticList<AlertRule[], AlertRule, AlertRule>({
+    queryKey: rulesQueryKey,
     mutationFn: (rule: AlertRule) => {
       const input: AlertRuleInput = {
         name: rule.name,
@@ -81,12 +92,15 @@ export function AlertRulesPage() {
         channel_ids: rule.channel_ids,
         enabled: !rule.enabled,
       };
-      return updateRule(rule.id, input);
+      return updateRule(rule.id, input, project);
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alert-rules"] }),
+    optimisticUpdate: (previous, rule) =>
+      previous.map((item) => (item.id === rule.id ? { ...item, enabled: !item.enabled } : item)),
+    onErrorMessage: setToggleError,
+    fallbackError: t("alerts.ruleSaveError"),
   });
 
-  if (!canManage) {
+  if (!canRead) {
     return (
       <PageContainer>
         <Card>
@@ -111,30 +125,59 @@ export function AlertRulesPage() {
     setFormOpen(true);
   }
 
+  const rows = rules.data ?? [];
+  const viewState = queryViewState({
+    hasData: rules.data !== undefined,
+    isLoading: rules.isLoading,
+    isError: rules.isError,
+    isEmpty: rows.length === 0,
+  });
+
   return (
     <PageContainer>
-      <PageActions>
-        <Button onClick={openNew} className="gap-1.5">
-          <Plus className="size-4" />
-          {t("alerts.newRule")}
-        </Button>
-      </PageActions>
+      {canWrite && (
+        <PageActions>
+          <Button onClick={openNew} className="gap-1.5">
+            <Plus className="size-4" />
+            {t("alerts.newRule")}
+          </Button>
+        </PageActions>
+      )}
+
+      {toggleError && (
+        <p className="mb-3 text-sm text-destructive" role="alert">
+          {toggleError}
+        </p>
+      )}
+
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={rules.isFetching}
+          onRetry={() => void rules.refetch()}
+        />
+      )}
 
       <Card>
         <CardContent className="p-0">
-          {rules.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-4">
               {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-14 w-full" />
               ))}
             </div>
-          ) : rules.isError ? (
+          ) : viewState === "error" ? (
             <QueryErrorState
               error={rules.error}
               forbiddenDesc={t("alerts.rulesForbiddenDesc")}
               onRetry={() => void rules.refetch()}
             />
-          ) : rules.data && rules.data.length > 0 ? (
+          ) : viewState === "empty" ? (
+            <EmptyState
+              icon={<ListChecks className="size-6" />}
+              title={t("alerts.noRules")}
+              desc={t("alerts.noRulesDesc")}
+            />
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -152,7 +195,7 @@ export function AlertRulesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rules.data.map((r) => (
+                  {rows.map((r) => (
                     <tr key={r.id} className="border-b border-border/60 last:border-0 align-top">
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2 font-medium">
@@ -177,13 +220,13 @@ export function AlertRulesPage() {
                       <td className="px-4 py-3">
                         <Switch
                           checked={r.enabled}
-                          disabled={!canManage || toggle.isPending}
+                          disabled={!canWrite || toggle.isPending}
                           onCheckedChange={() => toggle.mutate(r)}
                           aria-label={t("alerts.enabledField")}
                         />
                       </td>
                       <td className="px-4 py-3">
-                        {canManage && (
+                        {canWrite && (
                           <div className="flex items-center justify-end gap-1">
                             <Button
                               variant="ghost"
@@ -209,12 +252,6 @@ export function AlertRulesPage() {
                 </tbody>
               </table>
             </div>
-          ) : (
-            <EmptyState
-              icon={<ListChecks className="size-6" />}
-              title={t("alerts.noRules")}
-              desc={t("alerts.noRulesDesc")}
-            />
           )}
         </CardContent>
       </Card>
@@ -228,19 +265,21 @@ export function AlertRulesPage() {
         />
       )}
 
-      <ConfirmDialog
-        open={!!deleting}
-        onOpenChange={(o) => !o && setDeleting(null)}
-        title={t("alerts.deleteRuleConfirm", { name: deleting?.name ?? "" })}
-        description={t("alerts.deleteRuleConfirmDesc")}
-        confirmLabel={t("alerts.deleteRule")}
-        onConfirm={async () => {
-          if (!deleting) return;
-          await deleteRule(deleting.id);
-          void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
-          setDeleting(null);
-        }}
-      />
+      {deleting && (
+        <ConfirmDialog
+          key={deleting.id}
+          open
+          onOpenChange={(o) => !o && setDeleting(null)}
+          title={t("alerts.deleteRuleConfirm", { name: deleting.name })}
+          description={t("alerts.deleteRuleConfirmDesc")}
+          confirmLabel={t("alerts.deleteRule")}
+          onConfirm={async () => {
+            await deleteRule(deleting.id, project);
+            void queryClient.invalidateQueries({ queryKey: rulesQueryKey });
+            setDeleting(null);
+          }}
+        />
+      )}
     </PageContainer>
   );
 }
@@ -255,10 +294,15 @@ function RuleFormDialog({
   editing: AlertRule | null;
 }) {
   const { t } = useTranslation();
+  const { role } = useAuth();
+  const { currentSlug: project } = useProject();
+  const canReadChannels = hasCapability(role, "channels:read");
   const queryClient = useQueryClient();
   const channels = useQuery({
     queryKey: ["channels"],
     queryFn: ({ signal }) => listChannels(signal),
+    enabled: canReadChannels,
+    refetchOnWindowFocus: false,
     retry: false,
   });
 
@@ -295,9 +339,10 @@ function RuleFormDialog({
   );
 
   const mutation = useMutation({
-    mutationFn: () => (editing ? updateRule(editing.id, input) : createRule(input)),
+    mutationFn: () =>
+      editing ? updateRule(editing.id, input, project) : createRule(input, project),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
+      void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["alert-rules"]) });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("alerts.ruleSaveError")),
@@ -309,6 +354,14 @@ function RuleFormDialog({
     setError(null);
     mutation.mutate();
   }
+
+  const channelRows = channels.data ?? [];
+  const channelsState = queryViewState({
+    hasData: channels.data !== undefined,
+    isLoading: channels.isLoading,
+    isError: channels.isError,
+    isEmpty: channelRows.length === 0,
+  });
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -419,9 +472,15 @@ function RuleFormDialog({
 
           <div className="space-y-1.5">
             <Label>{t("alerts.channelsField")}</Label>
-            {channels.isLoading ? (
+            {channelsState === "stale" && (
+              <QueryStaleNotice
+                isRetrying={channels.isFetching}
+                onRetry={() => void channels.refetch()}
+              />
+            )}
+            {channelsState === "pending" ? (
               <Skeleton className="h-8 w-48" />
-            ) : channels.isError ? (
+            ) : channelsState === "error" ? (
               <div className="flex flex-wrap items-center gap-2 text-xs text-destructive" role="alert">
                 <span>
                   {isForbiddenError(channels.error)
@@ -440,9 +499,11 @@ function RuleFormDialog({
                   </Button>
                 )}
               </div>
-            ) : channels.data && channels.data.length > 0 ? (
+            ) : channelsState === "empty" ? (
+              <p className="text-xs text-muted-foreground">{t("alerts.noChannelsAvailable")}</p>
+            ) : (
               <div className="flex flex-wrap gap-2">
-                {channels.data.map((ch) => {
+                {channelRows.map((ch) => {
                   const selected = channelIds.includes(ch.id);
                   return (
                     <button
@@ -465,8 +526,6 @@ function RuleFormDialog({
                   );
                 })}
               </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">{t("alerts.noChannelsAvailable")}</p>
             )}
           </div>
 

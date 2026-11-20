@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BellOff, Loader2, Pencil, Plus, ShieldAlert, X } from "lucide-react";
 import {
   listSilences,
@@ -12,12 +12,16 @@ import {
   type Matcher,
 } from "@/lib/api/alerts";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageAlerts } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
+import { useProject } from "@/lib/project/project-provider";
+import { projectQueryKey } from "@/lib/project/project-scope";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDateTime, formatDurationShort } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -39,6 +43,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { queryViewState } from "./query-view-state";
 
 /** ISO <-> <input type="datetime-local"> value, in the browser's local zone. */
 function isoToLocalInput(iso: string): string {
@@ -55,13 +60,15 @@ const isActive = (s: Silence) => dayjs(s.ends_at).isAfter(dayjs());
 export function SilencesPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
-  const canManage = canManageAlerts(role);
+  const { currentSlug: project } = useProject();
+  const canRead = hasCapability(role, "alerts:read");
+  const canWrite = hasCapability(role, "alerts:write");
   const queryClient = useQueryClient();
 
-  const silences = useQuery({
+  const silences = useProjectQuery({
     queryKey: ["silences"],
-    queryFn: ({ signal }) => listSilences(signal),
-    enabled: canManage,
+    queryFn: ({ signal, project: activeProject }) => listSilences(signal, activeProject),
+    enabled: canRead,
     retry: false,
   });
 
@@ -77,7 +84,7 @@ export function SilencesPage() {
     };
   }, [silences.data]);
 
-  if (!canManage) {
+  if (!canRead) {
     return (
       <PageContainer>
         <Card>
@@ -102,21 +109,38 @@ export function SilencesPage() {
     setFormOpen(true);
   }
 
+  const rows = silences.data ?? [];
+  const viewState = queryViewState({
+    hasData: silences.data !== undefined,
+    isLoading: silences.isLoading,
+    isError: silences.isError,
+    isEmpty: rows.length === 0,
+  });
+
   return (
     <PageContainer>
-      <PageActions>
-        <Button onClick={openNew} className="gap-1.5">
-          <Plus className="size-4" />
-          {t("alerts.newSilence")}
-        </Button>
-      </PageActions>
+      {canWrite && (
+        <PageActions>
+          <Button onClick={openNew} className="gap-1.5">
+            <Plus className="size-4" />
+            {t("alerts.newSilence")}
+          </Button>
+        </PageActions>
+      )}
 
-      {silences.isLoading ? (
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={silences.isFetching}
+          onRetry={() => void silences.refetch()}
+        />
+      )}
+
+      {viewState === "pending" ? (
         <div className="space-y-3">
           <Skeleton className="h-24 w-full" />
           <Skeleton className="h-24 w-full" />
         </div>
-      ) : silences.isError ? (
+      ) : viewState === "error" ? (
         <Card>
           <CardContent>
             <QueryErrorState
@@ -126,7 +150,7 @@ export function SilencesPage() {
             />
           </CardContent>
         </Card>
-      ) : (silences.data?.length ?? 0) === 0 ? (
+      ) : viewState === "empty" ? (
         <Card>
           <CardContent>
             <EmptyState
@@ -143,7 +167,7 @@ export function SilencesPage() {
               <SilenceCard
                 key={s.id}
                 silence={s}
-                canManage={canManage}
+                canManage={canWrite}
                 onEdit={() => openEdit(s)}
                 onDelete={() => setDeleting(s)}
               />
@@ -155,7 +179,7 @@ export function SilencesPage() {
                 <SilenceCard
                   key={s.id}
                   silence={s}
-                  canManage={canManage}
+                  canManage={canWrite}
                   onEdit={() => openEdit(s)}
                   onDelete={() => setDeleting(s)}
                 />
@@ -173,19 +197,21 @@ export function SilencesPage() {
           editing={editing}
         />
       )}
-      <ConfirmDialog
-        open={!!deleting}
-        onOpenChange={(o) => !o && setDeleting(null)}
-        title={t("alerts.deleteSilenceConfirm")}
-        description={t("alerts.deleteSilenceConfirmDesc")}
-        confirmLabel={t("alerts.deleteSilence")}
-        onConfirm={async () => {
-          if (!deleting) return;
-          await deleteSilence(deleting.id);
-          void queryClient.invalidateQueries({ queryKey: ["silences"] });
-          setDeleting(null);
-        }}
-      />
+      {deleting && (
+        <ConfirmDialog
+          key={deleting.id}
+          open
+          onOpenChange={(o) => !o && setDeleting(null)}
+          title={t("alerts.deleteSilenceConfirm")}
+          description={t("alerts.deleteSilenceConfirmDesc")}
+          confirmLabel={t("alerts.deleteSilence")}
+          onConfirm={async () => {
+            await deleteSilence(deleting.id, project);
+            void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["silences"]) });
+            setDeleting(null);
+          }}
+        />
+      )}
     </PageContainer>
   );
 }
@@ -297,6 +323,7 @@ function SilenceFormDialog({
   editing: Silence | null;
 }) {
   const { t } = useTranslation();
+  const { currentSlug: project } = useProject();
   const queryClient = useQueryClient();
 
   const [matchers, setMatchers] = useState<Matcher[]>(
@@ -313,9 +340,9 @@ function SilenceFormDialog({
 
   const mutation = useMutation({
     mutationFn: (input: SilenceInput) =>
-      editing ? updateSilence(editing.id, input) : createSilence(input),
+      editing ? updateSilence(editing.id, input, project) : createSilence(input, project),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["silences"] });
+      void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["silences"]) });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("alerts.silenceSaveError")),

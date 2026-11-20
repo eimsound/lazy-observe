@@ -103,6 +103,9 @@ export async function mockAiSettingsGet(): Promise<AiSettings> {
 }
 
 export async function mockAiSettingsPut(req: AiSettingsUpdate): Promise<AiSettings> {
+  if (req.clear_api_key && req.api_key !== undefined && req.api_key.trim() !== "") {
+    throw new ApiError("api_key and clear_api_key cannot both be set", 400);
+  }
   const current = readMockSettings();
   const next: AiSettings = { ...current };
   if (req.enabled !== undefined) next.enabled = req.enabled;

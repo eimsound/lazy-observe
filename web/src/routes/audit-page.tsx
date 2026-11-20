@@ -4,7 +4,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, History, ShieldAlert, ShieldCheck } from "lucide-react";
 import { listAudit, type AuditEvent } from "@/lib/api/audit";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageUsers } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import {
   INITIAL_CURSOR_PAGINATION,
   canGoBackCursor,
@@ -17,10 +17,12 @@ import dayjs from "@/lib/dayjs";
 import { PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { queryViewState } from "./query-view-state";
 
 const PAGE_SIZE = 100;
 const fmt = (iso: string) => formatDateTime(dayjs(iso).valueOf());
@@ -28,6 +30,7 @@ const fmt = (iso: string) => formatDateTime(dayjs(iso).valueOf());
 export function AuditPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
+  const canRead = hasCapability(role, "audit:read");
   const [action, setAction] = useState("");
   const [actor, setActor] = useState("");
   const [pagination, setPagination] = useState<CursorPaginationState>(INITIAL_CURSOR_PAGINATION);
@@ -52,11 +55,11 @@ export function AuditPage() {
         signal,
       ),
     placeholderData: keepPreviousData,
-    enabled: canManageUsers(role),
+    enabled: canRead,
     retry: false,
   });
 
-  if (!canManageUsers(role)) {
+  if (!canRead) {
     return (
       <PageContainer>
         <Card>
@@ -74,6 +77,13 @@ export function AuditPage() {
 
   const events: AuditEvent[] = audit.data ?? [];
   const hasMore = events.length === PAGE_SIZE;
+  const viewState = queryViewState({
+    hasData: audit.data !== undefined,
+    isLoading: audit.isLoading,
+    isError: audit.isError,
+    isEmpty: events.length === 0,
+  });
+
   const goBack = () => {
     setPagination((prev) => popCursorPage(prev));
   };
@@ -105,22 +115,30 @@ export function AuditPage() {
           placeholder={t("audit.filterActor")}
         />
       </div>
+      {viewState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={audit.isFetching}
+          onRetry={() => void audit.refetch()}
+        />
+      )}
       <Card>
         <CardContent className="p-0">
-          {audit.isLoading ? (
+          {viewState === "pending" ? (
             <div className="space-y-2 p-4">
               {[0, 1, 2, 3].map((i) => (
                 <Skeleton key={i} className="h-10 w-full" />
               ))}
             </div>
-          ) : audit.isError ? (
+          ) : viewState === "error" ? (
             <QueryErrorState
               error={audit.error}
               forbiddenTitle={t("audit.forbiddenTitle")}
               forbiddenDesc={t("audit.forbiddenDesc")}
               onRetry={() => void audit.refetch()}
             />
-          ) : events.length > 0 ? (
+          ) : viewState === "empty" ? (
+            <EmptyState icon={<History className="size-6" />} title={t("audit.empty")} />
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -167,8 +185,6 @@ export function AuditPage() {
                 </tbody>
               </table>
             </div>
-          ) : (
-            <EmptyState icon={<History className="size-6" />} title={t("audit.empty")} />
           )}
         </CardContent>
       </Card>

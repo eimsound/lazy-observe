@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
+import { type UseQueryResult } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -26,11 +26,11 @@ import {
 import { IS_MOCK } from "@/lib/settings";
 import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageIssues } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
 import { projectQueryKey } from "@/lib/project/project-scope";
 import { useProjectQuery } from "@/lib/project/use-project-query";
-import { formatErrorMessage } from "@/lib/api/errors";
+import { useOptimisticList } from "@/hooks/use-optimistic-list";
 import { formatRelativeTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
@@ -64,8 +64,7 @@ export function IssuesPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
   const { currentSlug } = useProject();
-  const canManage = canManageIssues(role);
-  const queryClient = useQueryClient();
+  const canManage = hasCapability(role, "issues:write");
 
   const [status, setStatus] = useState<IssueStatus>("open");
   const [level, setLevel] = useState<string>(ALL_LEVELS);
@@ -75,19 +74,10 @@ export function IssuesPage() {
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [actionError, setActionError] = useState<string | null>(null);
-  const prevProjectRef = useRef(currentSlug);
-
-  useEffect(() => {
-    if (prevProjectRef.current !== currentSlug) {
-      prevProjectRef.current = currentSlug;
-      setPage(1);
-      setSelected(new Set());
-      setActionError(null);
-    }
-  }, [currentSlug]);
 
   const levelParam = level === ALL_LEVELS ? "" : (level as IssueLevel);
   const queryKey = projectQueryKey(currentSlug, ["issues", status, levelParam, q, sort, page]);
+  const invalidateKey = projectQueryKey(currentSlug, ["issues"]);
 
   const query = useProjectQuery<IssueListResult, ApiError>({
     queryKey: ["issues", status, levelParam, q, sort, page],
@@ -97,48 +87,28 @@ export function IssuesPage() {
     placeholderData: (prev) => prev,
   });
 
-  const mutation = useMutation({
-    mutationFn: ({ id, next }: { id: string; next: IssueStatus }) =>
-      updateIssueStatus(id, next, currentSlug),
-    onMutate: ({ id }) => {
-      setActionError(null);
-      const previous = queryClient.getQueryData<IssueListResult>(queryKey);
-      queryClient.setQueryData<IssueListResult>(queryKey, (old) =>
-        old ? { ...old, issues: old.issues.filter((i) => i.id !== id) } : old,
-      );
-      return { previous };
-    },
-    onError: (err, _vars, context) => {
-      if (context?.previous) {
-        queryClient.setQueryData(queryKey, context.previous);
-      }
-      setActionError(formatErrorMessage(err, t("issues.statusUpdateError")));
-    },
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: projectQueryKey(currentSlug, ["issues"]) });
-    },
+  const mutation = useOptimisticList<IssueListResult, { id: string; next: IssueStatus }>({
+    queryKey,
+    invalidateKey,
+    mutationFn: ({ id, next }) => updateIssueStatus(id, next, currentSlug),
+    optimisticUpdate: (old, { id }) => ({
+      ...old,
+      issues: old.issues.filter((i) => i.id !== id),
+    }),
+    onErrorMessage: setActionError,
+    fallbackError: t("issues.statusUpdateError"),
   });
 
-  const batchMutation = useMutation({
-    mutationFn: ({ ids, next }: { ids: string[]; next: IssueStatus }) =>
-      batchUpdateIssueStatus(ids, next, currentSlug),
-    onMutate: ({ ids }) => {
-      setActionError(null);
-      const previous = queryClient.getQueryData<IssueListResult>(queryKey);
-      queryClient.setQueryData<IssueListResult>(queryKey, (old) =>
-        old ? { ...old, issues: old.issues.filter((i) => !ids.includes(i.id)) } : old,
-      );
-      return { previous };
-    },
-    onError: (err, _vars, context) => {
-      if (context?.previous) {
-        queryClient.setQueryData(queryKey, context.previous);
-      }
-      setActionError(formatErrorMessage(err, t("issues.statusUpdateError")));
-    },
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: projectQueryKey(currentSlug, ["issues"]) });
-    },
+  const batchMutation = useOptimisticList<IssueListResult, { ids: string[]; next: IssueStatus }>({
+    queryKey,
+    invalidateKey,
+    mutationFn: ({ ids, next }) => batchUpdateIssueStatus(ids, next, currentSlug),
+    optimisticUpdate: (old, { ids }) => ({
+      ...old,
+      issues: old.issues.filter((i) => !ids.includes(i.id)),
+    }),
+    onErrorMessage: setActionError,
+    fallbackError: t("issues.statusUpdateError"),
   });
 
   const issues = query.data?.issues ?? [];

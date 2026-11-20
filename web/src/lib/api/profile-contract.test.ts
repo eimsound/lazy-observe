@@ -3,6 +3,7 @@ import { test } from "vitest";
 import dayjs from "../dayjs.ts";
 
 import {
+  normalizeFlameNode,
   normalizeProfileListResponse,
   normalizeProfileServicesResponse,
   type ProfileListResponseDTO,
@@ -66,4 +67,30 @@ test("rejects invalid IDs and timestamps at the API boundary", () => {
     () => normalizeProfileListResponse({ profiles: [{ ...valid, start: "yesterday" }] }),
     /RFC3339/,
   );
+});
+
+test("normalizes Go flameNode tree with unit, nested children, and truncated flag", () => {
+  // Exact wire shape from internal/gateway/profile_api.go flameNode:
+  const tree = normalizeFlameNode({
+    name: "root",
+    value: 1500,
+    unit: "nanoseconds",
+    children: [
+      {
+        name: "main.handleCheckout",
+        value: 1500,
+        truncated: true,
+        children: [{ name: "encoding/json.Marshal", value: 900 }],
+      },
+    ],
+  });
+
+  assert.equal(tree.name, "root");
+  assert.equal(tree.value, 1500);
+  assert.equal(tree.unit, "nanoseconds");
+  assert.equal(tree.children?.[0]?.truncated, true);
+  assert.equal(tree.children?.[0]?.children?.[0]?.value, 900);
+
+  assert.throws(() => normalizeFlameNode({ name: "root", value: -1 }), /non-negative number/);
+  assert.throws(() => normalizeFlameNode({ name: "root", value: 10, children: "bad" }), /children must be an array/);
 });

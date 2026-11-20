@@ -9,10 +9,11 @@ import {
 } from "@/lib/api/alert-config";
 import { listChannels } from "@/lib/api/alerts";
 import { useAuth } from "@/lib/auth/auth-provider";
-import { canManageAlerts } from "@/lib/auth/permissions";
+import { hasCapability } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
 import { isForbiddenError } from "@/lib/api/errors";
 import { QueryErrorState } from "@/components/common/query-error-state";
+import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import {
   Card,
   CardContent,
@@ -26,6 +27,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { queryViewState } from "@/routes/query-view-state";
 
 /**
  * Per-project alerting policy, embedded in the Settings page. Keyed by
@@ -64,7 +66,8 @@ export function AlertConfigCard() {
 function AlertConfigForm({ projectId }: { projectId: string }) {
   const { t } = useTranslation();
   const { role } = useAuth();
-  const canManage = canManageAlerts(role);
+  const canManage = hasCapability(role, "alerts:write");
+  const canReadChannels = hasCapability(role, "channels:read");
   const queryClient = useQueryClient();
 
   const config = useQuery({
@@ -77,7 +80,8 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
   const channels = useQuery({
     queryKey: ["channels"],
     queryFn: ({ signal }) => listChannels(signal),
-    enabled: canManage,
+    enabled: canReadChannels,
+    refetchOnWindowFocus: false,
     retry: false,
   });
 
@@ -144,7 +148,14 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
     setSaved(false);
   }
 
-  if (config.isLoading) {
+  const configState = queryViewState({
+    hasData: draft !== null,
+    isLoading: config.isLoading,
+    isError: config.isError,
+    isEmpty: false,
+  });
+
+  if (configState === "pending") {
     return (
       <div className="space-y-3">
         <Skeleton className="h-10 w-full" />
@@ -154,7 +165,7 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
     );
   }
 
-  if (config.isError || !draft) {
+  if (configState === "error" || !draft) {
     return (
       <QueryErrorState
         error={config.error}
@@ -163,8 +174,23 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
     );
   }
 
+  const channelRows = channels.data ?? [];
+  const channelsState = queryViewState({
+    hasData: channels.data !== undefined,
+    isLoading: channels.isLoading,
+    isError: channels.isError,
+    isEmpty: channelRows.length === 0,
+  });
+
   return (
     <>
+      {configState === "stale" && (
+        <QueryStaleNotice
+          isRetrying={config.isFetching}
+          onRetry={() => void config.refetch()}
+        />
+      )}
+
       <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
         <div>
           <Label htmlFor="ac-new-issue" className={canManage ? "cursor-pointer" : undefined}>
@@ -217,56 +243,67 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
 
       <div className="space-y-1.5">
         <Label>{t("alertConfig.channels")}</Label>
-        {!canManage ? (
+        {!canReadChannels ? (
           <p className="text-xs text-muted-foreground">
             {t("alertConfig.channelsReadOnlySummary", { count: draft.channel_ids.length })}
           </p>
-        ) : channels.isLoading ? (
-          <Skeleton className="h-8 w-48" />
-        ) : channels.isError ? (
-          <div className="flex flex-wrap items-center gap-2 text-xs text-destructive" role="alert">
-            <span>
-              {isForbiddenError(channels.error)
-                ? t("alertConfig.channelsForbidden")
-                : t("alerts.channelsLoadError")}
-            </span>
-            {!isForbiddenError(channels.error) && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-6 px-2 text-xs"
-                onClick={() => void channels.refetch()}
-              >
-                {t("common.retry")}
-              </Button>
-            )}
-          </div>
-        ) : channels.data && channels.data.length > 0 ? (
-          <div className="flex flex-wrap gap-2">
-            {channels.data.map((ch) => {
-              const selected = draft.channel_ids.includes(ch.id);
-              return (
-                <button
-                  key={ch.id}
-                  type="button"
-                  onClick={() => toggleChannel(ch.id)}
-                  className={cn(
-                    "rounded-md border px-2.5 py-1 text-xs font-medium transition-colors",
-                    selected
-                      ? "border-primary bg-primary/10 text-foreground"
-                      : "border-border text-muted-foreground hover:bg-accent",
-                  )}
-                >
-                  {ch.name}
-                </button>
-              );
-            })}
-          </div>
         ) : (
-          <p className="text-xs text-muted-foreground">
-            {t("alertConfig.noChannels")}
-          </p>
+          <>
+            {channelsState === "stale" && (
+              <QueryStaleNotice
+                isRetrying={channels.isFetching}
+                onRetry={() => void channels.refetch()}
+              />
+            )}
+            {channelsState === "pending" ? (
+              <Skeleton className="h-8 w-48" />
+            ) : channelsState === "error" ? (
+              <div className="flex flex-wrap items-center gap-2 text-xs text-destructive" role="alert">
+                <span>
+                  {isForbiddenError(channels.error)
+                    ? t("alertConfig.channelsForbidden")
+                    : t("alerts.channelsLoadError")}
+                </span>
+                {!isForbiddenError(channels.error) && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-2 text-xs"
+                    onClick={() => void channels.refetch()}
+                  >
+                    {t("common.retry")}
+                  </Button>
+                )}
+              </div>
+            ) : channelsState === "empty" ? (
+              <p className="text-xs text-muted-foreground">
+                {t("alertConfig.noChannels")}
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {channelRows.map((ch) => {
+                  const selected = draft.channel_ids.includes(ch.id);
+                  return (
+                    <button
+                      key={ch.id}
+                      type="button"
+                      disabled={!canManage}
+                      onClick={() => toggleChannel(ch.id)}
+                      className={cn(
+                        "rounded-md border px-2.5 py-1 text-xs font-medium transition-colors",
+                        selected
+                          ? "border-primary bg-primary/10 text-foreground"
+                          : "border-border text-muted-foreground hover:bg-accent",
+                      )}
+                    >
+                      {ch.name}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </>
         )}
       </div>
 
