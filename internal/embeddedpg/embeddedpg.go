@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -67,15 +68,29 @@ func DownloadProbe(version embeddedpostgres.PostgresVersion) string {
 func archiveURL(version embeddedpostgres.PostgresVersion) string {
 	operatingSystem, architecture := archivePlatform()
 
+	return jarURL(binaryRepository, operatingSystem, architecture, version)
+}
+
+// jarURL is the Maven path defaultRemoteFetchStrategy (remote_fetch.go) downloads.
+func jarURL(repository, operatingSystem, architecture string, version embeddedpostgres.PostgresVersion) string {
 	return fmt.Sprintf(
 		"%s/io/zonky/test/postgres/embedded-postgres-binaries-%s-%s/%s/embedded-postgres-binaries-%s-%s-%s.jar",
-		binaryRepository,
+		repository,
 		operatingSystem,
 		architecture,
 		version,
 		operatingSystem,
 		architecture,
 		version,
+	)
+}
+
+// archivePath is where defaultCacheLocator (cache_locator.go) looks for the extracted archive;
+// a regular file there is a cache hit and embedded-postgres does not download.
+func archivePath(cacheDir, operatingSystem, architecture string, version embeddedpostgres.PostgresVersion) string {
+	return filepath.Join(
+		cacheDir,
+		fmt.Sprintf("embedded-postgres-binaries-%s-%s-%s.txz", operatingSystem, architecture, version),
 	)
 }
 
