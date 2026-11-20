@@ -270,6 +270,24 @@ CREATE TABLE replay_sessions (
 CREATE UNIQUE INDEX replay_sessions_project_session ON replay_sessions (project_id, session_id);
 CREATE INDEX replay_sessions_project_last_seen ON replay_sessions (project_id, last_seen_at);
 
+CREATE TABLE replay_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL CHECK (seq >= 0),
+    started_at TIMESTAMP NOT NULL,
+    last_seen_at TIMESTAMP NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+    size_bytes INTEGER NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
+    payload_sha256 TEXT NOT NULL DEFAULT '',
+    markers_json TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP NOT NULL,
+    project_id INTEGER NOT NULL,
+    CONSTRAINT replay_segments_projects_replay_segments
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE NO ACTION
+);
+CREATE UNIQUE INDEX replay_segments_project_session_seq
+    ON replay_segments (project_id, session_id, seq);
+
 CREATE TABLE source_map_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     release TEXT NOT NULL,

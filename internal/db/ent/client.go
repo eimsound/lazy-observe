@@ -26,6 +26,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
+	"github.com/eimsound/lazy-observe/internal/db/ent/replaysegment"
 	"github.com/eimsound/lazy-observe/internal/db/ent/replaysession"
 	"github.com/eimsound/lazy-observe/internal/db/ent/scrapetarget"
 	"github.com/eimsound/lazy-observe/internal/db/ent/session"
@@ -67,6 +68,8 @@ type Client struct {
 	ProjectAPIToken *ProjectAPITokenClient
 	// ProjectAlertConfig is the client for interacting with the ProjectAlertConfig builders.
 	ProjectAlertConfig *ProjectAlertConfigClient
+	// ReplaySegment is the client for interacting with the ReplaySegment builders.
+	ReplaySegment *ReplaySegmentClient
 	// ReplaySession is the client for interacting with the ReplaySession builders.
 	ReplaySession *ReplaySessionClient
 	// ScrapeTarget is the client for interacting with the ScrapeTarget builders.
@@ -110,6 +113,7 @@ func (c *Client) init() {
 	c.Project = NewProjectClient(c.config)
 	c.ProjectAPIToken = NewProjectAPITokenClient(c.config)
 	c.ProjectAlertConfig = NewProjectAlertConfigClient(c.config)
+	c.ReplaySegment = NewReplaySegmentClient(c.config)
 	c.ReplaySession = NewReplaySessionClient(c.config)
 	c.ScrapeTarget = NewScrapeTargetClient(c.config)
 	c.Session = NewSessionClient(c.config)
@@ -225,6 +229,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		Project:                NewProjectClient(cfg),
 		ProjectAPIToken:        NewProjectAPITokenClient(cfg),
 		ProjectAlertConfig:     NewProjectAlertConfigClient(cfg),
+		ReplaySegment:          NewReplaySegmentClient(cfg),
 		ReplaySession:          NewReplaySessionClient(cfg),
 		ScrapeTarget:           NewScrapeTargetClient(cfg),
 		Session:                NewSessionClient(cfg),
@@ -267,6 +272,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		Project:                NewProjectClient(cfg),
 		ProjectAPIToken:        NewProjectAPITokenClient(cfg),
 		ProjectAlertConfig:     NewProjectAlertConfigClient(cfg),
+		ReplaySegment:          NewReplaySegmentClient(cfg),
 		ReplaySession:          NewReplaySessionClient(cfg),
 		ScrapeTarget:           NewScrapeTargetClient(cfg),
 		Session:                NewSessionClient(cfg),
@@ -309,9 +315,9 @@ func (c *Client) Use(hooks ...Hook) {
 		c.AISetting, c.AlertEvent, c.AlertRule, c.AuditEvent, c.InhibitionRule, c.Issue,
 		c.IssueLifecycleEvent, c.NotificationChannel, c.PlatformKeyFingerprint,
 		c.ProfileMeta, c.Project, c.ProjectAPIToken, c.ProjectAlertConfig,
-		c.ReplaySession, c.ScrapeTarget, c.Session, c.Silence, c.SourceMapArtifact,
-		c.SourceMapUploadToken, c.TelemetryInbox, c.TelemetryInboxState, c.User,
-		c.UserAPIToken,
+		c.ReplaySegment, c.ReplaySession, c.ScrapeTarget, c.Session, c.Silence,
+		c.SourceMapArtifact, c.SourceMapUploadToken, c.TelemetryInbox,
+		c.TelemetryInboxState, c.User, c.UserAPIToken,
 	} {
 		n.Use(hooks...)
 	}
@@ -324,9 +330,9 @@ func (c *Client) Intercept(interceptors ...Interceptor) {
 		c.AISetting, c.AlertEvent, c.AlertRule, c.AuditEvent, c.InhibitionRule, c.Issue,
 		c.IssueLifecycleEvent, c.NotificationChannel, c.PlatformKeyFingerprint,
 		c.ProfileMeta, c.Project, c.ProjectAPIToken, c.ProjectAlertConfig,
-		c.ReplaySession, c.ScrapeTarget, c.Session, c.Silence, c.SourceMapArtifact,
-		c.SourceMapUploadToken, c.TelemetryInbox, c.TelemetryInboxState, c.User,
-		c.UserAPIToken,
+		c.ReplaySegment, c.ReplaySession, c.ScrapeTarget, c.Session, c.Silence,
+		c.SourceMapArtifact, c.SourceMapUploadToken, c.TelemetryInbox,
+		c.TelemetryInboxState, c.User, c.UserAPIToken,
 	} {
 		n.Intercept(interceptors...)
 	}
@@ -361,6 +367,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.ProjectAPIToken.mutate(ctx, m)
 	case *ProjectAlertConfigMutation:
 		return c.ProjectAlertConfig.mutate(ctx, m)
+	case *ReplaySegmentMutation:
+		return c.ReplaySegment.mutate(ctx, m)
 	case *ReplaySessionMutation:
 		return c.ReplaySession.mutate(ctx, m)
 	case *ScrapeTargetMutation:
@@ -2096,6 +2104,22 @@ func (c *ProjectClient) QueryReplaySessions(_m *Project) *ReplaySessionQuery {
 	return query
 }
 
+// QueryReplaySegments queries the replay_segments edge of a Project.
+func (c *ProjectClient) QueryReplaySegments(_m *Project) *ReplaySegmentQuery {
+	query := (&ReplaySegmentClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(project.Table, project.FieldID, id),
+			sqlgraph.To(replaysegment.Table, replaysegment.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, project.ReplaySegmentsTable, project.ReplaySegmentsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // QuerySourceMapArtifacts queries the source_map_artifacts edge of a Project.
 func (c *ProjectClient) QuerySourceMapArtifacts(_m *Project) *SourceMapArtifactQuery {
 	query := (&SourceMapArtifactClient{config: c.config}).Query()
@@ -2528,6 +2552,155 @@ func (c *ProjectAlertConfigClient) mutate(ctx context.Context, m *ProjectAlertCo
 		return (&ProjectAlertConfigDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown ProjectAlertConfig mutation op: %q", m.Op())
+	}
+}
+
+// ReplaySegmentClient is a client for the ReplaySegment schema.
+type ReplaySegmentClient struct {
+	config
+}
+
+// NewReplaySegmentClient returns a client for the ReplaySegment from the given config.
+func NewReplaySegmentClient(c config) *ReplaySegmentClient {
+	return &ReplaySegmentClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `replaysegment.Hooks(f(g(h())))`.
+func (c *ReplaySegmentClient) Use(hooks ...Hook) {
+	c.hooks.ReplaySegment = append(c.hooks.ReplaySegment, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `replaysegment.Intercept(f(g(h())))`.
+func (c *ReplaySegmentClient) Intercept(interceptors ...Interceptor) {
+	c.inters.ReplaySegment = append(c.inters.ReplaySegment, interceptors...)
+}
+
+// Create returns a builder for creating a ReplaySegment entity.
+func (c *ReplaySegmentClient) Create() *ReplaySegmentCreate {
+	mutation := newReplaySegmentMutation(c.config, OpCreate)
+	return &ReplaySegmentCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of ReplaySegment entities.
+func (c *ReplaySegmentClient) CreateBulk(builders ...*ReplaySegmentCreate) *ReplaySegmentCreateBulk {
+	return &ReplaySegmentCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *ReplaySegmentClient) MapCreateBulk(slice any, setFunc func(*ReplaySegmentCreate, int)) *ReplaySegmentCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &ReplaySegmentCreateBulk{err: fmt.Errorf("calling to ReplaySegmentClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*ReplaySegmentCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &ReplaySegmentCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for ReplaySegment.
+func (c *ReplaySegmentClient) Update() *ReplaySegmentUpdate {
+	mutation := newReplaySegmentMutation(c.config, OpUpdate)
+	return &ReplaySegmentUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *ReplaySegmentClient) UpdateOne(_m *ReplaySegment) *ReplaySegmentUpdateOne {
+	mutation := newReplaySegmentMutation(c.config, OpUpdateOne, withReplaySegment(_m))
+	return &ReplaySegmentUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *ReplaySegmentClient) UpdateOneID(id int) *ReplaySegmentUpdateOne {
+	mutation := newReplaySegmentMutation(c.config, OpUpdateOne, withReplaySegmentID(id))
+	return &ReplaySegmentUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for ReplaySegment.
+func (c *ReplaySegmentClient) Delete() *ReplaySegmentDelete {
+	mutation := newReplaySegmentMutation(c.config, OpDelete)
+	return &ReplaySegmentDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *ReplaySegmentClient) DeleteOne(_m *ReplaySegment) *ReplaySegmentDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *ReplaySegmentClient) DeleteOneID(id int) *ReplaySegmentDeleteOne {
+	builder := c.Delete().Where(replaysegment.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &ReplaySegmentDeleteOne{builder}
+}
+
+// Query returns a query builder for ReplaySegment.
+func (c *ReplaySegmentClient) Query() *ReplaySegmentQuery {
+	return &ReplaySegmentQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeReplaySegment},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a ReplaySegment entity by its id.
+func (c *ReplaySegmentClient) Get(ctx context.Context, id int) (*ReplaySegment, error) {
+	return c.Query().Where(replaysegment.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *ReplaySegmentClient) GetX(ctx context.Context, id int) *ReplaySegment {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryProject queries the project edge of a ReplaySegment.
+func (c *ReplaySegmentClient) QueryProject(_m *ReplaySegment) *ProjectQuery {
+	query := (&ProjectClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(replaysegment.Table, replaysegment.FieldID, id),
+			sqlgraph.To(project.Table, project.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, replaysegment.ProjectTable, replaysegment.ProjectColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *ReplaySegmentClient) Hooks() []Hook {
+	return c.hooks.ReplaySegment
+}
+
+// Interceptors returns the client interceptors.
+func (c *ReplaySegmentClient) Interceptors() []Interceptor {
+	return c.inters.ReplaySegment
+}
+
+func (c *ReplaySegmentClient) mutate(ctx context.Context, m *ReplaySegmentMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&ReplaySegmentCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&ReplaySegmentUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&ReplaySegmentUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&ReplaySegmentDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown ReplaySegment mutation op: %q", m.Op())
 	}
 }
 
@@ -4026,15 +4199,15 @@ type (
 	hooks struct {
 		AISetting, AlertEvent, AlertRule, AuditEvent, InhibitionRule, Issue,
 		IssueLifecycleEvent, NotificationChannel, PlatformKeyFingerprint, ProfileMeta,
-		Project, ProjectAPIToken, ProjectAlertConfig, ReplaySession, ScrapeTarget,
-		Session, Silence, SourceMapArtifact, SourceMapUploadToken, TelemetryInbox,
-		TelemetryInboxState, User, UserAPIToken []ent.Hook
+		Project, ProjectAPIToken, ProjectAlertConfig, ReplaySegment, ReplaySession,
+		ScrapeTarget, Session, Silence, SourceMapArtifact, SourceMapUploadToken,
+		TelemetryInbox, TelemetryInboxState, User, UserAPIToken []ent.Hook
 	}
 	inters struct {
 		AISetting, AlertEvent, AlertRule, AuditEvent, InhibitionRule, Issue,
 		IssueLifecycleEvent, NotificationChannel, PlatformKeyFingerprint, ProfileMeta,
-		Project, ProjectAPIToken, ProjectAlertConfig, ReplaySession, ScrapeTarget,
-		Session, Silence, SourceMapArtifact, SourceMapUploadToken, TelemetryInbox,
-		TelemetryInboxState, User, UserAPIToken []ent.Interceptor
+		Project, ProjectAPIToken, ProjectAlertConfig, ReplaySegment, ReplaySession,
+		ScrapeTarget, Session, Silence, SourceMapArtifact, SourceMapUploadToken,
+		TelemetryInbox, TelemetryInboxState, User, UserAPIToken []ent.Interceptor
 	}
 )

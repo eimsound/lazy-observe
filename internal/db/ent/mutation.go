@@ -25,6 +25,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
+	"github.com/eimsound/lazy-observe/internal/db/ent/replaysegment"
 	"github.com/eimsound/lazy-observe/internal/db/ent/replaysession"
 	"github.com/eimsound/lazy-observe/internal/db/ent/scrapetarget"
 	"github.com/eimsound/lazy-observe/internal/db/ent/session"
@@ -59,6 +60,7 @@ const (
 	TypeProject                = "Project"
 	TypeProjectAPIToken        = "ProjectAPIToken"
 	TypeProjectAlertConfig     = "ProjectAlertConfig"
+	TypeReplaySegment          = "ReplaySegment"
 	TypeReplaySession          = "ReplaySession"
 	TypeScrapeTarget           = "ScrapeTarget"
 	TypeSession                = "Session"
@@ -9886,6 +9888,9 @@ type ProjectMutation struct {
 	replay_sessions                 map[int]struct{}
 	removedreplay_sessions          map[int]struct{}
 	clearedreplay_sessions          bool
+	replay_segments                 map[int]struct{}
+	removedreplay_segments          map[int]struct{}
+	clearedreplay_segments          bool
 	source_map_artifacts            map[int]struct{}
 	removedsource_map_artifacts     map[int]struct{}
 	clearedsource_map_artifacts     bool
@@ -10492,6 +10497,60 @@ func (m *ProjectMutation) ResetReplaySessions() {
 	m.removedreplay_sessions = nil
 }
 
+// AddReplaySegmentIDs adds the "replay_segments" edge to the ReplaySegment entity by ids.
+func (m *ProjectMutation) AddReplaySegmentIDs(ids ...int) {
+	if m.replay_segments == nil {
+		m.replay_segments = make(map[int]struct{})
+	}
+	for i := range ids {
+		m.replay_segments[ids[i]] = struct{}{}
+	}
+}
+
+// ClearReplaySegments clears the "replay_segments" edge to the ReplaySegment entity.
+func (m *ProjectMutation) ClearReplaySegments() {
+	m.clearedreplay_segments = true
+}
+
+// ReplaySegmentsCleared reports if the "replay_segments" edge to the ReplaySegment entity was cleared.
+func (m *ProjectMutation) ReplaySegmentsCleared() bool {
+	return m.clearedreplay_segments
+}
+
+// RemoveReplaySegmentIDs removes the "replay_segments" edge to the ReplaySegment entity by IDs.
+func (m *ProjectMutation) RemoveReplaySegmentIDs(ids ...int) {
+	if m.removedreplay_segments == nil {
+		m.removedreplay_segments = make(map[int]struct{})
+	}
+	for i := range ids {
+		delete(m.replay_segments, ids[i])
+		m.removedreplay_segments[ids[i]] = struct{}{}
+	}
+}
+
+// RemovedReplaySegments returns the removed IDs of the "replay_segments" edge to the ReplaySegment entity.
+func (m *ProjectMutation) RemovedReplaySegmentsIDs() (ids []int) {
+	for id := range m.removedreplay_segments {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// ReplaySegmentsIDs returns the "replay_segments" edge IDs in the mutation.
+func (m *ProjectMutation) ReplaySegmentsIDs() (ids []int) {
+	for id := range m.replay_segments {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// ResetReplaySegments resets all changes to the "replay_segments" edge.
+func (m *ProjectMutation) ResetReplaySegments() {
+	m.replay_segments = nil
+	m.clearedreplay_segments = false
+	m.removedreplay_segments = nil
+}
+
 // AddSourceMapArtifactIDs adds the "source_map_artifacts" edge to the SourceMapArtifact entity by ids.
 func (m *ProjectMutation) AddSourceMapArtifactIDs(ids ...int) {
 	if m.source_map_artifacts == nil {
@@ -10968,7 +11027,7 @@ func (m *ProjectMutation) ResetField(name string) error {
 
 // AddedEdges returns all edge names that were set/added in this mutation.
 func (m *ProjectMutation) AddedEdges() []string {
-	edges := make([]string, 0, 13)
+	edges := make([]string, 0, 14)
 	if m.api_tokens != nil {
 		edges = append(edges, project.EdgeAPITokens)
 	}
@@ -10989,6 +11048,9 @@ func (m *ProjectMutation) AddedEdges() []string {
 	}
 	if m.replay_sessions != nil {
 		edges = append(edges, project.EdgeReplaySessions)
+	}
+	if m.replay_segments != nil {
+		edges = append(edges, project.EdgeReplaySegments)
 	}
 	if m.source_map_artifacts != nil {
 		edges = append(edges, project.EdgeSourceMapArtifacts)
@@ -11057,6 +11119,12 @@ func (m *ProjectMutation) AddedIDs(name string) []ent.Value {
 			ids = append(ids, id)
 		}
 		return ids
+	case project.EdgeReplaySegments:
+		ids := make([]ent.Value, 0, len(m.replay_segments))
+		for id := range m.replay_segments {
+			ids = append(ids, id)
+		}
+		return ids
 	case project.EdgeSourceMapArtifacts:
 		ids := make([]ent.Value, 0, len(m.source_map_artifacts))
 		for id := range m.source_map_artifacts {
@@ -11097,7 +11165,7 @@ func (m *ProjectMutation) AddedIDs(name string) []ent.Value {
 
 // RemovedEdges returns all edge names that were removed in this mutation.
 func (m *ProjectMutation) RemovedEdges() []string {
-	edges := make([]string, 0, 13)
+	edges := make([]string, 0, 14)
 	if m.removedapi_tokens != nil {
 		edges = append(edges, project.EdgeAPITokens)
 	}
@@ -11118,6 +11186,9 @@ func (m *ProjectMutation) RemovedEdges() []string {
 	}
 	if m.removedreplay_sessions != nil {
 		edges = append(edges, project.EdgeReplaySessions)
+	}
+	if m.removedreplay_segments != nil {
+		edges = append(edges, project.EdgeReplaySegments)
 	}
 	if m.removedsource_map_artifacts != nil {
 		edges = append(edges, project.EdgeSourceMapArtifacts)
@@ -11183,6 +11254,12 @@ func (m *ProjectMutation) RemovedIDs(name string) []ent.Value {
 			ids = append(ids, id)
 		}
 		return ids
+	case project.EdgeReplaySegments:
+		ids := make([]ent.Value, 0, len(m.removedreplay_segments))
+		for id := range m.removedreplay_segments {
+			ids = append(ids, id)
+		}
+		return ids
 	case project.EdgeSourceMapArtifacts:
 		ids := make([]ent.Value, 0, len(m.removedsource_map_artifacts))
 		for id := range m.removedsource_map_artifacts {
@@ -11219,7 +11296,7 @@ func (m *ProjectMutation) RemovedIDs(name string) []ent.Value {
 
 // ClearedEdges returns all edge names that were cleared in this mutation.
 func (m *ProjectMutation) ClearedEdges() []string {
-	edges := make([]string, 0, 13)
+	edges := make([]string, 0, 14)
 	if m.clearedapi_tokens {
 		edges = append(edges, project.EdgeAPITokens)
 	}
@@ -11240,6 +11317,9 @@ func (m *ProjectMutation) ClearedEdges() []string {
 	}
 	if m.clearedreplay_sessions {
 		edges = append(edges, project.EdgeReplaySessions)
+	}
+	if m.clearedreplay_segments {
+		edges = append(edges, project.EdgeReplaySegments)
 	}
 	if m.clearedsource_map_artifacts {
 		edges = append(edges, project.EdgeSourceMapArtifacts)
@@ -11280,6 +11360,8 @@ func (m *ProjectMutation) EdgeCleared(name string) bool {
 		return m.clearedissues
 	case project.EdgeReplaySessions:
 		return m.clearedreplay_sessions
+	case project.EdgeReplaySegments:
+		return m.clearedreplay_segments
 	case project.EdgeSourceMapArtifacts:
 		return m.clearedsource_map_artifacts
 	case project.EdgeAlertConfig:
@@ -11331,6 +11413,9 @@ func (m *ProjectMutation) ResetEdge(name string) error {
 		return nil
 	case project.EdgeReplaySessions:
 		m.ResetReplaySessions()
+		return nil
+	case project.EdgeReplaySegments:
+		m.ResetReplaySegments()
 		return nil
 	case project.EdgeSourceMapArtifacts:
 		m.ResetSourceMapArtifacts()
@@ -12852,6 +12937,974 @@ func (m *ProjectAlertConfigMutation) ResetEdge(name string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown ProjectAlertConfig edge %s", name)
+}
+
+// ReplaySegmentMutation represents an operation that mutates the ReplaySegment nodes in the graph.
+type ReplaySegmentMutation struct {
+	config
+	op             Op
+	typ            string
+	id             *int
+	session_id     *string
+	seq            *int
+	addseq         *int
+	started_at     *time.Time
+	last_seen_at   *time.Time
+	event_count    *int
+	addevent_count *int
+	size_bytes     *int64
+	addsize_bytes  *int64
+	payload_sha256 *string
+	markers_json   *string
+	created_at     *time.Time
+	clearedFields  map[string]struct{}
+	project        *int
+	clearedproject bool
+	done           bool
+	oldValue       func(context.Context) (*ReplaySegment, error)
+	predicates     []predicate.ReplaySegment
+}
+
+var _ ent.Mutation = (*ReplaySegmentMutation)(nil)
+
+// replaysegmentOption allows management of the mutation configuration using functional options.
+type replaysegmentOption func(*ReplaySegmentMutation)
+
+// newReplaySegmentMutation creates new mutation for the ReplaySegment entity.
+func newReplaySegmentMutation(c config, op Op, opts ...replaysegmentOption) *ReplaySegmentMutation {
+	m := &ReplaySegmentMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeReplaySegment,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withReplaySegmentID sets the ID field of the mutation.
+func withReplaySegmentID(id int) replaysegmentOption {
+	return func(m *ReplaySegmentMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *ReplaySegment
+		)
+		m.oldValue = func(ctx context.Context) (*ReplaySegment, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().ReplaySegment.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withReplaySegment sets the old ReplaySegment of the mutation.
+func withReplaySegment(node *ReplaySegment) replaysegmentOption {
+	return func(m *ReplaySegmentMutation) {
+		m.oldValue = func(context.Context) (*ReplaySegment, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m ReplaySegmentMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m ReplaySegmentMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *ReplaySegmentMutation) ID() (id int, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *ReplaySegmentMutation) IDs(ctx context.Context) ([]int, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []int{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().ReplaySegment.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetSessionID sets the "session_id" field.
+func (m *ReplaySegmentMutation) SetSessionID(s string) {
+	m.session_id = &s
+}
+
+// SessionID returns the value of the "session_id" field in the mutation.
+func (m *ReplaySegmentMutation) SessionID() (r string, exists bool) {
+	v := m.session_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldSessionID returns the old "session_id" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldSessionID(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldSessionID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldSessionID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldSessionID: %w", err)
+	}
+	return oldValue.SessionID, nil
+}
+
+// ResetSessionID resets all changes to the "session_id" field.
+func (m *ReplaySegmentMutation) ResetSessionID() {
+	m.session_id = nil
+}
+
+// SetSeq sets the "seq" field.
+func (m *ReplaySegmentMutation) SetSeq(i int) {
+	m.seq = &i
+	m.addseq = nil
+}
+
+// Seq returns the value of the "seq" field in the mutation.
+func (m *ReplaySegmentMutation) Seq() (r int, exists bool) {
+	v := m.seq
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldSeq returns the old "seq" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldSeq(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldSeq is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldSeq requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldSeq: %w", err)
+	}
+	return oldValue.Seq, nil
+}
+
+// AddSeq adds i to the "seq" field.
+func (m *ReplaySegmentMutation) AddSeq(i int) {
+	if m.addseq != nil {
+		*m.addseq += i
+	} else {
+		m.addseq = &i
+	}
+}
+
+// AddedSeq returns the value that was added to the "seq" field in this mutation.
+func (m *ReplaySegmentMutation) AddedSeq() (r int, exists bool) {
+	v := m.addseq
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetSeq resets all changes to the "seq" field.
+func (m *ReplaySegmentMutation) ResetSeq() {
+	m.seq = nil
+	m.addseq = nil
+}
+
+// SetStartedAt sets the "started_at" field.
+func (m *ReplaySegmentMutation) SetStartedAt(t time.Time) {
+	m.started_at = &t
+}
+
+// StartedAt returns the value of the "started_at" field in the mutation.
+func (m *ReplaySegmentMutation) StartedAt() (r time.Time, exists bool) {
+	v := m.started_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldStartedAt returns the old "started_at" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldStartedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldStartedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldStartedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldStartedAt: %w", err)
+	}
+	return oldValue.StartedAt, nil
+}
+
+// ResetStartedAt resets all changes to the "started_at" field.
+func (m *ReplaySegmentMutation) ResetStartedAt() {
+	m.started_at = nil
+}
+
+// SetLastSeenAt sets the "last_seen_at" field.
+func (m *ReplaySegmentMutation) SetLastSeenAt(t time.Time) {
+	m.last_seen_at = &t
+}
+
+// LastSeenAt returns the value of the "last_seen_at" field in the mutation.
+func (m *ReplaySegmentMutation) LastSeenAt() (r time.Time, exists bool) {
+	v := m.last_seen_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldLastSeenAt returns the old "last_seen_at" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldLastSeenAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldLastSeenAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldLastSeenAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldLastSeenAt: %w", err)
+	}
+	return oldValue.LastSeenAt, nil
+}
+
+// ResetLastSeenAt resets all changes to the "last_seen_at" field.
+func (m *ReplaySegmentMutation) ResetLastSeenAt() {
+	m.last_seen_at = nil
+}
+
+// SetEventCount sets the "event_count" field.
+func (m *ReplaySegmentMutation) SetEventCount(i int) {
+	m.event_count = &i
+	m.addevent_count = nil
+}
+
+// EventCount returns the value of the "event_count" field in the mutation.
+func (m *ReplaySegmentMutation) EventCount() (r int, exists bool) {
+	v := m.event_count
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldEventCount returns the old "event_count" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldEventCount(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldEventCount is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldEventCount requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldEventCount: %w", err)
+	}
+	return oldValue.EventCount, nil
+}
+
+// AddEventCount adds i to the "event_count" field.
+func (m *ReplaySegmentMutation) AddEventCount(i int) {
+	if m.addevent_count != nil {
+		*m.addevent_count += i
+	} else {
+		m.addevent_count = &i
+	}
+}
+
+// AddedEventCount returns the value that was added to the "event_count" field in this mutation.
+func (m *ReplaySegmentMutation) AddedEventCount() (r int, exists bool) {
+	v := m.addevent_count
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetEventCount resets all changes to the "event_count" field.
+func (m *ReplaySegmentMutation) ResetEventCount() {
+	m.event_count = nil
+	m.addevent_count = nil
+}
+
+// SetSizeBytes sets the "size_bytes" field.
+func (m *ReplaySegmentMutation) SetSizeBytes(i int64) {
+	m.size_bytes = &i
+	m.addsize_bytes = nil
+}
+
+// SizeBytes returns the value of the "size_bytes" field in the mutation.
+func (m *ReplaySegmentMutation) SizeBytes() (r int64, exists bool) {
+	v := m.size_bytes
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldSizeBytes returns the old "size_bytes" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldSizeBytes(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldSizeBytes is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldSizeBytes requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldSizeBytes: %w", err)
+	}
+	return oldValue.SizeBytes, nil
+}
+
+// AddSizeBytes adds i to the "size_bytes" field.
+func (m *ReplaySegmentMutation) AddSizeBytes(i int64) {
+	if m.addsize_bytes != nil {
+		*m.addsize_bytes += i
+	} else {
+		m.addsize_bytes = &i
+	}
+}
+
+// AddedSizeBytes returns the value that was added to the "size_bytes" field in this mutation.
+func (m *ReplaySegmentMutation) AddedSizeBytes() (r int64, exists bool) {
+	v := m.addsize_bytes
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetSizeBytes resets all changes to the "size_bytes" field.
+func (m *ReplaySegmentMutation) ResetSizeBytes() {
+	m.size_bytes = nil
+	m.addsize_bytes = nil
+}
+
+// SetPayloadSha256 sets the "payload_sha256" field.
+func (m *ReplaySegmentMutation) SetPayloadSha256(s string) {
+	m.payload_sha256 = &s
+}
+
+// PayloadSha256 returns the value of the "payload_sha256" field in the mutation.
+func (m *ReplaySegmentMutation) PayloadSha256() (r string, exists bool) {
+	v := m.payload_sha256
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldPayloadSha256 returns the old "payload_sha256" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldPayloadSha256(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldPayloadSha256 is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldPayloadSha256 requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldPayloadSha256: %w", err)
+	}
+	return oldValue.PayloadSha256, nil
+}
+
+// ResetPayloadSha256 resets all changes to the "payload_sha256" field.
+func (m *ReplaySegmentMutation) ResetPayloadSha256() {
+	m.payload_sha256 = nil
+}
+
+// SetMarkersJSON sets the "markers_json" field.
+func (m *ReplaySegmentMutation) SetMarkersJSON(s string) {
+	m.markers_json = &s
+}
+
+// MarkersJSON returns the value of the "markers_json" field in the mutation.
+func (m *ReplaySegmentMutation) MarkersJSON() (r string, exists bool) {
+	v := m.markers_json
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldMarkersJSON returns the old "markers_json" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldMarkersJSON(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldMarkersJSON is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldMarkersJSON requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldMarkersJSON: %w", err)
+	}
+	return oldValue.MarkersJSON, nil
+}
+
+// ResetMarkersJSON resets all changes to the "markers_json" field.
+func (m *ReplaySegmentMutation) ResetMarkersJSON() {
+	m.markers_json = nil
+}
+
+// SetCreatedAt sets the "created_at" field.
+func (m *ReplaySegmentMutation) SetCreatedAt(t time.Time) {
+	m.created_at = &t
+}
+
+// CreatedAt returns the value of the "created_at" field in the mutation.
+func (m *ReplaySegmentMutation) CreatedAt() (r time.Time, exists bool) {
+	v := m.created_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldCreatedAt returns the old "created_at" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldCreatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldCreatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldCreatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldCreatedAt: %w", err)
+	}
+	return oldValue.CreatedAt, nil
+}
+
+// ResetCreatedAt resets all changes to the "created_at" field.
+func (m *ReplaySegmentMutation) ResetCreatedAt() {
+	m.created_at = nil
+}
+
+// SetProjectID sets the "project_id" field.
+func (m *ReplaySegmentMutation) SetProjectID(i int) {
+	m.project = &i
+}
+
+// ProjectID returns the value of the "project_id" field in the mutation.
+func (m *ReplaySegmentMutation) ProjectID() (r int, exists bool) {
+	v := m.project
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldProjectID returns the old "project_id" field's value of the ReplaySegment entity.
+// If the ReplaySegment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ReplaySegmentMutation) OldProjectID(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldProjectID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldProjectID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldProjectID: %w", err)
+	}
+	return oldValue.ProjectID, nil
+}
+
+// ResetProjectID resets all changes to the "project_id" field.
+func (m *ReplaySegmentMutation) ResetProjectID() {
+	m.project = nil
+}
+
+// ClearProject clears the "project" edge to the Project entity.
+func (m *ReplaySegmentMutation) ClearProject() {
+	m.clearedproject = true
+	m.clearedFields[replaysegment.FieldProjectID] = struct{}{}
+}
+
+// ProjectCleared reports if the "project" edge to the Project entity was cleared.
+func (m *ReplaySegmentMutation) ProjectCleared() bool {
+	return m.clearedproject
+}
+
+// ProjectIDs returns the "project" edge IDs in the mutation.
+// Note that IDs always returns len(IDs) <= 1 for unique edges, and you should use
+// ProjectID instead. It exists only for internal usage by the builders.
+func (m *ReplaySegmentMutation) ProjectIDs() (ids []int) {
+	if id := m.project; id != nil {
+		ids = append(ids, *id)
+	}
+	return
+}
+
+// ResetProject resets all changes to the "project" edge.
+func (m *ReplaySegmentMutation) ResetProject() {
+	m.project = nil
+	m.clearedproject = false
+}
+
+// Where appends a list predicates to the ReplaySegmentMutation builder.
+func (m *ReplaySegmentMutation) Where(ps ...predicate.ReplaySegment) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the ReplaySegmentMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *ReplaySegmentMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.ReplaySegment, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *ReplaySegmentMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *ReplaySegmentMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (ReplaySegment).
+func (m *ReplaySegmentMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *ReplaySegmentMutation) Fields() []string {
+	fields := make([]string, 0, 10)
+	if m.session_id != nil {
+		fields = append(fields, replaysegment.FieldSessionID)
+	}
+	if m.seq != nil {
+		fields = append(fields, replaysegment.FieldSeq)
+	}
+	if m.started_at != nil {
+		fields = append(fields, replaysegment.FieldStartedAt)
+	}
+	if m.last_seen_at != nil {
+		fields = append(fields, replaysegment.FieldLastSeenAt)
+	}
+	if m.event_count != nil {
+		fields = append(fields, replaysegment.FieldEventCount)
+	}
+	if m.size_bytes != nil {
+		fields = append(fields, replaysegment.FieldSizeBytes)
+	}
+	if m.payload_sha256 != nil {
+		fields = append(fields, replaysegment.FieldPayloadSha256)
+	}
+	if m.markers_json != nil {
+		fields = append(fields, replaysegment.FieldMarkersJSON)
+	}
+	if m.created_at != nil {
+		fields = append(fields, replaysegment.FieldCreatedAt)
+	}
+	if m.project != nil {
+		fields = append(fields, replaysegment.FieldProjectID)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *ReplaySegmentMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case replaysegment.FieldSessionID:
+		return m.SessionID()
+	case replaysegment.FieldSeq:
+		return m.Seq()
+	case replaysegment.FieldStartedAt:
+		return m.StartedAt()
+	case replaysegment.FieldLastSeenAt:
+		return m.LastSeenAt()
+	case replaysegment.FieldEventCount:
+		return m.EventCount()
+	case replaysegment.FieldSizeBytes:
+		return m.SizeBytes()
+	case replaysegment.FieldPayloadSha256:
+		return m.PayloadSha256()
+	case replaysegment.FieldMarkersJSON:
+		return m.MarkersJSON()
+	case replaysegment.FieldCreatedAt:
+		return m.CreatedAt()
+	case replaysegment.FieldProjectID:
+		return m.ProjectID()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *ReplaySegmentMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case replaysegment.FieldSessionID:
+		return m.OldSessionID(ctx)
+	case replaysegment.FieldSeq:
+		return m.OldSeq(ctx)
+	case replaysegment.FieldStartedAt:
+		return m.OldStartedAt(ctx)
+	case replaysegment.FieldLastSeenAt:
+		return m.OldLastSeenAt(ctx)
+	case replaysegment.FieldEventCount:
+		return m.OldEventCount(ctx)
+	case replaysegment.FieldSizeBytes:
+		return m.OldSizeBytes(ctx)
+	case replaysegment.FieldPayloadSha256:
+		return m.OldPayloadSha256(ctx)
+	case replaysegment.FieldMarkersJSON:
+		return m.OldMarkersJSON(ctx)
+	case replaysegment.FieldCreatedAt:
+		return m.OldCreatedAt(ctx)
+	case replaysegment.FieldProjectID:
+		return m.OldProjectID(ctx)
+	}
+	return nil, fmt.Errorf("unknown ReplaySegment field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *ReplaySegmentMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case replaysegment.FieldSessionID:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetSessionID(v)
+		return nil
+	case replaysegment.FieldSeq:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetSeq(v)
+		return nil
+	case replaysegment.FieldStartedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetStartedAt(v)
+		return nil
+	case replaysegment.FieldLastSeenAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetLastSeenAt(v)
+		return nil
+	case replaysegment.FieldEventCount:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetEventCount(v)
+		return nil
+	case replaysegment.FieldSizeBytes:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetSizeBytes(v)
+		return nil
+	case replaysegment.FieldPayloadSha256:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetPayloadSha256(v)
+		return nil
+	case replaysegment.FieldMarkersJSON:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetMarkersJSON(v)
+		return nil
+	case replaysegment.FieldCreatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCreatedAt(v)
+		return nil
+	case replaysegment.FieldProjectID:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetProjectID(v)
+		return nil
+	}
+	return fmt.Errorf("unknown ReplaySegment field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *ReplaySegmentMutation) AddedFields() []string {
+	var fields []string
+	if m.addseq != nil {
+		fields = append(fields, replaysegment.FieldSeq)
+	}
+	if m.addevent_count != nil {
+		fields = append(fields, replaysegment.FieldEventCount)
+	}
+	if m.addsize_bytes != nil {
+		fields = append(fields, replaysegment.FieldSizeBytes)
+	}
+	return fields
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *ReplaySegmentMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case replaysegment.FieldSeq:
+		return m.AddedSeq()
+	case replaysegment.FieldEventCount:
+		return m.AddedEventCount()
+	case replaysegment.FieldSizeBytes:
+		return m.AddedSizeBytes()
+	}
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *ReplaySegmentMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	case replaysegment.FieldSeq:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddSeq(v)
+		return nil
+	case replaysegment.FieldEventCount:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddEventCount(v)
+		return nil
+	case replaysegment.FieldSizeBytes:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddSizeBytes(v)
+		return nil
+	}
+	return fmt.Errorf("unknown ReplaySegment numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *ReplaySegmentMutation) ClearedFields() []string {
+	return nil
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *ReplaySegmentMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *ReplaySegmentMutation) ClearField(name string) error {
+	return fmt.Errorf("unknown ReplaySegment nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *ReplaySegmentMutation) ResetField(name string) error {
+	switch name {
+	case replaysegment.FieldSessionID:
+		m.ResetSessionID()
+		return nil
+	case replaysegment.FieldSeq:
+		m.ResetSeq()
+		return nil
+	case replaysegment.FieldStartedAt:
+		m.ResetStartedAt()
+		return nil
+	case replaysegment.FieldLastSeenAt:
+		m.ResetLastSeenAt()
+		return nil
+	case replaysegment.FieldEventCount:
+		m.ResetEventCount()
+		return nil
+	case replaysegment.FieldSizeBytes:
+		m.ResetSizeBytes()
+		return nil
+	case replaysegment.FieldPayloadSha256:
+		m.ResetPayloadSha256()
+		return nil
+	case replaysegment.FieldMarkersJSON:
+		m.ResetMarkersJSON()
+		return nil
+	case replaysegment.FieldCreatedAt:
+		m.ResetCreatedAt()
+		return nil
+	case replaysegment.FieldProjectID:
+		m.ResetProjectID()
+		return nil
+	}
+	return fmt.Errorf("unknown ReplaySegment field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *ReplaySegmentMutation) AddedEdges() []string {
+	edges := make([]string, 0, 1)
+	if m.project != nil {
+		edges = append(edges, replaysegment.EdgeProject)
+	}
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *ReplaySegmentMutation) AddedIDs(name string) []ent.Value {
+	switch name {
+	case replaysegment.EdgeProject:
+		if id := m.project; id != nil {
+			return []ent.Value{*id}
+		}
+	}
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *ReplaySegmentMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 1)
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *ReplaySegmentMutation) RemovedIDs(name string) []ent.Value {
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *ReplaySegmentMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 1)
+	if m.clearedproject {
+		edges = append(edges, replaysegment.EdgeProject)
+	}
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *ReplaySegmentMutation) EdgeCleared(name string) bool {
+	switch name {
+	case replaysegment.EdgeProject:
+		return m.clearedproject
+	}
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *ReplaySegmentMutation) ClearEdge(name string) error {
+	switch name {
+	case replaysegment.EdgeProject:
+		m.ClearProject()
+		return nil
+	}
+	return fmt.Errorf("unknown ReplaySegment unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *ReplaySegmentMutation) ResetEdge(name string) error {
+	switch name {
+	case replaysegment.EdgeProject:
+		m.ResetProject()
+		return nil
+	}
+	return fmt.Errorf("unknown ReplaySegment edge %s", name)
 }
 
 // ReplaySessionMutation represents an operation that mutates the ReplaySession nodes in the graph.

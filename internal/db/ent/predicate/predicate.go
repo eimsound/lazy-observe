@@ -45,6 +45,9 @@ type ProjectAPIToken func(*sql.Selector)
 // ProjectAlertConfig is the predicate function for projectalertconfig builders.
 type ProjectAlertConfig func(*sql.Selector)
 
+// ReplaySegment is the predicate function for replaysegment builders.
+type ReplaySegment func(*sql.Selector)
+
 // ReplaySession is the predicate function for replaysession builders.
 type ReplaySession func(*sql.Selector)
 

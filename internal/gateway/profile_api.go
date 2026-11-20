@@ -11,41 +11,32 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"math"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/profiling"
 	"github.com/gofiber/fiber/v3"
-	pprofprofile "github.com/google/pprof/profile"
 )
 
 const (
-	maxProfileSize         = 10 << 20
-	maxFlameDepth          = 256
-	maxFlameNodes          = 10_000
+	maxProfileSize         = profiling.DefaultMaxProfileBytes
+	maxFlameDepth          = profiling.DefaultMaxFlameDepth
+	maxFlameNodes          = profiling.DefaultMaxFlameNodes
 	maxFlamegraphProfiles  = 64
 	maxFlamegraphWindow    = 7 * 24 * time.Hour
 	defaultProfileListSize = 200
 	maxProfileListSize     = 500
-	profileIngestRateLimit = 120
 	maxProfileServiceLen   = 128
 	maxProfileLabelsRawLen = 8192
 	maxProfileLabelsCount  = 32
 	maxProfileLabelKeyLen  = 64
 	maxProfileLabelValLen  = 256
-	maxIngestClockSkew     = 5 * time.Minute
-)
-
-var (
-	minIngestTimestamp = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
-	errProfileNotGzip  = errors.New("profile is not gzip")
+	blobRollbackTimeout    = 5 * time.Second
 )
 
 type ProfileStore interface {
@@ -110,42 +101,12 @@ func newProfileListResponse(rows []*meta.ProfileMeta) profileListResponse {
 	return profileListResponse{Profiles: profiles}
 }
 
-func parseGzippedProfile(data []byte, decodedLimit int) (*pprofprofile.Profile, error) {
-	if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
-		return nil, errProfileNotGzip
-	}
-	decoded, err := gunzipBounded(data, decodedLimit)
-	if err != nil {
-		return nil, err
-	}
-	// Never allow nested gzip: ParseUncompressed refuses compressed streams, and
-	// checking explicitly guarantees a clear rejection without extra work.
-	if len(decoded) >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b {
-		return nil, errors.New("nested gzip pprof payload is not allowed")
-	}
-	parsed, err := pprofprofile.ParseUncompressed(decoded)
-	if err != nil {
-		return nil, err
-	}
-	if err := parsed.CheckValid(); err != nil {
-		return nil, err
-	}
-	return parsed, nil
-}
-
-func validProfileText(value string, maxLen int) bool {
-	if len(value) > maxLen || !utf8.ValidString(value) || strings.ContainsRune(value, 0) {
-		return false
-	}
-	return true
-}
-
 func parseProfileLabels(raw string) (map[string]string, bool) {
 	labels := map[string]string{}
 	if raw == "" {
 		return labels, true
 	}
-	if len(raw) > maxProfileLabelsRawLen || !utf8.ValidString(raw) || strings.ContainsRune(raw, 0) {
+	if !validIngestText(raw, maxProfileLabelsRawLen) {
 		return nil, false
 	}
 	if err := json.Unmarshal([]byte(raw), &labels); err != nil || labels == nil {
@@ -155,42 +116,11 @@ func parseProfileLabels(raw string) (map[string]string, bool) {
 		return nil, false
 	}
 	for k, v := range labels {
-		if k == "" || !validProfileText(k, maxProfileLabelKeyLen) || !validProfileText(v, maxProfileLabelValLen) {
+		if k == "" || !validIngestText(k, maxProfileLabelKeyLen) || !validIngestText(v, maxProfileLabelValLen) {
 			return nil, false
 		}
 	}
 	return labels, true
-}
-
-func clampProfileWindow(start, end, now time.Time) (time.Time, time.Time) {
-	now = now.UTC().Round(0)
-	start = start.UTC().Round(0)
-	end = end.UTC().Round(0)
-	maxAllowed := now.Add(maxIngestClockSkew)
-	if end.After(maxAllowed) {
-		end = now
-	}
-	if start.After(end) {
-		start = end
-	}
-	return start, end
-}
-
-func (g *Gateway) allowIngestRate(c fiber.Ctx, key string, limit int, message string) (bool, error) {
-	if g.limits == nil {
-		return true, nil
-	}
-	allowed, err := g.limits.Allow(c.Context(), key, limit, time.Minute)
-	if err != nil {
-		g.logger.Warn("ingest rate limiter error", "key", key, "error", err)
-		return false, c.Status(http.StatusServiceUnavailable).
-			JSON(fiber.Map{"error": "rate limiter temporarily unavailable"})
-	}
-	if !allowed {
-		c.Set(fiber.HeaderRetryAfter, "60")
-		return false, c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": message})
-	}
-	return true, nil
 }
 
 func (g *Gateway) profileIngest(c fiber.Ctx) error {
@@ -198,14 +128,6 @@ func (g *Gateway) profileIngest(c fiber.Ctx) error {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "profile storage unavailable"})
 	}
 	project := currentProject(c)
-	if allowed, err := g.allowIngestRate(
-		c,
-		"profile:ingest:project:"+strconv.Itoa(project.ID),
-		profileIngestRateLimit,
-		"profile ingest rate limit exceeded",
-	); !allowed {
-		return err
-	}
 	form, err := c.MultipartForm()
 	if err != nil {
 		return badRequest(c)
@@ -217,6 +139,23 @@ func (g *Gateway) profileIngest(c fiber.Ctx) error {
 		}
 		return badRequest(c)
 	}
+
+	service := strings.TrimSpace(c.FormValue("service"))
+	uploadID := strings.TrimSpace(c.FormValue("upload_id"))
+	profileType, ok := parseProfileType(c.FormValue("type"))
+	start, startErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(c.FormValue("start")))
+	end, endErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(c.FormValue("end")))
+	if service == "" || !validIngestText(service, maxProfileServiceLen) ||
+		!validProfileUploadID(uploadID) || !ok || startErr != nil || endErr != nil ||
+		start.Before(minIngestTimestamp) || end.Before(minIngestTimestamp) || end.Before(start) {
+		return badRequest(c)
+	}
+	start, end = clampIngestWindow(start, end, g.now())
+	labels, labelsOK := parseProfileLabels(strings.TrimSpace(c.FormValue("labels")))
+	if !labelsOK {
+		return badRequest(c)
+	}
+
 	file, err := files[0].Open()
 	if err != nil {
 		return badRequest(c)
@@ -229,31 +168,20 @@ func (g *Gateway) profileIngest(c fiber.Ctx) error {
 	if len(data) > maxProfileSize {
 		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "profile exceeds 10MB"})
 	}
-	if _, err := parseGzippedProfile(data, maxDecodedRequestBody); err != nil {
-		if errors.Is(err, errProfileNotGzip) {
+	if _, err := profiling.ParseGzippedForType(data, maxDecodedRequestBody, profileType); err != nil {
+		if errors.Is(err, profiling.ErrNotGzip) {
 			return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "profile must be gzip pprof"})
 		}
-		if errors.Is(err, errDecodedBodyTooLarge) {
+		if errors.Is(err, profiling.ErrDecodedTooLarge) {
 			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "decoded profile exceeds limit"})
+		}
+		if errors.Is(err, profiling.ErrInvalidSampleType) {
+			return c.Status(http.StatusUnprocessableEntity).
+				JSON(fiber.Map{"error": "profile has invalid or incompatible sample types"})
 		}
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid pprof profile"})
 	}
 
-	service := strings.TrimSpace(c.FormValue("service"))
-	uploadID := strings.TrimSpace(c.FormValue("upload_id"))
-	profileType, ok := parseProfileType(c.FormValue("type"))
-	start, startErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(c.FormValue("start")))
-	end, endErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(c.FormValue("end")))
-	if service == "" || !validProfileText(service, maxProfileServiceLen) ||
-		!validProfileUploadID(uploadID) || !ok || startErr != nil || endErr != nil ||
-		start.Before(minIngestTimestamp) || end.Before(minIngestTimestamp) || end.Before(start) {
-		return badRequest(c)
-	}
-	start, end = clampProfileWindow(start, end, g.now())
-	labels, labelsOK := parseProfileLabels(strings.TrimSpace(c.FormValue("labels")))
-	if !labelsOK {
-		return badRequest(c)
-	}
 	payloadDigest := sha256.Sum256(data)
 	payloadSHA256 := hex.EncodeToString(payloadDigest[:])
 	existing, err := g.profiles.GetProfileByUploadID(c.Context(), project.ID, uploadID)
@@ -303,7 +231,9 @@ func (g *Gateway) profileIngest(c fiber.Ctx) error {
 		labels,
 	)
 	if err != nil {
-		if delErr := g.blobs.Delete(c.Context(), key); delErr != nil && !errors.Is(delErr, blob.ErrNotFound) {
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), blobRollbackTimeout)
+		defer cancel()
+		if delErr := g.blobs.Delete(rollbackCtx, key); delErr != nil && !errors.Is(delErr, blob.ErrNotFound) {
 			g.logger.Warn("rollback profile blob failed", "project", project.Slug, "key", key, "error", delErr)
 		}
 		existing, lookupErr := g.profiles.GetProfileByUploadID(c.Context(), project.ID, uploadID)
@@ -396,7 +326,7 @@ func (g *Gateway) profileFlamegraph(c fiber.Ctx) error {
 	if len(rows) == 0 {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "no profiles in window"})
 	}
-	builder := newFlamegraphBuilder(opts.Type, maxFlameDepth, maxFlameNodes)
+	builder := profiling.NewFlamegraphBuilder(opts.Type, maxFlameDepth, maxFlameNodes)
 	for _, row := range rows {
 		r, err := g.blobs.Get(c.Context(), row.BlobKey)
 		if errors.Is(err, blob.ErrNotFound) {
@@ -407,34 +337,44 @@ func (g *Gateway) profileFlamegraph(c fiber.Ctx) error {
 			g.logger.Error("read profile blob failed", "profile_id", row.ID, "blob_key", row.BlobKey, "error", err)
 			return fiber.NewError(http.StatusInternalServerError, "read profile blob")
 		}
-		raw, readErr := io.ReadAll(io.LimitReader(r, maxProfileSize+1))
+		addErr := builder.AddGzippedReader(r, maxProfileSize, maxDecodedRequestBody)
 		closeErr := r.Close()
-		if readErr != nil || closeErr != nil {
+		if addErr != nil {
+			switch {
+			case errors.Is(addErr, profiling.ErrCompressedTooLarge):
+				g.logger.Warn("skipping oversized profile blob", "profile_id", row.ID, "blob_key", row.BlobKey)
+				continue
+			case errors.Is(addErr, profiling.ErrNotGzip),
+				errors.Is(addErr, profiling.ErrDecodedTooLarge),
+				errors.Is(addErr, profiling.ErrNestedGzip),
+				errors.Is(addErr, profiling.ErrInvalidProfile),
+				errors.Is(addErr, profiling.ErrInvalidSampleType):
+				g.logger.Warn(
+					"skipping corrupt profile blob",
+					"profile_id", row.ID, "blob_key", row.BlobKey, "error", addErr,
+				)
+				continue
+			default:
+				g.logger.Error(
+					"stream profile blob failed",
+					"profile_id", row.ID, "blob_key", row.BlobKey,
+					"read_err", addErr, "close_err", closeErr,
+				)
+				return fiber.NewError(http.StatusInternalServerError, "read profile blob")
+			}
+		}
+		if closeErr != nil {
 			g.logger.Error(
-				"stream profile blob failed",
-				"profile_id", row.ID, "blob_key", row.BlobKey,
-				"read_err", readErr, "close_err", closeErr,
+				"close profile blob failed",
+				"profile_id", row.ID, "blob_key", row.BlobKey, "close_err", closeErr,
 			)
 			return fiber.NewError(http.StatusInternalServerError, "read profile blob")
 		}
-		if len(raw) > maxProfileSize {
-			g.logger.Warn("skipping oversized profile blob", "profile_id", row.ID, "blob_key", row.BlobKey)
-			continue
-		}
-		parsed, parseErr := parseGzippedProfile(raw, maxDecodedRequestBody)
-		if parseErr != nil {
-			g.logger.Warn(
-				"skipping corrupt profile blob",
-				"profile_id", row.ID, "blob_key", row.BlobKey, "error", parseErr,
-			)
-			continue
-		}
-		builder.addProfile(parsed)
 	}
-	if builder.profileCount == 0 {
+	if builder.Count() == 0 {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "no profiles in window"})
 	}
-	return c.JSON(builder.finish())
+	return c.JSON(builder.Finish())
 }
 
 func (g *Gateway) rawProfile(c fiber.Ctx) error {
@@ -552,221 +492,4 @@ func safeProfileSegment(value string) string {
 		return "unknown"
 	}
 	return b.String()
-}
-
-type flameNode struct {
-	Name      string       `json:"name"`
-	Value     int64        `json:"value"`
-	Unit      string       `json:"unit,omitempty"`
-	Children  []*flameNode `json:"children,omitempty"`
-	Truncated bool         `json:"truncated,omitempty"`
-	byName    map[string]*flameNode
-}
-
-type flamegraphBuilder struct {
-	profileType  meta.ProfileType
-	maxDepth     int
-	maxNodes     int
-	root         *flameNode
-	nodes        int
-	profileCount int
-	unit         string
-	snapshot     bool
-}
-
-func newFlamegraphBuilder(profileType meta.ProfileType, maxDepth, maxNodes int) *flamegraphBuilder {
-	return &flamegraphBuilder{
-		profileType: profileType,
-		maxDepth:    maxDepth,
-		maxNodes:    maxNodes,
-		root:        &flameNode{Name: "root", byName: make(map[string]*flameNode)},
-		nodes:       1,
-	}
-}
-
-func (b *flamegraphBuilder) addProfile(p *pprofprofile.Profile) {
-	if p == nil {
-		return
-	}
-	valueIndex, unit, snapshot := profileValueMeta(p, b.profileType)
-	if b.profileCount == 0 {
-		b.unit = unit
-		b.snapshot = snapshot
-	} else if !snapshot {
-		b.snapshot = false
-	}
-	b.profileCount++
-	if b.maxNodes <= 0 {
-		if len(p.Sample) > 0 {
-			b.root.Truncated = true
-		}
-		return
-	}
-	for _, sample := range p.Sample {
-		if valueIndex < 0 || valueIndex >= len(sample.Value) {
-			continue
-		}
-		value := sample.Value[valueIndex]
-		if value <= 0 {
-			continue
-		}
-		b.root.Value = addInt64Clamped(b.root.Value, value)
-		frames := collapseDirectRecursion(sampleFrames(sample))
-		current := b.root
-		for depth, name := range frames {
-			if depth >= b.maxDepth {
-				current.Truncated = true
-				break
-			}
-			child := current.byName[name]
-			if child == nil {
-				if b.nodes >= b.maxNodes {
-					current.Truncated = true
-					break
-				}
-				child = &flameNode{Name: name, byName: make(map[string]*flameNode)}
-				current.byName[name] = child
-				current.Children = append(current.Children, child)
-				b.nodes++
-			}
-			child.Value = addInt64Clamped(child.Value, value)
-			current = child
-		}
-	}
-}
-
-func (b *flamegraphBuilder) finish() *flameNode {
-	if b.snapshot && b.profileCount > 1 {
-		scaleFlameTreeAverage(b.root, int64(b.profileCount))
-	}
-	b.root.Unit = b.unit
-	sortFlameTree(b.root)
-	return b.root
-}
-
-func buildFlamegraph(p *pprofprofile.Profile, profileType meta.ProfileType, maxDepth, maxNodes int) *flameNode {
-	builder := newFlamegraphBuilder(profileType, maxDepth, maxNodes)
-	builder.addProfile(p)
-	return builder.finish()
-}
-
-func addInt64Clamped(a, b int64) int64 {
-	if b <= 0 {
-		return a
-	}
-	if a > math.MaxInt64-b {
-		return math.MaxInt64
-	}
-	return a + b
-}
-
-func scaleFlameTreeAverage(node *flameNode, count int64) {
-	if node == nil || count <= 1 {
-		return
-	}
-	if node.Value > 0 {
-		q, r := node.Value/count, node.Value%count
-		if r*2 >= count && q < math.MaxInt64 {
-			q++
-		}
-		if q == 0 {
-			q = 1
-		}
-		node.Value = q
-	}
-	for _, child := range node.Children {
-		scaleFlameTreeAverage(child, count)
-	}
-}
-
-func collapseDirectRecursion(frames []string) []string {
-	if len(frames) <= 1 {
-		return frames
-	}
-	out := make([]string, 0, len(frames))
-	for _, frame := range frames {
-		if len(out) > 0 && out[len(out)-1] == frame {
-			continue
-		}
-		out = append(out, frame)
-	}
-	return out
-}
-
-func profileValueMeta(p *pprofprofile.Profile, profileType meta.ProfileType) (index int, unit string, snapshot bool) {
-	index = profileValueIndex(p, profileType)
-	if index >= 0 && index < len(p.SampleType) && p.SampleType[index] != nil {
-		st := p.SampleType[index]
-		unit = st.Unit
-		switch st.Type {
-		case "inuse_space", "inuse_objects", "goroutine":
-			return index, unit, true
-		case "cpu", "alloc_space", "alloc_objects":
-			return index, unit, false
-		case "samples":
-			return index, unit, profileType == meta.ProfileTypeGoroutine
-		}
-	}
-	return index, unit, profileType == meta.ProfileTypeHeap || profileType == meta.ProfileTypeGoroutine
-}
-
-func profileValueIndex(p *pprofprofile.Profile, profileType meta.ProfileType) int {
-	wanted := []string{}
-	switch profileType {
-	case meta.ProfileTypeCPU:
-		wanted = []string{"cpu"}
-	case meta.ProfileTypeHeap:
-		wanted = []string{"inuse_space", "alloc_space", "inuse_objects"}
-	case meta.ProfileTypeGoroutine:
-		wanted = []string{"goroutine", "samples"}
-	}
-	for _, name := range wanted {
-		for i, sampleType := range p.SampleType {
-			if sampleType != nil && sampleType.Type == name {
-				return i
-			}
-		}
-	}
-	if len(p.SampleType) == 0 {
-		return 0
-	}
-	return len(p.SampleType) - 1
-}
-
-func sampleFrames(sample *pprofprofile.Sample) []string {
-	leafFirst := make([]string, 0, len(sample.Location))
-	for _, location := range sample.Location {
-		if location == nil {
-			continue
-		}
-		if len(location.Line) == 0 {
-			leafFirst = append(leafFirst, fmt.Sprintf("0x%x", location.Address))
-			continue
-		}
-		for _, line := range location.Line {
-			name := "unknown"
-			if line.Function != nil && line.Function.Name != "" {
-				name = line.Function.Name
-			}
-			leafFirst = append(leafFirst, name)
-		}
-	}
-	frames := make([]string, len(leafFirst))
-	for i := range leafFirst {
-		frames[len(leafFirst)-1-i] = leafFirst[i]
-	}
-	return frames
-}
-
-func sortFlameTree(node *flameNode) {
-	sort.Slice(node.Children, func(i, j int) bool {
-		if node.Children[i].Value == node.Children[j].Value {
-			return node.Children[i].Name < node.Children[j].Name
-		}
-		return node.Children[i].Value > node.Children[j].Value
-	})
-	for _, child := range node.Children {
-		sortFlameTree(child)
-	}
-	node.byName = nil
 }

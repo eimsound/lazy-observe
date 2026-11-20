@@ -25,6 +25,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
+	"github.com/eimsound/lazy-observe/internal/db/ent/replaysegment"
 	"github.com/eimsound/lazy-observe/internal/db/ent/replaysession"
 	"github.com/eimsound/lazy-observe/internal/db/ent/scrapetarget"
 	"github.com/eimsound/lazy-observe/internal/db/ent/session"
@@ -108,6 +109,7 @@ func checkColumn(t, c string) error {
 			project.Table:                project.ValidColumn,
 			projectapitoken.Table:        projectapitoken.ValidColumn,
 			projectalertconfig.Table:     projectalertconfig.ValidColumn,
+			replaysegment.Table:          replaysegment.ValidColumn,
 			replaysession.Table:          replaysession.ValidColumn,
 			scrapetarget.Table:           scrapetarget.ValidColumn,
 			session.Table:                session.ValidColumn,

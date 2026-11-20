@@ -19,6 +19,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
+	"github.com/eimsound/lazy-observe/internal/db/ent/replaysegment"
 	"github.com/eimsound/lazy-observe/internal/db/ent/replaysession"
 	"github.com/eimsound/lazy-observe/internal/db/ent/scrapetarget"
 	"github.com/eimsound/lazy-observe/internal/db/ent/silence"
@@ -171,6 +172,21 @@ func (_u *ProjectUpdate) AddReplaySessions(v ...*ReplaySession) *ProjectUpdate {
 		ids[i] = v[i].ID
 	}
 	return _u.AddReplaySessionIDs(ids...)
+}
+
+// AddReplaySegmentIDs adds the "replay_segments" edge to the ReplaySegment entity by IDs.
+func (_u *ProjectUpdate) AddReplaySegmentIDs(ids ...int) *ProjectUpdate {
+	_u.mutation.AddReplaySegmentIDs(ids...)
+	return _u
+}
+
+// AddReplaySegments adds the "replay_segments" edges to the ReplaySegment entity.
+func (_u *ProjectUpdate) AddReplaySegments(v ...*ReplaySegment) *ProjectUpdate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddReplaySegmentIDs(ids...)
 }
 
 // AddSourceMapArtifactIDs adds the "source_map_artifacts" edge to the SourceMapArtifact entity by IDs.
@@ -417,6 +433,27 @@ func (_u *ProjectUpdate) RemoveReplaySessions(v ...*ReplaySession) *ProjectUpdat
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveReplaySessionIDs(ids...)
+}
+
+// ClearReplaySegments clears all "replay_segments" edges to the ReplaySegment entity.
+func (_u *ProjectUpdate) ClearReplaySegments() *ProjectUpdate {
+	_u.mutation.ClearReplaySegments()
+	return _u
+}
+
+// RemoveReplaySegmentIDs removes the "replay_segments" edge to ReplaySegment entities by IDs.
+func (_u *ProjectUpdate) RemoveReplaySegmentIDs(ids ...int) *ProjectUpdate {
+	_u.mutation.RemoveReplaySegmentIDs(ids...)
+	return _u
+}
+
+// RemoveReplaySegments removes "replay_segments" edges to ReplaySegment entities.
+func (_u *ProjectUpdate) RemoveReplaySegments(v ...*ReplaySegment) *ProjectUpdate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveReplaySegmentIDs(ids...)
 }
 
 // ClearSourceMapArtifacts clears all "source_map_artifacts" edges to the SourceMapArtifact entity.
@@ -905,6 +942,51 @@ func (_u *ProjectUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 		}
 		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
+	if _u.mutation.ReplaySegmentsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.ReplaySegmentsTable,
+			Columns: []string{project.ReplaySegmentsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(replaysegment.FieldID, field.TypeInt),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedReplaySegmentsIDs(); len(nodes) > 0 && !_u.mutation.ReplaySegmentsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.ReplaySegmentsTable,
+			Columns: []string{project.ReplaySegmentsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(replaysegment.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ReplaySegmentsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.ReplaySegmentsTable,
+			Columns: []string{project.ReplaySegmentsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(replaysegment.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
 	if _u.mutation.SourceMapArtifactsCleared() {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.O2M,
@@ -1312,6 +1394,21 @@ func (_u *ProjectUpdateOne) AddReplaySessions(v ...*ReplaySession) *ProjectUpdat
 	return _u.AddReplaySessionIDs(ids...)
 }
 
+// AddReplaySegmentIDs adds the "replay_segments" edge to the ReplaySegment entity by IDs.
+func (_u *ProjectUpdateOne) AddReplaySegmentIDs(ids ...int) *ProjectUpdateOne {
+	_u.mutation.AddReplaySegmentIDs(ids...)
+	return _u
+}
+
+// AddReplaySegments adds the "replay_segments" edges to the ReplaySegment entity.
+func (_u *ProjectUpdateOne) AddReplaySegments(v ...*ReplaySegment) *ProjectUpdateOne {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddReplaySegmentIDs(ids...)
+}
+
 // AddSourceMapArtifactIDs adds the "source_map_artifacts" edge to the SourceMapArtifact entity by IDs.
 func (_u *ProjectUpdateOne) AddSourceMapArtifactIDs(ids ...int) *ProjectUpdateOne {
 	_u.mutation.AddSourceMapArtifactIDs(ids...)
@@ -1556,6 +1653,27 @@ func (_u *ProjectUpdateOne) RemoveReplaySessions(v ...*ReplaySession) *ProjectUp
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveReplaySessionIDs(ids...)
+}
+
+// ClearReplaySegments clears all "replay_segments" edges to the ReplaySegment entity.
+func (_u *ProjectUpdateOne) ClearReplaySegments() *ProjectUpdateOne {
+	_u.mutation.ClearReplaySegments()
+	return _u
+}
+
+// RemoveReplaySegmentIDs removes the "replay_segments" edge to ReplaySegment entities by IDs.
+func (_u *ProjectUpdateOne) RemoveReplaySegmentIDs(ids ...int) *ProjectUpdateOne {
+	_u.mutation.RemoveReplaySegmentIDs(ids...)
+	return _u
+}
+
+// RemoveReplaySegments removes "replay_segments" edges to ReplaySegment entities.
+func (_u *ProjectUpdateOne) RemoveReplaySegments(v ...*ReplaySegment) *ProjectUpdateOne {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveReplaySegmentIDs(ids...)
 }
 
 // ClearSourceMapArtifacts clears all "source_map_artifacts" edges to the SourceMapArtifact entity.
@@ -2067,6 +2185,51 @@ func (_u *ProjectUpdateOne) sqlSave(ctx context.Context) (_node *Project, err er
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(replaysession.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.ReplaySegmentsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.ReplaySegmentsTable,
+			Columns: []string{project.ReplaySegmentsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(replaysegment.FieldID, field.TypeInt),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedReplaySegmentsIDs(); len(nodes) > 0 && !_u.mutation.ReplaySegmentsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.ReplaySegmentsTable,
+			Columns: []string{project.ReplaySegmentsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(replaysegment.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ReplaySegmentsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.ReplaySegmentsTable,
+			Columns: []string{project.ReplaySegmentsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(replaysegment.FieldID, field.TypeInt),
 			},
 		}
 		for _, k := range nodes {

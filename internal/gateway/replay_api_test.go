@@ -502,10 +502,10 @@ type failingUpsertReplayStore struct {
 	err error
 }
 
-func (s failingUpsertReplayStore) UpsertReplaySession(
-	context.Context, int, string, time.Time, time.Time, int, int64, bool, string, string,
-) error {
-	return s.err
+func (s failingUpsertReplayStore) UpsertReplaySegment(
+	context.Context, meta.ReplaySegmentInput,
+) (meta.ReplaySegmentUpsertResult, error) {
+	return meta.ReplaySegmentUpsertResult{}, s.err
 }
 
 func TestReplayFieldsSanitizationPersistedSummaryAndRollback(t *testing.T) {
@@ -614,4 +614,252 @@ func TestReplayFieldsSanitizationPersistedSummaryAndRollback(t *testing.T) {
 	if _, err := blobs.Get(ctx, "replay/default/rollback-sess/0.meta.json"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("orphan summary blob was not rolled back: err=%v", err)
 	}
+}
+
+type noListBlobStore struct {
+	blob.Store
+	listCalls int
+}
+
+func (s *noListBlobStore) List(ctx context.Context, prefix string) ([]blob.Object, error) {
+	s.listCalls++
+	return s.Store.List(ctx, prefix)
+}
+
+type countingIssueStore struct {
+	IssueStore
+	batch       replayIssueBatchLookup
+	singleCalls int
+	batchCalls  int
+}
+
+func (s *countingIssueStore) IssueIDForErrorEvent(
+	ctx context.Context,
+	projectID int,
+	eventID string,
+) (int, bool, error) {
+	s.singleCalls++
+	return s.IssueStore.IssueIDForErrorEvent(ctx, projectID, eventID)
+}
+
+func (s *countingIssueStore) IssueIDsForErrorEvents(
+	ctx context.Context, projectID int, eventIDs []string,
+) (map[string]int, error) {
+	s.batchCalls++
+	return s.batch.IssueIDsForErrorEvents(ctx, projectID, eventIDs)
+}
+
+func TestReplayDetailResolvesMultipleErrorMarkersInSingleBatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := store.ProjectBySlug(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := userQueryToken(t, store, "replay-batch-reader")
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	for _, evID := range []string{"batch-ev-1", "batch-ev-2"} {
+		payload := []byte(`{"event_id":"` + evID + `"}`)
+		if err := store.AcceptErrorEvents(ctx, []errortrack.InboxEntry{{
+			ProjectID: project.ID, EventID: evID, CanonicalDigest: evID,
+			Payload: payload, PayloadBytes: int64(len(payload)),
+			OccurredAt: fixedNow.Add(-time.Minute), AcceptedAt: fixedNow.Add(-time.Minute),
+		}}, errortrack.InboxCapacity{MaxItems: 10, MaxBytes: 1 << 20}); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := store.ClaimErrorEvents(ctx, "batch-worker", 1, fixedNow, time.Minute)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim %s: %v", evID, err)
+		}
+		if _, err := store.CompleteErrorEvent(
+			ctx, claimed[0].ID, "batch-worker", claimed[0].ClaimEpoch,
+			errortrack.IssueDelta{
+				ProjectID: project.ID, Fingerprint: "fp-" + evID, Title: "err " + evID, Level: "error",
+				Count: 1, FirstSeen: fixedNow.Add(-time.Minute), LastSeen: fixedNow.Add(-time.Minute),
+				LastEventID: evID, AcceptedAt: fixedNow.Add(-time.Minute), AppliedAt: fixedNow,
+			}, fixedNow,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	countedIssues := &countingIssueStore{IssueStore: store, batch: store}
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Issues: countedIssues, Replays: store, Blobs: blobs,
+		Now: func() time.Time { return fixedNow },
+	}).App()
+
+	seg0 := []byte(fmt.Sprintf(
+		`[{"type":5,"data":{"tag":"lazy-observe:error","payload":{"event_id":"batch-ev-1","title":"e1"}},"timestamp":%d}]`,
+		fixedNow.Add(-2*time.Minute).UnixMilli(),
+	))
+	seg1 := []byte(fmt.Sprintf(
+		`[{"type":5,"data":{"tag":"lazy-observe:error","payload":{"event_id":"batch-ev-2","title":"e2"}},"timestamp":%d}]`,
+		fixedNow.Add(-time.Minute).UnixMilli(),
+	))
+	uploadReplay(t, app, token, "batch-sess", 0, seg0, true, http.StatusAccepted)
+	uploadReplay(t, app, token, "batch-sess", 1, seg1, true, http.StatusAccepted)
+
+	detail := replayRequest(t, app, reader, "default", "/api/replay/sessions/batch-sess")
+	if detail.StatusCode != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detail.StatusCode, readBody(detail))
+	}
+	var parsed struct {
+		Markers []replayMarkerDTO `json:"markers"`
+	}
+	decodeResponse(t, detail, &parsed)
+	if len(parsed.Markers) != 2 || parsed.Markers[0].IssueID == "" || parsed.Markers[1].IssueID == "" {
+		t.Fatalf("expected both markers resolved, got %+v", parsed.Markers)
+	}
+	if countedIssues.batchCalls != 1 || countedIssues.singleCalls != 0 {
+		t.Fatalf("expected 1 bulk lookup and 0 N+1 lookups, got batch=%d single=%d",
+			countedIssues.batchCalls, countedIssues.singleCalls)
+	}
+}
+
+func TestReplayIngestAndReadDecoupledFromBlobListAndGuardLimits(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := userQueryToken(t, store, "replay-nolist-reader")
+	localBlobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	trackedBlobs := &noListBlobStore{Store: localBlobs}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: trackedBlobs,
+		Now: func() time.Time { return fixedNow },
+	}).App()
+
+	// 1. Ingest and read detail must NEVER call blobs.List.
+	seg0 := []byte(fmt.Sprintf(
+		`[{"type":4,"data":{"href":"https://example.test/checkout"},"timestamp":%d}]`,
+		fixedNow.Add(-2*time.Minute).UnixMilli(),
+	))
+	seg1 := []byte(fmt.Sprintf(
+		`[{"type":5,"data":{"tag":"lazy-observe:http","payload":{"method":"GET","path":"/api/cart","status":200,"duration_ms":15}},"timestamp":%d}]`,
+		fixedNow.Add(-time.Minute).UnixMilli(),
+	))
+	uploadReplay(t, app, token, "nolist-sess", 0, seg0, false, http.StatusAccepted)
+	uploadReplay(t, app, token, "nolist-sess", 1, seg1, false, http.StatusAccepted)
+
+	detail := replayRequest(t, app, reader, "default", "/api/replay/sessions/nolist-sess")
+	if detail.StatusCode != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detail.StatusCode, readBody(detail))
+	}
+	var parsed struct {
+		Segments []replaySegmentDTO `json:"segments"`
+		Markers  []replayMarkerDTO  `json:"markers"`
+	}
+	decodeResponse(t, detail, &parsed)
+	if len(parsed.Segments) != 2 || len(parsed.Markers) != 1 {
+		t.Fatalf("unexpected detail segments=%d markers=%d", len(parsed.Segments), len(parsed.Markers))
+	}
+	if trackedBlobs.listCalls != 0 {
+		t.Fatalf("expected 0 blobs.List calls on replay ingest+read, got %d", trackedBlobs.listCalls)
+	}
+
+	// 2. Legacy session (replay_sessions row without replay_segments) smoothly falls back to blob storage.
+	project, err := store.ProjectBySlug(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyGz bytes.Buffer
+	zw := gzip.NewWriter(&legacyGz)
+	_, _ = zw.Write(seg0)
+	_ = zw.Close()
+	if err := localBlobs.Put(
+		ctx,
+		"replay/default/legacy-sess/0.json.gz",
+		bytes.NewReader(legacyGz.Bytes()),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertReplaySession(
+		ctx, project.ID, "legacy-sess", fixedNow.Add(-2*time.Minute), fixedNow.Add(-2*time.Minute),
+		1, int64(legacyGz.Len()), false, "", "https://example.test/checkout",
+	); err != nil {
+		t.Fatal(err)
+	}
+	legacyDetail := replayRequest(t, app, reader, "default", "/api/replay/sessions/legacy-sess")
+	if legacyDetail.StatusCode != http.StatusOK {
+		t.Fatalf("legacy detail status=%d body=%s", legacyDetail.StatusCode, readBody(legacyDetail))
+	}
+	var legacyParsed struct {
+		Segments []replaySegmentDTO `json:"segments"`
+	}
+	decodeResponse(t, legacyDetail, &legacyParsed)
+	if len(legacyParsed.Segments) != 1 || legacyParsed.Segments[0].Seq != 0 {
+		t.Fatalf("legacy fallback segments=%+v", legacyParsed.Segments)
+	}
+
+	// 3. Single-request event count quota rejects > maxReplayEventsPerSegment with 413.
+	var hugeEvents strings.Builder
+	hugeEvents.WriteByte('[')
+	for i := 0; i < maxReplayEventsPerSegment+1; i++ {
+		if i > 0 {
+			hugeEvents.WriteByte(',')
+		}
+		hugeEvents.WriteString("{}")
+	}
+	hugeEvents.WriteByte(']')
+	uploadReplay(
+		t, app, token, "many-events", 0, []byte(hugeEvents.String()), false, http.StatusRequestEntityTooLarge,
+	)
+
+	// 4. Unified publicIngestAdmission enforces per-IP rate limit (429 + Retry-After) and fail-closed 503.
+	ipLimiter := &keyMatchLimiter{denyPrefix: "replay:ingest:ip:"}
+	ipApp := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: localBlobs, Limits: ipLimiter,
+	}).App()
+	req := httptest.NewRequest(http.MethodPost, "/api/replay/segments?session_id=rl-ip&seq=0", bytes.NewReader(seg0))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Origin", "https://app.example.test")
+	req.Header.Set("X-LO-Replay-Compression", "identity")
+	rlResp, err := ipApp.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rlResp.StatusCode != http.StatusTooManyRequests ||
+		rlResp.Header.Get("Retry-After") == "" ||
+		rlResp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("replay IP rate limit status=%d retry=%q cors=%q",
+			rlResp.StatusCode, rlResp.Header.Get("Retry-After"), rlResp.Header.Get("Access-Control-Allow-Origin"))
+	}
+	rlResp.Body.Close()
+
+	errApp := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: localBlobs,
+		Limits: &keyMatchLimiter{errPrefix: "replay:ingest:project:"},
+	}).App()
+	uploadReplay(t, errApp, token, "rl-err", 0, seg0, false, http.StatusServiceUnavailable)
 }

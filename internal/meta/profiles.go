@@ -110,3 +110,26 @@ func (s *Store) ListExpiredProfiles(ctx context.Context, cutoff time.Time, limit
 func (s *Store) DeleteProfile(ctx context.Context, id int) error {
 	return s.client.ProfileMeta.DeleteOneID(id).Exec(ctx)
 }
+
+// ReferencedProfileBlobKeys returns the set of blob keys referenced by active
+// profile_metas rows for a project so retention can sweep orphaned profile blobs.
+func (s *Store) ReferencedProfileBlobKeys(ctx context.Context, projectID int) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		bind(s.dialect, `SELECT blob_key FROM profile_metas WHERE project_id = ?`),
+		projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	keys := make(map[string]bool)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys[key] = true
+	}
+	return keys, rows.Err()
+}

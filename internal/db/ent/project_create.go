@@ -18,6 +18,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
+	"github.com/eimsound/lazy-observe/internal/db/ent/replaysegment"
 	"github.com/eimsound/lazy-observe/internal/db/ent/replaysession"
 	"github.com/eimsound/lazy-observe/internal/db/ent/scrapetarget"
 	"github.com/eimsound/lazy-observe/internal/db/ent/silence"
@@ -162,6 +163,21 @@ func (_c *ProjectCreate) AddReplaySessions(v ...*ReplaySession) *ProjectCreate {
 		ids[i] = v[i].ID
 	}
 	return _c.AddReplaySessionIDs(ids...)
+}
+
+// AddReplaySegmentIDs adds the "replay_segments" edge to the ReplaySegment entity by IDs.
+func (_c *ProjectCreate) AddReplaySegmentIDs(ids ...int) *ProjectCreate {
+	_c.mutation.AddReplaySegmentIDs(ids...)
+	return _c
+}
+
+// AddReplaySegments adds the "replay_segments" edges to the ReplaySegment entity.
+func (_c *ProjectCreate) AddReplaySegments(v ...*ReplaySegment) *ProjectCreate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddReplaySegmentIDs(ids...)
 }
 
 // AddSourceMapArtifactIDs adds the "source_map_artifacts" edge to the SourceMapArtifact entity by IDs.
@@ -463,6 +479,22 @@ func (_c *ProjectCreate) createSpec() (*Project, *sqlgraph.CreateSpec) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(replaysession.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.ReplaySegmentsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.ReplaySegmentsTable,
+			Columns: []string{project.ReplaySegmentsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(replaysegment.FieldID, field.TypeInt),
 			},
 		}
 		for _, k := range nodes {

@@ -392,3 +392,57 @@ func TestDeletedProjectBlobsTaskCleansAllPrefixes(t *testing.T) {
 		t.Fatalf("pending deleted project blobs=%v err=%v", pending, err)
 	}
 }
+
+func TestProfilesSweepOrphanBlobsRespectsGracePeriod(t *testing.T) {
+	ctx := context.Background()
+	store, project := openTestStore(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	activeKey := "profiles/default/svc/cpu/active.pb.gz"
+	orphanKey := "profiles/default/svc/cpu/orphan.pb.gz"
+	goneProjectKey := "profiles/deleted-proj/svc/cpu/orphan.pb.gz"
+	for _, key := range []string{activeKey, orphanKey, goneProjectKey} {
+		if err := blobs.Put(ctx, key, strings.NewReader("data")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.CreateProfileMeta(
+		ctx, project.ID, "svc", meta.ProfileTypeCPU,
+		now.Add(-time.Minute), now, 4,
+		strings.Repeat("9", 32), strings.Repeat("a", 64), activeKey, map[string]string{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := now.Add(-7 * 24 * time.Hour)
+	// Within grace period: orphan blobs must be preserved.
+	if _, err := (&Profiles{Metadata: store, Blobs: blobs}).Clean(ctx, cutoff); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{activeKey, orphanKey, goneProjectKey} {
+		if _, err := blobs.Get(ctx, key); err != nil {
+			t.Fatalf("blob %s unexpectedly removed within grace period: %v", key, err)
+		}
+	}
+
+	// Past grace period: unreferenced orphan blobs are reclaimed while active stays.
+	swept, err := (&Profiles{
+		Metadata: store,
+		Blobs:    blobs,
+		Now:      func() time.Time { return time.Now().UTC().Add(DefaultProfileGracePeriod + time.Minute) },
+	}).Clean(ctx, cutoff)
+	if err != nil || swept != 2 {
+		t.Fatalf("past-grace profile sweep swept=%d err=%v want=2", swept, err)
+	}
+	if _, err := blobs.Get(ctx, activeKey); err != nil {
+		t.Fatalf("active profile blob removed: %v", err)
+	}
+	for _, key := range []string{orphanKey, goneProjectKey} {
+		if _, err := blobs.Get(ctx, key); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("orphan profile blob %s still exists: err=%v", key, err)
+		}
+	}
+}

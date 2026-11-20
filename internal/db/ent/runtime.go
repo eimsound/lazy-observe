@@ -18,6 +18,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
+	"github.com/eimsound/lazy-observe/internal/db/ent/replaysegment"
 	"github.com/eimsound/lazy-observe/internal/db/ent/replaysession"
 	"github.com/eimsound/lazy-observe/internal/db/ent/scrapetarget"
 	"github.com/eimsound/lazy-observe/internal/db/ent/session"
@@ -389,6 +390,48 @@ func init() {
 	projectalertconfig.DefaultUpdatedAt = projectalertconfigDescUpdatedAt.Default.(func() time.Time)
 	// projectalertconfig.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
 	projectalertconfig.UpdateDefaultUpdatedAt = projectalertconfigDescUpdatedAt.UpdateDefault.(func() time.Time)
+	replaysegmentFields := schema.ReplaySegment{}.Fields()
+	_ = replaysegmentFields
+	// replaysegmentDescSessionID is the schema descriptor for session_id field.
+	replaysegmentDescSessionID := replaysegmentFields[0].Descriptor()
+	// replaysegment.SessionIDValidator is a validator for the "session_id" field. It is called by the builders before save.
+	replaysegment.SessionIDValidator = replaysegmentDescSessionID.Validators[0].(func(string) error)
+	// replaysegmentDescSeq is the schema descriptor for seq field.
+	replaysegmentDescSeq := replaysegmentFields[1].Descriptor()
+	// replaysegment.SeqValidator is a validator for the "seq" field. It is called by the builders before save.
+	replaysegment.SeqValidator = replaysegmentDescSeq.Validators[0].(func(int) error)
+	// replaysegmentDescStartedAt is the schema descriptor for started_at field.
+	replaysegmentDescStartedAt := replaysegmentFields[2].Descriptor()
+	// replaysegment.DefaultStartedAt holds the default value on creation for the started_at field.
+	replaysegment.DefaultStartedAt = replaysegmentDescStartedAt.Default.(func() time.Time)
+	// replaysegmentDescLastSeenAt is the schema descriptor for last_seen_at field.
+	replaysegmentDescLastSeenAt := replaysegmentFields[3].Descriptor()
+	// replaysegment.DefaultLastSeenAt holds the default value on creation for the last_seen_at field.
+	replaysegment.DefaultLastSeenAt = replaysegmentDescLastSeenAt.Default.(func() time.Time)
+	// replaysegmentDescEventCount is the schema descriptor for event_count field.
+	replaysegmentDescEventCount := replaysegmentFields[4].Descriptor()
+	// replaysegment.DefaultEventCount holds the default value on creation for the event_count field.
+	replaysegment.DefaultEventCount = replaysegmentDescEventCount.Default.(int)
+	// replaysegment.EventCountValidator is a validator for the "event_count" field. It is called by the builders before save.
+	replaysegment.EventCountValidator = replaysegmentDescEventCount.Validators[0].(func(int) error)
+	// replaysegmentDescSizeBytes is the schema descriptor for size_bytes field.
+	replaysegmentDescSizeBytes := replaysegmentFields[5].Descriptor()
+	// replaysegment.DefaultSizeBytes holds the default value on creation for the size_bytes field.
+	replaysegment.DefaultSizeBytes = replaysegmentDescSizeBytes.Default.(int64)
+	// replaysegment.SizeBytesValidator is a validator for the "size_bytes" field. It is called by the builders before save.
+	replaysegment.SizeBytesValidator = replaysegmentDescSizeBytes.Validators[0].(func(int64) error)
+	// replaysegmentDescPayloadSha256 is the schema descriptor for payload_sha256 field.
+	replaysegmentDescPayloadSha256 := replaysegmentFields[6].Descriptor()
+	// replaysegment.DefaultPayloadSha256 holds the default value on creation for the payload_sha256 field.
+	replaysegment.DefaultPayloadSha256 = replaysegmentDescPayloadSha256.Default.(string)
+	// replaysegmentDescMarkersJSON is the schema descriptor for markers_json field.
+	replaysegmentDescMarkersJSON := replaysegmentFields[7].Descriptor()
+	// replaysegment.DefaultMarkersJSON holds the default value on creation for the markers_json field.
+	replaysegment.DefaultMarkersJSON = replaysegmentDescMarkersJSON.Default.(string)
+	// replaysegmentDescCreatedAt is the schema descriptor for created_at field.
+	replaysegmentDescCreatedAt := replaysegmentFields[8].Descriptor()
+	// replaysegment.DefaultCreatedAt holds the default value on creation for the created_at field.
+	replaysegment.DefaultCreatedAt = replaysegmentDescCreatedAt.Default.(func() time.Time)
 	replaysessionFields := schema.ReplaySession{}.Fields()
 	_ = replaysessionFields
 	// replaysessionDescSessionID is the schema descriptor for session_id field.

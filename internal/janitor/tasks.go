@@ -156,6 +156,13 @@ type ProfileStore interface {
 	DeleteProfile(context.Context, int) error
 }
 
+type profileOrphanStore interface {
+	ProjectBySlug(context.Context, string) (meta.ProjectInfo, error)
+	ReferencedProfileBlobKeys(context.Context, int) (map[string]bool, error)
+}
+
+const DefaultProfileGracePeriod = 15 * time.Minute
+
 type AuditStore interface {
 	DeleteAuditBefore(context.Context, time.Time) (int, error)
 }
@@ -170,8 +177,10 @@ func (c AuditEvents) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 }
 
 type Profiles struct {
-	Metadata ProfileStore
-	Blobs    blob.Store
+	Metadata    ProfileStore
+	Blobs       blob.Store
+	GracePeriod time.Duration
+	Now         func() time.Time
 }
 
 func (c *Profiles) Clean(ctx context.Context, cutoff time.Time) (int, error) {
@@ -189,7 +198,7 @@ func (c *Profiles) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 			return deleted, errors.Join(errs...)
 		}
 		if len(rows) == 0 {
-			return deleted, errors.Join(errs...)
+			break
 		}
 		progressed := false
 		for _, row := range rows {
@@ -210,9 +219,73 @@ func (c *Profiles) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 			progressed = true
 		}
 		if !progressed || len(rows) < 100 {
-			return deleted, errors.Join(errs...)
+			break
 		}
 	}
+	if orphanStore, ok := c.Metadata.(profileOrphanStore); ok {
+		swept, sweepErr := c.sweepOrphans(ctx, orphanStore)
+		deleted += swept
+		if sweepErr != nil {
+			errs = append(errs, sweepErr)
+		}
+	}
+	return deleted, errors.Join(errs...)
+}
+
+func (c *Profiles) sweepOrphans(ctx context.Context, store profileOrphanStore) (int, error) {
+	objects, err := c.Blobs.List(ctx, "profiles/")
+	if err != nil {
+		return 0, fmt.Errorf("list profile blobs for orphan sweep: %w", err)
+	}
+	nowFn := c.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := nowFn().UTC()
+	grace := c.GracePeriod
+	if grace == 0 {
+		grace = DefaultProfileGracePeriod
+	}
+	bySlug := make(map[string][]string)
+	for _, object := range objects {
+		parts := strings.Split(object.Key, "/")
+		if len(parts) < 3 {
+			continue
+		}
+		if grace > 0 && !object.ModTime.IsZero() && now.Sub(object.ModTime.UTC()) < grace {
+			continue
+		}
+		bySlug[parts[1]] = append(bySlug[parts[1]], object.Key)
+	}
+	swept := 0
+	var errs []error
+	for slug, keys := range bySlug {
+		var referenced map[string]bool
+		project, err := store.ProjectBySlug(ctx, slug)
+		if err != nil {
+			if !meta.IsNotFound(err) {
+				errs = append(errs, fmt.Errorf("resolve profile project %s: %w", slug, err))
+				continue
+			}
+		} else {
+			referenced, err = store.ReferencedProfileBlobKeys(ctx, project.ID)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("list referenced profile blobs for %s: %w", slug, err))
+				continue
+			}
+		}
+		for _, key := range keys {
+			if referenced[key] {
+				continue
+			}
+			if err := c.Blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				errs = append(errs, fmt.Errorf("delete orphan profile blob %s: %w", key, err))
+				continue
+			}
+			swept++
+		}
+	}
+	return swept, errors.Join(errs...)
 }
 
 type SessionStore interface {
