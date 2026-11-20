@@ -167,10 +167,16 @@ func (s *stateSessions) RevokeOthers(ctx context.Context, userID int, keepToken 
 	return s.store.DeleteOtherByUser(ctx, userID, keepToken)
 }
 
+// SessionTokenPrefix starts every newly issued browser session token. It is
+// deliberately distinct from SourceMapUploadTokenPrefix ("los_", ADR 0018),
+// project API tokens ("lo_"), and user API tokens ("lou_"). Pre-existing
+// sessions stored as SHA-256 digests continue to authenticate until expiry.
+const SessionTokenPrefix = "lss_"
+
 func newSessionToken() (string, error) {
 	value := make([]byte, 32)
 	if _, err := rand.Read(value); err != nil {
 		return "", fmt.Errorf("generate session token: %w", err)
 	}
-	return "los_" + base64.RawURLEncoding.EncodeToString(value), nil
+	return SessionTokenPrefix + base64.RawURLEncoding.EncodeToString(value), nil
 }

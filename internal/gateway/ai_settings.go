@@ -224,9 +224,21 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 		})
 	}
 	var body aiSettingsWire
+	audit := auditEvent{
+		Action:     "ai_settings.update",
+		TargetType: "ai_settings",
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "update_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	if err := c.Bind().Body(&body); err != nil {
+		audit.FailureReason = "invalid_request"
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
+	audit.ChangedFields = aiSettingsChangedFields(body)
 	actor := ""
 	if user, ok := c.Locals(userLocal).(meta.UserInfo); ok {
 		actor = user.Username
@@ -297,6 +309,8 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 	m.current = snap
 	m.updatedBy = actor
 	m.mu.Unlock()
+	audit.TargetName = snap.provider
+	audit.Success = true
 	if m.logger != nil {
 		m.logger.Info("AI settings updated",
 			"enabled", snap.enabled, "provider", snap.provider, "model", snap.model, "by", actor)
@@ -312,6 +326,29 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 		"source":      "database",
 		"updated_by":  actor,
 	})
+}
+
+func aiSettingsChangedFields(body aiSettingsWire) []string {
+	changed := make([]string, 0, 6)
+	if body.Enabled != nil {
+		changed = append(changed, "enabled")
+	}
+	if body.Provider != nil {
+		changed = append(changed, "provider")
+	}
+	if body.BaseURL != nil {
+		changed = append(changed, "base_url")
+	}
+	if body.Model != nil {
+		changed = append(changed, "model")
+	}
+	if body.MaxTokens != nil {
+		changed = append(changed, "max_tokens")
+	}
+	if body.ClearAPIKey || (body.APIKey != nil && strings.TrimSpace(*body.APIKey) != "") {
+		changed = append(changed, "api_key")
+	}
+	return changed
 }
 
 func providerRequiresAPIKey(provider string) bool {

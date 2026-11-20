@@ -15,7 +15,12 @@ import (
 	"github.com/gofiber/fiber/v3"
 )
 
-const sessionTTL = 7 * 24 * time.Hour
+const (
+	sessionTTL            = 7 * 24 * time.Hour
+	maxLoginBodyBytes     = 8 << 10
+	loginAuditNoiseWindow = time.Minute
+	loginAuditNoisePerIP  = 1
+)
 
 type projectResponse struct {
 	ID        string    `json:"id"`
@@ -109,6 +114,10 @@ func userAPITokenJSON(token account.Token) tokenResponse {
 }
 
 func (g *Gateway) login(c fiber.Ctx) error {
+	if len(requestBody(c)) > maxLoginBodyBytes {
+		return c.Status(fiber.StatusBadRequest).
+			JSON(fiber.Map{"code": "invalid_request", "error": "invalid login request"})
+	}
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -118,7 +127,9 @@ func (g *Gateway) login(c fiber.Ctx) error {
 		Username: body.Username, Password: body.Password, SourceIP: c.IP(),
 	})
 	if err != nil {
-		g.auditAccountFacts(c, account.Facts(err))
+		if g.shouldAuditLoginFailure(c, account.Code(err)) {
+			g.auditAccountFacts(c, account.Facts(err))
+		}
 		return g.loginError(c, err)
 	}
 	if g.requireCSRF {
@@ -138,7 +149,32 @@ func (g *Gateway) login(c fiber.Ctx) error {
 	})
 }
 
+func (g *Gateway) shouldAuditLoginFailure(c fiber.Ctx, code account.ErrorCode) bool {
+	switch code {
+	case account.CodeRateLimited, account.CodeInvalidRequest:
+		if g.limits == nil {
+			return false
+		}
+		allowed, err := g.limits.Allow(
+			c.Context(),
+			"audit:login:"+string(code)+":"+c.IP(),
+			loginAuditNoisePerIP,
+			loginAuditNoiseWindow,
+		)
+		return err == nil && allowed
+	default:
+		return true
+	}
+}
+
 func (g *Gateway) loginServiceUnavailable(c fiber.Ctx, stage string, err error) error {
+	if retryAfter := account.RetryAfter(err); retryAfter > 0 {
+		seconds := int(retryAfter.Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(seconds))
+	}
 	if err != nil {
 		g.logger.Error("authentication service unavailable", "stage", stage, "error", err)
 	} else {
@@ -150,6 +186,9 @@ func (g *Gateway) loginServiceUnavailable(c fiber.Ctx, stage string, err error) 
 
 func (g *Gateway) loginError(c fiber.Ctx, err error) error {
 	switch account.Code(err) {
+	case account.CodeInvalidRequest:
+		return c.Status(fiber.StatusBadRequest).
+			JSON(fiber.Map{"code": "invalid_request", "error": "invalid login request"})
 	case account.CodeInvalidCredentials:
 		return c.Status(fiber.StatusUnauthorized).
 			JSON(fiber.Map{"code": "invalid_credentials", "error": "invalid username or password"})

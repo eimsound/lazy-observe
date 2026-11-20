@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -271,5 +272,55 @@ func TestLoadNeverCreatesAKey(t *testing.T) {
 	}
 	if loaded.key != created.key {
 		t.Fatal("Load read a different key than LoadOrCreate wrote")
+	}
+}
+
+func TestLoadOrCreateConcurrentReplicasConvergeOnSingleKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared", "secret.key")
+
+	const workers = 16
+	start := make(chan struct{})
+	boxes := make([]*Box, workers)
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			boxes[idx], errs[idx] = LoadOrCreate(path)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var want [keyBytes]byte
+	for i := range workers {
+		if errs[i] != nil {
+			t.Fatalf("worker %d LoadOrCreate error: %v", i, errs[i])
+		}
+		if i == 0 {
+			want = boxes[i].key
+			continue
+		}
+		if boxes[i].key != want {
+			t.Fatalf("worker %d loaded a different key from worker 0", i)
+		}
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat key file: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("key file mode = %o, want 600", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "secret.key" {
+		t.Fatalf("unexpected files left in key directory: %v", entries)
 	}
 }

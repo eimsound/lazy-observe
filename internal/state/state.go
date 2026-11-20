@@ -2,6 +2,7 @@
 package state
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -163,17 +164,85 @@ func (s *memorySessionStore) DeleteOtherByUser(_ context.Context, userID int, ke
 	return nil
 }
 
+const (
+	defaultMemoryMaxEntries = 65536
+	memorySweepInterval     = time.Minute
+)
+
+type loginGateEntry struct {
+	key           string
+	failStart     time.Time
+	failExpiresAt time.Time
+	failCount     int
+	lockUntil     time.Time
+}
+
+func (e *loginGateEntry) isLocked(now time.Time) bool {
+	return !e.lockUntil.IsZero() && e.lockUntil.After(now)
+}
+
+func (e *loginGateEntry) isExpired(now time.Time) bool {
+	failActive := !e.failExpiresAt.IsZero() && now.Before(e.failExpiresAt)
+	return !failActive && !e.isLocked(now)
+}
+
 type memoryLoginGate struct {
-	mu       sync.Mutex
-	failures map[string]memoryLimit
-	locks    map[string]time.Time
-	now      func() time.Time
+	mu         sync.Mutex
+	entries    map[string]*list.Element
+	order      *list.List
+	maxEntries int
+	lastSweep  time.Time
+	now        func() time.Time
 }
 
 // NewMemoryLoginGateWithClock returns a process-local LoginGate sharing the
-// caller's clock.
+// caller's clock with bounded capacity and expiry reclamation.
 func NewMemoryLoginGateWithClock(now func() time.Time) LoginGate {
-	return &memoryLoginGate{failures: make(map[string]memoryLimit), locks: make(map[string]time.Time), now: now}
+	return newMemoryLoginGateWithMax(now, defaultMemoryMaxEntries)
+}
+
+func newMemoryLoginGateWithMax(now func() time.Time, maxEntries int) *memoryLoginGate {
+	if maxEntries <= 0 {
+		maxEntries = defaultMemoryMaxEntries
+	}
+	return &memoryLoginGate{
+		entries:    make(map[string]*list.Element),
+		order:      list.New(),
+		maxEntries: maxEntries,
+		now:        now,
+	}
+}
+
+func (g *memoryLoginGate) removeElement(elem *list.Element) {
+	entry := elem.Value.(*loginGateEntry)
+	delete(g.entries, entry.key)
+	g.order.Remove(elem)
+}
+
+func (g *memoryLoginGate) sweepExpired(now time.Time) {
+	for elem := g.order.Back(); elem != nil; {
+		prev := elem.Prev()
+		entry := elem.Value.(*loginGateEntry)
+		if entry.isExpired(now) {
+			g.removeElement(elem)
+		}
+		elem = prev
+	}
+	g.lastSweep = now
+}
+
+func (g *memoryLoginGate) evictOne(now time.Time) {
+	// Prefer evicting an unlocked entry so flooding random unknown usernames
+	// cannot easily evict an active account lockout.
+	for elem := g.order.Back(); elem != nil; elem = elem.Prev() {
+		if !elem.Value.(*loginGateEntry).isLocked(now) {
+			g.removeElement(elem)
+			return
+		}
+	}
+	if back := g.order.Back(); back != nil {
+		g.removeElement(back)
+	}
 }
 
 func (g *memoryLoginGate) ConsumeFailure(
@@ -188,14 +257,32 @@ func (g *memoryLoginGate) ConsumeFailure(
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := g.now()
-	entry := g.failures[key]
-	if entry.start.IsZero() || now.Sub(entry.start) >= window {
-		entry = memoryLimit{start: now}
+	if g.lastSweep.IsZero() || now.Sub(g.lastSweep) >= memorySweepInterval {
+		g.sweepExpired(now)
 	}
-	entry.count++
-	g.failures[key] = entry
-	if entry.count >= threshold {
-		g.locks[key] = now.Add(lockFor)
+	elem, ok := g.entries[key]
+	var entry *loginGateEntry
+	if ok {
+		entry = elem.Value.(*loginGateEntry)
+		g.order.MoveToFront(elem)
+	} else {
+		if len(g.entries) >= g.maxEntries {
+			g.sweepExpired(now)
+		}
+		if len(g.entries) >= g.maxEntries {
+			g.evictOne(now)
+		}
+		entry = &loginGateEntry{key: key}
+		g.entries[key] = g.order.PushFront(entry)
+	}
+	if entry.failStart.IsZero() || now.Sub(entry.failStart) >= window {
+		entry.failStart = now
+		entry.failCount = 0
+	}
+	entry.failExpiresAt = entry.failStart.Add(window)
+	entry.failCount++
+	if entry.failCount >= threshold {
+		entry.lockUntil = now.Add(lockFor)
 		return true, nil
 	}
 	return false, nil
@@ -204,22 +291,28 @@ func (g *memoryLoginGate) ConsumeFailure(
 func (g *memoryLoginGate) Locked(_ context.Context, key string) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	until, ok := g.locks[key]
+	elem, ok := g.entries[key]
 	if !ok {
 		return false, nil
 	}
-	if !until.After(g.now()) {
-		delete(g.locks, key)
-		return false, nil
+	now := g.now()
+	entry := elem.Value.(*loginGateEntry)
+	if entry.isLocked(now) {
+		return true, nil
 	}
-	return true, nil
+	entry.lockUntil = time.Time{}
+	if entry.isExpired(now) {
+		g.removeElement(elem)
+	}
+	return false, nil
 }
 
 func (g *memoryLoginGate) Clear(_ context.Context, key string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	delete(g.failures, key)
-	delete(g.locks, key)
+	if elem, ok := g.entries[key]; ok {
+		g.removeElement(elem)
+	}
 	return nil
 }
 
@@ -236,14 +329,19 @@ func sessionRefID(token string) string { return digestRefID(tokenDigest(token)) 
 func digestRefID(digest string) string { return digest[:12] }
 
 type memoryLimit struct {
-	start time.Time
-	count int
+	key       string
+	start     time.Time
+	expiresAt time.Time
+	count     int
 }
 
 type memoryLimiter struct {
-	mu     sync.Mutex
-	limits map[string]memoryLimit
-	now    func() time.Time
+	mu         sync.Mutex
+	limits     map[string]*list.Element
+	order      *list.List
+	maxEntries int
+	lastSweep  time.Time
+	now        func() time.Time
 }
 
 func NewMemoryLimiter() Limiter { return newMemoryLimiter(time.Now) }
@@ -253,7 +351,37 @@ func NewMemoryLimiter() Limiter { return newMemoryLimiter(time.Now) }
 func NewMemoryLimiterWithClock(now func() time.Time) Limiter { return newMemoryLimiter(now) }
 
 func newMemoryLimiter(now func() time.Time) Limiter {
-	return &memoryLimiter{limits: make(map[string]memoryLimit), now: now}
+	return newMemoryLimiterWithMax(now, defaultMemoryMaxEntries)
+}
+
+func newMemoryLimiterWithMax(now func() time.Time, maxEntries int) *memoryLimiter {
+	if maxEntries <= 0 {
+		maxEntries = defaultMemoryMaxEntries
+	}
+	return &memoryLimiter{
+		limits:     make(map[string]*list.Element),
+		order:      list.New(),
+		maxEntries: maxEntries,
+		now:        now,
+	}
+}
+
+func (l *memoryLimiter) removeElement(elem *list.Element) {
+	entry := elem.Value.(*memoryLimit)
+	delete(l.limits, entry.key)
+	l.order.Remove(elem)
+}
+
+func (l *memoryLimiter) sweepExpired(now time.Time) {
+	for elem := l.order.Back(); elem != nil; {
+		prev := elem.Prev()
+		entry := elem.Value.(*memoryLimit)
+		if !now.Before(entry.expiresAt) {
+			l.removeElement(elem)
+		}
+		elem = prev
+	}
+	l.lastSweep = now
 }
 
 func (l *memoryLimiter) Allow(_ context.Context, key string, limit int, window time.Duration) (bool, error) {
@@ -263,11 +391,31 @@ func (l *memoryLimiter) Allow(_ context.Context, key string, limit int, window t
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	entry := l.limits[key]
-	if entry.start.IsZero() || now.Sub(entry.start) >= window {
-		entry = memoryLimit{start: now}
+	if l.lastSweep.IsZero() || now.Sub(l.lastSweep) >= memorySweepInterval {
+		l.sweepExpired(now)
 	}
+	elem, ok := l.limits[key]
+	var entry *memoryLimit
+	if ok {
+		entry = elem.Value.(*memoryLimit)
+		l.order.MoveToFront(elem)
+	} else {
+		if len(l.limits) >= l.maxEntries {
+			l.sweepExpired(now)
+		}
+		if len(l.limits) >= l.maxEntries {
+			if back := l.order.Back(); back != nil {
+				l.removeElement(back)
+			}
+		}
+		entry = &memoryLimit{key: key}
+		l.limits[key] = l.order.PushFront(entry)
+	}
+	if entry.start.IsZero() || now.Sub(entry.start) >= window {
+		entry.start = now
+		entry.count = 0
+	}
+	entry.expiresAt = entry.start.Add(window)
 	entry.count++
-	l.limits[key] = entry
 	return entry.count <= limit, nil
 }

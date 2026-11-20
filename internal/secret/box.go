@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // keyBytes is the AES-256 key length.
@@ -60,7 +61,12 @@ func LoadOrCreate(path string) (*Box, error) {
 		if _, err := rand.Read(box.key[:]); err != nil {
 			return nil, fmt.Errorf("generate encryption key: %w", err)
 		}
-		if err := persist(path, box.key[:]); err != nil {
+		if err := persistExclusive(path, box.key[:]); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				// Another replica created the key on a shared volume first;
+				// load its key so every replica converges on one platform key.
+				return Load(path)
+			}
 			return nil, err
 		}
 		return &box, nil
@@ -102,20 +108,94 @@ func boxFromRaw(raw []byte) (*Box, error) {
 	return &box, nil
 }
 
-func persist(path string, raw []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+// persistExclusive writes raw atomically and exclusively to path without ever
+// overwriting an existing key file. Each writer stages into a unique mode-0600
+// temp file, fsyncs it, and publishes via os.Link so concurrent replicas on a
+// shared volume cannot clobber each other's temp file or overwrite a winning
+// replica's key. Filesystems without hard-link support fall back to O_EXCL.
+func persistExclusive(path string, raw []byte) (retErr error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create key directory: %w", err)
 	}
 	encoded := make([]byte, base64.RawStdEncoding.EncodedLen(len(raw)))
 	base64.RawStdEncoding.Encode(encoded, raw)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, encoded, 0o600); err != nil {
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary encryption key file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("restrict encryption key file: %w", err)
+	}
+	if _, err := tmp.Write(encoded); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("write encryption key file: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync encryption key file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close encryption key file: %w", err)
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return os.ErrExist
+		}
+		if isUnsupportedLinkError(err) {
+			return writeExclusiveFallback(path, encoded)
+		}
 		return fmt.Errorf("persist encryption key file: %w", err)
 	}
+	syncDir(dir)
 	return nil
+}
+
+func isUnsupportedLinkError(err error) bool {
+	return errors.Is(err, syscall.EPERM) ||
+		errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.EOPNOTSUPP)
+}
+
+func writeExclusiveFallback(path string, encoded []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return os.ErrExist
+		}
+		return fmt.Errorf("create encryption key file: %w", err)
+	}
+	if _, err := f.Write(encoded); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("write encryption key file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("sync encryption key file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close encryption key file: %w", err)
+	}
+	syncDir(filepath.Dir(path))
+	return nil
+}
+
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // Encrypt seals plaintext into base64(nonce || ciphertext). The same value

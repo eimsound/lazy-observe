@@ -35,7 +35,7 @@ func (staticProjectTokens) Revision() uint64 { return 1 }
 // Authenticator owning its cache keys and the app not lending request memory.
 func tokenCacheProbeApp(tokens staticProjectTokens) *fiber.App {
 	auth := NewAuthenticator(tokens)
-	app := newFiberApp(defaultReadTimeout, defaultIdleTimeout)
+	app := newFiberApp(defaultReadTimeout, defaultIdleTimeout, nil)
 	app.Post("/ingest", auth.Middleware, func(c fiber.Ctx) error {
 		return c.SendString(currentProject(c).Slug)
 	})

@@ -39,7 +39,7 @@ import (
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/eimsound/lazy-observe/internal/webui"
 	"github.com/gofiber/fiber/v3"
-	"github.com/gofiber/fiber/v3/middleware/recover"
+	fiberrecover "github.com/gofiber/fiber/v3/middleware/recover"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
 	"go.opentelemetry.io/otel/metric"
@@ -192,8 +192,11 @@ type Config struct {
 	LiveTailMaxDuration   time.Duration
 	LiveTailHeartbeat     time.Duration
 	// SecureSessionCookie marks the session and CSRF cookies with the Secure
-	// attribute. Enable only when TLS terminates in front of the gateway.
+	// attribute. Enable when TLS terminates at the gateway or a reverse proxy.
 	SecureSessionCookie bool
+	// TrustedProxies lists explicit reverse proxy IPs or CIDRs whose
+	// X-Forwarded-For headers are trusted for client IP resolution.
+	TrustedProxies []string
 	// InitialAdminPasswordFile names the bootstrap-generated first-admin
 	// password file. The file is removed once the admin replaces that password.
 	// Empty disables removal: cmd supplies it unless security.admin_password_file
@@ -253,8 +256,8 @@ type Gateway struct {
 	initialAdminPasswordFile string
 }
 
-func newFiberApp(readTimeout, idleTimeout time.Duration) *fiber.App {
-	return fiber.New(fiber.Config{
+func newFiberApp(readTimeout, idleTimeout time.Duration, trustedProxies []string) *fiber.App {
+	cfg := fiber.Config{
 		// Immutable makes Ctx.Get, Params, Query, Cookies, FormValue, Path,
 		// Method, Bind().Body fields and friends return owned copies instead of
 		// borrowing fasthttp's request buffers, which are reused by the next
@@ -272,7 +275,15 @@ func newFiberApp(readTimeout, idleTimeout time.Duration) *fiber.App {
 		BodyLimit:               maxDecodedRequestBody,
 		ReadTimeout:             readTimeout,
 		IdleTimeout:             idleTimeout,
-	})
+	}
+	if len(trustedProxies) > 0 {
+		cfg.TrustProxy = true
+		cfg.ProxyHeader = fiber.HeaderXForwardedFor
+		cfg.TrustProxyConfig = fiber.TrustProxyConfig{
+			Proxies: append([]string(nil), trustedProxies...),
+		}
+	}
+	return fiber.New(cfg)
 }
 
 func New(cfg Config) *Gateway {
@@ -363,7 +374,7 @@ func New(cfg Config) *Gateway {
 	}
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	g := &Gateway{
-		app:        newFiberApp(cfg.ReadTimeout, cfg.IdleTimeout),
+		app:        newFiberApp(cfg.ReadTimeout, cfg.IdleTimeout, cfg.TrustedProxies),
 		instanceID: cfg.InstanceID,
 		auth: NewAuthenticator(
 			cfg.Tokens,
@@ -528,7 +539,7 @@ func (g *Gateway) routes() {
 func (g *Gateway) registerMiddlewareAndProbes() {
 	// A handler panic answers 500 for that request instead of killing the
 	// process (and every in-flight request with it).
-	g.app.Use(recover.New(recover.Config{
+	g.app.Use(fiberrecover.New(fiberrecover.Config{
 		EnableStackTrace: true,
 		StackTraceHandler: func(c fiber.Ctx, value any) {
 			// g.logger may export asynchronously; never hand it borrowed
@@ -851,16 +862,39 @@ func unauthorizedResponse(c fiber.Ctx) error {
 }
 
 func (g *Gateway) loadSessionProject(c fiber.Ctx) error {
+	return g.resolveRequestProject(c)
+}
+
+func (g *Gateway) resolveRequestProject(c fiber.Ctx) error {
+	if g.store == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "project store unavailable"})
+	}
 	slug := projectSlug(c)
 	p, err := g.store.ProjectBySlug(c.Context(), slug)
 	if err != nil {
-		_ = unauthorized(c)
-		return nil
+		if meta.IsNotFound(err) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "project not found"})
+		}
+		g.logger.Warn("project lookup failed", "project_slug", slug, "error", err)
+		return c.Status(fiber.StatusServiceUnavailable).
+			JSON(fiber.Map{"error": "project lookup temporarily unavailable"})
+	}
+	if p.ID <= 0 {
+		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
 	}
 	c.Locals(projectLocal, p)
 	return c.Next()
 }
 
+func probeComponentStatus(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if err.Error() == "component restarting" {
+		return "component restarting"
+	}
+	return "unavailable"
+}
 func (g *Gateway) healthz(c fiber.Ctx) error {
 	status := fiber.StatusOK
 	components := map[string]string{"gateway": "ok"}
@@ -868,7 +902,8 @@ func (g *Gateway) healthz(c fiber.Ctx) error {
 		for name, err := range g.health.Health(c.Context()) {
 			if err != nil {
 				status = fiber.StatusServiceUnavailable
-				components[name] = err.Error()
+				g.logger.Warn("health probe component unhealthy", "component", name, "error", err)
+				components[name] = probeComponentStatus(err)
 			} else {
 				components[name] = "ok"
 			}
@@ -912,7 +947,8 @@ func (g *Gateway) readyz(c fiber.Ctx) error {
 	if checker != nil {
 		for name, err := range checker.Health(c.Context()) {
 			if err != nil {
-				components[name] = err.Error()
+				g.logger.Warn("readiness probe component not ready", "component", name, "error", err)
+				components[name] = probeComponentStatus(err)
 				ready = false
 			} else {
 				components[name] = "ok"
@@ -921,7 +957,8 @@ func (g *Gateway) readyz(c fiber.Ctx) error {
 	}
 	if g.errorTracker != nil {
 		if err := g.errorTracker.Readiness(c.Context()); err != nil {
-			components["error_inbox"] = err.Error()
+			g.logger.Warn("readiness probe error inbox not ready", "error", err)
+			components["error_inbox"] = "unavailable"
 			ready = false
 		} else {
 			components["error_inbox"] = "ok"
@@ -1088,6 +1125,7 @@ func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error
 		bytes.NewReader(body),
 	)
 	if err != nil {
+		g.logger.Error("build upstream proxy request failed", "path", path, "error", err)
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to construct upstream request")
 	}
 	copyProxyRequestHeaders(req.Header, &c.Request().Header, true)
@@ -1248,30 +1286,22 @@ func (g *Gateway) queryRequired(c fiber.Ctx) error {
 		return nonQueryToken(c, token)
 	}
 	if err := g.loadSession(c); err != nil {
-		if !errors.Is(err, errResponseWritten) {
-			_ = unauthorized(c)
+		if errors.Is(err, errResponseWritten) {
+			return nil
 		}
+		if account.Code(err) == account.CodeUnavailable {
+			_ = c.Status(fiber.StatusServiceUnavailable).
+				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
+			return nil
+		}
+		_ = unauthorized(c)
 		return nil
 	}
 	return g.loadQueryProject(c)
 }
 
 func (g *Gateway) loadQueryProject(c fiber.Ctx) error {
-	slug := strings.TrimSpace(c.Get("X-LO-Project"))
-	if slug == "" {
-		slug = "default"
-	}
-	if g.store == nil {
-		_ = unauthorized(c)
-		return nil
-	}
-	p, err := g.store.ProjectBySlug(c.Context(), slug)
-	if err != nil {
-		_ = unauthorized(c)
-		return nil
-	}
-	c.Locals(projectLocal, p)
-	return c.Next()
+	return g.resolveRequestProject(c)
 }
 
 func bearerCredential(c fiber.Ctx) string {
@@ -1346,7 +1376,7 @@ func (g *Gateway) loadUserAPIToken(c fiber.Ctx, token string) (meta.UserInfo, er
 func (g *Gateway) loadSession(c fiber.Ctx) error {
 	token := strings.TrimSpace(c.Cookies("lo_session"))
 	if token == "" {
-		return fmt.Errorf("session cookie missing")
+		return &account.Error{Code: account.CodeInvalidCredentials}
 	}
 	u, err := g.account.AuthenticateSession(c.Context(), token)
 	if err != nil {
@@ -1438,25 +1468,30 @@ type cachedProject struct {
 
 var errAuthenticationRevisionChanged = errors.New("authentication store revision changed")
 
+const defaultAuthLookupTimeout = 5 * time.Second
+
 type authenticationCall struct {
 	done     chan struct{}
 	revision uint64
 	project  meta.ProjectInfo
 	err      error
+	panicked bool
+	panicVal any
 }
 
 // Authenticator resolves a bearer credential to a project through one lookup. Two
 // instances exist: ingest (project API tokens) and source map upload (ADR 0018);
 // each only ever consults its own token table.
 type Authenticator struct {
-	revisionFn func() uint64
-	lookup     func(context.Context, string) (meta.ProjectInfo, error)
-	invalid    error
-	configured bool
-	mu         sync.RWMutex
-	cache      map[string]cachedProject
-	inflight   map[string]*authenticationCall
-	revision   uint64
+	revisionFn    func() uint64
+	lookup        func(context.Context, string) (meta.ProjectInfo, error)
+	invalid       error
+	configured    bool
+	lookupTimeout time.Duration
+	mu            sync.RWMutex
+	cache         map[string]cachedProject
+	inflight      map[string]*authenticationCall
+	revision      uint64
 }
 
 func NewAuthenticator(store TokenStore) *Authenticator {
@@ -1483,8 +1518,9 @@ func newUploadAuthenticator(store UploadTokenStore) *Authenticator {
 
 func newAuthenticator() *Authenticator {
 	return &Authenticator{
-		cache:    make(map[string]cachedProject),
-		inflight: make(map[string]*authenticationCall),
+		lookupTimeout: defaultAuthLookupTimeout,
+		cache:         make(map[string]cachedProject),
+		inflight:      make(map[string]*authenticationCall),
 	}
 }
 
@@ -1565,33 +1601,80 @@ func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.Pr
 		a.inflight[key] = call
 		a.mu.Unlock()
 
-		project, authErr := a.lookup(ctx, key)
-		a.mu.Lock()
-		latestRevision := a.revisionFn()
-		if latestRevision != a.revision {
-			clear(a.cache)
-			a.revision = latestRevision
+		// Decouple upstream lookup from the leader's cancellation so a single
+		// client disconnect cannot fail concurrent waiters sharing this call,
+		// while bounding the lookup with an independent timeout.
+		timeout := a.lookupTimeout
+		if timeout <= 0 {
+			timeout = defaultAuthLookupTimeout
 		}
-		if latestRevision != call.revision {
-			call.err = errAuthenticationRevisionChanged
-		} else {
-			call.project, call.err = project, authErr
-			if authErr == nil {
-				a.cache[key] = cachedProject{
-					project:   project,
-					expiresAt: time.Now().Add(tokenCacheTTL),
-				}
-			}
-		}
-		if a.inflight[key] == call {
-			delete(a.inflight, key)
-		}
-		close(call.done)
-		a.mu.Unlock()
+		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		go a.runLookup(lookupCtx, cancel, key, call)
 
+		select {
+		case <-ctx.Done():
+			return meta.ProjectInfo{}, ctx.Err()
+		case <-call.done:
+		}
+		if call.panicked {
+			panic(call.panicVal)
+		}
 		if errors.Is(call.err, errAuthenticationRevisionChanged) {
 			continue
 		}
 		return call.project, call.err
 	}
+}
+
+func (a *Authenticator) runLookup(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	key string,
+	call *authenticationCall,
+) {
+	defer cancel()
+	completed := false
+	defer func() {
+		r := recover()
+		if !completed {
+			a.mu.Lock()
+			if r != nil {
+				call.panicked = true
+				call.panicVal = r
+				call.err = fmt.Errorf("authentication lookup panic: %v", r)
+			} else {
+				call.err = errors.New("authentication lookup aborted")
+			}
+			if a.inflight[key] == call {
+				delete(a.inflight, key)
+			}
+			close(call.done)
+			a.mu.Unlock()
+		}
+	}()
+
+	project, authErr := a.lookup(ctx, key)
+	a.mu.Lock()
+	latestRevision := a.revisionFn()
+	if latestRevision != a.revision {
+		clear(a.cache)
+		a.revision = latestRevision
+	}
+	if latestRevision != call.revision {
+		call.err = errAuthenticationRevisionChanged
+	} else {
+		call.project, call.err = project, authErr
+		if authErr == nil {
+			a.cache[key] = cachedProject{
+				project:   project,
+				expiresAt: time.Now().Add(tokenCacheTTL),
+			}
+		}
+	}
+	if a.inflight[key] == call {
+		delete(a.inflight, key)
+	}
+	completed = true
+	close(call.done)
+	a.mu.Unlock()
 }
