@@ -17,6 +17,8 @@ set -euo pipefail
 #
 # Without --publish (the default) the script only verifies that the tag matches
 # the package versions and builds the artifacts: nothing leaves the runner.
+# Verification (build, test, lint, license checks) delegates directly to the
+# single-source mise tasks (sdk-go, sdk-node, sdk-browser, sdk-python).
 # npm publishing reads NODE_AUTH_TOKEN (set by actions/setup-node from NPM_TOKEN).
 
 usage() {
@@ -38,6 +40,8 @@ fi
 
 root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 cd "$root"
+
+command -v mise >/dev/null 2>&1 || fail "mise is required to run SDK verification tasks (see mise.toml)"
 
 semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?'
 case $tag in
@@ -67,7 +71,7 @@ case $sdk in
     module_path=${module_lines%%$'\n'*}
     [[ $module_path == github.com/eimsound/lazy-observe/sdk/go ]] || \
       fail "unexpected Go SDK module path: $module_path"
-    (cd sdk/go && CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...)
+    mise run --skip-tools sdk-go
     bash scripts/check-go-licenses.sh --sdk-go-only
     if [[ $publish == 1 ]]; then
       (cd "$(mktemp -d)" && GOPROXY=https://proxy.golang.org go list -m "$module_path@v$version")
@@ -84,22 +88,8 @@ case $sdk in
       packages+=("$(dirname -- "$manifest")")
     done
     ((${#packages[@]} > 0)) || fail "no packages under $workspace/packages"
-    if [[ $sdk == browser ]]; then
-      # 先安装并构建 bundler-plugin，再整体 install：examples/react 的 workspace bin 依赖 dist/cli.js，
-      # 干净 runner 上直接整仓 install 会触发 Failed to create bin（与 mise run sdk-browser 一致）。
-      (
-        cd "$workspace"
-        CI=true pnpm install --frozen-lockfile --filter @lazy-observe/bundler-plugin
-        pnpm --filter @lazy-observe/bundler-plugin build
-        CI=true pnpm install --frozen-lockfile
-        pnpm build
-        pnpm typecheck
-        pnpm test
-      )
-    else
-      (cd "$workspace" && CI=true pnpm install --frozen-lockfile && pnpm build && pnpm typecheck && pnpm test)
-    fi
-    bash scripts/check-js-licenses.sh "$workspace"
+    # 复用 mise.toml 单源任务（包含 bundler-plugin 预构建、build、typecheck、test 与 JS 许可证校验）。
+    mise run --skip-tools "sdk-$sdk"
     for package in "${packages[@]}"; do
       [[ -f $package/LICENSE ]] || fail "$package/LICENSE is missing from the published files"
       if [[ $publish == 1 ]]; then
@@ -114,19 +104,10 @@ case $sdk in
     py_versions=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' sdk/python/pyproject.toml)
     py_version=${py_versions%%$'\n'*}
     expect_version sdk/python/pyproject.toml "$py_version"
-    # 只用 uv（CI 里由 `mise run sdk-python-release` 提供），不用系统 Python 与 pip；
+    # 复用 mise.toml 单源任务（uv 托管 Python 3.13、pytest 与 Python 许可证白名单校验）；
     # sdk/python/pyproject.toml 的 [tool.uv] exclude-newer 同样约束构建后端的解析。
-    # --managed-python：新 runner 上没有 uv 托管的解释器时，裸 `uv build` 会退到系统 /usr/bin/python3；
-    # 固定 3.13 与 sdk-python 的默认解释器、改用 uv 前 setup-python 的版本一致。
     command -v uv >/dev/null 2>&1 || fail "uv is required to build the Python SDK (run via 'mise run sdk-python-release')"
-    (
-      cd sdk/python
-      uv python install --managed-python 3.13
-      uv venv --managed-python --python 3.13 --clear .venv
-      uv pip install --quiet --python .venv/bin/python -e ".[test]"
-      .venv/bin/python -m pytest -q tests
-    )
-    bash scripts/check-python-licenses.sh sdk/python/.venv/bin/python
+    LO_SDK_PYTHON_VERSION=3.13 mise run --skip-tools sdk-python
     (
       cd sdk/python
       rm -rf dist

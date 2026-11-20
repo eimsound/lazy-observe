@@ -146,6 +146,10 @@ classify() {
   esac
 
   case "$file" in
+  # 机器校验的 Web 第三方许可证清单：必须在 *.md 之前命中，避免被纯文档规则悄悄跳过。
+  web/THIRD_PARTY_LICENSES.md)
+    set_flags web
+    ;;
   # 纯文档与 agent 流程：不跑业务 job。
   *.md | docs/* | LICENSE | NOTICE | .agents/* | .claude/* | skills-lock.json | .air.toml | .github/ISSUE_TEMPLATE/*)
     return
@@ -227,6 +231,10 @@ classify() {
   # JS 许可证检查被 web 与两个 JS SDK job 共用；本身是 shell 脚本也走 go 的 workflow-check。
   scripts/check-js-licenses.sh)
     set_flags go web sdk_node sdk_browser
+    ;;
+  # Web 第三方许可证清单生成与防漂移校验。
+  scripts/web-third-party-licenses.sh)
+    set_flags go web
     ;;
   # Python 许可证检查由 sdk-python 与 sdk-publish 共用。
   scripts/check-python-licenses.sh)

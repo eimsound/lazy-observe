@@ -45,9 +45,14 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 2
 
-# Keep gateway replicas on different nodes when the cluster has capacity.
-# Rendered with the release's selectorLabels (app.kubernetes.io/name + instance).
+# Keep gateway replicas on different nodes and spread across zones when the
+# cluster has capacity. Both bind automatically to the release's selectorLabels
+# (app.kubernetes.io/name + app.kubernetes.io/instance).
 podAntiAffinity: soft
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
 
 process:
   startupTimeout: 30s

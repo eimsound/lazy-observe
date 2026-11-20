@@ -73,6 +73,16 @@ assert_render_fails() {
 "$HELM" template test "$CHART" --set hpa.enabled=true --set hpa.minReplicas=1 >"$WORK/hpa-min1.yaml"
 "$HELM" template test "$CHART" --set replicaCount=2 --set podDisruptionBudget.minAvailable=2 >"$WORK/pdb-equal.yaml"
 "$HELM" template test "$CHART" --set security.sessionSecureCookie=true >"$WORK/secure-cookie.yaml"
+"$HELM" template test "$CHART" --set external.metrics.kind=prometheus --set external.metrics.cluster=false >"$WORK/prometheus.yaml"
+"$HELM" template test "$CHART" --set mode=allinone \
+  --set meta.migrationLockTimeout=90s \
+  --set process.startupTimeout=30s \
+  --set process.shutdownTimeout=20s \
+  --set process.drainTimeout=25s >"$WORK/allinone-custom-timeouts.yaml"
+"$HELM" template test "$CHART" --set podAntiAffinity=hard \
+  --set 'topologySpreadConstraints[0].maxSkew=1' \
+  --set 'topologySpreadConstraints[0].topologyKey=kubernetes.io/hostname' \
+  --set 'topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule' >"$WORK/hard-anti-affinity.yaml"
 
 extract_kind() {
   kind=$1
@@ -176,12 +186,25 @@ assert_contains "$WORK/standalone.yaml" '^[[:space:]]*session_secure_cookie: fal
 assert_contains "$WORK/secure-cookie.yaml" '^[[:space:]]*session_secure_cookie: true$' \
   'security.sessionSecureCookie=true must render session_secure_cookie: true'
 
-# 集群 profile 的 podAntiAffinity 按 release 的 name + instance 标签隔离，不硬编码 name。
+# 集群 profile 与显式配置的 podAntiAffinity / topologySpreadConstraints 按 release 的 selectorLabels 隔离。
 extract_kind Deployment "$WORK/cluster.yaml" "$WORK/deploy-cluster.yaml"
 assert_contains "$WORK/deploy-cluster.yaml" '^[[:space:]]*podAntiAffinity:' \
   'cluster profile must render podAntiAffinity'
+assert_contains "$WORK/deploy-cluster.yaml" '^[[:space:]]*topologySpreadConstraints:' \
+  'cluster profile must render topologySpreadConstraints'
+assert_contains "$WORK/deploy-cluster.yaml" '^[[:space:]]*topologyKey: "topology\.kubernetes\.io/zone"$' \
+  'cluster profile topologySpreadConstraints must spread across zones'
 assert_contains "$WORK/deploy-cluster.yaml" '^[[:space:]]*app\.kubernetes\.io/instance: test$' \
-  'cluster profile podAntiAffinity must scope by app.kubernetes.io/instance'
+  'cluster profile affinity and topologySpreadConstraints must scope by app.kubernetes.io/instance'
+extract_kind Deployment "$WORK/hard-anti-affinity.yaml" "$WORK/deploy-hard.yaml"
+assert_contains "$WORK/deploy-hard.yaml" '^[[:space:]]*requiredDuringSchedulingIgnoredDuringExecution:' \
+  'podAntiAffinity=hard must render requiredDuringSchedulingIgnoredDuringExecution'
+assert_contains "$WORK/deploy-hard.yaml" '^[[:space:]]*topologySpreadConstraints:' \
+  'explicit topologySpreadConstraints must render in Deployment'
+assert_contains "$WORK/deploy-hard.yaml" '^[[:space:]]*app\.kubernetes\.io/name: lazy-observe$' \
+  'hard anti-affinity / topologySpreadConstraints must bind app.kubernetes.io/name'
+assert_contains "$WORK/deploy-hard.yaml" '^[[:space:]]*app\.kubernetes\.io/instance: test$' \
+  'hard anti-affinity / topologySpreadConstraints must bind app.kubernetes.io/instance'
 
 # 镜像引用：digest 决定实际运行的字节；格式错误必须失败，不能悄悄退回可变 tag。
 IMAGE_REPO='ghcr\.io/eimsound/lazy-observe'
@@ -202,11 +225,32 @@ assert_contains "$WORK/image-tag-digest.yaml" "image: \"${IMAGE_REPO}:1\\.2\\.3@
 assert_contains "$WORK/image-tag-digest.yaml" '^[[:space:]]*imagePullPolicy: IfNotPresent$' \
   'version-pinned image must default imagePullPolicy to IfNotPresent'
 
-assert_render_fails 'a truncated digest must fail rendering' 'image.digest must be "sha256:"' \
+# values.schema.json 静态校验：非法 digest、模式、枚举、副本数与未知字段必须在渲染前被拦截。
+assert_render_fails 'schema must reject a truncated digest' '/image/digest' \
   --set image.digest=sha256:abc
-assert_render_fails 'an uppercase digest must fail rendering' 'image.digest must be "sha256:"' \
+assert_render_fails 'schema must reject an uppercase digest' '/image/digest' \
   --set image.digest=sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef
-assert_render_fails 'a non-sha256 digest must fail rendering' 'image.digest must be "sha256:"' \
+assert_render_fails 'schema must reject a non-sha256 digest' '/image/digest' \
+  --set image.digest=sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+assert_render_fails 'schema must reject an unknown mode' '/mode' \
+  --set mode=invalid-mode
+assert_render_fails 'schema must reject replicaCount=0' '/replicaCount' \
+  --set replicaCount=0
+assert_render_fails 'schema must reject unknown metrics kind' '/external/metrics/kind' \
+  --set external.metrics.kind=influxdb
+assert_render_fails 'schema must reject invalid podAntiAffinity' '/podAntiAffinity' \
+  --set podAntiAffinity=strict
+assert_render_fails 'schema must reject unknown top-level keys' 'unknownKey' \
+  --set unknownKey=true
+
+# 即使跳过 schema 校验，模板层自身仍必须拒绝畸形 digest（纵深防御）。
+assert_render_fails 'template must reject a truncated digest even with --skip-schema-validation' \
+  'image.digest must be "sha256:"' --skip-schema-validation --set image.digest=sha256:abc
+assert_render_fails 'template must reject an uppercase digest even with --skip-schema-validation' \
+  'image.digest must be "sha256:"' --skip-schema-validation \
+  --set image.digest=sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef
+assert_render_fails 'template must reject a non-sha256 digest even with --skip-schema-validation' \
+  'image.digest must be "sha256:"' --skip-schema-validation \
   --set image.digest=sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 # 发版附带的 values 片段：用假输入渲染再喂回 chart，生成器与模板对不上就会在这里暴露；
@@ -226,4 +270,29 @@ if [ -s "$WORK/render-fail.yaml" ]; then
   exit 1
 fi
 
-echo "PASS: Helm chart keeps key material out of the environment and honours image.digest"
+# Helm ConfigMap <-> Go internal/config.Load 双向契约校验：
+# 所有组合渲染出的 ConfigMap config.yaml 必须通过 KnownFields(true) + Validate()，
+# 且 Deployment 注入的 LO_* 环境变量必须与 internal/config 绑定一致。
+(
+  cd "$ROOT"
+  CGO_ENABLED=0 go run ./scripts/check-helm-config \
+    "$WORK/standalone.yaml" \
+    "$WORK/standalone-no-hpa.yaml" \
+    "$WORK/allinone.yaml" \
+    "$WORK/cluster.yaml" \
+    "$WORK/allinone-ephemeral.yaml" \
+    "$WORK/key-existing.yaml" \
+    "$WORK/admin-existing.yaml" \
+    "$WORK/single-replica.yaml" \
+    "$WORK/hpa-min1.yaml" \
+    "$WORK/pdb-equal.yaml" \
+    "$WORK/secure-cookie.yaml" \
+    "$WORK/prometheus.yaml" \
+    "$WORK/allinone-custom-timeouts.yaml" \
+    "$WORK/hard-anti-affinity.yaml" \
+    "$WORK/image-digest.yaml" \
+    "$WORK/image-tag-digest.yaml" \
+    "$WORK/image-release-values.yaml"
+)
+
+echo "PASS: Helm chart satisfies values.schema.json, security guards, image.digest, and Go config.Load contracts"

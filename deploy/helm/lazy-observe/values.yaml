@@ -224,3 +224,7 @@ tolerations: []
 # app.kubernetes.io/name and app.kubernetes.io/instance.
 podAntiAffinity: ""
 affinity: {}
+# Optional Pod topologySpreadConstraints. When an entry omits `labelSelector`,
+# the chart binds it automatically to this release's selectorLabels
+# (app.kubernetes.io/name + app.kubernetes.io/instance).
+topologySpreadConstraints: []
