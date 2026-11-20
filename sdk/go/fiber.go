@@ -22,8 +22,30 @@ var httpServerRequestDurationBucketsSeconds = []float64{
 	0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
 }
 
-// Fiber returns explicit Fiber v3 HTTP server instrumentation. Fiber v2 is not
-// supported: the handler takes the v3 fiber.Ctx interface.
+// FiberOptions customizes how FiberWithOptions instruments requests, classifies
+// returned handler errors, handles panics, and sanitizes request paths.
+type FiberOptions struct {
+	// StatusFromError maps a returned handler error to its HTTP status code
+	// without invoking Fiber's ErrorHandler inside the middleware. When set,
+	// returned errors propagate to Fiber's outer error-handling pipeline
+	// untouched. Returning <= 0 falls back to Fiber's default resolution
+	// (*fiber.Error.Code, an already-set >=400 response status, or 500).
+	StatusFromError func(error) int
+
+	// RepanicOnPanic re-panics the recovered value after finishing span,
+	// metric, structured log, and error-event capture. Use this when an outer
+	// recovery middleware owns the HTTP response for panics.
+	RepanicOnPanic bool
+
+	// RedactPath transforms the raw request path before it is stored in
+	// url.path span attributes, panic logs, and error-event URLs. When nil,
+	// the raw cloned request path is recorded as-is.
+	RedactPath func(string) string
+}
+
+// Fiber returns explicit Fiber v3 HTTP server instrumentation with default
+// options. Fiber v2 is not supported: the handler takes the v3 fiber.Ctx
+// interface.
 //
 // Without fiber.Config.Immutable, Fiber's request accessors (Method, Path,
 // Hostname, Get, Route fallbacks, ...) return strings that borrow pooled request
@@ -33,6 +55,12 @@ var httpServerRequestDurationBucketsSeconds = []float64{
 // copied with strings.Clone at the point it is read, so the middleware is
 // correct regardless of the application's Immutable setting.
 func (c *Client) Fiber() fiber.Handler {
+	return c.FiberWithOptions(FiberOptions{})
+}
+
+// FiberWithOptions returns explicit Fiber v3 HTTP server instrumentation
+// configured by opts.
+func (c *Client) FiberWithOptions(opts FiberOptions) fiber.Handler {
 	meter := c.meter.Meter(instrumentationName + "/fiber")
 	duration, _ := meter.Float64Histogram(
 		"http.server.request.duration",
@@ -51,6 +79,9 @@ func (c *Client) Fiber() fiber.Handler {
 		start := time.Now()
 		method := strings.Clone(fc.Method())
 		path := strings.Clone(fc.Path())
+		if opts.RedactPath != nil {
+			path = strings.Clone(opts.RedactPath(path))
+		}
 		parent := c.propagator.Extract(fc.Context(), fiberHeaderCarrier{ctx: fc})
 		spanAttrs := []attribute.KeyValue{
 			attribute.String("http.request.method", method),
@@ -77,6 +108,7 @@ func (c *Client) Fiber() fiber.Handler {
 				route = strings.Clone(fc.Route().Path)
 			}
 			panicked := false
+			var repanicValue any
 			var spanErrDesc string
 			if recovered := recover(); recovered != nil {
 				panicked = true
@@ -90,39 +122,49 @@ func (c *Client) Fiber() fiber.Handler {
 					"http.request.method", method,
 					"url.path", path,
 				)
-				if handlerErr := fc.App().ErrorHandler(fc, fiber.ErrInternalServerError); handlerErr != nil {
-					_ = fc.SendStatus(fiber.StatusInternalServerError)
-				}
-				status := fc.Response().StatusCode()
-				if status < http.StatusInternalServerError {
-					status = fiber.StatusInternalServerError
+				status := fiber.StatusInternalServerError
+				if opts.RepanicOnPanic {
+					repanicValue = recovered
+				} else {
+					if handlerErr := fc.App().ErrorHandler(fc, fiber.ErrInternalServerError); handlerErr != nil {
+						_ = fc.SendStatus(fiber.StatusInternalServerError)
+					}
+					if respStatus := fc.Response().StatusCode(); respStatus >= http.StatusInternalServerError {
+						status = respStatus
+					}
+					returnErr = nil
 				}
 				c.captureException(ctx, fmt.Errorf("%v", recovered), errorCaptureOptions{
 					exceptionType: "panic",
 					frames:        callerFrames(4),
 					tags:          fiberErrorTags(method, route, status),
-					url:           fiberRequestURL(fc),
+					url:           fiberRequestURL(fc, path),
 				})
-				returnErr = nil
 			}
 			handledErr := returnErr
-			if handledErr != nil {
-				if handlerErr := fc.App().ErrorHandler(fc, handledErr); handlerErr != nil {
-					_ = fc.SendStatus(fiber.StatusInternalServerError)
-					handledErr = errors.Join(handledErr, handlerErr)
+			var status int
+			if handledErr != nil && !panicked {
+				if opts.StatusFromError != nil {
+					status = opts.StatusFromError(handledErr)
+					if status <= 0 {
+						status = defaultFiberErrorStatus(handledErr, fc.Response().StatusCode())
+					}
+				} else {
+					if handlerErr := fc.App().ErrorHandler(fc, handledErr); handlerErr != nil {
+						_ = fc.SendStatus(fiber.StatusInternalServerError)
+						handledErr = errors.Join(handledErr, handlerErr)
+					}
+					returnErr = nil
+					status = fc.Response().StatusCode()
+					if status < http.StatusBadRequest {
+						status = defaultFiberErrorStatus(handledErr, status)
+					}
 				}
-				returnErr = nil
+			} else {
+				status = fc.Response().StatusCode()
 			}
-			status := fc.Response().StatusCode()
 			if panicked && status < http.StatusInternalServerError {
 				status = fiber.StatusInternalServerError
-			}
-			if handledErr != nil && status < http.StatusBadRequest {
-				status = fiber.StatusInternalServerError
-				var fiberErr *fiber.Error
-				if errors.As(handledErr, &fiberErr) && fiberErr.Code >= http.StatusBadRequest {
-					status = fiberErr.Code
-				}
 			}
 			if handledErr != nil && status >= http.StatusInternalServerError && !panicked {
 				spanErrDesc = handledErr.Error()
@@ -131,7 +173,7 @@ func (c *Client) Fiber() fiber.Handler {
 				c.captureException(ctx, handledErr, errorCaptureOptions{
 					omitStack: true,
 					tags:      fiberErrorTags(method, route, status),
-					url:       fiberRequestURL(fc),
+					url:       fiberRequestURL(fc, path),
 				})
 			}
 			span.SetName(method + " " + route)
@@ -149,11 +191,25 @@ func (c *Client) Fiber() fiber.Handler {
 			))
 			active.Add(ctx, -1, activeAttrs)
 			span.End()
+			if panicked && opts.RepanicOnPanic {
+				panic(repanicValue)
+			}
 		}()
 
 		returnErr = fc.Next()
 		return returnErr
 	}
+}
+
+func defaultFiberErrorStatus(err error, responseStatus int) int {
+	var fiberErr *fiber.Error
+	if errors.As(err, &fiberErr) && fiberErr.Code >= http.StatusBadRequest {
+		return fiberErr.Code
+	}
+	if responseStatus >= http.StatusBadRequest {
+		return responseStatus
+	}
+	return fiber.StatusInternalServerError
 }
 
 func fiberErrorTags(method, route string, status int) map[string]string {
@@ -166,8 +222,8 @@ func fiberErrorTags(method, route string, status int) map[string]string {
 
 // fiberRequestURL builds a fresh string by concatenation, so it never aliases the
 // request buffers it reads from.
-func fiberRequestURL(c fiber.Ctx) string {
-	return requestScheme(c) + "://" + c.Hostname() + c.Path()
+func fiberRequestURL(c fiber.Ctx, path string) string {
+	return requestScheme(c) + "://" + c.Hostname() + path
 }
 
 func requestScheme(c fiber.Ctx) string {

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -67,7 +66,10 @@ type Config struct {
 	Tags           map[string]string
 	ExportInterval time.Duration
 	// Profiling enables continuous CPU, heap, and goroutine pprof collection. Nil defaults to enabled.
-	Profiling         *bool
+	Profiling *bool
+	// ProfilingCPU enables CPU pprof sampling when Profiling is enabled. Nil defaults to enabled.
+	// Set to false to collect only heap and goroutine snapshots when another profiler owns CPU sampling.
+	ProfilingCPU      *bool
 	ProfilingInterval time.Duration
 	Delivery          DeliveryConfig
 }
@@ -81,32 +83,61 @@ type DeliveryConfig struct {
 	RetryMax             time.Duration
 }
 
+type dbMetricRegistration struct {
+	client  *Client
+	id      uint64
+	reg     metric.Registration
+	stopCtx func() bool
+	once    sync.Once
+	err     error
+}
+
+func (r *dbMetricRegistration) unregister() error {
+	r.once.Do(func() {
+		var stop func() bool
+		if r.client != nil {
+			stop = r.client.detachDBRegistration(r)
+		}
+		if stop != nil {
+			stop()
+		}
+		if r.reg != nil {
+			r.err = r.reg.Unregister()
+		}
+	})
+	return r.err
+}
+
 // Client is an isolated lazy-observe SDK instance. It never replaces global
 // OpenTelemetry providers or installs process-wide hooks.
 type Client struct {
-	cfg              Config
-	initErr          error
-	meter            metric.MeterProvider
-	tracer           trace.TracerProvider
-	metricSDK        *sdkmetric.MeterProvider
-	traceSDK         *sdktrace.TracerProvider
-	logSDK           *sdklog.LoggerProvider
-	logger           *slog.Logger
-	propagator       propagation.TextMapPropagator
-	dbRegsMu         sync.Mutex
-	dbRegs           []metric.Registration
-	shutdown         sync.Once
-	shutdownErr      error
-	profileStop      context.CancelFunc
-	profileDone      chan struct{}
-	profileURL       string
-	profileToken     string
-	profileClient    *http.Client
-	profileDelivery  *deliveryQueue[collectedProfile]
-	cpuProfiler      *cpuProfiler // nil means systemCPUProfiler; tests inject fakes
-	errorTransport   *errorTransport
-	droppedTelemetry atomic.Uint64
-	droppedCounter   metric.Int64Counter
+	cfg                 Config
+	initErr             error
+	meter               metric.MeterProvider
+	tracer              trace.TracerProvider
+	metricSDK           *sdkmetric.MeterProvider
+	traceSDK            *sdktrace.TracerProvider
+	logSDK              *sdklog.LoggerProvider
+	logger              *slog.Logger
+	propagator          propagation.TextMapPropagator
+	runtimeReg          metric.Registration
+	dbRegsMu            sync.Mutex
+	dbRegsClosed        bool
+	dbRegNextID         uint64
+	dbRegs              map[uint64]*dbMetricRegistration
+	shutdown            sync.Once
+	shutdownErr         error
+	ingest              *ingestClient
+	profileStop         context.CancelFunc
+	profileDone         chan struct{}
+	profileDelivery     *deliveryQueue[collectedProfile]
+	cpuProfiler         *cpuProfiler // nil means systemCPUProfiler; tests inject fakes
+	cpuConflictOnce     sync.Once
+	profileInitialDelay func(time.Duration) time.Duration // nil uses jitterInitialProfilingDelay
+	profileCycleDelay   func(time.Duration) time.Duration // nil uses jitterProfilingDelay
+	errorTransport      *errorTransport
+	droppedTelemetry    atomic.Uint64
+	droppedCounter      metric.Int64Counter
 }
 
 // SDKDiagnostics is a process-local snapshot of bounded delivery losses.
@@ -160,6 +191,10 @@ func normalizedConfig(cfg Config) (Config, error) {
 		enabled := true
 		cfg.Profiling = &enabled
 	}
+	if cfg.ProfilingCPU == nil {
+		enabled := true
+		cfg.ProfilingCPU = &enabled
+	}
 	if cfg.ProfilingInterval <= 0 {
 		cfg.ProfilingInterval = 60 * time.Second
 	}
@@ -196,6 +231,13 @@ func normalizeDeliveryConfig(cfg *DeliveryConfig) error {
 	return nil
 }
 
+func buildResource(base *resource.Resource, serviceName, project string) (*resource.Resource, error) {
+	return resource.Merge(base, resource.NewSchemaless(
+		semconv.ServiceName(serviceName),
+		attribute.String("lazy_observe.project", project),
+	))
+}
+
 func newClient(ctx context.Context, cfg Config) (*Client, error) {
 	parsed, err := parseDSN(cfg.DSN)
 	if err != nil {
@@ -206,20 +248,14 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, err
 	}
 	metricsOn, logsOn, tracesOn := signalMatrix(cfg)
-	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceName(cfg.ServiceName),
-		attribute.String("lazy_observe.project", parsed.project),
-	))
+	res, err := buildResource(resource.Default(), cfg.ServiceName, parsed.project)
 	if err != nil {
 		return nil, fmt.Errorf("create resource: %w", err)
 	}
 	c := &Client{
-		cfg:           cfg,
-		propagator:    propagation.TraceContext{},
-		profileURL:    parsed.endpoint + "/api/profiles",
-		profileToken:  parsed.token,
-		profileClient: &http.Client{Timeout: profilingSendTimeout},
+		cfg:        cfg,
+		propagator: propagation.TraceContext{},
+		ingest:     newIngestClient(parsed.endpoint, parsed.token, nil),
 	}
 	headers := map[string]string{"Authorization": "Bearer " + parsed.token}
 
@@ -303,7 +339,7 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("register delivery metrics: %w", counterErr)
 	}
 	c.droppedCounter = droppedCounter
-	c.errorTransport = newErrorTransport(parsed.endpoint, parsed.token, c.logger, cfg.Delivery, c.recordTelemetryDrop)
+	c.errorTransport = newErrorTransport(c.ingest, c.logger, cfg.Delivery, c.recordTelemetryDrop)
 	if *cfg.Profiling {
 		c.profileDelivery = newProfileDelivery(c)
 		profileCtx, cancel := context.WithCancel(context.Background())
@@ -347,8 +383,25 @@ func (c *Client) Diagnostics() SDKDiagnostics {
 	return SDKDiagnostics{DroppedTelemetry: c.droppedTelemetry.Load()}
 }
 
-// WrapDB explicitly opens an instrumented database/sql DB and registers pool metrics.
+// WrapDB explicitly opens an instrumented database/sql DB and registers pool
+// metrics that are unregistered when Shutdown runs. For short-lived or
+// dynamically rotated DB pools, prefer WrapDBContext so pool metric
+// registration is released as soon as the pool's context is cancelled.
 func (c *Client) WrapDB(driverName, dataSourceName string) (*sql.DB, error) {
+	return c.WrapDBContext(context.Background(), driverName, dataSourceName)
+}
+
+// WrapDBContext explicitly opens an instrumented database/sql DB and binds its
+// pool metric registration lifecycle to ctx as well as Client.Shutdown. When
+// ctx is cancelled or Shutdown runs, the metric.Registration is unregistered
+// immediately so closed databases are not retained or scraped indefinitely.
+func (c *Client) WrapDBContext(ctx context.Context, driverName, dataSourceName string) (*sql.DB, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("open instrumented database: %w", err)
+	}
 	opts := []otelsql.Option{
 		otelsql.WithTracerProvider(c.tracer),
 		otelsql.WithMeterProvider(c.meter),
@@ -372,15 +425,52 @@ func (c *Client) WrapDB(driverName, dataSourceName string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open instrumented database: %w", err)
 	}
+	c.dbRegsMu.Lock()
+	closed := c.dbRegsClosed
+	c.dbRegsMu.Unlock()
+	if closed {
+		return db, nil
+	}
 	reg, err := otelsql.RegisterDBStatsMetrics(db, opts...)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("register database metrics: %w", err)
 	}
+	entry := &dbMetricRegistration{client: c, reg: reg}
 	c.dbRegsMu.Lock()
-	c.dbRegs = append(c.dbRegs, reg)
+	if c.dbRegsClosed {
+		c.dbRegsMu.Unlock()
+		_ = reg.Unregister()
+		return db, nil
+	}
+	if c.dbRegs == nil {
+		c.dbRegs = make(map[uint64]*dbMetricRegistration)
+	}
+	c.dbRegNextID++
+	entry.id = c.dbRegNextID
+	c.dbRegs[entry.id] = entry
+	if ctx.Done() != nil {
+		entry.stopCtx = context.AfterFunc(ctx, func() {
+			_ = entry.unregister()
+		})
+	}
 	c.dbRegsMu.Unlock()
 	return db, nil
+}
+
+func (c *Client) detachDBRegistration(entry *dbMetricRegistration) func() bool {
+	c.dbRegsMu.Lock()
+	defer c.dbRegsMu.Unlock()
+	delete(c.dbRegs, entry.id)
+	stop := entry.stopCtx
+	entry.stopCtx = nil
+	return stop
+}
+
+func (c *Client) activeDBRegistrations() int {
+	c.dbRegsMu.Lock()
+	defer c.dbRegsMu.Unlock()
+	return len(c.dbRegs)
 }
 
 // Shutdown flushes all enabled signals and releases SDK resources.
@@ -422,11 +512,19 @@ func (c *Client) closeCreated(ctx context.Context) error {
 		errs = append(errs, c.profileDelivery.close(ctx))
 	}
 	c.dbRegsMu.Lock()
-	regs := append([]metric.Registration(nil), c.dbRegs...)
+	c.dbRegsClosed = true
+	regs := make([]*dbMetricRegistration, 0, len(c.dbRegs))
+	for _, entry := range c.dbRegs {
+		regs = append(regs, entry)
+	}
 	c.dbRegs = nil
 	c.dbRegsMu.Unlock()
-	for _, reg := range regs {
-		errs = append(errs, reg.Unregister())
+	for _, entry := range regs {
+		errs = append(errs, entry.unregister())
+	}
+	if c.runtimeReg != nil {
+		errs = append(errs, c.runtimeReg.Unregister())
+		c.runtimeReg = nil
 	}
 	if c.logSDK != nil {
 		errs = append(errs, c.logSDK.Shutdown(ctx))
@@ -483,7 +581,7 @@ func (c *Client) registerRuntimeMetrics() error {
 	if err != nil {
 		return err
 	}
-	_, err = m.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
+	reg, err := m.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
 		samples := [3]rtmetrics.Sample{
 			{Name: "/sched/goroutines:goroutines"},
 			{Name: "/memory/classes/heap/objects:bytes"},
@@ -503,5 +601,8 @@ func (c *Client) registerRuntimeMetrics() error {
 		}
 		return nil
 	}, goroutines, heap, gc)
+	if err == nil {
+		c.runtimeReg = reg
+	}
 	return err
 }

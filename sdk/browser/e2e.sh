@@ -114,7 +114,7 @@ wait_http() {
 
 
 printf 'building SDK workspace and examples from this repo...\n'
-(cd "$SDK_DIR/../go" && CGO_ENABLED=0 go build -o "$WORK/fiber-example" ./examples/fiber)
+(cd "$SDK_DIR/../go/examples/fiber" && CGO_ENABLED=0 go build -o "$WORK/fiber-example" .)
 (cd "$SDK_DIR/../node" && pnpm install --frozen-lockfile && pnpm build)
 # --with-deps 要用 apt 装系统库，需要 root 或免密 sudo（CI runner 满足）；
 # 没有这个权限的开发机只装浏览器本身，系统库缺失时 Playwright 启动 Chromium 会如实报错。

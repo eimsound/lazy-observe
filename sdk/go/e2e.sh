@@ -86,7 +86,7 @@ wait_http() {
 
 
 printf 'building SDK e2e examples (fake-llm, fiber-example)...\n'
-(cd "$SDK_DIR" && CGO_ENABLED=0 go build -o "$WORK/fake-llm" ./examples/fiber/fakellm)
+(cd "$SDK_DIR/examples/fiber" && CGO_ENABLED=0 go build -o "$WORK/fake-llm" ./fakellm)
 jq -n --arg username admin --arg password "$ADMIN_PASSWORD" \
 	'{username: $username, password: $password}' >"$WORK/login.json"
 curl -fsS -c "$WORK/session.cookie" \
@@ -94,7 +94,7 @@ curl -fsS -c "$WORK/session.cookie" \
 	--data-binary "@$WORK/login.json" "$PLATFORM_URL/api/auth/login" >/dev/null
 
 printf 'starting instrumented Fiber example...\n'
-(cd "$SDK_DIR" && CGO_ENABLED=0 go build -o "$WORK/fiber-example" ./examples/fiber)
+(cd "$SDK_DIR/examples/fiber" && CGO_ENABLED=0 go build -o "$WORK/fiber-example" .)
 env PORT="$LLM_PORT" "$WORK/fake-llm" >"$WORK/fake-llm.log" 2>&1 &
 LLM_PID=$!
 wait_http "$LLM_URL/healthz" || {
