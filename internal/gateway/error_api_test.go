@@ -1755,9 +1755,7 @@ func TestPostgresIssueCountAcrossGatewayReplicas(t *testing.T) {
 	t.Fatalf("replica issue rows=%#v err=%v", rows, err)
 }
 
-func uploadSourceMapTest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, token, release, filename string, data []byte, want int) {
+func uploadSourceMapTest(t *testing.T, app httpTestApp, token, release, filename string, data []byte, want int) {
 	t.Helper()
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
@@ -1785,9 +1783,7 @@ func uploadSourceMapTest(t *testing.T, app interface {
 	}
 }
 
-func postErrorsTest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, token string, events []any, want int) {
+func postErrorsTest(t *testing.T, app httpTestApp, token string, events []any, want int) {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"events": events})
 	req := httptest.NewRequest(http.MethodPost, "/api/events/errors", bytes.NewReader(body))
@@ -1804,16 +1800,18 @@ func postErrorsTest(t *testing.T, app interface {
 	}
 }
 
-func listIssuesTest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, cookie *http.Cookie, project string) []map[string]any {
+func listIssuesTest(t *testing.T, app httpTestApp, cookie *http.Cookie, project string) []map[string]any {
 	t.Helper()
 	return waitForIssuesTest(t, app, cookie, project, func(issues []map[string]any) bool { return len(issues) > 0 })
 }
 
-func waitForIssueCountTest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, cookie *http.Cookie, project string, count float64) map[string]any {
+func waitForIssueCountTest(
+	t *testing.T,
+	app httpTestApp,
+	cookie *http.Cookie,
+	project string,
+	count float64,
+) map[string]any {
 	t.Helper()
 	issues := waitForIssuesTest(t, app, cookie, project, func(issues []map[string]any) bool {
 		return issueWithCount(issues, count) != nil
@@ -1821,18 +1819,26 @@ func waitForIssueCountTest(t *testing.T, app interface {
 	return issueWithCount(issues, count)
 }
 
-func waitForIssueLengthTest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, cookie *http.Cookie, project string, length int) []map[string]any {
+func waitForIssueLengthTest(
+	t *testing.T,
+	app httpTestApp,
+	cookie *http.Cookie,
+	project string,
+	length int,
+) []map[string]any {
 	t.Helper()
 	return waitForIssuesTest(t, app, cookie, project, func(issues []map[string]any) bool {
 		return len(issues) == length
 	})
 }
 
-func waitForIssuesTest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, cookie *http.Cookie, project string, ready func([]map[string]any) bool) []map[string]any {
+func waitForIssuesTest(
+	t *testing.T,
+	app httpTestApp,
+	cookie *http.Cookie,
+	project string,
+	ready func([]map[string]any) bool,
+) []map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	var issues []map[string]any
@@ -1863,9 +1869,7 @@ func waitForIssuesTest(t *testing.T, app interface {
 	}
 }
 
-func patchIssueTest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, cookie *http.Cookie, project string, id int, status string) {
+func patchIssueTest(t *testing.T, app httpTestApp, cookie *http.Cookie, project string, id int, status string) {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"status": status})
 	req := httptest.NewRequest(http.MethodPatch, "/api/issues/"+strconv.Itoa(id), bytes.NewReader(body))

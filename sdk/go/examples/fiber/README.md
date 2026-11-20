@@ -1,6 +1,6 @@
 # Fiber 可观测示例
 
-该示例同时演示 Fiber v2 的 HTTP 指标、分布式 Trace、关联日志、`database/sql` 子 span、自定义业务指标和持续性能剖析。它不会安装全局 OpenTelemetry Provider，所有能力都由 `lazyobserve.Client` 显式提供。
+该示例同时演示 Fiber v3 的 HTTP 指标、分布式 Trace、关联日志、`database/sql` 子 span、自定义业务指标和持续性能剖析。它不会安装全局 OpenTelemetry Provider，所有能力都由 `lazyobserve.Client` 显式提供。
 
 ## 启动
 

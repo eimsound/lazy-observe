@@ -14,7 +14,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -104,12 +104,12 @@ type performanceMetricAccumulator struct {
 	points   map[int64]*performancePoint
 }
 
-func (g *Gateway) performanceEndpoints(c *fiber.Ctx) error {
+func (g *Gateway) performanceEndpoints(c fiber.Ctx) error {
 	start, end, step, ok := g.performanceRange(c)
 	if !ok {
 		return nil
 	}
-	response, err := g.queryPerformanceMetrics(c.UserContext(), currentProject(c), start, end, step)
+	response, err := g.queryPerformanceMetrics(c.Context(), currentProject(c), start, end, step)
 	if err != nil {
 		return c.Status(http.StatusBadGateway).JSON(fiber.Map{
 			"error":  "performance metrics query failed",
@@ -119,7 +119,7 @@ func (g *Gateway) performanceEndpoints(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-func (g *Gateway) performanceRange(c *fiber.Ctx) (time.Time, time.Time, time.Duration, bool) {
+func (g *Gateway) performanceRange(c fiber.Ctx) (time.Time, time.Time, time.Duration, bool) {
 	end := g.now().UTC()
 	start := end.Add(-performanceDefaultWindow)
 	var err error

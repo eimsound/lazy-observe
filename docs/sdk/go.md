@@ -1,6 +1,8 @@
 # Go SDK
 
-The Go SDK provides explicit Fiber v2, `slog`, `database/sql`, runtime metric, and pprof integrations. Importing it installs no hooks or global OpenTelemetry providers.
+The Go SDK provides explicit Fiber v3, `slog`, `database/sql`, runtime metric, and pprof integrations. Importing it installs no hooks or global OpenTelemetry providers.
+
+> **Breaking: Fiber v3 only.** `lo.Fiber()` returns a Fiber v3 handler (`github.com/gofiber/fiber/v3`, `func(fiber.Ctx) error`). Fiber v2 is not supported and there is no compatibility layer, so a Fiber v2 application cannot use `app.Use(lo.Fiber())`; migrate the application to v3 first (see the [Fiber v3 migration notes](../../sdk/go/README.md#fiber-v3-migration-notes)). The SDK has no tagged release yet, so no previously released version changes.
 
 ## Install
 
@@ -46,8 +48,8 @@ app := fiber.New()
 app.Use(lo.Fiber())
 slog.SetDefault(lo.Slog())
 
-app.Get("/orders/:id", func(c *fiber.Ctx) error {
-    slog.InfoContext(c.UserContext(), "loading order", "id", c.Params("id"))
+app.Get("/orders/:id", func(c fiber.Ctx) error {
+    slog.InfoContext(c.Context(), "loading order", "id", c.Params("id"))
     return c.SendStatus(fiber.StatusNoContent)
 })
 ```
@@ -69,7 +71,7 @@ if err != nil {
 }
 defer db.Close()
 
-row := db.QueryRowContext(c.UserContext(), "SELECT status FROM orders WHERE id = $1", id)
+row := db.QueryRowContext(c.Context(), "SELECT status FROM orders WHERE id = $1", id)
 ```
 
 `WrapDB` replaces `sql.Open`, creates client spans, and registers pool metrics without patching or registering drivers. Import the chosen database driver normally. SQL text is disabled by default; setting `CaptureDBStatement: true` captures query text but never bound parameter values.

@@ -13,7 +13,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/account"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -57,7 +57,7 @@ func newCSRFToken() (string, error) {
 // session-authenticated requests. Bearer-token requests and read-only
 // methods are exempt; the token never leaves the browser except through the
 // X-CSRF-Token header.
-func (g *Gateway) csrfRequired(c *fiber.Ctx) error {
+func (g *Gateway) csrfRequired(c fiber.Ctx) error {
 	if !g.requireCSRF {
 		return c.Next()
 	}
@@ -77,15 +77,15 @@ func (g *Gateway) csrfRequired(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-func (g *Gateway) changePassword(c *fiber.Ctx) error {
+func (g *Gateway) changePassword(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	var body struct {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
 	}
-	_ = c.BodyParser(&body)
+	_ = c.Bind().Body(&body)
 	facts, err := g.account.ChangePassword(
-		c.UserContext(), accountUser(u), body.CurrentPassword, body.NewPassword, c.Cookies("lo_session"),
+		c.Context(), accountUser(u), body.CurrentPassword, body.NewPassword, c.Cookies("lo_session"),
 	)
 	g.auditAccountFacts(c, facts)
 	if err != nil {
@@ -120,14 +120,14 @@ func (g *Gateway) removeInitialAdminPasswordFile(username string) {
 	}
 }
 
-func (g *Gateway) updateMe(c *fiber.Ctx) error {
+func (g *Gateway) updateMe(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	var body struct {
 		DisplayName *string `json:"display_name"`
 		Email       *string `json:"email"`
 	}
-	_ = c.BodyParser(&body)
-	updated, facts, err := g.account.UpdateProfile(c.UserContext(), accountUser(u), account.ProfileInput{
+	_ = c.Bind().Body(&body)
+	updated, facts, err := g.account.UpdateProfile(c.Context(), accountUser(u), account.ProfileInput{
 		DisplayName: body.DisplayName, Email: body.Email,
 	})
 	g.auditAccountFacts(c, facts)
@@ -137,23 +137,23 @@ func (g *Gateway) updateMe(c *fiber.Ctx) error {
 	return c.JSON(updated)
 }
 
-func (g *Gateway) listMySessions(c *fiber.Ctx) error {
+func (g *Gateway) listMySessions(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	token := c.Cookies("lo_session")
-	sessions, err := g.account.ListSessions(c.UserContext(), u.ID, token)
+	sessions, err := g.account.ListSessions(c.Context(), u.ID, token)
 	if err != nil {
 		return accountAPIError(c, err)
 	}
 	return c.JSON(sessions)
 }
 
-func (g *Gateway) deleteMySession(c *fiber.Ctx) error {
+func (g *Gateway) deleteMySession(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	id := c.Params("id")
 	if strings.TrimSpace(id) == "" {
 		return badRequest(c)
 	}
-	facts, err := g.account.RevokeSession(c.UserContext(), accountUser(u), id)
+	facts, err := g.account.RevokeSession(c.Context(), accountUser(u), id)
 	g.auditAccountFacts(c, facts)
 	if err != nil {
 		return accountAPIError(c, err)
@@ -161,7 +161,7 @@ func (g *Gateway) deleteMySession(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func accountAPIError(c *fiber.Ctx, err error) error {
+func accountAPIError(c fiber.Ctx, err error) error {
 	switch account.Code(err) {
 	case account.CodeInvalidRequest:
 		return badRequest(c)
@@ -186,7 +186,7 @@ func accountAPIError(c *fiber.Ctx, err error) error {
 	}
 }
 
-func (g *Gateway) listAudit(c *fiber.Ctx) error {
+func (g *Gateway) listAudit(c fiber.Ctx) error {
 	options := meta.AuditListOptions{
 		Action:     strings.TrimSpace(c.Query("action")),
 		Actor:      strings.TrimSpace(c.Query("actor")),
@@ -201,14 +201,14 @@ func (g *Gateway) listAudit(c *fiber.Ctx) error {
 		}
 		options.ProjectID = id
 	}
-	events, err := g.store.ListAudit(c.UserContext(), options)
+	events, err := g.store.ListAudit(c.Context(), options)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(events)
 }
 
-func intQuery(c *fiber.Ctx, name string) int {
+func intQuery(c fiber.Ctx, name string) int {
 	value, err := strconv.Atoi(strings.TrimSpace(c.Query(name)))
 	if err != nil || value < 0 {
 		return 0

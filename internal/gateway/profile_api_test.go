@@ -290,9 +290,7 @@ func TestProfileUploadIDIsIdempotentAndProjectScoped(t *testing.T) {
 	}
 }
 
-func profileTestApp(t *testing.T) (interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, string, string, *meta.Store) {
+func profileTestApp(t *testing.T) (httpTestApp, string, string, *meta.Store) {
 	t.Helper()
 	ctx := context.Background()
 	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
@@ -326,9 +324,13 @@ func profileTestApp(t *testing.T) (interface {
 		defaultToken, p2Token, store
 }
 
-func uploadProfileFixture(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, token, service, profileType string, data []byte, want int) *http.Response {
+func uploadProfileFixture(
+	t *testing.T,
+	app httpTestApp,
+	token, service, profileType string,
+	data []byte,
+	want int,
+) *http.Response {
 	t.Helper()
 	uploadID, err := randomProfileID()
 	if err != nil {
@@ -338,9 +340,14 @@ func uploadProfileFixture(t *testing.T, app interface {
 	return uploadProfileFixtureWithID(t, app, token, service, profileType, data, uploadID, want)
 }
 
-func uploadProfileFixtureWithID(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, token, service, profileType string, data []byte, uploadID string, want int) *http.Response {
+func uploadProfileFixtureWithID(
+	t *testing.T,
+	app httpTestApp,
+	token, service, profileType string,
+	data []byte,
+	uploadID string,
+	want int,
+) *http.Response {
 	t.Helper()
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
@@ -370,9 +377,7 @@ func uploadProfileFixtureWithID(t *testing.T, app interface {
 }
 
 // profileGET reads as a user API token holder; project tokens are ingest-only.
-func profileGET(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, reader, project, target string) *http.Response {
+func profileGET(t *testing.T, app httpTestApp, reader, project, target string) *http.Response {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	req.Header.Set("Authorization", "Bearer "+reader)

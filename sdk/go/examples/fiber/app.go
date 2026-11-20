@@ -12,7 +12,7 @@ import (
 	"time"
 
 	lazyobserve "github.com/eimsound/lazy-observe/sdk/go"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
@@ -51,7 +51,7 @@ func newExampleApp(lo *lazyobserve.Client, db *sql.DB, llmURL string) *fiber.App
 		llmURL:       strings.TrimRight(llmURL, "/"),
 	}
 
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	app.Use(lo.Fiber())
 	app.Get("/", server.index)
 	app.Get("/db", server.database)
@@ -59,16 +59,16 @@ func newExampleApp(lo *lazyobserve.Client, db *sql.DB, llmURL string) *fiber.App
 	app.Get("/performance/fast", server.workload("fast", 5*time.Millisecond, fiber.StatusOK))
 	app.Get("/performance/slow", server.workload("slow", 150*time.Millisecond, fiber.StatusOK))
 	app.Get("/performance/error", server.workload("error", 30*time.Millisecond, fiber.StatusServiceUnavailable))
-	app.Get("/panic", func(*fiber.Ctx) error { panic("example panic") })
-	app.Get("/cpu", func(c *fiber.Ctx) error {
+	app.Get("/panic", func(fiber.Ctx) error { panic("example panic") })
+	app.Get("/cpu", func(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{"result": cpuWork(250 * time.Millisecond)})
 	})
 	app.Get("/llm", server.llm)
 	return app
 }
 
-func (s *exampleServer) index(c *fiber.Ctx) error {
-	slog.InfoContext(c.UserContext(), "hello from Fiber")
+func (s *exampleServer) index(c fiber.Ctx) error {
+	slog.InfoContext(c.Context(), "hello from Fiber")
 	return c.JSON(fiber.Map{
 		"service": "lazy-observe-fiber-example",
 		"routes": []string{
@@ -84,19 +84,19 @@ func (s *exampleServer) index(c *fiber.Ctx) error {
 	})
 }
 
-func (s *exampleServer) database(c *fiber.Ctx) error {
+func (s *exampleServer) database(c fiber.Ctx) error {
 	var value int
-	if err := s.db.QueryRowContext(c.UserContext(), "SELECT 42").Scan(&value); err != nil {
+	if err := s.db.QueryRowContext(c.Context(), "SELECT 42").Scan(&value); err != nil {
 		return err
 	}
-	slog.InfoContext(c.UserContext(), "database query complete", "value", value)
-	return c.JSON(fiber.Map{"value": value, "trace_id": traceID(c.UserContext())})
+	slog.InfoContext(c.Context(), "database query complete", "value", value)
+	return c.JSON(fiber.Map{"value": value, "trace_id": traceID(c.Context())})
 }
 
 // orderTrace demonstrates one server span, three application spans, a DB child
 // span, and a log correlated to the same trace.
-func (s *exampleServer) orderTrace(c *fiber.Ctx) error {
-	requestCtx := c.UserContext()
+func (s *exampleServer) orderTrace(c fiber.Ctx) error {
+	requestCtx := c.Context()
 	// Params borrows Fiber's request buffer; the span attribute and log record
 	// below outlive the request, so keep an owned copy.
 	orderID := strings.Clone(c.Params("orderID"))
@@ -136,7 +136,7 @@ func (s *exampleServer) orderTrace(c *fiber.Ctx) error {
 }
 
 func (s *exampleServer) workload(name string, delay time.Duration, status int) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		actualDelay := delay
 		if raw := strings.TrimSpace(c.Query("delay_ms")); raw != "" {
 			milliseconds, err := strconv.Atoi(raw)
@@ -146,7 +146,7 @@ func (s *exampleServer) workload(name string, delay time.Duration, status int) f
 			actualDelay = time.Duration(milliseconds) * time.Millisecond
 		}
 		started := time.Now()
-		ctx, span := s.tracer.Start(c.UserContext(), "run "+name+" workload",
+		ctx, span := s.tracer.Start(c.Context(), "run "+name+" workload",
 			trace.WithAttributes(attribute.String("example.workload", name)),
 		)
 		time.Sleep(actualDelay)
@@ -173,18 +173,18 @@ func (s *exampleServer) workload(name string, delay time.Duration, status int) f
 		return c.Status(status).JSON(fiber.Map{
 			"workload":    name,
 			"duration_ms": elapsed.Milliseconds(),
-			"trace_id":    traceID(c.UserContext()),
+			"trace_id":    traceID(c.Context()),
 		})
 	}
 }
 
-func (s *exampleServer) llm(c *fiber.Ctx) error {
-	stream := c.QueryBool("stream", false)
+func (s *exampleServer) llm(c fiber.Ctx) error {
+	stream := fiber.Query[bool](c, "stream", false)
 	payload := `{"model":"e2e-request-model","messages":[{"role":"user","content":"e2e secret prompt"}],"stream":` + strconv.FormatBool(
 		stream,
 	) + `}`
 	req, err := http.NewRequestWithContext(
-		c.UserContext(),
+		c.Context(),
 		http.MethodPost,
 		s.llmURL+"/v1/chat/completions",
 		strings.NewReader(payload),

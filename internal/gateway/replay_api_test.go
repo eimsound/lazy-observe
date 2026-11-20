@@ -287,9 +287,16 @@ func TestReplayEndToEnd(t *testing.T) {
 	}
 }
 
-func uploadReplay(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, token, sessionID string, seq int, original []byte, hasError bool, want int, naked ...bool) {
+func uploadReplay(
+	t *testing.T,
+	app httpTestApp,
+	token, sessionID string,
+	seq int,
+	original []byte,
+	hasError bool,
+	want int,
+	naked ...bool,
+) {
 	t.Helper()
 	var compressed bytes.Buffer
 	zw := gzip.NewWriter(&compressed)
@@ -319,9 +326,7 @@ func uploadReplay(t *testing.T, app interface {
 	}
 }
 
-func replayRequest(t *testing.T, app interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-}, token, project, target string) *http.Response {
+func replayRequest(t *testing.T, app httpTestApp, token, project, target string) *http.Response {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	req.Header.Set("Authorization", "Bearer "+token)

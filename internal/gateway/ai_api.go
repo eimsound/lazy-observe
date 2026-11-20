@@ -5,10 +5,10 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/ai"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
-func (g *Gateway) aiStatus(c *fiber.Ctx) error {
+func (g *Gateway) aiStatus(c fiber.Ctx) error {
 	state := g.aiState()
 	return c.JSON(fiber.Map{
 		"enabled":  state.enabled,
@@ -17,7 +17,7 @@ func (g *Gateway) aiStatus(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) aiTest(c *fiber.Ctx) error {
+func (g *Gateway) aiTest(c fiber.Ctx) error {
 	state := g.aiState()
 	if !state.enabled || state.client == nil {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
@@ -26,7 +26,7 @@ func (g *Gateway) aiTest(c *fiber.Ctx) error {
 		})
 	}
 	started := time.Now()
-	response, err := state.client.Chat(c.UserContext(), ai.ChatRequest{
+	response, err := state.client.Chat(c.Context(), ai.ChatRequest{
 		System:      "You are a connectivity check for lazy-observe.",
 		Messages:    []ai.Message{{Role: "user", Content: "Reply with exactly: pong"}},
 		Temperature: 0,

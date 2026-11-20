@@ -20,7 +20,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/ai"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -183,7 +183,7 @@ type assistantGenerated struct {
 	Explanation string `json:"explanation"`
 }
 
-func (g *Gateway) aiAssistantQuery(c *fiber.Ctx) error {
+func (g *Gateway) aiAssistantQuery(c fiber.Ctx) error {
 	if !g.assistantReady(c) {
 		return nil
 	}
@@ -192,7 +192,7 @@ func (g *Gateway) aiAssistantQuery(c *fiber.Ctx) error {
 		return c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": "AI assistant rate limit exceeded"})
 	}
 	var input assistantQueryInput
-	if json.Unmarshal(c.Body(), &input) != nil {
+	if json.Unmarshal(requestBody(c), &input) != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 	input.Question = strings.TrimSpace(input.Question)
@@ -210,11 +210,11 @@ func (g *Gateway) aiAssistantQuery(c *fiber.Ctx) error {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": err.Error()})
 	}
 	project := currentProject(c)
-	contextSchema, err := g.aiAssistant.querySchema(c.UserContext(), project, input.Signal)
+	contextSchema, err := g.aiAssistant.querySchema(c.Context(), project, input.Signal)
 	if err != nil {
 		return c.Status(http.StatusBadGateway).JSON(fiber.Map{"error": "schema context collection failed"})
 	}
-	generated, raw, err := g.generateAssistantQuery(c.UserContext(), input, contextSchema)
+	generated, raw, err := g.generateAssistantQuery(c.Context(), input, contextSchema)
 	if err != nil {
 		var contractErr *assistantContractError
 		if !errors.As(err, &contractErr) {
@@ -239,7 +239,7 @@ func (g *Gateway) aiAssistantQuery(c *fiber.Ctx) error {
 		generated.Query,
 	)
 
-	result, executionErr := g.executeAssistantQuery(c.UserContext(), project, generated, start, end)
+	result, executionErr := g.executeAssistantQuery(c.Context(), project, generated, start, end)
 	response := fiber.Map{"signal": generated.Signal, "query": generated.Query, "explanation": generated.Explanation}
 	if executionErr != nil {
 		response["execution_error"] = executionErr.Error()
@@ -548,7 +548,7 @@ type assistantExplainInput struct {
 	Stats  map[string]float64 `json:"stats,omitempty"`
 }
 
-func (g *Gateway) aiAssistantExplain(c *fiber.Ctx) error {
+func (g *Gateway) aiAssistantExplain(c fiber.Ctx) error {
 	if !g.assistantReady(c) {
 		return nil
 	}
@@ -557,7 +557,7 @@ func (g *Gateway) aiAssistantExplain(c *fiber.Ctx) error {
 		return c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": "AI assistant rate limit exceeded"})
 	}
 	var input assistantExplainInput
-	if json.Unmarshal(c.Body(), &input) != nil {
+	if json.Unmarshal(requestBody(c), &input) != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 	input.Signal = strings.ToLower(strings.TrimSpace(input.Signal))
@@ -569,7 +569,7 @@ func (g *Gateway) aiAssistantExplain(c *fiber.Ctx) error {
 	}
 	stats, _ := json.Marshal(input.Stats)
 	state := g.aiState()
-	response, err := state.client.Chat(c.UserContext(), ai.ChatRequest{
+	response, err := state.client.Chat(c.Context(), ai.ChatRequest{
 		System: "Explain the read-only " + input.Signal + " query and what its result means in plain language. Be accurate, do not claim execution occurred, and answer in at most 200 Chinese characters (or 200 characters in the user's language).",
 		Messages: []ai.Message{
 			{Role: "user", Content: "Query: " + input.Query + "\nNumeric result summary: " + string(stats)},
@@ -582,7 +582,7 @@ func (g *Gateway) aiAssistantExplain(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"explanation": firstRunes(strings.TrimSpace(response.Content), 200)})
 }
 
-func (g *Gateway) assistantReady(c *fiber.Ctx) bool {
+func (g *Gateway) assistantReady(c fiber.Ctx) bool {
 	state := g.aiState()
 	if !state.enabled || state.client == nil {
 		_ = c.Status(http.StatusConflict).

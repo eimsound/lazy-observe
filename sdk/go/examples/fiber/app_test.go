@@ -10,6 +10,7 @@ import (
 	"time"
 
 	lazyobserve "github.com/eimsound/lazy-observe/sdk/go"
+	"github.com/gofiber/fiber/v3"
 )
 
 const testTraceID = "11111111111111111111111111111111"
@@ -18,7 +19,7 @@ func TestOrderTraceKeepsIncomingTraceID(t *testing.T) {
 	app := testApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/trace/order-42", nil)
 	req.Header.Set("traceparent", "00-"+testTraceID+"-2222222222222222-01")
-	resp, err := app.Test(req, 2_000)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 2 * time.Second, FailOnTimeout: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +56,10 @@ func TestPerformanceWorkloadsExposeLatencyAndErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.workload, func(t *testing.T) {
-			resp, err := app.Test(httptest.NewRequest(http.MethodGet, tt.path, nil), 2_000)
+			resp, err := app.Test(
+				httptest.NewRequest(http.MethodGet, tt.path, nil),
+				fiber.TestConfig{Timeout: 2 * time.Second, FailOnTimeout: true},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -95,9 +99,7 @@ func TestLoadPathMix(t *testing.T) {
 	}
 }
 
-func testApp(t *testing.T) interface {
-	Test(*http.Request, ...int) (*http.Response, error)
-} {
+func testApp(t *testing.T) *fiber.App {
 	t.Helper()
 	profiling := false
 	lo := lazyobserve.Init(lazyobserve.Config{DSN: "invalid", Profiling: &profiling})

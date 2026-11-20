@@ -5,9 +5,24 @@ linters:
   enable:
     - depguard
     - errcheck
+    - forbidigo
     - govet
     - staticcheck
   settings:
+    # Fiber v3 calls that compile but changed meaning (patterns match the
+    # type-qualified name, so fasthttp's c.Request().Body() is not caught).
+    forbidigo:
+      analyze-types: true
+      forbid:
+        # Ctx.Protocol is the HTTP version ("HTTP/1.1") in v3, never the scheme.
+        - pattern: ^fiber\.(Ctx|Req)\.Protocol$
+          pkg: ^github\.com/gofiber/fiber/v3$
+          msg: Fiber v3 Protocol() is the HTTP version; use Scheme() for http/https
+        # Ctx.Body decodes Content-Encoding again and returns error text for a
+        # coding it cannot undo; scoped to the gateway by an exclusion below.
+        - pattern: ^fiber\.(Ctx|Req)\.Body$
+          pkg: ^github\.com/gofiber/fiber/v3$
+          msg: gateway handlers read requestBody(c); Fiber v3 Body() re-decodes Content-Encoding
     depguard:
       rules:
         # ADR 0004: the generated Ent client and schema packages stay behind
@@ -23,6 +38,16 @@ linters:
               desc: use internal/meta behavior; Ent stays behind the metadata seam (ADR 0004)
   exclusions:
     rules:
+      # The Body ban guards gateway handlers only; tests and other packages may
+      # read the decoded body.
+      - path-except: ^internal/gateway/
+        text: requestBody\(c\)
+        linters:
+          - forbidigo
+      - path: _test\.go
+        text: requestBody\(c\)
+        linters:
+          - forbidigo
       # Existing tests intentionally use best-effort cleanup after assertions.
       - path: _test\.go
         linters:

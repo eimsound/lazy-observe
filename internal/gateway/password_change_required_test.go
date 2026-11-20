@@ -18,7 +18,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/state"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -60,7 +60,7 @@ func (c passwordChangeClient) do(method, path, body string, credential func(*htt
 	if credential != nil {
 		credential(req)
 	}
-	resp, err := c.app.Test(req, -1)
+	resp, err := c.app.Test(req, fiber.TestConfig{Timeout: 0})
 	if err != nil {
 		c.t.Fatal(err)
 	}

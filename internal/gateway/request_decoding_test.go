@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/gofiber/fiber/v3"
 )
 
 // gzipOfZeros returns a small gzip stream whose decoded size is n bytes.
@@ -78,7 +80,7 @@ func TestBoundedRequestDecodingRejectsDecompressionBombs(t *testing.T) {
 			if test.bearer {
 				req.Header.Set("Authorization", "Bearer lou_valid")
 			}
-			resp, err := app.Test(req, 30_000)
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -161,4 +163,52 @@ func TestProfileIngestBoundsPprofDecompression(t *testing.T) {
 	bomb := gzipOfZeros(t, maxDecodedRequestBody+1)
 	resp := uploadProfileFixture(t, app, token, "svc", "cpu", bomb, http.StatusRequestEntityTooLarge)
 	resp.Body.Close()
+}
+
+// A single coding the gateway does not decode (snappy, zstd) must reach the
+// storage upstream byte for byte with its Content-Encoding header. Fiber v3's
+// Ctx.Body decodes or rejects such codings itself; handlers read requestBody
+// instead so the upstream, which understands them, sees the original request.
+func TestProxyForwardsUndecodedContentEncodingUntouched(t *testing.T) {
+	type seen struct {
+		body     []byte
+		encoding string
+	}
+	received := make(chan seen, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- seen{body: body, encoding: r.Header.Get("Content-Encoding")}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	app := newTestGateway(Config{
+		Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 7, Slug: "alpha"}},
+		Metrics: upstream.URL, Logs: upstream.URL, Traces: upstream.URL,
+	}).App()
+	for _, coding := range []string{"zstd", "snappy"} {
+		t.Run(coding, func(t *testing.T) {
+			payload := []byte("\x28\xb5\x2f\xfd not really " + coding + " \x00\x01\x02")
+			req := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/x-protobuf")
+			req.Header.Set("Content-Encoding", coding)
+			req.Header.Set("Authorization", "Bearer lou_valid")
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("status=%d want=204 body=%s", resp.StatusCode, readBody(resp))
+			}
+			got := <-received
+			if got.encoding != coding || !bytes.Equal(got.body, payload) {
+				t.Fatalf(
+					"upstream saw encoding=%q body=%q, want encoding=%q body=%q",
+					got.encoding,
+					got.body,
+					coding,
+					payload,
+				)
+			}
+		})
+	}
 }

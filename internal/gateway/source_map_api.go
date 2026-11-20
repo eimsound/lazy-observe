@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/eimsound/lazy-observe/internal/symbolicate"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -28,7 +28,7 @@ type sourceMapUpload struct {
 	digest   string
 }
 
-func (g *Gateway) uploadSourceMaps(c *fiber.Ctx) error {
+func (g *Gateway) uploadSourceMaps(c fiber.Ctx) error {
 	if g.sourceMaps == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "source map storage unavailable"})
 	}
@@ -73,7 +73,7 @@ func (g *Gateway) uploadSourceMaps(c *fiber.Ctx) error {
 		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "release exceeds 200 files"})
 	}
 	p := currentProject(c)
-	existing, err := g.sourceMaps.SourceMapArtifacts(c.UserContext(), p.ID, release)
+	existing, err := g.sourceMaps.SourceMapArtifacts(c.Context(), p.ID, release)
 	if err != nil {
 		return fiber.NewError(http.StatusInternalServerError, err.Error())
 	}
@@ -90,11 +90,11 @@ func (g *Gateway) uploadSourceMaps(c *fiber.Ctx) error {
 	}
 	for _, upload := range uploads {
 		key := sourceMapRevisionKey(p.Slug, upload.digest)
-		if err := g.blobs.Put(c.UserContext(), key, bytes.NewReader(upload.data)); err != nil {
+		if err := g.blobs.Put(c.Context(), key, bytes.NewReader(upload.data)); err != nil {
 			return fiber.NewError(http.StatusInternalServerError, err.Error())
 		}
 		if err := g.sourceMaps.UpsertSourceMapArtifact(
-			c.UserContext(),
+			c.Context(),
 			p.ID,
 			release,
 			upload.filename,
@@ -109,19 +109,19 @@ func (g *Gateway) uploadSourceMaps(c *fiber.Ctx) error {
 		JSON(fiber.Map{"release": release, "uploaded": len(uploads), "size": incomingBytes})
 }
 
-func (g *Gateway) listSourceMapReleases(c *fiber.Ctx) error {
+func (g *Gateway) listSourceMapReleases(c fiber.Ctx) error {
 	if g.sourceMaps == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "source map storage unavailable"})
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	releases, err := g.sourceMaps.ListSourceMapReleases(c.UserContext(), currentProject(c).ID, limit)
+	releases, err := g.sourceMaps.ListSourceMapReleases(c.Context(), currentProject(c).ID, limit)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(fiber.Map{"releases": releases})
 }
 
-func (g *Gateway) deleteSourceMaps(c *fiber.Ctx) error {
+func (g *Gateway) deleteSourceMaps(c fiber.Ctx) error {
 	if g.sourceMaps == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "source map storage unavailable"})
 	}
@@ -130,7 +130,7 @@ func (g *Gateway) deleteSourceMaps(c *fiber.Ctx) error {
 		return badRequest(c)
 	}
 	p := currentProject(c)
-	if err := g.sourceMaps.DeleteSourceMapArtifacts(c.UserContext(), p.ID, release); err != nil {
+	if err := g.sourceMaps.DeleteSourceMapArtifacts(c.Context(), p.ID, release); err != nil {
 		return apiError(c, err)
 	}
 	return c.SendStatus(http.StatusNoContent)

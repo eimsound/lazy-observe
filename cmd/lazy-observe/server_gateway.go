@@ -127,9 +127,9 @@ func startGateway(
 		return nil, err
 	}
 	serverErr := make(chan error, 2)
-	go func() { serverErr <- gw.App().Listener(listener) }()
+	go func() { serverErr <- gw.Serve(listener) }()
 	if internal := loopback.take(); internal != nil {
-		go func() { serverErr <- gw.App().Listener(internal) }()
+		go func() { serverErr <- gw.Serve(internal) }()
 	}
 	gw.MarkReady()
 	logGatewayReady(cfg, logger)

@@ -14,7 +14,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/scrape"
 	sharedstate "github.com/eimsound/lazy-observe/internal/state"
 	lo "github.com/eimsound/lazy-observe/sdk/go"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 type selfMonitoring struct {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/ai"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/gofiber/fiber/v3"
 )
 
 type assistantFakeAI struct {
@@ -394,7 +395,7 @@ func assistantRequest(t *testing.T, app httpTestApp, cookie *http.Cookie, path, 
 }
 
 type httpTestApp interface {
-	Test(*http.Request, ...int) (*http.Response, error)
+	Test(*http.Request, ...fiber.TestConfig) (*http.Response, error)
 }
 
 func mustCreateDefaultProject(t *testing.T, store *meta.Store) {

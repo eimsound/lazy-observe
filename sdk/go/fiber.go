@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
@@ -20,7 +20,8 @@ var httpServerRequestDurationBucketsSeconds = []float64{
 	0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
 }
 
-// Fiber returns explicit Fiber v2 HTTP server instrumentation.
+// Fiber returns explicit Fiber v3 HTTP server instrumentation. Fiber v2 is not
+// supported: the handler takes the v3 fiber.Ctx interface.
 //
 // Without fiber.Config.Immutable, Fiber's request accessors (Method, Path,
 // Hostname, Get, Route fallbacks, ...) return strings that borrow pooled request
@@ -44,11 +45,11 @@ func (c *Client) Fiber() fiber.Handler {
 	)
 	tracer := c.tracer.Tracer(instrumentationName + "/fiber")
 
-	return func(fc *fiber.Ctx) (returnErr error) {
+	return func(fc fiber.Ctx) (returnErr error) {
 		start := time.Now()
 		method := strings.Clone(fc.Method())
 		path := strings.Clone(fc.Path())
-		parent := c.propagator.Extract(fc.UserContext(), fiberHeaderCarrier{ctx: fc})
+		parent := c.propagator.Extract(fc.Context(), fiberHeaderCarrier{ctx: fc})
 		spanAttrs := []attribute.KeyValue{
 			attribute.String("http.request.method", method),
 			attribute.String("url.scheme", requestScheme(fc)),
@@ -63,7 +64,7 @@ func (c *Client) Fiber() fiber.Handler {
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(spanAttrs...),
 		)
-		fc.SetUserContext(ctx)
+		fc.SetContext(ctx)
 		activeAttrs := metric.WithAttributes(attribute.String("http.request.method", method))
 		active.Add(ctx, 1, activeAttrs)
 
@@ -146,12 +147,13 @@ func fiberErrorTags(method, route string, status int) map[string]string {
 
 // fiberRequestURL builds a fresh string by concatenation, so it never aliases the
 // request buffers it reads from.
-func fiberRequestURL(c *fiber.Ctx) string {
+func fiberRequestURL(c fiber.Ctx) string {
 	return requestScheme(c) + "://" + c.Hostname() + c.Path()
 }
 
-func requestScheme(c *fiber.Ctx) string {
-	if c.Protocol() == "https" {
+func requestScheme(c fiber.Ctx) string {
+	// Fiber v3 Protocol() is the HTTP version ("HTTP/1.1"); Scheme() is http or https.
+	if c.Scheme() == "https" {
 		return "https"
 	}
 	if forwarded := c.Get(fiber.HeaderXForwardedProto); forwarded != "" {
@@ -160,7 +162,7 @@ func requestScheme(c *fiber.Ctx) string {
 	return "http"
 }
 
-type fiberHeaderCarrier struct{ ctx *fiber.Ctx }
+type fiberHeaderCarrier struct{ ctx fiber.Ctx }
 
 // Get copies the header: propagators keep parsed values (for example
 // tracestate members) in the span context, which is exported after the request.
@@ -170,7 +172,9 @@ func (c fiberHeaderCarrier) Set(key, value string) { c.ctx.Set(key, value) }
 
 func (c fiberHeaderCarrier) Keys() []string {
 	keys := make([]string, 0, c.ctx.Request().Header.Len())
-	c.ctx.Request().Header.VisitAll(func(key, _ []byte) { keys = append(keys, string(key)) })
+	for key := range c.ctx.Request().Header.All() {
+		keys = append(keys, string(key))
+	}
 	return keys
 }
 

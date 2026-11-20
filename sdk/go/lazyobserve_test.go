@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"go.opentelemetry.io/otel/codes"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
@@ -85,10 +85,10 @@ func TestFiberUsesHTTPServerDurationBuckets(t *testing.T) {
 		cfg: Config{ServiceName: "duration-bucket-test"}, meter: provider, tracer: tracenoop.NewTracerProvider(),
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), propagator: propagation.TraceContext{},
 	}
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	app.Use(client.Fiber())
-	app.Get("/orders/:id", func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
-	resp, err := app.Test(httptest.NewRequest("GET", "/orders/42", nil), -1)
+	app.Get("/orders/:id", func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
+	resp, err := app.Test(httptest.NewRequest("GET", "/orders/42", nil), fiber.TestConfig{Timeout: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,10 +147,10 @@ func TestFiberPanicCapture(t *testing.T) {
 		),
 		propagator: propagation.TraceContext{},
 	}
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	app.Use(client.Fiber())
-	app.Get("/panic", func(*fiber.Ctx) error { panic("boom") })
-	resp, err := app.Test(httptest.NewRequest("GET", "/panic", nil), -1)
+	app.Get("/panic", func(fiber.Ctx) error { panic("boom") })
+	resp, err := app.Test(httptest.NewRequest("GET", "/panic", nil), fiber.TestConfig{Timeout: 0})
 	if err != nil {
 		t.Fatal(err)
 	}

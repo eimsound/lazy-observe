@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/valyala/fasthttp"
 )
 
@@ -24,7 +24,7 @@ var errDecodedBodyTooLarge = errors.New("decoded request body exceeds limit")
 // body and no Content-Encoding header, so proxied requests also stay
 // self-consistent. A single coding the gateway does not decode (for example
 // snappy on Prometheus remote-write) is left for its handler.
-func boundedRequestDecoding(c *fiber.Ctx) error {
+func boundedRequestDecoding(c fiber.Ctx) error {
 	header := strings.TrimSpace(string(c.Request().Header.Peek(fiber.HeaderContentEncoding)))
 	if header == "" {
 		return c.Next()
@@ -73,7 +73,7 @@ func boundedRequestDecoding(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-func unsupportedContentEncoding(c *fiber.Ctx) error {
+func unsupportedContentEncoding(c fiber.Ctx) error {
 	return c.Status(fiber.StatusUnsupportedMediaType).
 		JSON(fiber.Map{"error": "unsupported Content-Encoding"})
 }
@@ -123,3 +123,15 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 var _ io.Writer = (*limitedBuffer)(nil)
+
+// requestBody returns the request body exactly as boundedRequestDecoding left
+// it. Handlers must not use Ctx.Body: Fiber v3's Body decodes Content-Encoding
+// a second time, and for a coding it cannot undo (snappy on Prometheus
+// remote-write) it answers 415 or 501 and returns the error text in place of
+// the bytes. It would also decode a single zstd body that the proxy forwards
+// with its Content-Encoding header intact. Reading fasthttp's raw body keeps
+// the v2 contract. GetBytes detaches the slice when the app is Immutable, as
+// Ctx.Body did, because fasthttp reuses the buffer for the next request.
+func requestBody(c fiber.Ctx) []byte {
+	return c.App().GetBytes(c.Request().Body())
+}

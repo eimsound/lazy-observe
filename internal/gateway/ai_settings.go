@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 
 	"github.com/eimsound/lazy-observe/internal/ai"
 	"github.com/eimsound/lazy-observe/internal/meta"
@@ -183,7 +183,7 @@ type aiSettingsWire struct {
 	ClearAPIKey bool    `json:"clear_api_key"`
 }
 
-func (g *Gateway) aiSettingsGet(c *fiber.Ctx) error {
+func (g *Gateway) aiSettingsGet(c fiber.Ctx) error {
 	m := g.ai
 	if m == nil || m.store == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -203,7 +203,7 @@ func (g *Gateway) aiSettingsGet(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) aiSettingsPut(c *fiber.Ctx) error {
+func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 	m := g.ai
 	if m == nil || m.store == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -211,7 +211,7 @@ func (g *Gateway) aiSettingsPut(c *fiber.Ctx) error {
 		})
 	}
 	var body aiSettingsWire
-	if err := c.BodyParser(&body); err != nil {
+	if err := c.Bind().Body(&body); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 	actor := ""
@@ -223,7 +223,7 @@ func (g *Gateway) aiSettingsPut(c *fiber.Ctx) error {
 	// The merged values outlive this request in the running snapshot and AI
 	// client, so copy them: BodyParser fills form-encoded fields with strings
 	// that borrow Fiber's reusable request buffer.
-	stored, ok, err := m.store.GetAISettings(c.UserContext())
+	stored, ok, err := m.store.GetAISettings(c.Context())
 	if err != nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "read AI settings failed"})
 	}
@@ -276,7 +276,7 @@ func (g *Gateway) aiSettingsPut(c *fiber.Ctx) error {
 	}
 	next.UpdatedAt = m.now().UTC()
 	next.UpdatedBy = actor
-	if err := m.store.UpsertAISettings(c.UserContext(), next); err != nil {
+	if err := m.store.UpsertAISettings(c.Context(), next); err != nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "save AI settings failed"})
 	}
 

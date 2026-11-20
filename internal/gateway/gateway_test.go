@@ -12,15 +12,16 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/storage"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 func TestSelfMonitoringInstrumentationSkipsIngestAndInternalToken(t *testing.T) {
 	var observed int
-	instrumentation := func(c *fiber.Ctx) error {
+	instrumentation := func(c fiber.Ctx) error {
 		observed++
 		return c.Next()
 	}
@@ -79,7 +80,7 @@ func TestMCPAuthenticationRequiresBearer(t *testing.T) {
 			if test.header != "" {
 				req.Header.Set("Authorization", "Bearer "+test.header)
 			}
-			resp, err := app.Test(req, 5000)
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 			if err != nil || resp.StatusCode != test.want {
 				t.Fatalf("status=%d want=%d err=%v", resp.StatusCode, test.want, err)
 			}
