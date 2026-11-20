@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -18,10 +19,14 @@ import (
 )
 
 const (
-	performanceDefaultWindow = 24 * time.Hour
-	performanceMaxWindow     = 7 * 24 * time.Hour
-	performanceDefaultStep   = 5 * time.Minute
-	performanceMaxBuckets    = 2_000
+	performanceDefaultWindow   = 24 * time.Hour
+	performanceMinWindow       = time.Second
+	performanceMaxWindow       = 7 * 24 * time.Hour
+	performanceDefaultStep     = 5 * time.Minute
+	performanceMaxBuckets      = 2_000
+	performanceQueryTimeout    = 15 * time.Second
+	performanceMaxResponseBody = 16 << 20
+	performanceMaxEndpoints    = 200
 
 	performanceDurationBucketMetric = "http.server.request.duration_bucket"
 	performanceDurationCountMetric  = "http.server.request.duration_count"
@@ -88,9 +93,10 @@ type performanceMetricQuery struct {
 }
 
 type performanceMetricResult struct {
-	query  performanceMetricQuery
-	series []performanceMetricSeries
-	err    error
+	query     performanceMetricQuery
+	series    []performanceMetricSeries
+	truncated bool
+	err       error
 }
 
 type performanceKey struct {
@@ -99,9 +105,73 @@ type performanceKey struct {
 	route   string
 }
 
+type rawPerformanceKey struct {
+	service string
+	method  string
+	route   string
+}
+
+type rawMetricValues struct {
+	throughput    float64
+	hasThroughput bool
+	errorRate     float64
+	hasErrorRate  bool
+	p50           float64
+	p95           float64
+	p99           float64
+}
+
+type rawSeriesAccumulator struct {
+	normalized performanceKey
+	summary    rawMetricValues
+	points     map[int64]*rawMetricValues
+}
+
+type mergedMetricAccumulator struct {
+	throughputSum        float64
+	errorRateWeightedSum float64
+	errorRateWeightSum   float64
+	errorRateMax         float64
+	p50Max               float64
+	p95Max               float64
+	p99Max               float64
+}
+
+func (m *mergedMetricAccumulator) add(v rawMetricValues) {
+	if v.hasThroughput {
+		m.throughputSum += v.throughput
+	}
+	if v.hasErrorRate {
+		if v.hasThroughput && v.throughput > 0 {
+			m.errorRateWeightedSum += v.errorRate * v.throughput
+			m.errorRateWeightSum += v.throughput
+		}
+		if v.errorRate > m.errorRateMax {
+			m.errorRateMax = v.errorRate
+		}
+	}
+	if v.p50 > m.p50Max {
+		m.p50Max = v.p50
+	}
+	if v.p95 > m.p95Max {
+		m.p95Max = v.p95
+	}
+	if v.p99 > m.p99Max {
+		m.p99Max = v.p99
+	}
+}
+
+func (m *mergedMetricAccumulator) errorRate() float64 {
+	if m.errorRateWeightSum > 0 {
+		return m.errorRateWeightedSum / m.errorRateWeightSum
+	}
+	return m.errorRateMax
+}
+
 type performanceMetricAccumulator struct {
 	endpoint performanceEndpoint
-	points   map[int64]*performancePoint
+	summary  mergedMetricAccumulator
+	points   map[int64]*mergedMetricAccumulator
 }
 
 func (g *Gateway) performanceEndpoints(c fiber.Ctx) error {
@@ -140,9 +210,10 @@ func (g *Gateway) performanceRange(c fiber.Ctx) (time.Time, time.Time, time.Dura
 	} else if strings.TrimSpace(c.Query("end")) != "" {
 		start = end.Add(-performanceDefaultWindow)
 	}
-	if !end.After(start) || end.Sub(start) > performanceMaxWindow {
+	window := end.Sub(start)
+	if window < performanceMinWindow || window > performanceMaxWindow {
 		_ = c.Status(http.StatusBadRequest).
-			JSON(fiber.Map{"error": "time range must be positive and no longer than 7d"})
+			JSON(fiber.Map{"error": "time range must be between 1s and 7d"})
 		return time.Time{}, time.Time{}, 0, false
 	}
 	step := performanceDefaultStep
@@ -155,7 +226,7 @@ func (g *Gateway) performanceRange(c fiber.Ctx) (time.Time, time.Time, time.Dura
 		}
 		step = time.Duration(seconds) * time.Second
 	}
-	if buckets := int(math.Ceil(float64(end.Sub(start)) / float64(step))); buckets > performanceMaxBuckets {
+	if buckets := int(math.Ceil(float64(window) / float64(step))); buckets > performanceMaxBuckets {
 		_ = c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "time range produces too many buckets"})
 		return time.Time{}, time.Time{}, 0, false
 	}
@@ -192,35 +263,19 @@ func (g *Gateway) queryPerformanceMetrics(
 		},
 	}
 
-	queryContext, cancel := context.WithCancel(ctx)
+	queryContext, cancel := context.WithTimeout(ctx, performanceQueryTimeout)
 	defer cancel()
 	results := make(chan performanceMetricResult, len(queries))
 	for _, query := range queries {
 		go func(query performanceMetricQuery) {
-			values := url.Values{"query": {query.expression}}
-			path := "/api/v1/query"
-			resultType := "vector"
-			if query.rangeQuery {
-				path = "/api/v1/query_range"
-				resultType = "matrix"
-				values.Set("start", start.Format(time.RFC3339Nano))
-				values.Set("end", end.Format(time.RFC3339Nano))
-				values.Set("step", strconv.FormatInt(int64(step/time.Second), 10))
-			} else {
-				values.Set("time", end.Format(time.RFC3339Nano))
-			}
-			body, err := g.isolatedQuery(queryContext, project, "metrics", path, values)
-			if err != nil {
-				results <- performanceMetricResult{query: query, err: err}
-				return
-			}
-			series, err := decodePerformanceMetricResponse(body, resultType)
-			results <- performanceMetricResult{query: query, series: series, err: err}
+			series, truncated, err := g.executePerformanceQuery(queryContext, project, query, start, end, step)
+			results <- performanceMetricResult{query: query, series: series, truncated: truncated, err: err}
 		}(query)
 	}
 
-	accumulators := make(map[performanceKey]*performanceMetricAccumulator)
+	rawAccumulators := make(map[rawPerformanceKey]*rawSeriesAccumulator)
 	var firstErr error
+	truncated := false
 	for range queries {
 		result := <-results
 		if result.err != nil {
@@ -230,9 +285,12 @@ func (g *Gateway) queryPerformanceMetrics(
 			}
 			continue
 		}
+		if result.truncated {
+			truncated = true
+		}
 		if result.query.rangeQuery {
 			if err := applyPerformanceMatrix(
-				accumulators,
+				rawAccumulators,
 				result.query.kind,
 				result.series,
 			); err != nil &&
@@ -243,7 +301,7 @@ func (g *Gateway) queryPerformanceMetrics(
 			continue
 		}
 		if err := applyPerformanceVector(
-			accumulators,
+			rawAccumulators,
 			result.query.kind,
 			result.series,
 		); err != nil &&
@@ -255,16 +313,64 @@ func (g *Gateway) queryPerformanceMetrics(
 	if firstErr != nil {
 		return performanceResponse{}, firstErr
 	}
-	return buildPerformanceResponse(accumulators, start, end, step), nil
+	accumulators := mergeRawPerformanceAccumulators(rawAccumulators)
+	return buildPerformanceResponse(accumulators, start, end, step, truncated), nil
+}
+
+func (g *Gateway) executePerformanceQuery(
+	ctx context.Context,
+	project meta.ProjectInfo,
+	query performanceMetricQuery,
+	start, end time.Time,
+	step time.Duration,
+) ([]performanceMetricSeries, bool, error) {
+	run := func(expression string) ([]performanceMetricSeries, error) {
+		values := url.Values{"query": {expression}}
+		path := "/api/v1/query"
+		resultType := "vector"
+		if query.rangeQuery {
+			path = "/api/v1/query_range"
+			resultType = "matrix"
+			values.Set("start", start.Format(time.RFC3339Nano))
+			values.Set("end", end.Format(time.RFC3339Nano))
+			values.Set("step", strconv.FormatInt(int64(step/time.Second), 10))
+		} else {
+			values.Set("time", end.Format(time.RFC3339Nano))
+		}
+		body, err := g.isolatedQueryWithLimit(ctx, project, "metrics", path, values, performanceMaxResponseBody)
+		if err != nil {
+			return nil, err
+		}
+		return decodePerformanceMetricResponse(body, resultType)
+	}
+	series, err := run(query.expression)
+	if errors.Is(err, errQueryResponseTooLarge) {
+		// Degrade gracefully on high-cardinality responses by bounding returned
+		// series with topk and flagging Truncated instead of failing with 502.
+		topkLimit := performanceMaxEndpoints
+		if query.kind == performanceQuantiles {
+			topkLimit = performanceMaxEndpoints * 3
+		}
+		boundedExpr := fmt.Sprintf("topk(%d, %s)", topkLimit, query.expression)
+		series, err = run(boundedExpr)
+		if err != nil {
+			return nil, false, err
+		}
+		return series, true, nil
+	}
+	return series, false, err
 }
 
 func performanceTrendRateWindow(window, step time.Duration) time.Duration {
-	rateWindow := 4 * step
+	rateWindow := step
 	if rateWindow < time.Minute {
 		rateWindow = time.Minute
 	}
 	if rateWindow > window {
-		return window
+		rateWindow = window
+	}
+	if rateWindow < performanceMinWindow {
+		return performanceMinWindow
 	}
 	return rateWindow
 }
@@ -362,12 +468,12 @@ func decodePerformanceMetricResponse(body []byte, resultType string) ([]performa
 }
 
 func applyPerformanceVector(
-	accumulators map[performanceKey]*performanceMetricAccumulator,
+	accumulators map[rawPerformanceKey]*rawSeriesAccumulator,
 	kind performanceMetricKind,
 	series []performanceMetricSeries,
 ) error {
 	for _, item := range series {
-		key, ok := performanceMetricKey(item.Metric)
+		rawKey, normKey, ok := performanceMetricKeys(item.Metric)
 		if !ok {
 			continue
 		}
@@ -378,23 +484,23 @@ func applyPerformanceVector(
 		if !valid {
 			continue
 		}
-		accumulator := performanceAccumulator(accumulators, key)
-		assignPerformanceMetric(&accumulator.endpoint, nil, kind, item.Metric["quantile"], value)
+		acc := rawPerformanceAccumulator(accumulators, rawKey, normKey)
+		assignRawMetric(&acc.summary, kind, item.Metric["quantile"], value)
 	}
 	return nil
 }
 
 func applyPerformanceMatrix(
-	accumulators map[performanceKey]*performanceMetricAccumulator,
+	accumulators map[rawPerformanceKey]*rawSeriesAccumulator,
 	kind performanceMetricKind,
 	series []performanceMetricSeries,
 ) error {
 	for _, item := range series {
-		key, ok := performanceMetricKey(item.Metric)
+		rawKey, normKey, ok := performanceMetricKeys(item.Metric)
 		if !ok {
 			continue
 		}
-		accumulator := performanceAccumulator(accumulators, key)
+		acc := rawPerformanceAccumulator(accumulators, rawKey, normKey)
 		for _, sample := range item.Values {
 			timestamp, value, valid, err := decodePerformanceSample(sample)
 			if err != nil {
@@ -403,25 +509,30 @@ func applyPerformanceMatrix(
 			if !valid {
 				continue
 			}
-			point := accumulator.points[timestamp]
+			point := acc.points[timestamp]
 			if point == nil {
-				point = &performancePoint{Time: timestamp}
-				accumulator.points[timestamp] = point
+				point = &rawMetricValues{}
+				acc.points[timestamp] = point
 			}
-			assignPerformanceMetric(nil, point, kind, item.Metric["quantile"], value)
+			assignRawMetric(point, kind, item.Metric["quantile"], value)
 		}
 	}
 	return nil
 }
 
-func performanceMetricKey(labels map[string]string) (performanceKey, bool) {
+func performanceMetricKeys(labels map[string]string) (rawPerformanceKey, performanceKey, bool) {
+	rawKey := rawPerformanceKey{
+		service: labels["service.name"],
+		method:  labels["http.request.method"],
+		route:   labels["http.route"],
+	}
 	key := performanceKey{
-		service: strings.TrimSpace(labels["service.name"]),
-		method:  strings.ToUpper(strings.TrimSpace(labels["http.request.method"])),
-		route:   strings.TrimSpace(labels["http.route"]),
+		service: strings.TrimSpace(rawKey.service),
+		method:  strings.ToUpper(strings.TrimSpace(rawKey.method)),
+		route:   strings.TrimSpace(rawKey.route),
 	}
 	if key.route == "" || key.route == "-" {
-		return performanceKey{}, false
+		return rawPerformanceKey{}, performanceKey{}, false
 	}
 	if key.service == "" || key.service == "-" {
 		key.service = "unknown"
@@ -429,27 +540,54 @@ func performanceMetricKey(labels map[string]string) (performanceKey, bool) {
 	if key.method == "" || key.method == "-" {
 		key.method = "UNKNOWN"
 	}
-	return key, true
+	return rawKey, key, true
 }
 
-func performanceAccumulator(
-	accumulators map[performanceKey]*performanceMetricAccumulator,
-	key performanceKey,
-) *performanceMetricAccumulator {
-	accumulator := accumulators[key]
-	if accumulator == nil {
-		accumulator = &performanceMetricAccumulator{
-			endpoint: performanceEndpoint{
-				Service: key.service,
-				Method:  key.method,
-				Route:   key.route,
-				Series:  []performancePoint{},
-			},
-			points: make(map[int64]*performancePoint),
+func rawPerformanceAccumulator(
+	accumulators map[rawPerformanceKey]*rawSeriesAccumulator,
+	rawKey rawPerformanceKey,
+	normKey performanceKey,
+) *rawSeriesAccumulator {
+	acc := accumulators[rawKey]
+	if acc == nil {
+		acc = &rawSeriesAccumulator{
+			normalized: normKey,
+			points:     make(map[int64]*rawMetricValues),
 		}
-		accumulators[key] = accumulator
+		accumulators[rawKey] = acc
 	}
-	return accumulator
+	return acc
+}
+
+func mergeRawPerformanceAccumulators(
+	rawAccumulators map[rawPerformanceKey]*rawSeriesAccumulator,
+) map[performanceKey]*performanceMetricAccumulator {
+	merged := make(map[performanceKey]*performanceMetricAccumulator, len(rawAccumulators))
+	for _, raw := range rawAccumulators {
+		acc := merged[raw.normalized]
+		if acc == nil {
+			acc = &performanceMetricAccumulator{
+				endpoint: performanceEndpoint{
+					Service: raw.normalized.service,
+					Method:  raw.normalized.method,
+					Route:   raw.normalized.route,
+					Series:  []performancePoint{},
+				},
+				points: make(map[int64]*mergedMetricAccumulator),
+			}
+			merged[raw.normalized] = acc
+		}
+		acc.summary.add(raw.summary)
+		for ts, pt := range raw.points {
+			mpt := acc.points[ts]
+			if mpt == nil {
+				mpt = &mergedMetricAccumulator{}
+				acc.points[ts] = mpt
+			}
+			mpt.add(*pt)
+		}
+	}
+	return merged
 }
 
 func decodePerformanceSample(sample []json.RawMessage) (int64, float64, bool, error) {
@@ -464,7 +602,7 @@ func decodePerformanceSample(sample []json.RawMessage) (int64, float64, bool, er
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("decode metrics value: %w", err)
 	}
-	if math.IsNaN(value) || math.IsInf(value, 0) {
+	if math.IsNaN(timestamp) || math.IsInf(timestamp, 0) || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0, 0, false, nil
 	}
 	return int64(math.Round(timestamp * 1_000)), value, true, nil
@@ -475,48 +613,35 @@ func parsePerformanceFloat(raw json.RawMessage) (float64, error) {
 	return strconv.ParseFloat(value, 64)
 }
 
-func assignPerformanceMetric(
-	endpoint *performanceEndpoint,
-	point *performancePoint,
+func assignRawMetric(
+	dst *rawMetricValues,
 	kind performanceMetricKind,
 	quantile string,
 	value float64,
 ) {
 	if kind == performanceThroughput {
-		if endpoint != nil {
-			endpoint.Throughput = value
-		} else {
-			point.Throughput = value
-		}
+		dst.throughput += value
+		dst.hasThroughput = true
 		return
 	}
 	if kind == performanceErrorRate {
-		if endpoint != nil {
-			endpoint.ErrorRate = value
-		} else {
-			point.ErrorRate = value
-		}
+		dst.errorRate = value
+		dst.hasErrorRate = true
 		return
 	}
 	value *= float64(time.Second / time.Millisecond)
 	switch quantile {
 	case "0.5":
-		if endpoint != nil {
-			endpoint.P50 = value
-		} else {
-			point.P50 = value
+		if value > dst.p50 {
+			dst.p50 = value
 		}
 	case "0.95":
-		if endpoint != nil {
-			endpoint.P95 = value
-		} else {
-			point.P95 = value
+		if value > dst.p95 {
+			dst.p95 = value
 		}
 	case "0.99":
-		if endpoint != nil {
-			endpoint.P99 = value
-		} else {
-			point.P99 = value
+		if value > dst.p99 {
+			dst.p99 = value
 		}
 	}
 }
@@ -525,16 +650,31 @@ func buildPerformanceResponse(
 	accumulators map[performanceKey]*performanceMetricAccumulator,
 	start, end time.Time,
 	step time.Duration,
+	truncated bool,
 ) performanceResponse {
 	endpoints := make([]performanceEndpoint, 0, len(accumulators))
 	for _, accumulator := range accumulators {
+		accumulator.endpoint.Throughput = accumulator.summary.throughputSum
+		accumulator.endpoint.ErrorRate = accumulator.summary.errorRate()
+		accumulator.endpoint.P50 = accumulator.summary.p50Max
+		accumulator.endpoint.P95 = accumulator.summary.p95Max
+		accumulator.endpoint.P99 = accumulator.summary.p99Max
+
 		timestamps := make([]int64, 0, len(accumulator.points))
 		for timestamp := range accumulator.points {
 			timestamps = append(timestamps, timestamp)
 		}
 		sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
 		for _, timestamp := range timestamps {
-			accumulator.endpoint.Series = append(accumulator.endpoint.Series, *accumulator.points[timestamp])
+			pt := accumulator.points[timestamp]
+			accumulator.endpoint.Series = append(accumulator.endpoint.Series, performancePoint{
+				Time:       timestamp,
+				Throughput: pt.throughputSum,
+				P50:        pt.p50Max,
+				P95:        pt.p95Max,
+				P99:        pt.p99Max,
+				ErrorRate:  pt.errorRate(),
+			})
 		}
 		endpoints = append(endpoints, accumulator.endpoint)
 	}
@@ -550,11 +690,15 @@ func buildPerformanceResponse(
 		}
 		return endpoints[i].Method < endpoints[j].Method
 	})
+	if len(endpoints) > performanceMaxEndpoints {
+		endpoints = endpoints[:performanceMaxEndpoints]
+		truncated = true
+	}
 	return performanceResponse{
 		Start:       start.UnixMilli(),
 		End:         end.UnixMilli(),
 		StepSeconds: int64(step / time.Second),
 		Endpoints:   endpoints,
-		Truncated:   false,
+		Truncated:   truncated,
 	}
 }

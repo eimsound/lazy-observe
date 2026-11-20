@@ -82,6 +82,7 @@ node_filesystem_size_bytes{mountpoint="/",fstype="ext4"} 1000
 		"--storage-startup-timeout",
 		"30s",
 	)
+	cmd.Env = append(os.Environ(), "LO_SECURITY_OUTBOUND_ALLOWLIST=127.0.0.1/32")
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

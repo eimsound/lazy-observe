@@ -513,8 +513,25 @@ func (s *Supervisor) ReloadVMAgent() error {
 		case <-process.done:
 			return errors.New("vmagent is restarting")
 		default:
-			return process.cmd.Process.Signal(syscall.SIGHUP)
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+managed.addr+"/-/reload", nil)
+		if err != nil {
+			return err
+		}
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("reload vmagent: %w", err)
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("reload vmagent status=%d body=%q", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		return nil
 	}
 	return errors.New("vmagent is not managed")
 }

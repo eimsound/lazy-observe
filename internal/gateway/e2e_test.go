@@ -444,7 +444,7 @@ func TestStorageGatewayE2E(t *testing.T) {
 	t.Log("error AC2-AC5: grouping/type split, lifecycle, raw trace context, isolation, and Web Vitals passed")
 
 	metricName := fmt.Sprintf("lazy_observe_e2e_%d", time.Now().UnixNano())
-	postProto(t, client, base+"/v1/metrics", token1, metricPayload(metricName, 111))
+	postProto(t, client, base+"/v1/metrics", token1, metricPayloadWithSpoofedProject(metricName, 111, "p2"))
 	postProto(t, client, base+"/v1/metrics", token2, metricPayload(metricName, 222))
 	var metricBody []byte
 	waitFor(t, 15*time.Second, func() bool {
@@ -455,6 +455,18 @@ func TestStorageGatewayE2E(t *testing.T) {
 			read2,
 		)
 		return metricValuesAre(metricBody, "222")
+	})
+	if strings.Contains(string(metricBody), `"111"`) {
+		t.Fatalf("spoofed OTLP project.id/project_id leaked token1 sample into p2: %s", metricBody)
+	}
+	waitFor(t, 15*time.Second, func() bool {
+		defaultBody := authorizedGet(
+			t,
+			client,
+			base+"/api/v1/query?"+url.Values{"query": []string{metricName}}.Encode(),
+			read1,
+		)
+		return metricValuesAre(defaultBody, "111") && strings.Contains(string(defaultBody), `"project_id":"default"`)
 	})
 	metricBody = sessionGet(
 		t,
@@ -1472,6 +1484,33 @@ func metricPayload(name string, value float64) []byte {
 			Name: name,
 			Data: &metricsdata.Metric_Gauge{Gauge: &metricsdata.Gauge{DataPoints: []*metricsdata.NumberDataPoint{{
 				TimeUnixNano: now, Value: &metricsdata.NumberDataPoint_AsDouble{AsDouble: value},
+			}}}},
+		}}}},
+	}}}
+	b, _ := proto.Marshal(req)
+	return b
+}
+
+func metricPayloadWithSpoofedProject(name string, value float64, spoofedProject string) []byte {
+	now := uint64(time.Now().UnixNano())
+	spoofAttrs := []*commonpb.KeyValue{
+		{
+			Key:   "project_id",
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: spoofedProject}},
+		},
+		{
+			Key:   "project.id",
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: spoofedProject}},
+		},
+	}
+	req := &metricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricsdata.ResourceMetrics{{
+		Resource: &resourcepb.Resource{Attributes: spoofAttrs},
+		ScopeMetrics: []*metricsdata.ScopeMetrics{{Metrics: []*metricsdata.Metric{{
+			Name: name,
+			Data: &metricsdata.Metric_Gauge{Gauge: &metricsdata.Gauge{DataPoints: []*metricsdata.NumberDataPoint{{
+				TimeUnixNano: now,
+				Value:        &metricsdata.NumberDataPoint_AsDouble{AsDouble: value},
+				Attributes:   spoofAttrs,
 			}}}},
 		}}}},
 	}}}
