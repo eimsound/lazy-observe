@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -86,5 +88,23 @@ func TestEffectiveSecureSessionCookieEnablesWithNativeTLS(t *testing.T) {
 	cfg.Security.TLSKey = "/tmp/key.pem"
 	if !effectiveSecureSessionCookie(cfg) {
 		t.Fatal("native TLS should automatically enable SecureSessionCookie")
+	}
+}
+
+func TestLoadLLMPricingUsesConfiguredOverrideFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pricing.json")
+	override := `[{"model_pattern":"custom-enterprise-model","input_per_1k":2.5,"output_per_1k":5.0,"currency":"USD"}]`
+	if err := os.WriteFile(path, []byte(override), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := appconfig.Defaults()
+	cfg.AI.PricingFile = path
+	table, err := loadLLMPricing(cfg)
+	if err != nil {
+		t.Fatalf("loadLLMPricing error=%v", err)
+	}
+	cost, unpriced := table.Cost("custom-enterprise-model", 1000, 1000)
+	if unpriced || cost != 7.5 {
+		t.Fatalf("cost=%v unpriced=%v want 7.5,false", cost, unpriced)
 	}
 }

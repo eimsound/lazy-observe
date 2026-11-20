@@ -136,11 +136,13 @@ security:
 # deepseek, ollama), optional base_url, model, and the API key. The key is
 # encrypted with the platform key above and never returned to the browser. AI
 # defaults to disabled and an unavailable provider never blocks core
-# ingest/query behavior. There is no ai: section in this file anymore.
+# ingest/query behavior. Only static LLM token pricing overrides live here.
+ai:
+  pricing_file: ""
 
 # Environment names use LO_ and upper-case field paths. Common examples:
 # LO_LISTEN, LO_DATA_DIR, LO_META_DB_URL, LO_META_MIGRATION_LOCK_TIMEOUT,
-# LO_STANDALONE, LO_STORAGE_BIN_DIR,
+# LO_STANDALONE, LO_STORAGE_BIN_DIR, LO_AI_PRICING_FILE,
 # LO_REDIS_ENABLED, LO_REDIS_ADDR, LO_REDIS_PASSWORD, LO_REDIS_DB, LO_REDIS_KEY_PREFIX,
 # LO_STORAGE_METRICS_KIND, LO_STORAGE_METRICS_QUERY_URL, LO_STORAGE_METRICS_INGEST_URL,
 # LO_STORAGE_METRICS_CLUSTER, LO_STORAGE_METRICS_TENANT_ACCOUNT_ID,
