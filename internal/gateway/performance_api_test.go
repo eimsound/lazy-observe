@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -433,4 +434,182 @@ func TestPerformanceEndpointsTruncatesHighCardinalityAndRejectsSubSecondWindow(t
 	if !got.Truncated || len(got.Endpoints) != performanceMaxEndpoints {
 		t.Fatalf("truncated=%v len=%d want true/%d", got.Truncated, len(got.Endpoints), performanceMaxEndpoints)
 	}
+}
+
+func TestPerformanceEndpointsDualModeMetricsPrometheusParityAndErrorSanitization(t *testing.T) {
+	start := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Minute)
+
+	runMode := func(mode storagepkg.MetricsKind) performanceResponse {
+		t.Helper()
+		var requests atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			q := r.URL.Query()
+			expr := q.Get("query")
+			if mode == storagepkg.MetricsPrometheus {
+				if q.Has("extra_filters[]") {
+					t.Errorf("prometheus mode sent extra_filters[]: %v", q)
+				}
+				if !strings.Contains(expr, `project_id="alpha"`) {
+					t.Errorf("prometheus mode missing project_id injection: %q", expr)
+				}
+			} else if got := q.Get("extra_filters[]"); got != `{project_id="alpha"}` {
+				t.Errorf("vm mode extra_filters[]=%q", got)
+			}
+
+			resultType := "vector"
+			if r.URL.Path == "/api/v1/query_range" {
+				resultType = "matrix"
+			}
+			var result []map[string]any
+			switch {
+			case strings.Contains(expr, "histogram_quantile"):
+				result = performanceQuantileFixture(resultType, start)
+			case strings.Contains(expr, `5..`):
+				result = performanceScalarFixture(resultType, start, 2.0/3.0, 0.5)
+			default:
+				result = performanceScalarFixture(resultType, start, 3.0/120.0, 2.0/60.0)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "success",
+				"data":   map[string]any{"resultType": resultType, "result": result},
+			})
+		}))
+		defer upstream.Close()
+
+		backend, err := storagepkg.New(mode, upstream.URL, upstream.URL, upstream.URL, upstream.URL, upstream.Client())
+		if err != nil {
+			t.Fatal(err)
+		}
+		app := newTestGateway(Config{
+			Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 42, Slug: "alpha"}},
+			Storage: backend,
+			Client:  upstream.Client(),
+			Now:     func() time.Time { return end },
+		}).App()
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/performance/endpoints?"+url.Values{
+			"start": {fmt.Sprint(start.Unix())},
+			"end":   {fmt.Sprint(end.Unix())},
+			"step":  {"60"},
+		}.Encode(), nil)
+		req.Header.Set("Authorization", "Bearer lou_valid")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("mode=%s status=%d body=%s", mode, resp.StatusCode, body)
+		}
+		if requests.Load() != 6 {
+			t.Fatalf("mode=%s requests=%d want=6", mode, requests.Load())
+		}
+		var out performanceResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	vmResp := runMode(storagepkg.MetricsVM)
+	promResp := runMode(storagepkg.MetricsPrometheus)
+	vmJSON, _ := json.Marshal(vmResp)
+	promJSON, _ := json.Marshal(promResp)
+	if string(vmJSON) != string(promJSON) {
+		t.Fatalf("MetricsPrometheus parity mismatch:\nVM:   %s\nProm: %s", vmJSON, promJSON)
+	}
+
+	// Verify oversized response triggers graceful topk(...) fallback via MetricsClient.
+	t.Run("oversized response falls back to topk and marks truncated", func(t *testing.T) {
+		var sawTopk atomic.Bool
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			expr := r.URL.Query().Get("query")
+			resultType := "vector"
+			if r.URL.Path == "/api/v1/query_range" {
+				resultType = "matrix"
+			}
+			if !strings.HasPrefix(expr, "topk(") {
+				// Return a payload exceeding performanceMaxResponseBody (16 MiB) on one query.
+				if resultType == "vector" && strings.Contains(expr, "histogram_quantiles") {
+					_, _ = io.WriteString(w, `{"status":"success","data":{"resultType":"vector","result":[`)
+					padding := strings.Repeat(" ", 1<<20)
+					for range 17 {
+						_, _ = io.WriteString(w, padding)
+					}
+					_, _ = io.WriteString(w, `]}}`)
+					return
+				}
+			} else {
+				sawTopk.Store(true)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "success",
+				"data":   map[string]any{"resultType": resultType, "result": []any{}},
+			})
+		}))
+		defer upstream.Close()
+
+		app := newTestGateway(Config{
+			Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 42, Slug: "alpha"}},
+			Metrics: upstream.URL,
+			Now:     func() time.Time { return end },
+		}).App()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/performance/endpoints?"+url.Values{
+			"start": {fmt.Sprint(start.Unix())},
+			"end":   {fmt.Sprint(end.Unix())},
+			"step":  {"60"},
+		}.Encode(), nil)
+		req.Header.Set("Authorization", "Bearer lou_valid")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var got performanceResponse
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK || !got.Truncated || !sawTopk.Load() {
+			t.Fatalf("status=%d truncated=%v sawTopk=%v", resp.StatusCode, got.Truncated, sawTopk.Load())
+		}
+	})
+
+	// Verify transport errors are sanitized and never leak internal metrics addresses.
+	t.Run("sanitizes internal backend address on failure", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		closedAddr := ln.Addr().String()
+		_ = ln.Close()
+
+		app := newTestGateway(Config{
+			Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 42, Slug: "alpha"}},
+			Metrics: "http://" + closedAddr,
+			Now:     func() time.Time { return end },
+		}).App()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/performance/endpoints?"+url.Values{
+			"start": {fmt.Sprint(start.Unix())},
+			"end":   {fmt.Sprint(end.Unix())},
+			"step":  {"60"},
+		}.Encode(), nil)
+		req.Header.Set("Authorization", "Bearer lou_valid")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status=%d want=502 body=%s", resp.StatusCode, raw)
+		}
+		for _, forbidden := range []string{closedAddr, "127.0.0.1", "http://", "connection refused"} {
+			if strings.Contains(string(raw), forbidden) {
+				t.Fatalf("performance error leaked %q: %s", forbidden, raw)
+			}
+		}
+	})
 }

@@ -137,9 +137,7 @@ func startScrapeService(
 				Logger:           logger,
 			},
 		)
-		if store != nil && store.IsClustered() {
-			go service.RunLeaderLoop(ctx, logger, scrape.DefaultLeaderSyncInterval)
-		}
+		go service.RunReconciler(ctx, logger, scrape.DefaultLeaderSyncInterval)
 		return service, ""
 	}
 	const unavailableReason = "scrape management is disabled: storage.metrics.ingest_url is not configured"

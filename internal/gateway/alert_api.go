@@ -293,13 +293,6 @@ func toAlertEventResponses(values []meta.AlertEventView) []alertEventResponse {
 	return out
 }
 
-func projectSlug(c fiber.Ctx) string {
-	slug := strings.TrimSpace(c.Get("X-LO-Project"))
-	if slug == "" {
-		slug = "default"
-	}
-	return slug
-}
 func (g *Gateway) alertingUnavailable(c fiber.Ctx) bool {
 	if g.alerts == nil {
 		_ = c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "alerting unavailable"})
@@ -319,7 +312,11 @@ func (g *Gateway) listAlertRules(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	v, e := g.alerts.ListRules(c.Context(), projectSlug(c))
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	v, e := g.alerts.ListRules(c.Context(), slug)
 	if e != nil {
 		return apiError(c, e)
 	}
@@ -327,6 +324,10 @@ func (g *Gateway) listAlertRules(c fiber.Ctx) error {
 }
 func (g *Gateway) createAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
+		return nil
+	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
 		return nil
 	}
 	var request alertRuleRequest
@@ -337,7 +338,7 @@ func (g *Gateway) createAlertRule(c fiber.Ctx) error {
 		(request.For != "" && alert.ValidateRuleFor(request.For) != nil) {
 		return badRequest(c)
 	}
-	in := request.input(projectSlug(c))
+	in := request.input(slug)
 	v, e := g.alerts.CreateRule(c.Context(), in)
 	if e != nil {
 		return alertAPIError(c, e)
@@ -352,13 +353,17 @@ func (g *Gateway) updateAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
 	var request alertRuleRequest
 	if c.Bind().Body(&request) != nil || !validAlertSignal(request.Signal, true) ||
 		(request.EvaluationEngine != "" && request.EvaluationEngine != "native") ||
 		(request.For != "" && alert.ValidateRuleFor(request.For) != nil) {
 		return badRequest(c)
 	}
-	in := request.input(projectSlug(c))
+	in := request.input(slug)
 	v, e := g.alerts.UpdateRule(c.Context(), id, in)
 	if e != nil {
 		return alertAPIError(c, e)
@@ -384,7 +389,11 @@ func (g *Gateway) deleteAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	if e := g.alerts.DeleteRule(c.Context(), projectSlug(c), id); e != nil {
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	if e := g.alerts.DeleteRule(c.Context(), slug, id); e != nil {
 		return apiError(c, e)
 	}
 	return c.SendStatus(fiber.StatusNoContent)
@@ -517,7 +526,11 @@ func (g *Gateway) listSilences(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	v, e := g.alerts.ListSilences(c.Context(), projectSlug(c))
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	v, e := g.alerts.ListSilences(c.Context(), slug)
 	if e != nil {
 		return apiError(c, e)
 	}
@@ -527,6 +540,10 @@ func (g *Gateway) createSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
 	var in alert.SilenceInput
 	if c.Bind().Body(&in) != nil || !validMatchers(in.Matchers) || in.StartsAt.IsZero() ||
 		!in.EndsAt.After(in.StartsAt) {
@@ -534,7 +551,7 @@ func (g *Gateway) createSilence(c fiber.Ctx) error {
 	}
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	in.Creator = u.Username
-	in.Project = projectSlug(c)
+	in.Project = slug
 	v, e := g.alerts.CreateSilence(c.Context(), in)
 	if e != nil {
 		return alertAPIError(c, e)
@@ -549,11 +566,15 @@ func (g *Gateway) updateSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
 	var in alert.SilenceInput
 	if c.Bind().Body(&in) != nil || (in.Matchers != nil && !validMatchers(in.Matchers)) {
 		return badRequest(c)
 	}
-	in.Project = projectSlug(c)
+	in.Project = slug
 	v, e := g.alerts.UpdateSilence(c.Context(), id, in)
 	if e != nil {
 		return alertAPIError(c, e)
@@ -568,13 +589,21 @@ func (g *Gateway) deleteSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	if e := g.alerts.DeleteSilence(c.Context(), projectSlug(c), id); e != nil {
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	if e := g.alerts.DeleteSilence(c.Context(), slug, id); e != nil {
 		return apiError(c, e)
 	}
 	return c.SendStatus(fiber.StatusNoContent)
 }
 func (g *Gateway) listAlerts(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
+		return nil
+	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
 		return nil
 	}
 	status := c.Query("status")
@@ -589,7 +618,7 @@ func (g *Gateway) listAlerts(c fiber.Ctx) error {
 		}
 		inhibited = &value
 	}
-	v, e := g.alerts.ListEvents(c.Context(), projectSlug(c), status, inhibited)
+	v, e := g.alerts.ListEvents(c.Context(), slug, status, inhibited)
 	if e != nil {
 		return apiError(c, e)
 	}
@@ -600,7 +629,11 @@ func (g *Gateway) listInhibitionRules(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	v, err := g.alerts.ListInhibitionRules(c.Context(), projectSlug(c))
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	v, err := g.alerts.ListInhibitionRules(c.Context(), slug)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -611,11 +644,15 @@ func (g *Gateway) createInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
 	var in alert.InhibitionRuleInput
 	if c.Bind().Body(&in) != nil || !validMatchers(in.SourceMatchers) || !validMatchers(in.TargetMatchers) {
 		return badRequest(c)
 	}
-	in.Project = projectSlug(c)
+	in.Project = slug
 	v, err := g.alerts.CreateInhibitionRule(c.Context(), in)
 	if err != nil {
 		return alertAPIError(c, err)
@@ -635,12 +672,16 @@ func (g *Gateway) updateInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
 	var in alert.InhibitionRuleInput
 	if c.Bind().Body(&in) != nil || (in.SourceMatchers != nil && !validMatchers(in.SourceMatchers)) ||
 		(in.TargetMatchers != nil && !validMatchers(in.TargetMatchers)) {
 		return badRequest(c)
 	}
-	in.Project = projectSlug(c)
+	in.Project = slug
 	v, err := g.alerts.UpdateInhibitionRule(c.Context(), id, in)
 	if err != nil {
 		return alertAPIError(c, err)
@@ -656,7 +697,11 @@ func (g *Gateway) deleteInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	if err := g.alerts.DeleteInhibitionRule(c.Context(), projectSlug(c), id); err != nil {
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	if err := g.alerts.DeleteInhibitionRule(c.Context(), slug, id); err != nil {
 		return apiError(c, err)
 	}
 	return c.SendStatus(fiber.StatusNoContent)

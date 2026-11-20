@@ -2,12 +2,10 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +14,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/gofiber/fiber/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -63,21 +62,6 @@ type performanceResponse struct {
 	Truncated   bool                  `json:"truncated"`
 }
 
-type performanceMetricSeries struct {
-	Metric map[string]string   `json:"metric"`
-	Value  []json.RawMessage   `json:"value"`
-	Values [][]json.RawMessage `json:"values"`
-}
-
-type performanceMetricResponse struct {
-	Status string `json:"status"`
-	Data   struct {
-		ResultType string                    `json:"resultType"`
-		Result     []performanceMetricSeries `json:"result"`
-	} `json:"data"`
-	Error string `json:"error"`
-}
-
 type performanceMetricKind int
 
 const (
@@ -94,9 +78,9 @@ type performanceMetricQuery struct {
 
 type performanceMetricResult struct {
 	query     performanceMetricQuery
-	series    []performanceMetricSeries
+	vector    []storagepkg.MetricsVectorSample
+	matrix    []storagepkg.MetricsMatrixSeries
 	truncated bool
-	err       error
 }
 
 type performanceKey struct {
@@ -265,53 +249,35 @@ func (g *Gateway) queryPerformanceMetrics(
 
 	queryContext, cancel := context.WithTimeout(ctx, performanceQueryTimeout)
 	defer cancel()
-	results := make(chan performanceMetricResult, len(queries))
-	for _, query := range queries {
-		go func(query performanceMetricQuery) {
-			series, truncated, err := g.executePerformanceQuery(queryContext, project, query, start, end, step)
-			results <- performanceMetricResult{query: query, series: series, truncated: truncated, err: err}
-		}(query)
+
+	results := make([]performanceMetricResult, len(queries))
+	eg, groupCtx := errgroup.WithContext(queryContext)
+	for i, q := range queries {
+		idx, query := i, q
+		eg.Go(func() error {
+			res, err := g.executePerformanceQuery(groupCtx, project, query, start, end, step)
+			if err != nil {
+				return err
+			}
+			results[idx] = res
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return performanceResponse{}, err
 	}
 
 	rawAccumulators := make(map[rawPerformanceKey]*rawSeriesAccumulator)
-	var firstErr error
 	truncated := false
-	for range queries {
-		result := <-results
-		if result.err != nil {
-			if firstErr == nil {
-				firstErr = result.err
-				cancel()
-			}
-			continue
-		}
+	for _, result := range results {
 		if result.truncated {
 			truncated = true
 		}
 		if result.query.rangeQuery {
-			if err := applyPerformanceMatrix(
-				rawAccumulators,
-				result.query.kind,
-				result.series,
-			); err != nil &&
-				firstErr == nil {
-				firstErr = err
-				cancel()
-			}
+			applyPerformanceMatrix(rawAccumulators, result.query.kind, result.matrix)
 			continue
 		}
-		if err := applyPerformanceVector(
-			rawAccumulators,
-			result.query.kind,
-			result.series,
-		); err != nil &&
-			firstErr == nil {
-			firstErr = err
-			cancel()
-		}
-	}
-	if firstErr != nil {
-		return performanceResponse{}, firstErr
+		applyPerformanceVector(rawAccumulators, result.query.kind, result.vector)
 	}
 	accumulators := mergeRawPerformanceAccumulators(rawAccumulators)
 	return buildPerformanceResponse(accumulators, start, end, step, truncated), nil
@@ -323,28 +289,35 @@ func (g *Gateway) executePerformanceQuery(
 	query performanceMetricQuery,
 	start, end time.Time,
 	step time.Duration,
-) ([]performanceMetricSeries, bool, error) {
-	run := func(expression string) ([]performanceMetricSeries, error) {
-		values := url.Values{"query": {expression}}
-		path := "/api/v1/query"
-		resultType := "vector"
+) (performanceMetricResult, error) {
+	mc := g.metricsQueryClient()
+	run := func(expression string) (performanceMetricResult, error) {
 		if query.rangeQuery {
-			path = "/api/v1/query_range"
-			resultType = "matrix"
-			values.Set("start", start.Format(time.RFC3339Nano))
-			values.Set("end", end.Format(time.RFC3339Nano))
-			values.Set("step", strconv.FormatInt(int64(step/time.Second), 10))
-		} else {
-			values.Set("time", end.Format(time.RFC3339Nano))
+			matrix, err := mc.QueryMatrix(ctx, project.Slug, expression, storagepkg.MetricsRangeQueryOptions{
+				Start:    start,
+				End:      end,
+				Step:     step,
+				Timeout:  performanceQueryTimeout,
+				MaxBytes: performanceMaxResponseBody,
+			})
+			if err != nil {
+				return performanceMetricResult{}, err
+			}
+			return performanceMetricResult{query: query, matrix: matrix}, nil
 		}
-		body, err := g.isolatedQueryWithLimit(ctx, project, "metrics", path, values, performanceMaxResponseBody)
+		vector, err := mc.QueryVector(ctx, project.Slug, expression, storagepkg.MetricsQueryOptions{
+			Time:     end,
+			Timeout:  performanceQueryTimeout,
+			MaxBytes: performanceMaxResponseBody,
+		})
 		if err != nil {
-			return nil, err
+			return performanceMetricResult{}, err
 		}
-		return decodePerformanceMetricResponse(body, resultType)
+		return performanceMetricResult{query: query, vector: vector}, nil
 	}
-	series, err := run(query.expression)
-	if errors.Is(err, errQueryResponseTooLarge) {
+
+	res, err := run(query.expression)
+	if errors.Is(err, storagepkg.ErrMetricsResponseTooLarge) {
 		// Degrade gracefully on high-cardinality responses by bounding returned
 		// series with topk and flagging Truncated instead of failing with 502.
 		topkLimit := performanceMaxEndpoints
@@ -352,13 +325,14 @@ func (g *Gateway) executePerformanceQuery(
 			topkLimit = performanceMaxEndpoints * 3
 		}
 		boundedExpr := fmt.Sprintf("topk(%d, %s)", topkLimit, query.expression)
-		series, err = run(boundedExpr)
+		res, err = run(boundedExpr)
 		if err != nil {
-			return nil, false, err
+			return performanceMetricResult{}, err
 		}
-		return series, true, nil
+		res.truncated = true
+		return res, nil
 	}
-	return series, false, err
+	return res, err
 }
 
 func performanceTrendRateWindow(window, step time.Duration) time.Duration {
@@ -421,14 +395,14 @@ func performanceErrorRateQuery(window time.Duration, metricsKind storagepkg.Metr
 		performanceDurationCountMetric,
 		duration,
 	)
-	errors := fmt.Sprintf(
+	errorsExpr := fmt.Sprintf(
 		`sum by (%s) (rate({__name__=%q,%s=~"5.."}[%s]))`,
 		performanceLabels(metricsKind),
 		performanceDurationCountMetric,
 		performanceStatusCodeLabel(metricsKind),
 		duration,
 	)
-	return fmt.Sprintf(`(%s / %s) or (%s * 0)`, errors, total, total)
+	return fmt.Sprintf(`(%s / %s) or (%s * 0)`, errorsExpr, total, total)
 }
 
 func performanceLabels(metricsKind storagepkg.MetricsKind) string {
@@ -450,74 +424,42 @@ func performanceDurationLiteral(duration time.Duration) string {
 	return strconv.FormatInt(seconds, 10) + "s"
 }
 
-func decodePerformanceMetricResponse(body []byte, resultType string) ([]performanceMetricSeries, error) {
-	var response performanceMetricResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("decode metrics response: %w", err)
-	}
-	if response.Status != "success" {
-		if response.Error == "" {
-			response.Error = "unknown metrics backend error"
-		}
-		return nil, fmt.Errorf("metrics backend: %s", response.Error)
-	}
-	if response.Data.ResultType != resultType {
-		return nil, fmt.Errorf("metrics backend returned result type %q, want %q", response.Data.ResultType, resultType)
-	}
-	return response.Data.Result, nil
-}
-
 func applyPerformanceVector(
 	accumulators map[rawPerformanceKey]*rawSeriesAccumulator,
 	kind performanceMetricKind,
-	series []performanceMetricSeries,
-) error {
+	series []storagepkg.MetricsVectorSample,
+) {
 	for _, item := range series {
 		rawKey, normKey, ok := performanceMetricKeys(item.Metric)
 		if !ok {
 			continue
 		}
-		_, value, valid, err := decodePerformanceSample(item.Value)
-		if err != nil {
-			return err
-		}
-		if !valid {
-			continue
-		}
 		acc := rawPerformanceAccumulator(accumulators, rawKey, normKey)
-		assignRawMetric(&acc.summary, kind, item.Metric["quantile"], value)
+		assignRawMetric(&acc.summary, kind, item.Metric["quantile"], item.Point.Value)
 	}
-	return nil
 }
 
 func applyPerformanceMatrix(
 	accumulators map[rawPerformanceKey]*rawSeriesAccumulator,
 	kind performanceMetricKind,
-	series []performanceMetricSeries,
-) error {
+	series []storagepkg.MetricsMatrixSeries,
+) {
 	for _, item := range series {
 		rawKey, normKey, ok := performanceMetricKeys(item.Metric)
 		if !ok {
 			continue
 		}
 		acc := rawPerformanceAccumulator(accumulators, rawKey, normKey)
-		for _, sample := range item.Values {
-			timestamp, value, valid, err := decodePerformanceSample(sample)
-			if err != nil {
-				return err
-			}
-			if !valid {
-				continue
-			}
+		for _, sample := range item.Points {
+			timestamp := sample.UnixMilli()
 			point := acc.points[timestamp]
 			if point == nil {
 				point = &rawMetricValues{}
 				acc.points[timestamp] = point
 			}
-			assignRawMetric(point, kind, item.Metric["quantile"], value)
+			assignRawMetric(point, kind, item.Metric["quantile"], sample.Value)
 		}
 	}
-	return nil
 }
 
 func performanceMetricKeys(labels map[string]string) (rawPerformanceKey, performanceKey, bool) {
@@ -588,29 +530,6 @@ func mergeRawPerformanceAccumulators(
 		}
 	}
 	return merged
-}
-
-func decodePerformanceSample(sample []json.RawMessage) (int64, float64, bool, error) {
-	if len(sample) != 2 {
-		return 0, 0, false, fmt.Errorf("metrics backend returned malformed sample")
-	}
-	timestamp, err := parsePerformanceFloat(sample[0])
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("decode metrics timestamp: %w", err)
-	}
-	value, err := parsePerformanceFloat(sample[1])
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("decode metrics value: %w", err)
-	}
-	if math.IsNaN(timestamp) || math.IsInf(timestamp, 0) || math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0, 0, false, nil
-	}
-	return int64(math.Round(timestamp * 1_000)), value, true, nil
-}
-
-func parsePerformanceFloat(raw json.RawMessage) (float64, error) {
-	value := strings.Trim(strings.TrimSpace(string(raw)), `"`)
-	return strconv.ParseFloat(value, 64)
 }
 
 func assignRawMetric(

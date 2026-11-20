@@ -1,14 +1,8 @@
 package gateway
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"math"
-	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,13 +10,15 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/scrape"
+	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/gofiber/fiber/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	metricsInstantQueryTimeout  = 10 * time.Second
-	metricsInstantQueryMaxBytes = 8 << 20
-	metricsBodyDrainLimit       = 64 << 10
+	metricsInstantQueryTimeout  = storagepkg.DefaultMetricsQueryTimeout
+	metricsInstantQueryMaxBytes = storagepkg.DefaultMetricsQueryMaxBytes
+	metricsBodyDrainLimit       = storagepkg.DefaultMetricsQueryBodyDrainSize
 )
 
 type scrapeTargetResponse struct {
@@ -177,96 +173,17 @@ func (g *Gateway) deleteScrapeTarget(c fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-type metricSample struct {
-	Metric map[string]string `json:"metric"`
-	Value  []json.RawMessage `json:"value"`
-}
-type queryResponse struct {
-	Status string `json:"status"`
-	Data   struct {
-		ResultType string         `json:"resultType"`
-		Result     []metricSample `json:"result"`
-	} `json:"data"`
-}
-
-func (g *Gateway) instantQuery(ctx context.Context, slug, expr string) ([]metricSample, error) {
-	q := url.Values{"query": {expr}}
-	if err := g.storage.ApplyMetricsQueryIsolation(q, slug, false); err != nil {
-		return nil, err
+func (g *Gateway) metricsQueryClient() *storagepkg.MetricsClient {
+	if g.metrics != nil {
+		return g.metrics
 	}
-	queryCtx, cancel := context.WithTimeout(ctx, metricsInstantQueryTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(
-		queryCtx,
-		http.MethodGet,
-		strings.TrimRight(g.storage.MetricsQueryBase(), "/")+"/api/v1/query?"+q.Encode(),
-		nil,
-	)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, metricsBodyDrainLimit))
-		resp.Body.Close()
-	}()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("metrics query status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, metricsInstantQueryMaxBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(body) > metricsInstantQueryMaxBytes {
-		return nil, errors.New("metrics query response exceeded limit")
-	}
-	var decoded queryResponse
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return nil, err
-	}
-	if decoded.Status != "success" || decoded.Data.ResultType != "vector" {
-		return nil, errors.New("unexpected metrics query response")
-	}
-	return decoded.Data.Result, nil
-}
-
-func sampleFloat(s metricSample) (float64, bool) {
-	if len(s.Value) != 2 {
-		return 0, false
-	}
-	var raw string
-	if json.Unmarshal(s.Value[1], &raw) != nil {
-		return 0, false
-	}
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, false
-	}
-	return v, true
-}
-
-func unixSecondsToTime(seconds float64) *time.Time {
-	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
-		return nil
-	}
-	sec, frac := math.Modf(seconds)
-	t := time.Unix(int64(sec), int64(math.Round(frac*1e9))).UTC()
-	return &t
-}
-
-func sampleTime(s metricSample) *time.Time {
-	if len(s.Value) == 0 {
-		return nil
-	}
-	var seconds float64
-	if json.Unmarshal(s.Value[0], &seconds) != nil {
-		return nil
-	}
-	return unixSecondsToTime(seconds)
+	return storagepkg.NewMetricsClient(storagepkg.MetricsClientConfig{
+		Backend:        g.storage,
+		HTTPClient:     g.client,
+		DefaultTimeout: metricsInstantQueryTimeout,
+		MaxBytes:       metricsInstantQueryMaxBytes,
+		BodyDrainLimit: metricsBodyDrainLimit,
+	})
 }
 
 func metricSeriesFingerprint(labels map[string]string) string {
@@ -313,51 +230,32 @@ func (g *Gateway) scrapeTargetHealth(c fiber.Ctx) error {
 	upExpr := fmt.Sprintf(`up{scrape_job=%q}`, job)
 	tsExpr := fmt.Sprintf(`timestamp(up{scrape_job=%q})`, job)
 
-	type queryOut struct {
-		isTimestamp bool
-		samples     []metricSample
-		err         error
+	mc := g.metricsQueryClient()
+	opts := storagepkg.MetricsQueryOptions{
+		Timeout:  metricsInstantQueryTimeout,
+		MaxBytes: metricsInstantQueryMaxBytes,
 	}
-	queryCtx, cancel := context.WithCancel(c.Context())
-	defer cancel()
-	ch := make(chan queryOut, 2)
-	go func() {
-		samples, qErr := g.instantQuery(queryCtx, slug, upExpr)
-		ch <- queryOut{isTimestamp: false, samples: samples, err: qErr}
-	}()
-	go func() {
-		samples, qErr := g.instantQuery(queryCtx, slug, tsExpr)
-		ch <- queryOut{isTimestamp: true, samples: samples, err: qErr}
-	}()
-
-	var upSamples, tsSamples []metricSample
-	var firstErr error
-	for range 2 {
-		out := <-ch
-		if out.err != nil {
-			if firstErr == nil {
-				firstErr = out.err
-				cancel()
-			}
-			continue
-		}
-		if out.isTimestamp {
-			tsSamples = out.samples
-		} else {
-			upSamples = out.samples
-		}
-	}
-	if firstErr != nil {
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": firstErr.Error()})
+	var upSamples, tsSamples []storagepkg.MetricsVectorSample
+	eg, queryCtx := errgroup.WithContext(c.Context())
+	eg.Go(func() error {
+		var qErr error
+		upSamples, qErr = mc.QueryVector(queryCtx, slug, upExpr, opts)
+		return qErr
+	})
+	eg.Go(func() error {
+		var qErr error
+		tsSamples, qErr = mc.QueryVector(queryCtx, slug, tsExpr, opts)
+		return qErr
+	})
+	if err := eg.Wait(); err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	timestamps := make(map[string]float64, len(tsSamples))
 	for _, s := range tsSamples {
-		if ts, valid := sampleFloat(s); valid {
-			fp := metricSeriesFingerprint(s.Metric)
-			if existing, exists := timestamps[fp]; !exists || ts > existing {
-				timestamps[fp] = ts
-			}
+		fp := metricSeriesFingerprint(s.Metric)
+		if existing, exists := timestamps[fp]; !exists || s.Point.Value > existing {
+			timestamps[fp] = s.Point.Value
 		}
 	}
 
@@ -370,23 +268,17 @@ func (g *Gateway) scrapeTargetHealth(c fiber.Ctx) error {
 		fp := metricSeriesFingerprint(s.Metric)
 		ts, hasTS := timestamps[fp]
 		if !hasTS {
-			if fallback := sampleTime(s); fallback != nil {
-				ts = float64(fallback.UnixNano()) / 1e9
-			}
+			ts = s.Point.Timestamp
 		}
 		if !chosen || ts > chosenTS || (ts == chosenTS && fp > chosenKey) {
 			chosen = true
 			chosenTS = ts
 			chosenKey = fp
-			last = unixSecondsToTime(ts)
-			if value, valid := sampleFloat(s); valid {
-				if value == 1 {
-					status = "up"
-				} else {
-					status = "down"
-				}
+			last = (storagepkg.MetricsPoint{Timestamp: ts}).Time()
+			if s.Point.Value == 1 {
+				status = "up"
 			} else {
-				status = "unknown"
+				status = "down"
 			}
 		}
 	}
@@ -406,56 +298,115 @@ type hostDTO struct {
 func ptr(v float64) *float64 { return &v }
 func boolPtr(v bool) *bool   { return &v }
 
+type hostMetricQuerySpec struct {
+	key   string
+	expr  string
+	apply func(hosts map[string]*hostDTO, ensure func(string) *hostDTO, samples []storagepkg.MetricsVectorSample)
+}
+
+var hostMetricQueries = []hostMetricQuerySpec{
+	{
+		key:  "uname",
+		expr: `max by(instance,nodename) (node_uname_info)`,
+		apply: func(_ map[string]*hostDTO, ensure func(string) *hostDTO, samples []storagepkg.MetricsVectorSample) {
+			for _, s := range samples {
+				instance := s.Metric["instance"]
+				if instance == "" {
+					continue
+				}
+				h := ensure(instance)
+				if name := s.Metric["nodename"]; name != "" {
+					h.Hostname = name
+				}
+			}
+		},
+	},
+	{
+		key:  "cores",
+		expr: `count(count by(instance,cpu) (node_cpu_seconds_total)) by(instance)`,
+		apply: applyHostFloatMetric(func(h *hostDTO, v *float64) {
+			h.CPUCores = v
+		}),
+	},
+	{
+		key:  "load",
+		expr: `max by(instance) (node_load1)`,
+		apply: applyHostFloatMetric(func(h *hostDTO, v *float64) {
+			h.Load1 = v
+		}),
+	},
+	{
+		key:  "memory",
+		expr: `100 * (1 - max by(instance) (node_memory_MemAvailable_bytes) / (max by(instance) (node_memory_MemTotal_bytes) > 0))`,
+		apply: applyHostFloatMetric(func(h *hostDTO, v *float64) {
+			h.MemoryUsedPercent = v
+		}),
+	},
+	{
+		key:  "disk",
+		expr: `max by(instance) (100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / (node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} > 0)))`,
+		apply: applyHostFloatMetric(func(h *hostDTO, v *float64) {
+			h.DiskUsedPercentMax = v
+		}),
+	},
+	{
+		// Only instances with node_* metrics represent hosts; non-host exporters
+		// that emit `up{scrape_job=~"scrape-.*"}` must not appear as host cards.
+		key:  "up",
+		expr: `max by(instance) (up{scrape_job=~"scrape-.*"})`,
+		apply: func(hosts map[string]*hostDTO, _ func(string) *hostDTO, samples []storagepkg.MetricsVectorSample) {
+			for _, s := range samples {
+				instance := s.Metric["instance"]
+				if instance == "" {
+					continue
+				}
+				h := hosts[instance]
+				if h == nil {
+					continue
+				}
+				h.Up = boolPtr(s.Point.Value == 1)
+			}
+		},
+	},
+}
+
+func applyHostFloatMetric(
+	setter func(*hostDTO, *float64),
+) func(map[string]*hostDTO, func(string) *hostDTO, []storagepkg.MetricsVectorSample) {
+	return func(_ map[string]*hostDTO, ensure func(string) *hostDTO, samples []storagepkg.MetricsVectorSample) {
+		for _, s := range samples {
+			if instance := s.Metric["instance"]; instance != "" {
+				setter(ensure(instance), ptr(s.Point.Value))
+			}
+		}
+	}
+}
+
 func (g *Gateway) hosts(c fiber.Ctx) error {
 	slug, ok := sessionProjectSlug(c)
 	if !ok {
 		return nil
 	}
-	queries := []struct{ key, expr string }{
-		{"uname", `max by(instance,nodename) (node_uname_info)`},
-		{"up", `max by(instance) (up{scrape_job=~"scrape-.*"})`},
-		{"cores", `count(count by(instance,cpu) (node_cpu_seconds_total)) by(instance)`},
-		{"load", `max by(instance) (node_load1)`},
-		{
-			"memory",
-			`100 * (1 - max by(instance) (node_memory_MemAvailable_bytes) / (max by(instance) (node_memory_MemTotal_bytes) > 0))`,
-		},
-		{
-			"disk",
-			`max by(instance) (100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / (node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} > 0)))`,
-		},
+	mc := g.metricsQueryClient()
+	opts := storagepkg.MetricsQueryOptions{
+		Timeout:  metricsInstantQueryTimeout,
+		MaxBytes: metricsInstantQueryMaxBytes,
 	}
-
-	type hostQueryResult struct {
-		key     string
-		samples []metricSample
-		err     error
-	}
-	queryCtx, cancel := context.WithCancel(c.Context())
-	defer cancel()
-	ch := make(chan hostQueryResult, len(queries))
-	for _, query := range queries {
-		go func(key, expr string) {
-			result, err := g.instantQuery(queryCtx, slug, expr)
-			ch <- hostQueryResult{key: key, samples: result, err: err}
-		}(query.key, query.expr)
-	}
-
-	all := make(map[string][]metricSample, len(queries))
-	var firstErr error
-	for range queries {
-		res := <-ch
-		if res.err != nil {
-			if firstErr == nil {
-				firstErr = res.err
-				cancel()
+	results := make([][]storagepkg.MetricsVectorSample, len(hostMetricQueries))
+	eg, queryCtx := errgroup.WithContext(c.Context())
+	for i, spec := range hostMetricQueries {
+		idx, expr := i, spec.expr
+		eg.Go(func() error {
+			samples, err := mc.QueryVector(queryCtx, slug, expr, opts)
+			if err != nil {
+				return err
 			}
-			continue
-		}
-		all[res.key] = res.samples
+			results[idx] = samples
+			return nil
+		})
 	}
-	if firstErr != nil {
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": firstErr.Error()})
+	if err := eg.Wait(); err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	hosts := map[string]*hostDTO{}
@@ -467,45 +418,8 @@ func (g *Gateway) hosts(c fiber.Ctx) error {
 		}
 		return h
 	}
-	// Only instances with node_* metrics represent hosts; non-host exporters
-	// that emit `up{scrape_job=~"scrape-.*"}` must not appear as host cards.
-	for _, s := range all["uname"] {
-		instance := s.Metric["instance"]
-		if instance == "" {
-			continue
-		}
-		h := ensure(instance)
-		if name := s.Metric["nodename"]; name != "" {
-			h.Hostname = name
-		}
-	}
-	for _, item := range []struct {
-		key string
-		set func(*hostDTO, *float64)
-	}{
-		{"cores", func(h *hostDTO, v *float64) { h.CPUCores = v }},
-		{"load", func(h *hostDTO, v *float64) { h.Load1 = v }},
-		{"memory", func(h *hostDTO, v *float64) { h.MemoryUsedPercent = v }},
-		{"disk", func(h *hostDTO, v *float64) { h.DiskUsedPercentMax = v }},
-	} {
-		for _, s := range all[item.key] {
-			if v, valid := sampleFloat(s); valid && s.Metric["instance"] != "" {
-				item.set(ensure(s.Metric["instance"]), ptr(v))
-			}
-		}
-	}
-	for _, s := range all["up"] {
-		instance := s.Metric["instance"]
-		if instance == "" {
-			continue
-		}
-		h := hosts[instance]
-		if h == nil {
-			continue
-		}
-		if v, valid := sampleFloat(s); valid {
-			h.Up = boolPtr(v == 1)
-		}
+	for i, spec := range hostMetricQueries {
+		spec.apply(hosts, ensure, results[i])
 	}
 	result := make([]hostDTO, 0, len(hosts))
 	for _, h := range hosts {

@@ -253,6 +253,7 @@ type Gateway struct {
 	profiles                 ProfileStore
 	scrapes                  *scrape.Service
 	storage                  storagepkg.SignalBackend
+	metrics                  *storagepkg.MetricsClient
 	scrapeUnavailableReason  string
 	mcpBaseURL               string
 	ai                       *aiManager
@@ -415,17 +416,24 @@ func New(cfg Config) *Gateway {
 			cfg.LiveTailMaxPerUser,
 			cfg.LiveTailMaxPerProject,
 		),
-		liveTailMaxDuration:      cfg.LiveTailMaxDuration,
-		liveTailHeartbeat:        cfg.LiveTailHeartbeat,
-		now:                      cfg.Now,
-		alerts:                   cfg.Alerts,
-		issues:                   cfg.Issues,
-		replays:                  cfg.Replays,
-		blobs:                    cfg.Blobs,
-		sourceMaps:               cfg.SourceMaps,
-		profiles:                 cfg.Profiles,
-		scrapes:                  cfg.Scrapes,
-		storage:                  cfg.Storage,
+		liveTailMaxDuration: cfg.LiveTailMaxDuration,
+		liveTailHeartbeat:   cfg.LiveTailHeartbeat,
+		now:                 cfg.Now,
+		alerts:              cfg.Alerts,
+		issues:              cfg.Issues,
+		replays:             cfg.Replays,
+		blobs:               cfg.Blobs,
+		sourceMaps:          cfg.SourceMaps,
+		profiles:            cfg.Profiles,
+		scrapes:             cfg.Scrapes,
+		storage:             cfg.Storage,
+		metrics: storagepkg.NewMetricsClient(storagepkg.MetricsClientConfig{
+			Backend:        cfg.Storage,
+			HTTPClient:     cfg.Client,
+			DefaultTimeout: metricsInstantQueryTimeout,
+			MaxBytes:       metricsInstantQueryMaxBytes,
+			BodyDrainLimit: metricsBodyDrainLimit,
+		}),
 		scrapeUnavailableReason:  cfg.ScrapeUnavailableReason,
 		mcpBaseURL:               cfg.MCPBaseURL,
 		llmPricing:               cfg.LLMPricing,
@@ -740,11 +748,11 @@ func (g *Gateway) registerSessionAPI() {
 	api.Patch("/users/:id", g.adminRequired, g.updateUser)
 	api.Put("/users/:id", g.adminRequired, g.updateUser)
 	api.Delete("/users/:id", g.adminRequired, g.deleteUser)
-	api.Get("/alert-rules", g.memberRequired, g.listAlertRules)
-	api.Post("/alert-rules", g.memberRequired, g.createAlertRule)
-	api.Patch("/alert-rules/:id", g.memberRequired, g.updateAlertRule)
-	api.Put("/alert-rules/:id", g.memberRequired, g.updateAlertRule)
-	api.Delete("/alert-rules/:id", g.memberRequired, g.deleteAlertRule)
+	api.Get("/alert-rules", g.memberRequired, g.loadSessionProject, g.listAlertRules)
+	api.Post("/alert-rules", g.memberRequired, g.loadSessionProject, g.createAlertRule)
+	api.Patch("/alert-rules/:id", g.memberRequired, g.loadSessionProject, g.updateAlertRule)
+	api.Put("/alert-rules/:id", g.memberRequired, g.loadSessionProject, g.updateAlertRule)
+	api.Delete("/alert-rules/:id", g.memberRequired, g.loadSessionProject, g.deleteAlertRule)
 	api.Get("/notifications", g.loadSessionProject, g.memberRequired, g.listNotifications)
 	api.Post("/notifications/:id/retry", g.loadSessionProject, g.memberRequired, g.requeueNotification)
 	api.Get("/channels", g.memberRequired, g.listChannels)
@@ -753,17 +761,17 @@ func (g *Gateway) registerSessionAPI() {
 	api.Put("/channels/:id", g.adminRequired, g.updateChannel)
 	api.Delete("/channels/:id", g.adminRequired, g.deleteChannel)
 	api.Post("/channels/:id/test", g.adminRequired, g.testChannel)
-	api.Get("/silences", g.memberRequired, g.listSilences)
-	api.Post("/silences", g.memberRequired, g.createSilence)
-	api.Patch("/silences/:id", g.memberRequired, g.updateSilence)
-	api.Put("/silences/:id", g.memberRequired, g.updateSilence)
-	api.Delete("/silences/:id", g.memberRequired, g.deleteSilence)
-	api.Get("/inhibition-rules", g.memberRequired, g.listInhibitionRules)
-	api.Post("/inhibition-rules", g.memberRequired, g.createInhibitionRule)
-	api.Patch("/inhibition-rules/:id", g.memberRequired, g.updateInhibitionRule)
-	api.Put("/inhibition-rules/:id", g.memberRequired, g.updateInhibitionRule)
-	api.Delete("/inhibition-rules/:id", g.memberRequired, g.deleteInhibitionRule)
-	api.Get("/alerts", g.listAlerts)
+	api.Get("/silences", g.memberRequired, g.loadSessionProject, g.listSilences)
+	api.Post("/silences", g.memberRequired, g.loadSessionProject, g.createSilence)
+	api.Patch("/silences/:id", g.memberRequired, g.loadSessionProject, g.updateSilence)
+	api.Put("/silences/:id", g.memberRequired, g.loadSessionProject, g.updateSilence)
+	api.Delete("/silences/:id", g.memberRequired, g.loadSessionProject, g.deleteSilence)
+	api.Get("/inhibition-rules", g.memberRequired, g.loadSessionProject, g.listInhibitionRules)
+	api.Post("/inhibition-rules", g.memberRequired, g.loadSessionProject, g.createInhibitionRule)
+	api.Patch("/inhibition-rules/:id", g.memberRequired, g.loadSessionProject, g.updateInhibitionRule)
+	api.Put("/inhibition-rules/:id", g.memberRequired, g.loadSessionProject, g.updateInhibitionRule)
+	api.Delete("/inhibition-rules/:id", g.memberRequired, g.loadSessionProject, g.deleteInhibitionRule)
+	api.Get("/alerts", g.loadSessionProject, g.listAlerts)
 	api.Get("/scrape-targets", g.loadSessionProject, g.listScrapeTargets)
 	api.Post("/scrape-targets", g.loadSessionProject, g.memberRequired, g.createScrapeTarget)
 	api.Get("/scrape-targets/:id", g.loadSessionProject, g.getScrapeTarget)
@@ -893,11 +901,19 @@ func (g *Gateway) loadSessionProject(c fiber.Ctx) error {
 	return g.resolveRequestProject(c)
 }
 
+func requestedProjectSlug(c fiber.Ctx) string {
+	slug := strings.TrimSpace(c.Get("X-LO-Project"))
+	if slug == "" {
+		slug = "default"
+	}
+	return slug
+}
+
 func (g *Gateway) resolveRequestProject(c fiber.Ctx) error {
 	if g.store == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "project store unavailable"})
 	}
-	slug := projectSlug(c)
+	slug := requestedProjectSlug(c)
 	p, err := g.store.ProjectBySlug(c.Context(), slug)
 	if err != nil {
 		if meta.IsNotFound(err) {

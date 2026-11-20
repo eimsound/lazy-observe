@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
@@ -334,5 +335,222 @@ func TestServiceConcurrentSyncIsSerializedAndLeavesNoTempFiles(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != "scrape.yml" {
 		t.Fatalf("unexpected files in scrape config dir: %v", entries)
+	}
+}
+
+func TestRenderPureFunctionDeterministicAndFiltersDisabledOrCorrupt(t *testing.T) {
+	input := []meta.ScrapeTargetView{
+		{
+			ID:       20,
+			Project:  meta.ProjectInfo{ID: 2, Slug: "beta"},
+			Name:     "b",
+			URL:      "https://beta.example.com:9443/custom?module=http",
+			Interval: "1m",
+			Labels:   map[string]string{"env": "staging", "__address__": "127.0.0.1:18428", "project_id": "spoof"},
+			Enabled:  true,
+		},
+		{
+			ID:       10,
+			Project:  meta.ProjectInfo{ID: 1, Slug: "alpha"},
+			Name:     "a",
+			URL:      "http://alpha.example.com:9100/metrics",
+			Interval: "15s",
+			Labels:   map[string]string{"role": "db"},
+			Enabled:  true,
+		},
+		{
+			ID:       15,
+			Project:  meta.ProjectInfo{ID: 1, Slug: "alpha"},
+			Name:     "disabled",
+			URL:      "http://disabled.example.com:9100/metrics",
+			Interval: "15s",
+			Enabled:  false,
+		},
+		{
+			ID:       16,
+			Project:  meta.ProjectInfo{ID: 1, Slug: "alpha"},
+			Name:     "corrupt-url",
+			URL:      "://bad",
+			Interval: "15s",
+			Enabled:  true,
+		},
+		{
+			ID:       17,
+			Project:  meta.ProjectInfo{ID: 1, Slug: ""},
+			Name:     "missing-project",
+			URL:      "http://orphan.example.com:9100/metrics",
+			Interval: "15s",
+			Enabled:  true,
+		},
+	}
+
+	first, err := Render(input)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	// Verify caller slice was not mutated and output is deterministic.
+	if input[0].ID != 20 {
+		t.Fatalf("Render mutated input slice order: first ID=%d want=20", input[0].ID)
+	}
+	second, err := Render([]meta.ScrapeTargetView{input[1], input[0], input[2], input[3], input[4]})
+	if err != nil {
+		t.Fatalf("second Render: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("Render is non-deterministic:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+	rendered := string(first)
+	idxA := strings.Index(rendered, "job_name: scrape-10")
+	idxB := strings.Index(rendered, "job_name: scrape-20")
+	if idxA < 0 || idxB < 0 || idxA >= idxB {
+		t.Fatalf("expected deterministic ID ordering scrape-10 before scrape-20:\n%s", rendered)
+	}
+	for _, want := range []string{
+		"follow_redirects: false",
+		"project_id: alpha",
+		"project_id: beta",
+		"env: staging",
+		"role: db",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("Render output missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, forbidden := range []string{"disabled.example.com", "orphan.example.com", "__address__", "spoof"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Fatalf("Render output leaked %q:\n%s", forbidden, rendered)
+		}
+	}
+
+	empty, err := Render(nil)
+	if err != nil {
+		t.Fatalf("Render(nil): %v", err)
+	}
+	if string(empty) != emptyScrapeConfigYAML {
+		t.Fatalf("Render(nil)=%q want=%q", empty, emptyScrapeConfigYAML)
+	}
+}
+
+func TestReconcilerEventDrivenWakeupBackoffRetryAndClosedLoopStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := openTestStore(t)
+	if _, err := store.CreateProject(ctx, "Alpha", "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateScrapeTarget(ctx, meta.ScrapeTargetCreate{
+		ProjectSlug: "alpha", Name: "node", URL: "http://exporter.example.com:9100/metrics", Interval: "15s",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "scrape.yml")
+	var attempts atomic.Int32
+	var failUntil atomic.Int32
+	failUntil.Store(2) // First two reload attempts fail; 3rd succeeds.
+	fixedNow := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+
+	svc := NewService(Config{
+		Store:          store,
+		ConfigPath:     cfgPath,
+		RetryBaseDelay: 10 * time.Millisecond,
+		RetryMaxDelay:  40 * time.Millisecond,
+		Now:            func() time.Time { return fixedNow },
+		Reload: func() error {
+			n := attempts.Add(1)
+			if n <= failUntil.Load() {
+				return errors.New("vmagent /-/reload status=503")
+			}
+			return nil
+		},
+	})
+
+	initial := svc.Status()
+	if !initial.Leader || initial.DesiredRevision != 0 || initial.AppliedRevision != 0 || !initial.InSync ||
+		initial.LastSyncAt != nil || initial.LastSyncError != "" {
+		t.Fatalf("unexpected initial status: %+v", initial)
+	}
+
+	// Burst of NotifyChange calls must be non-blocking and advance desiredRevision.
+	for range 5 {
+		svc.NotifyChange()
+	}
+	pending := svc.Status()
+	if pending.DesiredRevision != 5 || pending.AppliedRevision != 0 || pending.InSync {
+		t.Fatalf("unexpected pending status: %+v", pending)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.RunReconciler(ctx, nil, 0)
+	}()
+
+	// Wait until backoff retry succeeds on attempt 3 and closes the loop.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st := svc.Status()
+		if st.InSync && st.AppliedRevision == 5 && st.LastSyncError == "" && st.LastSyncAt != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st := svc.Status()
+	if !st.InSync || st.AppliedRevision != 5 || st.DesiredRevision != 5 || st.LastSyncError != "" ||
+		st.LastSyncAt == nil || !st.LastSyncAt.Equal(fixedNow) {
+		t.Fatalf("reconciler did not converge after backoff retry: status=%+v attempts=%d", st, attempts.Load())
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("reload attempts=%d want=3", attempts.Load())
+	}
+
+	// Deleting a project triggers NotifyProjectDeleted -> even if reload fails transiently,
+	// reconciler retries and clears the deleted project's target from scrape.yml.
+	p2, err := store.CreateProject(ctx, "Beta", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateScrapeTarget(ctx, meta.ScrapeTargetCreate{
+		ProjectSlug: "beta", Name: "beta-node", URL: "http://beta.example.com:9100/metrics", Interval: "15s",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Sync(ctx); err != nil {
+		t.Fatalf("sync beta target: %v", err)
+	}
+	if err := store.DeleteProject(ctx, p2.ID); err != nil {
+		t.Fatal(err)
+	}
+	failUntil.Store(attempts.Load() + 1) // Fail the immediate sync once, succeed on retry.
+	if err := svc.NotifyProjectDeleted(ctx); err == nil {
+		t.Fatal("expected immediate NotifyProjectDeleted reload failure")
+	}
+	if failed := svc.Status(); failed.InSync || failed.LastSyncError == "" {
+		t.Fatalf("expected out-of-sync error state after failed reload: %+v", failed)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cur := svc.Status(); cur.InSync && cur.LastSyncError == "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cur := svc.Status(); !cur.InSync || cur.LastSyncError != "" {
+		t.Fatalf("reconciler did not recover after project delete failure: %+v", cur)
+	}
+	rendered, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rendered), "beta") {
+		t.Fatalf("deleted project target remained in scrape.yml:\n%s", rendered)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RunReconciler did not stop on context cancellation")
 	}
 }
