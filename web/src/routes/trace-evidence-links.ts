@@ -38,13 +38,19 @@ export interface TraceEvidenceLinks {
 }
 
 export function buildTraceEvidenceLinks(trace: JaegerTrace): TraceEvidenceLinks {
-  if (trace.spans.length === 0) throw new TypeError("trace evidence requires at least one span");
+  const spans = trace.spans ?? [];
+  if (spans.length === 0) throw new TypeError("trace evidence requires at least one span");
   const root = rootSpan(trace);
-  const service = trace.processes[root.processID]?.serviceName?.trim() || root.processID;
+  const service = trace.processes?.[root.processID]?.serviceName?.trim() || root.processID;
   if (!service) throw new TypeError("trace evidence requires a root service");
 
-  const startUs = Math.min(...trace.spans.map((span) => span.startTime));
-  const endUs = Math.max(...trace.spans.map((span) => span.startTime + span.duration));
+  let startUs = Infinity;
+  let endUs = -Infinity;
+  for (const span of spans) {
+    if (span.startTime < startUs) startUs = span.startTime;
+    const spanEnd = span.startTime + span.duration;
+    if (spanEnd > endUs) endUs = spanEnd;
+  }
   if (!Number.isSafeInteger(startUs) || !Number.isSafeInteger(endUs) || endUs < startUs) {
     throw new TypeError("trace evidence requires valid span bounds");
   }
@@ -104,16 +110,20 @@ export function parseMetricsEvidenceSearch(search: Record<string, unknown>): Met
 }
 
 function rootSpan(trace: JaegerTrace): JaegerSpan {
-  const ids = new Set(trace.spans.map((span) => span.spanID));
-  return trace.spans.find(
-    (span) => !span.references.some(
-      (reference) => reference.refType === "CHILD_OF" && ids.has(reference.spanID),
+  const spans = trace.spans ?? [];
+  const ids = new Set(spans.map((span) => span.spanID));
+  return spans.find(
+    (span) => !(span.references ?? []).some(
+      (reference) =>
+        reference.refType === "CHILD_OF"
+        && reference.spanID !== span.spanID
+        && ids.has(reference.spanID),
     ),
-  ) ?? trace.spans[0];
+  ) ?? spans[0];
 }
 
 function stringTag(span: JaegerSpan, key: string): string {
-  const value = span.tags.find((tag) => tag.key === key)?.value;
+  const value = (span.tags ?? []).find((tag) => tag.key === key)?.value;
   return typeof value === "string" ? value.trim() : "";
 }
 

@@ -7,14 +7,21 @@ import {
   type ReactNode,
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
+import { AlertCircle, Loader2 } from "lucide-react";
 import { listProjects, type Project } from "@/lib/api/projects";
 import { getProjectSlug, setProjectSlug } from "@/lib/settings";
-import { switchProjectQueries } from "./project-scope";
+import { Button } from "@/components/ui/button";
+import { resolveProjectSelection, switchProjectQueries } from "./project-scope";
 
 /**
  * Selected-project state (session mode). Mounted inside the authed layout so it
  * only loads projects when signed in. The current slug is persisted and sent as
  * `X-LO-Project` on every data read (see client.ts). The selection is per tab.
+ *
+ * Child routes are deferred until `/api/projects` resolves and the active slug
+ * is validated against that list so a stale `lo-project` (deleted or renamed)
+ * never fires data requests that bounce back as 401/404 in a sign-out loop.
  * Switching projects resets project-scoped cached queries (switchProjectQueries)
  * so no page renders results fetched for the previous project.
  */
@@ -32,25 +39,32 @@ const ProjectContext = createContext<ProjectContextValue | null>(null);
 const PROJECTS_KEY = ["projects"] as const;
 
 export function ProjectProvider({ children }: { children: ReactNode }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { data, isLoading } = useQuery<Project[]>({
+  const projectsQuery = useQuery<Project[]>({
     queryKey: PROJECTS_KEY,
     queryFn: ({ signal }) => listProjects(signal),
     staleTime: 60_000,
+    retry: false,
   });
 
-  const projects = useMemo(() => data ?? [], [data]);
+  const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data]);
   const [currentSlug, setCurrentSlug] = useState<string>(() => getProjectSlug());
 
-  // Auto-select a project once the list loads (or if the stored one vanished).
+  const selection = useMemo(
+    () => (projectsQuery.isSuccess
+      ? resolveProjectSelection(projects, currentSlug)
+      : { ready: false, resolvedSlug: currentSlug, changed: false }),
+    [projectsQuery.isSuccess, projects, currentSlug],
+  );
+
+  // Auto-select a valid project once the list loads (or if the stored one vanished).
   useEffect(() => {
-    if (projects.length === 0) return;
-    if (!currentSlug || !projects.some((p) => p.slug === currentSlug)) {
-      setProjectSlug(projects[0].slug);
-      setCurrentSlug(projects[0].slug);
-      void switchProjectQueries(queryClient);
-    }
-  }, [projects, currentSlug, queryClient]);
+    if (!projectsQuery.isSuccess || !selection.changed) return;
+    setProjectSlug(selection.resolvedSlug);
+    setCurrentSlug(selection.resolvedSlug);
+    void switchProjectQueries(queryClient);
+  }, [projectsQuery.isSuccess, selection.changed, selection.resolvedSlug, queryClient]);
 
   const value = useMemo<ProjectContextValue>(() => {
     const current = projects.find((p) => p.slug === currentSlug) ?? null;
@@ -58,7 +72,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       projects,
       current,
       currentSlug,
-      isLoading,
+      isLoading: projectsQuery.isLoading,
       setCurrent: (slug: string) => {
         if (slug === currentSlug) return;
         setProjectSlug(slug);
@@ -67,7 +81,33 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         void switchProjectQueries(queryClient);
       },
     };
-  }, [projects, currentSlug, isLoading, queryClient]);
+  }, [projects, currentSlug, projectsQuery.isLoading, queryClient]);
+
+  if (projectsQuery.isError) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-background px-4 text-foreground">
+        <div className="flex max-w-sm flex-col items-center gap-3 text-center" role="alert">
+          <AlertCircle className="size-6 text-destructive" />
+          <div className="text-sm font-medium">{t("common.loadFailed")}</div>
+          <p className="text-xs text-muted-foreground">{t("common.queryErrorDesc")}</p>
+          <Button variant="outline" size="sm" onClick={() => void projectsQuery.refetch()}>
+            {t("common.retry")}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!selection.ready) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-background text-muted-foreground">
+        <div className="flex items-center gap-2 text-sm">
+          <Loader2 className="size-4 animate-spin" />
+          {t("topbar.loadingProjects")}
+        </div>
+      </div>
+    );
+  }
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;
 }

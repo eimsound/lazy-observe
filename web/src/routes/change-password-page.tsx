@@ -3,6 +3,7 @@ import { Navigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { Activity, Loader2, LogOut, ShieldAlert } from "lucide-react";
 import { useAuth } from "@/lib/auth/auth-provider";
+import { safeRedirect } from "@/lib/auth/safe-redirect";
 import { changePasswordRoute } from "@/router";
 import { PasswordCard } from "@/components/settings/password-card";
 import { ThemeSwitcher } from "@/components/theme/theme-switcher";
@@ -20,9 +21,10 @@ export function ChangePasswordPage() {
   const { status, user, refresh, logout } = useAuth();
   const { redirect } = changePasswordRoute.useSearch();
   const [signingOut, setSigningOut] = useState(false);
-  const target = redirect && redirect.startsWith("/") && !redirect.startsWith("/change-password")
-    ? redirect
-    : "/";
+  const [signOutFailed, setSignOutFailed] = useState(false);
+  const target = safeRedirect(redirect, {
+    disallowPrefixes: ["/login", "/change-password"],
+  });
 
   if (status === "loading") {
     return (
@@ -69,14 +71,23 @@ export function ChangePasswordPage() {
 
         <PasswordCard onChanged={refresh} />
 
+        {signOutFailed && (
+          <p role="alert" className="text-center text-xs text-destructive">
+            {t("topbar.signOutFailed")}
+          </p>
+        )}
+
         <Button
           variant="ghost"
           className="w-full gap-1.5"
           disabled={signingOut}
           onClick={async () => {
             setSigningOut(true);
+            setSignOutFailed(false);
             try {
               await logout();
+            } catch {
+              setSignOutFailed(true);
             } finally {
               setSigningOut(false);
             }

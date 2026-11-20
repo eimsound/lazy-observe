@@ -23,13 +23,15 @@ const loadMock = () => import("./mock");
 export async function queryRange(
   params: QueryRangeParams,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<TimeSeries[]> {
-  return (await queryRangeDetailed(params, signal)).data;
+  return (await queryRangeDetailed(params, signal, project)).data;
 }
 
 export async function queryRangeDetailed(
   params: QueryRangeParams,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<MetricsQueryEnvelope<TimeSeries[]>> {
   const started = performance.now();
   const resp: PromQueryRangeResponse = IS_MOCK
@@ -42,6 +44,7 @@ export async function queryRangeDetailed(
           step: `${params.step}s`,
         },
         signal,
+        project,
       });
 
   if (resp.status === "error") {
@@ -73,11 +76,15 @@ export interface ServerClockSample {
 }
 
 /** Query the metrics server's current clock without overriding its evaluation time. */
-export async function queryServerClock(signal?: AbortSignal): Promise<ServerClockSample> {
+export async function queryServerClock(
+  signal?: AbortSignal,
+  project?: string,
+): Promise<ServerClockSample> {
   const requestStartedMs = dayjs().valueOf();
   const resp = await apiGet<PromInstantResponse>("/query", {
     params: { query: "time()" },
     signal,
+    project,
   });
   const responseReceivedMs = dayjs().valueOf();
   if (resp.status === "error") throw new ApiError(resp.error || "server time query failed", 400);
@@ -100,6 +107,7 @@ export async function queryInstantDetailed(
   query: string,
   time: number,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<MetricsQueryEnvelope<MetricTableResult>> {
   const started = performance.now();
   const resp: PromInstantResponse = IS_MOCK
@@ -107,6 +115,7 @@ export async function queryInstantDetailed(
     : await apiGet<PromInstantResponse>("/query", {
         params: { query, time },
         signal,
+        project,
       });
 
   if (resp.status === "error") {
@@ -163,6 +172,7 @@ export interface MetricsMetadataParams {
   end: number;
   match?: string;
   limit?: number;
+  project?: string;
 }
 
 interface PromStringsResponse {
@@ -189,6 +199,7 @@ async function metadataValues(
       limit: params.limit,
     },
     signal,
+    project: params.project,
   });
   if (resp.status === "error") throw new ApiError(resp.error || "metadata query failed", 400);
   return (resp.data ?? []).filter((item): item is string => typeof item === "string");
@@ -212,11 +223,16 @@ interface PrettifyResponse {
   msg?: string;
 }
 
-export async function prettifyPromQL(query: string, signal?: AbortSignal): Promise<string> {
+export async function prettifyPromQL(
+  query: string,
+  signal?: AbortSignal,
+  project?: string,
+): Promise<string> {
   if (IS_MOCK) return query.trim();
   const resp = await apiGet<PrettifyResponse>("/prettify-query", {
     params: { query },
     signal,
+    project,
   });
   if (resp.status !== "success" || typeof resp.query !== "string") {
     throw new ApiError(resp.msg || "invalid PromQL", 400);

@@ -14,7 +14,6 @@ import {
   useNavigate,
   useRouter,
   useRouterState,
-  useSearch,
 } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -203,10 +202,12 @@ function queryColumnWidths(value: string | null): Record<string, number> {
   }
 }
 
-function initialLogsState(): InitialLogsState {
-  const params = typeof window === "undefined"
-    ? new URLSearchParams()
-    : new URLSearchParams(window.location.search);
+function initialLogsState(locationHref?: string): InitialLogsState {
+  const params = locationHref !== undefined
+    ? new URL(locationHref, "https://lazy-observe.invalid").searchParams
+    : typeof window === "undefined"
+      ? new URLSearchParams()
+      : new URLSearchParams(window.location.search);
   const query = params.get("q")?.trim() || DEFAULT_LOGS_QUERY;
   const viewValue = params.get("view");
   const view: LogsViewMode = ["group", "table", "json", "live"].includes(viewValue ?? "")
@@ -294,12 +295,14 @@ export function LogsPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const router = useRouter();
-  const routeSearch = useSearch({ strict: false }) as Record<string, unknown>;
   const queryClient = useQueryClient();
   const { currentSlug: project } = useProject();
+  // Re-read the raw history href whenever the router commits a navigation.
+  const routeLocation = useRouterState({ select: () => router.history.location.href });
   const initialRef = useRef<InitialLogsState | null>(null);
-  if (!initialRef.current) initialRef.current = initialLogsState();
+  if (!initialRef.current) initialRef.current = initialLogsState(routeLocation);
   const initial = initialRef.current;
+  const selfAuthoredLocationsRef = useRef<Set<string>>(new Set([routeLocation]));
   const [localTime, setLocalTime] = useState(localTimePreference);
   const [autocomplete, setAutocomplete] = useState(initial.autocomplete);
   const [hideLogs, setHideLogs] = useState(initial.hideLogs);
@@ -340,13 +343,12 @@ export function LogsPage() {
     chart.topN,
     hideLogs,
   ]);
-  // Re-read the raw history href whenever the router commits a navigation.
-  const routeLocation = useRouterState({ select: () => router.history.location.href });
   const { workspace, snapshot } = useLogsWorkspace({
     project,
     location: routeLocation,
     auxiliaryConfig,
     replaceLocation: (location) => {
+      selfAuthoredLocationsRef.current.add(location);
       router.history.replace(location, router.history.location.state);
     },
   });
@@ -461,6 +463,7 @@ export function LogsPage() {
     }
     const target = `${url.pathname}${url.search}${url.hash}`;
     if (target === router.history.location.href) return;
+    selfAuthoredLocationsRef.current.add(target);
     router.history.replace(target, router.history.location.state);
   }, [
     autocomplete,
@@ -477,13 +480,19 @@ export function LogsPage() {
     tableSettings.visibleFields,
     tableSettings.columnWidths,
     tableSettings.pageSize,
-    routeSearch,
     router,
     view,
   ]);
 
+  // Only resync presentation state on genuine external navigations (back/forward
+  // or deep links), never in response to URL writes authored by this page itself.
   useEffect(() => {
-    const next = initialLogsState();
+    if (selfAuthoredLocationsRef.current.has(routeLocation)) {
+      selfAuthoredLocationsRef.current.delete(routeLocation);
+      return;
+    }
+    selfAuthoredLocationsRef.current.clear();
+    const next = initialLogsState(routeLocation);
     setAutocomplete(next.autocomplete);
     setHideLogs(next.hideLogs);
     setChart(next.chart);
@@ -499,7 +508,7 @@ export function LogsPage() {
     setSelected(null);
     setDrawerOpen(false);
     setContextAnchor(null);
-  }, [routeSearch]);
+  }, [routeLocation]);
 
   const execute = useCallback((query = queryText) => {
     if (
@@ -600,6 +609,7 @@ export function LogsPage() {
       start: metadataRange.start,
       end: metadataRange.end,
       limit: 1_000,
+      project,
       ...metadataFilters,
     }, signal),
   });
@@ -621,6 +631,7 @@ export function LogsPage() {
       start: metadataRange.start,
       end: metadataRange.end,
       limit: 1_000,
+      project,
       ...metadataFilters,
     }, signal),
   });
@@ -691,6 +702,7 @@ export function LogsPage() {
         start: metadataRange.start,
         end: metadataRange.end,
         limit: 1_000,
+        project,
         ...fieldFilters,
       }, signal),
     }).then((response) => {
@@ -748,6 +760,7 @@ export function LogsPage() {
         end: metadataRange.end,
         filter: context.token,
         limit: 100,
+        project,
         ...filtersForRequest,
       }, AbortSignal.any([signal, querySignal])),
     });
@@ -833,6 +846,7 @@ export function LogsPage() {
         start: effectiveRange.start,
         end: effectiveRange.end,
         format,
+        project: executed.project,
         ...filtersForRequest,
       }, controller.signal);
       if (writable) {

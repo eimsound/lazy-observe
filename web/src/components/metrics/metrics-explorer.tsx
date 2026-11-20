@@ -1,9 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, Copy, Loader2, Plus, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { labelNames, labelValues, metricNames } from "@/lib/api/metrics";
-import { getProjectSlug } from "@/lib/settings";
+import { useProject } from "@/lib/project/project-provider";
 import type { ResolvedMetricsRange } from "@/lib/metrics-query";
 import { Button } from "@/components/ui/button";
 import {
@@ -26,12 +26,22 @@ const escapePromQL = (value: string) => value.replace(/\\/g, "\\\\").replace(/"/
 
 export function MetricsExplorer({ open, range, onOpenChange, onInsert }: MetricsExplorerProps) {
   const { t } = useTranslation();
-  const project = getProjectSlug();
+  const { currentSlug: project } = useProject();
+  const previousProject = useRef(project);
   const [filter, setFilter] = useState("");
   const [selectedMetric, setSelectedMetric] = useState("");
   const [selectedLabel, setSelectedLabel] = useState("");
   const [matchers, setMatchers] = useState<Record<string, string>>({});
-  const base = { start: range.start, end: range.end, limit: 10_000 };
+  const base = { start: range.start, end: range.end, limit: 10_000, project };
+
+  useEffect(() => {
+    if (previousProject.current === project) return;
+    previousProject.current = project;
+    setFilter("");
+    setSelectedMetric("");
+    setSelectedLabel("");
+    setMatchers({});
+  }, [project]);
 
   const names = useQuery({
     queryKey: ["metrics-explorer", project, range.start, range.end],
@@ -44,7 +54,7 @@ export function MetricsExplorer({ open, range, onOpenChange, onInsert }: Metrics
       : ""}`
     : "";
   const labels = useQuery({
-    queryKey: ["metrics-explorer-labels", project, selectedMetric, range.start, range.end],
+    queryKey: ["metrics-explorer-labels", project, selectedMetric, selector, range.start, range.end],
     queryFn: ({ signal }) => labelNames({ ...base, match: selector || undefined }, signal),
     enabled: open && Boolean(selectedMetric),
   });

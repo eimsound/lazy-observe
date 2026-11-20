@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
@@ -26,6 +26,7 @@ import {
   resolveRangeMicros,
 } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
+import { useProject } from "@/lib/project/project-provider";
 import { ApiError } from "@/lib/api/client";
 import { formatDateTime, formatDurationMicros } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -58,6 +59,8 @@ const ALL_OPERATIONS = "__all__";
 export function TracesPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const { currentSlug: project } = useProject();
+  const previousProject = useRef(project);
   const routeSearch = useSearch({ strict: false }) as TraceSearchURL;
   const {
     service: urlService, operation: urlOperation, start: urlStart, end: urlEnd,
@@ -82,6 +85,17 @@ export function TracesPage() {
   const [executed, setExecuted] = useState<TraceSearchParams | null>(initialSearch);
 
   useEffect(() => {
+    if (previousProject.current === project) return;
+    previousProject.current = project;
+    setService("");
+    setOperation(ALL_OPERATIONS);
+    setMinDuration("");
+    setTags("");
+    setExecuted(null);
+    void navigate({ to: "/traces", search: {}, replace: true });
+  }, [project, navigate]);
+
+  useEffect(() => {
     setExecuted(urlSearch);
     if (!urlSearch) return;
     setService(urlSearch.service);
@@ -92,8 +106,8 @@ export function TracesPage() {
   }, [urlSearch]);
 
   const servicesQuery = useQuery<string[], ApiError>({
-    queryKey: ["trace-services"],
-    queryFn: ({ signal }) => getServices(signal),
+    queryKey: ["trace-services", project],
+    queryFn: ({ signal }) => getServices(signal, project),
     retry: false,
   });
 
@@ -105,9 +119,9 @@ export function TracesPage() {
   }, [service, servicesQuery.data]);
 
   const operationsQuery = useQuery<string[], ApiError>({
-    queryKey: ["trace-operations", service],
+    queryKey: ["trace-operations", project, service],
     enabled: !!service,
-    queryFn: ({ signal }) => getOperations(service, signal),
+    queryFn: ({ signal }) => getOperations(service, signal, project),
     retry: false,
   });
   const serviceOptions = useMemo(
@@ -148,6 +162,7 @@ export function TracesPage() {
   const searchQuery = useQuery<JaegerTrace[], ApiError>({
     queryKey: [
       "trace-search",
+      project,
       executed?.service,
       executed?.operation,
       executed?.start,
@@ -159,7 +174,7 @@ export function TracesPage() {
     enabled: executed !== null,
     retry: false,
     placeholderData: (previous) => previous,
-    queryFn: ({ signal }) => searchTraces(executed!, signal),
+    queryFn: ({ signal }) => searchTraces(executed!, signal, project),
   });
 
   const summaries = useMemo<TraceSummary[]>(

@@ -65,7 +65,10 @@ export type { LogsExtraFilterParams } from "../logs-explorer.ts";
 
 export type LogsTimeValue = string | number;
 export type LogsDurationValue = string | number;
-export type LogsRequestFilters = Partial<LogsExtraFilterParams>;
+export type LogsRequestFilters = Partial<LogsExtraFilterParams> & {
+  /** Explicit project slug override for `X-LO-Project` (prevents project-switch races). */
+  project?: string;
+};
 
 export interface LogsQueryParams extends LogsRequestFilters {
   query: string;
@@ -155,9 +158,11 @@ async function postLogsJson(
   path: string,
   fields: FormFields,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<unknown> {
   const response = await apiPostFormResponse(path, fields, {
     signal,
+    project,
     accept: "application/json",
   });
   try {
@@ -183,7 +188,7 @@ export async function queryLogs(
       offset: params.offset,
       ...filterFields(params),
     },
-    { signal, accept: "application/stream+json, application/x-ndjson" },
+    { signal, project: params.project, accept: "application/stream+json, application/x-ndjson" },
   );
   return parseJsonLines(text);
 }
@@ -193,7 +198,7 @@ export async function queryLogs(
  * New explorer code should use queryLogHitsSeries to preserve grouping fields.
  */
 export async function logsHits(
-  params: LogsHitsParams,
+  params: LogsHitsParams & { project?: string },
   signal?: AbortSignal,
 ): Promise<LogsHistogram> {
   if (IS_MOCK) return (await loadMockLogs()).mockLogsHits(params, signal);
@@ -205,6 +210,7 @@ export async function logsHits(
       step: `${params.step}s`,
     },
     signal,
+    project: params.project,
   });
   return normalizeHits(response);
 }
@@ -226,6 +232,7 @@ export async function queryLogHitsSeries(
       fields_limit: params.fieldsLimit,
     },
     signal,
+    params.project,
   );
   return { hits: normalizeHitsSeries(response) };
 }
@@ -245,6 +252,7 @@ export async function queryLogStatsRange(
       fields_limit: params.fieldsLimit,
     },
     signal,
+    params.project,
   );
   return normalizeStatsQueryRange(response);
 }
@@ -259,6 +267,7 @@ export async function queryLogsTimeRange(
     "/logs/query_time_range",
     rangeFields(params),
     signal,
+    params.project,
   );
   return normalizeQueryTimeRange(response);
 }
@@ -283,6 +292,7 @@ async function queryMetadata(
       ...filterFields(params),
     },
     signal,
+    params.project,
   );
   return normalizeFieldValuesResponse(response);
 }
@@ -343,6 +353,7 @@ export async function* tailLogs(
     },
     {
       signal,
+      project: params.project,
       accept: "application/x-ndjson, application/stream+json",
     },
   );
@@ -376,6 +387,7 @@ export async function exportLogs(
     },
     {
       signal,
+      project: params.project,
       accept: isCsv ? "text/csv" : "application/stream+json, application/x-ndjson",
     },
   );

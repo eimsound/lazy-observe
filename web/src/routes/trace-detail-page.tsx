@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
@@ -11,6 +11,7 @@ import {
 } from "@/lib/api/traces";
 import { buildTree, maxDepth } from "@/lib/trace-tree";
 import { ApiError } from "@/lib/api/client";
+import { useProject } from "@/lib/project/project-provider";
 import { formatDurationMicros } from "@/lib/format";
 import { PageContainer } from "@/components/layout/page";
 import { TraceWaterfall } from "@/components/traces/trace-waterfall";
@@ -25,13 +26,19 @@ export function TraceDetailPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { traceID } = useParams({ strict: false }) as { traceID: string };
+  const { currentSlug: project } = useProject();
 
   const [selected, setSelected] = useState<JaegerSpan | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
+  useEffect(() => {
+    setSelected(null);
+    setDrawerOpen(false);
+  }, [project, traceID]);
+
   const traceQuery = useQuery<JaegerTrace, ApiError>({
-    queryKey: ["trace", traceID],
-    queryFn: ({ signal }) => getTrace(traceID, signal),
+    queryKey: ["trace", project, traceID],
+    queryFn: ({ signal }) => getTrace(traceID, signal, project),
     retry: false,
   });
 
@@ -91,6 +98,7 @@ export function TraceDetailPage() {
         </Card>
       ) : (
         <TraceDetailBody
+          key={`${project}:${traceID}`}
           trace={traceQuery.data}
           selected={selected}
           drawerOpen={drawerOpen}

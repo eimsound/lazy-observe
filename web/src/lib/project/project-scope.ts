@@ -58,6 +58,46 @@ function isProjectScoped(queryKey: readonly unknown[]): boolean {
   return !UNAFFECTED_ROOTS.has(String(queryKey[0]));
 }
 
+export interface ProjectSelectionResolution {
+  /** True once `currentSlug` is already valid for the loaded project list. */
+  ready: boolean;
+  /** The valid slug to use (empty when the user has no projects). */
+  resolvedSlug: string;
+  /** True when the stored/active slug must be updated to `resolvedSlug`. */
+  changed: boolean;
+}
+
+/**
+ * Resolve the active project slug against the authoritative `/api/projects`
+ * list. When a stale slug is cached in localStorage (deleted/renamed project),
+ * `ready` stays false until state and storage switch to `resolvedSlug` so
+ * child routes never fire data queries with an invalid `X-LO-Project` header.
+ */
+export function resolveProjectSelection(
+  projects: readonly { slug: string }[],
+  currentSlug: string,
+): ProjectSelectionResolution {
+  if (projects.length === 0) {
+    return {
+      ready: currentSlug === "",
+      resolvedSlug: "",
+      changed: currentSlug !== "",
+    };
+  }
+  if (currentSlug && projects.some((p) => p.slug === currentSlug)) {
+    return {
+      ready: true,
+      resolvedSlug: currentSlug,
+      changed: false,
+    };
+  }
+  return {
+    ready: false,
+    resolvedSlug: projects[0].slug,
+    changed: true,
+  };
+}
+
 /**
  * Bring cached queries in line with a newly selected project. Query keys do
  * not carry the project, so results cached under the previous project are
