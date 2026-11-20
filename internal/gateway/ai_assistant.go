@@ -500,6 +500,9 @@ func (g *Gateway) isolatedQuery(
 		return nil, err
 	}
 	if signal == "logs" || signal == "traces" {
+		if project.ID <= 0 {
+			return nil, errors.New("invalid project ID for tenant isolation")
+		}
 		g.storage.SetTenantHeaders(req.Header, project.ID)
 	}
 	resp, err := g.client.Do(req)

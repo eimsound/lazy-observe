@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -26,6 +27,10 @@ func TestDetectLLMSystem(t *testing.T) {
 		{"/proxy/v1/messages", llmAnthropic, true},
 		{"/api/chat", llmOllama, true},
 		{"/v1/models", "", false},
+		{"/v1/messages/count_tokens", "", false},
+		{"/v1/messages/msg_123", "", false},
+		{"/api/chat/history", "", false},
+		{"/v1/chat/completions/abc", "", false},
 	}
 	for _, tt := range tests {
 		got, ok := detectLLMSystem(tt.path)
@@ -382,6 +387,138 @@ func TestLLMTransportPreservesResponseStatusAndHeadersOnBodyReadError(t *testing
 	span := onlyLLMSpan(t, exporter)
 	if span.Status.Code.String() != "Error" || len(span.Events) == 0 {
 		t.Fatalf("body read error not recorded on span: %#v", span)
+	}
+}
+
+func TestLLMTransportNon2xxStreamEndsSpanImmediately(t *testing.T) {
+	t.Parallel()
+	exporter, client := llmTestClient(t, false)
+	httpClient := &http.Client{
+		Transport: client.LLMTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status:     "429 Too Many Requests",
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"rate limited"}}`)),
+			}, nil
+		})),
+	}
+	resp, err := httpClient.Post(
+		"http://llm.test/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Intentionally do NOT read resp.Body before checking spans: a caller that
+	// bails out on HTTP 429 must not leak the LLM span.
+	span := onlyLLMSpan(t, exporter)
+	if span.Status.Code.String() != "Error" {
+		t.Fatalf("429 stream status = %s, want Error", span.Status.Code)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestLLMTransportCapturesCacheAndReasoningTokens(t *testing.T) {
+	t.Parallel()
+	t.Run("openai non-streaming", func(t *testing.T) {
+		exporter, client := llmTestClient(t, false)
+		httpClient := &http.Client{
+			Transport: client.LLMTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return llmHTTPResponse(
+					"application/json",
+					`{"model":"o3-mini","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1000,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":600},"completion_tokens_details":{"reasoning_tokens":200}}}`,
+				), nil
+			})),
+		}
+		resp, err := httpClient.Post(
+			"http://llm.test/v1/chat/completions",
+			"application/json",
+			strings.NewReader(`{"model":"o3-mini","messages":[{"role":"user","content":"hi"}]}`),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		attrs := spanAttributes(onlyLLMSpan(t, exporter).Attributes)
+		if attrs["gen_ai.usage.input_tokens"] != int64(1000) ||
+			attrs["gen_ai.usage.output_tokens"] != int64(300) ||
+			attrs["gen_ai.usage.cache_read.input_tokens"] != int64(600) ||
+			attrs["gen_ai.usage.reasoning_tokens"] != int64(200) {
+			t.Fatalf("openai cache/reasoning attrs = %#v", attrs)
+		}
+	})
+
+	t.Run("anthropic streaming", func(t *testing.T) {
+		exporter, client := llmTestClient(t, true)
+		stream := strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"cache_creation_input_tokens":5000,"cache_read_input_tokens":20000}}}`,
+			``,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"cached reply"}}`,
+			``,
+			`event: message_delta`,
+			`data: {"type":"message_delta","usage":{"output_tokens":42}}`,
+			``,
+		}, "\n")
+		httpClient := &http.Client{
+			Transport: client.LLMTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return llmHTTPResponse("text/event-stream", stream), nil
+			})),
+		}
+		resp, err := httpClient.Post(
+			"http://llm.test/v1/messages",
+			"application/json",
+			strings.NewReader(`{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		attrs := spanAttributes(onlyLLMSpan(t, exporter).Attributes)
+		if attrs["gen_ai.response.model"] != "claude-sonnet-4-20250514" ||
+			attrs["gen_ai.usage.input_tokens"] != int64(100) ||
+			attrs["gen_ai.usage.output_tokens"] != int64(42) ||
+			attrs["gen_ai.usage.cache_creation.input_tokens"] != int64(5000) ||
+			attrs["gen_ai.usage.cache_read.input_tokens"] != int64(20000) ||
+			attrs["gen_ai.completion"] != "cached reply" {
+			t.Fatalf("anthropic stream attrs = %#v", attrs)
+		}
+	})
+}
+
+func TestLLMStreamBodyOversizedLineAndConcurrentClose(t *testing.T) {
+	t.Parallel()
+	exporter, client := llmTestClient(t, false)
+	// First line exceeds llmBodyInspectionLimit and must be discarded cleanly;
+	// the following valid SSE usage line must still parse.
+	oversized := "data: " + strings.Repeat("x", llmBodyInspectionLimit+1024) + "\n"
+	valid := `data: {"model":"gpt-4o","usage":{"prompt_tokens":15,"completion_tokens":5}}` + "\n"
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = io.WriteString(pw, oversized)
+		_, _ = io.WriteString(pw, valid)
+		_ = pw.Close()
+	}()
+	_, span := client.tracer.Tracer("test").Start(context.Background(), "chat openai")
+	stream := newLLMStreamBody(pr, llmOpenAI, span, false)
+	_, _ = io.Copy(io.Discard, stream)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = stream.Close()
+		}()
+	}
+	wg.Wait()
+	attrs := spanAttributes(onlyLLMSpan(t, exporter).Attributes)
+	if attrs["gen_ai.usage.input_tokens"] != int64(15) || attrs["gen_ai.usage.output_tokens"] != int64(5) {
+		t.Fatalf("oversized-line recovery attrs = %#v", attrs)
 	}
 }
 
