@@ -14,13 +14,13 @@ case "$platform" in
   linux-amd64)
     metrics_sha=54409ea381db0316f0bf6f242c718bc498085eb1eb37520b73526e6d86891601 # v1.156.0
     vmutils_sha=d71f7f00e07782531000620ec6c2a9d7ec83324f364dd1f36095ab378b5fb43b # v1.156.0
-    logs_sha=55feba89713cafa952673f91b8b38e7701bb0290989263da671b47a0de16edd3 # v1.53.0
+    logs_sha=739e78c82294520b6079bc8a6ae32a1f9fb95a543092929a53a2fe9ab7383016 # v1.54.0
     traces_sha=789e006d076f3c8b99de7bb1d0277024a7db776db0294d1c27fcc5422d98c4bc # v0.13.0
     ;;
   linux-arm64)
     metrics_sha=f777110b232bfdf435556c57d0896716e27000afafe969c4eb08852352dceb7d # v1.156.0
     vmutils_sha=1a8e4ed55df2a59d5cd03056213f50d293d4fab029e38dd960597362d92cf176 # v1.156.0
-    logs_sha=301b7ef12ff9fac7f70b155191affe07ac6212755514174461d775548699ef96 # v1.53.0
+    logs_sha=f6c4eb5bc4e2ec5a70c75f670f038122eed907b7e635b66497e80d38956561fa # v1.54.0
     traces_sha=210bc863666865ba9a4ff0a19901318042da0c474d248fec69ca71c07b1e5f7a # v0.13.0
     ;;
   *)
@@ -30,7 +30,7 @@ case "$platform" in
 esac
 
 metrics_version=v1.156.0
-logs_version=v1.53.0
+logs_version=v1.54.0
 traces_version=v0.13.0
 metrics_asset="victoria-metrics-$platform-$metrics_version.tar.gz"
 vmutils_asset="vmutils-$platform-$metrics_version.tar.gz"
