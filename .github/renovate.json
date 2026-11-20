@@ -33,7 +33,7 @@
   },
   "timezone": "Asia/Shanghai",
   "schedule": [
-    "after 3am on monday"
+    "at any time"
   ],
   "dependencyDashboard": {
     "enabled": true

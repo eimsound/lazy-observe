@@ -104,7 +104,7 @@ Renovate 的 mise manager 只改 `mise.toml`，所以工具版本只在 `mise.to
 
 - Renovate 44 用 `managerFilePatterns`（旧名 `fileMatch`），值是 `/regex/` 字符串；`dependencyDashboard` 必须写成对象 `{"enabled": true}`，布尔写法 `--strict` 会报需要迁移。
 - 提交信息 `chore: update dependency x to v1.2.3`：`semanticCommits: enabled`、`semanticCommitType: chore`、`semanticCommitScope: null`，并去掉 `:semanticPrefixFixDepsChoreOthers`。
-- 排期 `timezone: Asia/Shanghai`、`schedule: ["after 3am on monday"]`；Mend 免费托管每 4 小时跑一轮。`prConcurrentLimit: 10`，`prHourlyLimit: 0`。
+- 排期 `timezone: Asia/Shanghai`，常规为 `schedule: ["after 3am on monday"]`。2026-11-20 起临时随时开 PR，全部升级完成后恢复周一排期（待恢复切片）；期间全局 `schedule` 是 `["at any time"]`，7 天最小发布年龄不变。Mend 免费托管每 4 小时跑一轮。`prConcurrentLimit: 10`，`prHourlyLimit: 0`。
 - `enabledManagers` 显式列出（github-actions、gomod、npm、pep621、dockerfile、mise、custom.regex），避免托管 App 的默认集合打开 `helm-values` 等不需要的 manager。
 - `packageRules` 按顺序合并，后面命中的规则覆盖前面的同名字段：专用分组（ent、OpenTelemetry、pnpm）必须排在通用的 minor-patch 规则之后，`timestamp-optional` 那条用 `groupName: null` 把无时间戳依赖从各组里拿出来。改规则后用 `--dry-run=lookup` 看每个更新的 `branchName`。
 - 本地验证时 `--platform=local` 用 `git ls-files` 取文件，新文件要先 `git add` 才会被读到。
