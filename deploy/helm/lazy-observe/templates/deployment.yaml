@@ -187,3 +187,30 @@ spec:
       {{- with .Values.tolerations }}
       tolerations: {{ toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey | quote }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | quote }}
+          {{- if .minDomains }}
+          minDomains: {{ .minDomains }}
+          {{- end }}
+          {{- if .nodeAffinityPolicy }}
+          nodeAffinityPolicy: {{ .nodeAffinityPolicy | quote }}
+          {{- end }}
+          {{- if .nodeTaintsPolicy }}
+          nodeTaintsPolicy: {{ .nodeTaintsPolicy | quote }}
+          {{- end }}
+          {{- with .matchLabelKeys }}
+          matchLabelKeys: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          labelSelector:
+            {{- if .labelSelector }}
+            {{- toYaml .labelSelector | nindent 12 }}
+            {{- else }}
+            matchLabels:
+              {{- include "lazy-observe.selectorLabels" $ | nindent 14 }}
+            {{- end }}
+        {{- end }}
+      {{- end }}

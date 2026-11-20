@@ -71,7 +71,13 @@ def norm(name: str) -> str:
 def extract_licenses(dist: md.Distribution) -> list[str]:
     expr = (dist.metadata.get("License-Expression") or "").strip()
     if expr:
-        return [token.strip() for token in re.split(r"\s+(?:OR|AND)\s+", expr) if token.strip()]
+        tokens = [
+            token.strip().strip("()").strip()
+            for token in re.split(r"\s+(?:OR|AND)\s+", expr)
+            if token.strip().strip("()").strip()
+        ]
+        if tokens:
+            return tokens
     raw = (dist.metadata.get("License") or "").strip()
     if raw:
         first_line = raw.splitlines()[0].strip()

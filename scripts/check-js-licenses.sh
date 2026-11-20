@@ -16,6 +16,7 @@ command -v node >/dev/null 2>&1 || {
   exit 1
 }
 
+root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 work=$(mktemp -d "${TMPDIR:-/tmp}/lazy-observe-js-licenses.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
@@ -144,4 +145,9 @@ if (fs.existsSync(noticePath)) {
 
 console.log(`PASS: ${workspace} production dependencies use the JavaScript license allowlist`);
 NODE
+
+  workspace_abs=$(CDPATH='' cd -- "$workspace" && pwd -P)
+  if [[ $workspace_abs == "$root/web" ]]; then
+    bash "$root/scripts/web-third-party-licenses.sh" --check --license-json "$output"
+  fi
 done

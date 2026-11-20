@@ -244,7 +244,7 @@ description = "Lint the Helm chart"
 run = '${HELM:-helm} lint deploy/helm/lazy-observe'
 
 [tasks.helm-template-test]
-description = "Check the Helm chart keeps key material out of the environment and honours image.digest"
+description = "Check the Helm chart values schema, security guards, image.digest, and Go config.Load contract"
 run = "bash scripts/helm-template-test.sh"
 
 [tasks.workflow-check]
@@ -572,6 +572,10 @@ exit "$status"
 [tasks.third-party-notices]
 description = "Regenerate third_party/go/THIRD_PARTY_NOTICES.txt from the linked Go dependency graph"
 run = "bash scripts/third-party-notices.sh"
+
+[tasks.web-third-party-licenses]
+description = "Regenerate web/THIRD_PARTY_LICENSES.md from the production web dependency graph"
+run = "bash scripts/web-third-party-licenses.sh"
 
 [tasks.snapshot]
 description = "Build a local GoReleaser snapshot"
