@@ -112,6 +112,8 @@ self_monitoring:
 # 256-bit key is generated and persisted with mode 0600. Empty uses
 # <data_dir>/secret.key. HA replicas must share the same key file.
 security:
+  # Mark session and CSRF cookies Secure when TLS terminates in front of the gateway.
+  session_secure_cookie: false
   # Set both paths to enable native HTTPS; leave both empty for plain HTTP or
   # when TLS terminates at a trusted reverse proxy.
   tls_cert: ""
@@ -145,6 +147,7 @@ security:
 # LO_PROCESS_RESTART_INITIAL, LO_PROCESS_RESTART_MAX, LO_PROCESS_DRAIN_TIMEOUT,
 # LO_PROCESS_COMPONENT_PORT_OFFSET, LO_ALERT_STORM_THRESHOLD.
 # Self-monitoring fields: LO_SELF_MONITORING_ENABLED and LO_SELF_MONITORING_PROFILING.
-# Security fields: LO_SECURITY_SECRET_KEY_FILE, LO_SECURITY_ADMIN_PASSWORD_FILE.
-# Both take a file path; the key material and the password never travel via env.
+# Security fields: LO_SECURITY_SECRET_KEY_FILE, LO_SECURITY_ADMIN_PASSWORD_FILE,
+# LO_SECURITY_SESSION_SECURE_COOKIE, LO_SECURITY_OUTBOUND_ALLOWLIST.
+# Both *_FILE variables take a file path; the key material and the password never travel via env.
 # Only canonical names are accepted; short compatibility aliases are not supported.

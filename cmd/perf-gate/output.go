@@ -4,8 +4,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 )
+
+func resultMetadata() (string, string) {
+	commit := strings.TrimSpace(os.Getenv("LO_PERF_COMMIT"))
+	if commit == "" {
+		if out, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
+			commit = strings.TrimSpace(string(out))
+		}
+	}
+	return commit, time.Now().UTC().Format(time.RFC3339)
+}
 
 func writeResult(path string, value any) error {
 	if path == "" {

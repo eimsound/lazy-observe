@@ -68,6 +68,7 @@ case $sdk in
     [[ $module_path == github.com/eimsound/lazy-observe/sdk/go ]] || \
       fail "unexpected Go SDK module path: $module_path"
     (cd sdk/go && CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...)
+    bash scripts/check-go-licenses.sh --sdk-go-only
     if [[ $publish == 1 ]]; then
       (cd "$(mktemp -d)" && GOPROXY=https://proxy.golang.org go list -m "$module_path@v$version")
       printf 'DONE: %s@v%s is available from proxy.golang.org\n' "$module_path" "$version"
@@ -83,7 +84,22 @@ case $sdk in
       packages+=("$(dirname -- "$manifest")")
     done
     ((${#packages[@]} > 0)) || fail "no packages under $workspace/packages"
-    (cd "$workspace" && pnpm install --frozen-lockfile && pnpm build && pnpm typecheck && pnpm test)
+    if [[ $sdk == browser ]]; then
+      # 先安装并构建 bundler-plugin，再整体 install：examples/react 的 workspace bin 依赖 dist/cli.js，
+      # 干净 runner 上直接整仓 install 会触发 Failed to create bin（与 mise run sdk-browser 一致）。
+      (
+        cd "$workspace"
+        CI=true pnpm install --frozen-lockfile --filter @lazy-observe/bundler-plugin
+        pnpm --filter @lazy-observe/bundler-plugin build
+        CI=true pnpm install --frozen-lockfile
+        pnpm build
+        pnpm typecheck
+        pnpm test
+      )
+    else
+      (cd "$workspace" && CI=true pnpm install --frozen-lockfile && pnpm build && pnpm typecheck && pnpm test)
+    fi
+    bash scripts/check-js-licenses.sh "$workspace"
     for package in "${packages[@]}"; do
       [[ -f $package/LICENSE ]] || fail "$package/LICENSE is missing from the published files"
       if [[ $publish == 1 ]]; then
@@ -103,6 +119,14 @@ case $sdk in
     # --managed-python：新 runner 上没有 uv 托管的解释器时，裸 `uv build` 会退到系统 /usr/bin/python3；
     # 固定 3.13 与 sdk-python 的默认解释器、改用 uv 前 setup-python 的版本一致。
     command -v uv >/dev/null 2>&1 || fail "uv is required to build the Python SDK (run via 'mise run sdk-python-release')"
+    (
+      cd sdk/python
+      uv python install --managed-python 3.13
+      uv venv --managed-python --python 3.13 --clear .venv
+      uv pip install --quiet --python .venv/bin/python -e ".[test]"
+      .venv/bin/python -m pytest -q tests
+    )
+    bash scripts/check-python-licenses.sh sdk/python/.venv/bin/python
     (
       cd sdk/python
       rm -rf dist

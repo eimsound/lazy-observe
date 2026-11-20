@@ -79,9 +79,22 @@ mkdir -p "$tmp_dir/extracted"
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir/extracted"
 [ -f "$tmp_dir/extracted/lazy-observe" ] || { printf 'archive is missing lazy-observe\n' >&2; exit 1; }
 
+nearest_existing_dir() {
+  dir=$1
+  while [ ! -e "$dir" ]; do
+    parent=$(dirname "$dir")
+    [ "$parent" = "$dir" ] && break
+    dir=$parent
+  done
+  printf '%s' "$dir"
+}
+
 if [ -d "$prefix/bin" ] && [ -w "$prefix/bin" ]; then
   install -m 0755 "$tmp_dir/extracted/lazy-observe" "$destination"
-elif [ ! -e "$prefix/bin" ] && [ -w "$prefix" ]; then
+elif [ -e "$prefix/bin" ] && [ ! -d "$prefix/bin" ]; then
+  printf 'install destination exists and is not a directory: %s\n' "$prefix/bin" >&2
+  exit 1
+elif [ ! -e "$prefix/bin" ] && ancestor=$(nearest_existing_dir "$prefix/bin") && [ -d "$ancestor" ] && [ -w "$ancestor" ]; then
   mkdir -p "$prefix/bin"
   install -m 0755 "$tmp_dir/extracted/lazy-observe" "$destination"
 elif command -v sudo >/dev/null 2>&1; then

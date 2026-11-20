@@ -498,8 +498,9 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		c.Standalone = parsed
 	}
 	for name, dst := range map[string]*bool{
-		"LO_SERVE_WEB_UI":            &c.ServeWebUI,
-		"LO_STORAGE_METRICS_CLUSTER": &c.Storage.Metrics.Cluster,
+		"LO_SERVE_WEB_UI":                   &c.ServeWebUI,
+		"LO_STORAGE_METRICS_CLUSTER":        &c.Storage.Metrics.Cluster,
+		"LO_SECURITY_SESSION_SECURE_COOKIE": &c.Security.SessionSecureCookie,
 	} {
 		if v, ok := lookup(name); ok {
 			parsed, err := strconv.ParseBool(v)

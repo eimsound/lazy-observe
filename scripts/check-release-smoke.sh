@@ -682,7 +682,12 @@ then
   fail "embedded storage extraction or process supervision validation failed"
 fi
 
-if ! "$python_command" - "$children_file" "$server_pid" "$max_rss_bytes" "$smoke_output" <<'PY'
+smoke_commit=${LO_PERF_COMMIT:-}
+if [[ -z $smoke_commit ]]; then
+  smoke_commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
+fi
+if ! "$python_command" - "$children_file" "$server_pid" "$max_rss_bytes" "$smoke_output" "$smoke_commit" <<'PY'
+from datetime import datetime, timezone
 import json
 import pathlib
 import subprocess
@@ -692,6 +697,7 @@ children_path = pathlib.Path(sys.argv[1])
 server_pid = int(sys.argv[2])
 maximum = int(sys.argv[3])
 output = sys.argv[4]
+git_commit = sys.argv[5]
 processes = [("gateway", server_pid)]
 for line in children_path.read_text(encoding="utf-8").splitlines():
     component, raw_pid, _ = line.split("\t", 2)
@@ -716,6 +722,8 @@ for component, pid in processes:
 total = sum(item["rss_bytes"] for item in measurements)
 payload = {
     "version": 1,
+    "git_commit": git_commit,
+    "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "aggregate_idle_rss_bytes": total,
     "max_idle_rss_bytes": maximum,
     "processes": measurements,

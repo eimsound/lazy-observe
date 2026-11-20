@@ -48,6 +48,18 @@ this is a live failure mode, not a hypothetical one.
 {{- printf "%s:%s" $repository $tag -}}
 {{- end -}}
 {{- end }}
+{{- define "lazy-observe.imagePullPolicy" -}}
+{{- if .Values.image.pullPolicy -}}
+{{- .Values.image.pullPolicy -}}
+{{- else -}}
+{{- $tag := toString (default .Chart.AppVersion .Values.image.tag) -}}
+{{- if and (not .Values.image.digest) (eq $tag "latest") -}}
+Always
+{{- else -}}
+IfNotPresent
+{{- end -}}
+{{- end -}}
+{{- end }}
 {{- define "lazy-observe.secretName" -}}
 {{- default (include "lazy-observe.fullname" .) .Values.secret.existingSecret }}
 {{- end }}

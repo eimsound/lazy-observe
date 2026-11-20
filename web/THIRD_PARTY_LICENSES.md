@@ -3,7 +3,7 @@
 The production web application includes the following Prometheus-maintained
 package for the PromQL query tree and Explain view:
 
-- `@prometheus-io/lezer-promql` 0.313.1
+- `@prometheus-io/lezer-promql` 0.316.0
 
 Copyright 2021 The Prometheus Authors.
 
@@ -27,10 +27,10 @@ The metrics time-series charts and logs histograms use `uplot` 1.6.32,
 Copyright (c) 2019 Leon Sorokin, under the MIT license. The full license text
 is distributed in the npm package as `LICENSE`.
 
-Date parsing, formatting, localization, and timezone handling use `dayjs`
-1.11.21, Copyright (c) 2018-present, iamkun, under the MIT license. The
-application statically includes only the English and Simplified Chinese locale
-modules. The full license text is distributed in the npm package as `LICENSE`.
+Date parsing, formatting, localization, and timezone handling use `dayjs` 1.11.23,
+Copyright (c) 2018-present, iamkun, under the MIT license. The application statically
+includes only the English and Simplified Chinese locale modules. The full license text
+is distributed in the npm package as `LICENSE`.
 
 The query-workspace layout and application state in lazy-observe were rewritten
 for this project after reviewing Prometheus' Expression Browser behavior; no

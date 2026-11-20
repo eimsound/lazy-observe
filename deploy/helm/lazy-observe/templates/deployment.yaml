@@ -6,7 +6,9 @@ metadata:
   labels:
     {{- include "lazy-observe.labels" . | nindent 4 }}
 spec:
+  {{- if or (eq .Values.mode "allinone") (not .Values.hpa.enabled) }}
   replicas: {{ if eq .Values.mode "allinone" }}1{{ else }}{{ .Values.replicaCount }}{{ end }}
+  {{- end }}
   strategy:
     type: {{ if eq .Values.mode "allinone" }}Recreate{{ else }}RollingUpdate{{ end }}
   selector:
@@ -16,11 +18,19 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if and .Values.secret.create (not .Values.secret.existingSecret) }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
       labels:
         {{- include "lazy-observe.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
     spec:
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{ toYaml . | nindent 8 }}
@@ -28,7 +38,11 @@ spec:
       containers:
         - name: lazy-observe
           image: {{ include "lazy-observe.image" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "lazy-observe.imagePullPolicy" . }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           args: ["server", "--config", "/etc/lazy-observe/config.yaml"]
           ports:
             - name: http
@@ -90,6 +104,8 @@ spec:
               readOnly: true
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
             {{- if include "lazy-observe.encryptionKey.mounted" . }}
             - name: encryption-key
               mountPath: {{ include "lazy-observe.encryptionKey.mountPath" . }}
@@ -110,8 +126,16 @@ spec:
             claimName: {{ include "lazy-observe.fullname" . }}
         {{- else }}
         - name: data
-          emptyDir: {}
+          emptyDir:
+            {{- with .Values.emptyDir.dataSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
         {{- end }}
+        - name: tmp
+          emptyDir:
+            {{- with .Values.emptyDir.tmpSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
         {{- if include "lazy-observe.encryptionKey.mounted" . }}
         - name: encryption-key
           secret:
@@ -137,8 +161,28 @@ spec:
       {{- with .Values.nodeSelector }}
       nodeSelector: {{ toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
-      affinity: {{ toYaml . | nindent 8 }}
+      {{- if .Values.affinity }}
+      affinity: {{ toYaml .Values.affinity | nindent 8 }}
+      {{- else if eq .Values.podAntiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "lazy-observe.selectorLabels" . | nindent 20 }}
+      {{- else if eq .Values.podAntiAffinity "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "lazy-observe.selectorLabels" . | nindent 18 }}
+      {{- else if .Values.podAntiAffinity }}
+      {{- fail (printf "podAntiAffinity must be \"\", \"soft\", or \"hard\", got %q" .Values.podAntiAffinity) }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations: {{ toYaml . | nindent 8 }}

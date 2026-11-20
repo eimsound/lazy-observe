@@ -37,6 +37,8 @@ type queryEndpointResult struct {
 
 type queryGateResult struct {
 	Version      int                   `json:"version"`
+	GitCommit    string                `json:"git_commit,omitempty"`
+	GeneratedAt  string                `json:"generated_at,omitempty"`
 	BaseURL      string                `json:"base_url"`
 	Warmup       int                   `json:"warmup_requests"`
 	Fixture      queryFixtureResult    `json:"medium_fixture"`
@@ -214,7 +216,16 @@ func runQueryGate(args []string) error {
 		*minLogRows,
 		required.Issues,
 	)
-	result := queryGateResult{Version: 2, BaseURL: normalizedBase, Warmup: warmup, Fixture: fixture, GatePassed: true}
+	gitCommit, generatedAt := resultMetadata()
+	result := queryGateResult{
+		Version:     2,
+		GitCommit:   gitCommit,
+		GeneratedAt: generatedAt,
+		BaseURL:     normalizedBase,
+		Warmup:      warmup,
+		Fixture:     fixture,
+		GatePassed:  true,
+	}
 	for _, target := range targets {
 		endpoint, endpointErr := measureQueryEndpoint(
 			context.Background(),

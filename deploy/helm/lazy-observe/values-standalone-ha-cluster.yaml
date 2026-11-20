@@ -46,15 +46,8 @@ podDisruptionBudget:
   minAvailable: 2
 
 # Keep gateway replicas on different nodes when the cluster has capacity.
-affinity:
-  podAntiAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        podAffinityTerm:
-          topologyKey: kubernetes.io/hostname
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: lazy-observe
+# Rendered with the release's selectorLabels (app.kubernetes.io/name + instance).
+podAntiAffinity: soft
 
 process:
   startupTimeout: 30s

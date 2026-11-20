@@ -136,6 +136,14 @@ classify() {
   if [[ $file == scripts/install-trivy.sh ]]; then
     set_flags trivy_pin
   fi
+  # 7 天发布年龄策略（scripts/check-github-workflows.sh）和 pipefail 静态门禁（scripts/check-pipefail-pipelines.sh）
+  # 都运行在 go job 的 workflow-check 中：动到任意 pnpm-workspace/lock、pyproject.toml 或 shell 脚本时必须打开 go，
+  # 避免被下面的 sdk/*、web/* 窄分组跳过。
+  case "$file" in
+  *pnpm-workspace.yaml | *pnpm-lock.yaml | *pyproject.toml | *.sh)
+    set_flags go
+    ;;
+  esac
 
   case "$file" in
   # 纯文档与 agent 流程：不跑业务 job。
@@ -169,6 +177,9 @@ classify() {
     set_flags sdk_python
     set_journeys python
     ;;
+  sdk/scripts/*)
+    set_flags go sdk_go sdk_node sdk_browser sdk_python sdk_journeys
+    ;;
   sdk/*)
     set_flags sdk_go sdk_node sdk_browser sdk_python sdk_journeys
     ;;
@@ -176,7 +187,7 @@ classify() {
     set_flags web build
     set_journeys browser
     ;;
-  internal/db/* | internal/meta/* | entc.mod | entc.sum | tools/entgen/* | scripts/generate-ent.sh)
+  internal/db/* | internal/meta/* | internal/embeddedpg/* | entc.mod | entc.sum | tools/entgen/* | scripts/generate-ent.sh)
     set_flags go build e2e ha meta_pg sdk_journeys
     ;;
   # 依赖升级可能动到 pgx / embedded-postgres，PG 元数据测试一起跑。
@@ -213,14 +224,22 @@ classify() {
   bench/performance-gates.json)
     set_flags go ha
     ;;
-  # JS 许可证检查被 web 与两个 JS SDK job 共用。
+  # JS 许可证检查被 web 与两个 JS SDK job 共用；本身是 shell 脚本也走 go 的 workflow-check。
   scripts/check-js-licenses.sh)
-    set_flags web sdk_node sdk_browser
+    set_flags go web sdk_node sdk_browser
+    ;;
+  # Python 许可证检查由 sdk-python 与 sdk-publish 共用。
+  scripts/check-python-licenses.sh)
+    set_flags go sdk_python
+    ;;
+  # 根 .golangci.yml 同时约束主仓库与 sdk/go。
+  .golangci.yml)
+    set_flags go sdk_go
     ;;
   .dockerignore | .goreleaser.yaml)
     set_flags go build arm64
     ;;
-  scripts/* | deploy/* | bench/* | tools/* | .golangci.yml | config.example.yaml | .gitignore)
+  scripts/* | deploy/* | bench/* | tools/* | config.example.yaml | .gitignore)
     set_flags go
     ;;
   *)

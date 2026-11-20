@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+mode=all
+case $# in
+  0) ;;
+  1)
+    [[ $1 == --sdk-go-only ]] || {
+      printf 'usage: %s [--sdk-go-only]\n' "${0##*/}" >&2
+      exit 2
+    }
+    mode=sdk-go-only
+    ;;
+  *)
+    printf 'usage: %s [--sdk-go-only]\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac
+
 main_module=$(go list -m -f '{{.Path}}')
 
 reviewed_non_go_packages=$(printf '%s\n' \
@@ -24,43 +40,54 @@ reviewed_non_go_packages=$(printf '%s\n' \
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
 
-# The main module (MIT, including the in-repo sdk/go module that shares its path
-# prefix) is ignored; dependencies reached through it remain in scope. Check the
-# exact two release targets because OS-specific package graphs differ.
-for platform in linux/amd64 linux/arm64; do
-  goos=${platform%/*}
-  goarch=${platform#*/}
-  warning_log="$workdir/${goos}-${goarch}.warnings"
-  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-    go-licenses check ./cmd/lazy-observe \
-      --allowed_licenses=Apache-2.0,MIT,BSD-2-Clause,BSD-3-Clause \
-      --ignore="$main_module" \
-      2> >(tee "$warning_log" >&2)
+check_target() {
+  local label=$1 dir=$2 pkg=$3 platform=$4
+  local goos=${platform%/*} goarch=${platform#*/}
+  local warning_log="$workdir/${label}-${goos}-${goarch}.warnings"
 
+  # 同步落盘到文件再回显并解析，避免 `2> >(tee ...)` 进程替换尚未刷盘就读取日志的竞态。
+  if ! (
+    cd "$dir"
+    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+      go-licenses check "$pkg" \
+        --allowed_licenses=Apache-2.0,MIT,BSD-2-Clause,BSD-3-Clause \
+        --ignore="$main_module" \
+        2>"$warning_log"
+  ); then
+    cat "$warning_log" >&2
+    exit 1
+  fi
+  cat "$warning_log" >&2
+
+  local actual_non_go_packages unexpected
   actual_non_go_packages=$(sed -n 's/.*"\([^"]*\)" contains non-Go code.*/\1/p' "$warning_log" | sort -u)
   unexpected=$(comm -23 \
     <(printf '%s\n' "$actual_non_go_packages" | sed '/^$/d') \
     <(printf '%s\n' "$reviewed_non_go_packages"))
   if [[ -n "$unexpected" ]]; then
-    printf 'Unreviewed non-Go dependency packages for %s:\n%s\n' "$platform" "$unexpected" >&2
+    printf 'Unreviewed non-Go dependency packages for %s (%s):\n%s\n' "$label" "$platform" "$unexpected" >&2
     exit 1
   fi
-  printf 'PASS: %s production Go dependencies use Apache-2.0, MIT, or BSD licenses\n' "$platform"
+  printf 'PASS: %s (%s) production Go dependencies use Apache-2.0, MIT, or BSD licenses\n' "$label" "$platform"
+}
+
+if [[ $mode == all ]]; then
+  # The main module (MIT, including the in-repo sdk/go module that shares its path
+  # prefix) is ignored; dependencies reached through it remain in scope. Check the
+  # exact two release targets because OS-specific package graphs differ.
+  for platform in linux/amd64 linux/arm64; do
+    check_target server . ./cmd/lazy-observe "$platform"
+  done
+  printf 'PASS: both production Go dependency graphs satisfy the license allowlist\n'
+fi
+
+# The Go SDK is a separate module that applications import directly, so every
+# package under sdk/go must satisfy the same allowlist across release targets.
+for platform in linux/amd64 linux/arm64; do
+  check_target sdk-go sdk/go ./... "$platform"
 done
-
-printf 'PASS: both production Go dependency graphs satisfy the license allowlist\n'
-
-# The Go SDK is a separate module that applications import directly, so its own
-# production dependency graph must satisfy the same allowlist.
-(
-  cd sdk/go
-  CGO_ENABLED=0 go-licenses check . \
-    --allowed_licenses=Apache-2.0,MIT,BSD-2-Clause,BSD-3-Clause \
-    --ignore="$main_module" 2>"$workdir/sdk-go.warnings" || {
-    cat "$workdir/sdk-go.warnings" >&2
-    exit 1
-  }
-)
 printf 'PASS: sdk/go production Go dependencies use Apache-2.0, MIT, or BSD licenses\n'
 
-bash scripts/third-party-notices.sh --check
+if [[ $mode == all ]]; then
+  bash scripts/third-party-notices.sh --check
+fi

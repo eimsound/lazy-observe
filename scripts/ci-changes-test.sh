@@ -34,6 +34,13 @@ expect_go() { # files
   }
 }
 
+expect_flag() { # files flag
+  grep -qx "${2}=true" <<<"$(changes_for "$1")" || {
+    printf 'FAIL [%s] %s must be true\n' "$1" "$2" >&2
+    failures=$((failures + 1))
+  }
+}
+
 expect_full '.github/workflows/ci.yml'
 expect_full 'mise.toml'
 expect_full 'scripts/ci-changes.sh'
@@ -44,6 +51,22 @@ expect_full 'Makefile' # 未分类路径
 expect_go 'internal/gateway/router.go'
 expect_go 'cmd/lazy-observe/main.go'
 expect_go 'go.mod'
+
+# 7 天发布年龄与 pipefail 静态门禁在 go job 的 workflow-check 运行，相关清单与脚本不得跳过 go。
+expect_go 'web/pnpm-workspace.yaml'
+expect_go 'sdk/node/pnpm-workspace.yaml'
+expect_go 'sdk/browser/pnpm-workspace.yaml'
+expect_go 'sdk/python/pyproject.toml'
+expect_go 'scripts/check-js-licenses.sh'
+expect_go 'sdk/scripts/sdk-publish.sh'
+expect_flag 'scripts/check-python-licenses.sh' 'go'
+expect_flag 'scripts/check-python-licenses.sh' 'sdk_python'
+
+# embeddedpg 改动不得跳过 meta-pg；.golangci.yml 改动不得跳过 sdk-go。
+expect_flag 'internal/embeddedpg/pg.go' 'go'
+expect_flag 'internal/embeddedpg/pg.go' 'meta_pg'
+expect_flag '.golangci.yml' 'go'
+expect_flag '.golangci.yml' 'sdk_go'
 
 got=$(GITHUB_OUTPUT='' bash "$script" --all 2>/dev/null)
 for flag in "${flags[@]}"; do
