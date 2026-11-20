@@ -250,9 +250,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   token dialog); the value is shown once at creation, stored as a SHA-256
   digest, and creation and revocation are audited without the value. A revoked
   token stops working at once on the replica that handled the revocation and
-  within 30 seconds on the others. There is still no per-project quota on
-  total source map storage, only the existing per-release limit of 200 files
-  and 50 MB (#116).
+  within 30 seconds on the others (the 30-second authentication cache TTL;
+  `mise run e2e-ha` now checks this cross-replica bound for project API tokens
+  and upload tokens, plus immediate revocation on every replica for uncached
+  user API tokens; #132). There is still no per-project quota on total source
+  map storage, only the existing per-release limit of 200 files and 50 MB
+  (#116).
 
 ### Changed
 
@@ -315,6 +318,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   failed the build). With a DSN set, an invalid DSN, a missing directory, or a
   failed upload fails the Vite build, or makes the command exit 1 (usage
   errors exit 2), and the error message never contains the token.
+- **Breaking:** the Go SDK (`github.com/eimsound/lazy-observe/sdk/go`) supports
+  Fiber v3 only (`v3.7.0`, #151). `lo.Fiber()` returns a
+  `github.com/gofiber/fiber/v3` handler (`func(fiber.Ctx) error`) with no v2
+  compatibility layer, so Fiber v2 apps cannot pass it to `app.Use`. The SDK
+  has no tagged release yet. Migrate the app to Fiber v3 first (official
+  [migration guide](https://docs.gofiber.io/whats_new#-migration-guide); full
+  SDK notes in `sdk/go/README.md#fiber-v3-migration-notes`), then
+  `app.Use(lo.Fiber())` works unchanged:
+  - Handlers take the `fiber.Ctx` interface instead of `*fiber.Ctx`; imports
+    move to `github.com/gofiber/fiber/v3`.
+  - `c.UserContext()`/`c.SetUserContext()` become `c.Context()`/`c.SetContext()`
+    (used by `slog.InfoContext`, `db.QueryRowContext`, etc.); v2 `c.Context()`
+    (`*fasthttp.RequestCtx`) becomes `c.RequestCtx()`. `c.Context()` is safe to
+    keep after the handler returns; `c` itself is pooled and is not.
+  - `c.BodyParser`/`c.QueryParser` become `c.Bind().Body()`/`c.Bind().Query()`;
+    typed query helpers become `fiber.Query[T](c, "key", default)`.
+  - `c.Protocol()` returns the HTTP version (`HTTP/1.1`), while `c.Scheme()`
+    returns `http`/`https`. `DisableStartupMessage` moves to
+    `fiber.ListenConfig`, and `app.Test(req, ms)` becomes
+    `app.Test(req, fiber.TestConfig{Timeout: d, FailOnTimeout: true})` (zero
+    `Timeout` waits without limit, replacing `-1`).
+  - Behind a reverse proxy, `server.address` and error-event URL hosts now come
+    from `Host`, not `X-Forwarded-Host`: v3 reads proxy headers in
+    `c.Hostname()`, `c.Scheme()`, and `c.IP()` only when
+    `fiber.Config{TrustProxy: true}` and `TrustProxyConfig` trust the peer
+    (`c.IP()` also needs `ProxyHeader`). Configure both to restore forwarded
+    hosts; `url.scheme` still falls back to raw `X-Forwarded-Proto`, while
+    `X-Forwarded-Protocol`, `X-Forwarded-Ssl`, and `X-Url-Scheme` apply only
+    behind a trusted proxy.
+  - Every `GET` route also answers `HEAD` through the same chain, producing
+    spans and `http.server.request.duration` points under that `GET` route's
+    `http.route`; set `fiber.Config{DisableHeadAutoRegister: true}` for v2
+    routing.
+  - `c.Body()` decodes `Content-Encoding` itself and answers 415 or 501 with
+    the error text as body for unsupported codings; read `c.Request().Body()`
+    for raw bytes.
+
+  `lo.Fiber()` still copies every request value it retains, so telemetry stays
+  safe with or without `Immutable`. The gateway also moves to Fiber v3.7.0 and
+  fasthttp 1.78 (from v2.52.16 / 1.51), keeping `DisableHeadAutoRegister`
+  (API/probe `HEAD` still returns 404) and forwarding raw request bodies
+  untouched. Visible gateway changes: JSON responses now send
+  `Content-Type: application/json; charset=utf-8` instead of
+  `application/json`, the binary grows by ~5 MB (55.3 MB to 60.6 MB in #151's
+  measurement), and RSS grows by ~2.6 MiB (default read/write buffers rise
+  from 4096 to 8192 bytes, also raising max accepted header size). No endpoint,
+  field, DSN, or auth change (`docs/version-matrix.md` unchanged; #151).
 - The metadata baseline gained `platform_key_fingerprints`, so a metadata
   database (SQLite file or PostgreSQL database) created by an earlier commit
   refuses to start with `metadata migration 1 checksum mismatch`; recreate it
@@ -425,14 +475,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   settings below, differ from `scripts/release-age.env`. The age gate therefore
   only covers PRs Renovate opens: a pin changed by hand gets no age check, and
   the dependencies whose registry reports no release time are exempt (the Quay
-  Victoria cluster images, the Docker Hub `seaweedfs`, `postgres`, and `debian`
-  images, GCR distroless, and `govulncheck`). The `minimumReleaseAge` of
+  Victoria cluster images, GCR distroless, and `govulncheck`). `seaweedfs`,
+  `postgres`, and the Dockerfile's `debian` stay on that exemption list only as
+  a fallback: the hosted Renovate does read Docker Hub release times for them
+  and waits the 7 days, and only a lookup that returns no time lets a new
+  version through at once. The `minimumReleaseAge` of
   the `web`, `sdk/node`, and `sdk/browser` pnpm workspaces uses the same 7 days,
   so pnpm also holds back a security patch younger than that until it is listed
   in `minimumReleaseAgeExclude`. `web` is now a single-package pnpm workspace
   (`pnpm-workspace.yaml`); the lockfile is unchanged. `sdk/python` follows with
   `[tool.uv] exclude-newer = "7 days"` in its `pyproject.toml` (#70, #119,
-  #130).
+  #130, #138).
 - `mise run sdk-journeys` runs the Go, Node, Python, and browser SDK journeys
   (`sdk/*/e2e.sh`) against a freshly started local platform, and changes that
   touch server, SDK, web, or storage-download paths now run it as the
@@ -442,12 +495,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   unchanged. `sdk/browser/e2e.sh` installs Playwright system dependencies only
   as root or with passwordless `sudo`. The browser and Python SDK READMEs,
   which since #9 called the journeys manual-only, now point to this task (#68).
-- The PostgreSQL metadata tests (`mise run test-meta-pg`) cache the downloaded
-  embedded-postgres archive in `LO_TEST_PG_CACHE` (default
-  `$HOME/.cache/embedded-postgres`, also cached by CI), so they no longer
-  download it from Maven Central on every run, and a failed download reports
-  the real HTTP status of the probed URL instead of the library's
-  `no version found matching 18.3.0` (#66).
+- The PostgreSQL metadata tests (`mise run test-meta-pg`, test-only: not linked
+  into the production binary) cache the downloaded PostgreSQL distribution in
+  `LO_TEST_PG_CACHE` (default `$HOME/.cache/embedded-postgres`, also cached by
+  CI) and report the real HTTP status on failure instead of
+  `no version found matching 18.3.0` (#66). #133 added Maven Central retries
+  and mandatory sha256 checks; embedded-postgres v2.0.1 (#140) replaced that
+  prefetch and the Maven source. The tests now download PostgreSQL 18.6.1 (was
+  18.3.0) from `theseus-rs/postgresql-binaries` GitHub releases, trying each
+  request up to 5 times (2, 4, 8, and 16 seconds apart, honoring `Retry-After`
+  up to 30 seconds) on 403, 404, 408, 429, 5xx, and network errors, verified
+  against the library's built-in sha256 manifest (pinned by `go.sum`);
+  persistent failures fail with the HTTP status and never skip. The unpacked
+  cache is ~117 MB (~37 MB in the CI cache, up from a ~14–15 MB archive) and
+  needs no network when warm. The supervisor is built with `go build` from the
+  `go.sum`-pinned module source rather than downloaded (#133, #140).
 - The bootstrap `mise` in `scripts/mise-release.env` (read by
   `scripts/ci-setup-mise.sh` and the Dockerfile builder stage) is upgraded from
   v2026.5.3 to v2026.11.7. A change to that file now runs every CI job, as a
@@ -526,31 +588,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `entc.mod`, the pnpm workspaces, the Python SDK's `pyproject.toml`, GitHub
   Actions, the Dockerfile, mise tools) and the versions pinned by hand in
   scripts (the Victoria storage binaries, Trivy, the bootstrap mise release,
-  the e2e and BuildKit images). Most updates are grouped and opened after 3 am
-  on Monday (Asia/Shanghai); the hand-pinned versions are not tied to that
-  schedule. Where a pin carries a sha256, Renovate is configured to update the
-  version and the digest in one PR: every sha line in `scripts/mise-release.env`,
-  `scripts/download-storage-bins.sh`, and `scripts/install-trivy.sh` now ends
-  with a `# <release tag>` comment that Renovate reads, and the scripts that
-  consume those lines are unchanged. `.github/dependabot.yml`,
+  the e2e and BuildKit images). Most updates are grouped; the global schedule
+  is `at any time` (changed from Mondays after 3 am Asia/Shanghai in #139).
+  Where a pin carries a sha256, Renovate updates the version and digest in one
+  PR using `# <release tag>` markers on `scripts/mise-release.env` and
+  `scripts/download-storage-bins.sh`. Trivy is the exception (#138): hosted
+  Renovate hit `lookupUpdates error` on `aquasecurity/trivy`, so
+  `scripts/install-trivy.sh` sha lines carry no `# <tag>` comment, Renovate
+  only updates `trivy_version`, and the two sha256 values are filled in from
+  `trivy_<version>_checksums.txt`. `.github/dependabot.yml`,
   `.github/workflows/pinned-releases.yml`, the `pinned-releases` CI job, and
   `scripts/check-pinned-releases.sh` (with its test and mise task) are
   deleted. A new `trivy-pin` CI job downloads Trivy on amd64 and arm64 and
-  checks its sha256 whenever `scripts/install-trivy.sh` changes, and `ci-ok`
-  waits for it, because the Trivy checksum was otherwise only exercised at
-  release time. Trivy upgrades no longer get a manual `gh release verify`:
-  the 7-day age and the sha256 check are the gates. Some Renovate PRs need
-  manual work before merging (the review checklist in
-  `.agents/docs/plans/renovate.md` has the commands): a Go update that changes
-  a module in the binary needs `third_party/go/THIRD_PARTY_NOTICES.txt`
-  regenerated with `mise run third-party-notices`, and a Victoria update needs
-  the version and LICENSE links in `third_party/victoria/SOURCES.txt` moved to
-  the new tag, otherwise `license-check` fails; the `ent` PR needs `entc.sum`
-  filled in by hand, because Renovate cannot update it; a mise tools update
-  has to be copied to the same tools pinned again in `scripts/ci-setup-mise.sh`
-  and in the `mise x go uv@…` step of `ci.yml`, which Renovate does not
-  change; and the diff of the first pin PR and the first GitHub Actions PR
-  should be checked by hand.
+  checks its sha256 whenever `scripts/install-trivy.sh` changes (`ci-ok` waits
+  for it, so a Renovate Trivy PR stays red until the digests are filled in);
+  Trivy upgrades rely on the 7-day age gate and sha256 check rather than a
+  manual `gh release verify`. #138 also enabled `gomodUpdateImportPaths` for Go
+  major upgrades (majors needing code changes are still migrated in dedicated
+  PRs, as in #140 and #151), split `go` in `mise.toml` into `renovate/mise-go`,
+  and grouped `github.com/google/pprof` digest bumps with Go minor/patch
+  updates. Remaining manual steps before merging Renovate PRs (commands in
+  `.agents/docs/plans/renovate.md`): regenerate
+  `third_party/go/THIRD_PARTY_NOTICES.txt` (`mise run third-party-notices`)
+  when binary Go dependencies change; update `third_party/victoria/SOURCES.txt`
+  on Victoria bumps; fill `entc.sum` on `ent` group PRs (which also include
+  `golang.org/x/tools` in `entc.mod`, #152); and rebase workflow-touching
+  Renovate PRs onto `main` (tick rebase/retry) when the merge token lacks
+  `workflow` scope. mise tool versions are now written once in `mise.toml`
+  (#134), so mise updates need no manual sync.
 - `internal/db/ent`, the generated Ent client, is now tracked in git (it used
   to be ignored and generated by every mise task, #128). Renovate clones the
   repository without generated code, so `go get` for the root module could not
@@ -595,6 +660,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with artifacts) from "supported" (an upgrade path, with the database
   baseline frozen and append-only migrations), and the first supported
   release is not v0.1.0 (#126).
+- Tool versions are written once, in `mise.toml` (#134). Per-task `tools.*`
+  entries are gone, and `scripts/ci-setup-mise.sh` profiles plus `ci.yml`
+  `mise x` calls name tools without versions (`uv`, not `uv@0.13.7`), so
+  Renovate updates every caller via `mise.toml`. `uv`, `golangci-lint`, `helm`,
+  `goreleaser`, `go-licenses`, and `govulncheck` are `lazy = true` (installed
+  on first task/command use, not by a bare `mise install` or `mise run`). For
+  contributors, the minimum mise version is now 2026.10.13 (was 2025.8.4;
+  `README.md`, `README.zh-CN.md`, and `CONTRIBUTING.md` updated); older mise
+  refuses to load the config, while CI and Docker bootstrap v2026.11.7.
+  `scripts/ci-setup-mise.sh` verifies pins before and after install: bare tool
+  names must resolve to exact versions in this repo's `mise.toml` (rejecting
+  unconfigured tools, `MISE_<TOOL>_VERSION`, `mise.local.toml`, and global
+  entries), profiles reject `name@version`, and `MISE_CI_TOOLS` allows exact
+  `name@version` overrides (for example the Node matrix) while rejecting
+  non-exact or duplicate entries.
+- The toolchain is Go 1.27.4 (was 1.26.11; `mise.toml`, #152); `go` directives
+  in `go.mod` and `entc.mod` (1.26.11) and `sdk/go/go.mod` (1.26.0) are
+  unchanged. Go 1.27's `gofmt` indents composite literals inside multi-line
+  `return` statements differently, so `internal/ai/stream.go` was reformatted
+  (3 lines, `golines -w`; Go 1.26's `gofmt` reverts that indentation). Because
+  a `go:` tool in `mise.toml` is compiled by the Go active at install time and
+  a Go 1.26 build fails on the Go 1.27 standard library (for example
+  `govulncheck` fails with `package requires newer Go version go1.27
+  (application built with go1.26)`), `scripts/ci-setup-mise.sh` runs
+  `mise install --force <tool>` whenever a `go:` tool's build Go differs from
+  the current Go; local copies can be rebuilt the same way. `entc.mod` pins
+  `golang.org/x/tools` v0.52.0 (indirect) because Ent v0.14.6's default v0.30.0
+  failed `ent-generate-check` on Go 1.27 with `package "context" without types`;
+  the generated `internal/db/ent` is unchanged.
+- The web, Node SDK, and browser SDK workspaces use pnpm 12.20.0 (was 10.33.0;
+  `mise.toml` and each `packageManager` field, #149), and each `pnpm-lock.yaml`
+  now opens with a document recording pnpm itself. Because pnpm 11+ ignores
+  `onlyBuiltDependencies` and fails with `ERR_PNPM_IGNORED_BUILDS` on
+  unreviewed install scripts, `sdk/browser/pnpm-workspace.yaml` switches to
+  `allowBuilds: {esbuild: true}` and `sdk/node/pnpm-workspace.yaml` sets
+  `allowBuilds: {esbuild: false}` (preserving the old ignored behavior, since
+  esbuild uses its platform binary package). Because pnpm 12 `pnpm licenses
+  list` only checks the root package at a workspace root,
+  `scripts/check-js-licenses.sh` now passes `--recursive`; compared with pnpm
+  10, production lists for `sdk/browser` (17) and `sdk/node` (103) are
+  identical, while `web` drops 5 `devDependencies` entries (type packages and
+  `typescript`).
+- Other development tools moved up through Renovate (#145, #147, #148, #150):
+  `helm` 4.3.2 (was 3.21.3; `mise run helm-lint`, `helm-template-test`, and CI
+  Helm checks pass with the chart and `docs/deployment.md` unchanged), `rg`
+  15.2.0 (was 14.1.1), `air` 1.67.4, `golines` 0.16.1, `uv` 0.13.8,
+  `golangci-lint` 2.15.0, `goreleaser` 2.20.2, and `govulncheck` 1.10.0. No
+  source files needed changes.
+- Server third-party Go modules moved to newer minor and patch releases through
+  Renovate (#144, #142): pgx 5.13.0 (was 5.10.0), AWS SDK for Go v2
+  (`aws-sdk-go-v2` 1.48.0, S3 1.114.10), MCP Go SDK 1.8.0 (was 1.6.1),
+  Prometheus 0.316.0 with `prometheus/common` 0.74.0, go-redis 9.23.0, grpc
+  1.84.0, `golang.org/x/crypto` 0.59.0, `pflag` 1.1.0, and
+  `go.opentelemetry.io/proto/otlp` 1.11.1 (was 1.11.0). Only the root module's
+  `go.mod`, `go.sum`, and `third_party/go/THIRD_PARTY_NOTICES.txt` changed (not
+  `sdk/go`, configuration, endpoints, or schema); regenerated notices add
+  `pandatix/go-abnf` (MIT), `golang.org/x/time/rate` (BSD-3-Clause), and Go
+  standard library code copied inside `smithy-go` (BSD-3-Clause).
 - Made release archives consume the canonical root `LICENSE` file.
 - Made PostgreSQL the correctness boundary for multi-replica alert membership,
   per-rule leases/fencing, durable state, and notification Outbox work; Redis
@@ -627,9 +750,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The Go SDK now requires OpenTelemetry Go 1.45 (logs 0.21) and emits the
   matching v1.43 semconv schema URL; with the old v1.41 URL, an application on
   OTel Go 1.45 failed to create the client on a schema-URL conflict (#11).
-- The server builds with Go 1.26.11 and picks up the govulncheck-reported fixes
+- The server built with Go 1.26.11 and picked up the govulncheck-reported fixes
   in grpc 1.83.2, x/net 0.62, brotli 1.2.7, and klauspost/compress 1.18.7; the
-  `sdk/go` manifest follows the same OpenTelemetry Go 1.45 upgrade (#11).
+  `sdk/go` manifest followed the same OpenTelemetry Go 1.45 upgrade (#11). The
+  toolchain is now Go 1.27.4 and the server module is on grpc 1.84.0 and
+  klauspost/compress 1.20.3, and brotli is no longer a dependency (it came with
+  Fiber v2; #144, #151, #152).
 - Container images build on Debian 13 (trixie) instead of Debian 12 (bookworm)
   and run on `gcr.io/distroless/static-debian13:nonroot`, and the Dockerfile
   frontend plus every base image are pinned to a multi-platform index digest.
