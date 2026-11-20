@@ -299,22 +299,6 @@ func toAlertEventResponses(values []meta.AlertEventView) []alertEventResponse {
 	return out
 }
 
-func projectSlug(c fiber.Ctx) string {
-	slug := strings.TrimSpace(c.Get("X-LO-Project"))
-	if slug == "" {
-		slug = "default"
-	}
-	return slug
-}
-
-func resolvedProject(c fiber.Ctx) meta.ProjectInfo {
-	p := currentProject(c)
-	if p.Slug == "" {
-		p.Slug = projectSlug(c)
-	}
-	return p
-}
-
 func (g *Gateway) alertingUnavailable(c fiber.Ctx) bool {
 	if g.alerts == nil {
 		_ = c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "alerting unavailable"})
@@ -344,7 +328,10 @@ func (g *Gateway) listAlertRules(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	v, e := g.alerts.ListRules(c.Context(), proj.Slug)
 	if e != nil {
 		return apiError(c, e)
@@ -356,7 +343,10 @@ func (g *Gateway) createAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "alert_rule.create",
 		TargetType:  "alert_rule",
@@ -395,7 +385,10 @@ func (g *Gateway) updateAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "alert_rule.update",
 		TargetType:  "alert_rule",
@@ -435,7 +428,10 @@ func (g *Gateway) deleteAlertRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "alert_rule.delete",
 		TargetType:  "alert_rule",
@@ -586,7 +582,10 @@ func (g *Gateway) listSilences(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	v, e := g.alerts.ListSilences(c.Context(), proj.Slug)
 	if e != nil {
 		return apiError(c, e)
@@ -598,7 +597,10 @@ func (g *Gateway) createSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "silence.create",
 		TargetType:  "silence",
@@ -637,7 +639,10 @@ func (g *Gateway) updateSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "silence.update",
 		TargetType:  "silence",
@@ -675,7 +680,10 @@ func (g *Gateway) deleteSilence(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "silence.delete",
 		TargetType:  "silence",
@@ -701,7 +709,10 @@ func (g *Gateway) listAlerts(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	status := c.Query("status")
 	if status != "" && status != "firing" && status != "resolved" {
 		return badRequest(c)
@@ -725,7 +736,10 @@ func (g *Gateway) listInhibitionRules(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	v, err := g.alerts.ListInhibitionRules(c.Context(), proj.Slug)
 	if err != nil {
 		return apiError(c, err)
@@ -737,7 +751,10 @@ func (g *Gateway) createInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "inhibition_rule.create",
 		TargetType:  "inhibition_rule",
@@ -774,7 +791,10 @@ func (g *Gateway) updateInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "inhibition_rule.update",
 		TargetType:  "inhibition_rule",
@@ -812,7 +832,10 @@ func (g *Gateway) deleteInhibitionRule(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
-	proj := resolvedProject(c)
+	proj, ok := sessionProject(c)
+	if !ok {
+		return nil
+	}
 	audit := auditEvent{
 		Action:      "inhibition_rule.delete",
 		TargetType:  "inhibition_rule",

@@ -254,6 +254,7 @@ type Gateway struct {
 	profiles                 ProfileStore
 	scrapes                  *scrape.Service
 	storage                  storagepkg.SignalBackend
+	metrics                  *storagepkg.MetricsClient
 	scrapeUnavailableReason  string
 	mcpBaseURL               string
 	querier                  *query.StorageQuerier
@@ -416,17 +417,24 @@ func New(cfg Config) *Gateway {
 			cfg.LiveTailMaxPerUser,
 			cfg.LiveTailMaxPerProject,
 		),
-		liveTailMaxDuration:      cfg.LiveTailMaxDuration,
-		liveTailHeartbeat:        cfg.LiveTailHeartbeat,
-		now:                      cfg.Now,
-		alerts:                   cfg.Alerts,
-		issues:                   cfg.Issues,
-		replays:                  cfg.Replays,
-		blobs:                    cfg.Blobs,
-		sourceMaps:               cfg.SourceMaps,
-		profiles:                 cfg.Profiles,
-		scrapes:                  cfg.Scrapes,
-		storage:                  cfg.Storage,
+		liveTailMaxDuration: cfg.LiveTailMaxDuration,
+		liveTailHeartbeat:   cfg.LiveTailHeartbeat,
+		now:                 cfg.Now,
+		alerts:              cfg.Alerts,
+		issues:              cfg.Issues,
+		replays:             cfg.Replays,
+		blobs:               cfg.Blobs,
+		sourceMaps:          cfg.SourceMaps,
+		profiles:            cfg.Profiles,
+		scrapes:             cfg.Scrapes,
+		storage:             cfg.Storage,
+		metrics: storagepkg.NewMetricsClient(storagepkg.MetricsClientConfig{
+			Backend:        cfg.Storage,
+			HTTPClient:     cfg.Client,
+			DefaultTimeout: metricsInstantQueryTimeout,
+			MaxBytes:       metricsInstantQueryMaxBytes,
+			BodyDrainLimit: metricsBodyDrainLimit,
+		}),
 		scrapeUnavailableReason:  cfg.ScrapeUnavailableReason,
 		mcpBaseURL:               cfg.MCPBaseURL,
 		llmPricing:               cfg.LLMPricing,
@@ -906,11 +914,19 @@ func (g *Gateway) loadSessionProject(c fiber.Ctx) error {
 	return g.resolveRequestProject(c)
 }
 
+func requestedProjectSlug(c fiber.Ctx) string {
+	slug := strings.TrimSpace(c.Get("X-LO-Project"))
+	if slug == "" {
+		slug = "default"
+	}
+	return slug
+}
+
 func (g *Gateway) resolveRequestProject(c fiber.Ctx) error {
 	if g.store == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "project store unavailable"})
 	}
-	slug := projectSlug(c)
+	slug := requestedProjectSlug(c)
 	p, err := g.store.ProjectBySlug(c.Context(), slug)
 	if err != nil {
 		if meta.IsNotFound(err) {

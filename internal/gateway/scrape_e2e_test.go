@@ -200,13 +200,22 @@ node_filesystem_size_bytes{mountpoint="/",fstype="ext4"} 1000
 	// become queryable a few seconds later under CI load. Require the timestamp
 	// to hold for several intervals so late-visible in-flight samples settle
 	// before the "stays stopped" assertion below.
+	type scrapeE2EQueryResponse struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Value []json.RawMessage `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
 	const stableWindow = 5 * time.Second
 	var before []byte
 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
 		first := query(p2Token, `timestamp(up{scrape_job="`+job+`"})`)
 		time.Sleep(stableWindow)
 		second := query(p2Token, `timestamp(up{scrape_job="`+job+`"})`)
-		var fq, sq queryResponse
+		var fq, sq scrapeE2EQueryResponse
 		_ = json.Unmarshal(first, &fq)
 		_ = json.Unmarshal(second, &sq)
 		if len(fq.Data.Result) > 0 && len(sq.Data.Result) > 0 &&
@@ -220,7 +229,7 @@ node_filesystem_size_bytes{mountpoint="/",fstype="ext4"} 1000
 	}
 	time.Sleep(3 * time.Second)
 	after := query(p2Token, `timestamp(up{scrape_job="`+job+`"})`)
-	var bq, aq queryResponse
+	var bq, aq scrapeE2EQueryResponse
 	_ = json.Unmarshal(before, &bq)
 	_ = json.Unmarshal(after, &aq)
 	if len(bq.Data.Result) == 0 || len(aq.Data.Result) == 0 ||

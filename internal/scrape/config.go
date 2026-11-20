@@ -10,18 +10,13 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
-	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -46,8 +41,6 @@ var (
 	promDurationPattern   = regexp.MustCompile(`^(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?$`)
 )
 
-const DefaultLeaderSyncInterval = 5 * time.Second
-
 type ReloadFunc func() error
 
 type Config struct {
@@ -60,6 +53,9 @@ type Config struct {
 	MaxTargetsPerProject int
 	Resolver             outbound.Resolver
 	Logger               *slog.Logger
+	RetryBaseDelay       time.Duration
+	RetryMaxDelay        time.Duration
+	Now                  func() time.Time
 }
 
 type Service struct {
@@ -73,9 +69,18 @@ type Service struct {
 	maxTargetsPerProject int
 	resolver             outbound.Resolver
 	logger               *slog.Logger
+	retryBaseDelay       time.Duration
+	retryMaxDelay        time.Duration
+	now                  func() time.Time
 
-	leaderMu sync.RWMutex
-	isLeader bool
+	statusMu        sync.RWMutex
+	isLeader        bool
+	desiredRevision uint64
+	appliedRevision uint64
+	lastSyncAt      *time.Time
+	lastSyncError   string
+
+	wakeCh   chan struct{}
 	hasHash  bool
 	lastHash [sha256.Size]byte
 }
@@ -121,6 +126,10 @@ func NewService(cfg Config) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	nowFn := cfg.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	clustered := cfg.Store != nil && cfg.Store.IsClustered()
 	return &Service{
 		store:                cfg.Store,
@@ -132,152 +141,11 @@ func NewService(cfg Config) *Service {
 		maxTargetsPerProject: maxTargets,
 		resolver:             cfg.Resolver,
 		logger:               logger,
+		retryBaseDelay:       cfg.RetryBaseDelay,
+		retryMaxDelay:        cfg.RetryMaxDelay,
+		now:                  nowFn,
 		isLeader:             !clustered,
-	}
-}
-
-func JobName(t meta.ScrapeTargetView) string { return fmt.Sprintf("scrape-%d", t.ID) }
-
-func (s *Service) IsLeader() bool {
-	s.leaderMu.RLock()
-	defer s.leaderMu.RUnlock()
-	return s.isLeader
-}
-
-func (s *Service) setLeader(leader bool) {
-	s.leaderMu.Lock()
-	s.isLeader = leader
-	s.leaderMu.Unlock()
-}
-
-func (s *Service) Sync(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.syncLocked(ctx)
-}
-
-func (s *Service) syncLocked(ctx context.Context) error {
-	if s.store != nil && s.store.IsClustered() && !s.IsLeader() {
-		// In HA mode, only the replica holding the scrape leader lock renders
-		// targets to vmagent. The leader's sync loop picks up DB changes written
-		// by non-leader replicas automatically.
-		return nil
-	}
-	return s.syncActiveLocked(ctx, true)
-}
-
-func (s *Service) syncActiveLocked(ctx context.Context, forceReload bool) error {
-	data, err := renderConfig(ctx, s.store, s.logger)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256(data)
-	if !forceReload && s.hasHash && s.lastHash == sum {
-		return nil
-	}
-	if err := writeAtomicFile(s.configPath, data); err != nil {
-		return err
-	}
-	if s.reload != nil {
-		if err := s.reload(); err != nil {
-			return err
-		}
-	}
-	s.lastHash = sum
-	s.hasHash = true
-	return nil
-}
-
-func (s *Service) syncStandbyLocked() error {
-	data := []byte("scrape_configs: []\n")
-	sum := sha256.Sum256(data)
-	if s.hasHash && s.lastHash == sum {
-		return nil
-	}
-	if err := writeAtomicFile(s.configPath, data); err != nil {
-		return err
-	}
-	if s.reload != nil {
-		if err := s.reload(); err != nil {
-			return err
-		}
-	}
-	s.lastHash = sum
-	s.hasHash = true
-	return nil
-}
-
-// RunLeaderLoop coordinates single-owner scraping across HA PostgreSQL replicas
-// and periodically reconciles target changes written through other replicas.
-func (s *Service) RunLeaderLoop(ctx context.Context, logger *slog.Logger, interval time.Duration) {
-	if s.store == nil || !s.store.IsClustered() {
-		return
-	}
-	if logger == nil {
-		logger = slog.Default()
-	}
-	if interval <= 0 {
-		interval = DefaultLeaderSyncInterval
-	}
-	var release func() error
-	releaseLeader := func() {
-		s.setLeader(false)
-		if release != nil {
-			if err := release(); err != nil {
-				logger.Warn("release scrape leader lock failed", "error", err)
-			}
-			release = nil
-		}
-	}
-	defer releaseLeader()
-
-	step := func() {
-		if !s.IsLeader() {
-			rel, acquired, err := s.store.TryAcquireScrapeLeader(ctx)
-			if err != nil {
-				if ctx.Err() == nil {
-					logger.Warn("acquire scrape leader lock failed", "error", err)
-				}
-				return
-			}
-			if !acquired {
-				s.mu.Lock()
-				err = s.syncStandbyLocked()
-				s.mu.Unlock()
-				if err != nil {
-					logger.Warn("clear standby scrape config failed", "error", err)
-				}
-				return
-			}
-			release = rel
-			s.setLeader(true)
-			logger.Info("acquired HA scrape leader lock")
-			s.mu.Lock()
-			err = s.syncActiveLocked(ctx, true)
-			s.mu.Unlock()
-			if err != nil {
-				logger.Warn("initial leader scrape sync failed", "error", err)
-			}
-			return
-		}
-		s.mu.Lock()
-		err := s.syncActiveLocked(ctx, false)
-		s.mu.Unlock()
-		if err != nil && ctx.Err() == nil {
-			logger.Warn("reconcile leader scrape config failed", "error", err)
-		}
-	}
-
-	step()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			step()
-		}
+		wakeCh:               make(chan struct{}, 1),
 	}
 }
 
@@ -315,6 +183,7 @@ func (s *Service) Create(ctx context.Context, slug string, in Input) (meta.Scrap
 	if err != nil {
 		return meta.ScrapeTargetView{}, err
 	}
+	s.bumpDesiredRevision()
 	if err := s.syncLocked(ctx); err != nil {
 		if rollbackErr := s.store.DeleteScrapeTarget(ctx, slug, target.ID); rollbackErr != nil {
 			s.logger.Warn(
@@ -329,6 +198,7 @@ func (s *Service) Create(ctx context.Context, slug string, in Input) (meta.Scrap
 		} else {
 			_ = WriteConfigWithLogger(ctx, s.store, s.configPath, s.logger)
 		}
+		s.signalWake()
 		return meta.ScrapeTargetView{}, err
 	}
 	return target, nil
@@ -391,6 +261,7 @@ func (s *Service) Update(ctx context.Context, slug string, id int, in Input) (me
 	if err != nil {
 		return meta.ScrapeTargetView{}, err
 	}
+	s.bumpDesiredRevision()
 	if err := s.syncLocked(ctx); err != nil {
 		// Restore previous state so DB and rendered vmagent config stay aligned.
 		oldName, oldURL, oldInterval, oldEnabled := old.Name, old.URL, old.Interval, old.Enabled
@@ -413,6 +284,7 @@ func (s *Service) Update(ctx context.Context, slug string, id int, in Input) (me
 		} else {
 			_ = WriteConfigWithLogger(ctx, s.store, s.configPath, s.logger)
 		}
+		s.signalWake()
 		return meta.ScrapeTargetView{}, err
 	}
 	return target, nil
@@ -425,7 +297,12 @@ func (s *Service) Delete(ctx context.Context, slug string, id int) error {
 	if err := s.store.DeleteScrapeTarget(ctx, slug, id); err != nil {
 		return err
 	}
-	return s.syncLocked(ctx)
+	s.bumpDesiredRevision()
+	if err := s.syncLocked(ctx); err != nil {
+		s.signalWake()
+		return err
+	}
+	return nil
 }
 
 func (s *Service) validate(in Input, partial bool) error {
@@ -525,99 +402,6 @@ func isCloudMetadataHostname(host string) bool {
 	}
 }
 
-func validateLabels(labels map[string]string) error {
-	if len(labels) > maxCustomLabelsPerTarget {
-		return fmt.Errorf("%w: at most %d custom labels are allowed", ErrInvalidTarget, maxCustomLabelsPerTarget)
-	}
-	for key, val := range labels {
-		if !isAllowedCustomLabelName(key) {
-			return fmt.Errorf("%w: invalid or reserved label %q", ErrInvalidTarget, key)
-		}
-		if len(val) > maxLabelValueLen {
-			return fmt.Errorf("%w: label %q value exceeds %d bytes", ErrInvalidTarget, key, maxLabelValueLen)
-		}
-		if strings.ContainsAny(val, "\r\n\x00") {
-			return fmt.Errorf("%w: label %q value contains control characters", ErrInvalidTarget, key)
-		}
-	}
-	return nil
-}
-
-func isAllowedCustomLabelName(key string) bool {
-	if key == "" || len(key) > maxLabelNameLen {
-		return false
-	}
-	if strings.HasPrefix(key, "__") {
-		return false
-	}
-	switch key {
-	case "project_id", "scrape_job", "job", "instance":
-		return false
-	}
-	return validLabelNamePattern.MatchString(key)
-}
-
-func normalizeInterval(raw string) (string, time.Duration, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return formatPrometheusDuration(defaultScrapeInterval), defaultScrapeInterval, nil
-	}
-	if trimmed != raw || strings.HasPrefix(trimmed, "+") || strings.HasPrefix(trimmed, "-") {
-		return "", 0, errors.New("interval must be a positive Prometheus duration (e.g. 15s, 1m)")
-	}
-	matches := promDurationPattern.FindStringSubmatch(trimmed)
-	if matches == nil || (matches[1] == "" && matches[2] == "" && matches[3] == "") {
-		return "", 0, errors.New("interval must use whole h/m/s Prometheus duration units (e.g. 15s, 1m)")
-	}
-	var total time.Duration
-	if matches[1] != "" {
-		hours, err := strconv.ParseInt(matches[1], 10, 64)
-		if err != nil || hours > 24 {
-			return "", 0, errors.New("interval must be between 1s and 1h")
-		}
-		total += time.Duration(hours) * time.Hour
-	}
-	if matches[2] != "" {
-		minutes, err := strconv.ParseInt(matches[2], 10, 64)
-		if err != nil || minutes > 1440 {
-			return "", 0, errors.New("interval must be between 1s and 1h")
-		}
-		total += time.Duration(minutes) * time.Minute
-	}
-	if matches[3] != "" {
-		seconds, err := strconv.ParseInt(matches[3], 10, 64)
-		if err != nil || seconds > 86400 {
-			return "", 0, errors.New("interval must be between 1s and 1h")
-		}
-		total += time.Duration(seconds) * time.Second
-	}
-	if total < minScrapeInterval || total > maxScrapeInterval {
-		return "", 0, errors.New("interval must be between 1s and 1h")
-	}
-	return formatPrometheusDuration(total), total, nil
-}
-
-func formatPrometheusDuration(d time.Duration) string {
-	if d%time.Hour == 0 {
-		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
-	}
-	if d%time.Minute == 0 {
-		return strconv.FormatInt(int64(d/time.Minute), 10) + "m"
-	}
-	return strconv.FormatInt(int64(d/time.Second), 10) + "s"
-}
-
-func scrapeTimeoutForInterval(interval time.Duration) string {
-	timeout := defaultMaxScrapeTimeout
-	if interval < timeout {
-		timeout = interval
-	}
-	if timeout < minScrapeInterval {
-		timeout = minScrapeInterval
-	}
-	return formatPrometheusDuration(timeout)
-}
-
 func nonNilLabels(labels map[string]string) map[string]string {
 	if labels == nil {
 		return map[string]string{}
@@ -634,215 +418,4 @@ func cloneLabels(src map[string]string) map[string]string {
 		dst[k] = v
 	}
 	return dst
-}
-
-type vmagentConfig struct {
-	ScrapeConfigs []scrapeConfig `yaml:"scrape_configs"`
-}
-
-type scrapeConfig struct {
-	JobName         string              `yaml:"job_name"`
-	ScrapeInterval  string              `yaml:"scrape_interval"`
-	ScrapeTimeout   string              `yaml:"scrape_timeout"`
-	FollowRedirects bool                `yaml:"follow_redirects"`
-	SampleLimit     int                 `yaml:"sample_limit"`
-	LabelLimit      int                 `yaml:"label_limit"`
-	Scheme          string              `yaml:"scheme"`
-	MetricsPath     string              `yaml:"metrics_path"`
-	Params          map[string][]string `yaml:"params,omitempty"`
-	StaticConfigs   []staticConfig      `yaml:"static_configs"`
-}
-
-type staticConfig struct {
-	Targets []string          `yaml:"targets"`
-	Labels  map[string]string `yaml:"labels"`
-}
-
-func WriteConfig(ctx context.Context, store *meta.Store, path string) error {
-	return WriteConfigWithLogger(ctx, store, path, slog.Default())
-}
-
-// WriteConfigWithLogger renders enabled scrape targets to path atomically,
-// skipping corrupt rows with a warning so one bad record cannot poison global
-// vmagent scraping or prevent startup.
-func WriteConfigWithLogger(ctx context.Context, store *meta.Store, path string, logger *slog.Logger) error {
-	data, err := renderConfig(ctx, store, logger)
-	if err != nil {
-		return err
-	}
-	return writeAtomicFile(path, data)
-}
-
-func WriteEmptyConfig(path string) error {
-	return writeAtomicFile(path, []byte("scrape_configs: []\n"))
-}
-
-func renderConfig(ctx context.Context, store *meta.Store, logger *slog.Logger) ([]byte, error) {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	targets, err := store.ScrapeConfigSnapshot(ctx)
-	if err != nil {
-		return nil, err
-	}
-	cfg := vmagentConfig{ScrapeConfigs: make([]scrapeConfig, 0, len(targets))}
-	for _, target := range targets {
-		u, _, err := parseTargetURL(target.URL)
-		if err != nil {
-			logger.Warn(
-				"skipping invalid scrape target URL while rendering config",
-				"target_id",
-				target.ID,
-				"project",
-				target.Project.Slug,
-				"error",
-				err,
-			)
-			continue
-		}
-		intervalLiteral, intervalDur, err := normalizeInterval(target.Interval)
-		if err != nil {
-			logger.Warn(
-				"skipping scrape target with invalid interval while rendering config",
-				"target_id",
-				target.ID,
-				"project",
-				target.Project.Slug,
-				"error",
-				err,
-			)
-			continue
-		}
-		labels := make(map[string]string, len(target.Labels)+2)
-		keys := make([]string, 0, len(target.Labels))
-		for k := range target.Labels {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if !isAllowedCustomLabelName(k) || len(target.Labels[k]) > maxLabelValueLen ||
-				strings.ContainsAny(target.Labels[k], "\r\n\x00") {
-				logger.Warn(
-					"dropping disallowed scrape target label while rendering config",
-					"target_id",
-					target.ID,
-					"project",
-					target.Project.Slug,
-					"label",
-					k,
-				)
-				continue
-			}
-			labels[k] = target.Labels[k]
-		}
-		job := JobName(target)
-		labels["project_id"], labels["scrape_job"] = target.Project.Slug, job
-		params := make(map[string][]string, len(u.Query()))
-		for k, values := range u.Query() {
-			params[k] = values
-		}
-		cfg.ScrapeConfigs = append(
-			cfg.ScrapeConfigs,
-			scrapeConfig{
-				JobName:         job,
-				ScrapeInterval:  intervalLiteral,
-				ScrapeTimeout:   scrapeTimeoutForInterval(intervalDur),
-				FollowRedirects: false,
-				SampleLimit:     defaultSampleLimit,
-				LabelLimit:      defaultLabelLimit,
-				Scheme:          u.Scheme,
-				MetricsPath:     u.Path,
-				Params:          params,
-				StaticConfigs:   []staticConfig{{Targets: []string{u.Host}, Labels: labels}},
-			},
-		)
-	}
-	return yaml.Marshal(cfg)
-}
-
-func writeAtomicFile(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmpFile, err := os.CreateTemp(dir, ".scrape-*.yml.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmpFile.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close()
-		return err
-	}
-	if err := tmpFile.Sync(); err != nil {
-		_ = tmpFile.Close()
-		return err
-	}
-	if err := tmpFile.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpPath, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
-}
-
-func parseTargetURL(raw string) (*url.URL, int, error) {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return nil, 0, errors.New("invalid url")
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if (scheme != "http" && scheme != "https") || u.Opaque != "" || u.Hostname() == "" || u.User != nil ||
-		u.Fragment != "" {
-		return nil, 0, errors.New("url must be http(s)://host:port/metrics")
-	}
-	rawPort := u.Port()
-	if rawPort == "" {
-		return nil, 0, errors.New("explicit port is required")
-	}
-	port, canonicalPort, err := outbound.NormalizePort(rawPort)
-	if err != nil {
-		return nil, 0, err
-	}
-	u.Scheme = scheme
-	u.Host = net.JoinHostPort(u.Hostname(), canonicalPort)
-	if u.Path == "" {
-		u.Path = "/metrics"
-	}
-	return u, port, nil
-}
-
-func normalizeHostPortKey(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	host, rawPort, err := net.SplitHostPort(raw)
-	if err != nil {
-		return ""
-	}
-	port, _, err := outbound.NormalizePort(rawPort)
-	if err != nil {
-		return ""
-	}
-	return hostPortKey(host, port)
-}
-
-func hostPortKey(host string, port int) string {
-	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	if addr, err := netip.ParseAddr(host); err == nil {
-		host = addr.Unmap().String()
-	}
-	return net.JoinHostPort(host, strconv.Itoa(port))
 }
