@@ -136,7 +136,7 @@ mise_release=scripts/mise-release.env
 grep -Eq '^MISE_BOOTSTRAP_VERSION=v[0-9]+\.[0-9]+\.[0-9]+$' "$mise_release" ||
   fail "$mise_release must pin MISE_BOOTSTRAP_VERSION=vX.Y.Z"
 for var in MISE_BOOTSTRAP_SHA256_AMD64 MISE_BOOTSTRAP_SHA256_ARM64; do
-  grep -Eq "^${var}=[0-9a-f]{64}$" "$mise_release" ||
+  grep -Eq "^${var}=[0-9a-f]{64}( # v[0-9][^[:space:]]*)?$" "$mise_release" ||
     fail "$mise_release must pin $var to a 64-character sha256"
 done
 for consumer in Dockerfile scripts/ci-setup-mise.sh; do
@@ -248,7 +248,7 @@ if [[ -f $release_wf ]]; then
   done
   grep -Eq '^trivy_version=[0-9]+\.[0-9]+\.[0-9]+$' scripts/install-trivy.sh ||
     fail 'scripts/install-trivy.sh must pin trivy_version=X.Y.Z'
-  [[ $(grep -Ec '^[[:space:]]+sha256=[0-9a-f]{64}$' scripts/install-trivy.sh) -eq 2 ]] ||
+  [[ $(grep -Ec '^[[:space:]]+sha256=[0-9a-f]{64}( # v[0-9][^[:space:]]*)?$' scripts/install-trivy.sh) -eq 2 ]] ||
     fail 'scripts/install-trivy.sh must pin one sha256 per architecture (amd64, arm64)'
 
   # 发版附带的 digest 固定 Helm values 片段由 helm-values job 上传。最小权限：docker job 会把 GITHUB_TOKEN 当
@@ -283,37 +283,8 @@ if [[ -n $bad_ignores ]]; then
   fail "$trivyignore entries must carry a statement and an expired_at date (YYYY-MM-DD)"
 fi
 
-# Dependabot 覆盖面：每个依赖清单所在目录都要有对应生态的条目。
-dependabot=.github/dependabot.yml
-[[ -f $dependabot ]] || fail "$dependabot is missing"
-dependabot_entries=$(awk '
-  /^[[:space:]]*-[[:space:]]+package-ecosystem:/ { eco = $NF; gsub(/["'\'']/, "", eco) }
-  /^[[:space:]]+directory:/ { dir = $NF; gsub(/["'\'']/, "", dir); print eco " " dir }
-' "$dependabot")
-expected_entries=$(
-  printf 'github-actions /\n'
-  git ls-files --cached --others --exclude-standard -- '*go.mod' '*pnpm-lock.yaml' '*pyproject.toml' '*Dockerfile' |
-    while IFS= read -r manifest; do
-      case ${manifest##*/} in
-      go.mod) eco=gomod ;;
-      pnpm-lock.yaml) eco=npm ;;
-      pyproject.toml) eco=pip ;;
-      Dockerfile) eco=docker ;;
-      *) continue ;;
-      esac
-      dir=${manifest%/*}
-      [[ $dir == "$manifest" ]] && dir=
-      printf '%s /%s\n' "$eco" "$dir"
-    done
-)
-missing_dependabot=$(comm -23 <(sort -u <<<"$expected_entries") <(sort -u <<<"$dependabot_entries"))
-if [[ -n $missing_dependabot ]]; then
-  printf '%s\n' "$missing_dependabot" >&2
-  fail "$dependabot must cover every manifest directory listed above"
-fi
-
-# 最小发布年龄：天数只在 scripts/release-age.env 维护，Dependabot cooldown、pnpm minimumReleaseAge（分钟）都要与它一致，
-# 手工固定点由 scripts/check-pinned-releases.sh 按同一个值检查。
+# 最小发布年龄：天数只在 scripts/release-age.env 维护，renovate.json 的 minimumReleaseAge（顶层与 vulnerabilityAlerts）、
+# pnpm minimumReleaseAge（分钟）、uv exclude-newer 都要与它一致。不一致会让某一侧悄悄放行更新的版本。
 release_age_env=scripts/release-age.env
 [[ -f $release_age_env ]] || fail "$release_age_env is missing"
 min_release_age_days=$(
@@ -323,19 +294,28 @@ min_release_age_days=$(
   printf '%s' "$MIN_RELEASE_AGE_DAYS"
 )
 [[ $min_release_age_days =~ ^[1-9][0-9]*$ ]] || fail "$release_age_env must set MIN_RELEASE_AGE_DAYS to a positive integer"
-cooldown_count=0
-dependabot_entry_count=0
-while IFS= read -r line || [[ -n $line ]]; do
-  if [[ $line =~ ^[[:space:]]*-[[:space:]]+package-ecosystem: ]]; then
-    dependabot_entry_count=$((dependabot_entry_count + 1))
-  elif [[ $line =~ ^[[:space:]]+default-days:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
-    cooldown_count=$((cooldown_count + 1))
-    [[ ${BASH_REMATCH[1]} == "$min_release_age_days" ]] ||
-      fail "$dependabot: cooldown default-days ${BASH_REMATCH[1]} must equal MIN_RELEASE_AGE_DAYS=$min_release_age_days ($release_age_env)"
-  fi
-done <"$dependabot"
-((cooldown_count == dependabot_entry_count)) ||
-  fail "$dependabot: every update entry needs cooldown.default-days: $min_release_age_days ($cooldown_count of $dependabot_entry_count have one)"
+renovate=.github/renovate.json
+[[ -f $renovate ]] || fail "$renovate is missing"
+# 顶层与 vulnerabilityAlerts 都必须显式写（Renovate 默认安全更新不等待）；文件里出现的每个 minimumReleaseAge 都得是这个值。
+# 不用 jq：go-ci profile 没装它，文件由 JSON 缩进固定的 2 空格格式维护。
+grep -Eq "^  \"minimumReleaseAge\":[[:space:]]*\"${min_release_age_days} days\",?[[:space:]]*\$" "$renovate" ||
+  fail "$renovate: top-level minimumReleaseAge must be \"${min_release_age_days} days\" (MIN_RELEASE_AGE_DAYS in $release_age_env)"
+awk -v want="\"minimumReleaseAge\": \"${min_release_age_days} days\"" '
+  /^  "vulnerabilityAlerts":[[:space:]]*\{/ { in_block = 1; next }
+  in_block && /^  \}/ { in_block = 0 }
+  in_block && index($0, want) { found = 1 }
+  END { exit !found }
+' "$renovate" ||
+  fail "$renovate: vulnerabilityAlerts.minimumReleaseAge must be \"${min_release_age_days} days\" (security updates would otherwise skip the wait)"
+age_total=$(grep -Ec '^[[:space:]]*"minimumReleaseAge":' "$renovate" || true)
+age_ok=$(grep -Ec "^[[:space:]]*\"minimumReleaseAge\":[[:space:]]*\"${min_release_age_days} days\",?[[:space:]]*\$" "$renovate" || true)
+((age_total == age_ok)) ||
+  fail "$renovate: every minimumReleaseAge must be \"${min_release_age_days} days\" (MIN_RELEASE_AGE_DAYS in $release_age_env)"
+# 年龄闸要靠 internalChecksFilter: strict 才生效：flexible/none 会在所有新版本都不满 7 天时照样开 PR（安全更新也一样）。
+filter_total=$(grep -Ec '^[[:space:]]*"internalChecksFilter":' "$renovate" || true)
+filter_strict=$(grep -Ec '^[[:space:]]*"internalChecksFilter":[[:space:]]*"strict",?[[:space:]]*$' "$renovate" || true)
+grep -Eq '^  "internalChecksFilter":[[:space:]]*"strict",?[[:space:]]*$' "$renovate" && ((filter_total == filter_strict)) ||
+  fail "$renovate: internalChecksFilter must be \"strict\" at the top level and wherever it appears (otherwise minimumReleaseAge does not hold PRs back)"
 while IFS= read -r lock; do
   workspace=${lock%pnpm-lock.yaml}pnpm-workspace.yaml
   [[ -f $workspace ]] || fail "$workspace is missing: pnpm projects must set minimumReleaseAge there"
@@ -351,21 +331,6 @@ while IFS= read -r manifest; do
   grep -Eq "^exclude-newer[[:space:]]*=[[:space:]]*\"$min_release_age_days days\"[[:space:]]*(#.*)?$" "$manifest" ||
     fail "$manifest must set exclude-newer = \"$min_release_age_days days\" under [tool.uv] (MIN_RELEASE_AGE_DAYS=$min_release_age_days)"
 done < <(git ls-files --cached --others --exclude-standard -- '*pyproject.toml')
-
-# 手工固定点的年龄门禁与每周追踪：PR 门禁是 ci.yml 里的 pinned-releases job，追踪是定时 workflow。
-# issues: write 只留给追踪 workflow 的那一个 job，别的 workflow 不该拿到它。
-[[ $(release_job .github/workflows/ci.yml pinned-releases) == *'run: bash scripts/check-pinned-releases.sh --gate'* ]] ||
-  fail ".github/workflows/ci.yml: pinned-releases must run scripts/check-pinned-releases.sh --gate"
-tracker=.github/workflows/pinned-releases.yml
-[[ -f $tracker ]] || fail "$tracker is missing"
-tracker_text=$(<"$tracker")
-[[ $tracker_text == *$'\n  schedule:\n'* && $tracker_text == *$'\n  workflow_dispatch:'* ]] ||
-  fail "$tracker must run on schedule and workflow_dispatch"
-[[ $tracker_text == *'scripts/check-pinned-releases.sh --report'* ]] ||
-  fail "$tracker must run scripts/check-pinned-releases.sh --report"
-[[ $(release_job "$tracker" report) == *'issues: write'* ]] || fail "$tracker: the report job must hold issues: write"
-issue_writers=$(grep -El '^[[:space:]]*issues:[[:space:]]*write' "${workflows[@]}" || true)
-[[ $issue_writers == "$tracker" ]] || fail "only $tracker may request issues: write, found: ${issue_writers:-none}"
 
 # ci-ok 汇总：被跳过的 job 在 ci-ok 里算通过，所以 ci-ok 必须 if: always()，且 needs 覆盖 ci.yml 里所有其它 job，
 # 否则某个 job 失败不会挡住合并。

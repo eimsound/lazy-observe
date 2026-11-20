@@ -72,8 +72,7 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 ### release
 
 1. 打 tag 前，在 Renovate Dependency Dashboard 勾选重跑，确认 Victoria、Trivy 等手工固定点没有待合并的升级；有就先合并或明确放过。
-   版本是否落后只看这一步，`storage-bin-scan` 不查（ADR 0016）。Renovate 由后续切片接入，接入前先人工核对
-   `scripts/download-storage-bins.sh` 与 `scripts/install-trivy.sh` 里的 pin。
+   版本是否落后只看这一步，`storage-bin-scan` 不查（ADR 0016）。依赖升级统一由 Renovate 提 PR（ADR 0015、`.agents/docs/plans/renovate.md`）；人工改 pin 时版本、sha 与 sha 行尾的 `# <tag>` 一起改。
 2. 更新 `docs/version-matrix.md`（先矩阵、后发布），确认该提交的 CI 为绿，更新 `CHANGELOG.md`。
 3. 打 tag 属于「必须停下来等人」的动作：由负责人确认后再打。`release.yml` 的 `storage-bin-scan` 命中只警告，
    发版后看 run 的 step summary 里的警告表即可；扫描失败才会挡住出包。
@@ -151,8 +150,8 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | `go.mod`/`go.sum` | 同上 + meta-pg |
 | `scripts/e2e-multi-replica.sh` 及其辅助程序、`bench/performance-gates.json`、`scripts/download-storage-bins.sh` | HA E2E（另加各自原有的 job） |
 | 打包链路 | 零配置产物冒烟 + 原生 arm64 构建与冒烟 |
-| `.github/dependabot.yml`、`.trivyignore.yaml` | 只跑 Go 检查（workflow-check 校验它们） |
-| `scripts/download-storage-bins.sh`、`scripts/mise-release.env`、`scripts/check-image-vulns.sh`、`scripts/install-trivy.sh`、`scripts/e2e-multi-replica.sh`、`scripts/check-pinned-releases.sh`、`scripts/release-age.env` | 叠加 `pins`：`pinned-releases` job（手工固定点的最小发布年龄门禁，要联网查 GitHub API；叠加在上面原有的分组上） |
+| `.github/renovate.json`、`.trivyignore.yaml` | 只跑 Go 检查（workflow-check 校验它们） |
+| `scripts/install-trivy.sh` | 叠加 `trivy_pin`：`trivy-pin` job（在 amd64、arm64 上各真下载一次 Trivy 并校验 sha256，不查 API、不要 token；叠加在原有分组上） |
 | `.github/**`、`mise.toml`、`scripts/ci-*`、`scripts/mise-release.env`、`Dockerfile*` | 全量 |
 
 `sdk-journeys` job（`mise run sdk-journeys`，PR CI 里最长的一条，冷缓存约 9.5 分钟）：起一个真实平台，再依次跑

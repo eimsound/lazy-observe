@@ -160,8 +160,8 @@ business job.
 | `scripts/e2e-multi-replica.sh` and its helpers, `bench/performance-gates.json`, `scripts/download-storage-bins.sh` | Adds HA E2E |
 | `scripts/e2e.sh`, `scripts/e2e-restart.sh` and other single-replica E2E scripts | Go checks and E2E |
 | Packaging chain (`Dockerfile`, `.dockerignore`, `.goreleaser.yaml`, `go.mod`, `go.sum`, `mise.toml`, `internal/embed/**`, `scripts/download-storage-bins.sh`, `scripts/prepare-embedded-storage.sh`, `scripts/prepare-web-assets.sh`, `scripts/check-embedded-artifact.sh`, `scripts/check-container-smoke.sh`) | Zero-config artifact smoke plus native arm64 build and smoke |
-| `scripts/download-storage-bins.sh`, `scripts/mise-release.env`, `scripts/check-image-vulns.sh`, `scripts/install-trivy.sh`, `scripts/e2e-multi-replica.sh`, `scripts/check-pinned-releases.sh`, `scripts/release-age.env` | Adds the pinned-release minimum-age gate (`pins`; it queries the GitHub API, so it only runs when a pin changes) |
-| `.github/dependabot.yml`, `.trivyignore.yaml` | Go checks only (`workflow-check` validates them) |
+| `scripts/install-trivy.sh` | Adds the `trivy-pin` job (downloads Trivy and checks its sha256 on amd64 and arm64; no GitHub API, no token), on top of the groups above |
+| `.github/renovate.json`, `.trivyignore.yaml` | Go checks only (`workflow-check` validates them) |
 | `.github/**`, `mise.toml`, `scripts/ci-*`, `scripts/mise-release.env`, `Dockerfile*` | Everything |
 
 | Trigger | Workflow | Scope |
@@ -177,10 +177,13 @@ performance-sensitive.
 
 The embedded-binary scan never blocks a release because of a CVE: findings show up as `::warning::` annotations and
 in the job's step summary, and upstream decides when they go away. The scan does not check whether the pins are
-outdated either. Before tagging a release, re-run Renovate from its Dependency Dashboard and confirm that no upgrade
-for a hand-pinned point (Victoria, Trivy and the like) is waiting to be merged; Renovate itself is set up in a
-follow-up change, until then compare the pins in `scripts/download-storage-bins.sh` and `scripts/install-trivy.sh`
-with the upstream releases by hand.
+outdated either. Dependency upgrades, including the hand-pinned points (Victoria, Trivy, the mise bootstrap, the E2E
+images), come from Renovate (`.github/renovate.json`, ADR 0015), which waits 7 days after a release is published
+(`scripts/release-age.env`; registries that publish no timestamps are exempt, see ADR 0015). Before tagging a release, re-run Renovate from its Dependency Dashboard and
+confirm that no upgrade for a hand-pinned point is waiting to be merged. When bumping a pin by hand, change the version
+and every sha256 line together, including the trailing `# <tag>` marker Renovate uses to sync digests; Renovate does
+not run `gh release verify`, so review the diff of the first pin PR and the first Actions PR yourself
+(`.agents/docs/plans/renovate.md`).
 
 ### PostgreSQL dialect tests
 

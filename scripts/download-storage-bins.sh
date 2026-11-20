@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 版本与 sha256 由 Renovate 一起升级（.github/renovate.json）：每个 sha 行行尾的 `# <tag>` 是它同步 digest 的标记，
+# 人工升级时与下面的 *_version 一起改。*_version 变量不要加行尾注释（scripts/third-party-notices.sh 按整行读取）。
+
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 bin_dir=${LO_STORAGE_BIN_DIR:-"$root/.cache/storage-bin"}
 goos=${GOOS:-$(go env GOOS)}
@@ -9,16 +12,16 @@ platform="$goos-$goarch"
 
 case "$platform" in
   linux-amd64)
-    metrics_sha=54409ea381db0316f0bf6f242c718bc498085eb1eb37520b73526e6d86891601
-    vmutils_sha=d71f7f00e07782531000620ec6c2a9d7ec83324f364dd1f36095ab378b5fb43b
-    logs_sha=55feba89713cafa952673f91b8b38e7701bb0290989263da671b47a0de16edd3
-    traces_sha=789e006d076f3c8b99de7bb1d0277024a7db776db0294d1c27fcc5422d98c4bc
+    metrics_sha=54409ea381db0316f0bf6f242c718bc498085eb1eb37520b73526e6d86891601 # v1.156.0
+    vmutils_sha=d71f7f00e07782531000620ec6c2a9d7ec83324f364dd1f36095ab378b5fb43b # v1.156.0
+    logs_sha=55feba89713cafa952673f91b8b38e7701bb0290989263da671b47a0de16edd3 # v1.53.0
+    traces_sha=789e006d076f3c8b99de7bb1d0277024a7db776db0294d1c27fcc5422d98c4bc # v0.13.0
     ;;
   linux-arm64)
-    metrics_sha=f777110b232bfdf435556c57d0896716e27000afafe969c4eb08852352dceb7d
-    vmutils_sha=1a8e4ed55df2a59d5cd03056213f50d293d4fab029e38dd960597362d92cf176
-    logs_sha=301b7ef12ff9fac7f70b155191affe07ac6212755514174461d775548699ef96
-    traces_sha=210bc863666865ba9a4ff0a19901318042da0c474d248fec69ca71c07b1e5f7a
+    metrics_sha=f777110b232bfdf435556c57d0896716e27000afafe969c4eb08852352dceb7d # v1.156.0
+    vmutils_sha=1a8e4ed55df2a59d5cd03056213f50d293d4fab029e38dd960597362d92cf176 # v1.156.0
+    logs_sha=301b7ef12ff9fac7f70b155191affe07ac6212755514174461d775548699ef96 # v1.53.0
+    traces_sha=210bc863666865ba9a4ff0a19901318042da0c474d248fec69ca71c07b1e5f7a # v0.13.0
     ;;
   *)
     printf 'unsupported storage binary platform: %s (supported: linux x amd64/arm64)\n' "$platform" >&2
