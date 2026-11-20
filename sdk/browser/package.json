@@ -1,7 +1,7 @@
 {
   "name": "lazy-observe-browser-workspace",
   "private": true,
-  "packageManager": "pnpm@12.20.0",
+  "packageManager": "pnpm@12.21.0",
   "scripts": {
     "build": "pnpm -r --if-present build",
     "test": "pnpm --filter @lazy-observe/browser --filter @lazy-observe/react --filter @lazy-observe/bundler-plugin test",
