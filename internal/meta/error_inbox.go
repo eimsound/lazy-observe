@@ -84,7 +84,7 @@ func (s *Store) AcceptErrorEvents(
 	}
 	if capacityExceeded {
 		if _, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox_state SET
-			rejections_total = rejections_total + 1, updated_at = ? WHERE id = 1`), unique[0].AcceptedAt); err != nil {
+			rejections_total = rejections_total + 1, updated_at = ? WHERE id = 1`), unique[0].AcceptedAt.UTC()); err != nil {
 			return fmt.Errorf("record error Inbox capacity rejection: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -106,8 +106,8 @@ func (s *Store) AcceptErrorEvents(
 		}
 		query := bind(s.dialect, `INSERT INTO telemetry_inbox(
 			event_id, canonical_digest, payload, payload_bytes, occurred_at, accepted_at, source_map_snapshot,
-			status, available_at, claim_owner, attempts, last_error, outcome, created_at, updated_at, project_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0, '', '', ?, ?, ?)
+			status, available_at, claim_owner, claim_epoch, attempts, last_error, outcome, created_at, updated_at, project_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0, 0, '', '', ?, ?, ?)
 		RETURNING id`)
 		var insertedID int64
 		if err := tx.QueryRowContext(
@@ -117,12 +117,12 @@ func (s *Store) AcceptErrorEvents(
 			entry.CanonicalDigest,
 			entry.Payload,
 			entry.PayloadBytes,
-			entry.OccurredAt,
-			entry.AcceptedAt,
+			entry.OccurredAt.UTC(),
+			entry.AcceptedAt.UTC(),
 			snapshot,
-			entry.AcceptedAt,
-			entry.AcceptedAt,
-			entry.AcceptedAt,
+			entry.AcceptedAt.UTC(),
+			entry.AcceptedAt.UTC(),
+			entry.AcceptedAt.UTC(),
 			entry.ProjectID,
 		).Scan(&insertedID); err != nil {
 			return fmt.Errorf("accept error event %q: %w", entry.EventID, err)
@@ -131,7 +131,7 @@ func (s *Store) AcceptErrorEvents(
 	if len(newEntries) > 0 {
 		if _, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox_state SET
 			active_items = active_items + ?, active_bytes = active_bytes + ?, updated_at = ? WHERE id = 1`),
-			len(newEntries), newBytes, unique[0].AcceptedAt); err != nil {
+			len(newEntries), newBytes, unique[0].AcceptedAt.UTC()); err != nil {
 			return fmt.Errorf("reserve error Inbox capacity: %w", err)
 		}
 	}
@@ -229,6 +229,7 @@ func (s *Store) claimPostgresErrorEvents(
 	now time.Time,
 	ttl time.Duration,
 ) ([]errortrack.InboxItem, error) {
+	claimUntil := now.Add(ttl)
 	query := `WITH picked AS (
 		SELECT id FROM telemetry_inbox
 		WHERE (status = 'pending' AND available_at <= ?)
@@ -236,15 +237,16 @@ func (s *Store) claimPostgresErrorEvents(
 		ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT ?
 	), claimed AS (
 		UPDATE telemetry_inbox AS item SET status = 'processing', claim_owner = ?,
-			claim_until = ?, attempts = attempts + 1, updated_at = ?
+			claim_until = ?, claim_epoch = claim_epoch + 1, attempts = attempts + 1, updated_at = ?
 		FROM picked WHERE item.id = picked.id
 		RETURNING item.id, item.project_id, item.event_id, item.payload, item.occurred_at, item.accepted_at,
-			item.source_map_snapshot, item.attempts
+			item.source_map_snapshot, item.claim_epoch, item.claim_until, item.attempts
 	)
 	SELECT claimed.id, claimed.project_id, projects.slug, claimed.event_id, claimed.payload,
-		claimed.occurred_at, claimed.accepted_at, claimed.source_map_snapshot, claimed.attempts
+		claimed.occurred_at, claimed.accepted_at, claimed.source_map_snapshot,
+		claimed.claim_epoch, claimed.claim_until, claimed.attempts
 	FROM claimed JOIN projects ON projects.id = claimed.project_id ORDER BY claimed.id`
-	rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), now, now, limit, owner, now.Add(ttl), now)
+	rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), now, now, limit, owner, claimUntil, now)
 	if err != nil {
 		return nil, fmt.Errorf("claim PostgreSQL error Inbox: %w", err)
 	}
@@ -259,6 +261,7 @@ func (s *Store) claimSQLiteErrorEvents(
 	now time.Time,
 	ttl time.Duration,
 ) ([]errortrack.InboxItem, error) {
+	claimUntil := now.Add(ttl)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin SQLite error Inbox claim: %w", err)
@@ -286,13 +289,14 @@ func (s *Store) claimSQLiteErrorEvents(
 	items := make([]errortrack.InboxItem, 0, len(ids))
 	for _, id := range ids {
 		query := `UPDATE telemetry_inbox SET status = 'processing', claim_owner = ?,
-			claim_until = ?, attempts = attempts + 1, updated_at = ?
+			claim_until = ?, claim_epoch = claim_epoch + 1, attempts = attempts + 1, updated_at = ?
 			WHERE id = ? AND ((status = 'pending' AND available_at <= ?)
 				OR (status = 'processing' AND claim_until <= ?))
-			RETURNING id, project_id, event_id, payload, occurred_at, accepted_at, source_map_snapshot, attempts`
+			RETURNING id, project_id, event_id, payload, occurred_at, accepted_at,
+				source_map_snapshot, claim_epoch, claim_until, attempts`
 		var item errortrack.InboxItem
 		var snapshot string
-		if err := tx.QueryRowContext(ctx, query, owner, now.Add(ttl), now, id, now, now).
+		if err := tx.QueryRowContext(ctx, query, owner, claimUntil, now, id, now, now).
 			Scan(
 				&item.ID,
 				&item.ProjectID,
@@ -301,6 +305,8 @@ func (s *Store) claimSQLiteErrorEvents(
 				&item.OccurredAt,
 				&item.AcceptedAt,
 				&snapshot,
+				&item.ClaimEpoch,
+				&item.ClaimUntil,
 				&item.Attempts,
 			); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -325,12 +331,15 @@ func (s *Store) CompleteErrorEvent(
 	ctx context.Context,
 	id int64,
 	owner string,
+	claimEpoch int64,
 	delta errortrack.IssueDelta,
 	processedAt time.Time,
 ) ([]errortrack.IssueChange, error) {
-	if id <= 0 || owner == "" || delta.ProjectID <= 0 || delta.LastEventID == "" || processedAt.IsZero() {
+	if id <= 0 || owner == "" || claimEpoch <= 0 || delta.ProjectID <= 0 || delta.LastEventID == "" ||
+		processedAt.IsZero() {
 		return nil, fmt.Errorf("%w: incomplete completion input", errortrack.ErrInvalid)
 	}
+	processedAt = processedAt.UTC()
 	s.issueMu.Lock()
 	defer s.issueMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -343,7 +352,7 @@ func (s *Store) CompleteErrorEvent(
 		return nil, fmt.Errorf("lock error Inbox completion capacity: %w", err)
 	}
 	query := `SELECT project_id, event_id, payload_bytes, accepted_at FROM telemetry_inbox
-		WHERE id = ? AND status = 'processing' AND claim_owner = ?`
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`
 	if s.dialect == dialect.Postgres {
 		query += " FOR UPDATE"
 	}
@@ -351,7 +360,7 @@ func (s *Store) CompleteErrorEvent(
 	var eventID string
 	var payloadBytes int64
 	var acceptedAt time.Time
-	if err := tx.QueryRowContext(ctx, bind(s.dialect, query), id, owner).
+	if err := tx.QueryRowContext(ctx, bind(s.dialect, query), id, owner, claimEpoch).
 		Scan(&projectID, &eventID, &payloadBytes, &acceptedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errortrack.ErrClaimLost
@@ -364,7 +373,7 @@ func (s *Store) CompleteErrorEvent(
 	if state.activeItems < 1 || state.activeBytes < payloadBytes {
 		return nil, errors.New("error Inbox capacity counters are inconsistent")
 	}
-	delta.AcceptedAt = acceptedAt
+	delta.AcceptedAt = acceptedAt.UTC()
 	delta.AppliedAt = processedAt
 	changes, err := s.applyIssueDeltasTx(ctx, tx, []errortrack.IssueDelta{delta})
 	if err != nil {
@@ -378,6 +387,25 @@ func (s *Store) CompleteErrorEvent(
 		delta.Fingerprint,
 	).Scan(&issueID); err != nil {
 		return nil, fmt.Errorf("read completed error event issue %q: %w", eventID, err)
+	}
+	for _, change := range changes {
+		if _, err := tx.ExecContext(ctx, bind(s.dialect, `INSERT INTO issue_lifecycle_events(
+			project_id, issue_id, inbox_item_id, kind, title, level, seen_at,
+			status, available_at, claim_owner, claim_epoch, attempts, last_error, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0, 0, '', ?, ?)`),
+			change.ProjectID,
+			change.IssueID,
+			id,
+			change.Kind,
+			change.Title,
+			change.Level,
+			change.SeenAt.UTC(),
+			processedAt,
+			processedAt,
+			processedAt,
+		); err != nil {
+			return nil, fmt.Errorf("persist issue lifecycle event for %q: %w", eventID, err)
+		}
 	}
 	var lifecycle *errortrack.IssueChange
 	lifecycleKind := ""
@@ -399,8 +427,8 @@ func (s *Store) CompleteErrorEvent(
 	result, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox SET
 		status = 'completed', payload = NULL, payload_bytes = 0, claim_owner = '', claim_until = NULL,
 		outcome = ?, processed_at = ?, completed_at = ?, updated_at = ?
-		WHERE id = ? AND status = 'processing' AND claim_owner = ?`),
-		string(outcome), processedAt, processedAt, processedAt, id, owner)
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		string(outcome), processedAt, processedAt, processedAt, id, owner, claimEpoch)
 	if err != nil {
 		return nil, fmt.Errorf("complete error Inbox item %d: %w", id, err)
 	}
@@ -454,22 +482,34 @@ func (s *Store) RetryErrorEvent(
 	ctx context.Context,
 	id int64,
 	owner string,
+	claimEpoch int64,
 	retriedAt time.Time,
 	availableAt time.Time,
 	reason string,
 ) error {
+	if id <= 0 || owner == "" || claimEpoch <= 0 {
+		return fmt.Errorf("%w: incomplete retry input", errortrack.ErrInvalid)
+	}
 	if len(reason) > 2048 {
 		reason = reason[:2048]
 	}
+	retriedAt = retriedAt.UTC()
+	availableAt = availableAt.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin error Inbox retry: %w", err)
 	}
 	defer tx.Rollback()
+	// Always lock telemetry_inbox_state(id=1) before modifying telemetry_inbox
+	// to match Accept/Complete/Terminal/DeleteProject lock ordering and prevent
+	// PostgreSQL AB-BA deadlocks (SQLSTATE 40P01).
+	if _, err := s.lockErrorInboxStateTx(ctx, tx); err != nil {
+		return fmt.Errorf("lock error Inbox retry state: %w", err)
+	}
 	result, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox SET
 		status = 'pending', available_at = ?, claim_owner = '', claim_until = NULL, last_error = ?, updated_at = ?
-		WHERE id = ? AND status = 'processing' AND claim_owner = ?`),
-		availableAt, reason, retriedAt, id, owner)
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		availableAt, reason, retriedAt, id, owner, claimEpoch)
 	if err != nil {
 		return fmt.Errorf("retry error Inbox item %d: %w", id, err)
 	}
@@ -494,14 +534,19 @@ func (s *Store) ReleaseErrorEvent(
 	ctx context.Context,
 	id int64,
 	owner string,
+	claimEpoch int64,
 	releasedAt time.Time,
 ) error {
+	if id <= 0 || owner == "" || claimEpoch <= 0 {
+		return fmt.Errorf("%w: incomplete release input", errortrack.ErrInvalid)
+	}
+	releasedAt = releasedAt.UTC()
 	result, err := s.db.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox SET
 		status = 'pending', available_at = ?, claim_owner = '', claim_until = NULL,
 		attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
 		last_error = 'worker_shutdown: released', updated_at = ?
-		WHERE id = ? AND status = 'processing' AND claim_owner = ?`),
-		releasedAt, releasedAt, id, owner)
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		releasedAt, releasedAt, id, owner, claimEpoch)
 	if err != nil {
 		return fmt.Errorf("release error Inbox item %d: %w", id, err)
 	}
@@ -519,16 +564,18 @@ func (s *Store) TerminalErrorEvent(
 	ctx context.Context,
 	id int64,
 	owner string,
+	claimEpoch int64,
 	completedAt time.Time,
 	attempts int,
 	reason string,
 ) error {
-	if attempts <= 0 {
-		return fmt.Errorf("%w: terminal attempt count is required", errortrack.ErrInvalid)
+	if id <= 0 || owner == "" || claimEpoch <= 0 || attempts <= 0 {
+		return fmt.Errorf("%w: terminal owner, epoch, and attempt count are required", errortrack.ErrInvalid)
 	}
 	if len(reason) > 2048 {
 		reason = reason[:2048]
 	}
+	completedAt = completedAt.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin terminal error Inbox item: %w", err)
@@ -538,12 +585,13 @@ func (s *Store) TerminalErrorEvent(
 	if err != nil {
 		return fmt.Errorf("lock terminal error Inbox capacity: %w", err)
 	}
-	query := `SELECT payload_bytes FROM telemetry_inbox WHERE id = ? AND status = 'processing' AND claim_owner = ?`
+	query := `SELECT payload_bytes FROM telemetry_inbox
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`
 	if s.dialect == dialect.Postgres {
 		query += " FOR UPDATE"
 	}
 	var payloadBytes int64
-	if err := tx.QueryRowContext(ctx, bind(s.dialect, query), id, owner).Scan(&payloadBytes); err != nil {
+	if err := tx.QueryRowContext(ctx, bind(s.dialect, query), id, owner, claimEpoch).Scan(&payloadBytes); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errortrack.ErrClaimLost
 		}
@@ -556,8 +604,8 @@ func (s *Store) TerminalErrorEvent(
 	result, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox SET
 		status = 'terminal', payload = NULL, payload_bytes = 0, claim_owner = '', claim_until = NULL,
 		attempts = ?, last_error = ?, outcome = ?, processed_at = ?, completed_at = ?, updated_at = ?
-		WHERE id = ? AND status = 'processing' AND claim_owner = ?`),
-		attempts, reason, string(outcome), completedAt, completedAt, completedAt, id, owner)
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		attempts, reason, string(outcome), completedAt, completedAt, completedAt, id, owner, claimEpoch)
 	if err != nil {
 		return fmt.Errorf("mark terminal error Inbox item %d: %w", id, err)
 	}
@@ -580,35 +628,78 @@ func (s *Store) TerminalErrorEvent(
 	return nil
 }
 
+// ErrorInboxSummary reads the O(1) singleton summary row from
+// telemetry_inbox_state without scanning telemetry_inbox.
+func (s *Store) ErrorInboxSummary(ctx context.Context) (errortrack.InboxSummary, error) {
+	var summary errortrack.InboxSummary
+	if err := s.db.QueryRowContext(ctx, `SELECT active_items, active_bytes, rejections_total, retries_total,
+		terminal_failures_total, drops_total FROM telemetry_inbox_state WHERE id = 1`).Scan(
+		&summary.ActiveItems,
+		&summary.ActiveBytes,
+		&summary.RejectionsTotal,
+		&summary.RetriesTotal,
+		&summary.TerminalFailuresTotal,
+		&summary.DropsTotal,
+	); err != nil {
+		return errortrack.InboxSummary{}, fmt.Errorf("read error Inbox summary: %w", err)
+	}
+	return summary, nil
+}
+
+// OldestActiveErrorAcceptedAt returns the earliest accepted_at among active
+// (pending or processing) Inbox entries using the (status, accepted_at, id)
+// index for each active status.
+func (s *Store) OldestActiveErrorAcceptedAt(ctx context.Context) (*time.Time, error) {
+	var oldest *time.Time
+	for _, status := range []string{"pending", "processing"} {
+		var candidate time.Time
+		err := s.db.QueryRowContext(ctx, bind(s.dialect, `SELECT accepted_at FROM telemetry_inbox
+			WHERE status = ? ORDER BY accepted_at, id LIMIT 1`), status).Scan(&candidate)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read oldest %s error Inbox item: %w", status, err)
+		}
+		if oldest == nil || candidate.Before(*oldest) {
+			t := candidate.UTC()
+			oldest = &t
+		}
+	}
+	return oldest, nil
+}
+
 func (s *Store) ErrorInboxDiagnostics(ctx context.Context, recentLimit int) (errortrack.InboxDiagnostics, error) {
 	if recentLimit <= 0 || recentLimit > 100 {
 		recentLimit = 20
 	}
-	var diagnostics errortrack.InboxDiagnostics
-	if err := s.db.QueryRowContext(ctx, `SELECT active_items, active_bytes, rejections_total, retries_total,
-		terminal_failures_total, drops_total FROM telemetry_inbox_state WHERE id = 1`).Scan(
-		&diagnostics.ActiveItems,
-		&diagnostics.ActiveBytes,
-		&diagnostics.RejectionsTotal,
-		&diagnostics.RetriesTotal,
-		&diagnostics.TerminalFailuresTotal,
-		&diagnostics.DropsTotal,
-	); err != nil {
+	summary, err := s.ErrorInboxSummary(ctx)
+	if err != nil {
 		return errortrack.InboxDiagnostics{}, fmt.Errorf("read error Inbox diagnostics: %w", err)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT
-		COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0)
-		FROM telemetry_inbox`).Scan(&diagnostics.PendingItems, &diagnostics.ProcessingItems); err != nil {
-		return errortrack.InboxDiagnostics{}, fmt.Errorf("read error Inbox backlog: %w", err)
+	diagnostics := errortrack.InboxDiagnostics{
+		ActiveItems:           summary.ActiveItems,
+		ActiveBytes:           summary.ActiveBytes,
+		RejectionsTotal:       summary.RejectionsTotal,
+		RetriesTotal:          summary.RetriesTotal,
+		TerminalFailuresTotal: summary.TerminalFailuresTotal,
+		DropsTotal:            summary.DropsTotal,
 	}
-	var oldest time.Time
-	if err := s.db.QueryRowContext(ctx, `SELECT accepted_at FROM telemetry_inbox
-		WHERE status IN ('pending', 'processing') ORDER BY accepted_at, id LIMIT 1`).Scan(&oldest); err == nil {
-		diagnostics.OldestAcceptedAt = &oldest
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return errortrack.InboxDiagnostics{}, fmt.Errorf("read oldest error Inbox item: %w", err)
+	// Count each active status via the (status, ...) index instead of scanning
+	// historical completed/terminal rows across the entire telemetry_inbox table.
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_inbox WHERE status = 'pending'`).
+		Scan(&diagnostics.PendingItems); err != nil {
+		return errortrack.InboxDiagnostics{}, fmt.Errorf("read pending error Inbox count: %w", err)
 	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_inbox WHERE status = 'processing'`).
+		Scan(&diagnostics.ProcessingItems); err != nil {
+		return errortrack.InboxDiagnostics{}, fmt.Errorf("read processing error Inbox count: %w", err)
+	}
+	oldest, err := s.OldestActiveErrorAcceptedAt(ctx)
+	if err != nil {
+		return errortrack.InboxDiagnostics{}, err
+	}
+	diagnostics.OldestAcceptedAt = oldest
 	diagnostics.RecentTerminal = make([]errortrack.TerminalDiagnostic, 0)
 	rows, err := s.db.QueryContext(ctx, bind(s.dialect, `SELECT project_id, event_id, attempts, payload_bytes,
 		last_error, completed_at FROM telemetry_inbox WHERE status = 'terminal'
@@ -637,7 +728,212 @@ func (s *Store) ErrorInboxDiagnostics(ctx context.Context, recentLimit int) (err
 	return diagnostics, nil
 }
 
+func (s *Store) ClaimIssueLifecycleEvents(
+	ctx context.Context,
+	owner string,
+	limit int,
+	now time.Time,
+	ttl time.Duration,
+) ([]errortrack.LifecycleEvent, error) {
+	if owner == "" || limit <= 0 || now.IsZero() || ttl <= 0 {
+		return nil, fmt.Errorf("%w: owner, limit, current time, and TTL are required", errortrack.ErrInvalid)
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	now = now.UTC()
+	claimUntil := now.Add(ttl)
+	if s.dialect == dialect.Postgres {
+		query := `WITH picked AS (
+			SELECT id FROM issue_lifecycle_events
+			WHERE (status = 'pending' AND available_at <= ?)
+			   OR (status = 'processing' AND claim_until <= ?)
+			ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT ?
+		)
+		UPDATE issue_lifecycle_events AS item SET status = 'processing', claim_owner = ?,
+			claim_until = ?, claim_epoch = claim_epoch + 1, attempts = attempts + 1, updated_at = ?
+		FROM picked WHERE item.id = picked.id
+		RETURNING item.id, item.project_id, item.issue_id, item.inbox_item_id, item.kind,
+			item.title, item.level, item.seen_at, item.claim_epoch, item.claim_until, item.attempts`
+		rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), now, now, limit, owner, claimUntil, now)
+		if err != nil {
+			return nil, fmt.Errorf("claim PostgreSQL issue lifecycle events: %w", err)
+		}
+		defer rows.Close()
+		return scanLifecycleEventRows(rows)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin SQLite issue lifecycle claim: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM issue_lifecycle_events
+		WHERE (status = 'pending' AND available_at <= ?)
+		   OR (status = 'processing' AND claim_until <= ?)
+		ORDER BY available_at, id LIMIT ?`, now, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select SQLite issue lifecycle events: %w", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	events := make([]errortrack.LifecycleEvent, 0, len(ids))
+	for _, id := range ids {
+		var evt errortrack.LifecycleEvent
+		err := tx.QueryRowContext(ctx, `UPDATE issue_lifecycle_events SET status = 'processing', claim_owner = ?,
+			claim_until = ?, claim_epoch = claim_epoch + 1, attempts = attempts + 1, updated_at = ?
+			WHERE id = ? AND ((status = 'pending' AND available_at <= ?)
+				OR (status = 'processing' AND claim_until <= ?))
+			RETURNING id, project_id, issue_id, inbox_item_id, kind, title, level, seen_at,
+				claim_epoch, claim_until, attempts`,
+			owner, claimUntil, now, id, now, now).Scan(
+			&evt.ID,
+			&evt.ProjectID,
+			&evt.IssueID,
+			&evt.InboxItemID,
+			&evt.Kind,
+			&evt.Title,
+			&evt.Level,
+			&evt.SeenAt,
+			&evt.ClaimEpoch,
+			&evt.ClaimUntil,
+			&evt.Attempts,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("claim SQLite issue lifecycle event %d: %w", id, err)
+		}
+		events = append(events, evt)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit SQLite issue lifecycle claim: %w", err)
+	}
+	return events, nil
+}
+
+func (s *Store) CompleteIssueLifecycleEvent(
+	ctx context.Context,
+	id int64,
+	owner string,
+	claimEpoch int64,
+	dispatchedAt time.Time,
+) error {
+	dispatchedAt = dispatchedAt.UTC()
+	result, err := s.db.ExecContext(ctx, bind(s.dialect, `UPDATE issue_lifecycle_events SET
+		status = 'dispatched', claim_owner = '', claim_until = NULL, dispatched_at = ?, updated_at = ?
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		dispatchedAt, dispatchedAt, id, owner, claimEpoch)
+	if err != nil {
+		return fmt.Errorf("complete issue lifecycle event %d: %w", id, err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return errortrack.ErrClaimLost
+	}
+	return nil
+}
+
+func (s *Store) RetryIssueLifecycleEvent(
+	ctx context.Context,
+	id int64,
+	owner string,
+	claimEpoch int64,
+	retriedAt time.Time,
+	availableAt time.Time,
+	reason string,
+) error {
+	if len(reason) > 2048 {
+		reason = reason[:2048]
+	}
+	result, err := s.db.ExecContext(ctx, bind(s.dialect, `UPDATE issue_lifecycle_events SET
+		status = 'pending', available_at = ?, claim_owner = '', claim_until = NULL, last_error = ?, updated_at = ?
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		availableAt.UTC(), reason, retriedAt.UTC(), id, owner, claimEpoch)
+	if err != nil {
+		return fmt.Errorf("retry issue lifecycle event %d: %w", id, err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return errortrack.ErrClaimLost
+	}
+	return nil
+}
+
+func (s *Store) ReleaseIssueLifecycleEvent(
+	ctx context.Context,
+	id int64,
+	owner string,
+	claimEpoch int64,
+	releasedAt time.Time,
+) error {
+	releasedAt = releasedAt.UTC()
+	result, err := s.db.ExecContext(ctx, bind(s.dialect, `UPDATE issue_lifecycle_events SET
+		status = 'pending', available_at = ?, claim_owner = '', claim_until = NULL,
+		attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+		last_error = 'worker_shutdown: released', updated_at = ?
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		releasedAt, releasedAt, id, owner, claimEpoch)
+	if err != nil {
+		return fmt.Errorf("release issue lifecycle event %d: %w", id, err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return errortrack.ErrClaimLost
+	}
+	return nil
+}
+
+func (s *Store) FailIssueLifecycleEvent(
+	ctx context.Context,
+	id int64,
+	owner string,
+	claimEpoch int64,
+	failedAt time.Time,
+	reason string,
+) error {
+	if len(reason) > 2048 {
+		reason = reason[:2048]
+	}
+	failedAt = failedAt.UTC()
+	result, err := s.db.ExecContext(ctx, bind(s.dialect, `UPDATE issue_lifecycle_events SET
+		status = 'failed', claim_owner = '', claim_until = NULL, last_error = ?, dispatched_at = ?, updated_at = ?
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
+		reason, failedAt, failedAt, id, owner, claimEpoch)
+	if err != nil {
+		return fmt.Errorf("fail issue lifecycle event %d: %w", id, err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return errortrack.ErrClaimLost
+	}
+	return nil
+}
+
 func (s *Store) DeleteCompletedErrorReceipts(ctx context.Context, cutoff time.Time) (int, error) {
+	cutoff = cutoff.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin completed error receipt cleanup: %w", err)
@@ -654,6 +950,10 @@ func (s *Store) DeleteCompletedErrorReceipts(ctx context.Context, cutoff time.Ti
 	deleted, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("count deleted error receipts: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM issue_lifecycle_events
+		WHERE status IN ('dispatched', 'failed') AND dispatched_at < ?`), cutoff); err != nil {
+		return 0, fmt.Errorf("delete completed issue lifecycle events: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit completed error receipt cleanup: %w", err)
@@ -681,6 +981,8 @@ func scanErrorInboxRows(rows errorInboxRows) ([]errortrack.InboxItem, error) {
 			&item.OccurredAt,
 			&item.AcceptedAt,
 			&snapshot,
+			&item.ClaimEpoch,
+			&item.ClaimUntil,
 			&item.Attempts,
 		); err != nil {
 			return nil, fmt.Errorf("scan error Inbox item: %w", err)
@@ -692,4 +994,31 @@ func scanErrorInboxRows(rows errorInboxRows) ([]errortrack.InboxItem, error) {
 		return nil, fmt.Errorf("iterate error Inbox items: %w", err)
 	}
 	return items, nil
+}
+
+func scanLifecycleEventRows(rows errorInboxRows) ([]errortrack.LifecycleEvent, error) {
+	var events []errortrack.LifecycleEvent
+	for rows.Next() {
+		var evt errortrack.LifecycleEvent
+		if err := rows.Scan(
+			&evt.ID,
+			&evt.ProjectID,
+			&evt.IssueID,
+			&evt.InboxItemID,
+			&evt.Kind,
+			&evt.Title,
+			&evt.Level,
+			&evt.SeenAt,
+			&evt.ClaimEpoch,
+			&evt.ClaimUntil,
+			&evt.Attempts,
+		); err != nil {
+			return nil, fmt.Errorf("scan issue lifecycle event: %w", err)
+		}
+		events = append(events, evt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate issue lifecycle events: %w", err)
+	}
+	return events, nil
 }

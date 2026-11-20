@@ -19,9 +19,13 @@ type SourceMapStore interface {
 	ReferencedSourceMapDigests(context.Context, int) (map[string]bool, error)
 }
 
+const DefaultSourceMapGracePeriod = 15 * time.Minute
+
 type SourceMaps struct {
-	Metadata SourceMapStore
-	Blobs    blob.Store
+	Metadata    SourceMapStore
+	Blobs       blob.Store
+	GracePeriod time.Duration
+	Now         func() time.Time
 }
 
 // Clean deletes expired releases' metadata, then reclaims revision blobs that
@@ -57,10 +61,24 @@ func (c *SourceMaps) sweepRevisions(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list source map revisions: %w", err)
 	}
+	nowFn := c.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := nowFn().UTC()
+	grace := c.GracePeriod
+	if grace == 0 {
+		grace = DefaultSourceMapGracePeriod
+	}
 	byProject := make(map[string][]string)
 	for _, object := range objects {
 		parts := strings.Split(object.Key, "/")
 		if len(parts) != 4 || parts[2] != "revisions" || !strings.HasSuffix(parts[3], ".map") {
+			continue
+		}
+		// Skip recently written blobs so an in-flight upload between blob Put
+		// and metadata Upsert commit is never reclaimed as an orphan.
+		if grace > 0 && !object.ModTime.IsZero() && now.Sub(object.ModTime.UTC()) < grace {
 			continue
 		}
 		byProject[parts[1]] = append(byProject[parts[1]], strings.TrimSuffix(parts[3], ".map"))

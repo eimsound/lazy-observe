@@ -45,13 +45,20 @@ func normalizedFrames(platform string, input []Frame) []normalizedFrame {
 	for _, f := range input {
 		hasInApp = hasInApp || f.InApp
 	}
-	result := make([]normalizedFrame, 0, 8)
-	selected := 0
+	candidates := make([]Frame, 0, len(input))
 	for _, f := range input {
 		if hasInApp && !f.InApp {
 			continue
 		}
-		selected++
+		candidates = append(candidates, f)
+	}
+	// SDKs report stack frames outermost-first (caller -> callee), so the tail
+	// holds the innermost frames where the failure actually occurred.
+	if len(candidates) > 8 {
+		candidates = candidates[len(candidates)-8:]
+	}
+	result := make([]normalizedFrame, 0, len(candidates))
+	for _, f := range candidates {
 		filename := normalizeFilename(f.Filename)
 		module := strings.ToLower(strings.TrimSpace(f.Module))
 		function := normalizeFunction(f.Function)
@@ -62,16 +69,10 @@ func normalizedFrames(platform string, input []Frame) []normalizedFrame {
 		if len(result) != 0 {
 			previous := result[len(result)-1]
 			if previous.module == n.module && previous.function == n.function {
-				if selected == 8 {
-					break
-				}
 				continue
 			}
 		}
 		result = append(result, n)
-		if selected == 8 {
-			break
-		}
 	}
 	return result
 }

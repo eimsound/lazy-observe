@@ -18,6 +18,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/auditevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/inhibitionrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
+	"github.com/eimsound/lazy-observe/internal/db/ent/issuelifecycleevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/notificationchannel"
 	"github.com/eimsound/lazy-observe/internal/db/ent/platformkeyfingerprint"
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
@@ -100,6 +101,7 @@ func checkColumn(t, c string) error {
 			auditevent.Table:             auditevent.ValidColumn,
 			inhibitionrule.Table:         inhibitionrule.ValidColumn,
 			issue.Table:                  issue.ValidColumn,
+			issuelifecycleevent.Table:    issuelifecycleevent.ValidColumn,
 			notificationchannel.Table:    notificationchannel.ValidColumn,
 			platformkeyfingerprint.Table: platformkeyfingerprint.ValidColumn,
 			profilemeta.Table:            profilemeta.ValidColumn,

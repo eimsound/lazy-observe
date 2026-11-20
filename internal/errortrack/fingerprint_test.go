@@ -188,15 +188,25 @@ func TestFingerprintTypeAndFrameSelection(t *testing.T) {
 	if Fingerprint(withoutStack) != Fingerprint(changedValue) {
 		t.Fatal("exception value affected stackless fingerprint")
 	}
-	frames := make([]Frame, 9)
+	frames := make([]Frame, 10)
 	for i := range frames {
-		frames[i] = Frame{Function: "same", Filename: "same.go", InApp: true}
+		frames[i] = Frame{Function: "frame_" + string(rune('a'+i)), Filename: "app.go", InApp: true}
 	}
-	firstEight := Event{Platform: "go", Exception: Exception{Type: "panic", Stacktrace: Stacktrace{Frames: frames}}}
-	changedNinth := firstEight
-	changedNinth.Exception.Stacktrace.Frames = append([]Frame(nil), frames...)
-	changedNinth.Exception.Stacktrace.Frames[8] = Frame{Function: "changed", Filename: "changed.go", InApp: true}
-	if Fingerprint(firstEight) != Fingerprint(changedNinth) {
-		t.Fatal("ninth frame affected fingerprint")
+	baseDeep := Event{Platform: "go", Exception: Exception{Type: "panic", Stacktrace: Stacktrace{Frames: frames}}}
+	changedOutermost := baseDeep
+	changedOutermost.Exception.Stacktrace.Frames = append([]Frame(nil), frames...)
+	changedOutermost.Exception.Stacktrace.Frames[0] = Frame{
+		Function: "outer_changed",
+		Filename: "entry.go",
+		InApp:    true,
+	}
+	if Fingerprint(baseDeep) != Fingerprint(changedOutermost) {
+		t.Fatal("outermost frame outside innermost 8 affected fingerprint")
+	}
+	changedInnermost := baseDeep
+	changedInnermost.Exception.Stacktrace.Frames = append([]Frame(nil), frames...)
+	changedInnermost.Exception.Stacktrace.Frames[9] = Frame{Function: "inner_bug", Filename: "bug.go", InApp: true}
+	if Fingerprint(baseDeep) == Fingerprint(changedInnermost) {
+		t.Fatal("innermost frame did not affect fingerprint")
 	}
 }

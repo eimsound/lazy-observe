@@ -44,6 +44,8 @@ const (
 	EdgeProfileMetas = "profile_metas"
 	// EdgeTelemetryInbox holds the string denoting the telemetry_inbox edge name in mutations.
 	EdgeTelemetryInbox = "telemetry_inbox"
+	// EdgeIssueLifecycleEvents holds the string denoting the issue_lifecycle_events edge name in mutations.
+	EdgeIssueLifecycleEvents = "issue_lifecycle_events"
 	// Table holds the table name of the project in the database.
 	Table = "projects"
 	// APITokensTable is the table that holds the api_tokens relation/edge.
@@ -130,6 +132,13 @@ const (
 	TelemetryInboxInverseTable = "telemetry_inbox"
 	// TelemetryInboxColumn is the table column denoting the telemetry_inbox relation/edge.
 	TelemetryInboxColumn = "project_id"
+	// IssueLifecycleEventsTable is the table that holds the issue_lifecycle_events relation/edge.
+	IssueLifecycleEventsTable = "issue_lifecycle_events"
+	// IssueLifecycleEventsInverseTable is the table name for the IssueLifecycleEvent entity.
+	// It exists in this package in order to avoid circular dependency with the "issuelifecycleevent" package.
+	IssueLifecycleEventsInverseTable = "issue_lifecycle_events"
+	// IssueLifecycleEventsColumn is the table column denoting the issue_lifecycle_events relation/edge.
+	IssueLifecycleEventsColumn = "project_id"
 )
 
 // Columns holds all SQL columns for project fields.
@@ -342,6 +351,20 @@ func ByTelemetryInbox(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newTelemetryInboxStep(), append([]sql.OrderTerm{term}, terms...)...)
 	}
 }
+
+// ByIssueLifecycleEventsCount orders the results by issue_lifecycle_events count.
+func ByIssueLifecycleEventsCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newIssueLifecycleEventsStep(), opts...)
+	}
+}
+
+// ByIssueLifecycleEvents orders the results by issue_lifecycle_events terms.
+func ByIssueLifecycleEvents(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newIssueLifecycleEventsStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
 func newAPITokensStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
@@ -424,5 +447,12 @@ func newTelemetryInboxStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(TelemetryInboxInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.O2M, false, TelemetryInboxTable, TelemetryInboxColumn),
+	)
+}
+func newIssueLifecycleEventsStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(IssueLifecycleEventsInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, IssueLifecycleEventsTable, IssueLifecycleEventsColumn),
 	)
 }

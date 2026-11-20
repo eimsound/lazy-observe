@@ -81,6 +81,18 @@ func (f IssueFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.IssueMutation", m)
 }
 
+// The IssueLifecycleEventFunc type is an adapter to allow the use of ordinary
+// function as IssueLifecycleEvent mutator.
+type IssueLifecycleEventFunc func(context.Context, *ent.IssueLifecycleEventMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f IssueLifecycleEventFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.IssueLifecycleEventMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.IssueLifecycleEventMutation", m)
+}
+
 // The NotificationChannelFunc type is an adapter to allow the use of ordinary
 // function as NotificationChannel mutator.
 type NotificationChannelFunc func(context.Context, *ent.NotificationChannelMutation) (ent.Value, error)

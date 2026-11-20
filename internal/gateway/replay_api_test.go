@@ -67,11 +67,18 @@ func TestReplayEndToEnd(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim replay error receipt=%#v err=%v", claimed, err)
 	}
-	changes, err := store.CompleteErrorEvent(ctx, claimed[0].ID, "replay-worker", errortrack.IssueDelta{
-		ProjectID: defaultProject.ID, Fingerprint: "replay-error", Title: "checkout failed", Level: "warning",
-		Count: 1, FirstSeen: recordingStart.Add(2 * time.Second), LastSeen: recordingStart.Add(2 * time.Second),
-		LastEventID: "event-1", AcceptedAt: acceptedAt, AppliedAt: acceptedAt.Add(2 * time.Second),
-	}, acceptedAt.Add(2*time.Second))
+	changes, err := store.CompleteErrorEvent(
+		ctx,
+		claimed[0].ID,
+		"replay-worker",
+		claimed[0].ClaimEpoch,
+		errortrack.IssueDelta{
+			ProjectID: defaultProject.ID, Fingerprint: "replay-error", Title: "checkout failed", Level: "warning",
+			Count: 1, FirstSeen: recordingStart.Add(2 * time.Second), LastSeen: recordingStart.Add(2 * time.Second),
+			LastEventID: "event-1", AcceptedAt: acceptedAt, AppliedAt: acceptedAt.Add(2 * time.Second),
+		},
+		acceptedAt.Add(2*time.Second),
+	)
 	if err != nil || len(changes) != 1 {
 		t.Fatalf("complete replay error receipt changes=%#v err=%v", changes, err)
 	}

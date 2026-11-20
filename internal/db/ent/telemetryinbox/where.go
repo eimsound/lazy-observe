@@ -100,6 +100,11 @@ func ClaimUntil(v time.Time) predicate.TelemetryInbox {
 	return predicate.TelemetryInbox(sql.FieldEQ(FieldClaimUntil, v))
 }
 
+// ClaimEpoch applies equality check predicate on the "claim_epoch" field. It's identical to ClaimEpochEQ.
+func ClaimEpoch(v int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldEQ(FieldClaimEpoch, v))
+}
+
 // Attempts applies equality check predicate on the "attempts" field. It's identical to AttemptsEQ.
 func Attempts(v int) predicate.TelemetryInbox {
 	return predicate.TelemetryInbox(sql.FieldEQ(FieldAttempts, v))
@@ -613,6 +618,46 @@ func ClaimUntilIsNil() predicate.TelemetryInbox {
 // ClaimUntilNotNil applies the NotNil predicate on the "claim_until" field.
 func ClaimUntilNotNil() predicate.TelemetryInbox {
 	return predicate.TelemetryInbox(sql.FieldNotNull(FieldClaimUntil))
+}
+
+// ClaimEpochEQ applies the EQ predicate on the "claim_epoch" field.
+func ClaimEpochEQ(v int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldEQ(FieldClaimEpoch, v))
+}
+
+// ClaimEpochNEQ applies the NEQ predicate on the "claim_epoch" field.
+func ClaimEpochNEQ(v int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldNEQ(FieldClaimEpoch, v))
+}
+
+// ClaimEpochIn applies the In predicate on the "claim_epoch" field.
+func ClaimEpochIn(vs ...int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldIn(FieldClaimEpoch, vs...))
+}
+
+// ClaimEpochNotIn applies the NotIn predicate on the "claim_epoch" field.
+func ClaimEpochNotIn(vs ...int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldNotIn(FieldClaimEpoch, vs...))
+}
+
+// ClaimEpochGT applies the GT predicate on the "claim_epoch" field.
+func ClaimEpochGT(v int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldGT(FieldClaimEpoch, v))
+}
+
+// ClaimEpochGTE applies the GTE predicate on the "claim_epoch" field.
+func ClaimEpochGTE(v int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldGTE(FieldClaimEpoch, v))
+}
+
+// ClaimEpochLT applies the LT predicate on the "claim_epoch" field.
+func ClaimEpochLT(v int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldLT(FieldClaimEpoch, v))
+}
+
+// ClaimEpochLTE applies the LTE predicate on the "claim_epoch" field.
+func ClaimEpochLTE(v int64) predicate.TelemetryInbox {
+	return predicate.TelemetryInbox(sql.FieldLTE(FieldClaimEpoch, v))
 }
 
 // AttemptsEQ applies the EQ predicate on the "attempts" field.

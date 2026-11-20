@@ -15,6 +15,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/alertrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/inhibitionrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
+	"github.com/eimsound/lazy-observe/internal/db/ent/issuelifecycleevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/predicate"
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
@@ -47,6 +48,7 @@ type ProjectQuery struct {
 	withScrapeTargets         *ScrapeTargetQuery
 	withProfileMetas          *ProfileMetaQuery
 	withTelemetryInbox        *TelemetryInboxQuery
+	withIssueLifecycleEvents  *IssueLifecycleEventQuery
 	// intermediate query (i.e. traversal path).
 	sql  *sql.Selector
 	path func(context.Context) (*sql.Selector, error)
@@ -347,6 +349,28 @@ func (_q *ProjectQuery) QueryTelemetryInbox() *TelemetryInboxQuery {
 	return query
 }
 
+// QueryIssueLifecycleEvents chains the current query on the "issue_lifecycle_events" edge.
+func (_q *ProjectQuery) QueryIssueLifecycleEvents() *IssueLifecycleEventQuery {
+	query := (&IssueLifecycleEventClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(project.Table, project.FieldID, selector),
+			sqlgraph.To(issuelifecycleevent.Table, issuelifecycleevent.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, project.IssueLifecycleEventsTable, project.IssueLifecycleEventsColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
 // First returns the first Project entity from the query.
 // Returns a *NotFoundError when no Project was found.
 func (_q *ProjectQuery) First(ctx context.Context) (*Project, error) {
@@ -551,6 +575,7 @@ func (_q *ProjectQuery) Clone() *ProjectQuery {
 		withScrapeTargets:         _q.withScrapeTargets.Clone(),
 		withProfileMetas:          _q.withProfileMetas.Clone(),
 		withTelemetryInbox:        _q.withTelemetryInbox.Clone(),
+		withIssueLifecycleEvents:  _q.withIssueLifecycleEvents.Clone(),
 		// clone intermediate query.
 		sql:  _q.sql.Clone(),
 		path: _q.path,
@@ -689,6 +714,17 @@ func (_q *ProjectQuery) WithTelemetryInbox(opts ...func(*TelemetryInboxQuery)) *
 	return _q
 }
 
+// WithIssueLifecycleEvents tells the query-builder to eager-load the nodes that are connected to
+// the "issue_lifecycle_events" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *ProjectQuery) WithIssueLifecycleEvents(opts ...func(*IssueLifecycleEventQuery)) *ProjectQuery {
+	query := (&IssueLifecycleEventClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withIssueLifecycleEvents = query
+	return _q
+}
+
 // GroupBy is used to group vertices by one or more fields/columns.
 // It is often used with aggregate functions, like: count, max, mean, min, sum.
 //
@@ -767,7 +803,7 @@ func (_q *ProjectQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Proj
 	var (
 		nodes       = []*Project{}
 		_spec       = _q.querySpec()
-		loadedTypes = [12]bool{
+		loadedTypes = [13]bool{
 			_q.withAPITokens != nil,
 			_q.withSourceMapUploadTokens != nil,
 			_q.withAlertRules != nil,
@@ -780,6 +816,7 @@ func (_q *ProjectQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Proj
 			_q.withScrapeTargets != nil,
 			_q.withProfileMetas != nil,
 			_q.withTelemetryInbox != nil,
+			_q.withIssueLifecycleEvents != nil,
 		}
 	)
 	_spec.ScanValues = func(columns []string) ([]any, error) {
@@ -884,6 +921,15 @@ func (_q *ProjectQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Proj
 		if err := _q.loadTelemetryInbox(ctx, query, nodes,
 			func(n *Project) { n.Edges.TelemetryInbox = []*TelemetryInbox{} },
 			func(n *Project, e *TelemetryInbox) { n.Edges.TelemetryInbox = append(n.Edges.TelemetryInbox, e) }); err != nil {
+			return nil, err
+		}
+	}
+	if query := _q.withIssueLifecycleEvents; query != nil {
+		if err := _q.loadIssueLifecycleEvents(ctx, query, nodes,
+			func(n *Project) { n.Edges.IssueLifecycleEvents = []*IssueLifecycleEvent{} },
+			func(n *Project, e *IssueLifecycleEvent) {
+				n.Edges.IssueLifecycleEvents = append(n.Edges.IssueLifecycleEvents, e)
+			}); err != nil {
 			return nil, err
 		}
 	}
@@ -1232,6 +1278,36 @@ func (_q *ProjectQuery) loadTelemetryInbox(ctx context.Context, query *Telemetry
 	}
 	query.Where(predicate.TelemetryInbox(func(s *sql.Selector) {
 		s.Where(sql.InValues(s.C(project.TelemetryInboxColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.ProjectID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "project_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
+func (_q *ProjectQuery) loadIssueLifecycleEvents(ctx context.Context, query *IssueLifecycleEventQuery, nodes []*Project, init func(*Project), assign func(*Project, *IssueLifecycleEvent)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[int]*Project)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+		if init != nil {
+			init(nodes[i])
+		}
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(issuelifecycleevent.FieldProjectID)
+	}
+	query.Where(predicate.IssueLifecycleEvent(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(project.IssueLifecycleEventsColumn), fks...))
 	}))
 	neighbors, err := query.All(ctx)
 	if err != nil {

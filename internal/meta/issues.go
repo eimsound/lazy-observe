@@ -22,7 +22,10 @@ type IssueListOptions struct {
 	Page   int
 }
 
-const IssuePageSize = 50
+const (
+	IssuePageSize = 50
+	MaxIssuePage  = 10_000
+)
 
 type IssueView struct {
 	ID              int            `json:"id"`
@@ -205,6 +208,9 @@ func (s *Store) ListIssues(ctx context.Context, projectID int, opts IssueListOpt
 	if page < 1 {
 		page = 1
 	}
+	if page > MaxIssuePage || page-1 > math.MaxInt/IssuePageSize {
+		return []IssueView{}, nil
+	}
 	rows, err := q.Offset((page - 1) * IssuePageSize).Limit(IssuePageSize).All(ctx)
 	if err != nil {
 		return nil, err
@@ -294,7 +300,13 @@ func (s *Store) SetIssuesStatus(
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	if ids[0] == 0 {
+	validIDs := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			validIDs = append(validIDs, id)
+		}
+	}
+	if len(validIDs) == 0 {
 		return 0, nil
 	}
 	if changedAt.IsZero() {
@@ -303,7 +315,7 @@ func (s *Store) SetIssuesStatus(
 	s.issueMu.Lock()
 	defer s.issueMu.Unlock()
 	return s.client.Issue.Update().
-		Where(issue.ProjectIDEQ(projectID), issue.IDIn(ids...)).
+		Where(issue.ProjectIDEQ(projectID), issue.IDIn(validIDs...)).
 		SetStatus(issue.Status(status)).
 		SetStatusChangedAt(changedAt).
 		Save(ctx)

@@ -87,18 +87,21 @@ func (s *Local) List(ctx context.Context, prefix string) ([]Object, error) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if d.IsDir() {
+		if d.IsDir() || strings.HasPrefix(d.Name(), ".blob-") {
 			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		rel, err := filepath.Rel(s.root, path)
 		if err != nil {
 			return err
 		}
-		objects = append(objects, Object{Key: filepath.ToSlash(rel), Size: info.Size()})
+		objects = append(objects, Object{Key: filepath.ToSlash(rel), Size: info.Size(), ModTime: info.ModTime().UTC()})
 		return nil
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {

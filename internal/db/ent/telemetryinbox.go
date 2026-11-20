@@ -41,6 +41,8 @@ type TelemetryInbox struct {
 	ClaimOwner string `json:"claim_owner,omitempty"`
 	// ClaimUntil holds the value of the "claim_until" field.
 	ClaimUntil *time.Time `json:"claim_until,omitempty"`
+	// ClaimEpoch holds the value of the "claim_epoch" field.
+	ClaimEpoch int64 `json:"claim_epoch,omitempty"`
 	// Attempts holds the value of the "attempts" field.
 	Attempts int `json:"attempts,omitempty"`
 	// LastError holds the value of the "last_error" field.
@@ -90,7 +92,7 @@ func (*TelemetryInbox) scanValues(columns []string) ([]any, error) {
 		switch columns[i] {
 		case telemetryinbox.FieldPayload, telemetryinbox.FieldSourceMapSnapshot:
 			values[i] = new([]byte)
-		case telemetryinbox.FieldID, telemetryinbox.FieldPayloadBytes, telemetryinbox.FieldAttempts, telemetryinbox.FieldProjectID:
+		case telemetryinbox.FieldID, telemetryinbox.FieldPayloadBytes, telemetryinbox.FieldClaimEpoch, telemetryinbox.FieldAttempts, telemetryinbox.FieldProjectID:
 			values[i] = new(sql.NullInt64)
 		case telemetryinbox.FieldEventID, telemetryinbox.FieldCanonicalDigest, telemetryinbox.FieldStatus, telemetryinbox.FieldClaimOwner, telemetryinbox.FieldLastError, telemetryinbox.FieldOutcome:
 			values[i] = new(sql.NullString)
@@ -185,6 +187,12 @@ func (_m *TelemetryInbox) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.ClaimUntil = new(time.Time)
 				*_m.ClaimUntil = value.Time
+			}
+		case telemetryinbox.FieldClaimEpoch:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field claim_epoch", values[i])
+			} else if value.Valid {
+				_m.ClaimEpoch = value.Int64
 			}
 		case telemetryinbox.FieldAttempts:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
@@ -313,6 +321,9 @@ func (_m *TelemetryInbox) String() string {
 		builder.WriteString("claim_until=")
 		builder.WriteString(v.Format(time.ANSIC))
 	}
+	builder.WriteString(", ")
+	builder.WriteString("claim_epoch=")
+	builder.WriteString(fmt.Sprintf("%v", _m.ClaimEpoch))
 	builder.WriteString(", ")
 	builder.WriteString("attempts=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Attempts))

@@ -48,6 +48,7 @@ type Store struct {
 	dialect            string
 	startupLockTimeout time.Duration
 	issueMu            sync.Mutex
+	sourceMapMu        sync.Mutex
 	revision           atomic.Uint64
 	secretBox          atomic.Pointer[secret.Box]
 }
@@ -469,6 +470,7 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 		`DELETE FROM source_map_upload_tokens WHERE project_id = ?`,
 		`DELETE FROM silences WHERE project_id = ?`,
 		`DELETE FROM inhibition_rules WHERE project_id = ?`,
+		`DELETE FROM issue_lifecycle_events WHERE project_id = ?`,
 		`DELETE FROM telemetry_inbox WHERE project_id = ?`,
 		`DELETE FROM issues WHERE project_id = ?`,
 		`DELETE FROM replay_sessions WHERE project_id = ?`,

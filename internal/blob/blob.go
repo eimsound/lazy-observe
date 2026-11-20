@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 )
 
 var (
@@ -13,8 +14,9 @@ var (
 )
 
 type Object struct {
-	Key  string `json:"key"`
-	Size int64  `json:"size"`
+	Key     string    `json:"key"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time,omitempty"`
 }
 
 type Store interface {

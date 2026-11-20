@@ -19,6 +19,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/auditevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/inhibitionrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
+	"github.com/eimsound/lazy-observe/internal/db/ent/issuelifecycleevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/notificationchannel"
 	"github.com/eimsound/lazy-observe/internal/db/ent/platformkeyfingerprint"
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
@@ -52,6 +53,8 @@ type Client struct {
 	InhibitionRule *InhibitionRuleClient
 	// Issue is the client for interacting with the Issue builders.
 	Issue *IssueClient
+	// IssueLifecycleEvent is the client for interacting with the IssueLifecycleEvent builders.
+	IssueLifecycleEvent *IssueLifecycleEventClient
 	// NotificationChannel is the client for interacting with the NotificationChannel builders.
 	NotificationChannel *NotificationChannelClient
 	// PlatformKeyFingerprint is the client for interacting with the PlatformKeyFingerprint builders.
@@ -100,6 +103,7 @@ func (c *Client) init() {
 	c.AuditEvent = NewAuditEventClient(c.config)
 	c.InhibitionRule = NewInhibitionRuleClient(c.config)
 	c.Issue = NewIssueClient(c.config)
+	c.IssueLifecycleEvent = NewIssueLifecycleEventClient(c.config)
 	c.NotificationChannel = NewNotificationChannelClient(c.config)
 	c.PlatformKeyFingerprint = NewPlatformKeyFingerprintClient(c.config)
 	c.ProfileMeta = NewProfileMetaClient(c.config)
@@ -214,6 +218,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		AuditEvent:             NewAuditEventClient(cfg),
 		InhibitionRule:         NewInhibitionRuleClient(cfg),
 		Issue:                  NewIssueClient(cfg),
+		IssueLifecycleEvent:    NewIssueLifecycleEventClient(cfg),
 		NotificationChannel:    NewNotificationChannelClient(cfg),
 		PlatformKeyFingerprint: NewPlatformKeyFingerprintClient(cfg),
 		ProfileMeta:            NewProfileMetaClient(cfg),
@@ -255,6 +260,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		AuditEvent:             NewAuditEventClient(cfg),
 		InhibitionRule:         NewInhibitionRuleClient(cfg),
 		Issue:                  NewIssueClient(cfg),
+		IssueLifecycleEvent:    NewIssueLifecycleEventClient(cfg),
 		NotificationChannel:    NewNotificationChannelClient(cfg),
 		PlatformKeyFingerprint: NewPlatformKeyFingerprintClient(cfg),
 		ProfileMeta:            NewProfileMetaClient(cfg),
@@ -301,10 +307,11 @@ func (c *Client) Close() error {
 func (c *Client) Use(hooks ...Hook) {
 	for _, n := range []interface{ Use(...Hook) }{
 		c.AISetting, c.AlertEvent, c.AlertRule, c.AuditEvent, c.InhibitionRule, c.Issue,
-		c.NotificationChannel, c.PlatformKeyFingerprint, c.ProfileMeta, c.Project,
-		c.ProjectAPIToken, c.ProjectAlertConfig, c.ReplaySession, c.ScrapeTarget,
-		c.Session, c.Silence, c.SourceMapArtifact, c.SourceMapUploadToken,
-		c.TelemetryInbox, c.TelemetryInboxState, c.User, c.UserAPIToken,
+		c.IssueLifecycleEvent, c.NotificationChannel, c.PlatformKeyFingerprint,
+		c.ProfileMeta, c.Project, c.ProjectAPIToken, c.ProjectAlertConfig,
+		c.ReplaySession, c.ScrapeTarget, c.Session, c.Silence, c.SourceMapArtifact,
+		c.SourceMapUploadToken, c.TelemetryInbox, c.TelemetryInboxState, c.User,
+		c.UserAPIToken,
 	} {
 		n.Use(hooks...)
 	}
@@ -315,10 +322,11 @@ func (c *Client) Use(hooks ...Hook) {
 func (c *Client) Intercept(interceptors ...Interceptor) {
 	for _, n := range []interface{ Intercept(...Interceptor) }{
 		c.AISetting, c.AlertEvent, c.AlertRule, c.AuditEvent, c.InhibitionRule, c.Issue,
-		c.NotificationChannel, c.PlatformKeyFingerprint, c.ProfileMeta, c.Project,
-		c.ProjectAPIToken, c.ProjectAlertConfig, c.ReplaySession, c.ScrapeTarget,
-		c.Session, c.Silence, c.SourceMapArtifact, c.SourceMapUploadToken,
-		c.TelemetryInbox, c.TelemetryInboxState, c.User, c.UserAPIToken,
+		c.IssueLifecycleEvent, c.NotificationChannel, c.PlatformKeyFingerprint,
+		c.ProfileMeta, c.Project, c.ProjectAPIToken, c.ProjectAlertConfig,
+		c.ReplaySession, c.ScrapeTarget, c.Session, c.Silence, c.SourceMapArtifact,
+		c.SourceMapUploadToken, c.TelemetryInbox, c.TelemetryInboxState, c.User,
+		c.UserAPIToken,
 	} {
 		n.Intercept(interceptors...)
 	}
@@ -339,6 +347,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.InhibitionRule.mutate(ctx, m)
 	case *IssueMutation:
 		return c.Issue.mutate(ctx, m)
+	case *IssueLifecycleEventMutation:
+		return c.IssueLifecycleEvent.mutate(ctx, m)
 	case *NotificationChannelMutation:
 		return c.NotificationChannel.mutate(ctx, m)
 	case *PlatformKeyFingerprintMutation:
@@ -1270,6 +1280,155 @@ func (c *IssueClient) mutate(ctx context.Context, m *IssueMutation) (Value, erro
 	}
 }
 
+// IssueLifecycleEventClient is a client for the IssueLifecycleEvent schema.
+type IssueLifecycleEventClient struct {
+	config
+}
+
+// NewIssueLifecycleEventClient returns a client for the IssueLifecycleEvent from the given config.
+func NewIssueLifecycleEventClient(c config) *IssueLifecycleEventClient {
+	return &IssueLifecycleEventClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `issuelifecycleevent.Hooks(f(g(h())))`.
+func (c *IssueLifecycleEventClient) Use(hooks ...Hook) {
+	c.hooks.IssueLifecycleEvent = append(c.hooks.IssueLifecycleEvent, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `issuelifecycleevent.Intercept(f(g(h())))`.
+func (c *IssueLifecycleEventClient) Intercept(interceptors ...Interceptor) {
+	c.inters.IssueLifecycleEvent = append(c.inters.IssueLifecycleEvent, interceptors...)
+}
+
+// Create returns a builder for creating a IssueLifecycleEvent entity.
+func (c *IssueLifecycleEventClient) Create() *IssueLifecycleEventCreate {
+	mutation := newIssueLifecycleEventMutation(c.config, OpCreate)
+	return &IssueLifecycleEventCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of IssueLifecycleEvent entities.
+func (c *IssueLifecycleEventClient) CreateBulk(builders ...*IssueLifecycleEventCreate) *IssueLifecycleEventCreateBulk {
+	return &IssueLifecycleEventCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *IssueLifecycleEventClient) MapCreateBulk(slice any, setFunc func(*IssueLifecycleEventCreate, int)) *IssueLifecycleEventCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &IssueLifecycleEventCreateBulk{err: fmt.Errorf("calling to IssueLifecycleEventClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*IssueLifecycleEventCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &IssueLifecycleEventCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for IssueLifecycleEvent.
+func (c *IssueLifecycleEventClient) Update() *IssueLifecycleEventUpdate {
+	mutation := newIssueLifecycleEventMutation(c.config, OpUpdate)
+	return &IssueLifecycleEventUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *IssueLifecycleEventClient) UpdateOne(_m *IssueLifecycleEvent) *IssueLifecycleEventUpdateOne {
+	mutation := newIssueLifecycleEventMutation(c.config, OpUpdateOne, withIssueLifecycleEvent(_m))
+	return &IssueLifecycleEventUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *IssueLifecycleEventClient) UpdateOneID(id int) *IssueLifecycleEventUpdateOne {
+	mutation := newIssueLifecycleEventMutation(c.config, OpUpdateOne, withIssueLifecycleEventID(id))
+	return &IssueLifecycleEventUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for IssueLifecycleEvent.
+func (c *IssueLifecycleEventClient) Delete() *IssueLifecycleEventDelete {
+	mutation := newIssueLifecycleEventMutation(c.config, OpDelete)
+	return &IssueLifecycleEventDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *IssueLifecycleEventClient) DeleteOne(_m *IssueLifecycleEvent) *IssueLifecycleEventDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *IssueLifecycleEventClient) DeleteOneID(id int) *IssueLifecycleEventDeleteOne {
+	builder := c.Delete().Where(issuelifecycleevent.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &IssueLifecycleEventDeleteOne{builder}
+}
+
+// Query returns a query builder for IssueLifecycleEvent.
+func (c *IssueLifecycleEventClient) Query() *IssueLifecycleEventQuery {
+	return &IssueLifecycleEventQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeIssueLifecycleEvent},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a IssueLifecycleEvent entity by its id.
+func (c *IssueLifecycleEventClient) Get(ctx context.Context, id int) (*IssueLifecycleEvent, error) {
+	return c.Query().Where(issuelifecycleevent.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *IssueLifecycleEventClient) GetX(ctx context.Context, id int) *IssueLifecycleEvent {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryProject queries the project edge of a IssueLifecycleEvent.
+func (c *IssueLifecycleEventClient) QueryProject(_m *IssueLifecycleEvent) *ProjectQuery {
+	query := (&ProjectClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(issuelifecycleevent.Table, issuelifecycleevent.FieldID, id),
+			sqlgraph.To(project.Table, project.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, issuelifecycleevent.ProjectTable, issuelifecycleevent.ProjectColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *IssueLifecycleEventClient) Hooks() []Hook {
+	return c.hooks.IssueLifecycleEvent
+}
+
+// Interceptors returns the client interceptors.
+func (c *IssueLifecycleEventClient) Interceptors() []Interceptor {
+	return c.inters.IssueLifecycleEvent
+}
+
+func (c *IssueLifecycleEventClient) mutate(ctx context.Context, m *IssueLifecycleEventMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&IssueLifecycleEventCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&IssueLifecycleEventUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&IssueLifecycleEventUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&IssueLifecycleEventDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown IssueLifecycleEvent mutation op: %q", m.Op())
+	}
+}
+
 // NotificationChannelClient is a client for the NotificationChannel schema.
 type NotificationChannelClient struct {
 	config
@@ -2010,6 +2169,22 @@ func (c *ProjectClient) QueryTelemetryInbox(_m *Project) *TelemetryInboxQuery {
 			sqlgraph.From(project.Table, project.FieldID, id),
 			sqlgraph.To(telemetryinbox.Table, telemetryinbox.FieldID),
 			sqlgraph.Edge(sqlgraph.O2M, false, project.TelemetryInboxTable, project.TelemetryInboxColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryIssueLifecycleEvents queries the issue_lifecycle_events edge of a Project.
+func (c *ProjectClient) QueryIssueLifecycleEvents(_m *Project) *IssueLifecycleEventQuery {
+	query := (&IssueLifecycleEventClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(project.Table, project.FieldID, id),
+			sqlgraph.To(issuelifecycleevent.Table, issuelifecycleevent.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, project.IssueLifecycleEventsTable, project.IssueLifecycleEventsColumn),
 		)
 		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
 		return fromV, nil
@@ -3850,16 +4025,16 @@ func (c *UserAPITokenClient) mutate(ctx context.Context, m *UserAPITokenMutation
 type (
 	hooks struct {
 		AISetting, AlertEvent, AlertRule, AuditEvent, InhibitionRule, Issue,
-		NotificationChannel, PlatformKeyFingerprint, ProfileMeta, Project,
-		ProjectAPIToken, ProjectAlertConfig, ReplaySession, ScrapeTarget, Session,
-		Silence, SourceMapArtifact, SourceMapUploadToken, TelemetryInbox,
+		IssueLifecycleEvent, NotificationChannel, PlatformKeyFingerprint, ProfileMeta,
+		Project, ProjectAPIToken, ProjectAlertConfig, ReplaySession, ScrapeTarget,
+		Session, Silence, SourceMapArtifact, SourceMapUploadToken, TelemetryInbox,
 		TelemetryInboxState, User, UserAPIToken []ent.Hook
 	}
 	inters struct {
 		AISetting, AlertEvent, AlertRule, AuditEvent, InhibitionRule, Issue,
-		NotificationChannel, PlatformKeyFingerprint, ProfileMeta, Project,
-		ProjectAPIToken, ProjectAlertConfig, ReplaySession, ScrapeTarget, Session,
-		Silence, SourceMapArtifact, SourceMapUploadToken, TelemetryInbox,
+		IssueLifecycleEvent, NotificationChannel, PlatformKeyFingerprint, ProfileMeta,
+		Project, ProjectAPIToken, ProjectAlertConfig, ReplaySession, ScrapeTarget,
+		Session, Silence, SourceMapArtifact, SourceMapUploadToken, TelemetryInbox,
 		TelemetryInboxState, User, UserAPIToken []ent.Interceptor
 	}
 )

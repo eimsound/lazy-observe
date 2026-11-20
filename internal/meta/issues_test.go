@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -225,6 +226,44 @@ func TestIssueRegressionUsesAcceptedAtCutoff(t *testing.T) {
 		if err != nil || getErr != nil || len(changes) != 0 || ignored.Status != "ignored" || ignored.Count != 5 ||
 			!ignored.StatusChangedAt.Equal(ignoredAt) {
 			t.Fatalf("ignored event changes=%#v issue=%#v err=%v get_err=%v", changes, ignored, err, getErr)
+		}
+	})
+}
+
+func TestSetIssuesStatusHandlesLeadingZeroAndListIssuesHandlesOverflowPage(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "Edge", "edge")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		changes, err := store.ApplyIssueDeltas(ctx, []errortrack.IssueDelta{
+			{
+				ProjectID: project.ID, Fingerprint: "fp-1", Title: "One", Level: "error",
+				Count: 1, FirstSeen: now, LastSeen: now, LastEventID: "e1", AcceptedAt: now, AppliedAt: now,
+			},
+			{
+				ProjectID: project.ID, Fingerprint: "fp-2", Title: "Two", Level: "error",
+				Count: 1, FirstSeen: now, LastSeen: now, LastEventID: "e2", AcceptedAt: now, AppliedAt: now,
+			},
+		})
+		if err != nil || len(changes) != 2 {
+			t.Fatalf("changes=%#v err=%v", changes, err)
+		}
+		updated, err := store.SetIssuesStatus(
+			ctx,
+			project.ID,
+			[]int{0, changes[0].IssueID, changes[1].IssueID},
+			"resolved",
+			now.Add(time.Second),
+		)
+		if err != nil || updated != 2 {
+			t.Fatalf("SetIssuesStatus with leading zero updated=%d want 2 err=%v", updated, err)
+		}
+		rows, err := store.ListIssues(ctx, project.ID, IssueListOptions{Page: math.MaxInt})
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("ListIssues with MaxInt page rows=%#v err=%v", rows, err)
 		}
 	})
 }

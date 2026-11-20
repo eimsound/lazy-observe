@@ -33,6 +33,7 @@ func (TelemetryInbox) Fields() []ent.Field {
 		field.Time("available_at"),
 		field.String("claim_owner").Default(""),
 		field.Time("claim_until").Optional().Nillable(),
+		field.Int64("claim_epoch").Default(0).NonNegative(),
 		field.Int("attempts").Default(0).NonNegative(),
 		field.String("last_error").Default(""),
 		field.String("outcome").Default(""),
@@ -54,6 +55,7 @@ func (TelemetryInbox) Indexes() []ent.Index {
 	return []ent.Index{
 		index.Fields("project_id", "event_id").Unique(),
 		index.Fields("status", "available_at", "id"),
+		index.Fields("status", "accepted_at", "id"),
 		index.Fields("claim_until"),
 		index.Fields("completed_at"),
 	}

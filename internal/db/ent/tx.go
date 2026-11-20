@@ -24,6 +24,8 @@ type Tx struct {
 	InhibitionRule *InhibitionRuleClient
 	// Issue is the client for interacting with the Issue builders.
 	Issue *IssueClient
+	// IssueLifecycleEvent is the client for interacting with the IssueLifecycleEvent builders.
+	IssueLifecycleEvent *IssueLifecycleEventClient
 	// NotificationChannel is the client for interacting with the NotificationChannel builders.
 	NotificationChannel *NotificationChannelClient
 	// PlatformKeyFingerprint is the client for interacting with the PlatformKeyFingerprint builders.
@@ -193,6 +195,7 @@ func (tx *Tx) init() {
 	tx.AuditEvent = NewAuditEventClient(tx.config)
 	tx.InhibitionRule = NewInhibitionRuleClient(tx.config)
 	tx.Issue = NewIssueClient(tx.config)
+	tx.IssueLifecycleEvent = NewIssueLifecycleEventClient(tx.config)
 	tx.NotificationChannel = NewNotificationChannelClient(tx.config)
 	tx.PlatformKeyFingerprint = NewPlatformKeyFingerprintClient(tx.config)
 	tx.ProfileMeta = NewProfileMetaClient(tx.config)

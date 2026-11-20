@@ -13,6 +13,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/alertrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/inhibitionrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
+	"github.com/eimsound/lazy-observe/internal/db/ent/issuelifecycleevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/predicate"
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
@@ -249,6 +250,21 @@ func (_u *ProjectUpdate) AddTelemetryInbox(v ...*TelemetryInbox) *ProjectUpdate 
 		ids[i] = v[i].ID
 	}
 	return _u.AddTelemetryInboxIDs(ids...)
+}
+
+// AddIssueLifecycleEventIDs adds the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity by IDs.
+func (_u *ProjectUpdate) AddIssueLifecycleEventIDs(ids ...int) *ProjectUpdate {
+	_u.mutation.AddIssueLifecycleEventIDs(ids...)
+	return _u
+}
+
+// AddIssueLifecycleEvents adds the "issue_lifecycle_events" edges to the IssueLifecycleEvent entity.
+func (_u *ProjectUpdate) AddIssueLifecycleEvents(v ...*IssueLifecycleEvent) *ProjectUpdate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddIssueLifecycleEventIDs(ids...)
 }
 
 // Mutation returns the ProjectMutation object of the builder.
@@ -491,6 +507,27 @@ func (_u *ProjectUpdate) RemoveTelemetryInbox(v ...*TelemetryInbox) *ProjectUpda
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveTelemetryInboxIDs(ids...)
+}
+
+// ClearIssueLifecycleEvents clears all "issue_lifecycle_events" edges to the IssueLifecycleEvent entity.
+func (_u *ProjectUpdate) ClearIssueLifecycleEvents() *ProjectUpdate {
+	_u.mutation.ClearIssueLifecycleEvents()
+	return _u
+}
+
+// RemoveIssueLifecycleEventIDs removes the "issue_lifecycle_events" edge to IssueLifecycleEvent entities by IDs.
+func (_u *ProjectUpdate) RemoveIssueLifecycleEventIDs(ids ...int) *ProjectUpdate {
+	_u.mutation.RemoveIssueLifecycleEventIDs(ids...)
+	return _u
+}
+
+// RemoveIssueLifecycleEvents removes "issue_lifecycle_events" edges to IssueLifecycleEvent entities.
+func (_u *ProjectUpdate) RemoveIssueLifecycleEvents(v ...*IssueLifecycleEvent) *ProjectUpdate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveIssueLifecycleEventIDs(ids...)
 }
 
 // Save executes the query and returns the number of nodes affected by the update operation.
@@ -1077,6 +1114,51 @@ func (_u *ProjectUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 		}
 		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
+	if _u.mutation.IssueLifecycleEventsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.IssueLifecycleEventsTable,
+			Columns: []string{project.IssueLifecycleEventsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(issuelifecycleevent.FieldID, field.TypeInt),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedIssueLifecycleEventsIDs(); len(nodes) > 0 && !_u.mutation.IssueLifecycleEventsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.IssueLifecycleEventsTable,
+			Columns: []string{project.IssueLifecycleEventsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(issuelifecycleevent.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.IssueLifecycleEventsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.IssueLifecycleEventsTable,
+			Columns: []string{project.IssueLifecycleEventsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(issuelifecycleevent.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
 			err = &NotFoundError{project.Label}
@@ -1307,6 +1389,21 @@ func (_u *ProjectUpdateOne) AddTelemetryInbox(v ...*TelemetryInbox) *ProjectUpda
 		ids[i] = v[i].ID
 	}
 	return _u.AddTelemetryInboxIDs(ids...)
+}
+
+// AddIssueLifecycleEventIDs adds the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity by IDs.
+func (_u *ProjectUpdateOne) AddIssueLifecycleEventIDs(ids ...int) *ProjectUpdateOne {
+	_u.mutation.AddIssueLifecycleEventIDs(ids...)
+	return _u
+}
+
+// AddIssueLifecycleEvents adds the "issue_lifecycle_events" edges to the IssueLifecycleEvent entity.
+func (_u *ProjectUpdateOne) AddIssueLifecycleEvents(v ...*IssueLifecycleEvent) *ProjectUpdateOne {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddIssueLifecycleEventIDs(ids...)
 }
 
 // Mutation returns the ProjectMutation object of the builder.
@@ -1549,6 +1646,27 @@ func (_u *ProjectUpdateOne) RemoveTelemetryInbox(v ...*TelemetryInbox) *ProjectU
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveTelemetryInboxIDs(ids...)
+}
+
+// ClearIssueLifecycleEvents clears all "issue_lifecycle_events" edges to the IssueLifecycleEvent entity.
+func (_u *ProjectUpdateOne) ClearIssueLifecycleEvents() *ProjectUpdateOne {
+	_u.mutation.ClearIssueLifecycleEvents()
+	return _u
+}
+
+// RemoveIssueLifecycleEventIDs removes the "issue_lifecycle_events" edge to IssueLifecycleEvent entities by IDs.
+func (_u *ProjectUpdateOne) RemoveIssueLifecycleEventIDs(ids ...int) *ProjectUpdateOne {
+	_u.mutation.RemoveIssueLifecycleEventIDs(ids...)
+	return _u
+}
+
+// RemoveIssueLifecycleEvents removes "issue_lifecycle_events" edges to IssueLifecycleEvent entities.
+func (_u *ProjectUpdateOne) RemoveIssueLifecycleEvents(v ...*IssueLifecycleEvent) *ProjectUpdateOne {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveIssueLifecycleEventIDs(ids...)
 }
 
 // Where appends a list predicates to the ProjectUpdate builder.
@@ -2158,6 +2276,51 @@ func (_u *ProjectUpdateOne) sqlSave(ctx context.Context) (_node *Project, err er
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(telemetryinbox.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.IssueLifecycleEventsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.IssueLifecycleEventsTable,
+			Columns: []string{project.IssueLifecycleEventsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(issuelifecycleevent.FieldID, field.TypeInt),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedIssueLifecycleEventsIDs(); len(nodes) > 0 && !_u.mutation.IssueLifecycleEventsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.IssueLifecycleEventsTable,
+			Columns: []string{project.IssueLifecycleEventsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(issuelifecycleevent.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.IssueLifecycleEventsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.IssueLifecycleEventsTable,
+			Columns: []string{project.IssueLifecycleEventsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(issuelifecycleevent.FieldID, field.TypeInt),
 			},
 		}
 		for _, k := range nodes {

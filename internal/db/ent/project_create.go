@@ -13,6 +13,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/alertrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/inhibitionrule"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
+	"github.com/eimsound/lazy-observe/internal/db/ent/issuelifecycleevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
@@ -240,6 +241,21 @@ func (_c *ProjectCreate) AddTelemetryInbox(v ...*TelemetryInbox) *ProjectCreate 
 		ids[i] = v[i].ID
 	}
 	return _c.AddTelemetryInboxIDs(ids...)
+}
+
+// AddIssueLifecycleEventIDs adds the "issue_lifecycle_events" edge to the IssueLifecycleEvent entity by IDs.
+func (_c *ProjectCreate) AddIssueLifecycleEventIDs(ids ...int) *ProjectCreate {
+	_c.mutation.AddIssueLifecycleEventIDs(ids...)
+	return _c
+}
+
+// AddIssueLifecycleEvents adds the "issue_lifecycle_events" edges to the IssueLifecycleEvent entity.
+func (_c *ProjectCreate) AddIssueLifecycleEvents(v ...*IssueLifecycleEvent) *ProjectCreate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddIssueLifecycleEventIDs(ids...)
 }
 
 // Mutation returns the ProjectMutation object of the builder.
@@ -527,6 +543,22 @@ func (_c *ProjectCreate) createSpec() (*Project, *sqlgraph.CreateSpec) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(telemetryinbox.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.IssueLifecycleEventsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.IssueLifecycleEventsTable,
+			Columns: []string{project.IssueLifecycleEventsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(issuelifecycleevent.FieldID, field.TypeInt),
 			},
 		}
 		for _, k := range nodes {
