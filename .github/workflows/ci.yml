@@ -384,6 +384,10 @@ jobs:
       # 把归档目录（mise 的 test-meta-pg 任务默认用 $HOME/.cache/embedded-postgres）缓存起来，
       # 命中时不再联网。key 固定 runner os/arch、库版本（来自 go.mod）和归档版本 18.3.0
       # （embedded-postgres 的 V18，即 DefaultConfig 的默认版本），升级库或换 PG 版本时一起改。
+      # 这个缓存只是加速，不是保证：仓库 cache 总量超过 10 GB 时，15 MB 的归档会被 LRU 淘汰
+      # （UTC 2026-11-19 23:46 main 命中、32 分钟后的 PR 未命中，仓库内没有删 cache 的步骤）。未命中时由
+      # internal/embeddedpg.Prepare 下载：对 403/404/408/429/5xx 与网络错误退避重试，
+      # 必须取到并校验 .sha256，仍失败就让测试失败，不会跳过。
       - name: Resolve embedded Postgres module version
         id: embedded-pg
         run: |

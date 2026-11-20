@@ -45,9 +45,17 @@ func TestMain(m *testing.M) {
 	_ = listener.Close()
 	// The downloaded archive goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
 	// CI can reuse it; runtime and data stay in the per-run temporary directory.
+	cachePath := embeddedpg.CachePath(filepath.Join(temp, "cache"))
+	// Prepare downloads with retries and a mandatory checksum; a failure here is final and
+	// never skips the PostgreSQL tests.
+	if err := embeddedpg.Prepare(embeddedpostgres.V18, cachePath); err != nil {
+		fmt.Fprintf(os.Stderr, "prepare embedded postgres archive: %v\n", err)
+		_ = os.RemoveAll(temp)
+		os.Exit(1)
+	}
 	config := embeddedpostgres.DefaultConfig().
 		Port(port).
-		CachePath(embeddedpg.CachePath(filepath.Join(temp, "cache"))).
+		CachePath(cachePath).
 		RuntimePath(filepath.Join(temp, "runtime")).
 		DataPath(filepath.Join(temp, "data")).
 		StartTimeout(2 * time.Minute).
