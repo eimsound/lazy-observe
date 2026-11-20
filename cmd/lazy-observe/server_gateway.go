@@ -85,6 +85,7 @@ func startGateway(
 			AISecretBox:              essentials.secretBox,
 			AIBuildClient:            ai.New,
 			AITimeout:                60 * time.Second,
+			OutboundPolicy:           essentials.outboundPolicy,
 			LLMPricing:               essentials.llmPricing,
 			DisableWebUI:             !cfg.ServeWebUI,
 			Instrumentation:          monitoring.instrumentation,

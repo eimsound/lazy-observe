@@ -8,17 +8,23 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/state"
 )
+
+// ErrInvalidChannelConfig reports a rejected notification channel configuration.
+var ErrInvalidChannelConfig = errors.New("invalid notification channel config")
 
 type Config struct {
 	Store           *meta.Store
 	Sender          *Sender
+	OutboundPolicy  outbound.Policy
 	GroupWait       time.Duration
 	RepeatInterval  time.Duration
 	StormThreshold  int
@@ -44,7 +50,10 @@ type Service struct {
 
 func NewService(cfg Config) *Service {
 	if cfg.Sender == nil {
-		cfg.Sender = &Sender{}
+		cfg.Sender = &Sender{Outbound: cfg.OutboundPolicy}
+	} else if !cfg.Sender.Outbound.AllowPrivate && len(cfg.Sender.Outbound.AllowedCIDRs) == 0 &&
+		len(cfg.Sender.Outbound.AllowedHosts) == 0 && len(cfg.Sender.Outbound.BlockedPorts) == 0 {
+		cfg.Sender.Outbound = cfg.OutboundPolicy
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -188,20 +197,194 @@ type ChannelInput struct {
 func (s *Service) ListChannels(ctx context.Context) ([]meta.NotificationChannelView, error) {
 	return s.store.ListNotificationChannels(ctx)
 }
+
 func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (meta.NotificationChannelView, error) {
+	if err := validateChannelConfig(in.Type, in.Config, s.sender.Outbound); err != nil {
+		return meta.NotificationChannelView{}, err
+	}
 	return s.store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
 		Type: in.Type, Name: in.Name, Config: in.Config, Enabled: in.Enabled,
 	})
 }
+
 func (s *Service) UpdateChannel(ctx context.Context, id int, in ChannelInput) (meta.NotificationChannelView, error) {
-	update := meta.NotificationChannelUpdate{Config: in.Config, Enabled: in.Enabled}
+	update := meta.NotificationChannelUpdate{Enabled: in.Enabled}
 	if in.Type != "" {
 		update.Type = &in.Type
 	}
 	if in.Name != "" {
 		update.Name = &in.Name
 	}
+	if in.Config != nil {
+		existing, loadErr := s.store.NotificationChannel(ctx, id)
+		if loadErr != nil && meta.IsNotFound(loadErr) {
+			return meta.NotificationChannelView{}, loadErr
+		}
+		effectiveType := in.Type
+		if effectiveType == "" {
+			effectiveType = existing.Type
+		}
+		merged, err := preserveRedactedChannelSecrets(in.Config, existing.Config, loadErr)
+		if err != nil {
+			return meta.NotificationChannelView{}, err
+		}
+		if err := validateChannelConfig(effectiveType, merged, s.sender.Outbound); err != nil {
+			return meta.NotificationChannelView{}, err
+		}
+		update.Config = merged
+	}
 	return s.store.UpdateNotificationChannel(ctx, id, update)
+}
+
+func validateChannelConfig(kind string, cfg map[string]any, policy outbound.Policy) error {
+	if cfg == nil {
+		return nil
+	}
+	if kind == "smtp" {
+		port, err := parseSMTPPort(cfg["port"], 587)
+		if err != nil {
+			return fmt.Errorf("%w: %s", ErrInvalidChannelConfig, outbound.SanitizeError(err))
+		}
+		if host, ok := cfg["host"].(string); ok && strings.TrimSpace(host) != "" {
+			if err := outbound.ValidateHostPort(host, port, policy); err != nil {
+				return fmt.Errorf("%w: %s", ErrInvalidChannelConfig, outbound.SanitizeError(err))
+			}
+		}
+		if from, ok := cfg["from"].(string); ok && hasHeaderInjection(from) {
+			return fmt.Errorf("%w: smtp from contains invalid control characters", ErrInvalidChannelConfig)
+		}
+		for _, recipient := range stringList(cfg["to"]) {
+			if hasHeaderInjection(recipient) {
+				return fmt.Errorf("%w: smtp recipient contains invalid control characters", ErrInvalidChannelConfig)
+			}
+		}
+		return nil
+	}
+	if rawURL, ok := cfg["url"].(string); ok && strings.TrimSpace(rawURL) != "" {
+		if _, err := outbound.ValidateURL(rawURL, policy); err != nil {
+			return fmt.Errorf("%w: %s", ErrInvalidChannelConfig, outbound.SanitizeError(err))
+		}
+	}
+	return nil
+}
+
+// RedactChannelConfig returns a copy of cfg safe to return from admin APIs:
+// webhook URLs have tokens/query values stripped and secret/password/header
+// values are replaced with [REDACTED].
+func RedactChannelConfig(_ string, cfg map[string]any) map[string]any {
+	if cfg == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(cfg))
+	for k, v := range cfg {
+		if k == "headers" {
+			if headers, ok := v.(map[string]any); ok {
+				redactedHeaders := make(map[string]any, len(headers))
+				for hk, hv := range headers {
+					if str, isStr := hv.(string); isStr && str != "" {
+						redactedHeaders[hk] = outbound.RedactedValue
+					} else {
+						redactedHeaders[hk] = hv
+					}
+				}
+				out[k] = redactedHeaders
+				continue
+			}
+		}
+		if strings.EqualFold(k, "url") {
+			if raw, ok := v.(string); ok && raw != "" {
+				if raw == outbound.RedactedValue || strings.HasPrefix(raw, "enc:v1:") {
+					out[k] = outbound.RedactedValue
+				} else {
+					out[k] = outbound.SanitizeURL(raw)
+				}
+				continue
+			}
+		}
+		if isSecretConfigField(k) {
+			if raw, ok := v.(string); ok && raw != "" {
+				out[k] = outbound.RedactedValue
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func preserveRedactedChannelSecrets(
+	incoming, existing map[string]any,
+	existingErr error,
+) (map[string]any, error) {
+	out := make(map[string]any, len(incoming))
+	for k, v := range incoming {
+		if k == "headers" {
+			if headers, ok := v.(map[string]any); ok {
+				existingHeaders, _ := existing["headers"].(map[string]any)
+				mergedHeaders := make(map[string]any, len(headers))
+				for hk, hv := range headers {
+					if str, isStr := hv.(string); isStr && str == outbound.RedactedValue {
+						if existingErr != nil {
+							return nil, fmt.Errorf(
+								"%w: existing channel secret cannot be preserved; supply a new value",
+								ErrInvalidChannelConfig,
+							)
+						}
+						if prev, exists := existingHeaders[hk]; exists {
+							mergedHeaders[hk] = prev
+							continue
+						}
+					}
+					mergedHeaders[hk] = hv
+				}
+				out[k] = mergedHeaders
+				continue
+			}
+		}
+		if strings.EqualFold(k, "url") {
+			if raw, ok := v.(string); ok && raw != "" {
+				existingURL, _ := existing["url"].(string)
+				if raw == outbound.RedactedValue || (existingURL != "" && raw == outbound.SanitizeURL(existingURL)) {
+					if existingErr != nil {
+						return nil, fmt.Errorf(
+							"%w: existing channel url cannot be preserved; supply a new value",
+							ErrInvalidChannelConfig,
+						)
+					}
+					if existingURL != "" {
+						out[k] = existingURL
+						continue
+					}
+				}
+			}
+		}
+		if isSecretConfigField(k) {
+			if raw, ok := v.(string); ok && raw == outbound.RedactedValue {
+				if existingErr != nil {
+					return nil, fmt.Errorf(
+						"%w: existing channel secret cannot be preserved; supply a new value",
+						ErrInvalidChannelConfig,
+					)
+				}
+				if prev, exists := existing[k]; exists {
+					out[k] = prev
+					continue
+				}
+			}
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+func isSecretConfigField(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	for _, marker := range []string{"secret", "password", "passwd", "token", "key", "auth", "credential", "cookie"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 func (s *Service) DeleteChannel(ctx context.Context, id int) error {
 	return s.store.DeleteNotificationChannel(ctx, id)

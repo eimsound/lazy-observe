@@ -33,6 +33,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/session"
 	"github.com/eimsound/lazy-observe/internal/db/ent/user"
 	"github.com/eimsound/lazy-observe/internal/db/ent/userapitoken"
+	"github.com/eimsound/lazy-observe/internal/secret"
 	pgxstdlib "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
@@ -48,6 +49,7 @@ type Store struct {
 	startupLockTimeout time.Duration
 	issueMu            sync.Mutex
 	revision           atomic.Uint64
+	secretBox          atomic.Pointer[secret.Box]
 }
 
 type ProjectInfo struct {
@@ -176,6 +178,7 @@ const (
 type OpenOptions struct {
 	MigrationLockTimeout time.Duration
 	ApplicationVersion   string
+	SecretBox            *secret.Box
 }
 
 // OpenStore opens a SQLite path/sqlite:// URL or a postgres:// URL. Plain paths
@@ -225,10 +228,20 @@ func OpenStoreWithOptions(ctx context.Context, dbURL string, options OpenOptions
 		db.Close()
 		return nil, err
 	}
-	return &Store{
+	store := &Store{
 		client: dbent.NewClient(dbent.Driver(entsql.OpenDB(entDialect, db))), db: db, dbURL: dbURL,
 		dialect: entDialect, startupLockTimeout: options.MigrationLockTimeout,
-	}, nil
+	}
+	if options.SecretBox != nil {
+		store.secretBox.Store(options.SecretBox)
+	}
+	return store, nil
+}
+
+// SetSecretBox configures the platform encryption box used to seal sensitive
+// metadata such as notification channel credentials.
+func (s *Store) SetSecretBox(box *secret.Box) {
+	s.secretBox.Store(box)
 }
 
 func parseDBURL(dbURL string) (driverName, entDialect, dsn string, err error) {

@@ -111,6 +111,7 @@ func TestStorageGatewayE2E(t *testing.T) {
 		os.Environ(),
 		"LO_META_DB_URL="+metaDBURL,
 		"LO_SELF_MONITORING_ENABLED=false",
+		"LO_SECURITY_OUTBOUND_ALLOWLIST=127.0.0.1/32",
 	)
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err := cmd.Start(); err != nil {

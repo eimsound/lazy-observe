@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/alert"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -190,7 +192,7 @@ func toNotificationChannelResponse(value meta.NotificationChannelView) notificat
 		),
 		Type:      value.Type,
 		Name:      value.Name,
-		Config:    anyMap(normalizeChannelConfig(value.Type, value.Config)),
+		Config:    anyMap(alert.RedactChannelConfig(value.Type, normalizeChannelConfig(value.Type, value.Config))),
 		Enabled:   value.Enabled,
 		CreatedAt: apiTime(value.CreatedAt),
 		UpdatedAt: apiTime(value.UpdatedAt),
@@ -376,6 +378,9 @@ func (g *Gateway) createChannel(c fiber.Ctx) error {
 	}
 	v, e := g.alerts.CreateChannel(c.Context(), in)
 	if e != nil {
+		if errors.Is(e, alert.ErrInvalidChannelConfig) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(e)})
+		}
 		return apiError(c, e)
 	}
 	return c.Status(fiber.StatusCreated).JSON(toNotificationChannelResponse(v))
@@ -396,6 +401,9 @@ func (g *Gateway) updateChannel(c fiber.Ctx) error {
 	in.Config = normalizeChannelConfig(in.Type, in.Config)
 	v, e := g.alerts.UpdateChannel(c.Context(), id, in)
 	if e != nil {
+		if errors.Is(e, alert.ErrInvalidChannelConfig) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(e)})
+		}
 		return apiError(c, e)
 	}
 	return c.JSON(toNotificationChannelResponse(v))
@@ -422,7 +430,10 @@ func (g *Gateway) testChannel(c fiber.Ctx) error {
 		return nil
 	}
 	if e := g.alerts.TestChannel(c.Context(), id); e != nil {
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": e.Error()})
+		if meta.IsNotFound(e) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+		}
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": outbound.SanitizeError(e)})
 	}
 	return c.JSON(channelTestResponse{OK: true, Message: "test notification sent"})
 }

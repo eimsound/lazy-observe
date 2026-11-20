@@ -14,16 +14,18 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/backoff"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/state"
 )
 
 const (
-	defaultOutboxPollInterval = time.Second
-	defaultOutboxClaimTTL     = 2 * time.Minute
-	defaultOutboxRetryBase    = 5 * time.Second
-	defaultOutboxMaxAttempts  = 5
-	defaultOutboxClaimBatch   = 8
-	defaultChannelRateLimit   = 30
+	defaultOutboxPollInterval    = time.Second
+	defaultOutboxClaimTTL        = 2 * time.Minute
+	defaultOutboxRetryBase       = 5 * time.Second
+	defaultOutboxMaxAttempts     = 5
+	defaultOutboxClaimBatch      = 8
+	defaultChannelRateLimit      = 30
+	defaultOutboxDeliveryTimeout = 15 * time.Second
 )
 
 type OutboxWorkerConfig struct {
@@ -66,12 +68,6 @@ func NewOutboxWorker(cfg OutboxWorkerConfig) *OutboxWorker {
 	}
 	if cfg.Sender == nil {
 		cfg.Sender = &Sender{}
-	}
-	if cfg.Sender.Client == nil {
-		cfg.Sender.Client = defaultHTTPClient()
-	}
-	if cfg.Sender.Sleep == nil {
-		cfg.Sender.Sleep = time.Sleep
 	}
 	if cfg.WorkerID == "" {
 		cfg.WorkerID = randomOutboxWorkerID()
@@ -211,10 +207,12 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 			limit = defaultChannelRateLimit
 		}
 		allowed, limitErr := w.limiter.Allow(ctx, "notification-channel:"+strconv.Itoa(channel.ID), limit, w.rateWindow)
-		if limitErr != nil || !allowed {
-			if limitErr != nil {
-				slog.Error("check notification rate limit", "channel_id", channel.ID, "error", limitErr)
-			}
+		if limitErr != nil {
+			slog.Error("check notification rate limit", "channel_id", channel.ID, "error", limitErr)
+			w.retry(ctx, item, errors.New("notification rate limiter unavailable"))
+			return
+		}
+		if !allowed {
 			if err := w.store.DeferNotification(
 				ctx,
 				item.ID,
@@ -227,7 +225,9 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 			return
 		}
 	}
-	_, err = w.sender.Send(ctx, channel, n)
+	sendCtx, cancel := context.WithTimeout(ctx, w.deliverTimeout())
+	defer cancel()
+	_, err = w.sender.Send(sendCtx, channel, n)
 	if err != nil {
 		w.retry(ctx, item, err)
 		return
@@ -241,13 +241,22 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 	w.recordDelivery(ctx, item, "sent", "")
 }
 
+func (w *OutboxWorker) deliverTimeout() time.Duration {
+	timeout := defaultOutboxDeliveryTimeout
+	if halfTTL := w.claimTTL / 2; halfTTL > 0 && halfTTL < timeout {
+		timeout = halfTTL
+	}
+	return timeout
+}
+
 func (w *OutboxWorker) retry(ctx context.Context, item meta.NotificationOutboxItem, deliveryErr error) {
 	delay, delayErr := backoff.Delay(item.Attempts-1, w.retryBase, time.Hour, 1, 0, 0)
 	if delayErr != nil {
 		slog.Error("calculate notification retry", "outbox_id", item.ID, "error", delayErr)
 		return
 	}
-	status, err := w.store.RetryNotification(ctx, item.ID, w.workerID, deliveryErr.Error(), delay, w.maxAttempts)
+	safeMessage := outbound.SanitizeError(deliveryErr)
+	status, err := w.store.RetryNotification(ctx, item.ID, w.workerID, safeMessage, delay, w.maxAttempts)
 	if err != nil {
 		if !errors.Is(err, meta.ErrNotificationOutboxClaimLost) && !errors.Is(err, context.Canceled) {
 			slog.Error("retry notification outbox", "outbox_id", item.ID, "error", err)
@@ -255,7 +264,7 @@ func (w *OutboxWorker) retry(ctx context.Context, item meta.NotificationOutboxIt
 		return
 	}
 	if status == "dead" {
-		w.recordDelivery(ctx, item, "failed", deliveryErr.Error())
+		w.recordDelivery(ctx, item, "failed", safeMessage)
 	}
 }
 

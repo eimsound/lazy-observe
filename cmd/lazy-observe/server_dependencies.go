@@ -12,14 +12,16 @@ import (
 	appconfig "github.com/eimsound/lazy-observe/internal/config"
 	"github.com/eimsound/lazy-observe/internal/llmcost"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/secret"
 	sharedstate "github.com/eimsound/lazy-observe/internal/state"
 	"github.com/redis/go-redis/v9"
 )
 
 type serverEssentials struct {
-	llmPricing *llmcost.Table
-	secretBox  *secret.Box
+	llmPricing     *llmcost.Table
+	secretBox      *secret.Box
+	outboundPolicy outbound.Policy
 }
 
 func loadLLMPricing() (*llmcost.Table, error) {
@@ -30,6 +32,33 @@ func loadSecretBox(cfg appconfig.Config) (*secret.Box, error) {
 	// The platform key protects sensitive metadata such as BYO LLM API keys.
 	// It is created on first startup and then held in memory.
 	return secret.LoadOrCreate(secretKeyFile(cfg))
+}
+
+func serverOutboundPolicy(cfg appconfig.Config) (outbound.Policy, error) {
+	policy, err := outbound.ParseAllowlist(cfg.Security.OutboundAllowlist)
+	if err != nil {
+		return outbound.Policy{}, err
+	}
+	blocked := map[int]struct{}{
+		3100:  {},
+		18428: {},
+		19428: {},
+		20428: {},
+		21428: {},
+		22428: {},
+	}
+	if port := listenPort(cfg.Listen); port > 0 {
+		blocked[port] = struct{}{}
+	}
+	if offset := cfg.Process.ComponentPortOffset; offset != 0 {
+		for _, basePort := range []int{18428, 19428, 20428, 21428, 22428} {
+			if p := basePort + offset; p > 0 && p <= 65535 {
+				blocked[p] = struct{}{}
+			}
+		}
+	}
+	policy.BlockedPorts = blocked
+	return policy, nil
 }
 
 // secretKeyFile is the configured platform encryption key file; an empty
@@ -150,6 +179,7 @@ func openServerMetadata(
 	if err != nil {
 		return nil, err
 	}
+	store.SetSecretBox(secretBox)
 	initialized := false
 	defer func() {
 		if !initialized {

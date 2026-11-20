@@ -239,6 +239,7 @@ func TestAssistantMetricsE2EAndMaliciousSelectorIsolation(t *testing.T) {
 			Model:     "fake",
 			MaxTokens: 500,
 			Timeout:   time.Second,
+			Client:    provider.Client(),
 		},
 	)
 	if err != nil {
@@ -297,9 +298,19 @@ func TestAssistantLogsE2EIsolation(t *testing.T) {
 	defer backend.Close()
 	provider := fakeOpenAI(t, `{"signal":"logs","query":"service_name:=\"default\"","explanation":"matching logs"}`)
 	defer provider.Close()
-	client, _ := ai.New(
-		ai.Config{Provider: "openai", BaseURL: provider.URL, Model: "fake", MaxTokens: 500, Timeout: time.Second},
+	client, err := ai.New(
+		ai.Config{
+			Provider:  "openai",
+			BaseURL:   provider.URL,
+			Model:     "fake",
+			MaxTokens: 500,
+			Timeout:   time.Second,
+			Client:    provider.Client(),
+		},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cookie := sessionCookie(t, store, "assistant-logs", "password", "viewer")
 	app := newMetadataTestGateway(store,
 		Config{Tokens: store, Store: store, Metrics: backend.URL, Logs: backend.URL, AIEnabled: true, AIClient: client},

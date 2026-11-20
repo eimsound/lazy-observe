@@ -394,6 +394,8 @@ self_monitoring:
 security:
   admin_password_file: "$ADMIN_PASSWORD_FILE"
   secret_key_file: "$SECRET_KEY_FILE"
+  outbound_allowlist:
+    - "127.0.0.1:29090"
 EOF
 }
 write_config "$WORK/replica-a.yaml" 127.0.0.1:23101 http://127.0.0.1:29091 "http://$VMINSERT_1_HOST:8480" 0

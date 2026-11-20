@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/alert"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
 func TestPlatformAlertPipelineRealStore(t *testing.T) {
@@ -44,7 +45,12 @@ func TestPlatformAlertPipelineRealStore(t *testing.T) {
 	)
 	defer logs.Close()
 
-	alerts := alert.NewService(alert.Config{Store: store, GroupWait: 10 * time.Millisecond, RepeatInterval: time.Hour})
+	alerts := alert.NewService(alert.Config{
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		GroupWait:      10 * time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
 	channel, err := alerts.CreateChannel(
 		ctx,
 		alert.ChannelInput{Type: "webhook", Name: "platform-test", Config: map[string]any{"url": webhook.URL}},

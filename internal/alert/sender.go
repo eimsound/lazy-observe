@@ -7,61 +7,108 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"net"
 	"net/http"
 	"net/smtp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/eimsound/lazy-observe/internal/backoff"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
-type Sender struct {
-	Client *http.Client
-	Sleep  func(time.Duration)
+const (
+	defaultSendTimeout     = 10 * time.Second
+	maxNotifyResponseBytes = 64 << 10
+)
+
+type deliveryError struct {
+	msg   string
+	cause error
 }
 
-func defaultHTTPClient() *http.Client { return &http.Client{Timeout: 10 * time.Second} }
+func (e *deliveryError) Error() string { return e.msg }
+func (e *deliveryError) Unwrap() error { return e.cause }
 
+func sanitizedDeliveryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &deliveryError{msg: outbound.SanitizeError(err), cause: err}
+}
+
+type Sender struct {
+	Client      *http.Client
+	Outbound    outbound.Policy
+	Timeout     time.Duration
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	Sleep       func(time.Duration)
+
+	clientOnce    sync.Once
+	defaultClient *http.Client
+}
+
+func (s *Sender) timeout() time.Duration {
+	if s != nil && s.Timeout > 0 {
+		return s.Timeout
+	}
+	return defaultSendTimeout
+}
+
+func (s *Sender) httpClient() *http.Client {
+	if s.Client != nil {
+		clientCopy := *s.Client
+		if clientCopy.Timeout <= 0 {
+			clientCopy.Timeout = s.timeout()
+		}
+		if clientCopy.CheckRedirect == nil {
+			clientCopy.CheckRedirect = outbound.RejectRedirects
+		}
+		return &clientCopy
+	}
+	s.clientOnce.Do(func() {
+		s.defaultClient = outbound.NewHTTPClient(s.timeout(), s.Outbound)
+	})
+	return s.defaultClient
+}
+
+func (s *Sender) dialContext() func(context.Context, string, string) (net.Conn, error) {
+	if s.DialContext != nil {
+		return s.DialContext
+	}
+	return outbound.NewDialer(s.Outbound).DialContext
+}
+
+// Send performs a single bounded delivery attempt. Retries and exponential
+// backoff are owned solely by OutboxWorker so retries never nest.
 func (s *Sender) Send(ctx context.Context, ch Channel, n Notification) (int, error) {
-	if s.Client == nil {
-		s.Client = defaultHTTPClient()
-	}
-	if s.Sleep == nil {
-		s.Sleep = time.Sleep
-	}
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		err = s.sendOnce(ctx, ch, n)
-		if err == nil {
-			return attempt, nil
-		}
-		if attempt < 3 {
-			delay, delayErr := backoff.Delay(attempt-1, time.Second, 2*time.Second, 1, 0, 0)
-			if delayErr != nil {
-				return attempt, errors.Join(err, delayErr)
-			}
-			s.Sleep(delay)
-		}
-	}
-	return 3, err
+	return 1, s.sendOnce(ctx, ch, n)
 }
 
 func (s *Sender) sendOnce(ctx context.Context, ch Channel, n Notification) error {
 	if ch.Type == "smtp" {
-		return sendSMTP(ch.Config, n)
+		return s.sendSMTP(ctx, ch.Config, n)
 	}
 	payload, err := ChannelPayload(ch.Type, n)
 	if err != nil {
 		return err
 	}
 	endpoint, _ := ch.Config["url"].(string)
+	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		return errors.New("channel url is required")
 	}
+	if s.Client == nil {
+		if _, err := outbound.ValidateURL(endpoint, s.Outbound); err != nil {
+			return sanitizedDeliveryError(err)
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return sanitizedDeliveryError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if headers, ok := ch.Config["headers"].(map[string]any); ok {
@@ -72,13 +119,57 @@ func (s *Sender) sendOnce(ctx context.Context, ch Channel, n Notification) error
 	if n.IdempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", n.IdempotencyKey)
 	}
-	resp, err := s.Client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
-		return err
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return sanitizedDeliveryError(err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxNotifyResponseBytes))
+		_ = resp.Body.Close()
+	}()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxNotifyResponseBytes))
+	if err != nil {
+		return sanitizedDeliveryError(err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("notification endpoint status %d", resp.StatusCode)
+	}
+	return checkChannelResponse(ch.Type, body)
+}
+
+func checkChannelResponse(kind string, body []byte) error {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	switch kind {
+	case "feishu":
+		var resp struct {
+			Code       *int `json:"code"`
+			StatusCode *int `json:"StatusCode"`
+		}
+		if err := json.Unmarshal(trimmed, &resp); err != nil {
+			return errors.New("feishu notification returned invalid JSON response")
+		}
+		if resp.Code != nil && *resp.Code != 0 {
+			return fmt.Errorf("feishu notification rejected (code %d)", *resp.Code)
+		}
+		if resp.StatusCode != nil && *resp.StatusCode != 0 {
+			return fmt.Errorf("feishu notification rejected (code %d)", *resp.StatusCode)
+		}
+	case "dingtalk", "wecom":
+		var resp struct {
+			ErrCode *int `json:"errcode"`
+		}
+		if err := json.Unmarshal(trimmed, &resp); err != nil {
+			return fmt.Errorf("%s notification returned invalid JSON response", kind)
+		}
+		if resp.ErrCode != nil && *resp.ErrCode != 0 {
+			return fmt.Errorf("%s notification rejected (errcode %d)", kind, *resp.ErrCode)
+		}
 	}
 	return nil
 }
@@ -150,68 +241,189 @@ func formatLabels(labels map[string]string) string {
 	return string(data)
 }
 
-func sendSMTP(cfg map[string]any, n Notification) error {
+func (s *Sender) sendSMTP(ctx context.Context, cfg map[string]any, n Notification) error {
 	host, _ := cfg["host"].(string)
+	host = strings.TrimSpace(host)
 	from, _ := cfg["from"].(string)
-	to := stringList(cfg["to"])
+	from = strings.TrimSpace(from)
+	rawTo := stringList(cfg["to"])
+	to := make([]string, 0, len(rawTo))
+	for _, recipient := range rawTo {
+		if trimmed := strings.TrimSpace(recipient); trimmed != "" {
+			to = append(to, trimmed)
+		}
+	}
 	if host == "" || from == "" || len(to) == 0 {
 		return errors.New("smtp host, from and to are required")
 	}
-	port := intValue(cfg["port"], 587)
-	addr := host + ":" + strconv.Itoa(port)
+	if hasHeaderInjection(from) {
+		return errors.New("smtp from contains invalid control characters")
+	}
+	for _, recipient := range to {
+		if hasHeaderInjection(recipient) {
+			return errors.New("smtp recipient contains invalid control characters")
+		}
+	}
+	port, err := parseSMTPPort(cfg["port"], 587)
+	if err != nil {
+		return err
+	}
+	if s.DialContext == nil {
+		if err := outbound.ValidateHostPort(host, port, s.Outbound); err != nil {
+			return sanitizedDeliveryError(err)
+		}
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, s.timeout())
+	defer cancel()
+
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := s.dialContext()(sendCtx, "tcp", addr)
+	if err != nil {
+		return sanitizedDeliveryError(err)
+	}
+	if deadline, ok := sendCtx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-sendCtx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+
+	implicit, _ := cfg["tls"].(bool)
+	if implicit {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		if err := tlsConn.HandshakeContext(sendCtx); err != nil {
+			_ = conn.Close()
+			return sanitizedDeliveryError(err)
+		}
+		conn = tlsConn
+	}
+
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		_ = conn.Close()
+		return sanitizedSMTPError(sendCtx, err, "smtp handshake failed")
+	}
+	defer client.Close()
+
+	if !implicit {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
+				return sanitizedSMTPError(sendCtx, err, "smtp STARTTLS failed")
+			}
+		}
+	}
+
 	user, _ := cfg["username"].(string)
 	password, _ := cfg["password"].(string)
-	msg := EmailPayload(from, to, n)
-	var auth smtp.Auth
 	if user != "" {
-		auth = smtp.PlainAuth("", user, password, host)
+		auth := smtp.PlainAuth("", user, password, host)
+		if err := client.Auth(auth); err != nil {
+			return sanitizedSMTPError(sendCtx, err, "smtp authentication failed")
+		}
 	}
-	if implicit, _ := cfg["tls"].(bool); implicit {
-		conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
-		if err != nil {
-			return err
-		}
-		client, err := smtp.NewClient(conn, host)
-		if err != nil {
-			return err
-		}
-		defer client.Close()
-		if auth != nil {
-			if err := client.Auth(auth); err != nil {
-				return err
-			}
-		}
-		if err := client.Mail(from); err != nil {
-			return err
-		}
-		for _, recipient := range to {
-			if err := client.Rcpt(recipient); err != nil {
-				return err
-			}
-		}
-		w, err := client.Data()
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write(msg); err != nil {
-			return err
-		}
-		return w.Close()
+	if err := client.Mail(from); err != nil {
+		return sanitizedSMTPError(sendCtx, err, "smtp sender rejected")
 	}
-	return smtp.SendMail(addr, auth, from, to, msg)
+	for _, recipient := range to {
+		if err := client.Rcpt(recipient); err != nil {
+			return sanitizedSMTPError(sendCtx, err, "smtp recipient rejected")
+		}
+	}
+	w, err := client.Data()
+	if err != nil {
+		return sanitizedSMTPError(sendCtx, err, "smtp data rejected")
+	}
+	if _, err := w.Write(EmailPayload(from, to, n)); err != nil {
+		_ = w.Close()
+		return sanitizedSMTPError(sendCtx, err, "smtp write failed")
+	}
+	if err := w.Close(); err != nil {
+		return sanitizedSMTPError(sendCtx, err, "smtp commit failed")
+	}
+	_ = client.Quit()
+	return nil
+}
+
+func sanitizedSMTPError(ctx context.Context, err error, fallback string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return &deliveryError{msg: "smtp delivery timed out", cause: context.DeadlineExceeded}
+	}
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return &deliveryError{msg: "smtp delivery canceled", cause: context.Canceled}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &deliveryError{msg: "smtp delivery timed out", cause: err}
+	}
+	return &deliveryError{msg: fallback, cause: err}
 }
 
 func EmailPayload(from string, to []string, n Notification) []byte {
-	title := fmt.Sprintf("[%s] %s / %s", strings.ToUpper(n.Status), n.Project, n.Rule)
+	safeFrom := sanitizeEmailHeader(from)
+	safeTo := make([]string, 0, len(to))
+	for _, recipient := range to {
+		safeTo = append(safeTo, sanitizeEmailHeader(recipient))
+	}
+	title := sanitizeEmailHeader(fmt.Sprintf("[%s] %s / %s", strings.ToUpper(n.Status), n.Project, n.Rule))
 	body, _ := json.MarshalIndent(n, "", "  ")
 	return []byte(
-		"From: " + from + "\r\nTo: " + strings.Join(
-			to,
+		"From: " + safeFrom + "\r\nTo: " + strings.Join(
+			safeTo,
 			",",
 		) + "\r\nSubject: " + title + "\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + string(
 			body,
 		),
 	)
+}
+
+func hasHeaderInjection(value string) bool {
+	return strings.ContainsAny(value, "\r\n\x00")
+}
+
+func sanitizeEmailHeader(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == 0 {
+			return -1
+		}
+		return r
+	}, value)
+}
+
+func parseSMTPPort(v any, fallback int) (int, error) {
+	if v == nil {
+		return fallback, nil
+	}
+	switch x := v.(type) {
+	case string:
+		trimmed := strings.TrimSpace(x)
+		if trimmed == "" {
+			return fallback, nil
+		}
+		port, _, err := outbound.NormalizePort(trimmed)
+		if err != nil {
+			return 0, fmt.Errorf("smtp port is invalid: %w", err)
+		}
+		return port, nil
+	case int:
+		if x < 1 || x > 65535 {
+			return 0, fmt.Errorf("smtp port out of range: %w", outbound.ErrInvalidTarget)
+		}
+		return x, nil
+	case float64:
+		if math.Trunc(x) != x || x < 1 || x > 65535 {
+			return 0, fmt.Errorf("smtp port out of range: %w", outbound.ErrInvalidTarget)
+		}
+		return int(x), nil
+	default:
+		return 0, fmt.Errorf("smtp port is invalid: %w", outbound.ErrInvalidTarget)
+	}
 }
 
 func stringList(v any) []string {
@@ -233,6 +445,7 @@ func stringList(v any) []string {
 		return nil
 	}
 }
+
 func intValue(v any, fallback int) int {
 	switch x := v.(type) {
 	case float64:

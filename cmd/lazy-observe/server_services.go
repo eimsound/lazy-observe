@@ -82,6 +82,7 @@ func startServerServices(
 	ctx context.Context,
 	cfg appconfig.Config,
 	logger *slog.Logger,
+	essentials serverEssentials,
 	metadata *serverMetadata,
 	signals *serverSignalStorage,
 	limits sharedstate.Limiter,
@@ -89,6 +90,7 @@ func startServerServices(
 	alerts := alert.NewService(
 		alert.Config{
 			Store:          metadata.store,
+			OutboundPolicy: essentials.outboundPolicy,
 			StormThreshold: cfg.Alert.StormThreshold,
 			GroupWait:      cfg.Alert.GroupWait.Value(),
 			RepeatInterval: cfg.Alert.RepeatInterval.Value(),

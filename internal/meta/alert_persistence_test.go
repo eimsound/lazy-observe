@@ -3,8 +3,11 @@ package meta
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/eimsound/lazy-observe/internal/secret"
 )
 
 func TestAlertRulePersistenceListAndCreateAreProjectScoped(t *testing.T) {
@@ -187,6 +190,65 @@ func TestNotificationChannelPatchPreservesUnspecifiedConfig(t *testing.T) {
 		}
 		if loaded.Config["url"] != "https://example.test/hook" {
 			t.Fatalf("loaded channel = %+v", loaded)
+		}
+	})
+}
+
+func TestNotificationChannelConfigEncryptedAtRest(t *testing.T) {
+	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		store.SetSecretBox(box)
+		ctx := context.Background()
+		channel, err := store.CreateNotificationChannel(ctx, NotificationChannelCreate{
+			Type: "dingtalk",
+			Name: "encrypted-dingtalk",
+			Config: map[string]any{
+				"url":      "https://oapi.dingtalk.com/robot/send?access_token=ding-plain-secret",
+				"secret":   "SEC-signing-secret",
+				"password": "smtp-plain-password",
+				"headers":  map[string]any{"Authorization": "Bearer header-plain-secret"},
+				"host":     "smtp.example.com",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Raw database column must store ciphertext, never plaintext secrets.
+		var rawConfig string
+		if err := store.db.QueryRowContext(
+			ctx,
+			bind(store.dialect, `SELECT config FROM notification_channels WHERE id = ?`),
+			channel.ID,
+		).Scan(&rawConfig); err != nil {
+			t.Fatal(err)
+		}
+		for _, secretVal := range []string{"ding-plain-secret", "SEC-signing-secret", "smtp-plain-password", "header-plain-secret"} {
+			if strings.Contains(rawConfig, secretVal) {
+				t.Fatalf("raw DB config leaked %q: %s", secretVal, rawConfig)
+			}
+		}
+		if !strings.Contains(rawConfig, channelConfigCipherPrefix) {
+			t.Fatalf("raw DB config missing %q prefix: %s", channelConfigCipherPrefix, rawConfig)
+		}
+
+		// Decrypted view returns exact plaintext for internal delivery.
+		loaded, err := store.NotificationChannel(ctx, channel.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Config["url"] != "https://oapi.dingtalk.com/robot/send?access_token=ding-plain-secret" ||
+			loaded.Config["secret"] != "SEC-signing-secret" ||
+			loaded.Config["password"] != "smtp-plain-password" ||
+			loaded.Config["host"] != "smtp.example.com" {
+			t.Fatalf("decrypted channel config = %#v", loaded.Config)
+		}
+		headers, ok := loaded.Config["headers"].(map[string]any)
+		if !ok || headers["Authorization"] != "Bearer header-plain-secret" {
+			t.Fatalf("decrypted headers = %#v", loaded.Config["headers"])
 		}
 	})
 }
