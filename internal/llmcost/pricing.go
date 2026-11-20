@@ -2,15 +2,18 @@
 package llmcost
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 //go:embed pricing.json
@@ -19,17 +22,24 @@ var builtInPricing []byte
 type Price struct {
 	ModelPattern       string   `json:"model_pattern"`
 	Aliases            []string `json:"aliases,omitempty"`
+	Provider           string   `json:"provider,omitempty"`
 	InputPer1K         float64  `json:"input_per_1k"`
 	OutputPer1K        float64  `json:"output_per_1k"`
 	CacheReadPer1K     *float64 `json:"cache_read_per_1k,omitempty"`
 	CacheCreationPer1K *float64 `json:"cache_creation_per_1k,omitempty"`
 	ReasoningPer1K     *float64 `json:"reasoning_per_1k,omitempty"`
+	SelfHosted         bool     `json:"self_hosted,omitempty"`
+	EffectiveFrom      string   `json:"effective_from,omitempty"`
 	Currency           string   `json:"currency"`
+
+	effectiveAt time.Time
 }
 
-// Usage captures token counts and provider context for an LLM call or aggregate.
+// Usage captures token counts, provider context, and optional timestamp for an
+// LLM call or aggregate.
 type Usage struct {
 	Provider            string
+	Timestamp           time.Time
 	InputTokens         int64
 	OutputTokens        int64
 	CacheReadTokens     int64
@@ -40,6 +50,17 @@ type Usage struct {
 type priceFileEntry struct {
 	Price
 	Comment string `json:"_comment"`
+}
+
+type priceGroupKey struct {
+	pattern  string
+	provider string
+}
+
+type priceUniqueKey struct {
+	pattern       string
+	provider      string
+	effectiveFrom string
 }
 
 type Table struct {
@@ -55,16 +76,18 @@ var bedrockVendorPrefixes = []string{
 }
 
 // Load returns the built-in table, merged with entries from overridePath when set.
-// An override replaces a built-in entry with the same normalized model pattern;
-// patterns not present in the built-in table are appended.
+// Override entries replace built-in entries sharing the same normalized
+// (model_pattern, provider) key, allowing both single-entry overrides and
+// multi-date effective_from schedules; new keys are appended.
 func Load(overridePath string) (*Table, error) {
 	builtIn, err := parsePrices(builtInPricing)
 	if err != nil {
 		return nil, fmt.Errorf("parse embedded LLM pricing: %w", err)
 	}
-	merged := make(map[string]Price, len(builtIn))
+	merged := make(map[priceGroupKey][]Price, len(builtIn))
 	for _, price := range builtIn {
-		merged[normalize(price.ModelPattern)] = price
+		key := priceGroupKey{pattern: price.ModelPattern, provider: price.Provider}
+		merged[key] = append(merged[key], price)
 	}
 	if strings.TrimSpace(overridePath) != "" {
 		data, err := os.ReadFile(overridePath)
@@ -75,21 +98,39 @@ func Load(overridePath string) (*Table, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse LLM pricing override: %w", err)
 		}
+		groupedOverrides := make(map[priceGroupKey][]Price, len(overrides))
 		for _, price := range overrides {
-			merged[normalize(price.ModelPattern)] = price
+			key := priceGroupKey{pattern: price.ModelPattern, provider: price.Provider}
+			groupedOverrides[key] = append(groupedOverrides[key], price)
+		}
+		for key, group := range groupedOverrides {
+			merged[key] = group
 		}
 	}
 	prices := make([]Price, 0, len(merged))
-	for _, price := range merged {
-		prices = append(prices, price)
+	for _, group := range merged {
+		prices = append(prices, group...)
 	}
-	// Longest match wins, so gpt-4o-mini cannot be shadowed by gpt-4o.
+	// Longest model_pattern wins, then provider-specific before provider-agnostic,
+	// then newer effective_from first so deterministic ordering holds.
 	sort.Slice(prices, func(i, j int) bool {
-		left, right := normalize(prices[i].ModelPattern), normalize(prices[j].ModelPattern)
-		if len(left) != len(right) {
-			return len(left) > len(right)
+		left, right := prices[i], prices[j]
+		if len(left.ModelPattern) != len(right.ModelPattern) {
+			return len(left.ModelPattern) > len(right.ModelPattern)
 		}
-		return left < right
+		if (left.Provider != "") != (right.Provider != "") {
+			return left.Provider != ""
+		}
+		if left.ModelPattern != right.ModelPattern {
+			return left.ModelPattern < right.ModelPattern
+		}
+		if left.Provider != right.Provider {
+			return left.Provider < right.Provider
+		}
+		if !left.effectiveAt.Equal(right.effectiveAt) {
+			return left.effectiveAt.After(right.effectiveAt)
+		}
+		return left.EffectiveFrom > right.EffectiveFrom
 	})
 	return &Table{prices: prices}, nil
 }
@@ -105,17 +146,26 @@ func Default() *Table {
 }
 
 func parsePrices(data []byte) ([]Price, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
 	var entries []priceFileEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	if err := decoder.Decode(&entries); err != nil {
 		return nil, err
 	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("unexpected trailing content after JSON pricing array")
+	}
+
+	seen := make(map[priceUniqueKey]struct{}, len(entries))
 	prices := make([]Price, 0, len(entries))
 	for i, entry := range entries {
 		price := entry.Price
 		if strings.TrimSpace(price.ModelPattern) == "" && entry.Comment != "" {
 			continue
 		}
-		if strings.TrimSpace(price.ModelPattern) == "" {
+		normalizedPattern := normalize(price.ModelPattern)
+		if normalizedPattern == "" {
 			return nil, fmt.Errorf("entry %d: model_pattern is required", i)
 		}
 		if err := validateRate(price.InputPer1K); err != nil {
@@ -139,10 +189,21 @@ func parsePrices(data []byte) ([]Price, error) {
 				return nil, fmt.Errorf("entry %d: reasoning_per_1k %w", i, err)
 			}
 		}
-		if !strings.EqualFold(strings.TrimSpace(price.Currency), "USD") {
+		currency := strings.TrimSpace(price.Currency)
+		if currency == "" && price.SelfHosted {
+			currency = "USD"
+		}
+		if !strings.EqualFold(currency, "USD") {
 			return nil, fmt.Errorf("entry %d: currency must be USD", i)
 		}
-		price.ModelPattern = normalize(price.ModelPattern)
+		effectiveFrom, effectiveAt, err := parseEffectiveFrom(price.EffectiveFrom)
+		if err != nil {
+			return nil, fmt.Errorf("entry %d: effective_from %w", i, err)
+		}
+		price.ModelPattern = normalizedPattern
+		price.Provider = normalizeProvider(price.Provider)
+		price.EffectiveFrom = effectiveFrom
+		price.effectiveAt = effectiveAt
 		if len(price.Aliases) > 0 {
 			aliases := make([]string, 0, len(price.Aliases))
 			for _, alias := range price.Aliases {
@@ -153,12 +214,42 @@ func parsePrices(data []byte) ([]Price, error) {
 			price.Aliases = aliases
 		}
 		price.Currency = "USD"
+
+		uniqueKey := priceUniqueKey{
+			pattern:       price.ModelPattern,
+			provider:      price.Provider,
+			effectiveFrom: price.EffectiveFrom,
+		}
+		if _, exists := seen[uniqueKey]; exists {
+			return nil, fmt.Errorf(
+				"entry %d: duplicate pricing entry for model_pattern=%q provider=%q effective_from=%q",
+				i,
+				price.ModelPattern,
+				price.Provider,
+				price.EffectiveFrom,
+			)
+		}
+		seen[uniqueKey] = struct{}{}
 		prices = append(prices, price)
 	}
 	if len(prices) == 0 {
 		return nil, errors.New("pricing table is empty")
 	}
 	return prices, nil
+}
+
+func parseEffectiveFrom(raw string) (string, time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", time.Time{}, nil
+	}
+	if parsed, err := time.Parse("2006-01-02", trimmed); err == nil {
+		return trimmed, parsed.UTC(), nil
+	}
+	if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return parsed.UTC().Format(time.RFC3339), parsed.UTC(), nil
+	}
+	return "", time.Time{}, errors.New("must be YYYY-MM-DD or RFC3339 timestamp")
 }
 
 func validateRate(rate float64) error {
@@ -171,29 +262,95 @@ func validateRate(rate float64) error {
 // Lookup matches exact model patterns, explicit aliases, and known version/date
 // snapshot suffixes without swallowing distinct model variants or generations.
 func (t *Table) Lookup(model string) (Price, bool) {
-	return t.LookupWithProvider(model, "")
+	return t.LookupAt(model, "", time.Time{})
 }
 
 // LookupWithProvider resolves pricing for model using optional provider context.
 // Self-hosted providers (such as ollama) default to $0 unless explicitly priced.
 func (t *Table) LookupWithProvider(model, provider string) (Price, bool) {
+	return t.LookupAt(model, provider, time.Time{})
+}
+
+// LookupAt resolves pricing for model using optional provider context and an
+// optional call timestamp for effective_from version selection.
+func (t *Table) LookupAt(model, provider string, at time.Time) (Price, bool) {
 	if t == nil {
 		return Price{}, false
 	}
-	selfHosted := hasOllamaPrefix(model) || isSelfHostedProvider(provider)
+	normalizedProvider := normalizeProvider(provider)
+	selfHosted := hasOllamaPrefix(model) || isSelfHostedProvider(normalizedProvider)
 	normalized := normalize(model)
 	if normalized == "" || normalized == "unknown" {
 		return Price{}, false
 	}
+
+	var matched []Price
+	bestPatternLen := -1
+	bestProviderSpecific := false
 	for _, price := range t.prices {
-		if matchesPrice(normalized, price) {
-			return price, true
+		if price.Provider != "" && price.Provider != normalizedProvider {
+			continue
+		}
+		if !matchesPrice(normalized, price) {
+			continue
+		}
+		providerSpecific := price.Provider != ""
+		if len(price.ModelPattern) < bestPatternLen {
+			continue
+		}
+		if len(price.ModelPattern) > bestPatternLen ||
+			(len(price.ModelPattern) == bestPatternLen && providerSpecific && !bestProviderSpecific) {
+			bestPatternLen = len(price.ModelPattern)
+			bestProviderSpecific = providerSpecific
+			matched = matched[:0]
+		}
+		if len(price.ModelPattern) == bestPatternLen && providerSpecific == bestProviderSpecific {
+			matched = append(matched, price)
 		}
 	}
+	if len(matched) > 0 {
+		return selectEffectivePrice(matched, at), true
+	}
 	if selfHosted {
-		return Price{ModelPattern: "ollama", InputPer1K: 0, OutputPer1K: 0, Currency: "USD"}, true
+		return Price{
+			ModelPattern: "ollama",
+			Provider:     "ollama",
+			SelfHosted:   true,
+			InputPer1K:   0,
+			OutputPer1K:  0,
+			Currency:     "USD",
+		}, true
 	}
 	return Price{}, false
+}
+
+func selectEffectivePrice(candidates []Price, at time.Time) Price {
+	if len(candidates) == 1 || at.IsZero() {
+		// Candidates are sorted newest effectiveAt first.
+		return candidates[0]
+	}
+	atUTC := at.UTC()
+	var bestActive *Price
+	for i := range candidates {
+		c := &candidates[i]
+		if c.effectiveAt.IsZero() || !c.effectiveAt.After(atUTC) {
+			if bestActive == nil || c.effectiveAt.After(bestActive.effectiveAt) {
+				bestActive = c
+			}
+		}
+	}
+	if bestActive != nil {
+		return *bestActive
+	}
+	// If the call predates all recorded snapshots for this model, fall back to
+	// the earliest snapshot rather than dropping pricing for a known model.
+	earliest := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.effectiveAt.Before(earliest.effectiveAt) {
+			earliest = c
+		}
+	}
+	return earliest
 }
 
 func (t *Table) Cost(model string, inputTokens, outputTokens int64) (float64, bool) {
@@ -201,7 +358,7 @@ func (t *Table) Cost(model string, inputTokens, outputTokens int64) (float64, bo
 }
 
 func (t *Table) CostWithUsage(model string, usage Usage) (float64, bool) {
-	price, ok := t.LookupWithProvider(model, usage.Provider)
+	price, ok := t.LookupAt(model, usage.Provider, usage.Timestamp)
 	if !ok {
 		return 0, true
 	}
@@ -266,8 +423,12 @@ func clampNonNegative(v int64) int64 {
 	return v
 }
 
+func normalizeProvider(provider string) string {
+	return strings.ToLower(strings.TrimSpace(provider))
+}
+
 func isSelfHostedProvider(provider string) bool {
-	return strings.EqualFold(strings.TrimSpace(provider), "ollama")
+	return normalizeProvider(provider) == "ollama"
 }
 
 func hasOllamaPrefix(rawModel string) bool {
@@ -275,7 +436,7 @@ func hasOllamaPrefix(rawModel string) bool {
 }
 
 func isExclusiveCacheInput(model, provider string) bool {
-	if strings.EqualFold(strings.TrimSpace(provider), "anthropic") {
+	if normalizeProvider(provider) == "anthropic" {
 		return true
 	}
 	return strings.HasPrefix(normalize(model), "claude-")

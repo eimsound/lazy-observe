@@ -23,6 +23,24 @@ const (
 	llmBodyInspectionLimit = 1 << 20
 )
 
+// Standard GenAI span attribute keys shared across Go, Node, and Python SDKs
+// (verified against sdk/testdata/genai/contract.json).
+const (
+	genAIAttrOperationName          = "gen_ai.operation.name"
+	genAIAttrProviderName           = "gen_ai.provider.name"
+	genAIAttrSystem                 = "gen_ai.system"
+	genAIAttrRequestModel           = "gen_ai.request.model"
+	genAIAttrResponseModel          = "gen_ai.response.model"
+	genAIAttrUsageInputTokens       = "gen_ai.usage.input_tokens"
+	genAIAttrUsageOutputTokens      = "gen_ai.usage.output_tokens"
+	genAIAttrUsageCacheReadTokens   = "gen_ai.usage.cache_read.input_tokens"
+	genAIAttrUsageCacheCreateTokens = "gen_ai.usage.cache_creation.input_tokens"
+	genAIAttrUsageReasoningTokens   = "gen_ai.usage.reasoning_tokens"
+	genAIAttrUsageMissing           = "gen_ai.usage.missing"
+	genAIAttrPrompt                 = "gen_ai.prompt"
+	genAIAttrCompletion             = "gen_ai.completion"
+)
+
 type llmSystem string
 
 const (
@@ -67,16 +85,16 @@ func (t *llmTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		request = parseLLMRequest(system, reqBody, t.captureContent)
 	}
 	attrs := []attribute.KeyValue{
-		attribute.String("gen_ai.operation.name", "chat"),
-		attribute.String("gen_ai.provider.name", string(system)),
+		attribute.String(genAIAttrOperationName, "chat"),
+		attribute.String(genAIAttrProviderName, string(system)),
 		// Retained for compatibility with older OpenTelemetry GenAI consumers.
-		attribute.String("gen_ai.system", string(system)),
+		attribute.String(genAIAttrSystem, string(system)),
 	}
 	if request.Model != "" {
-		attrs = append(attrs, attribute.String("gen_ai.request.model", request.Model))
+		attrs = append(attrs, attribute.String(genAIAttrRequestModel, request.Model))
 	}
 	if t.captureContent && request.Prompt != "" {
-		attrs = append(attrs, attribute.String("gen_ai.prompt", truncateLLMContent(request.Prompt)))
+		attrs = append(attrs, attribute.String(genAIAttrPrompt, truncateLLMContent(request.Prompt)))
 	}
 	ctx, span := t.tracer.Start(
 		req.Context(),
@@ -130,7 +148,7 @@ func (t *llmTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return resp, nil
 	}
 	if len(responseBody) > llmBodyInspectionLimit {
-		span.SetAttributes(attribute.Bool("gen_ai.usage.missing", true))
+		span.SetAttributes(attribute.Bool(genAIAttrUsageMissing, true))
 		resp.Body = &multiReadCloser{
 			Reader: io.MultiReader(bytes.NewReader(responseBody), resp.Body),
 			closer: resp.Body,
@@ -317,31 +335,31 @@ func parseLLMResponseObject(system llmSystem, raw map[string]any, captureContent
 func applyLLMResponse(span trace.Span, response llmResponse, captureContent bool) {
 	attrs := make([]attribute.KeyValue, 0, 8)
 	if response.Model != "" {
-		attrs = append(attrs, attribute.String("gen_ai.response.model", response.Model))
+		attrs = append(attrs, attribute.String(genAIAttrResponseModel, response.Model))
 	}
 	if response.InputTokens != nil {
-		attrs = append(attrs, attribute.Int64("gen_ai.usage.input_tokens", *response.InputTokens))
+		attrs = append(attrs, attribute.Int64(genAIAttrUsageInputTokens, *response.InputTokens))
 	}
 	if response.OutputTokens != nil {
-		attrs = append(attrs, attribute.Int64("gen_ai.usage.output_tokens", *response.OutputTokens))
+		attrs = append(attrs, attribute.Int64(genAIAttrUsageOutputTokens, *response.OutputTokens))
 	}
 	if response.CacheReadTokens != nil {
-		attrs = append(attrs, attribute.Int64("gen_ai.usage.cache_read.input_tokens", *response.CacheReadTokens))
+		attrs = append(attrs, attribute.Int64(genAIAttrUsageCacheReadTokens, *response.CacheReadTokens))
 	}
 	if response.CacheCreationTokens != nil {
 		attrs = append(
 			attrs,
-			attribute.Int64("gen_ai.usage.cache_creation.input_tokens", *response.CacheCreationTokens),
+			attribute.Int64(genAIAttrUsageCacheCreateTokens, *response.CacheCreationTokens),
 		)
 	}
 	if response.ReasoningTokens != nil {
-		attrs = append(attrs, attribute.Int64("gen_ai.usage.reasoning_tokens", *response.ReasoningTokens))
+		attrs = append(attrs, attribute.Int64(genAIAttrUsageReasoningTokens, *response.ReasoningTokens))
 	}
 	if response.InputTokens == nil || response.OutputTokens == nil {
-		attrs = append(attrs, attribute.Bool("gen_ai.usage.missing", true))
+		attrs = append(attrs, attribute.Bool(genAIAttrUsageMissing, true))
 	}
 	if captureContent && response.Completion != "" {
-		attrs = append(attrs, attribute.String("gen_ai.completion", truncateLLMContent(response.Completion)))
+		attrs = append(attrs, attribute.String(genAIAttrCompletion, truncateLLMContent(response.Completion)))
 	}
 	span.SetAttributes(attrs...)
 }

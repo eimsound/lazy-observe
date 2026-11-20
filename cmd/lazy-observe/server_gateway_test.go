@@ -96,7 +96,10 @@ func TestEffectiveSecureSessionCookieEnablesWithNativeTLS(t *testing.T) {
 
 func TestLoadLLMPricingUsesConfiguredOverrideFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pricing.json")
-	override := `[{"model_pattern":"custom-enterprise-model","input_per_1k":2.5,"output_per_1k":5.0,"currency":"USD"}]`
+	override := `[
+		{"model_pattern":"custom-enterprise-model","input_per_1k":2.5,"output_per_1k":5.0,"effective_from":"2026-07-01","currency":"USD"},
+		{"model_pattern":"internal-vllm-llama","provider":"vllm","self_hosted":true,"input_per_1k":0,"output_per_1k":0}
+	]`
 	if err := os.WriteFile(path, []byte(override), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +112,69 @@ func TestLoadLLMPricingUsesConfiguredOverrideFile(t *testing.T) {
 	cost, unpriced := table.Cost("custom-enterprise-model", 1000, 1000)
 	if unpriced || cost != 7.5 {
 		t.Fatalf("cost=%v unpriced=%v want 7.5,false", cost, unpriced)
+	}
+	if price, ok := table.LookupWithProvider("internal-vllm-llama", "vllm"); !ok || !price.SelfHosted {
+		t.Fatalf("self-hosted lookup=%#v ok=%v", price, ok)
+	}
+}
+
+func TestLoadServerEssentialsValidatesPricingFileAtStartup(t *testing.T) {
+	t.Run("missing pricing file", func(t *testing.T) {
+		cfg := appconfig.Defaults()
+		cfg.DataDir = t.TempDir()
+		cfg.AI.PricingFile = filepath.Join(t.TempDir(), "does-not-exist.json")
+		_, err := loadServerEssentials(cfg)
+		if err == nil || !strings.Contains(err.Error(), "configure LLM pricing") {
+			t.Fatalf("loadServerEssentials err=%v want configure LLM pricing", err)
+		}
+	})
+
+	invalidPayloads := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			name:    "invalid JSON syntax",
+			content: `[{"model_pattern":"gpt-4o"`,
+			wantErr: "configure LLM pricing",
+		},
+		{
+			name:    "unknown field typo",
+			content: `[{"model_pattern":"gpt-4o","input_per_1000":1,"output_per_1k":2,"currency":"USD"}]`,
+			wantErr: "unknown field",
+		},
+		{
+			name:    "invalid effective_from date",
+			content: `[{"model_pattern":"gpt-4o","input_per_1k":1,"output_per_1k":2,"effective_from":"not-a-date","currency":"USD"}]`,
+			wantErr: "effective_from",
+		},
+		{
+			name:    "negative rate",
+			content: `[{"model_pattern":"gpt-4o","input_per_1k":-1,"output_per_1k":2,"currency":"USD"}]`,
+			wantErr: "input_per_1k",
+		},
+		{
+			name:    "unsupported currency",
+			content: `[{"model_pattern":"gpt-4o","input_per_1k":1,"output_per_1k":2,"currency":"CNY"}]`,
+			wantErr: "currency must be USD",
+		},
+	}
+	for _, tc := range invalidPayloads {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "pricing.json")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := appconfig.Defaults()
+			cfg.DataDir = dir
+			cfg.AI.PricingFile = path
+			_, err := loadServerEssentials(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("loadServerEssentials(%s) err=%v want substring %q", tc.name, err, tc.wantErr)
+			}
+		})
 	}
 }
 

@@ -4,7 +4,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuiltInMatchingAndCost(t *testing.T) {
@@ -135,5 +137,156 @@ func TestPricingOverrideMergesReplacesAndSupportsAliasesAndReasoningRate(t *test
 	}
 	if _, ok := table.Lookup("claude-sonnet-4-20250514"); !ok {
 		t.Fatal("override discarded built-in entries")
+	}
+}
+
+func TestPricingSelfHostedProviderAndEffectiveFromSchedule(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prices.json")
+	data := `[
+  {"model_pattern":"gpt-4o","input_per_1k":0.005,"output_per_1k":0.015,"effective_from":"2025-01-01","currency":"USD"},
+  {"model_pattern":"gpt-4o","input_per_1k":0.0025,"output_per_1k":0.01,"effective_from":"2026-01-01","currency":"USD"},
+  {"model_pattern":"gpt-4o","provider":"azure","input_per_1k":0.003,"output_per_1k":0.012,"effective_from":"2026-01-01","currency":"USD"},
+  {"model_pattern":"llama-3.3-70b","provider":"vllm","self_hosted":true,"input_per_1k":0,"output_per_1k":0},
+  {"model_pattern":"qwen-32b","provider":"vllm","self_hosted":true,"input_per_1k":0.0002,"output_per_1k":0.0004,"currency":"USD"}
+]`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	table, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Historical timestamp selects earlier effective_from rate.
+	oldCost, unpriced := table.CostWithUsage("gpt-4o", Usage{
+		Provider:     "openai",
+		Timestamp:    time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC),
+		InputTokens:  1000,
+		OutputTokens: 1000,
+	})
+	if unpriced || math.Abs(oldCost-0.02) > 1e-12 {
+		t.Fatalf("2025 cost=%v unpriced=%v want=0.02", oldCost, unpriced)
+	}
+
+	// Current timestamp selects newer effective_from rate.
+	newCost, unpriced := table.CostWithUsage("gpt-4o", Usage{
+		Provider:     "openai",
+		Timestamp:    time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC),
+		InputTokens:  1000,
+		OutputTokens: 1000,
+	})
+	if unpriced || math.Abs(newCost-0.0125) > 1e-12 {
+		t.Fatalf("2026 cost=%v unpriced=%v want=0.0125", newCost, unpriced)
+	}
+
+	// Timestamp predating all snapshots falls back to earliest known snapshot.
+	preCost, unpriced := table.CostWithUsage("gpt-4o", Usage{
+		Provider:     "openai",
+		Timestamp:    time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		InputTokens:  1000,
+		OutputTokens: 1000,
+	})
+	if unpriced || math.Abs(preCost-0.02) > 1e-12 {
+		t.Fatalf("pre-snapshot cost=%v unpriced=%v want=0.02", preCost, unpriced)
+	}
+
+	// Provider-specific entry beats provider-agnostic entry for matching provider.
+	azureCost, unpriced := table.CostWithUsage("gpt-4o", Usage{
+		Provider:     "azure",
+		Timestamp:    time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC),
+		InputTokens:  1000,
+		OutputTokens: 1000,
+	})
+	if unpriced || math.Abs(azureCost-0.015) > 1e-12 {
+		t.Fatalf("azure cost=%v unpriced=%v want=0.015", azureCost, unpriced)
+	}
+
+	// Self-hosted vllm entry prices at $0 (with SelfHosted=true), while unknown provider stays unpriced.
+	vllmPrice, ok := table.LookupWithProvider("llama-3.3-70b", "vllm")
+	if !ok || !vllmPrice.SelfHosted || vllmPrice.InputPer1K != 0 || vllmPrice.OutputPer1K != 0 {
+		t.Fatalf("vllm price=%#v ok=%v", vllmPrice, ok)
+	}
+	if _, ok := table.LookupWithProvider("llama-3.3-70b", "together"); ok {
+		t.Fatal("commercial provider must not inherit vllm self_hosted entry")
+	}
+
+	// Self-hosted with explicit amortized GPU cost still bills the configured rate.
+	gpuCost, unpriced := table.CostWithUsage("qwen-32b", Usage{
+		Provider:     "vllm",
+		InputTokens:  1000,
+		OutputTokens: 1000,
+	})
+	if unpriced || math.Abs(gpuCost-0.0006) > 1e-12 {
+		t.Fatalf("vllm gpu cost=%v unpriced=%v want=0.0006", gpuCost, unpriced)
+	}
+
+	// Built-in ollama fallback marks SelfHosted=true.
+	ollamaPrice, ok := table.LookupWithProvider("llama3.2", "ollama")
+	if !ok || !ollamaPrice.SelfHosted {
+		t.Fatalf("ollama fallback=%#v ok=%v", ollamaPrice, ok)
+	}
+	// Built-in entries carry snapshot effective_from metadata.
+	gpt4oMini, ok := Default().Lookup("gpt-4o-mini")
+	if !ok || gpt4oMini.EffectiveFrom != "2026-07-17" {
+		t.Fatalf("built-in gpt-4o-mini=%#v ok=%v", gpt4oMini, ok)
+	}
+}
+
+func TestPricingValidationRejectsMalformedOverrideFiles(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		wantErr string
+	}{
+		{
+			name:    "unknown field typo",
+			payload: `[{"model_pattern":"m","input_per_1k":1,"output_per_1k":2,"unknown_field":true,"currency":"USD"}]`,
+			wantErr: "unknown field",
+		},
+		{
+			name:    "trailing json content",
+			payload: `[{"model_pattern":"m","input_per_1k":1,"output_per_1k":2,"currency":"USD"}] {"extra":1}`,
+			wantErr: "trailing content",
+		},
+		{
+			name:    "invalid effective_from",
+			payload: `[{"model_pattern":"m","input_per_1k":1,"output_per_1k":2,"effective_from":"2026-13-45","currency":"USD"}]`,
+			wantErr: "effective_from",
+		},
+		{
+			name:    "negative rate",
+			payload: `[{"model_pattern":"m","input_per_1k":-0.1,"output_per_1k":2,"currency":"USD"}]`,
+			wantErr: "input_per_1k",
+		},
+		{
+			name:    "unsupported currency",
+			payload: `[{"model_pattern":"m","input_per_1k":1,"output_per_1k":2,"currency":"EUR"}]`,
+			wantErr: "currency must be USD",
+		},
+		{
+			name: "duplicate model provider effective_from",
+			payload: `[
+				{"model_pattern":"m","provider":"openai","effective_from":"2026-01-01","input_per_1k":1,"output_per_1k":2,"currency":"USD"},
+				{"model_pattern":"m","provider":"openai","effective_from":"2026-01-01","input_per_1k":3,"output_per_1k":4,"currency":"USD"}
+			]`,
+			wantErr: "duplicate pricing entry",
+		},
+		{
+			name:    "empty pricing array",
+			payload: `[{"_comment":"comment only"}]`,
+			wantErr: "empty",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "bad.json")
+			if err := os.WriteFile(path, []byte(tc.payload), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load() err=%v want substring %q", err, tc.wantErr)
+			}
+		})
 	}
 }
