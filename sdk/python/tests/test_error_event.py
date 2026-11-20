@@ -1,15 +1,15 @@
-import io
 import json
 import logging
 import os
 import sysconfig
 import threading
-import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import httpx
 import pytest
 
+from lazyobserve._http import InternalHTTPTransport
 from lazyobserve.error_event import (
     _EVENT_SIZE_LIMIT,
     ErrorEvent,
@@ -220,16 +220,16 @@ def test_transport_drops_permanent_4xx_immediately_as_server_rejected_and_closes
     drops = []
     closed_flags = []
 
-    class _TrackedBody(io.BytesIO):
+    class _TrackedStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"rejected"
+
         def close(self):
             closed_flags.append(True)
-            super().close()
 
-    def opener(request, timeout=None):
+    def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        raise urllib.error.HTTPError(
-            request.full_url, status_code, "bad", {}, _TrackedBody(b"rejected")
-        )
+        return httpx.Response(status_code, stream=_TrackedStream())
 
     transport = ErrorTransport(
         endpoint="http://127.0.0.1:1",
@@ -238,7 +238,7 @@ def test_transport_drops_permanent_4xx_immediately_as_server_rejected_and_closes
         max_attempts=3,
         retry_initial=0.01,
         warn=lambda reason, err, count: drops.append((reason, count)),
-        opener=opener,
+        transport=httpx.MockTransport(handler),
     )
     event = ErrorEvent(
         event_id="e" * 32,
@@ -252,6 +252,7 @@ def test_transport_drops_permanent_4xx_immediately_as_server_rejected_and_closes
     assert len(calls) == 1
     assert drops == [("server_rejected", 1)]
     assert closed_flags
+    assert transport._http.closed is True
 
 
 @pytest.mark.parametrize("status_code", [408, 429])
@@ -259,27 +260,15 @@ def test_transport_retries_408_and_429_and_honors_retry_after(status_code):
     calls = []
     drops = []
 
-    class _OkResp:
-        def read(self, n=-1):
-            return b'{"accepted":1}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-    def opener(request, timeout=None):
+    def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         if len(calls) == 1:
-            raise urllib.error.HTTPError(
-                request.full_url,
+            return httpx.Response(
                 status_code,
-                "retry",
-                {"Retry-After": "0.02"},
-                io.BytesIO(b"slow down"),
+                headers={"Retry-After": "0.02"},
+                content=b"slow down",
             )
-        return _OkResp()
+        return httpx.Response(200, content=b'{"accepted":1}')
 
     transport = ErrorTransport(
         endpoint="http://127.0.0.1:1",
@@ -288,7 +277,7 @@ def test_transport_retries_408_and_429_and_honors_retry_after(status_code):
         max_attempts=2,
         retry_initial=0.0,
         warn=lambda reason, err, count: drops.append((reason, count)),
-        opener=opener,
+        transport=httpx.MockTransport(handler),
     )
     transport.enqueue(
         ErrorEvent(
@@ -302,6 +291,116 @@ def test_transport_retries_408_and_429_and_honors_retry_after(status_code):
     assert transport.close(timeout=2.0) is None
     assert len(calls) == 2
     assert drops == []
+
+
+def test_internal_http_transport_reuses_keepalive_connection_and_closes_cleanly():
+    peer_addresses = []
+
+    class _KeepAliveHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            peer_addresses.append(self.client_address)
+            body = b'{"accepted":1}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _KeepAliveHandler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    http_transport = InternalHTTPTransport()
+    try:
+        for _ in range(3):
+            status = http_transport.post(
+                f"http://127.0.0.1:{port}/api/events/errors",
+                content=b'{"events":[]}',
+                headers={"Authorization": "Bearer tok", "Content-Type": "application/json"},
+                action="send error events",
+            )
+            assert status == 200
+        assert len(peer_addresses) == 3
+        # HTTP/1.1 keep-alive reuses the same client TCP socket (identical source port).
+        assert len(set(peer_addresses)) == 1
+        underlying = http_transport._client
+        assert underlying is not None
+        assert underlying.is_closed is False
+        http_transport.close()
+        assert http_transport.closed is True
+        assert underlying.is_closed is True
+        # Idempotent second close.
+        http_transport.close()
+    finally:
+        http_transport.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_client_shutdown_closes_shared_internal_http_transport(capture_server):
+    import lazyobserve
+
+    port = capture_server.server_address[1]
+    lo = lazyobserve.init(
+        {
+            "dsn": f"http://127.0.0.1:{port}/p/default@tok",
+            "service_name": "shared-http-test",
+            "traces": True,
+        }
+    )
+    assert not lo.degraded
+    assert lo._http_transport is not None
+    assert lo.error_transport._http is lo._http_transport
+    assert lo.error_transport._owns_http is False
+
+    lo.capture_exception(RuntimeError("boom"))
+    assert lo.shutdown(timeout=3.0) is None
+    assert lo._http_transport.closed is True
+    assert len(_CaptureHandler.captured) == 1
+
+
+def test_internal_http_transport_defers_pool_close_until_in_flight_finishes():
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        release.wait(timeout=5.0)
+        return httpx.Response(200, content=b'{"accepted":1}')
+
+    http_transport = InternalHTTPTransport(transport=httpx.MockTransport(handler))
+
+    def worker():
+        status = http_transport.post(
+            "http://127.0.0.1:1/api/events/errors",
+            content=b'{"events":[]}',
+            headers={"Authorization": "Bearer tok"},
+            action="send error events",
+        )
+        results.append(status)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert entered.wait(timeout=5.0)
+
+    underlying = http_transport._client
+    assert underlying is not None
+    http_transport.close()
+    assert http_transport.closed is True
+    # Underlying client stays open while the in-flight request completes.
+    assert underlying.is_closed is False
+
+    release.set()
+    thread.join(timeout=5.0)
+    assert results == [200]
+    assert underlying.is_closed is True
 
 
 def test_transport_ignores_global_opener_and_refuses_redirects():

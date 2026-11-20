@@ -401,6 +401,7 @@ def build_uploader(client: Any, parsed: Any, config: Any, logger: logging.Logger
         retry_initial=config.delivery.retry_initial,
         retry_max=config.delivery.retry_max,
         warn=warn,
+        http_transport=getattr(client, "_http_transport", None),
     )
 
 

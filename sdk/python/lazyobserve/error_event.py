@@ -11,21 +11,25 @@ import logging
 import os
 import sys
 import sysconfig
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from opentelemetry import trace as otel_trace
 
-from ._http import open_no_redirect
-from .delivery import DeliveryQueue, DeliveryWarn, RetryableError, parse_retry_after
+from ._http import (
+    DEFAULT_ERROR_SEND_TIMEOUT,
+    ERROR_EVENT_SIZE_LIMIT,
+    InternalHTTPTransport,
+    PayloadTooLargeError,
+    PermanentHTTPError,
+)
+from .delivery import DeliveryQueue, DeliveryWarn
 
 _ERROR_BATCH_SIZE = 20
 _ERROR_FLUSH_INTERVAL = 0.1
-_ERROR_SEND_TIMEOUT = 5.0
-_EVENT_SIZE_LIMIT = 200 << 10
+_ERROR_SEND_TIMEOUT = DEFAULT_ERROR_SEND_TIMEOUT
+_EVENT_SIZE_LIMIT = ERROR_EVENT_SIZE_LIMIT
 
 _MAX_MESSAGE_BYTES = 16 << 10
 _MAX_EXCEPTION_VALUE_BYTES = 16 << 10
@@ -353,12 +357,20 @@ class ErrorTransport:
         retry_initial: float = 0.1,
         retry_max: float = 1.0,
         warn: Optional[DeliveryWarn] = None,
-        opener: Optional[Callable[..., Any]] = None,
+        http_transport: Optional[InternalHTTPTransport] = None,
+        transport: Optional[Any] = None,
+        send_timeout: float = _ERROR_SEND_TIMEOUT,
     ) -> None:
         self.endpoint = endpoint.rstrip("/") + "/api/events/errors"
         self.token = token
         self.logger = logger
-        self._opener = opener or open_no_redirect
+        self.send_timeout = send_timeout
+        if http_transport is not None:
+            self._http = http_transport
+            self._owns_http = False
+        else:
+            self._http = InternalHTTPTransport(transport=transport, default_timeout=send_timeout)
+            self._owns_http = True
         self.delivery = DeliveryQueue(
             send=self._send,
             capacity=queue_capacity,
@@ -377,7 +389,7 @@ class ErrorTransport:
             if fitted is None:
                 self.delivery.record_drop(
                     "server_rejected",
-                    ValueError(f"error event exceeds {_EVENT_SIZE_LIMIT} bytes"),
+                    PayloadTooLargeError(f"error event exceeds {_EVENT_SIZE_LIMIT} bytes"),
                     1,
                 )
                 return False
@@ -385,7 +397,13 @@ class ErrorTransport:
         return self.delivery.enqueue(event)
 
     def close(self, timeout: Optional[float] = None) -> Optional[BaseException]:
-        return self.delivery.close(timeout)
+        err = self.delivery.close(timeout)
+        if self._owns_http:
+            try:
+                self._http.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return err
 
     def dropped(self) -> int:
         return self.delivery.dropped()
@@ -402,43 +420,26 @@ class ErrorTransport:
         if oversized:
             self.delivery.record_drop(
                 "server_rejected",
-                ValueError(f"error event exceeds {_EVENT_SIZE_LIMIT} bytes"),
+                PayloadTooLargeError(f"error event exceeds {_EVENT_SIZE_LIMIT} bytes"),
                 oversized,
             )
         if not valid_payloads:
             return
         payload = json.dumps({"events": valid_payloads}, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint,
-            data=payload,
-            method="POST",
-            headers={
-                "Authorization": "Bearer " + self.token,
-                "Content-Type": "application/json",
-            },
-        )
         try:
-            with self._opener(request, timeout=_ERROR_SEND_TIMEOUT) as response:
-                response.read(4096)
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read(4096).decode("utf-8", "replace").strip()
-            except Exception:  # noqa: BLE001
-                body = ""
-            finally:
-                exc.close()
-            message = f"send error events: HTTP {exc.code}: {body}"
-            if 400 <= exc.code < 500 and exc.code not in (408, 429):
-                self.delivery.record_drop("server_rejected", RuntimeError(message), len(valid_payloads))
-                return
-            retry_after = parse_retry_after(
-                exc.headers.get("Retry-After") if exc.headers is not None else None
+            self._http.post(
+                self.endpoint,
+                content=payload,
+                headers={
+                    "Authorization": "Bearer " + self.token,
+                    "Content-Type": "application/json",
+                },
+                timeout=self.send_timeout,
+                action="send error events",
             )
-            if retry_after is not None:
-                raise RetryableError(message, retry_after=retry_after) from exc
-            raise RuntimeError(message) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"send error events: {exc.reason}") from exc
+        except (PermanentHTTPError, PayloadTooLargeError) as exc:
+            self.delivery.record_drop("server_rejected", exc, len(valid_payloads))
+            return
 
 
 OnDrop = Callable[[str, Optional[BaseException], int], None]

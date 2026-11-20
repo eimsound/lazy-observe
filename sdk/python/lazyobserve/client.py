@@ -57,7 +57,29 @@ def _threads_count() -> int:
         return 0
 
 
+def _linux_proc_statm_rss(statm_path: str = "/proc/self/statm") -> Optional[int]:
+    """Read current live RSS in bytes from Linux ``/proc/self/statm``."""
+    try:
+        with open(statm_path, "r", encoding="ascii") as fh:
+            fields = fh.read().split()
+        if len(fields) < 2:
+            return None
+        resident_pages = int(fields[1])
+        if resident_pages < 0:
+            return None
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if page_size <= 0:
+            return None
+        return resident_pages * page_size
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _memory_rss() -> int:
+    if sys.platform.startswith("linux"):
+        rss = _linux_proc_statm_rss()
+        if rss is not None:
+            return rss
     try:
         import resource
 
@@ -114,6 +136,7 @@ class Client:
         error_transport: Any = None,
         dropped_counter: Any = None,
         init_err: Optional[BaseException] = None,
+        http_transport: Any = None,
     ) -> None:
         self.config = config
         self.meter_provider = meter
@@ -122,6 +145,7 @@ class Client:
         self.logger = logger
         self.propagator: Any = _TraceContextTextMapPropagator()
         self.error_transport = error_transport
+        self._http_transport = http_transport
         self._dropped_counter = dropped_counter
         self._init_err = init_err
         #: The continuous-profiling controller when ``Config.profiling`` is on.
@@ -145,6 +169,10 @@ class Client:
         self._drop_lock = threading.Lock()
         self._db_instrument_lock = threading.Lock()
         self._dropped_telemetry = 0
+        if self._http_transport is not None:
+            reinit = getattr(self._http_transport, "_reinit_after_fork", None)
+            if callable(reinit):
+                reinit()
 
     def db_duration_histogram(self, buckets: Sequence[float]) -> Any:
         if self._db_duration_histogram is None:
@@ -315,6 +343,9 @@ class Client:
             # providers, as in Go: a profiling window must not eat their budget.
             profiling = self.profiling
             step("profiling", lambda: profiling.shutdown(remaining()))
+        if self._http_transport is not None:
+            http_transport = self._http_transport
+            step("http transport", http_transport.close)
         for provider, name in (
             (self.logger_provider, "logs"),
             (self.tracer_provider, "traces"),
@@ -432,11 +463,12 @@ def build_client(config: Any, parsed: Any) -> Client:
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics._internal.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
+    from ._http import InternalHTTPTransport
     from .config import signal_matrix
 
     metrics_on, logs_on, traces_on = signal_matrix(config)
@@ -451,6 +483,7 @@ def build_client(config: Any, parsed: Any) -> Client:
     headers = _headers(parsed.token)
     created: List[Any] = []
     error_transport: Any = None
+    http_transport: Optional[InternalHTTPTransport] = None
 
     meter_provider: Any = None
     tracer_provider: Any = None
@@ -503,6 +536,7 @@ def build_client(config: Any, parsed: Any) -> Client:
         import logging as _stdlib_logging
 
         logger = _stdlib_logging.getLogger("lazyobserve")
+        http_transport = InternalHTTPTransport()
 
         client = Client(
             config=config,
@@ -510,6 +544,7 @@ def build_client(config: Any, parsed: Any) -> Client:
             tracer_provider=tracer_provider or _otel_trace.NoOpTracerProvider(),
             logger_provider=logger_provider,
             logger=logger,
+            http_transport=http_transport,
         )
         if meter_provider is not None:
             _register_runtime_metrics(client)
@@ -527,12 +562,18 @@ def build_client(config: Any, parsed: Any) -> Client:
             retry_initial=config.delivery.retry_initial,
             retry_max=config.delivery.retry_max,
             warn=default_warn_factory(logger, "error", client.record_telemetry_drop),
+            http_transport=http_transport,
         )
         client.error_transport = error_transport
     except Exception:
         if error_transport is not None:
             try:
                 error_transport.close(0.0)
+            except Exception:  # noqa: BLE001
+                pass
+        if http_transport is not None:
+            try:
+                http_transport.close()
             except Exception:  # noqa: BLE001
                 pass
         for provider in reversed(created):

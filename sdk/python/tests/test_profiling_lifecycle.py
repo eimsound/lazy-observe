@@ -700,6 +700,8 @@ def test_shutdown_before_the_probe_finished_leaves_nothing_running():
 
 
 def test_shutdown_does_not_leak_threads():
+    import httpx
+
     def names():
         return {t.name for t in threading.enumerate() if t.name.startswith("lazyobserve-profil")}
 
@@ -707,14 +709,16 @@ def test_shutdown_does_not_leak_threads():
     sampler = BlockingSampler(partial_seconds=6.0)
     opened = []
 
-    def opener(request, timeout=None):
+    def handler(request: httpx.Request) -> httpx.Response:
         opened.append(request)
-        return _Response()
+        return httpx.Response(201, content=b"")
 
     controller = _profiling.ProfilingController(
         interval=60.0,
         sampler_factory=lambda: sampler,
-        uploader_factory=lambda: ProfileUploader("http://127.0.0.1:1", "tok", "svc", opener=opener),
+        uploader_factory=lambda: ProfileUploader(
+            "http://127.0.0.1:1", "tok", "svc", transport=httpx.MockTransport(handler)
+        ),
         record_drop=lambda *a: None,
         logger=logging.getLogger(LOGGER_NAME),
     )
@@ -727,7 +731,7 @@ def test_shutdown_does_not_leak_threads():
         time.sleep(0.01)
     assert names() - before == set()
     assert len(opened) == 1  # the 6 s partial window went out through the real queue
-    assert opened[0].full_url.endswith("/api/profiles")
+    assert str(opened[0].url).endswith("/api/profiles")
 
 
 # --- public switch through init/build_client -------------------------------------------
@@ -963,15 +967,23 @@ class ForkRig:
         self.samplers = []
         self.uploaders = []
 
-    def opener(self, request, timeout=None):
-        self.sent.append((os.getpid(), request.data))
+    def handler(self, request):
+        import httpx
+
+        self.sent.append((os.getpid(), request.content))
         if os.getpid() == self.parent_pid:
             self.gate.wait(10)
-        return _Response()
+        return httpx.Response(201, content=b"")
 
     def make_uploader(self):
+        import httpx
+
         uploader = ProfileUploader(
-            "http://127.0.0.1:1", "tok", "fork-svc", max_attempts=1, opener=self.opener
+            "http://127.0.0.1:1",
+            "tok",
+            "fork-svc",
+            max_attempts=1,
+            transport=httpx.MockTransport(self.handler),
         )
         self.uploaders.append(uploader)
         return uploader
@@ -1262,11 +1274,13 @@ def test_real_315t_profiles_a_busy_thread_and_uploads_through_the_real_path():
                 total += i * i
         return total
 
+    import httpx
+
     sent = []
 
-    def opener(request, timeout=None):
+    def handler(request: httpx.Request) -> httpx.Response:
         sent.append(request)
-        return _Response()
+        return httpx.Response(201, content=b"")
 
     probed = threading.Event()
 
@@ -1280,7 +1294,9 @@ def test_real_315t_profiles_a_busy_thread_and_uploads_through_the_real_path():
     controller = _profiling.ProfilingController(
         interval=60.0,
         sampler_factory=create_sampler,
-        uploader_factory=lambda: ProfileUploader("http://127.0.0.1:1", "tok", "real-svc", opener=opener),
+        uploader_factory=lambda: ProfileUploader(
+            "http://127.0.0.1:1", "tok", "real-svc", transport=httpx.MockTransport(handler)
+        ),
         record_drop=lambda *a: None,
         logger=logging.getLogger(LOGGER_NAME),
     )
@@ -1296,7 +1312,7 @@ def test_real_315t_profiles_a_busy_thread_and_uploads_through_the_real_path():
         worker.join(5)
 
     assert len(sent) == 1
-    body = sent[0].data
+    body = sent[0].content
     assert _multipart_field(body, "type") == "cpu"
     assert _multipart_field(body, "service") == "real-svc"
     import gzip

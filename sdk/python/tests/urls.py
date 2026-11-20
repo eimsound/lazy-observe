@@ -29,9 +29,21 @@ def drf_server_view(request):
     raise ServerExplosion()
 
 
+async def async_ok_view(request):
+    from django.http import JsonResponse
+
+    return JsonResponse({"status": "async-ok"})
+
+
+async def async_boom_view(request):
+    raise ValueError("async-boom")
+
+
 urlpatterns = [
     path("ok", ok_view, name="ok"),
     path("boom", boom_view, name="boom"),
+    path("async-ok", async_ok_view, name="async-ok"),
+    path("async-boom", async_boom_view, name="async-boom"),
     path("api/boom", drf_boom_view, name="drf-boom"),
     path("api/server", drf_server_view, name="drf-server"),
 ]

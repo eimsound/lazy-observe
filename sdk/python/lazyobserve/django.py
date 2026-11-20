@@ -1,13 +1,25 @@
-"""Django middleware. Parity with the Go SDK's ``lo.Fiber()``: extracts W3C
-traceparent, creates a SERVER span, records request duration / active-request
-metrics, recovers unhandled exceptions as HTTP 500 with a correlated error log,
-and queues 5xx-originating exceptions as error events.
+"""Django middleware (WSGI and ASGI). Parity with the Go SDK's ``lo.Fiber()``:
+extracts W3C traceparent, creates a SERVER span, records request duration and
+active-request metrics, observes unhandled exceptions via ``process_exception``
+while preserving Django's native 500 pipeline, and queues 5xx-originating
+exceptions as error events.
 
-In Django, unhandled view exceptions reach middleware through the official
-``process_exception`` hook (the plain ``get_response`` call never sees them —
-Django's ``convert_exception_to_response`` wraps ``_get_response`` at the
-innermost link of the middleware chain). We implement that hook plus a
-defensive ``try/except`` for direct (non-Django) invocation.
+WSGI / ASGI and streaming support boundaries:
+- Declares ``sync_capable = True`` and ``async_capable = True``. When Django
+  passes an async ``get_response`` under ASGI, the middleware marks itself as a
+  coroutine function and runs natively on the event loop without ``sync_to_async``
+  thread hopping.
+- Wraps both synchronous and asynchronous ``StreamingHttpResponse`` content
+  iterators (and hooks ``_resource_closers``) so span duration,
+  ``http.server.request.duration``, and ``http.server.active_requests`` reflect
+  the full stream lifetime rather than stopping when headers are returned. The
+  OpenTelemetry request context is still detached on middleware return so it
+  never leaks across requests or outer middleware.
+- In Django, unhandled view exceptions reach middleware through the official
+  ``process_exception`` hook (the plain ``get_response`` call never sees them —
+  Django's ``convert_exception_to_response`` wraps ``_get_response`` at the
+  innermost link of the middleware chain). We implement that hook plus a
+  defensive ``try/except`` for direct (non-Django) invocation.
 
 Usage (registry-bound, keeps Django's string-based MIDDLEWARE config):
 
@@ -20,11 +32,12 @@ or bind explicitly on an instance:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import threading
 import time as _time
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from opentelemetry import context as _otel_context
 from opentelemetry import trace as _otel_trace
@@ -45,6 +58,24 @@ _SPAN_ATTR = "_lazyobserve_span"
 _START_ATTR = "_lazyobserve_start"
 _RECORDED_EXCS_ATTR = "_lazyobserve_recorded_exceptions"
 _UNMATCHED_ROUTE = "unmatched"
+
+
+def _is_coroutine_function(fn: Any) -> bool:
+    try:
+        from asgiref.sync import iscoroutinefunction
+
+        return bool(iscoroutinefunction(fn))
+    except Exception:  # noqa: BLE001
+        return inspect.iscoroutinefunction(fn)
+
+
+def _mark_coroutine_function(obj: Any) -> None:
+    try:
+        from asgiref.sync import markcoroutinefunction
+
+        markcoroutinefunction(obj)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _request_scheme(request: Any) -> str:
@@ -130,11 +161,28 @@ class _Instrumentation:
 class _BaseMiddleware:
     """Shared behavior for registry-bound and explicit-bound middleware."""
 
+    sync_capable = True
+    async_capable = True
+
+    def _init_async_mode(self, get_response: Any) -> None:
+        self.get_response = get_response
+        self._is_async = _is_coroutine_function(get_response)
+        if self._is_async:
+            _mark_coroutine_function(self)
+
     def __call__(self, request: Any):
+        if self._is_async:
+            return self._acall(request)
         client = self._resolve_client()
         if client is None or client.degraded:
             return self.get_response(request)
         return _instrument_request(self, client, request)
+
+    async def _acall(self, request: Any):
+        client = self._resolve_client()
+        if client is None or client.degraded:
+            return await self.get_response(request)
+        return await _instrument_request_async(self, client, request)
 
     def process_exception(self, request: Any, exception: BaseException):
         """Django's official exception hook (called via
@@ -174,10 +222,10 @@ class DjangoMiddleware(_BaseMiddleware):
     """Django middleware bound to the active lazyobserve client."""
 
     def __init__(self, get_response: Any) -> None:
-        self.get_response = get_response
         self._instrumentation: Optional[_Instrumentation] = None
         self._instrumentation_client: Any = None
         self._lock = threading.Lock()
+        self._init_async_mode(get_response)
 
     def _resolve_client(self) -> Any:
         try:
@@ -192,11 +240,11 @@ class _BoundMiddleware(_BaseMiddleware):
     """Middleware bound to an explicit client (``lo.django_middleware()``)."""
 
     def __init__(self, get_response: Any, client: Any) -> None:
-        self.get_response = get_response
         self._client = client
         self._instrumentation: Optional[_Instrumentation] = None
         self._instrumentation_client: Any = None
         self._lock = threading.Lock()
+        self._init_async_mode(get_response)
 
     def _resolve_client(self) -> Any:
         return self._client
@@ -208,6 +256,8 @@ def build_middleware(client: Any):
             return factory
         return _BoundMiddleware(get_response, client)
 
+    factory.sync_capable = True  # type: ignore[attr-defined]
+    factory.async_capable = True  # type: ignore[attr-defined]
     return factory
 
 
@@ -237,11 +287,16 @@ def _build_server_span(
     return _otel_trace.set_span_in_context(span), span
 
 
-def _instrument_request(instance: _BaseMiddleware, client: Any, request: Any) -> Any:
-    instrumentation = instance._client_for(client)
-    if instrumentation is None:
-        return instance.get_response(request)
+def _setup_request_instrumentation(
+    instrumentation: _Instrumentation,
+    client: Any,
+    request: Any,
+) -> Optional[Tuple[Any, Any, str, float]]:
+    """Start SERVER span, attach OTel context, increment active_requests.
 
+    Returns ``(token, span, method, start)`` on success, or ``None`` if setup
+    failed (after cleaning up partial state so the caller can pass through).
+    """
     token = None
     span = None
     active_added = False
@@ -271,6 +326,7 @@ def _instrument_request(instance: _BaseMiddleware, client: Any, request: Any) ->
         setattr(request, _START_ATTR, start)
         instrumentation.active.add(1, {"http.request.method": method})
         active_added = True
+        return token, span, method, start
     except Exception as exc:  # noqa: BLE001 - SDK setup failure must never break the request
         logger.warning("lazyobserve Django middleware request setup failed: %s", exc)
         if active_added:
@@ -288,29 +344,38 @@ def _instrument_request(instance: _BaseMiddleware, client: Any, request: Any) ->
                 _otel_context.detach(token)
             except Exception:  # noqa: BLE001
                 pass
-        return instance.get_response(request)
+        return None
 
-    status = 500
-    try:
-        response = instance.get_response(request)
-        status = getattr(response, "status_code", 200)
-        return response
-    except Exception as exc:  # noqa: BLE001 - defensive path for non-Django callers
-        if _is_exception_recorded(request, exc):
-            raise
-        _observe_exception(client, request, exc)
-        if getattr(client.config, "re_raise_on_500", False):
-            raise
-        from django.http import HttpResponseServerError
 
-        return HttpResponseServerError("Internal Server Error")
-    finally:
+def _make_finalizer(
+    instrumentation: _Instrumentation,
+    request: Any,
+    span: Any,
+    method: str,
+    start: float,
+    status_holder: list[int],
+) -> Callable[[Optional[BaseException]], None]:
+    """Build an idempotent finalizer recording duration, active_requests, and span end."""
+    lock = threading.Lock()
+    finished = False
+
+    def finalize(stream_exc: Optional[BaseException] = None) -> None:
+        nonlocal finished
+        with lock:
+            if finished:
+                return
+            finished = True
+        status = status_holder[0]
         try:
             route = _route_for(request)
             span.update_name(_span_name(method, route))
             span.set_attribute("http.route", route)
             span.set_attribute("http.response.status_code", status)
-            if status >= 500:
+            if stream_exc is not None:
+                if isinstance(stream_exc, Exception):
+                    span.record_exception(stream_exc)
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR, str(stream_exc)))
+            elif status >= 500:
                 span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
             instrumentation.duration.record(
                 _time.monotonic() - start,
@@ -330,10 +395,126 @@ def _instrument_request(instance: _BaseMiddleware, client: Any, request: Any) ->
             span.end()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            _otel_context.detach(token)
-        except Exception:  # noqa: BLE001
-            pass
+
+    return finalize
+
+
+def _wrap_streaming_response(
+    response: Any,
+    finalize: Callable[[Optional[BaseException]], None],
+) -> bool:
+    """Wrap a Django ``StreamingHttpResponse`` so metrics/span finish when streaming ends."""
+    if not getattr(response, "streaming", False):
+        return False
+    if not hasattr(response, "streaming_content"):
+        return False
+    try:
+        is_async_stream = bool(getattr(response, "is_async", False))
+        original = response.streaming_content
+        if is_async_stream:
+            async def _async_stream():
+                try:
+                    async for chunk in original:
+                        yield chunk
+                except BaseException as exc:
+                    finalize(exc)
+                    raise
+                finally:
+                    finalize()
+
+            response.streaming_content = _async_stream()
+        else:
+            def _sync_stream():
+                try:
+                    for chunk in original:
+                        yield chunk
+                except BaseException as exc:
+                    finalize(exc)
+                    raise
+                finally:
+                    finalize()
+
+            response.streaming_content = _sync_stream()
+
+        closers = getattr(response, "_resource_closers", None)
+        if isinstance(closers, list):
+            closers.append(finalize)
+        return True
+    except Exception:  # noqa: BLE001 - fall back to immediate finalization on any unexpected shape
+        return False
+
+
+def _detach_context(token: Any) -> None:
+    try:
+        _otel_context.detach(token)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _instrument_request(instance: _BaseMiddleware, client: Any, request: Any) -> Any:
+    instrumentation = instance._client_for(client)
+    if instrumentation is None:
+        return instance.get_response(request)
+
+    setup = _setup_request_instrumentation(instrumentation, client, request)
+    if setup is None:
+        return instance.get_response(request)
+    token, span, method, start = setup
+
+    status_holder = [500]
+    finalize = _make_finalizer(instrumentation, request, span, method, start, status_holder)
+    stream_owned = False
+    try:
+        response = instance.get_response(request)
+        status_holder[0] = getattr(response, "status_code", 200)
+        stream_owned = _wrap_streaming_response(response, finalize)
+        return response
+    except Exception as exc:  # noqa: BLE001 - defensive path for non-Django callers
+        if _is_exception_recorded(request, exc):
+            raise
+        _observe_exception(client, request, exc)
+        if getattr(client.config, "re_raise_on_500", False):
+            raise
+        from django.http import HttpResponseServerError
+
+        return HttpResponseServerError("Internal Server Error")
+    finally:
+        if not stream_owned:
+            finalize(None)
+        _detach_context(token)
+
+
+async def _instrument_request_async(instance: _BaseMiddleware, client: Any, request: Any) -> Any:
+    instrumentation = instance._client_for(client)
+    if instrumentation is None:
+        return await instance.get_response(request)
+
+    setup = _setup_request_instrumentation(instrumentation, client, request)
+    if setup is None:
+        return await instance.get_response(request)
+    token, span, method, start = setup
+
+    status_holder = [500]
+    finalize = _make_finalizer(instrumentation, request, span, method, start, status_holder)
+    stream_owned = False
+    try:
+        response = await instance.get_response(request)
+        status_holder[0] = getattr(response, "status_code", 200)
+        stream_owned = _wrap_streaming_response(response, finalize)
+        return response
+    except Exception as exc:  # noqa: BLE001 - defensive path for non-Django callers
+        if _is_exception_recorded(request, exc):
+            raise
+        _observe_exception(client, request, exc)
+        if getattr(client.config, "re_raise_on_500", False):
+            raise
+        from django.http import HttpResponseServerError
+
+        return HttpResponseServerError("Internal Server Error")
+    finally:
+        if not stream_owned:
+            finalize(None)
+        _detach_context(token)
 
 
 def _is_exception_recorded(request: Any, exc: BaseException) -> bool:

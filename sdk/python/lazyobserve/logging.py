@@ -143,27 +143,39 @@ class LazyObserveLogHandler(logging.Handler):
     """Python ``logging`` handler that exports records as OTLP logs with
     ``service.name`` and active ``trace_id``/``span_id`` injected.
 
-    The handler resolves the active SDK client from the lazyobserve registry, so
-    it can be declared in Django's ``LOGGING`` without a hard reference to the
-    client instance.
+    By default the handler resolves the active SDK client from the lazyobserve
+    registry, so it can be declared in Django's ``LOGGING`` without a hard
+    reference to the client instance. Pass ``client=...`` to bind the handler
+    explicitly to one :class:`lazyobserve.Client` instance (used by
+    :class:`ClientLogger` for multi-instance isolation).
     """
 
-    def __init__(self, level: int = logging.NOTSET, tee_to_stderr: bool | None = None) -> None:
+    def __init__(
+        self,
+        level: int = logging.NOTSET,
+        tee_to_stderr: bool | None = None,
+        client: Optional[Any] = None,
+    ) -> None:
         super().__init__(level)
         self.tee_to_stderr = tee_to_stderr
+        self._client = client
+
+    def _resolve_client(self) -> Optional[Any]:
+        if self._client is not None:
+            return self._client
+        try:
+            from . import _registry
+
+            return _registry.get_active_client()
+        except Exception:  # noqa: BLE001
+            return None
 
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(_in_emit, "active", False):
             return
         _in_emit.active = True
         try:
-            client = None
-            try:
-                from . import _registry
-
-                client = _registry.get_active_client()
-            except Exception:  # noqa: BLE001
-                client = None
+            client = self._resolve_client()
             if client is not None and not _is_internal_logger(record):
                 self._emit(client, record)
             if self._should_tee(record=record, client=client):
@@ -177,12 +189,7 @@ class LazyObserveLogHandler(logging.Handler):
         if self.tee_to_stderr is not None:
             return self.tee_to_stderr
         if client is None:
-            try:
-                from . import _registry
-
-                client = _registry.get_active_client()
-            except Exception:  # noqa: BLE001
-                client = None
+            client = self._resolve_client()
         if client is not None:
             return bool(client.config.tee_to_stderr)
         return True
@@ -240,11 +247,21 @@ class LazyObserveLogHandler(logging.Handler):
 
 
 class ClientLogger:
-    """A stdlib ``Logger`` attached to a LazyObserveLogHandler (Go ``lo.Slog()``)."""
+    """An isolated stdlib ``Logger`` bound explicitly to one SDK client (Go ``lo.Slog()``)."""
 
     def __init__(self, client: Any) -> None:
-        self.logger = logging.getLogger("lazyobserve.client")
-        self.logger.handlers[:] = [LazyObserveLogHandler(tee_to_stderr=bool(client.config.tee_to_stderr))]
+        self.client = client
+        # Construct an isolated Logger instance instead of mutating the global
+        # logging manager's ``"lazyobserve.client"`` singleton so multiple clients
+        # and tests never overwrite each other's handlers or cross-talk via the
+        # global active client registry.
+        self.logger = logging.Logger("lazyobserve.client")
+        self.logger.handlers[:] = [
+            LazyObserveLogHandler(
+                tee_to_stderr=bool(client.config.tee_to_stderr),
+                client=client,
+            )
+        ]
         self.logger.propagate = False
         # NOTSET 会继承 root logger 的默认 WARNING，导致 info 级记录被过滤、handler
         # 不触发；显式设为 INFO 使所有常规记录都进入 OTLP 日志导出。
