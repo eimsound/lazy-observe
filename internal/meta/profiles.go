@@ -37,8 +37,8 @@ func (s *Store) CreateProfileMeta(
 		SetPayloadSha256(payloadSHA256).
 		SetService(service).
 		SetType(profileType).
-		SetStart(start).
-		SetEnd(end).
+		SetStart(start.UTC().Round(0)).
+		SetEnd(end.UTC().Round(0)).
 		SetSize(size).
 		SetBlobKey(blobKey).
 		SetLabels(labels).
@@ -72,10 +72,10 @@ func (s *Store) ListProfiles(ctx context.Context, projectID int, opts ProfileLis
 	}
 	// A profile belongs to the requested window when the intervals overlap.
 	if opts.Start != nil {
-		q = q.Where(profilemeta.EndGTE(*opts.Start))
+		q = q.Where(profilemeta.EndGTE(opts.Start.UTC().Round(0)))
 	}
 	if opts.End != nil {
-		q = q.Where(profilemeta.StartLTE(*opts.End))
+		q = q.Where(profilemeta.StartLTE(opts.End.UTC().Round(0)))
 	}
 	q = q.Order(orderDesc(profilemeta.FieldStart), orderDesc(profilemeta.FieldID))
 	if opts.Limit > 0 {
@@ -93,7 +93,7 @@ func (s *Store) ListExpiredProfiles(ctx context.Context, cutoff time.Time, limit
 		limit = 100
 	}
 	rows, err := s.client.ProfileMeta.Query().
-		Where(profilemeta.EndLT(cutoff)).
+		Where(profilemeta.EndLT(cutoff.UTC().Round(0))).
 		Order(orderAsc(profilemeta.FieldID)).
 		Limit(limit).
 		All(ctx)

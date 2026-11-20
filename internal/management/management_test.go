@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
@@ -167,5 +168,41 @@ func TestProjectTokenManagementProtectsSecretAndProjectOwnership(t *testing.T) {
 	if facts, err := manager.RevokeProjectToken(ctx, self.ID, issued.Token.ID); !IsErrorKind(err, ErrorProtected) ||
 		facts.FailureReason != "protected_project" {
 		t.Fatalf("protected revoke error = %v facts=%#v", err, facts)
+	}
+}
+
+func TestCreateProjectValidatesSlugPattern(t *testing.T) {
+	manager, _ := testManager(t)
+	ctx := context.Background()
+
+	invalidSlugs := []string{
+		"team/app",
+		"team app",
+		"UpperCase",
+		"-leading",
+		"_leading",
+		"a.b",
+		"项目",
+		strings.Repeat("a", 64),
+	}
+	for _, slug := range invalidSlugs {
+		if _, facts, err := manager.CreateProject(ctx, CreateProjectInput{Name: "Bad", Slug: slug}); !IsErrorKind(
+			err,
+			ErrorInvalidInput,
+		) || facts.Success {
+			t.Fatalf("slug %q: err=%v facts=%+v, want invalid_input", slug, err, facts)
+		}
+	}
+
+	validSlugs := []string{
+		"a",
+		"team-1_app",
+		strings.Repeat("z", 63),
+	}
+	for _, slug := range validSlugs {
+		got, facts, err := manager.CreateProject(ctx, CreateProjectInput{Name: "Good " + slug, Slug: slug})
+		if err != nil || !facts.Success || got.Slug != slug {
+			t.Fatalf("slug %q: got=%+v facts=%+v err=%v", slug, got, facts, err)
+		}
 	}
 }
