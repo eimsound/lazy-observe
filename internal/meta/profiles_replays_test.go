@@ -193,11 +193,18 @@ func TestIssueIDsForErrorEventsBulkAcrossDialects(t *testing.T) {
 			if err != nil || len(claimed) != 1 {
 				t.Fatalf("claim %s: %v", tc.eventID, err)
 			}
-			if _, err := store.CompleteErrorEvent(ctx, claimed[0].ID, "bulk-worker", errortrack.IssueDelta{
-				ProjectID: tc.projectID, Fingerprint: tc.fp, Title: tc.fp, Level: "error",
-				Count: 1, FirstSeen: now, LastSeen: now, LastEventID: tc.eventID,
-				AcceptedAt: now, AppliedAt: now.Add(2 * time.Second),
-			}, now.Add(2*time.Second)); err != nil {
+			if _, err := store.CompleteErrorEvent(
+				ctx,
+				claimed[0].ID,
+				"bulk-worker",
+				claimed[0].ClaimEpoch,
+				errortrack.IssueDelta{
+					ProjectID: tc.projectID, Fingerprint: tc.fp, Title: tc.fp, Level: "error",
+					Count: 1, FirstSeen: now, LastSeen: now, LastEventID: tc.eventID,
+					AcceptedAt: now, AppliedAt: now.Add(2 * time.Second),
+				},
+				now.Add(2*time.Second),
+			); err != nil {
 				t.Fatal(err)
 			}
 		}
