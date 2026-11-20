@@ -63,12 +63,14 @@ async function executeFinitePlan(
   statsErrorMessage: string,
 ) {
   const filters = buildLogsExtraFilterParams(plan.snapshot.filters);
+  const project = plan.snapshot.project;
   switch (plan.slot) {
     case "timeRange":
       return queryLogsTimeRange({
         query: plan.snapshot.query,
         start: plan.snapshot.start,
         end: plan.snapshot.end,
+        project,
         ...filters,
       }, signal);
     case "rows":
@@ -77,6 +79,7 @@ async function executeFinitePlan(
         start: plan.range.start,
         end: plan.range.end,
         limit: plan.snapshot.limit,
+        project,
         ...filters,
       }, signal);
     case "hits":
@@ -87,6 +90,7 @@ async function executeFinitePlan(
         step: plan.step,
         field: plan.groupBy,
         fieldsLimit: plan.topN,
+        project,
         ...filters,
       }, signal);
     case "stats": {
@@ -96,6 +100,7 @@ async function executeFinitePlan(
         end: plan.range.end,
         step: plan.step,
         fieldsLimit: plan.topN,
+        project,
         ...filters,
       }, signal);
       if (response.status === "error") throw new Error(response.error || statsErrorMessage);
@@ -208,6 +213,7 @@ export function useLogsWorkspace({
               query: request.query,
               offset: request.offset,
               refreshInterval: "1s",
+              project: request.project,
               ...buildLogsExtraFilterParams(request.filters),
             }, controller.signal)) {
               if (!opened) {
@@ -266,7 +272,7 @@ export function useLogsWorkspace({
     };
   }, [workspace]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     workspace.send({ type: "projectChanged", project });
   }, [project, workspace]);
 

@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { Activity, Loader2, Info } from "lucide-react";
 import { useAuth } from "@/lib/auth/auth-provider";
+import { safeRedirect } from "@/lib/auth/safe-redirect";
 import { loginErrorTranslationKey } from "@/lib/api/login-error";
 import { IS_MOCK } from "@/lib/settings";
 import { loginRoute } from "@/router";
@@ -35,7 +36,7 @@ export function LoginPage() {
       await login(username, password);
       // Hard navigation to the originally requested path (handles targets with
       // their own query string) — the session persists across the reload.
-      const target = redirect && redirect.startsWith("/") ? redirect : "/";
+      const target = safeRedirect(redirect);
       window.location.assign(target);
     } catch (err) {
       setError(t(loginErrorTranslationKey(err)));

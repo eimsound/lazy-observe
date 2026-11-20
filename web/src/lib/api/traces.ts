@@ -80,7 +80,8 @@ export interface TraceSummary {
 
 /** True when a span is flagged as errored (Jaeger convention: tag error=true). */
 export function isErrorSpan(span: JaegerSpan): boolean {
-  return span.tags.some(
+  const tags = span.tags ?? [];
+  return tags.some(
     (t) =>
       (t.key === "error" && (t.value === true || t.value === "true")) ||
       (t.key === "otel.status_code" && t.value === "ERROR") ||
@@ -88,41 +89,66 @@ export function isErrorSpan(span: JaegerSpan): boolean {
   );
 }
 
-/** The root span = the one with no CHILD_OF reference inside the trace. */
+/** The root span = the one with no non-self CHILD_OF reference inside the trace. */
 export function findRootSpan(trace: JaegerTrace): JaegerSpan | undefined {
-  const ids = new Set(trace.spans.map((s) => s.spanID));
+  const spans = trace.spans ?? [];
+  if (spans.length === 0) return undefined;
+  const ids = new Set(spans.map((s) => s.spanID));
   return (
-    trace.spans.find(
-      (s) => !s.references.some((r) => r.refType === "CHILD_OF" && ids.has(r.spanID)),
-    ) ?? trace.spans[0]
+    spans.find(
+      (s) =>
+        !(s.references ?? []).some(
+          (r) => r.refType === "CHILD_OF" && r.spanID !== s.spanID && ids.has(r.spanID),
+        ),
+    ) ?? spans[0]
   );
 }
 
-/** Collapse a full trace into a list-row summary. */
+/** Collapse a full trace into a list-row summary without spread-argument stack overflow. */
 export function summarizeTrace(trace: JaegerTrace): TraceSummary {
+  const spans = trace.spans ?? [];
+  const processes = trace.processes ?? {};
   const root = findRootSpan(trace);
-  const start = Math.min(...trace.spans.map((s) => s.startTime));
-  const end = Math.max(...trace.spans.map((s) => s.startTime + s.duration));
-  const services = new Set(
-    trace.spans.map((s) => trace.processes[s.processID]?.serviceName ?? s.processID),
-  );
+
+  let start = Infinity;
+  let end = -Infinity;
+  let errorCount = 0;
+  const services = new Set<string>();
+
+  for (const span of spans) {
+    if (Number.isFinite(span.startTime)) {
+      if (span.startTime < start) start = span.startTime;
+      const spanEnd = span.startTime + (Number.isFinite(span.duration) ? span.duration : 0);
+      if (spanEnd > end) end = spanEnd;
+    }
+    services.add(processes[span.processID]?.serviceName ?? span.processID);
+    if (isErrorSpan(span)) errorCount += 1;
+  }
+
+  if (!Number.isFinite(start)) start = 0;
+  if (!Number.isFinite(end)) end = start;
+
   return {
     traceID: trace.traceID,
     rootName: root?.operationName ?? "unknown",
-    rootService: root ? trace.processes[root.processID]?.serviceName ?? "" : "",
-    spanCount: trace.spans.length,
+    rootService: root ? processes[root.processID]?.serviceName ?? "" : "",
+    spanCount: spans.length,
     serviceCount: services.size,
-    errorCount: trace.spans.filter(isErrorSpan).length,
+    errorCount,
     startTime: start,
-    duration: end - start,
+    duration: Math.max(0, end - start),
   };
 }
 
-export async function getServices(signal?: AbortSignal): Promise<string[]> {
+export async function getServices(
+  signal?: AbortSignal,
+  project?: string,
+): Promise<string[]> {
   if (IS_MOCK) return (await loadMockTraces()).mockServices();
   const resp = await apiGet<{ data: string[] | null }>("/traces/services", {
     base: API_ROOT,
     signal,
+    project,
   });
   return resp.data ?? [];
 }
@@ -130,11 +156,12 @@ export async function getServices(signal?: AbortSignal): Promise<string[]> {
 export async function getOperations(
   service: string,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<string[]> {
   if (IS_MOCK) return (await loadMockTraces()).mockOperations(service);
   const resp = await apiGet<{ data: string[] | null }>(
     `/traces/services/${encodeURIComponent(service)}/operations`,
-    { base: API_ROOT, signal },
+    { base: API_ROOT, signal, project },
   );
   return resp.data ?? [];
 }
@@ -142,6 +169,7 @@ export async function getOperations(
 export async function searchTraces(
   params: TraceSearchParams,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<JaegerTrace[]> {
   if (IS_MOCK) return (await loadMockTraces()).mockSearchTraces(params);
   const resp = await apiGet<{ data: JaegerTrace[] | null }>("/traces/search", {
@@ -156,6 +184,7 @@ export async function searchTraces(
       tags: params.tags || undefined,
     },
     signal,
+    project,
   });
   return resp.data ?? [];
 }
@@ -163,11 +192,12 @@ export async function searchTraces(
 export async function getTrace(
   traceID: string,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<JaegerTrace> {
   if (IS_MOCK) return (await loadMockTraces()).mockGetTrace(traceID);
   const resp = await apiGet<{ data: JaegerTrace[] | null }>(
     `/traces/${encodeURIComponent(traceID)}`,
-    { base: API_ROOT, signal },
+    { base: API_ROOT, signal, project },
   );
   const trace = resp.data?.[0];
   if (!trace) throw new Error(`trace ${traceID} not found`);

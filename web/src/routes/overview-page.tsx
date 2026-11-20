@@ -20,6 +20,7 @@ import { listAlerts, eventSeverity } from "@/lib/api/alerts";
 import { listIssues, type IssueListResult } from "@/lib/api/issues";
 import { rangeById, resolveRange } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
+import { useProject } from "@/lib/project/project-provider";
 import { formatRelativeTime } from "@/lib/format";
 import type { TimeSeries } from "@/lib/api/types";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -34,27 +35,16 @@ import {
   RECENT_ISSUES_PARAMS,
   recentIssuesView,
 } from "@/routes/overview-issues";
-
-/** Latest numeric value across the first series (last non-null point). */
-function lastValue(series: TimeSeries[] | undefined): number | null {
-  const pts = series?.[0]?.points;
-  if (!pts) return null;
-  for (let i = pts.length - 1; i >= 0; i--) {
-    const v = pts[i][1];
-    if (v != null && Number.isFinite(v)) return v;
-  }
-  return null;
-}
-
-const DASH_QUERIES = {
-  requestRate: "sum(rate(http_requests_total[5m]))",
-  p95: "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
-  errorRate:
-    'sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))',
-};
+import {
+  lastSeriesValue,
+  OVERVIEW_DASH_QUERIES,
+  OVERVIEW_UNIT_SCALES,
+  scaleTimeSeries,
+} from "@/routes/overview-metrics";
 
 export function OverviewPage() {
   const { t } = useTranslation();
+  const { currentSlug: project } = useProject();
 
   // Capture a single window for the whole overview so every panel aligns.
   const window = useMemo(() => {
@@ -77,28 +67,34 @@ export function OverviewPage() {
         <MetricPanel
           icon={<Gauge className="size-4" />}
           title={t("overview.cardRequestRate")}
-          query={DASH_QUERIES.requestRate}
+          query={OVERVIEW_DASH_QUERIES.requestRate}
           unit={t("overview.unitReqs")}
+          scale={OVERVIEW_UNIT_SCALES.requestRate}
+          project={project}
           window={window}
         />
         <MetricPanel
           icon={<Timer className="size-4" />}
           title={t("overview.cardP95")}
-          query={DASH_QUERIES.p95}
+          query={OVERVIEW_DASH_QUERIES.p95}
           unit={t("overview.unitMs")}
+          scale={OVERVIEW_UNIT_SCALES.p95SecondsToMs}
+          project={project}
           window={window}
         />
         <MetricPanel
           icon={<Percent className="size-4" />}
           title={t("overview.cardErrorRate")}
-          query={DASH_QUERIES.errorRate}
+          query={OVERVIEW_DASH_QUERIES.errorRate}
           unit={t("overview.unitPercent")}
+          scale={OVERVIEW_UNIT_SCALES.errorRatioToPercent}
+          project={project}
           window={window}
         />
 
-        <ActiveAlertsCard />
-        <LogVolumeCard window={window} />
-        <IssuesCard />
+        <ActiveAlertsCard project={project} />
+        <LogVolumeCard project={project} window={window} />
+        <IssuesCard project={project} />
       </div>
     </PageContainer>
   );
@@ -115,22 +111,34 @@ function MetricPanel({
   title,
   query,
   unit,
+  scale = 1,
+  project,
   window,
 }: {
   icon: React.ReactNode;
   title: string;
   query: string;
   unit: string;
+  scale?: number;
+  project: string;
   window: Window;
 }) {
   const { t } = useTranslation();
   const result = useQuery<TimeSeries[]>({
-    queryKey: ["overview", query, window.end],
+    queryKey: ["overview", project, query, window.end],
     queryFn: ({ signal }) =>
-      queryRange({ query, start: window.start, end: window.end, step: window.step }, signal),
+      queryRange(
+        { query, start: window.start, end: window.end, step: window.step },
+        signal,
+        project,
+      ),
   });
 
-  const value = lastValue(result.data);
+  const scaledSeries = useMemo(
+    () => scaleTimeSeries(result.data, scale),
+    [result.data, scale],
+  );
+  const value = lastSeriesValue(scaledSeries);
 
   return (
     <Card>
@@ -157,8 +165,8 @@ function MetricPanel({
       <CardContent className="p-2 pt-1">
         {result.isLoading ? (
           <Skeleton className="h-[120px] w-full" />
-        ) : result.data && result.data.length > 0 ? (
-          <TimeSeriesChart series={result.data.slice(0, 1)} height={120} />
+        ) : scaledSeries && scaledSeries.length > 0 ? (
+          <TimeSeriesChart series={scaledSeries.slice(0, 1)} height={120} />
         ) : (
           <div className="h-[120px]" />
         )}
@@ -167,10 +175,10 @@ function MetricPanel({
   );
 }
 
-function ActiveAlertsCard() {
+function ActiveAlertsCard({ project }: { project: string }) {
   const { t } = useTranslation();
   const alerts = useQuery({
-    queryKey: ["overview", "alerts"],
+    queryKey: ["overview", project, "alerts"],
     queryFn: ({ signal }) => listAlerts("firing", signal),
     refetchInterval: 30_000,
   });
@@ -229,12 +237,12 @@ function ActiveAlertsCard() {
   );
 }
 
-function LogVolumeCard({ window }: { window: Window }) {
+function LogVolumeCard({ project, window }: { project: string; window: Window }) {
   const { t } = useTranslation();
   const hits = useQuery<LogsHistogram>({
-    queryKey: ["overview", "logs-hits", window.end],
+    queryKey: ["overview", project, "logs-hits", window.end],
     queryFn: ({ signal }) =>
-      logsHits({ query: "*", start: window.start, end: window.end, step: 60 }, signal),
+      logsHits({ query: "*", start: window.start, end: window.end, step: 60, project }, signal),
   });
 
   return (
@@ -263,10 +271,10 @@ function LogVolumeCard({ window }: { window: Window }) {
   );
 }
 
-function IssuesCard() {
+function IssuesCard({ project }: { project: string }) {
   const { t, i18n } = useTranslation();
   const query = useQuery<IssueListResult>({
-    queryKey: ["overview", "issues", RECENT_ISSUES_PARAMS],
+    queryKey: ["overview", project, "issues", RECENT_ISSUES_PARAMS],
     queryFn: ({ signal }) => listIssues(RECENT_ISSUES_PARAMS, signal),
     retry: false,
     refetchInterval: 30_000,

@@ -6,6 +6,7 @@ import "@/lib/i18n";
 import { ThemeProvider } from "@/lib/theme/theme-provider";
 import { AuthProvider } from "@/lib/auth/auth-provider";
 import { handleSessionExpiry } from "@/lib/auth/session-expiry";
+import { registerSessionExpiryHandler } from "@/lib/api/client";
 import { SidebarProvider } from "@/hooks/use-sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { router } from "@/router";
@@ -23,6 +24,8 @@ const queryClient: QueryClient = new QueryClient({
     },
   },
 });
+
+registerSessionExpiryHandler((error) => handleSessionExpiry(queryClient, error));
 
 const rootEl = document.getElementById("root");
 if (!rootEl) throw new Error("#root not found");

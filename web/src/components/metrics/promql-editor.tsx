@@ -46,8 +46,9 @@ import { tags } from "@lezer/highlight";
 import { parser } from "@prometheus-io/lezer-promql";
 import { Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { labelNames, labelValues, metricNames } from "@/lib/api/metrics";
-import { getProjectSlug } from "@/lib/settings";
+import { useProject } from "@/lib/project/project-provider";
 import {
   analyzePromQLContext,
   insertPromQLSuggestion,
@@ -74,9 +75,7 @@ interface PromQLEditorProps {
 
 const MAX_SUGGESTIONS = 50;
 const AUTOCOMPLETE_QUERY_LIMIT = 1_000;
-const AUTOCOMPLETE_CACHE_LIMIT = 1_000;
 const externalValue = Annotation.define<boolean>();
-const autocompleteCache = new Map<string, string[]>();
 
 const promQLLanguage = LRLanguage.define({
   parser: parser.configure({ top: "PromQL" }),
@@ -159,62 +158,56 @@ const escapeMatcher = (value: string) => value.replace(/\\/g, "\\\\").replace(/"
 const escapeRegex = (value: string) =>
   value.replace(/[\\.*+?()[\]{}|^$]/g, "\\$&").replace(/"/g, '\\"');
 
-function cacheGet(key: string) {
-  const value = autocompleteCache.get(key);
-  if (!value) return undefined;
-  autocompleteCache.delete(key);
-  autocompleteCache.set(key, value);
-  return value;
-}
-
-function cachePut(key: string, value: string[]) {
-  autocompleteCache.delete(key);
-  autocompleteCache.set(key, value);
-  while (autocompleteCache.size > AUTOCOMPLETE_CACHE_LIMIT) {
-    const oldest = autocompleteCache.keys().next().value;
-    if (oldest === undefined) break;
-    autocompleteCache.delete(oldest);
-  }
-}
-
 async function fetchSuggestions(
+  queryClient: QueryClient,
   context: PromQLContext,
   range: ResolvedMetricsRange,
   project: string,
   signal: AbortSignal,
-) {
+): Promise<string[]> {
   const autocompleteRange = metricsAutocompleteRange(range);
   const base = {
     ...autocompleteRange,
     limit: AUTOCOMPLETE_QUERY_LIMIT,
+    project,
   };
   const metric = context.metric ? `__name__="${escapeMatcher(context.metric)}"` : "";
   const escapedToken = escapeRegex(context.token);
-  let cacheKey = "";
-  let fetcher: (() => Promise<string[]>) | undefined;
 
   if (context.kind === "metric" && context.token) {
     const match = `{__name__=~".*${escapedToken}.*"}`;
-    cacheKey = JSON.stringify({ project, kind: context.kind, ...base, match });
-    fetcher = () => metricNames({ ...base, match }, signal);
-  } else if (context.kind === "label") {
+    return queryClient.fetchQuery({
+      queryKey: ["promql-autocomplete", project, "metric", autocompleteRange.start, autocompleteRange.end, match],
+      staleTime: 60_000,
+      retry: false,
+      queryFn: ({ signal: querySignal }) =>
+        metricNames({ ...base, match }, AbortSignal.any([signal, querySignal])),
+    });
+  }
+  if (context.kind === "label") {
     const matchers = [metric, ...context.matchers].filter(Boolean).join(",");
     const match = matchers ? `{${matchers}}` : undefined;
-    cacheKey = JSON.stringify({ project, kind: context.kind, ...base, match });
-    fetcher = () => labelNames({ ...base, match }, signal);
-  } else if (context.kind === "value" && context.label) {
+    return queryClient.fetchQuery({
+      queryKey: ["promql-autocomplete", project, "label", autocompleteRange.start, autocompleteRange.end, match ?? ""],
+      staleTime: 60_000,
+      retry: false,
+      queryFn: ({ signal: querySignal }) =>
+        labelNames({ ...base, match }, AbortSignal.any([signal, querySignal])),
+    });
+  }
+  if (context.kind === "value" && context.label) {
     const currentValue = `${context.label}=~".*${escapedToken}.*"`;
     const match = `{${[metric, ...context.matchers, currentValue].filter(Boolean).join(",")}}`;
-    cacheKey = JSON.stringify({ project, kind: context.kind, label: context.label, ...base, match });
-    fetcher = () => labelValues(context.label, { ...base, match }, signal);
+    return queryClient.fetchQuery({
+      queryKey: ["promql-autocomplete", project, "value", context.label, autocompleteRange.start, autocompleteRange.end, match],
+      staleTime: 60_000,
+      retry: false,
+      queryFn: ({ signal: querySignal }) =>
+        labelValues(context.label, { ...base, match }, AbortSignal.any([signal, querySignal])),
+    });
   }
 
-  if (!fetcher) return [];
-  const cached = cacheGet(cacheKey);
-  if (cached) return cached;
-  const result = await fetcher();
-  cachePut(cacheKey, result);
-  return result;
+  return [];
 }
 
 function applySuggestion(
@@ -262,12 +255,15 @@ export const PromQLEditor = forwardRef<PromQLEditorHandle, PromQLEditorProps>(fu
   onRun,
 }, forwardedRef) {
   const { t, i18n } = useTranslation();
+  const queryClient = useQueryClient();
+  const { currentSlug: project } = useProject();
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const onRunRef = useRef(onRun);
   const rangeRef = useRef(range);
-  const projectRef = useRef(getProjectSlug());
+  const projectRef = useRef(project);
+  const queryClientRef = useRef(queryClient);
   const tRef = useRef(t);
   // The editor is created once per id; later value changes are synced by the
   // effect below, so creation reads the latest value through a ref.
@@ -276,9 +272,17 @@ export const PromQLEditor = forwardRef<PromQLEditorHandle, PromQLEditorProps>(fu
   onChangeRef.current = onChange;
   onRunRef.current = onRun;
   rangeRef.current = range;
-  projectRef.current = getProjectSlug();
+  projectRef.current = project;
+  queryClientRef.current = queryClient;
   tRef.current = t;
   valueRef.current = value;
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (view && completionStatus(view.state)) {
+      closeCompletion(view);
+    }
+  }, [project]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -291,19 +295,21 @@ export const PromQLEditor = forwardRef<PromQLEditorHandle, PromQLEditorProps>(fu
       const controller = new AbortController();
       cmContext.addEventListener("abort", () => controller.abort(), { onDocChange: true });
 
+      const requestProject = projectRef.current;
       let remote: string[] = [];
       try {
         remote = await fetchSuggestions(
+          queryClientRef.current,
           context,
           rangeRef.current,
-          projectRef.current,
+          requestProject,
           controller.signal,
         );
       } catch (error) {
         if (controller.signal.aborted) return null;
         console.error("Unable to load PromQL suggestions:", error);
       }
-      if (cmContext.aborted) return null;
+      if (cmContext.aborted || projectRef.current !== requestProject) return null;
 
       const remoteKind = context.kind === "metric"
         ? "metric"

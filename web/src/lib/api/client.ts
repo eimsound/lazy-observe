@@ -33,6 +33,10 @@ export interface RequestOptions {
   signal?: AbortSignal;
   /** Override the base path (defaults to /api/v1). */
   base?: string;
+  /** Explicit project slug override for `X-LO-Project` (prevents project-switch races). */
+  project?: string;
+  /** Skip the global 401 session-expiry hook (used by auth endpoints themselves). */
+  skipSessionExpiry?: boolean;
 }
 
 export type FormFieldValue = string | number | boolean;
@@ -41,15 +45,36 @@ export type FormFields = Record<
   FormFieldValue | readonly FormFieldValue[] | null | undefined
 >;
 
-export interface FormRequestOptions extends Pick<RequestOptions, "base" | "signal"> {
+export interface FormRequestOptions
+  extends Pick<RequestOptions, "base" | "signal" | "project" | "skipSessionExpiry"> {
   /** Value for the Accept header. It is intentionally optional for raw streams. */
   accept?: string;
 }
 
+type SessionExpiryHandler = (error: ApiError) => void;
+let sessionExpiryHandler: SessionExpiryHandler | null = null;
+
+/**
+ * Register a global handler notified whenever any transport call fails with an
+ * HTTP error. Ensures direct (non-React-Query) calls such as Live Tail, log
+ * exports, PromQL prettify, and AI assistant queries still trigger session
+ * expiry handling on 401.
+ */
+export function registerSessionExpiryHandler(handler: SessionExpiryHandler | null): void {
+  sessionExpiryHandler = handler;
+}
+
+function handleTransportError(error: ApiError, skipSessionExpiry?: boolean): never {
+  if (!skipSessionExpiry) {
+    sessionExpiryHandler?.(error);
+  }
+  throw error;
+}
+
 /** Attach the selected project scope in one place. */
-function identityHeaders(): Record<string, string> {
+function identityHeaders(projectOverride?: string): Record<string, string> {
   const headers: Record<string, string> = {};
-  const project = getProjectSlug();
+  const project = projectOverride !== undefined ? projectOverride : getProjectSlug();
   if (project) headers["X-LO-Project"] = project;
   return headers;
 }
@@ -97,7 +122,7 @@ function toError(body: unknown, status: number): ApiError {
 export async function apiGet<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = {
     Accept: "application/json",
-    ...identityHeaders(),
+    ...identityHeaders(opts.project),
   };
 
   let res: Response;
@@ -114,7 +139,7 @@ export async function apiGet<T>(path: string, opts: RequestOptions = {}): Promis
   }
 
   const body = await parse(res);
-  if (!res.ok) throw toError(body, res.status);
+  if (!res.ok) handleTransportError(toError(body, res.status), opts.skipSessionExpiry);
   return body as T;
 }
 
@@ -127,7 +152,7 @@ export async function apiSend<T>(
 ): Promise<T> {
   const headers: Record<string, string> = {
     Accept: "application/json",
-    ...identityHeaders(),
+    ...identityHeaders(opts.project),
     ...csrfHeaders(),
   };
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -147,7 +172,7 @@ export async function apiSend<T>(
   }
 
   const parsed = await parse(res);
-  if (!res.ok) throw toError(parsed, res.status);
+  if (!res.ok) handleTransportError(toError(parsed, res.status), opts.skipSessionExpiry);
   return parsed as T;
 }
 
@@ -178,7 +203,7 @@ export async function apiPostFormResponse(
 ): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/x-www-form-urlencoded",
-    ...identityHeaders(),
+    ...identityHeaders(opts.project),
   };
   if (opts.accept) headers.Accept = opts.accept;
 
@@ -196,7 +221,9 @@ export async function apiPostFormResponse(
     throw new ApiError((e as Error).message || "network error", 0);
   }
 
-  if (!res.ok) throw toError(await parse(res), res.status);
+  if (!res.ok) {
+    handleTransportError(toError(await parse(res), res.status), opts.skipSessionExpiry);
+  }
   return res;
 }
 

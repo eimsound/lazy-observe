@@ -12,7 +12,9 @@ import type {
   AiStatus,
   AiTestResult,
   AssistantAnswer,
+  AssistantQueryRequest,
   AssistantResult,
+  AssistantTimeRange,
   IssueAiAnalysis,
   ProbableCause,
 } from "./ai";
@@ -173,8 +175,33 @@ function explainFor(kind: "metrics" | "logs", query: string): string {
     : `This LogsQL expression retrieves logs relevant to your question. It scopes the target stream and matches keywords, returning the most recent hits.`;
 }
 
-async function buildMetricsResult(query: string, timeRange?: string): Promise<AssistantResult> {
-  const { start, end, step } = resolveRange(rangeById(timeRange ?? "1h"));
+function resolveMockRange(timeRange?: string | AssistantTimeRange): {
+  start: number;
+  end: number;
+  step: number;
+} {
+  if (!timeRange || typeof timeRange === "string") {
+    return resolveRange(rangeById(timeRange ?? "1h"));
+  }
+  const parseSec = (value: string | number): number => {
+    if (typeof value === "number") return value;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric;
+    return Math.floor(dayjs(value).valueOf() / 1_000);
+  };
+  const start = parseSec(timeRange.start);
+  const end = parseSec(timeRange.end);
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+    return { start, end, step: Math.max(1, Math.floor((end - start) / 120)) };
+  }
+  return resolveRange(rangeById("1h"));
+}
+
+async function buildMetricsResult(
+  query: string,
+  timeRange?: string | AssistantTimeRange,
+): Promise<AssistantResult> {
+  const { start, end, step } = resolveMockRange(timeRange);
   const resp = mockQueryRange({ query, start, end, step });
   const series: TimeSeries[] =
     resp.status === "success"
@@ -190,17 +217,18 @@ async function buildMetricsResult(query: string, timeRange?: string): Promise<As
   return { kind: "metrics", series };
 }
 
-async function buildLogsResult(query: string, timeRange?: string): Promise<AssistantResult> {
-  const { start, end } = resolveRange(rangeById(timeRange ?? "1h"));
+async function buildLogsResult(
+  query: string,
+  timeRange?: string | AssistantTimeRange,
+): Promise<AssistantResult> {
+  const { start, end } = resolveMockRange(timeRange);
   const rows = await mockQueryLogs({ query, start, end, limit: 20 });
   return { kind: "logs", rows };
 }
 
-export async function mockAssistantQuery(req: {
-  question: string;
-  signal?: AiSignal;
-  time_range?: string;
-}): Promise<AssistantAnswer> {
+export async function mockAssistantQuery(
+  req: AssistantQueryRequest,
+): Promise<AssistantAnswer> {
   ensureEnabled();
   const question = req.question.trim();
   const kind = resolveSignal(question, req.signal ?? "auto");

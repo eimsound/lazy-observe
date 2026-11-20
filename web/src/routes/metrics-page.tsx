@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useSearch } from "@tanstack/react-router";
+import { useRouter, useSearch } from "@tanstack/react-router";
 import {
   AlertCircle,
   BarChart3,
@@ -32,7 +32,8 @@ import type {
   MetricsQueryEnvelope,
   TimeSeries,
 } from "@/lib/api/types";
-import { getProjectSlug, IS_MOCK } from "@/lib/settings";
+import { IS_MOCK } from "@/lib/settings";
+import { useProject } from "@/lib/project/project-provider";
 import dayjs, { dayjsLocale } from "@/lib/dayjs";
 import {
   clearMetricsHistory,
@@ -53,6 +54,7 @@ import {
   type MetricsResolution,
   type MetricsTableMode,
   type MetricsTimeFormat,
+  type ResolvedMetricsRange,
 } from "@/lib/metrics-query";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
@@ -93,6 +95,8 @@ interface QueryPanelState {
 interface ExecutedQuery {
   query: string;
   runId: number;
+  /** Time window frozen when the query was executed or its range changed. */
+  range: ResolvedMetricsRange;
 }
 
 const DEFAULT_RANGE = METRICS_RANGE_PRESETS.find((item) => item.presetId === "1h") ?? METRICS_RANGE_PRESETS[0];
@@ -168,7 +172,11 @@ function initialMetricsState(
     panels.push(panel);
     const query = panel.query.trim();
     if (query && params.has(`g${index}.expr`)) {
-      executed[panel.id] = { query, runId: panels.length };
+      executed[panel.id] = {
+        query,
+        runId: panels.length,
+        range: resolveMetricsRange(panel.range),
+      };
     }
   }
   if (panels.length > 0) return { panels, executed };
@@ -183,10 +191,12 @@ function initialMetricsState(
   return { panels: [panel], executed };
 }
 
-function syncPanelsToURL(panels: QueryPanelState[]) {
-  const url = new URL(window.location.href);
+function buildPanelsURL(currentHref: string, panels: QueryPanelState[]): string {
+  const url = new URL(currentHref, window.location.origin);
   for (const key of [...url.searchParams.keys()]) {
-    if (/^g\d+\./.test(key) || key === "q" || key === "run") url.searchParams.delete(key);
+    if (/^g\d+\./.test(key) || key === "q" || key === "run" || key === "start" || key === "end") {
+      url.searchParams.delete(key);
+    }
   }
   panels.forEach((panel, index) => {
     const prefix = `g${index}.`;
@@ -220,12 +230,14 @@ function syncPanelsToURL(panels: QueryPanelState[]) {
     );
     if (panel.yAxisZero) url.searchParams.set(prefix + "y_axis_min", "0");
   });
-  window.history.replaceState(window.history.state, "", url);
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 export function MetricsPage() {
   const { t } = useTranslation();
+  const router = useRouter();
   const search = useSearch({ strict: false }) as MetricsEvidenceSearch;
+  const { currentSlug: project } = useProject();
   const initial = useRef<InitialMetricsState | null>(null);
   if (!initial.current) {
     initial.current = initialMetricsState(
@@ -236,17 +248,37 @@ export function MetricsPage() {
     );
   }
   const [panels, setPanels] = useState<QueryPanelState[]>(initial.current.panels);
+  const panelsRef = useRef(panels);
+  panelsRef.current = panels;
   const nextPanelId = useRef(initial.current.panels.length + 1);
   const nextRunId = useRef(initial.current.panels.length + 1);
-  const project = getProjectSlug();
+  const projectRef = useRef(project);
+  projectRef.current = project;
   const [localTime, setLocalTime] = useState(initialLocalTime);
   const [executed, setExecuted] = useState<Record<string, ExecutedQuery>>(initial.current.executed);
   const [history, setHistory] = useState<MetricsHistoryEntry[]>(() => getMetricsHistory(project));
   const [prettifying, setPrettifying] = useState<Record<string, boolean>>({});
   const [editorErrors, setEditorErrors] = useState<Record<string, string>>({});
+  const previousProject = useRef(project);
+  const lastDeepLinkKey = useRef<string | null>(null);
 
-  useEffect(() => setHistory(getMetricsHistory(project)), [project]);
-  useEffect(() => syncPanelsToURL(panels), [panels]);
+  useEffect(() => {
+    setHistory(getMetricsHistory(project));
+    if (previousProject.current !== project) {
+      previousProject.current = project;
+      setPrettifying({});
+      setEditorErrors({});
+    }
+  }, [project]);
+
+  useEffect(() => {
+    const currentHref = router.history.location.href;
+    const target = buildPanelsURL(currentHref, panels);
+    if (target !== currentHref) {
+      router.history.replace(target, router.history.location.state);
+    }
+  }, [panels, router]);
+
   useEffect(() => {
     try {
       localStorage.setItem(LOCAL_TIME_KEY, String(localTime));
@@ -257,27 +289,74 @@ export function MetricsPage() {
 
   function updatePanel(id: string, patch: Partial<QueryPanelState>) {
     setPanels((current) => current.map((panel) => panel.id === id ? { ...panel, ...patch } : panel));
+    if (patch.range) {
+      const nextRange = resolveMetricsRange(patch.range);
+      setExecuted((current) => (
+        current[id]
+          ? { ...current, [id]: { ...current[id], range: nextRange } }
+          : current
+      ));
+    }
   }
 
   function execute(id: string) {
     const panel = panels.find((item) => item.id === id);
     if (!panel?.query.trim()) return;
+    const trimmed = panel.query.trim();
     setExecuted((current) => ({
       ...current,
-      [id]: { query: panel.query.trim(), runId: nextRunId.current++ },
+      [id]: {
+        query: trimmed,
+        runId: nextRunId.current++,
+        range: resolveMetricsRange(panel.range),
+      },
     }));
-    setHistory(pushMetricsHistory(project, [panel.query]));
+    setHistory(pushMetricsHistory(project, [trimmed]));
   }
 
-  // A deep link (?q=…&run=1) executes the first panel once, on arrival.
-  const executeRef = useRef(execute);
-  executeRef.current = execute;
-  const deepLinkHandled = useRef(false);
+  // Deep links (?q=…&run=1[&start=…&end=…]) work both on initial arrival and
+  // for same-page navigation (e.g. "Open in Metrics" from the AI assistant).
   useEffect(() => {
-    if (deepLinkHandled.current) return;
-    deepLinkHandled.current = true;
-    if (search.q && search.run === "1") executeRef.current("query-1");
-  }, [search.q, search.run]);
+    if (!search.q) {
+      lastDeepLinkKey.current = null;
+      return;
+    }
+    const key = JSON.stringify([search.q, search.run ?? "", search.start ?? null, search.end ?? null]);
+    if (lastDeepLinkKey.current === key) return;
+    lastDeepLinkKey.current = key;
+
+    const trimmed = search.q.trim();
+    const evidenceRange: MetricsRange | undefined =
+      search.start !== undefined && search.end !== undefined
+        ? {
+          mode: "absolute",
+          startMs: search.start * 1_000,
+          endMs: search.end * 1_000,
+        }
+        : undefined;
+
+    const currentPanels = panelsRef.current;
+    const target = currentPanels[0] ?? newPanel("query-1");
+    const nextRange = evidenceRange ?? target.range;
+    const updated: QueryPanelState = {
+      ...target,
+      query: search.q ?? "",
+      range: nextRange,
+    };
+    setPanels(currentPanels.length > 0 ? [updated, ...currentPanels.slice(1)] : [updated]);
+    if (search.run === "1" && trimmed) {
+      const frozenRange = resolveMetricsRange(nextRange);
+      setExecuted((prev) => ({
+        ...prev,
+        [updated.id]: {
+          query: trimmed,
+          runId: nextRunId.current++,
+          range: frozenRange,
+        },
+      }));
+      setHistory(pushMetricsHistory(projectRef.current, [trimmed]));
+    }
+  }, [search.q, search.run, search.start, search.end]);
 
   function addPanel(afterId?: string, duplicate?: QueryPanelState) {
     const id = `query-${nextPanelId.current++}`;
@@ -302,17 +381,23 @@ export function MetricsPage() {
   async function prettify(id: string) {
     const panel = panels.find((item) => item.id === id);
     if (!panel?.query.trim()) return;
+    const requestProject = project;
     setPrettifying((current) => ({ ...current, [id]: true }));
     setEditorErrors((current) => ({ ...current, [id]: "" }));
     try {
-      updatePanel(id, { query: await prettifyPromQL(panel.query.trim()) });
+      const formatted = await prettifyPromQL(panel.query.trim(), undefined, requestProject);
+      if (projectRef.current !== requestProject) return;
+      updatePanel(id, { query: formatted });
     } catch (error) {
+      if (projectRef.current !== requestProject) return;
       setEditorErrors((current) => ({
         ...current,
         [id]: error instanceof Error ? error.message : t("metrics.prettifyFailed"),
       }));
     } finally {
-      setPrettifying((current) => ({ ...current, [id]: false }));
+      if (projectRef.current === requestProject) {
+        setPrettifying((current) => ({ ...current, [id]: false }));
+      }
     }
   }
 
@@ -322,7 +407,7 @@ export function MetricsPage() {
     staleTime: 30_000,
     refetchInterval: 60_000,
     retry: false,
-    queryFn: ({ signal }) => queryServerClock(signal),
+    queryFn: ({ signal }) => queryServerClock(signal, project),
   });
   const driftSeconds = serverTime.data?.driftSeconds ?? 0;
 
@@ -358,6 +443,7 @@ export function MetricsPage() {
         {panels.map((panel) => (
           <QueryCard
             key={panel.id}
+            project={project}
             panel={panel}
             executed={executed[panel.id]}
             history={history}
@@ -368,7 +454,14 @@ export function MetricsPage() {
             onChange={(patch) => updatePanel(panel.id, patch)}
             onExecute={() => execute(panel.id)}
             onRetry={() => setExecuted((current) => current[panel.id]
-              ? { ...current, [panel.id]: { ...current[panel.id], runId: nextRunId.current++ } }
+              ? {
+                ...current,
+                [panel.id]: {
+                  ...current[panel.id],
+                  runId: nextRunId.current++,
+                  range: resolveMetricsRange(panel.range),
+                },
+              }
               : current)}
             onPrettify={() => void prettify(panel.id)}
             onDuplicate={() => addPanel(panel.id, panel)}
@@ -386,6 +479,7 @@ export function MetricsPage() {
 }
 
 function QueryCard({
+  project,
   panel,
   executed,
   history,
@@ -402,6 +496,7 @@ function QueryCard({
   onLocalTimeChange,
   onClearHistory,
 }: {
+  project: string;
   panel: QueryPanelState;
   executed?: ExecutedQuery;
   history: MetricsHistoryEntry[];
@@ -422,7 +517,9 @@ function QueryCard({
   const editorRef = useRef<PromQLEditorHandle>(null);
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const resolvedRange = resolveMetricsRange(panel.range);
+  // Resolve autocomplete/explorer range only when the range selection itself
+  // changes, never on every keystroke in the PromQL editor.
+  const autocompleteRange = useMemo(() => resolveMetricsRange(panel.range), [panel.range]);
 
   return (
     <Card className="overflow-visible">
@@ -432,7 +529,7 @@ function QueryCard({
             ref={editorRef}
             id={`${panel.id}-promql`}
             value={panel.query}
-            range={resolvedRange}
+            range={autocompleteRange}
             onChange={(query) => onChange({ query })}
             onRun={onExecute}
             actions={(
@@ -504,6 +601,7 @@ function QueryCard({
               />
             </div>
             <QueryResult
+              project={project}
               panel={panel}
               executed={executed}
               localTime={localTime}
@@ -526,6 +624,7 @@ function QueryCard({
               onLocalTimeChange={onLocalTimeChange}
             />
             <QueryResult
+              project={project}
               panel={panel}
               executed={executed}
               localTime={localTime}
@@ -537,7 +636,7 @@ function QueryCard({
 
       <MetricsExplorer
         open={explorerOpen}
-        range={resolvedRange}
+        range={autocompleteRange}
         onOpenChange={setExplorerOpen}
         onInsert={(selector) => editorRef.current?.insertText(selector)}
       />
@@ -553,28 +652,51 @@ function QueryCard({
   );
 }
 
-function QueryResult({ panel, executed, localTime, onRetry }: {
+function QueryResult({ project, panel, executed, localTime, onRetry }: {
+  project: string;
   panel: QueryPanelState;
   executed?: ExecutedQuery;
   localTime: boolean;
   onRetry: () => void;
 }) {
   const { t } = useTranslation();
-  const range = resolveMetricsRange(panel.range);
-  const step = effectiveMetricsStep(panel.resolution, range.end - range.start);
+  const range = executed?.range;
+  const step = range ? effectiveMetricsStep(panel.resolution, range.end - range.start) : 1;
   const graph = useQuery<MetricsQueryEnvelope<TimeSeries[]>, ApiError>({
-    queryKey: ["metrics-panel", panel.id, "graph", executed?.query, range.start, range.end, step, executed?.runId],
-    enabled: panel.activeTab === "graph" && Boolean(executed),
+    queryKey: [
+      "metrics-panel",
+      project,
+      panel.id,
+      "graph",
+      executed?.query,
+      range?.start,
+      range?.end,
+      step,
+      executed?.runId,
+    ],
+    enabled: panel.activeTab === "graph" && Boolean(executed && range),
     retry: false,
     placeholderData: (previous) => previous,
-    queryFn: ({ signal }) => queryRangeDetailed({ query: executed!.query, ...range, step }, signal),
+    queryFn: ({ signal }) => queryRangeDetailed(
+      { query: executed!.query, start: range!.start, end: range!.end, step },
+      signal,
+      project,
+    ),
   });
   const table = useQuery<MetricsQueryEnvelope<MetricTableResult>, ApiError>({
-    queryKey: ["metrics-panel", panel.id, "table", executed?.query, range.end, executed?.runId],
-    enabled: panel.activeTab === "table" && Boolean(executed),
+    queryKey: [
+      "metrics-panel",
+      project,
+      panel.id,
+      "table",
+      executed?.query,
+      range?.end,
+      executed?.runId,
+    ],
+    enabled: panel.activeTab === "table" && Boolean(executed && range),
     retry: false,
     placeholderData: (previous) => previous,
-    queryFn: ({ signal }) => queryInstantDetailed(executed!.query, range.end, signal),
+    queryFn: ({ signal }) => queryInstantDetailed(executed!.query, range!.end, signal, project),
   });
   const result = panel.activeTab === "table" ? table : graph;
   const count = panel.activeTab === "table"
@@ -587,7 +709,9 @@ function QueryResult({ panel, executed, localTime, onRetry }: {
     isEmpty: count === 0,
   });
 
-  if (!executed) return <ResultMessage icon={<Search />} title={t("metrics.initialTitle")} desc={t("metrics.initialDesc")} />;
+  if (!executed || !range) {
+    return <ResultMessage icon={<Search />} title={t("metrics.initialTitle")} desc={t("metrics.initialDesc")} />;
+  }
   if (viewState === "pending") return <div className="space-y-2"><Skeleton className="h-8 w-full" /><Skeleton className="h-[320px] w-full" /></div>;
   if (viewState === "error") {
     return <ResultMessage icon={<AlertCircle className="text-destructive" />} title={t("metrics.errorTitle")} desc={t("common.queryErrorDesc")} action={<Button variant="outline" size="sm" onClick={onRetry}>{t("common.retry")}</Button>} />;

@@ -53,10 +53,10 @@ export function SpanDetailDrawer({
 }: SpanDetailDrawerProps) {
   const { t } = useTranslation();
   const { start, total } = bounds(trace);
-  const process = span ? trace.processes[span.processID] : undefined;
+  const process = span ? trace.processes?.[span.processID] : undefined;
   const service = process?.serviceName ?? span?.processID ?? "";
   const errored = span ? isErrorSpan(span) : false;
-  const genAI = span ? extractGenAISpanDetails(span.tags) : null;
+  const genAI = span ? extractGenAISpanDetails(span.tags ?? []) : null;
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -144,7 +144,7 @@ export function SpanDetailDrawer({
                   {t("traces.tagsSection")}
                 </h3>
                 <KeyValueTable
-                  rows={span.tags
+                  rows={(span.tags ?? [])
                     .filter((tag) => !GEN_AI_CONTENT_TAGS.has(tag.key))
                     .map((tag) => ({ key: tag.key, value: String(tag.value) }))}
                 />
@@ -159,7 +159,7 @@ export function SpanDetailDrawer({
                   <KeyValueTable
                     rows={[
                       { key: "serviceName", value: process.serviceName },
-                      ...process.tags.map((tag) => ({ key: tag.key, value: String(tag.value) })),
+                      ...(process.tags ?? []).map((tag) => ({ key: tag.key, value: String(tag.value) })),
                     ]}
                   />
                 </section>

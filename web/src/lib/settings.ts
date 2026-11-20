@@ -7,8 +7,10 @@
  */
 
 import { createProjectScope, type SlugStorage } from "@/lib/project/project-scope";
+import { registerLocalSignOutCleanup } from "@/lib/auth/session-expiry";
 
 const scope = createProjectScope(browserStorage());
+registerLocalSignOutCleanup(() => scope.set(""));
 
 function browserStorage(): SlugStorage | null {
   try {

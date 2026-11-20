@@ -7,8 +7,7 @@ import {
   type Role,
   type User,
 } from "@/lib/api/auth";
-import { setProjectSlug } from "@/lib/settings";
-import { AUTH_QUERY_KEY, signOutLocally } from "./session-expiry";
+import { AUTH_QUERY_KEY, performLogout } from "./session-expiry";
 
 /**
  * Session state. Wraps the whole app (above the router) so the login page and
@@ -63,10 +62,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         await queryClient.invalidateQueries({ queryKey: AUTH_KEY });
       },
       logout: async () => {
-        await apiLogout();
-        setProjectSlug("");
-        // Drop everything cached for this user, not just the project list.
-        signOutLocally(queryClient);
+        await performLogout(apiLogout, queryClient);
       },
     };
   }, [query.data, query.isLoading, queryClient]);

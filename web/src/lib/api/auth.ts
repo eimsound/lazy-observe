@@ -70,7 +70,11 @@ function writeMockSession(user: User | null): void {
 export async function getMe(signal?: AbortSignal): Promise<User | null> {
   if (IS_MOCK) return delay(readMockSession(), 150);
   try {
-    return await apiGet<User>("/auth/me", { base: API_ROOT, signal });
+    return await apiGet<User>("/auth/me", {
+      base: API_ROOT,
+      signal,
+      skipSessionExpiry: true,
+    });
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) return null;
     throw e;
@@ -86,7 +90,12 @@ export async function login(username: string, password: string): Promise<User> {
     writeMockSession(user);
     return delay(user, 250);
   }
-  await apiSend<void>("POST", "/auth/login", { username, password }, { base: API_ROOT });
+  await apiSend<void>(
+    "POST",
+    "/auth/login",
+    { username, password },
+    { base: API_ROOT, skipSessionExpiry: true },
+  );
   const me = await getMe();
   if (!me) throw new ApiError("login failed", 401);
   return me;
@@ -97,7 +106,10 @@ export async function logout(): Promise<void> {
     writeMockSession(null);
     return delay(undefined, 150);
   }
-  await apiSend<void>("POST", "/auth/logout", undefined, { base: API_ROOT });
+  await apiSend<void>("POST", "/auth/logout", undefined, {
+    base: API_ROOT,
+    skipSessionExpiry: true,
+  });
 }
 
 export interface ProfileUpdate {

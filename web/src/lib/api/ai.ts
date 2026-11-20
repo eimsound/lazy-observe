@@ -1,10 +1,25 @@
 import { apiGet, apiSend, ApiError, IS_MOCK, API_ROOT } from "./client";
-import { seriesLabel } from "./metrics";
-import { normalizeLine, type LogRow } from "./logs";
-import type { PromQueryRangeResponse, TimeSeries } from "./types";
+import {
+  buildAssistantQueryPayload,
+  normalizeAssistantAnswer,
+  type AiSignal,
+  type AssistantAnswer,
+  type AssistantQueryRequest,
+  type AssistantQueryWire,
+  type AssistantResult,
+  type AssistantTimeRange,
+} from "./ai-contract";
 
 // Mock data is only for VITE_MOCK builds; load it lazily so it never ships with real chunks.
 const loadMockAi = () => import("./mock-ai");
+
+export type {
+  AiSignal,
+  AssistantAnswer,
+  AssistantQueryRequest,
+  AssistantResult,
+  AssistantTimeRange,
+};
 
 /**
  * AI features API. All endpoints live under /api (platform scope, not /api/v1):
@@ -71,37 +86,6 @@ export interface AiTestResult {
   echo: string;
 }
 
-/** Which signal the assistant should target; "auto" lets the model decide. */
-export type AiSignal = "metrics" | "logs" | "auto";
-
-/** Normalized inline result rendered under an assistant answer. */
-export type AssistantResult =
-  | { kind: "metrics"; series: TimeSeries[] }
-  | { kind: "logs"; rows: LogRow[] };
-
-/** A single assistant answer (normalized from the backend response). */
-export interface AssistantAnswer {
-  /** The concrete signal the model chose (never "auto"). */
-  signal: "metrics" | "logs";
-  /** Generated PromQL / LogsQL — always shown, always copyable. */
-  query: string;
-  /** Natural-language explanation of the query. */
-  explanation: string;
-  /** Inline result; absent when the generated query failed to execute. */
-  result?: AssistantResult;
-  /** Present when the query was generated but failed to run against the store. */
-  executionError?: string;
-}
-
-/** Raw on-the-wire response (backend). Kept loose; normalized below. */
-interface AssistantQueryWire {
-  signal: "metrics" | "logs";
-  query: string;
-  explanation: string;
-  result?: unknown;
-  execution_error?: string;
-}
-
 export async function getAiStatus(signal?: AbortSignal): Promise<AiStatus> {
   if (IS_MOCK) return (await loadMockAi()).mockAiStatus();
   return apiGet<AiStatus>("/ai/status", { base: API_ROOT, signal });
@@ -124,61 +108,30 @@ export async function updateAiSettings(req: AiSettingsUpdate): Promise<AiSetting
   return apiSend<AiSettings>("PUT", "/ai/settings", req, { base: API_ROOT });
 }
 
-/** Normalize a Prometheus matrix response into chart-ready TimeSeries. */
-function normalizeMetrics(raw: unknown): TimeSeries[] {
-  const resp = raw as PromQueryRangeResponse;
-  if (!resp || resp.status !== "success") return [];
-  return resp.data.result.map((r) => ({
-    name: seriesLabel(r.metric),
-    labels: r.metric,
-    points: r.values.map(([t, v]) => {
-      const n = Number(v);
-      return [t * 1000, Number.isFinite(n) ? n : null] as [number, number | null];
-    }),
-  }));
-}
-
-/** Normalize a logs result (array of raw objects) into LogRows. */
-function normalizeLogs(raw: unknown): LogRow[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.map((o, i) => normalizeLine(o as Record<string, unknown>, i));
-}
-
-function normalizeAnswer(wire: AssistantQueryWire): AssistantAnswer {
-  const base: AssistantAnswer = {
-    signal: wire.signal,
-    query: wire.query,
-    explanation: wire.explanation,
-    executionError: wire.execution_error,
-  };
-  if (wire.execution_error || wire.result === undefined) return base;
-  base.result =
-    wire.signal === "metrics"
-      ? { kind: "metrics", series: normalizeMetrics(wire.result) }
-      : { kind: "logs", rows: normalizeLogs(wire.result) };
-  return base;
-}
-
 export async function assistantQuery(
-  req: { question: string; signal?: AiSignal; time_range?: string },
+  req: AssistantQueryRequest,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<AssistantAnswer> {
   if (IS_MOCK) return (await loadMockAi()).mockAssistantQuery(req);
+  const payload = buildAssistantQueryPayload(req);
   const wire = await apiSend<AssistantQueryWire>(
     "POST",
     "/ai/assistant/query",
-    { question: req.question, signal: req.signal, time_range: req.time_range },
-    { base: API_ROOT, signal },
+    payload,
+    { base: API_ROOT, signal, project },
   );
-  return normalizeAnswer(wire);
+  return normalizeAssistantAnswer(wire);
 }
 
 export async function assistantExplain(
   req: { signal: "metrics" | "logs"; query: string; stats?: Record<string, unknown> },
+  project?: string,
 ): Promise<{ explanation: string }> {
   if (IS_MOCK) return (await loadMockAi()).mockAssistantExplain(req);
   return apiSend<{ explanation: string }>("POST", "/ai/assistant/explain", req, {
     base: API_ROOT,
+    project,
   });
 }
 
