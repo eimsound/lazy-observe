@@ -416,7 +416,7 @@ github.com/XSAM/otelsql v0.44.0 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.14 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.27 (Apache-2.0)
 
 
                                  Apache License
@@ -622,7 +622,7 @@ github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.14 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/config v1.32.30 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/config v1.33.18 (Apache-2.0)
 
 
                                  Apache License
@@ -828,7 +828,7 @@ github.com/aws/aws-sdk-go-v2/config v1.32.30 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/credentials v1.19.29 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/credentials v1.21.0 (Apache-2.0)
 
 
                                  Apache License
@@ -1034,7 +1034,7 @@ github.com/aws/aws-sdk-go-v2/credentials v1.19.29 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.30 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.9 (Apache-2.0)
 
 
                                  Apache License
@@ -1240,7 +1240,7 @@ github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.30 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.30 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.12 (Apache-2.0)
 
 
                                  Apache License
@@ -1446,7 +1446,7 @@ github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.30 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.30 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.12 (Apache-2.0)
 
 
                                  Apache License
@@ -1652,7 +1652,7 @@ github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.30 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.31 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.12 (Apache-2.0)
 
 
                                  Apache License
@@ -1858,7 +1858,7 @@ github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.31 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.13 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.25 (Apache-2.0)
 
 
                                  Apache License
@@ -2064,7 +2064,7 @@ github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.13 (Apache-2
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.9.23 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.11.13 (Apache-2.0)
 
 
                                  Apache License
@@ -2270,7 +2270,7 @@ github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.9.23 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.30 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.12 (Apache-2.0)
 
 
                                  Apache License
@@ -2476,7 +2476,7 @@ github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.30 (Apache-2.0
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.31 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.20.12 (Apache-2.0)
 
 
                                  Apache License
@@ -2682,7 +2682,7 @@ github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.31 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/s3 v1.105.2 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/s3 v1.114.10 (Apache-2.0)
 
 
                                  Apache License
@@ -2888,7 +2888,7 @@ github.com/aws/aws-sdk-go-v2/service/s3 v1.105.2 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/signin v1.4.1 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/signin v1.13.1 (Apache-2.0)
 
 
                                  Apache License
@@ -3094,7 +3094,7 @@ github.com/aws/aws-sdk-go-v2/service/signin v1.4.1 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/sso v1.32.1 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/sso v1.39.5 (Apache-2.0)
 
 
                                  Apache License
@@ -3300,7 +3300,7 @@ github.com/aws/aws-sdk-go-v2/service/sso v1.32.1 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/ssooidc v1.37.1 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/ssooidc v1.44.5 (Apache-2.0)
 
 
                                  Apache License
@@ -3506,7 +3506,7 @@ github.com/aws/aws-sdk-go-v2/service/ssooidc v1.37.1 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/service/sts v1.44.1 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2/service/sts v1.52.0 (Apache-2.0)
 
 
                                  Apache License
@@ -3712,7 +3712,7 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.44.1 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2 v1.42.1 (Apache-2.0)
+github.com/aws/aws-sdk-go-v2 v1.48.0 (Apache-2.0)
 
 
                                  Apache License
@@ -3918,7 +3918,7 @@ github.com/aws/aws-sdk-go-v2 v1.42.1 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/aws/aws-sdk-go-v2/internal/sync/singleflight v1.42.1 (BSD-3-Clause)
+github.com/aws/aws-sdk-go-v2/internal/sync/singleflight v1.48.0 (BSD-3-Clause)
 
 Copyright (c) 2009 The Go Authors. All rights reserved.
 
@@ -3950,7 +3950,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ------------------------------------------------------------------------
-github.com/aws/smithy-go v1.27.3 (Apache-2.0)
+github.com/aws/smithy-go v1.28.9 (Apache-2.0)
 
 
                                  Apache License
@@ -4129,7 +4129,7 @@ github.com/aws/smithy-go v1.27.3 (Apache-2.0)
       of your accepting any such warranty or additional liability.
 
 ------------------------------------------------------------------------
-github.com/aws/smithy-go/internal/sync/singleflight v1.27.3 (BSD-3-Clause)
+github.com/aws/smithy-go/internal/sync/singleflight v1.28.9 (BSD-3-Clause)
 
 Copyright (c) 2009 The Go Authors. All rights reserved.
 
@@ -4159,6 +4159,37 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+
+------------------------------------------------------------------------
+github.com/aws/smithy-go/transport/http/protocol/internal/json/internal/stdlib v1.28.9 (BSD-3-Clause)
+
+Copyright (c) 2009 The Go Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
 github.com/beorn7/perks/quantile v1.0.1 (MIT)
@@ -5193,7 +5224,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
-github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 (BSD-3-Clause)
+github.com/grpc-ecosystem/grpc-gateway/v2 v2.32.0 (BSD-3-Clause)
 
 Copyright (c) 2015, Gengo, Inc.
 All rights reserved.
@@ -5276,7 +5307,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-github.com/jackc/pgx/v5 v5.10.0 (MIT)
+github.com/jackc/pgx/v5 v5.13.0 (MIT)
 
 Copyright (c) 2013-2021 Jack Christensen
 
@@ -5302,7 +5333,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-github.com/jackc/puddle/v2 v2.2.2 (MIT)
+github.com/jackc/puddle/v2 v2.2.3 (MIT)
 
 Copyright (c) 2018 Jack Christensen
 
@@ -5733,8 +5764,8 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-github.com/modelcontextprotocol/go-sdk v1.6.1 (Apache-2.0)
-github.com/modelcontextprotocol/go-sdk v1.6.1 (MIT)
+github.com/modelcontextprotocol/go-sdk v1.8.0 (Apache-2.0)
+github.com/modelcontextprotocol/go-sdk v1.8.0 (MIT)
 
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.
 
@@ -6014,6 +6045,31 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
+github.com/pandatix/go-abnf v0.5.5 (MIT)
+
+MIT License
+
+Copyright (c) 2024 Lucas TESSON - PandatiX <lucastesson@protonmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
 github.com/philhofer/fwd v1.2.1 (MIT)
 
 Copyright (c) 2014-2015, Philip Hofer
@@ -6024,7 +6080,7 @@ The above copyright notice and this permission notice shall be included in all c
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------
-github.com/prometheus/client_golang/prometheus v1.23.2 (Apache-2.0)
+github.com/prometheus/client_golang/prometheus v1.25.0 (Apache-2.0)
 
                                  Apache License
                            Version 2.0, January 2004
@@ -6229,7 +6285,7 @@ github.com/prometheus/client_golang/prometheus v1.23.2 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/prometheus/client_model/go v0.6.2 (Apache-2.0)
+github.com/prometheus/client_model/go v0.6.3 (Apache-2.0)
 
                                  Apache License
                            Version 2.0, January 2004
@@ -6434,7 +6490,7 @@ github.com/prometheus/client_model/go v0.6.2 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/prometheus/common v0.69.0 (Apache-2.0)
+github.com/prometheus/common v0.74.0 (Apache-2.0)
 
                                  Apache License
                            Version 2.0, January 2004
@@ -6639,7 +6695,7 @@ github.com/prometheus/common v0.69.0 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/prometheus/procfs v0.16.1 (Apache-2.0)
+github.com/prometheus/procfs v0.22.0 (Apache-2.0)
 
                                  Apache License
                            Version 2.0, January 2004
@@ -6844,7 +6900,7 @@ github.com/prometheus/procfs v0.16.1 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/prometheus/prometheus v0.313.1 (Apache-2.0)
+github.com/prometheus/prometheus v0.316.0 (Apache-2.0)
 
                                  Apache License
                            Version 2.0, January 2004
@@ -7049,7 +7105,7 @@ github.com/prometheus/prometheus v0.313.1 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-github.com/redis/go-redis/v9 v9.21.0 (BSD-2-Clause)
+github.com/redis/go-redis/v9 v9.23.0 (BSD-2-Clause)
 
 Copyright (c) 2013 The github.com/redis/go-redis Authors.
 All rights reserved.
@@ -7337,7 +7393,7 @@ github.com/spf13/cobra v1.10.2 (Apache-2.0)
       of your accepting any such warranty or additional liability.
 
 ------------------------------------------------------------------------
-github.com/spf13/pflag v1.0.10 (BSD-3-Clause)
+github.com/spf13/pflag v1.1.0 (BSD-3-Clause)
 
 Copyright (c) 2012 Alex Ogier. All rights reserved.
 Copyright (c) 2012 The Go Authors. All rights reserved.
@@ -10702,7 +10758,7 @@ go.opentelemetry.io/proto/otlp v1.11.0 (Apache-2.0)
    limitations under the License.
 
 ------------------------------------------------------------------------
-go.uber.org/atomic v1.11.0 (MIT)
+go.uber.org/atomic v1.12.0 (MIT)
 
 Copyright (c) 2016 Uber Technologies, Inc.
 
@@ -10725,7 +10781,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ------------------------------------------------------------------------
-golang.org/x/crypto v0.58.0 (BSD-3-Clause)
+golang.org/x/crypto v0.59.0 (BSD-3-Clause)
 
 Copyright 2009 The Go Authors.
 
@@ -10787,7 +10843,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
-golang.org/x/oauth2 v0.36.0 (BSD-3-Clause)
+golang.org/x/oauth2 v0.38.0 (BSD-3-Clause)
 
 Copyright 2009 The Go Authors.
 
@@ -10818,7 +10874,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
-golang.org/x/sync/semaphore v0.24.0 (BSD-3-Clause)
+golang.org/x/sync v0.25.0 (BSD-3-Clause)
 
 Copyright 2009 The Go Authors.
 
@@ -10849,7 +10905,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
-golang.org/x/sys v0.49.0 (BSD-3-Clause)
+golang.org/x/sys v0.50.0 (BSD-3-Clause)
 
 Copyright 2009 The Go Authors.
 
@@ -10880,7 +10936,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
-golang.org/x/text v0.43.0 (BSD-3-Clause)
+golang.org/x/text v0.44.0 (BSD-3-Clause)
 
 Copyright 2009 The Go Authors.
 
@@ -10911,7 +10967,38 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ------------------------------------------------------------------------
-google.golang.org/genproto/googleapis/api/httpbody v0.0.0-20260928230214-8a89bd6388cc (Apache-2.0)
+golang.org/x/time/rate v0.16.0 (BSD-3-Clause)
+
+Copyright 2009 The Go Authors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google LLC nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+------------------------------------------------------------------------
+google.golang.org/genproto/googleapis/api/httpbody v0.0.0-20261019180522-ce908d29299b (Apache-2.0)
 
 
                                  Apache License
@@ -11117,7 +11204,7 @@ google.golang.org/genproto/googleapis/api/httpbody v0.0.0-20260928230214-8a89bd6
    limitations under the License.
 
 ------------------------------------------------------------------------
-google.golang.org/genproto/googleapis/rpc/status v0.0.0-20260928230214-8a89bd6388cc (Apache-2.0)
+google.golang.org/genproto/googleapis/rpc/status v0.0.0-20261012220534-4341edf3f941 (Apache-2.0)
 
 
                                  Apache License
@@ -11323,7 +11410,7 @@ google.golang.org/genproto/googleapis/rpc/status v0.0.0-20260928230214-8a89bd638
    limitations under the License.
 
 ------------------------------------------------------------------------
-google.golang.org/grpc v1.83.2 (Apache-2.0)
+google.golang.org/grpc v1.84.0 (Apache-2.0)
 
 
                                  Apache License
