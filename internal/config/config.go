@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -61,9 +62,14 @@ type Security struct {
 	// CSRF enables the double-submit CSRF token check for session-authenticated
 	// mutating requests. Enabled by default.
 	CSRF bool `yaml:"csrf"`
-	// SessionSecureCookie marks session and CSRF cookies Secure. Enable only
-	// when TLS terminates in front of the gateway.
+	// SessionSecureCookie marks session and CSRF cookies Secure. Automatically
+	// enabled when native TLS (tls_cert and tls_key) is configured; set this
+	// explicitly when TLS terminates at a reverse proxy in front of the gateway.
 	SessionSecureCookie bool `yaml:"session_secure_cookie"`
+	// TrustedProxies lists explicit reverse proxy IP addresses or CIDRs whose
+	// X-Forwarded-For headers are trusted to identify client IPs for rate
+	// limiting. Empty disables proxy header trust (direct peer IP only).
+	TrustedProxies []string `yaml:"trusted_proxies"`
 	// AuditRetention bounds how long management audit events are kept.
 	AuditRetention Duration `yaml:"audit_retention"`
 	// TLSCert and TLSKey enable gateway-side TLS termination. Both must be
@@ -367,7 +373,13 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 		&cfg.Security.SessionSecureCookie,
 		"security-secure-cookie",
 		cfg.Security.SessionSecureCookie,
-		"mark session and CSRF cookies Secure (TLS-terminated deployments)",
+		"mark session and CSRF cookies Secure (automatically enabled with native TLS)",
+	)
+	fs.StringSliceVar(
+		&cfg.Security.TrustedProxies,
+		"security-trusted-proxies",
+		cfg.Security.TrustedProxies,
+		"comma-separated reverse proxy IPs or CIDRs trusted for X-Forwarded-For",
 	)
 	fs.Var(&cfg.Security.AuditRetention, "audit-retention", "management audit event retention")
 	fs.StringVar(&cfg.Security.TLSCert, "tls-cert", cfg.Security.TLSCert, "TLS certificate file (enables HTTPS)")
@@ -576,6 +588,16 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		}
 		c.Alert.StormThreshold = parsed
 	}
+	if v, ok := lookup("LO_SECURITY_TRUSTED_PROXIES"); ok {
+		parts := strings.Split(v, ",")
+		proxies := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				proxies = append(proxies, trimmed)
+			}
+		}
+		c.Security.TrustedProxies = proxies
+	}
 	if v, ok := lookup("LO_RETENTION_ISSUES_CLOSED"); ok {
 		parsed, err := strconv.ParseBool(v)
 		if err != nil {
@@ -646,6 +668,17 @@ func (c Config) Validate() error {
 	}
 	if c.Redis.DB < 0 {
 		return errors.New("redis.db must not be negative")
+	}
+	for _, raw := range c.Security.TrustedProxies {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			return errors.New("security.trusted_proxies entries must not be empty")
+		}
+		if _, err := netip.ParsePrefix(entry); err != nil {
+			if _, addrErr := netip.ParseAddr(entry); addrErr != nil {
+				return fmt.Errorf("security.trusted_proxies entry %q must be a valid IP or CIDR", raw)
+			}
+		}
 	}
 	return nil
 }

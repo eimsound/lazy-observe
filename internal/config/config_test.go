@@ -562,3 +562,44 @@ func TestMetaDBURLPrecedenceAndValidation(t *testing.T) {
 		t.Fatal("zero metadata migration lock timeout accepted")
 	}
 }
+
+func TestSecurityTrustedProxiesPrecedenceAndValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("security:\n  trusted_proxies:\n    - 10.0.0.0/8\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.TrustedProxies) != 1 || cfg.Security.TrustedProxies[0] != "10.0.0.0/8" {
+		t.Fatalf("yaml trusted_proxies = %#v", cfg.Security.TrustedProxies)
+	}
+
+	env := map[string]string{"LO_SECURITY_TRUSTED_PROXIES": "127.0.0.1, 172.16.0.0/12"}
+	cfg, _, err = Load([]string{"--config", path}, func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.TrustedProxies) != 2 || cfg.Security.TrustedProxies[0] != "127.0.0.1" ||
+		cfg.Security.TrustedProxies[1] != "172.16.0.0/12" {
+		t.Fatalf("env trusted_proxies = %#v", cfg.Security.TrustedProxies)
+	}
+
+	cfg, _, err = Load(
+		[]string{"--config", path, "--security-trusted-proxies", "192.168.1.10"},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.TrustedProxies) != 1 || cfg.Security.TrustedProxies[0] != "192.168.1.10" {
+		t.Fatalf("flag trusted_proxies = %#v", cfg.Security.TrustedProxies)
+	}
+
+	invalid := Defaults()
+	invalid.Security.TrustedProxies = []string{"not-an-ip-or-cidr"}
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("invalid trusted_proxies entry was accepted")
+	}
+}

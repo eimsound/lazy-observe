@@ -747,11 +747,20 @@ func (s *Store) MarkLogin(ctx context.Context, userID int) error {
 func (s *Store) AuthenticateCredentials(ctx context.Context, username, password string) (UserInfo, error) {
 	u, err := s.client.User.Query().Where(user.UsernameEQ(username)).Only(ctx)
 	if err != nil {
-		// Perform equivalent expensive work even when the username does not exist.
-		_ = argon2Dummy(password)
-		return UserInfo{}, errInvalidCredentials
+		if IsNotFound(err) {
+			// Perform equivalent expensive work even when the username does not exist.
+			if _, dummyErr := argon2DummyContext(ctx, password); dummyErr != nil {
+				return UserInfo{}, dummyErr
+			}
+			return UserInfo{}, errInvalidCredentials
+		}
+		return UserInfo{}, err
 	}
-	if !VerifyPassword(u.PasswordHash, password) {
+	ok, err := VerifyPasswordContext(ctx, u.PasswordHash, password)
+	if err != nil {
+		return UserInfo{}, err
+	}
+	if !ok {
 		return UserInfo{}, errInvalidCredentials
 	}
 	return userInfo(u), nil
@@ -856,21 +865,39 @@ func (s *Store) UpdateUser(ctx context.Context, id int, username, password, role
 }
 
 // UpdateManagedUser atomically updates all requested account and profile
-// fields for one administrator-managed user.
-func (s *Store) UpdateManagedUser(ctx context.Context, input ManagedUserUpdate) (UserInfo, error) {
+// fields for one administrator-managed user, protects the last admin from
+// demotion, and revokes persisted sessions on password reset or role downgrade.
+func (s *Store) UpdateManagedUser(ctx context.Context, input ManagedUserUpdate) (result UserInfo, err error) {
 	var hash string
-	var err error
 	if input.Password != "" {
-		hash, err = HashPassword(input.Password)
+		hash, err = HashPasswordContext(ctx, input.Password)
 		if err != nil {
 			return UserInfo{}, err
 		}
+	}
+	if input.Role != "" && input.Role != string(user.RoleAdmin) {
+		release, lockErr := s.acquireAdminRoleCoordination(ctx)
+		if lockErr != nil {
+			return UserInfo{}, lockErr
+		}
+		defer func() { err = errors.Join(err, release()) }()
 	}
 	tx, err := s.client.Tx(ctx)
 	if err != nil {
 		return UserInfo{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	existing, err := tx.User.Get(ctx, input.ID)
+	if err != nil {
+		return UserInfo{}, err
+	}
+	demotingAdmin := existing.Role == user.RoleAdmin && input.Role != "" && input.Role != string(user.RoleAdmin)
+	if demotingAdmin {
+		if err := ensureNotLastAdminTx(ctx, tx); err != nil {
+			return UserInfo{}, err
+		}
+	}
 
 	builder := tx.User.UpdateOneID(input.ID)
 	if input.Username != "" {
@@ -900,15 +927,47 @@ func (s *Store) UpdateManagedUser(ctx context.Context, input ManagedUserUpdate) 
 	if err != nil {
 		return UserInfo{}, err
 	}
-	result := userInfo(updated)
+	if hash != "" || isUserRoleDowngrade(existing.Role, input.Role) {
+		if _, err := tx.Session.Delete().Where(session.UserIDEQ(input.ID)).Exec(ctx); err != nil {
+			return UserInfo{}, err
+		}
+	}
+	result = userInfo(updated)
 	if err := tx.Commit(); err != nil {
 		return UserInfo{}, err
 	}
 	return result, nil
 }
 
-func (s *Store) DeleteUser(ctx context.Context, id int) error {
-	return s.client.User.DeleteOneID(id).Exec(ctx)
+func (s *Store) DeleteUser(ctx context.Context, id int) (err error) {
+	release, lockErr := s.acquireAdminRoleCoordination(ctx)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() { err = errors.Join(err, release()) }()
+
+	tx, err := s.client.Tx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	existing, err := tx.User.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if existing.Role == user.RoleAdmin {
+		if err := ensureNotLastAdminTx(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Session.Delete().Where(session.UserIDEQ(id)).Exec(ctx); err != nil {
+		return err
+	}
+	if err := tx.User.DeleteOneID(id).Exec(ctx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ChangePassword verifies the current password and stores the new hash.
@@ -918,10 +977,14 @@ func (s *Store) ChangePassword(ctx context.Context, userID int, currentPassword,
 	if err != nil {
 		return err
 	}
-	if !VerifyPassword(u.PasswordHash, currentPassword) {
+	ok, err := VerifyPasswordContext(ctx, u.PasswordHash, currentPassword)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return errInvalidCredentials
 	}
-	hash, err := HashPassword(newPassword)
+	hash, err := HashPasswordContext(ctx, newPassword)
 	if err != nil {
 		return err
 	}
@@ -1181,12 +1244,12 @@ func (s *Store) BootstrapSelfMonitoring(
 }
 
 func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, admin BootstrapAdmin) error {
-	_, err := s.client.User.Query().Where(user.UsernameEQ(BootstrapAdminUsername)).Only(ctx)
-	if err == nil {
-		return nil
+	exists, err := s.client.User.Query().Exist(ctx)
+	if err != nil {
+		return fmt.Errorf("find existing users: %w", err)
 	}
-	if !IsNotFound(err) {
-		return fmt.Errorf("find bootstrap admin: %w", err)
+	if exists {
+		return nil
 	}
 	host := bootstrapHost()
 	if admin.PasswordFile != "" {

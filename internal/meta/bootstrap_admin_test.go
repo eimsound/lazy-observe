@@ -249,3 +249,36 @@ func TestBootstrapKeepsExistingAdmin(t *testing.T) {
 		t.Fatalf("existing admin must not produce a generated file: %v", err)
 	}
 }
+
+func TestBootstrapDoesNotRecreateAdminAfterRenameOrReplacement(t *testing.T) {
+	ctx := context.Background()
+	store := openBootstrapTestStore(t)
+	dir := t.TempDir()
+	generated := filepath.Join(dir, InitialAdminPasswordFileName)
+	logger, _ := newRecordingLogger()
+	if _, err := store.Bootstrap(ctx, logger, BootstrapAdmin{GeneratedPasswordFile: generated}); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := store.UserByUsername(ctx, BootstrapAdminUsername)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateManagedUser(ctx, ManagedUserUpdate{ID: admin.ID, Username: "ops-root"}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger, records := newRecordingLogger()
+	secondGenerated := filepath.Join(dir, "second-"+InitialAdminPasswordFileName)
+	if _, err := store.Bootstrap(ctx, logger, BootstrapAdmin{GeneratedPasswordFile: secondGenerated}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findLog(records(), "created bootstrap admin"); ok {
+		t.Fatal("bootstrap recreated default admin after rename")
+	}
+	if _, err := store.UserByUsername(ctx, BootstrapAdminUsername); !IsNotFound(err) {
+		t.Fatalf("renamed admin caused default admin recreation: err=%v", err)
+	}
+	if _, err := os.Stat(secondGenerated); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("bootstrap wrote generated password file when users already exist: %v", err)
+	}
+}

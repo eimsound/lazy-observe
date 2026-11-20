@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,15 @@ func testSessionContract(t *testing.T, sessions account.Sessions, ownerID, other
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.HasPrefix(first, account.SessionTokenPrefix) ||
+		strings.HasPrefix(first, meta.SourceMapUploadTokenPrefix) {
+		t.Fatalf(
+			"session token prefix = %q, want %q and distinct from %q",
+			first,
+			account.SessionTokenPrefix,
+			meta.SourceMapUploadTokenPrefix,
+		)
+	}
 	second, err := sessions.Create(ctx, ownerID, now.Add(time.Minute), now.Add(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -95,5 +105,29 @@ func testSessionContract(t *testing.T, sessions account.Sessions, ownerID, other
 	}
 	if len(remaining) > 1 {
 		t.Fatalf("remaining sessions=%d, want at most current", len(remaining))
+	}
+}
+
+func TestLegacyLosPrefixedSessionsRemainCompatible(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	store, err := meta.OpenStore(t.Context(), filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	owner, err := store.CreateUser(t.Context(), "legacy-owner", "password", "member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const legacyToken = "los_existing-legacy-session-token"
+	if err := store.CreateAccountSession(t.Context(), meta.AccountSession{
+		Token: legacyToken, UserID: owner.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessions := account.NewMetadataSessions(store)
+	userID, err := sessions.Authenticate(t.Context(), legacyToken, now)
+	if err != nil || userID != owner.ID {
+		t.Fatalf("legacy session auth user=%d err=%v", userID, err)
 	}
 }

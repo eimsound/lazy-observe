@@ -365,10 +365,20 @@ func (g *Gateway) createChannel(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	audit := auditEvent{Action: "notification_channel.create", TargetType: "notification_channel"}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "create_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var in alert.ChannelInput
 	if c.Bind().Body(&in) != nil || !validChannelType(in.Type) || strings.TrimSpace(in.Name) == "" {
+		audit.TargetName = strings.TrimSpace(in.Name)
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
+	audit.TargetName = strings.TrimSpace(in.Name)
 	in.Type = normalizeChannelType(in.Type)
 	in.Config = normalizeChannelConfig(in.Type, in.Config)
 	if in.Config == nil {
@@ -378,6 +388,9 @@ func (g *Gateway) createChannel(c fiber.Ctx) error {
 	if e != nil {
 		return apiError(c, e)
 	}
+	audit.TargetID = v.ID
+	audit.TargetName = v.Name
+	audit.Success = true
 	return c.Status(fiber.StatusCreated).JSON(toNotificationChannelResponse(v))
 }
 func (g *Gateway) updateChannel(c fiber.Ctx) error {
@@ -388,16 +401,28 @@ func (g *Gateway) updateChannel(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	audit := auditEvent{Action: "notification_channel.update", TargetType: "notification_channel", TargetID: id}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "update_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var in alert.ChannelInput
 	if c.Bind().Body(&in) != nil || (in.Type != "" && !validChannelType(in.Type)) {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
+	audit.TargetName = strings.TrimSpace(in.Name)
 	in.Type = normalizeChannelType(in.Type)
 	in.Config = normalizeChannelConfig(in.Type, in.Config)
 	v, e := g.alerts.UpdateChannel(c.Context(), id, in)
 	if e != nil {
 		return apiError(c, e)
 	}
+	audit.TargetID = v.ID
+	audit.TargetName = v.Name
+	audit.Success = true
 	return c.JSON(toNotificationChannelResponse(v))
 }
 func (g *Gateway) deleteChannel(c fiber.Ctx) error {
@@ -408,9 +433,17 @@ func (g *Gateway) deleteChannel(c fiber.Ctx) error {
 	if g.alertingUnavailable(c) {
 		return nil
 	}
+	audit := auditEvent{Action: "notification_channel.delete", TargetType: "notification_channel", TargetID: id}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "delete_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	if e := g.alerts.DeleteChannel(c.Context(), id); e != nil {
 		return apiError(c, e)
 	}
+	audit.Success = true
 	return c.SendStatus(fiber.StatusNoContent)
 }
 func (g *Gateway) testChannel(c fiber.Ctx) error {

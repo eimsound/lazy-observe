@@ -116,6 +116,9 @@ security:
   # when TLS terminates at a trusted reverse proxy.
   tls_cert: ""
   tls_key: ""
+  # Explicit reverse proxy IPs or CIDRs trusted to supply X-Forwarded-For for
+  # client IP rate limiting. Empty trusts direct peer addresses only.
+  trusted_proxies: []
   secret_key_file: ""
   # First admin password, read only while the admin account does not exist.
   # Surrounding whitespace is ignored; at least 8 characters are required.
