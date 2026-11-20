@@ -13,7 +13,7 @@ CHART="$ROOT/deploy/helm/lazy-observe"
 HELM=${HELM:-helm}
 
 if ! command -v "$HELM" >/dev/null 2>&1; then
-  echo "helm not found; install Helm 3 or set HELM=/path/to/helm" >&2
+  echo "helm not found; install Helm (see mise.toml) or set HELM=/path/to/helm" >&2
   exit 1
 fi
 
