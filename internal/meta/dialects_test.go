@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,13 +35,6 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "create embedded postgres directory:", err)
 		os.Exit(1)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "allocate embedded postgres port:", err)
-		os.Exit(1)
-	}
-	port := uint32(listener.Addr().(*net.TCPAddr).Port)
-	_ = listener.Close()
 	// The downloaded distribution goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
 	// CI can reuse it; the supervisor, runtime and data stay in the per-run temporary directory.
 	// A failure here is final and never skips the PostgreSQL tests.
@@ -51,13 +44,24 @@ func TestMain(m *testing.M) {
 		_ = os.RemoveAll(temp)
 		os.Exit(1)
 	}
-	postgres := embeddedpostgres.NewDatabase(config.Port(port))
+	postgres := embeddedpostgres.NewDatabase(config)
 	if err := postgres.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "start embedded postgres: %v\n", err)
 		_ = os.RemoveAll(temp)
 		os.Exit(1)
 	}
-	postgresAdminURL = fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
+	postgresAdminURL = postgres.ConnectionURL()
+	if postgresAdminURL == "" || postgres.GetPort() == 0 {
+		fmt.Fprintf(
+			os.Stderr,
+			"embedded postgres returned empty endpoint: url=%q port=%d\n",
+			postgresAdminURL,
+			postgres.GetPort(),
+		)
+		_ = postgres.Stop()
+		_ = os.RemoveAll(temp)
+		os.Exit(1)
+	}
 	code := m.Run()
 	if err := postgres.Stop(); err != nil {
 		fmt.Fprintln(os.Stderr, "stop embedded postgres:", err)
@@ -108,7 +112,14 @@ func newPostgresTestDatabase(t *testing.T) string {
 		_ = admin.Close()
 		t.Fatalf("create postgres test database: %v", err)
 	}
-	dbURL := postgresAdminURL[:len(postgresAdminURL)-len("postgres?sslmode=disable")] + database + "?sslmode=disable"
+	parsed, err := url.Parse(postgresAdminURL)
+	if err != nil {
+		_ = admin.Close()
+		t.Fatalf("parse postgres admin URL: %v", err)
+	}
+	parsed.Path = "/" + database
+	parsed.RawPath = ""
+	dbURL := parsed.String()
 	t.Cleanup(func() {
 		_, _ = admin.ExecContext(context.Background(), `DROP DATABASE "`+database+`" WITH (FORCE)`)
 		_ = admin.Close()

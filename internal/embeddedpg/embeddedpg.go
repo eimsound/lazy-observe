@@ -53,8 +53,10 @@ func CachePath(fallback string) string {
 
 // NewConfig readies everything Start needs and returns a config whose Start makes no network
 // request: the Postgres distribution is in cacheDir, the supervisor is built from source into
-// root, and the work and data directories are under root. root is per run and the caller
-// removes it; cacheDir is shared and may be reused. Callers add Port, Database and so on.
+// root, the work and data directories are under root, and Port(0) lets embedded-postgres
+// allocate an available port with retry on bind collision. root is per run and the caller
+// removes it; cacheDir is shared and may be reused. Callers read ConnectionURL from the
+// started database and may add Database or override Port.
 //
 // A failure carries the real HTTP status, the SHA-256 mismatch or the compiler output, and is
 // final: it never skips the download or falls back to an unverified binary.
@@ -70,6 +72,7 @@ func NewConfig(cacheDir, root string) (embeddedpostgres.Config, error) {
 
 	return embeddedpostgres.DefaultConfig().
 		Version(Version).
+		Port(0).
 		Provider(provider).
 		Supervisor(supervisor).
 		Storage(embeddedpostgres.Storage{

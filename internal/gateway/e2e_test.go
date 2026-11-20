@@ -1234,12 +1234,6 @@ func runSelfMonitoringModeE2E(t *testing.T, enabled bool) {
 
 func startEmbeddedPostgresE2E(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := uint32(listener.Addr().(*net.TCPAddr).Port)
-	_ = listener.Close()
 	root := t.TempDir()
 	// The downloaded distribution goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
 	// CI can reuse it; the supervisor, runtime and data stay in the per-run temporary directory.
@@ -1247,7 +1241,7 @@ func startEmbeddedPostgresE2E(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("prepare embedded postgres: %v", err)
 	}
-	postgres := embeddedpostgres.NewDatabase(config.Port(port).Database("lazy_observe_e2e"))
+	postgres := embeddedpostgres.NewDatabase(config.Database("lazy_observe_e2e"))
 	if err := postgres.Start(); err != nil {
 		t.Fatalf("start embedded postgres: %v", err)
 	}
@@ -1256,7 +1250,11 @@ func startEmbeddedPostgresE2E(t *testing.T) string {
 			t.Errorf("stop embedded postgres: %v", err)
 		}
 	})
-	return fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/lazy_observe_e2e?sslmode=disable", port)
+	dbURL := postgres.ConnectionURL()
+	if dbURL == "" || postgres.GetPort() == 0 {
+		t.Fatalf("embedded postgres returned empty endpoint: url=%q port=%d", dbURL, postgres.GetPort())
+	}
+	return dbURL
 }
 
 type bearerTokenTransport struct {
