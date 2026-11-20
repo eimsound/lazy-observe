@@ -466,6 +466,8 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 		`DELETE FROM alert_rules WHERE project_id = ?`,
 		`DELETE FROM project_alert_config_channels WHERE project_alert_config_id IN (SELECT id FROM project_alert_configs WHERE project_id = ?)`,
 		`DELETE FROM project_alert_configs WHERE project_id = ?`,
+		`DELETE FROM platform_error_rate_buckets WHERE project_id = ?`,
+		`DELETE FROM platform_alert_states WHERE project_id = ?`,
 		`DELETE FROM project_api_tokens WHERE project_id = ?`,
 		`DELETE FROM source_map_upload_tokens WHERE project_id = ?`,
 		`DELETE FROM silences WHERE project_id = ?`,

@@ -303,6 +303,89 @@ func TestPlatformNotificationsUseOneOutboxItemAcrossReplicas(t *testing.T) {
 	}
 }
 
+func TestPlatformErrorRateSpikeRecoversAndSecondSpikeNotSwallowed(t *testing.T) {
+	ctx := context.Background()
+	store := openOutboxTestStore(t)
+	project, err := store.CreateProject(ctx, "SpikeCycle", "spike-cycle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan Notification, 8)
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var n Notification
+		if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		received <- n
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer endpoint.Close()
+
+	base := time.Date(2026, 8, 1, 14, 0, 0, 0, time.UTC)
+	var curTime atomic.Int64
+	curTime.Store(base.UnixNano())
+	svc := NewService(Config{
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		Sender:         &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
+		GroupWait:      10 * time.Millisecond,
+		RepeatInterval: time.Hour,
+		Now:            func() time.Time { return time.Unix(0, curTime.Load()).UTC() },
+		Outbox:         OutboxWorkerConfig{WorkerID: "spike-worker", PollInterval: 5 * time.Millisecond},
+	})
+	defer svc.Close()
+
+	ch, err := svc.CreateChannel(ctx, ChannelInput{
+		Type: "webhook", Name: "spike-hook", Config: map[string]any{"url": endpoint.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PutProjectAlertConfig(ctx, project.ID, ProjectAlertConfigInput{
+		NewIssue: false, Regression: false, ErrorRateThresholdPerMinute: 1, ChannelIDs: []int{ch.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger first spike (6 events > 1/min * 5min).
+	for i := range 6 {
+		ts := base.Add(time.Duration(i) * time.Second)
+		curTime.Store(ts.UnixNano())
+		if err := svc.RecordErrorEvent(ctx, project.ID, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := waitNotificationStatus(t, received, "firing")
+	if first.Rule != "error_rate_spike" || first.Alerts[0].Annotations["cycle"] != "1" {
+		t.Fatalf("first spike notification=%#v", first)
+	}
+
+	// Advance past 5m window and check recoveries -> resolved notification emitted.
+	curTime.Store(base.Add(6 * time.Minute).UnixNano())
+	if err := svc.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolved := waitNotificationStatus(t, received, "resolved")
+	if resolved.Rule != "error_rate_spike" || resolved.Alerts[0].Annotations["cycle"] != "1" {
+		t.Fatalf("resolved spike notification=%#v", resolved)
+	}
+
+	// Trigger second spike with identical rate -> must NOT be swallowed by idempotency key.
+	secondBase := base.Add(10 * time.Minute)
+	for i := range 6 {
+		ts := secondBase.Add(time.Duration(i) * time.Second)
+		curTime.Store(ts.UnixNano())
+		if err := svc.RecordErrorEvent(ctx, project.ID, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second := waitNotificationStatus(t, received, "firing")
+	if second.Rule != "error_rate_spike" || second.Alerts[0].Annotations["cycle"] != "2" {
+		t.Fatalf("second spike notification=%#v", second)
+	}
+}
+
 func openOutboxTestStore(t *testing.T) *meta.Store {
 	t.Helper()
 	store, err := meta.OpenStore(context.Background(), filepath.Join(t.TempDir(), "meta.db"))

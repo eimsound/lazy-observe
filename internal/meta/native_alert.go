@@ -15,14 +15,15 @@ type NativeAlertEvaluation struct {
 	MemberID              string
 	LeaseEpoch            int64
 	States                []AlertRuleState
+	PruneFingerprints     []string
 	InhibitedFingerprints map[string]bool
 	Notifications         []NotificationOutboxEnqueue
 }
 
 // CommitNativeAlertEvaluation advances candidate state and creates durable
 // notification work under the same fenced transaction. The rule row and lease
-// are locked before writes so a concurrent engine cutover is ordered before or
-// after the whole evaluation, never through its middle.
+// are locked in consistent order (rule then lease) before writes so a
+// concurrent rule update or engine cutover is ordered cleanly without deadlock.
 func (s *Store) CommitNativeAlertEvaluation(ctx context.Context, evaluation NativeAlertEvaluation) error {
 	if evaluation.RuleID <= 0 || evaluation.MemberID == "" || evaluation.LeaseEpoch <= 0 {
 		return errors.New("native alert evaluation requires rule, member, and fencing epoch")
@@ -32,12 +33,12 @@ func (s *Store) CommitNativeAlertEvaluation(ctx context.Context, evaluation Nati
 		return fmt.Errorf("begin native alert evaluation: %w", err)
 	}
 	defer tx.Rollback()
-	lockQuery := `SELECT lease.epoch FROM alert_rule_leases AS lease
-		JOIN alert_rules AS rule ON rule.id = lease.rule_id
+	lockQuery := `SELECT lease.epoch FROM alert_rules AS rule
+		JOIN alert_rule_leases AS lease ON lease.rule_id = rule.id
 		WHERE lease.rule_id = ? AND lease.owner_id = ? AND lease.epoch = ?
 		AND lease.expires_at > CURRENT_TIMESTAMP AND rule.enabled = TRUE AND rule.evaluation_engine = 'native'`
 	if s.dialect == dialect.Postgres {
-		lockQuery += ` FOR UPDATE OF lease, rule`
+		lockQuery += ` FOR UPDATE OF rule, lease`
 	}
 	var epoch int64
 	if err := tx.QueryRowContext(ctx, s.alertClockSQL(lockQuery), evaluation.RuleID, evaluation.MemberID, evaluation.LeaseEpoch).
@@ -63,6 +64,29 @@ func (s *Store) CommitNativeAlertEvaluation(ctx context.Context, evaluation Nati
 		annotations, err := json.Marshal(nonNilStringMap(state.Annotations))
 		if err != nil {
 			return fmt.Errorf("encode native alert annotations: %w", err)
+		}
+		if state.Status == "recovered" {
+			if state.FiringSince != nil {
+				resolveQuery := `INSERT INTO alert_events(fingerprint, status, labels, annotations, starts_at, ends_at, inhibited, updated_at, rule_id)
+					VALUES (?, 'resolved', ?, ?, ?, ?, FALSE, CURRENT_TIMESTAMP, ?)
+					ON CONFLICT(fingerprint, rule_id) DO UPDATE SET status = 'resolved', labels = excluded.labels,
+					annotations = excluded.annotations, starts_at = excluded.starts_at, ends_at = excluded.ends_at,
+					inhibited = FALSE, updated_at = CURRENT_TIMESTAMP
+					WHERE alert_events.status <> 'resolved'`
+				if _, err := tx.ExecContext(ctx, bind(s.dialect, resolveQuery), state.Fingerprint, string(labels),
+					string(annotations), state.FiringSince, state.LastEvaluatedAt, state.RuleID); err != nil {
+					return fmt.Errorf("resolve native alert event: %w", err)
+				}
+			}
+			if _, err := tx.ExecContext(
+				ctx,
+				bind(s.dialect, `DELETE FROM alert_rule_states WHERE rule_id = ? AND fingerprint = ?`),
+				state.RuleID,
+				state.Fingerprint,
+			); err != nil {
+				return fmt.Errorf("prune recovered alert state: %w", err)
+			}
+			continue
 		}
 		query := `INSERT INTO alert_rule_states(rule_id, fingerprint, status, pending_since, firing_since, last_evaluated_at,
 			labels, annotations, value, last_notified_at, lease_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -90,21 +114,40 @@ func (s *Store) CommitNativeAlertEvaluation(ctx context.Context, evaluation Nati
 		if state.Status == "pending" || state.FiringSince == nil {
 			continue
 		}
-		eventStatus := "firing"
-		var endsAt any
-		if state.Status == "recovered" {
-			eventStatus = "resolved"
-			endsAt = state.LastEvaluatedAt
+		inhibited, hasInhibited := evaluation.InhibitedFingerprints[state.Fingerprint]
+		if hasInhibited {
+			eventQuery := `INSERT INTO alert_events(fingerprint, status, labels, annotations, starts_at, ends_at, inhibited, updated_at, rule_id)
+				VALUES (?, 'firing', ?, ?, ?, NULL, ?, CURRENT_TIMESTAMP, ?)
+				ON CONFLICT(fingerprint, rule_id) DO UPDATE SET status = 'firing', labels = excluded.labels,
+				annotations = excluded.annotations, starts_at = excluded.starts_at, ends_at = NULL,
+				inhibited = excluded.inhibited, updated_at = CURRENT_TIMESTAMP`
+			if _, err := tx.ExecContext(ctx, bind(s.dialect, eventQuery), state.Fingerprint, string(labels),
+				string(annotations), state.FiringSince, inhibited, state.RuleID); err != nil {
+				return fmt.Errorf("persist native alert event: %w", err)
+			}
+		} else {
+			eventQuery := `INSERT INTO alert_events(fingerprint, status, labels, annotations, starts_at, ends_at, inhibited, updated_at, rule_id)
+				VALUES (?, 'firing', ?, ?, ?, NULL, FALSE, CURRENT_TIMESTAMP, ?)
+				ON CONFLICT(fingerprint, rule_id) DO UPDATE SET status = 'firing', labels = excluded.labels,
+				annotations = excluded.annotations, starts_at = excluded.starts_at, ends_at = NULL,
+				updated_at = CURRENT_TIMESTAMP`
+			if _, err := tx.ExecContext(ctx, bind(s.dialect, eventQuery), state.Fingerprint, string(labels),
+				string(annotations), state.FiringSince, state.RuleID); err != nil {
+				return fmt.Errorf("persist native alert event: %w", err)
+			}
 		}
-		inhibited := evaluation.InhibitedFingerprints[state.Fingerprint]
-		eventQuery := `INSERT INTO alert_events(fingerprint, status, labels, annotations, starts_at, ends_at, inhibited, updated_at, rule_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-			ON CONFLICT(fingerprint, rule_id) DO UPDATE SET status = excluded.status, labels = excluded.labels,
-			annotations = excluded.annotations, starts_at = excluded.starts_at, ends_at = excluded.ends_at,
-			inhibited = excluded.inhibited, updated_at = CURRENT_TIMESTAMP`
-		if _, err := tx.ExecContext(ctx, bind(s.dialect, eventQuery), state.Fingerprint, eventStatus, string(labels),
-			string(annotations), state.FiringSince, endsAt, inhibited, state.RuleID); err != nil {
-			return fmt.Errorf("persist native alert event: %w", err)
+	}
+	for _, fingerprint := range evaluation.PruneFingerprints {
+		if fingerprint == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			bind(s.dialect, `DELETE FROM alert_rule_states WHERE rule_id = ? AND fingerprint = ?`),
+			evaluation.RuleID,
+			fingerprint,
+		); err != nil {
+			return fmt.Errorf("prune stale alert state: %w", err)
 		}
 	}
 	for _, notification := range evaluation.Notifications {

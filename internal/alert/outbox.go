@@ -218,9 +218,13 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 				item.ID,
 				w.workerID,
 				w.rateWindow,
-			); err != nil &&
-				!errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
-				slog.Error("defer rate-limited notification", "outbox_id", item.ID, "error", err)
+			); err != nil {
+				if errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+					slog.Warn("notification outbox claim lost while deferring", "outbox_id", item.ID,
+						"worker_id", w.workerID, "attempts", item.Attempts)
+				} else {
+					slog.Error("defer rate-limited notification", "outbox_id", item.ID, "error", err)
+				}
 			}
 			return
 		}
@@ -233,7 +237,10 @@ func (w *OutboxWorker) deliver(ctx context.Context, item meta.NotificationOutbox
 		return
 	}
 	if err := w.store.CompleteNotification(ctx, item.ID, w.workerID); err != nil {
-		if !errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+		if errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+			slog.Warn("notification outbox claim lost before completion", "outbox_id", item.ID,
+				"worker_id", w.workerID, "attempts", item.Attempts)
+		} else {
 			slog.Error("complete notification outbox", "outbox_id", item.ID, "error", err)
 		}
 		return
@@ -258,7 +265,10 @@ func (w *OutboxWorker) retry(ctx context.Context, item meta.NotificationOutboxIt
 	safeMessage := outbound.SanitizeError(deliveryErr)
 	status, err := w.store.RetryNotification(ctx, item.ID, w.workerID, safeMessage, delay, w.maxAttempts)
 	if err != nil {
-		if !errors.Is(err, meta.ErrNotificationOutboxClaimLost) && !errors.Is(err, context.Canceled) {
+		if errors.Is(err, meta.ErrNotificationOutboxClaimLost) {
+			slog.Warn("notification outbox claim lost before retry update", "outbox_id", item.ID,
+				"worker_id", w.workerID, "attempts", item.Attempts)
+		} else if !errors.Is(err, context.Canceled) {
 			slog.Error("retry notification outbox", "outbox_id", item.ID, "error", err)
 		}
 		return

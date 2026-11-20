@@ -1,9 +1,11 @@
 package alert
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -432,12 +434,17 @@ func TestNativeEvaluatorCommitsFiringAndResolvedNotifications(t *testing.T) {
 	if err := service.DeleteSilence(ctx, project.Slug, silence.ID); err != nil {
 		t.Fatal(err)
 	}
+	// Lifting the silence must notify promptly instead of waiting RepeatInterval.
+	firingAfterSilence := waitNotificationStatus(t, received, "firing")
+	if len(firingAfterSilence.Alerts) != 1 || firingAfterSilence.Alerts[0].Fingerprint != "native-alert" {
+		t.Fatalf("firing notification after silence lifted=%#v", firingAfterSilence)
+	}
 	query.Set(nil)
 	resolved = waitNotificationStatus(t, received, "resolved")
 	if len(resolved.Alerts) != 1 || resolved.Alerts[0].Fingerprint != "native-alert" {
 		t.Fatalf("resolved notification after silence=%#v", resolved)
 	}
-	for range 3 {
+	for range 4 {
 		select {
 		case key := <-keys:
 			if key == "" {
@@ -453,12 +460,574 @@ func TestNativeEvaluatorCommitsFiringAndResolvedNotifications(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	states, err := store.AlertRuleStates(ctx, rule.ID)
-	if err != nil || len(states) != 1 || states[0].Status != "recovered" || states[0].LastNotifiedAt == nil {
-		t.Fatalf("native states=%#v err=%v", states, err)
+	if err != nil || len(states) != 0 {
+		t.Fatalf("recovered states must be pruned from alert_rule_states: states=%#v err=%v", states, err)
 	}
 	events, err := store.ListAlertEvents(ctx, project.Slug, "", nil)
-	if err != nil || len(events) != 1 || events[0].Status != "resolved" {
+	if err != nil || len(events) != 1 || events[0].Status != "resolved" || events[0].EndsAt == nil {
 		t.Fatalf("native events=%#v err=%v", events, err)
+	}
+}
+
+func TestHTTPRuleQueryProtectsTrustedProjectID(t *testing.T) {
+	project := &meta.ProjectInfo{ID: 42, Slug: "alpha"}
+	now := time.Date(2026, 7, 18, 2, 3, 4, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(
+			[]byte(
+				`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"up","project_id":"spoofed-metric"},"value":[1784340184,"1"]}]}}`,
+			),
+		)
+	}))
+	defer server.Close()
+	query := HTTPRuleQuery{
+		Backend: evaluatorTestBackend{kind: storage.MetricsVM, base: server.URL},
+		Client:  server.Client(),
+	}
+	rule := &meta.AlertRuleView{
+		ID: 7, Name: "TenantGuard", Signal: "metrics", Expression: "up == 0", Severity: "critical",
+		Labels: map[string]string{"project_id": "other-tenant", "team": "ops"},
+	}
+	samples, err := query.Evaluate(context.Background(), rule, project, now)
+	if err != nil || len(samples) != 1 {
+		t.Fatalf("samples=%#v err=%v", samples, err)
+	}
+	if samples[0].Labels["project_id"] != "alpha" {
+		t.Fatalf("project_id was overwritten: %#v", samples[0].Labels)
+	}
+	if samples[0].Labels["team"] != "ops" {
+		t.Fatalf("custom label lost: %#v", samples[0].Labels)
+	}
+}
+
+func TestAdvanceRuleStatesDropsVanishedPendingAndAlreadyRecovered(t *testing.T) {
+	rule := &meta.AlertRuleView{ID: 7, For: "1m"}
+	t0 := time.Date(2026, 7, 18, 0, 0, 0, 0, time.UTC)
+	prev := []meta.AlertRuleState{
+		{RuleID: 7, Fingerprint: "pending-gone", Status: "pending", PendingSince: &t0, LastEvaluatedAt: t0},
+		{RuleID: 7, Fingerprint: "already-recovered", Status: "recovered", FiringSince: &t0, LastEvaluatedAt: t0},
+		{RuleID: 7, Fingerprint: "firing-now-gone", Status: "firing", FiringSince: &t0, LastEvaluatedAt: t0},
+	}
+	states, err := advanceRuleStates(rule, prev, nil, t0.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].Fingerprint != "firing-now-gone" || states[0].Status != "recovered" {
+		t.Fatalf("unexpected converged states=%#v", states)
+	}
+}
+
+func TestNativeEvaluatorPreservesInhibitedAndSilenceDoesNotSpamPeer(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	project, err := store.CreateProject(ctx, "Inhibit", "inhibit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
+		Type: "webhook", Name: "inhibit-hook", Config: map[string]any{"url": "https://example.invalid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+		ProjectSlug: project.Slug, Name: "HostDown", Signal: "metrics", Expression: "up == 0", For: "0s",
+		Severity: "critical", ChannelIDs: []int{channel.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+		ProjectSlug: project.Slug, Name: "ServiceDown", Signal: "metrics", Expression: "svc == 0", For: "0s",
+		Severity: "warning", ChannelIDs: []int{channel.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateInhibitionRule(ctx, meta.InhibitionRuleCreate{
+		ProjectSlug:    project.Slug,
+		SourceMatchers: []map[string]string{{"name": "alertname", "op": "=", "value": "HostDown"}},
+		TargetMatchers: []map[string]string{{"name": "alertname", "op": "=", "value": "ServiceDown"}},
+		EqualLabels:    []string{"instance"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSilence(ctx, meta.SilenceCreate{
+		ProjectSlug: project.Slug,
+		Matchers:    []map[string]string{{"name": "instance", "op": "=", "value": "silenced-1"}},
+		StartsAt:    now.Add(-time.Minute),
+		EndsAt:      now.Add(time.Hour),
+		Creator:     "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var curTime atomic.Int64
+	curTime.Store(now.UnixNano())
+	query := &perRuleQuery{
+		byRule: map[int][]RuleSample{
+			sourceRule.ID: {
+				{
+					Fingerprint: "host-1",
+					Labels: map[string]string{
+						"project_id": project.Slug,
+						"alertname":  "HostDown",
+						"instance":   "node-1",
+					},
+					Value: 1,
+				},
+			},
+			targetRule.ID: {
+				{
+					Fingerprint: "svc-node-1",
+					Labels: map[string]string{
+						"project_id": project.Slug,
+						"alertname":  "ServiceDown",
+						"instance":   "node-1",
+					},
+					Value: 1,
+				},
+				{
+					Fingerprint: "svc-silenced-1",
+					Labels: map[string]string{
+						"project_id": project.Slug,
+						"alertname":  "ServiceDown",
+						"instance":   "silenced-1",
+					},
+					Value: 1,
+				},
+				{
+					Fingerprint: "svc-active-1",
+					Labels: map[string]string{
+						"project_id": project.Slug,
+						"alertname":  "ServiceDown",
+						"instance":   "active-1",
+					},
+					Value: 1,
+				},
+			},
+		},
+	}
+	evaluator := NewRuleEvaluator(RuleEvaluatorConfig{
+		Store:           store,
+		Query:           query,
+		MemberID:        "inhibit-member",
+		MetricsInterval: time.Second,
+		GroupWait:       time.Second,
+		RepeatInterval:  4 * time.Hour,
+		LeaseTTL:        time.Minute,
+		MemberTTL:       time.Minute,
+		Now:             func() time.Time { return time.Unix(0, curTime.Load()).UTC() },
+	})
+	// Cycle 1: enters firing (within GroupWait).
+	evaluator.evaluateCycle(ctx)
+	// Cycle 2: past GroupWait -> active-1 notifies, node-1 is inhibited, silenced-1 is silenced.
+	curTime.Store(now.Add(2 * time.Second).UnixNano())
+	evaluator.evaluateCycle(ctx)
+	// Cycle 3 & 4: non-notify cycles -> inhibited must stay true, active-1 must NOT re-notify.
+	for _, offset := range []time.Duration{7 * time.Second, 12 * time.Second} {
+		curTime.Store(now.Add(offset).UnixNano())
+		evaluator.evaluateCycle(ctx)
+	}
+	events, err := store.ListAlertEvents(ctx, project.Slug, "firing", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byFP := make(map[string]meta.AlertEventView, len(events))
+	for _, ev := range events {
+		byFP[ev.Fingerprint] = ev
+	}
+	if !byFP["svc-node-1"].Inhibited {
+		t.Fatalf("svc-node-1 lost inhibited=true on non-notify cycle: %#v", byFP["svc-node-1"])
+	}
+	states, err := store.AlertRuleStates(ctx, targetRule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateByFP := make(map[string]meta.AlertRuleState, len(states))
+	for _, st := range states {
+		stateByFP[st.Fingerprint] = st
+	}
+	if stateByFP["svc-silenced-1"].LastNotifiedAt != nil {
+		t.Fatalf("silenced alert must not set LastNotifiedAt: %#v", stateByFP["svc-silenced-1"])
+	}
+	if stateByFP["svc-node-1"].LastNotifiedAt != nil {
+		t.Fatalf("inhibited alert must not set LastNotifiedAt: %#v", stateByFP["svc-node-1"])
+	}
+	if stateByFP["svc-active-1"].LastNotifiedAt == nil {
+		t.Fatalf("notified alert missing LastNotifiedAt: %#v", stateByFP["svc-active-1"])
+	}
+	outbox, err := store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly 2 notifications: 1 for HostDown, 1 for ServiceDown(active-1).
+	if len(outbox) != 2 {
+		t.Fatalf("expected 2 outbox entries (no repeat spam from silenced peer), got %d: %#v", len(outbox), outbox)
+	}
+}
+
+func TestNativeEvaluatorIndependentRenewalKeepsSlowQueryLeaseAlive(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	project, err := store.CreateProject(ctx, "SlowQuery", "slow-query")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+		ProjectSlug: project.Slug, Name: "SlowRule", Signal: "metrics", Expression: "up == 0", For: "0s",
+		Severity: "warning",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Query takes 450ms while LeaseTTL is only 250ms; independent renewal must keep the lease alive.
+	slowQuery := &slowRuleQuery{
+		delay: 450 * time.Millisecond,
+		samples: []RuleSample{{
+			Fingerprint: "slow-fp",
+			Labels:      map[string]string{"project_id": project.Slug, "alertname": "SlowRule"},
+			Value:       1,
+		}},
+	}
+	evaluator := NewRuleEvaluator(RuleEvaluatorConfig{
+		Store:             store,
+		Query:             slowQuery,
+		MemberID:          "slow-member",
+		TickInterval:      20 * time.Millisecond,
+		MetricsInterval:   20 * time.Millisecond,
+		HeartbeatInterval: 100 * time.Millisecond,
+		MemberTTL:         2 * time.Second,
+		LeaseTTL:          250 * time.Millisecond,
+		QueryTimeout:      2 * time.Second,
+	})
+	evaluator.Start()
+	defer evaluator.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		states, stateErr := store.AlertRuleStates(ctx, rule.ID)
+		if stateErr == nil && len(states) == 1 && states[0].Status == "firing" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	states, _ := store.AlertRuleStates(ctx, rule.ID)
+	t.Fatalf("slow query evaluation never committed firing state (renewal failed): states=%#v", states)
+}
+
+func TestNativeEvaluatorLogsLeaseRejectionsAndCleansExpiredMembers(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	project, err := store.CreateProject(ctx, "Logs", "logs-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+		ProjectSlug: project.Slug, Name: "Contested", Signal: "metrics", Expression: "up == 0", For: "0s",
+		Severity: "warning",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed another member holding the lease so our evaluator hits ErrRuleLeaseHeld.
+	if _, err := store.HeartbeatAlertEngine(ctx, "holder-member", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireAlertRuleLease(ctx, rule.ID, "holder-member", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// Seed an already-expired member so heartbeat cleanup removes it.
+	if _, err := store.HeartbeatAlertEngine(ctx, "expired-member", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(15 * time.Millisecond)
+
+	var buf bytes.Buffer
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(oldLogger)
+
+	// Force evaluator to be sole active member after holder expires? Instead,
+	// delete holder-member row while its lease is still unexpired, so our
+	// evaluator wins rendezvous hash and hits ErrRuleLeaseHeld.
+	if _, err := store.DeleteAlertEngineMember(ctx, "holder-member"); err != nil {
+		t.Fatal(err)
+	}
+	evaluator := NewRuleEvaluator(RuleEvaluatorConfig{
+		Store:             store,
+		Query:             &countingRuleQuery{},
+		MemberID:          "contender-member",
+		MemberTTL:         time.Minute,
+		HeartbeatInterval: 20 * time.Millisecond,
+		LeaseTTL:          time.Minute,
+	})
+	evaluator.evaluateCycle(ctx)
+	// Also exercise stale release warning.
+	evaluator.mu.Lock()
+	evaluator.leases[rule.ID] = meta.AlertRuleLease{RuleID: rule.ID, OwnerID: "contender-member", Epoch: 99}
+	evaluator.mu.Unlock()
+	evaluator.releaseAll(ctx)
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "level=WARN") || !strings.Contains(logOutput, "rule_id=") ||
+		!strings.Contains(logOutput, "member_id=contender-member") || !strings.Contains(logOutput, "lease_epoch=") {
+		t.Fatalf("expected WARN fencing logs with rule/member/epoch, got:\n%s", logOutput)
+	}
+
+	// Start briefly to verify heartbeat cleans expired members.
+	evaluator.Start()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		members, listErr := store.ActiveAlertEngineMembers(ctx)
+		if listErr == nil && len(members) == 1 && members[0].MemberID == "contender-member" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	evaluator.Close()
+}
+
+func TestNativeEvaluatorRespectsStormThreshold(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	project, err := store.CreateProject(ctx, "Storm", "storm-native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
+		Type: "webhook", Name: "storm-hook", Config: map[string]any{"url": "https://example.invalid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byRule := make(map[int][]RuleSample)
+	for i := range 3 {
+		name := fmt.Sprintf("StormRule-%d", i)
+		r, createErr := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug: project.Slug, Name: name, Signal: "metrics", Expression: "vector(1)", For: "0s",
+			Severity: "critical", ChannelIDs: []int{channel.ID},
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		byRule[r.ID] = []RuleSample{{
+			Fingerprint: fmt.Sprintf("fp-%d", i),
+			Labels:      map[string]string{"project_id": project.Slug, "alertname": name, "severity": "critical"},
+			Value:       1,
+		}}
+	}
+	now := time.Date(2026, 8, 1, 13, 0, 0, 0, time.UTC)
+	var curTime atomic.Int64
+	curTime.Store(now.UnixNano())
+	evaluator := NewRuleEvaluator(RuleEvaluatorConfig{
+		Store:           store,
+		Query:           &perRuleQuery{byRule: byRule},
+		MemberID:        "storm-member",
+		MetricsInterval: time.Second,
+		GroupWait:       time.Second,
+		RepeatInterval:  time.Hour,
+		StormThreshold:  2,
+		MaxConcurrency:  1,
+		LeaseTTL:        time.Minute,
+		MemberTTL:       time.Minute,
+		Now:             func() time.Time { return time.Unix(0, curTime.Load()).UTC() },
+	})
+	// Cycle 1: all 3 rules enter firing state (before GroupWait).
+	evaluator.evaluateCycle(ctx)
+	// Cycle 2: past GroupWait with 3 firing rules > StormThreshold(2) -> storm summary deduplicated to 1 entry!
+	curTime.Store(now.Add(2 * time.Second).UnixNano())
+	evaluator.evaluateCycle(ctx)
+
+	outbox, err := store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outbox) != 1 {
+		t.Fatalf("expected 1 deduplicated storm notification for 3 rules (> threshold 2), got %d", len(outbox))
+	}
+	item, err := store.NotificationOutboxItem(ctx, outbox[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n Notification
+	if err := json.Unmarshal(item.Payload, &n); err != nil {
+		t.Fatal(err)
+	}
+	if n.Rule != "alert_storm" || n.Storm == nil || n.Storm.GroupCount != 3 {
+		t.Fatalf("expected alert_storm summary with GroupCount=3, got %#v", n)
+	}
+}
+
+func TestUpdateAlertRuleExpressionAndDisableDeliverResolvedOnce(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	project, err := store.CreateProject(ctx, "RuleUpdateResolve", "rule-update-resolve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan Notification, 8)
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var notification Notification
+		if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		received <- notification
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer endpoint.Close()
+
+	query := &exprAwareRuleQuery{firingExpr: "up == 0"}
+	service := NewService(Config{
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		Sender:         &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+		Outbox:         OutboxWorkerConfig{WorkerID: "update-resolve-outbox", PollInterval: 5 * time.Millisecond},
+		Evaluator: RuleEvaluatorConfig{
+			Query:           query,
+			MemberID:        "update-resolve-engine",
+			TickInterval:    5 * time.Millisecond,
+			MetricsInterval: 5 * time.Millisecond,
+			LeaseTTL:        time.Second,
+		},
+	})
+	defer service.Close()
+
+	channel, err := service.CreateChannel(ctx, ChannelInput{
+		Type: "webhook", Name: "update-resolve-hook", Config: map[string]any{"url": endpoint.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := service.CreateRule(ctx, RuleInput{
+		Project: project.Slug, Name: "UpdateResolveRule", Expr: "up == 0", ChannelIDs: []int{channel.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firing := waitNotificationStatus(t, received, "firing")
+	if firing.Rule != "UpdateResolveRule" {
+		t.Fatalf("unexpected firing notification: %#v", firing)
+	}
+
+	// Updating expression to a non-firing query must emit exactly one resolved notification.
+	if _, err := service.UpdateRule(ctx, rule.ID, RuleInput{
+		Project: project.Slug, Expr: "vector(0) > 0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resolved := waitNotificationStatus(t, received, "resolved")
+	if resolved.Rule != "UpdateResolveRule" || len(resolved.Alerts) != 1 || resolved.Alerts[0].EndsAt.IsZero() {
+		t.Fatalf("unexpected resolved notification after expr update: %#v", resolved)
+	}
+	select {
+	case extra := <-received:
+		t.Fatalf("duplicate notification after expr update: %#v", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Re-trigger firing, then disable the rule -> must emit exactly one resolved notification.
+	if _, err := service.UpdateRule(ctx, rule.ID, RuleInput{
+		Project: project.Slug, Expr: "up == 0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitNotificationStatus(t, received, "firing")
+	disabled := false
+	if _, err := service.UpdateRule(ctx, rule.ID, RuleInput{
+		Project: project.Slug, Enabled: &disabled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resolved = waitNotificationStatus(t, received, "resolved")
+	if resolved.Rule != "UpdateResolveRule" {
+		t.Fatalf("unexpected resolved notification after disable: %#v", resolved)
+	}
+	select {
+	case extra := <-received:
+		t.Fatalf("duplicate notification after disable: %#v", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+type exprAwareRuleQuery struct {
+	firingExpr string
+}
+
+func (q *exprAwareRuleQuery) Evaluate(
+	_ context.Context,
+	rule *meta.AlertRuleView,
+	project *meta.ProjectInfo,
+	_ time.Time,
+) ([]RuleSample, error) {
+	if rule.Expression != q.firingExpr {
+		return nil, nil
+	}
+	return []RuleSample{{
+		Fingerprint: "expr-aware-fp",
+		Labels:      map[string]string{"project_id": project.Slug, "alertname": rule.Name},
+		Annotations: map[string]string{"summary": "active"},
+		Value:       1,
+	}}, nil
+}
+
+type perRuleQuery struct {
+	mu     sync.RWMutex
+	byRule map[int][]RuleSample
+}
+
+func (q *perRuleQuery) Evaluate(
+	_ context.Context,
+	rule *meta.AlertRuleView,
+	_ *meta.ProjectInfo,
+	_ time.Time,
+) ([]RuleSample, error) {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return slices.Clone(q.byRule[rule.ID]), nil
+}
+
+type slowRuleQuery struct {
+	delay   time.Duration
+	samples []RuleSample
+}
+
+func (q *slowRuleQuery) Evaluate(
+	ctx context.Context,
+	_ *meta.AlertRuleView,
+	_ *meta.ProjectInfo,
+	_ time.Time,
+) ([]RuleSample, error) {
+	select {
+	case <-time.After(q.delay):
+		return slices.Clone(q.samples), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

@@ -116,6 +116,24 @@ func TestNotificationOutboxLifecycle(t *testing.T) {
 				t.Fatalf("outbox id=%d status=%q want=%q err=%v", id, item.Status, want, err)
 			}
 		}
+
+		// Requeueing a dead item must reset attempts to 0 and make it
+		// immediately claimable via the database clock.
+		requeued, err := store.RequeueNotification(ctx, firstID, project.ID)
+		if err != nil || !requeued {
+			t.Fatalf("requeue dead item=%v err=%v", requeued, err)
+		}
+		requeuedItem, err := store.NotificationOutboxItem(ctx, firstID)
+		if err != nil || requeuedItem.Status != "pending" || requeuedItem.Attempts != 0 {
+			t.Fatalf("requeued item=%#v err=%v", requeuedItem, err)
+		}
+		items, err = store.ClaimNotifications(ctx, "worker-requeue", 1, time.Minute)
+		if err != nil || len(items) != 1 || items[0].ID != firstID || items[0].Attempts != 1 {
+			t.Fatalf("claim after requeue=%#v err=%v", items, err)
+		}
+		if err := store.CompleteNotification(ctx, firstID, "worker-requeue"); err != nil {
+			t.Fatal(err)
+		}
 	})
 }
 

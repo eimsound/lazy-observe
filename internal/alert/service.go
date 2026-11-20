@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,10 +18,25 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/eimsound/lazy-observe/internal/state"
+	prommodel "github.com/prometheus/common/model"
 )
 
 // ErrInvalidChannelConfig reports a rejected notification channel configuration.
 var ErrInvalidChannelConfig = errors.New("invalid notification channel config")
+
+// ErrInvalidInput reports a rejected alert rule, silence, inhibition, or config input.
+var ErrInvalidInput = errors.New("invalid alert input")
+
+const (
+	platformConfigCacheTTL        = 5 * time.Second
+	platformRecoveryCheckInterval = 5 * time.Second
+)
+
+type cachedPlatformConfig struct {
+	cfg       meta.ProjectAlertConfigView
+	project   meta.ProjectInfo
+	expiresAt time.Time
+}
 
 type Config struct {
 	Store           *meta.Store
@@ -42,10 +59,12 @@ type Service struct {
 	engine         *Engine
 	now            func() time.Time
 	repeatInterval time.Duration
-	rateMu         sync.Mutex
-	rate           map[int][]time.Time
+	cfgCacheMu     sync.RWMutex
+	cfgCache       map[int]cachedPlatformConfig
 	outbox         *OutboxWorker
 	evaluator      *RuleEvaluator
+	monitorCancel  context.CancelFunc
+	monitorWG      sync.WaitGroup
 }
 
 func NewService(cfg Config) *Service {
@@ -66,7 +85,7 @@ func NewService(cfg Config) *Service {
 		sender:         cfg.Sender,
 		now:            cfg.Now,
 		repeatInterval: cfg.RepeatInterval,
-		rate:           make(map[int][]time.Time),
+		cfgCache:       make(map[int]cachedPlatformConfig),
 	}
 	s.engine = NewEngine(
 		EngineConfig{
@@ -105,12 +124,37 @@ func NewService(cfg Config) *Service {
 	if cfg.RepeatInterval > 0 {
 		cfg.Evaluator.RepeatInterval = cfg.RepeatInterval
 	}
+	if cfg.StormThreshold > 0 && cfg.Evaluator.StormThreshold <= 0 {
+		cfg.Evaluator.StormThreshold = cfg.StormThreshold
+	}
 	cfg.Evaluator.WakeOutbox = s.outbox.Wake
 	s.evaluator = NewRuleEvaluator(cfg.Evaluator)
 	s.evaluator.Start()
+	if s.store != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.monitorCancel = cancel
+		s.monitorWG.Add(1)
+		go s.runPlatformErrorRateMonitor(ctx)
+	}
 	return s
 }
-func (s *Service) Close() { s.engine.Close(); s.evaluator.Close(); s.outbox.Close() }
+
+func (s *Service) Close() {
+	if s.monitorCancel != nil {
+		s.monitorCancel()
+		s.monitorWG.Wait()
+	}
+	s.engine.Close()
+	s.evaluator.Close()
+	s.outbox.Close()
+}
+
+// WakeOutbox nudges the outbox worker to claim newly pending notifications.
+func (s *Service) WakeOutbox() {
+	if s != nil && s.outbox != nil {
+		s.outbox.Wake()
+	}
+}
 
 type RuleInput struct {
 	Project          string            `json:"project"`
@@ -126,19 +170,80 @@ type RuleInput struct {
 	ChannelIDs       []int             `json:"channel_ids"`
 }
 
+// ValidateRuleFor validates a Prometheus-style duration string for a rule's
+// `for` field (e.g. "0s", "1m", "5m30s").
+func ValidateRuleFor(raw string) error {
+	d, err := prommodel.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("%w: invalid alert for duration %q", ErrInvalidInput, raw)
+	}
+	if time.Duration(d) < 0 {
+		return fmt.Errorf("%w: alert for duration must not be negative", ErrInvalidInput)
+	}
+	return nil
+}
+
+// NormalizeChannelType maps legacy aliases (such as "email") to canonical
+// channel types.
+func NormalizeChannelType(v string) string {
+	if v == "email" {
+		return "smtp"
+	}
+	return v
+}
+
+// NormalizeChannelConfig maps legacy SMTP keys (`smtp_host`/`smtp_port`) to
+// their canonical names (`host`/`port`) when kind is "smtp".
+func NormalizeChannelConfig(kind string, config map[string]any) map[string]any {
+	if config == nil {
+		return nil
+	}
+	if NormalizeChannelType(kind) != "smtp" {
+		return config
+	}
+	out := make(map[string]any, len(config))
+	for key, value := range config {
+		out[key] = value
+	}
+	if _, ok := out["host"]; !ok {
+		if value, exists := out["smtp_host"]; exists {
+			out["host"] = value
+		}
+	}
+	if _, ok := out["port"]; !ok {
+		if value, exists := out["smtp_port"]; exists {
+			out["port"] = value
+		}
+	}
+	delete(out, "smtp_host")
+	delete(out, "smtp_port")
+	return out
+}
+
 func (s *Service) ListRules(ctx context.Context, slug string) ([]meta.AlertRuleView, error) {
 	return s.store.ListAlertRules(ctx, slug)
 }
 func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleView, error) {
 	if in.EvaluationEngine != "" && in.EvaluationEngine != "native" {
-		return meta.AlertRuleView{}, fmt.Errorf("unsupported alert evaluation engine %q", in.EvaluationEngine)
+		return meta.AlertRuleView{}, fmt.Errorf(
+			"%w: unsupported alert evaluation engine %q",
+			ErrInvalidInput,
+			in.EvaluationEngine,
+		)
+	}
+	if in.Signal != "" && in.Signal != "metrics" && in.Signal != "logs" {
+		return meta.AlertRuleView{}, fmt.Errorf("%w: unsupported alert signal %q", ErrInvalidInput, in.Signal)
+	}
+	forDuration := defaultString(in.For, "0s")
+	if err := ValidateRuleFor(forDuration); err != nil {
+		return meta.AlertRuleView{}, err
 	}
 	return s.store.CreateAlertRule(ctx, meta.AlertRuleCreate{
 		ProjectSlug: in.Project,
 		Name:        in.Name,
 		Signal:      defaultString(in.Signal, "metrics"),
 		Expression:  in.Expr,
-		For:         defaultString(in.For, "0s"),
+		For:         forDuration,
 		Severity:    defaultString(in.Severity, "warning"),
 		Labels:      nonNilMap(in.Labels),
 		Annotations: nonNilMap(in.Annotations),
@@ -147,21 +252,80 @@ func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleV
 	})
 }
 func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.AlertRuleView, error) {
+	if in.EvaluationEngine != "" && in.EvaluationEngine != "native" {
+		return meta.AlertRuleView{}, fmt.Errorf(
+			"%w: unsupported alert evaluation engine %q",
+			ErrInvalidInput,
+			in.EvaluationEngine,
+		)
+	}
+	if in.Signal != "" && in.Signal != "metrics" && in.Signal != "logs" {
+		return meta.AlertRuleView{}, fmt.Errorf("%w: unsupported alert signal %q", ErrInvalidInput, in.Signal)
+	}
+	if in.For != "" {
+		if err := ValidateRuleFor(in.For); err != nil {
+			return meta.AlertRuleView{}, err
+		}
+	}
 	old, err := s.store.AlertRule(ctx, in.Project, id)
 	if err != nil {
 		return meta.AlertRuleView{}, err
 	}
-	if in.EvaluationEngine != "" && in.EvaluationEngine != "native" {
-		return meta.AlertRuleView{}, fmt.Errorf("unsupported alert evaluation engine %q", in.EvaluationEngine)
+	resolveFiring := (in.Expr != "" && in.Expr != old.Expression) ||
+		(in.Signal != "" && in.Signal != old.Signal) ||
+		(in.Enabled != nil && *in.Enabled != old.Enabled)
+	var activeSilences [][]Matcher
+	if resolveFiring {
+		policy, policyErr := s.store.AlertPolicySnapshot(ctx, old.Project.ID, s.now().UTC())
+		if policyErr != nil {
+			return meta.AlertRuleView{}, policyErr
+		}
+		activeSilences = make([][]Matcher, 0, len(policy.Silences))
+		for _, matchers := range policy.Silences {
+			activeSilences = append(activeSilences, mapsToMatchers(matchers))
+		}
 	}
+	var enqueuedResolved bool
 	update := meta.AlertRuleUpdate{
 		Labels:             in.Labels,
 		Annotations:        in.Annotations,
 		Enabled:            in.Enabled,
 		ActivateEvaluation: in.EvaluationEngine == "native" && old.EvaluationEngine == "paused",
-		ResolveFiring: (in.Expr != "" && in.Expr != old.Expression) ||
-			(in.Signal != "" && in.Signal != old.Signal) ||
-			(in.Enabled != nil && *in.Enabled != old.Enabled),
+		ResolveFiring:      resolveFiring,
+		BuildResolveNotifications: func(
+			resolvedStates []meta.AlertRuleState,
+			enabledChannelIDs []int,
+			resolvedAt time.Time,
+		) ([]meta.NotificationOutboxEnqueue, error) {
+			resolvedAlerts := make([]Alert, 0, len(resolvedStates))
+			for _, state := range resolvedStates {
+				a := alertFromRuleState(state, "resolved", resolvedAt)
+				if !matchesAny(a.Labels, activeSilences) {
+					resolvedAlerts = append(resolvedAlerts, a)
+				}
+			}
+			if len(resolvedAlerts) == 0 {
+				return nil, nil
+			}
+			ruleView := old
+			ruleView.EnabledChannelIDs = enabledChannelIDs
+			entries := nativeOutboxEntries(
+				&ruleView,
+				&old.Project,
+				[]Notification{{
+					Project: old.Project.Slug,
+					Rule:    old.Name,
+					Status:  "resolved",
+					Alerts:  resolvedAlerts,
+				}},
+				resolvedAt,
+				s.repeatInterval,
+			)
+			if len(entries) != 0 {
+				enqueuedResolved = true
+			}
+			return entries, nil
+		},
 	}
 	if in.Name != "" {
 		update.Name = &in.Name
@@ -181,7 +345,14 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 	if in.ChannelIDs != nil {
 		update.ChannelIDs = &in.ChannelIDs
 	}
-	return s.store.UpdateAlertRule(ctx, in.Project, id, update)
+	updated, err := s.store.UpdateAlertRule(ctx, in.Project, id, update)
+	if err != nil {
+		return meta.AlertRuleView{}, err
+	}
+	if enqueuedResolved {
+		s.WakeOutbox()
+	}
+	return updated, nil
 }
 func (s *Service) DeleteRule(ctx context.Context, projectSlug string, id int) error {
 	return s.store.DeleteAlertRule(ctx, projectSlug, id)
@@ -199,6 +370,8 @@ func (s *Service) ListChannels(ctx context.Context) ([]meta.NotificationChannelV
 }
 
 func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (meta.NotificationChannelView, error) {
+	in.Type = NormalizeChannelType(in.Type)
+	in.Config = NormalizeChannelConfig(in.Type, in.Config)
 	if err := validateChannelConfig(in.Type, in.Config, s.sender.Outbound); err != nil {
 		return meta.NotificationChannelView{}, err
 	}
@@ -208,6 +381,7 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (meta.Noti
 }
 
 func (s *Service) UpdateChannel(ctx context.Context, id int, in ChannelInput) (meta.NotificationChannelView, error) {
+	in.Type = NormalizeChannelType(in.Type)
 	update := meta.NotificationChannelUpdate{Enabled: in.Enabled}
 	if in.Type != "" {
 		update.Type = &in.Type
@@ -224,7 +398,9 @@ func (s *Service) UpdateChannel(ctx context.Context, id int, in ChannelInput) (m
 		if effectiveType == "" {
 			effectiveType = existing.Type
 		}
-		merged, err := preserveRedactedChannelSecrets(in.Config, existing.Config, loadErr)
+		normalizedIncoming := NormalizeChannelConfig(effectiveType, in.Config)
+		normalizedExisting := NormalizeChannelConfig(effectiveType, existing.Config)
+		merged, err := preserveRedactedChannelSecrets(normalizedIncoming, normalizedExisting, loadErr)
 		if err != nil {
 			return meta.NotificationChannelView{}, err
 		}
@@ -420,6 +596,12 @@ func (s *Service) ListSilences(ctx context.Context, slug string) ([]meta.Silence
 	return s.store.ListSilences(ctx, slug)
 }
 func (s *Service) CreateSilence(ctx context.Context, in SilenceInput) (meta.SilenceView, error) {
+	if err := ValidateMatchers(in.Matchers); err != nil {
+		return meta.SilenceView{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
+	}
+	if in.StartsAt.IsZero() || !in.EndsAt.After(in.StartsAt) {
+		return meta.SilenceView{}, fmt.Errorf("%w: silence ends_at must be after starts_at", ErrInvalidInput)
+	}
 	return s.store.CreateSilence(ctx, meta.SilenceCreate{
 		ProjectSlug: in.Project,
 		Matchers:    matchersToMaps(in.Matchers),
@@ -430,6 +612,28 @@ func (s *Service) CreateSilence(ctx context.Context, in SilenceInput) (meta.Sile
 	})
 }
 func (s *Service) UpdateSilence(ctx context.Context, id int, in SilenceInput) (meta.SilenceView, error) {
+	if in.Matchers != nil {
+		if err := ValidateMatchers(in.Matchers); err != nil {
+			return meta.SilenceView{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
+		}
+	}
+	if !in.StartsAt.IsZero() || !in.EndsAt.IsZero() {
+		existing, err := s.store.SilenceByID(ctx, in.Project, id)
+		if err != nil {
+			return meta.SilenceView{}, err
+		}
+		effectiveStart := existing.StartsAt
+		if !in.StartsAt.IsZero() {
+			effectiveStart = in.StartsAt
+		}
+		effectiveEnd := existing.EndsAt
+		if !in.EndsAt.IsZero() {
+			effectiveEnd = in.EndsAt
+		}
+		if !effectiveEnd.After(effectiveStart) {
+			return meta.SilenceView{}, fmt.Errorf("%w: silence ends_at must be after starts_at", ErrInvalidInput)
+		}
+	}
 	update := meta.SilenceUpdate{}
 	if in.Matchers != nil {
 		update.Matchers = matchersToMaps(in.Matchers)
@@ -486,6 +690,12 @@ func (s *Service) ListInhibitionRules(ctx context.Context, slug string) ([]meta.
 }
 
 func (s *Service) CreateInhibitionRule(ctx context.Context, in InhibitionRuleInput) (meta.InhibitionRuleView, error) {
+	if err := ValidateMatchers(in.SourceMatchers); err != nil {
+		return meta.InhibitionRuleView{}, fmt.Errorf("%w: source_matchers: %w", ErrInvalidInput, err)
+	}
+	if err := ValidateMatchers(in.TargetMatchers); err != nil {
+		return meta.InhibitionRuleView{}, fmt.Errorf("%w: target_matchers: %w", ErrInvalidInput, err)
+	}
 	rule, err := s.store.CreateInhibitionRule(ctx, meta.InhibitionRuleCreate{
 		ProjectSlug:    in.Project,
 		SourceMatchers: matchersToMaps(in.SourceMatchers),
@@ -506,6 +716,16 @@ func (s *Service) UpdateInhibitionRule(
 	id int,
 	in InhibitionRuleInput,
 ) (meta.InhibitionRuleView, error) {
+	if in.SourceMatchers != nil {
+		if err := ValidateMatchers(in.SourceMatchers); err != nil {
+			return meta.InhibitionRuleView{}, fmt.Errorf("%w: source_matchers: %w", ErrInvalidInput, err)
+		}
+	}
+	if in.TargetMatchers != nil {
+		if err := ValidateMatchers(in.TargetMatchers); err != nil {
+			return meta.InhibitionRuleView{}, fmt.Errorf("%w: target_matchers: %w", ErrInvalidInput, err)
+		}
+	}
 	update := meta.InhibitionRuleUpdate{Enabled: in.Enabled}
 	if in.SourceMatchers != nil {
 		update.SourceMatchers = matchersToMaps(in.SourceMatchers)
@@ -650,7 +870,7 @@ func (s *Service) PutProjectAlertConfig(
 	in ProjectAlertConfigInput,
 ) (ProjectAlertConfigView, error) {
 	if in.ErrorRateThresholdPerMinute < 0 {
-		return ProjectAlertConfigView{}, fmt.Errorf("error rate threshold must not be negative")
+		return ProjectAlertConfigView{}, fmt.Errorf("%w: error rate threshold must not be negative", ErrInvalidInput)
 	}
 	cfg, err := s.store.PutProjectAlertConfig(ctx, projectID, meta.ProjectAlertConfigUpdate{
 		NewIssue:                    in.NewIssue,
@@ -661,16 +881,20 @@ func (s *Service) PutProjectAlertConfig(
 	if err != nil {
 		return ProjectAlertConfigView{}, err
 	}
-	s.rateMu.Lock()
-	delete(s.rate, projectID)
-	s.rateMu.Unlock()
+	s.invalidatePlatformConfigCache(projectID)
+	if _, clearErr := s.store.ClearPlatformErrorRateState(ctx, projectID, s.now().UTC()); clearErr != nil {
+		slog.Warn("clear platform error rate state after config update", "project_id", projectID, "error", clearErr)
+	}
+	if _, p, pErr := s.platformConfig(ctx, projectID); pErr == nil {
+		s.engine.Remove(p.Slug, "error_rate_spike")
+	}
 	return cfg, nil
 }
 
 // HandleIssueChange injects a committed issue lifecycle event into the same
 // grouping, silence and notification engine used by platform-event alerts.
 func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.IssueChange) error {
-	cfg, p, err := s.platformConfig(ctx, change.ProjectID)
+	cfg, p, err := s.cachedPlatformConfig(ctx, change.ProjectID)
 	if err != nil {
 		return err
 	}
@@ -689,11 +913,12 @@ func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.Issue
 	return nil
 }
 
-// RecordErrorEvent uses a five-minute sliding window. A spike fires when the
-// observed count divided by five minutes is strictly greater than the configured
-// absolute per-minute threshold. Threshold zero disables this event type.
+// RecordErrorEvent uses a durable five-minute sliding window. A spike fires
+// when the observed count divided by five minutes is strictly greater than the
+// configured absolute per-minute threshold, and resolves when it falls back to
+// or below the threshold. Threshold zero disables this event type.
 func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredAt time.Time) error {
-	cfg, p, err := s.platformConfig(ctx, projectID)
+	cfg, p, err := s.cachedPlatformConfig(ctx, projectID)
 	if err != nil {
 		return err
 	}
@@ -701,37 +926,132 @@ func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredA
 		return nil
 	}
 	now := s.now().UTC()
-	cutoff := now.Add(-errorRateWindow)
-	occurredAt = occurredAt.UTC()
-	if occurredAt.IsZero() || occurredAt.Before(cutoff) {
+	transition, err := s.store.RecordPlatformErrorRate(
+		ctx,
+		projectID,
+		occurredAt,
+		now,
+		errorRateWindow,
+		cfg.ErrorRateThresholdPerMinute,
+	)
+	if err != nil {
+		return err
+	}
+	switch transition.Transition {
+	case "firing":
+		rate := float64(transition.Count) / errorRateWindow.Minutes()
+		s.engine.Add(
+			ctx,
+			p.Slug,
+			"error_rate_spike",
+			Alert{Status: "firing", Labels: platformLabels(p.Slug, "error_rate_spike"), Annotations: map[string]string{
+				"summary":           fmt.Sprintf("Error rate spike: %.1f events/min", rate),
+				"window":            "5m",
+				"threshold_per_min": strconv.Itoa(cfg.ErrorRateThresholdPerMinute),
+				"cycle":             strconv.FormatInt(transition.Cycle, 10),
+			}, StartsAt: transition.StartsAt},
+		)
+	case "resolved":
+		rate := float64(transition.Count) / errorRateWindow.Minutes()
+		s.engine.Add(
+			ctx,
+			p.Slug,
+			"error_rate_spike",
+			Alert{
+				Status: "resolved",
+				Labels: platformLabels(p.Slug, "error_rate_spike"),
+				Annotations: map[string]string{
+					"summary":           fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
+					"window":            "5m",
+					"threshold_per_min": strconv.Itoa(cfg.ErrorRateThresholdPerMinute),
+					"cycle":             strconv.FormatInt(transition.Cycle, 10),
+				},
+				StartsAt: transition.StartsAt,
+				EndsAt:   transition.EndsAt,
+			},
+		)
+	}
+	return nil
+}
+
+// CheckErrorRateRecoveries evaluates durable firing error_rate_spike states and
+// emits resolved alerts once their 5-minute window drops back within threshold.
+func (s *Service) CheckErrorRateRecoveries(ctx context.Context) error {
+	if s == nil || s.store == nil {
 		return nil
 	}
-	s.rateMu.Lock()
-	times := s.rate[projectID]
-	retained := times[:0]
-	for _, observedAt := range times {
-		if !observedAt.Before(cutoff) {
-			retained = append(retained, observedAt)
+	recoveries, err := s.store.CheckPlatformErrorRateRecoveries(ctx, s.now().UTC(), errorRateWindow)
+	if err != nil {
+		return err
+	}
+	for _, rec := range recoveries {
+		rate := float64(rec.Count) / errorRateWindow.Minutes()
+		s.engine.Add(
+			ctx,
+			rec.ProjectSlug,
+			"error_rate_spike",
+			Alert{
+				Status: "resolved",
+				Labels: platformLabels(rec.ProjectSlug, "error_rate_spike"),
+				Annotations: map[string]string{
+					"summary":           fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
+					"window":            "5m",
+					"threshold_per_min": strconv.Itoa(rec.Threshold),
+					"cycle":             strconv.FormatInt(rec.Cycle, 10),
+				},
+				StartsAt: rec.StartsAt,
+				EndsAt:   rec.EndsAt,
+			},
+		)
+	}
+	return nil
+}
+
+func (s *Service) runPlatformErrorRateMonitor(ctx context.Context) {
+	defer s.monitorWG.Done()
+	ticker := time.NewTicker(platformRecoveryCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.CheckErrorRateRecoveries(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Warn("check platform error rate recoveries", "error", err)
+			}
 		}
 	}
-	times = append(retained, occurredAt)
-	s.rate[projectID] = times
-	spike := len(times) > cfg.ErrorRateThresholdPerMinute*int(errorRateWindow/time.Minute)
-	rate := float64(len(times)) / errorRateWindow.Minutes()
-	s.rateMu.Unlock()
-	if !spike {
-		return nil
+}
+
+func (s *Service) cachedPlatformConfig(
+	ctx context.Context,
+	projectID int,
+) (meta.ProjectAlertConfigView, meta.ProjectInfo, error) {
+	now := s.now().UTC()
+	s.cfgCacheMu.RLock()
+	entry, ok := s.cfgCache[projectID]
+	s.cfgCacheMu.RUnlock()
+	if ok && now.Before(entry.expiresAt) {
+		return entry.cfg, entry.project, nil
 	}
-	s.engine.Add(
-		ctx,
-		p.Slug,
-		"error_rate_spike",
-		Alert{Status: "firing", Labels: platformLabels(p.Slug, "error_rate_spike"), Annotations: map[string]string{
-			"summary": fmt.Sprintf("Error rate spike: %.1f events/min", rate),
-			"window":  "5m", "threshold_per_min": strconv.Itoa(cfg.ErrorRateThresholdPerMinute),
-		}, StartsAt: now},
-	)
-	return nil
+	cfg, proj, err := s.platformConfig(ctx, projectID)
+	if err != nil {
+		return meta.ProjectAlertConfigView{}, meta.ProjectInfo{}, err
+	}
+	s.cfgCacheMu.Lock()
+	s.cfgCache[projectID] = cachedPlatformConfig{
+		cfg:       cfg,
+		project:   proj,
+		expiresAt: now.Add(platformConfigCacheTTL),
+	}
+	s.cfgCacheMu.Unlock()
+	return cfg, proj, nil
+}
+
+func (s *Service) invalidatePlatformConfigCache(projectID int) {
+	s.cfgCacheMu.Lock()
+	delete(s.cfgCache, projectID)
+	s.cfgCacheMu.Unlock()
 }
 
 func (s *Service) platformConfig(
@@ -756,14 +1076,25 @@ func (s *Service) notifyPlatform(ctx context.Context, n Notification) error {
 		return nil
 	}
 	n = s.attachIssueAIAnalysis(ctx, n)
+	payload, marshalErr := json.Marshal(n)
+	if marshalErr != nil {
+		return fmt.Errorf("encode platform notification: %w", marshalErr)
+	}
+	// Include rule, status, and repeat generation in the idempotency key so
+	// concurrent replicas deduplicate the same event while repeat deliveries
+	// and subsequent spike cycles are never permanently swallowed.
+	keyPayload := append(slices.Clone(payload), []byte(fmt.Sprintf("\x00platform\x00%s\x00%s", n.Rule, n.Status))...)
+	if n.Status == "firing" && s.repeatInterval > 0 && len(n.Alerts) > 0 && !n.Alerts[0].StartsAt.IsZero() {
+		elapsed := s.now().UTC().Sub(n.Alerts[0].StartsAt.UTC())
+		var generation int64
+		if elapsed > 0 {
+			generation = elapsed.Nanoseconds() / s.repeatInterval.Nanoseconds()
+		}
+		keyPayload = append(keyPayload, []byte(fmt.Sprintf("\x00%d", generation))...)
+	}
 	var errs []error
 	for _, ch := range cfg.Channels {
 		if !ch.Enabled {
-			continue
-		}
-		payload, marshalErr := json.Marshal(n)
-		if marshalErr != nil {
-			errs = append(errs, fmt.Errorf("encode platform notification for channel %d: %w", ch.ID, marshalErr))
 			continue
 		}
 		priority := 0
@@ -771,7 +1102,7 @@ func (s *Service) notifyPlatform(ctx context.Context, n Notification) error {
 			priority = 100
 		}
 		_, inserted, enqueueErr := s.store.EnqueueNotification(ctx, meta.NotificationOutboxEnqueue{
-			IdempotencyKey: notificationOutboxKey(ch.ID, payload),
+			IdempotencyKey: notificationOutboxKey(ch.ID, keyPayload),
 			ProjectID:      cfg.ProjectID,
 			ChannelID:      ch.ID,
 			Payload:        payload,

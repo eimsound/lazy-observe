@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"entgo.io/ent/dialect/sql/sqlgraph"
 	dbent "github.com/eimsound/lazy-observe/internal/db/ent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
 )
@@ -36,10 +37,13 @@ const (
 // Ordering helpers stay private: query builders are not part of the metadata
 // API (ADR 0004).
 var (
-	orderAsc          = dbent.Asc
-	orderDesc         = dbent.Desc
-	IsConstraintError = dbent.IsConstraintError
+	orderAsc  = dbent.Asc
+	orderDesc = dbent.Desc
 )
+
+func IsConstraintError(err error) bool {
+	return dbent.IsConstraintError(err) || sqlgraph.IsConstraintError(err)
+}
 
 // NotFoundError covers metadata operations implemented with reviewed SQL
 // rather than an Ent builder. IsNotFound recognizes both error families.

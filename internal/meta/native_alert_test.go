@@ -109,3 +109,106 @@ func TestCommitNativeAlertEvaluationIsAtomicAndFenced(t *testing.T) {
 		}
 	})
 }
+
+func TestCommitNativeAlertEvaluationPrunesRecoveredAndPreservesInhibited(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "Converge", "converge")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug: project.Slug, Name: "ConvergeRule", Signal: "metrics", Expression: "up == 0", For: "0s",
+			Severity: "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.HeartbeatAlertEngine(ctx, "owner-1", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireAlertRuleLease(ctx, rule.ID, "owner-1", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+		firingState := AlertRuleState{
+			RuleID: rule.ID, Fingerprint: "fp-1", Status: "firing", FiringSince: &t0, LastEvaluatedAt: t0,
+			Labels: map[string]string{"alertname": "ConvergeRule"}, Annotations: map[string]string{},
+		}
+		pendingState := AlertRuleState{
+			RuleID: rule.ID, Fingerprint: "fp-pending", Status: "pending", PendingSince: &t0, LastEvaluatedAt: t0,
+			Labels: map[string]string{"alertname": "ConvergeRule"}, Annotations: map[string]string{},
+		}
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID: rule.ID, MemberID: "owner-1", LeaseEpoch: lease.Epoch,
+			States:                []AlertRuleState{firingState, pendingState},
+			InhibitedFingerprints: map[string]bool{"fp-1": true},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		events, err := store.ListAlertEvents(ctx, project.Slug, "", nil)
+		if err != nil || len(events) != 1 || !events[0].Inhibited {
+			t.Fatalf("initial inhibited event=%#v err=%v", events, err)
+		}
+		// Subsequent commit with nil InhibitedFingerprints must not clear inhibited=true,
+		// and PruneFingerprints must delete vanished pending states.
+		firingState.LastEvaluatedAt = t0.Add(5 * time.Second)
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID: rule.ID, MemberID: "owner-1", LeaseEpoch: lease.Epoch,
+			States:            []AlertRuleState{firingState},
+			PruneFingerprints: []string{"fp-pending"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		events, err = store.ListAlertEvents(ctx, project.Slug, "", nil)
+		if err != nil || len(events) != 1 || !events[0].Inhibited {
+			t.Fatalf("inhibited flag clobbered=%#v err=%v", events, err)
+		}
+		states, err := store.AlertRuleStates(ctx, rule.ID)
+		if err != nil || len(states) != 1 || states[0].Fingerprint != "fp-1" {
+			t.Fatalf("pending state not pruned: %#v err=%v", states, err)
+		}
+		// Transition to recovered: alert_rule_states row is pruned and alert_events records EndsAt.
+		resolvedAt := t0.Add(time.Minute)
+		recoveredState := firingState
+		recoveredState.Status = "recovered"
+		recoveredState.LastEvaluatedAt = resolvedAt
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID: rule.ID, MemberID: "owner-1", LeaseEpoch: lease.Epoch,
+			States: []AlertRuleState{recoveredState},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		states, err = store.AlertRuleStates(ctx, rule.ID)
+		if err != nil || len(states) != 0 {
+			t.Fatalf("recovered state not pruned from alert_rule_states: %#v err=%v", states, err)
+		}
+		events, err = store.ListAlertEvents(ctx, project.Slug, "", nil)
+		if err != nil || len(events) != 1 || events[0].Status != "resolved" || events[0].EndsAt == nil ||
+			!events[0].EndsAt.Equal(resolvedAt) {
+			t.Fatalf("resolved event=%#v err=%v", events, err)
+		}
+		origUpdatedAt := events[0].UpdatedAt
+		// A duplicate recovered commit must not overwrite EndsAt or UpdatedAt.
+		time.Sleep(1100 * time.Millisecond)
+		recoveredState.LastEvaluatedAt = resolvedAt.Add(time.Minute)
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID: rule.ID, MemberID: "owner-1", LeaseEpoch: lease.Epoch,
+			States: []AlertRuleState{recoveredState},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		events, err = store.ListAlertEvents(ctx, project.Slug, "", nil)
+		if err != nil || len(events) != 1 || events[0].EndsAt == nil || !events[0].EndsAt.Equal(resolvedAt) ||
+			!events[0].UpdatedAt.Equal(origUpdatedAt) {
+			t.Fatalf(
+				"duplicate recovered overwrote timestamps: ends_at=%v want=%v updated_at=%v want=%v",
+				events[0].EndsAt,
+				resolvedAt,
+				events[0].UpdatedAt,
+				origUpdatedAt,
+			)
+		}
+	})
+}
