@@ -58,11 +58,27 @@ func TestAutomaticIssueAIReportsDroppedAndFailedWork(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("automatic Issue AI worker did not start the first job")
 	}
-	for range issueAIQueueSize + 1 { // fill the queue, then overflow it once
-		_ = gw.HandleIssueChange(context.Background(), change)
+	// Duplicate issue IDs while pending/in-flight are deduplicated rather than filling the queue.
+	_ = gw.HandleIssueChange(context.Background(), errortrack.IssueChange{Kind: "new_issue", ProjectID: 7, IssueID: 2})
+	_ = gw.HandleIssueChange(context.Background(), errortrack.IssueChange{Kind: "new_issue", ProjectID: 7, IssueID: 2})
+	if got := issueAIOutcomes(t, reader)["deduped"]; got != 1 {
+		t.Fatalf("deduped outcomes=%d want 1", got)
+	}
+	// Fill the remaining per-project queue capacity with distinct issues, then overflow once.
+	for i := 3; i <= issueAIProjectQueueCap+2; i++ {
+		_ = gw.HandleIssueChange(context.Background(), errortrack.IssueChange{
+			Kind:      "new_issue",
+			ProjectID: 7,
+			IssueID:   i,
+		})
 	}
 	if got := issueAIOutcomes(t, reader)["queue_full"]; got != 1 {
 		t.Fatalf("queue_full outcomes=%d want 1", got)
+	}
+	// Another project must still be admitted into its own fair queue.
+	_ = gw.HandleIssueChange(context.Background(), errortrack.IssueChange{Kind: "new_issue", ProjectID: 8, IssueID: 1})
+	if got := issueAIOutcomes(t, reader)["queue_full"]; got != 1 {
+		t.Fatalf("project 8 was starved by project 7; queue_full=%d want 1", got)
 	}
 	close(store.release)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

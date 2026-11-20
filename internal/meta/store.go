@@ -48,6 +48,7 @@ type Store struct {
 	dialect            string
 	startupLockTimeout time.Duration
 	issueMu            sync.Mutex
+	aiSettingsMu       sync.Mutex
 	sourceMapMu        sync.Mutex
 	revision           atomic.Uint64
 	secretBox          atomic.Pointer[secret.Box]

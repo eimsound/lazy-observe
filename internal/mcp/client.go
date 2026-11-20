@@ -16,16 +16,23 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	MaxLogRows       = 100
-	MaxTraceSpans    = 200
-	maxTraceSearch   = 100
-	maxMetricSeries  = 500
-	maxMetricSamples = 5000
-	maxResponseBytes = 8 << 20
+	MaxLogRows         = 100
+	MaxTraceSpans      = 200
+	maxTraceSearch     = 100
+	maxMetricSeries    = 500
+	maxMetricSamples   = 5000
+	maxResponseBytes   = 8 << 20
+	defaultHTTPTimeout = 30 * time.Second
 )
+
+func defaultHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	return &http.Client{Timeout: defaultHTTPTimeout, Transport: transport}
+}
 
 type APIClient struct {
 	BaseURL string
@@ -48,7 +55,7 @@ func NewAPIClient(baseURL, token string, client *http.Client) (*APIClient, error
 		return nil, errors.New("token is required")
 	}
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultHTTPClient()
 	}
 	return &APIClient{BaseURL: baseURL, Token: token, HTTP: client}, nil
 }
@@ -92,7 +99,11 @@ func (c *APIClient) get(ctx context.Context, path string, query url.Values) ([]b
 	if c.Project != "" {
 		req.Header.Set("X-LO-Project", c.Project)
 	}
-	resp, err := c.HTTP.Do(req)
+	httpClient := c.HTTP
+	if httpClient == nil {
+		httpClient = defaultHTTPClient()
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("platform query failed: %w", err)
 	}

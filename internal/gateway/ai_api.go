@@ -18,6 +18,9 @@ func (g *Gateway) aiStatus(c fiber.Ctx) error {
 }
 
 func (g *Gateway) aiTest(c fiber.Ctx) error {
+	if g.ai != nil && g.ai.store != nil {
+		g.ai.refreshFromStore(c.Context())
+	}
 	state := g.aiState()
 	if !state.enabled || state.client == nil {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{

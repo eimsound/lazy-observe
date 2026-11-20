@@ -53,14 +53,63 @@ type Client interface {
 }
 
 type Config struct {
-	Provider  string
-	BaseURL   string
-	APIKey    string
-	Model     string
-	MaxTokens int
-	Timeout   time.Duration
-	Client    *http.Client
-	Outbound  outbound.Policy
+	Provider          string
+	BaseURL           string
+	APIKey            string
+	Model             string
+	MaxTokens         int
+	Timeout           time.Duration
+	StreamIdleTimeout time.Duration
+	Client            *http.Client
+	Outbound          outbound.Policy
+}
+
+type safeOutboundRoundTripper struct {
+	policy outbound.Policy
+	base   http.RoundTripper
+}
+
+func (rt *safeOutboundRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil {
+		return nil, outbound.ErrInvalidTarget
+	}
+	if _, err := outbound.ValidateURL(req.URL.String(), rt.policy); err != nil {
+		return nil, err
+	}
+	return rt.base.RoundTrip(req)
+}
+
+func newStreamHTTPClient(base *http.Client, headerTimeout time.Duration, policy outbound.Policy) *http.Client {
+	if base == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		dialer := outbound.NewDialer(policy)
+		if headerTimeout > 0 && headerTimeout < dialer.Dialer.Timeout {
+			dialer.Dialer.Timeout = headerTimeout
+		}
+		transport.DialContext = dialer.DialContext
+		transport.ResponseHeaderTimeout = headerTimeout
+		return &http.Client{
+			Timeout:       0,
+			Transport:     &safeOutboundRoundTripper{policy: policy, base: transport},
+			CheckRedirect: outbound.RejectRedirects,
+		}
+	}
+	clientCopy := *base
+	clientCopy.Timeout = 0
+	if clientCopy.CheckRedirect == nil {
+		clientCopy.CheckRedirect = outbound.RejectRedirects
+	}
+	switch tr := clientCopy.Transport.(type) {
+	case nil:
+		cloned := http.DefaultTransport.(*http.Transport).Clone()
+		cloned.ResponseHeaderTimeout = headerTimeout
+		clientCopy.Transport = cloned
+	case *http.Transport:
+		cloned := tr.Clone()
+		cloned.ResponseHeaderTimeout = headerTimeout
+		clientCopy.Transport = cloned
+	}
+	return &clientCopy
 }
 
 func New(cfg Config) (Client, error) {
@@ -74,27 +123,37 @@ func New(cfg Config) (Client, error) {
 		return nil, errors.New("model is required")
 	}
 	rawBaseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	var chatClient *http.Client
+	var streamClient *http.Client
 	if cfg.Client == nil {
 		if rawBaseURL != "" {
 			if _, err := outbound.ValidateURL(rawBaseURL, cfg.Outbound); err != nil {
 				return nil, fmt.Errorf("invalid AI base_url: %w", err)
 			}
 		}
-		cfg.Client = outbound.NewHTTPClient(cfg.Timeout, cfg.Outbound)
+		chatClient = outbound.NewHTTPClient(cfg.Timeout, cfg.Outbound)
+		streamClient = newStreamHTTPClient(nil, cfg.Timeout, cfg.Outbound)
 	} else {
 		clientCopy := *cfg.Client
 		clientCopy.Timeout = cfg.Timeout
 		if clientCopy.CheckRedirect == nil {
 			clientCopy.CheckRedirect = outbound.RejectRedirects
 		}
-		cfg.Client = &clientCopy
+		chatClient = &clientCopy
+		streamClient = newStreamHTTPClient(cfg.Client, cfg.Timeout, cfg.Outbound)
+	}
+	streamIdle := cfg.StreamIdleTimeout
+	if streamIdle <= 0 {
+		streamIdle = cfg.Timeout
 	}
 	b := &providerClient{
-		baseURL:   rawBaseURL,
-		apiKey:    strings.TrimSpace(cfg.APIKey),
-		model:     strings.TrimSpace(cfg.Model),
-		maxTokens: cfg.MaxTokens,
-		client:    cfg.Client,
+		baseURL:           rawBaseURL,
+		apiKey:            strings.TrimSpace(cfg.APIKey),
+		model:             strings.TrimSpace(cfg.Model),
+		maxTokens:         cfg.MaxTokens,
+		client:            chatClient,
+		streamClient:      streamClient,
+		streamIdleTimeout: streamIdle,
 	}
 	switch cfg.Provider {
 	case "openai":

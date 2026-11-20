@@ -107,3 +107,31 @@ func TestParseDSNSelectsProjectOnEveryQuery(t *testing.T) {
 		t.Fatalf("Authorization=%q X-LO-Project=%q", got[0], got[1])
 	}
 }
+
+func TestAPIClientDefaultsToBoundedTimeoutAndHandlesNilHTTP(t *testing.T) {
+	api, err := NewAPIClient("https://observe.example", "lou_reader", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if api.HTTP == nil || api.HTTP.Timeout <= 0 {
+		t.Fatalf("default HTTP client missing timeout: %#v", api.HTTP)
+	}
+	parsed, err := ParseDSN("https://observe.example/p/default@lou_reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.HTTP == nil || parsed.HTTP.Timeout <= 0 {
+		t.Fatalf("ParseDSN HTTP client missing timeout: %#v", parsed.HTTP)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	// Manually constructed APIClient with HTTP == nil must not panic.
+	bare := &APIClient{BaseURL: server.URL, Token: "lou_reader"}
+	if _, err := bare.json(t.Context(), "/api/v1/issues", nil); err != nil {
+		t.Fatalf("bare APIClient.json with nil HTTP failed: %v", err)
+	}
+}

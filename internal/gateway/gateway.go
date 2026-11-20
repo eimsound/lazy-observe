@@ -161,6 +161,12 @@ type Config struct {
 	AIBuildClient func(ai.Config) (ai.Client, error)
 	// AITimeout bounds provider calls; defaults to 60s when unset.
 	AITimeout time.Duration
+	// AISettingsRefreshInterval controls HA polling of persisted AI settings;
+	// defaults to 5s when unset.
+	AISettingsRefreshInterval time.Duration
+	// IssueAIAutoDailyBudget sets the default per-project daily automatic
+	// Issue AI budget; defaults to 20 when unset.
+	IssueAIAutoDailyBudget int
 	// OutboundPolicy restricts outbound destinations for BYO AI requests.
 	OutboundPolicy      outbound.Policy
 	LLMPricing          *llmcost.Table
@@ -368,14 +374,25 @@ func New(cfg Config) *Gateway {
 			cfg.AISecretBox,
 			cfg.AIBuildClient,
 			cfg.AITimeout,
+			cfg.AISettingsRefreshInterval,
 			cfg.OutboundPolicy,
 			cfg.Now,
 			cfg.Logger,
 		)
 		g.ai.loadFromStore(context.Background())
+		g.ai.startSyncLoop()
 	} else {
 		// Static mode: constructor-provided AI state (tests, embedders).
-		g.ai = newAIManager(nil, nil, cfg.AIBuildClient, cfg.AITimeout, cfg.OutboundPolicy, cfg.Now, cfg.Logger)
+		g.ai = newAIManager(
+			nil,
+			nil,
+			cfg.AIBuildClient,
+			cfg.AITimeout,
+			cfg.AISettingsRefreshInterval,
+			cfg.OutboundPolicy,
+			cfg.Now,
+			cfg.Logger,
+		)
 		g.ai.current = aiSnapshot{
 			enabled:   cfg.AIEnabled,
 			provider:  cfg.AIProvider,
@@ -386,7 +403,7 @@ func New(cfg Config) *Gateway {
 		}
 	}
 	g.aiAssistant = newAssistantService(g)
-	g.issueAI = newIssueAIService(g)
+	g.issueAI = newIssueAIService(g, cfg.IssueAIAutoDailyBudget)
 	g.errorTracker = cfg.ErrorTracker
 	g.notifications = cfg.Notifications
 	g.routes()
@@ -451,7 +468,11 @@ func (g *Gateway) Drain(ctx context.Context) error {
 	if g.issueAI != nil {
 		aiErr = g.issueAI.Close(ctx)
 	}
-	return errors.Join(shutdownErr, errorTrackErr, aiErr)
+	var aiSyncErr error
+	if g.ai != nil {
+		aiSyncErr = g.ai.Close(ctx)
+	}
+	return errors.Join(shutdownErr, errorTrackErr, aiErr, aiSyncErr)
 }
 
 func (g *Gateway) Shutdown() error {
@@ -624,6 +645,7 @@ func (g *Gateway) registerTelemetryRoutes() {
 	// reuse the same handlers as the UI and therefore retain project isolation.
 	g.app.Get("/api/v1/issues", g.queryRequired, g.listIssues)
 	g.app.Get("/api/v1/issues/:id", g.queryRequired, g.getIssue)
+	g.app.Get("/api/v1/issues/:id/events/:event_id", g.queryRequired, g.getIssueEvent)
 	g.app.Get("/api/v1/alerts", g.queryRequired, g.listAlerts)
 	g.app.Get("/api/v1/hosts", g.queryRequired, g.hosts)
 }
@@ -642,6 +664,8 @@ func (g *Gateway) registerSessionAPI() {
 	api.Get("/projects/:id", g.getProject)
 	api.Get("/projects/:id/alert-config", g.getProjectAlertConfig)
 	api.Put("/projects/:id/alert-config", g.memberRequired, g.putProjectAlertConfig)
+	api.Get("/projects/:id/ai-config", g.getProjectAIConfig)
+	api.Put("/projects/:id/ai-config", g.memberRequired, g.putProjectAIConfig)
 	api.Post("/projects", g.adminRequired, g.createProject)
 	api.Patch("/projects/:id", g.adminRequired, g.updateProject)
 	api.Put("/projects/:id", g.adminRequired, g.updateProject)

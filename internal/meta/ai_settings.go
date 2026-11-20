@@ -2,6 +2,8 @@ package meta
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -49,9 +51,12 @@ func (s *Store) GetAISettings(ctx context.Context) (AISettings, bool, error) {
 // Uses a plain SQL upsert because the Ent codegen does not enable the upsert
 // feature; both SQLite and PostgreSQL support ON CONFLICT here.
 func (s *Store) UpsertAISettings(ctx context.Context, settings AISettings) error {
+	s.aiSettingsMu.Lock()
+	defer s.aiSettingsMu.Unlock()
 	if settings.UpdatedAt.IsZero() {
 		settings.UpdatedAt = time.Now().UTC()
 	}
+	settings.UpdatedAt = settings.UpdatedAt.UTC().Truncate(time.Microsecond)
 	query := `INSERT INTO ai_settings (
     id, enabled, provider, base_url, model, api_key_ciphertext, max_tokens, updated_at, updated_by
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -78,4 +83,126 @@ ON CONFLICT (id) DO UPDATE SET
 		settings.UpdatedBy,
 	)
 	return err
+}
+
+// CompareAndSwapAISettings atomically inserts or replaces the single AI
+// settings row only when the stored row matches expected (nil expects no row).
+// Returns (false, nil) on conflict so callers can reload and retry or reject.
+func (s *Store) CompareAndSwapAISettings(ctx context.Context, expected *AISettings, next AISettings) (bool, error) {
+	s.aiSettingsMu.Lock()
+	defer s.aiSettingsMu.Unlock()
+
+	if next.UpdatedAt.IsZero() {
+		next.UpdatedAt = time.Now().UTC()
+	}
+	next.UpdatedAt = next.UpdatedAt.UTC().Truncate(time.Microsecond)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	selectQuery := `SELECT enabled, provider, base_url, model, api_key_ciphertext, max_tokens, updated_at, updated_by
+FROM ai_settings WHERE id = ?`
+	if s.dialect == "postgres" {
+		selectQuery += " FOR UPDATE"
+	}
+	var current AISettings
+	scanErr := tx.QueryRowContext(ctx, bind(s.dialect, selectQuery), aiSettingsRowID).Scan(
+		&current.Enabled,
+		&current.Provider,
+		&current.BaseURL,
+		&current.Model,
+		&current.APIKeyCiphertext,
+		&current.MaxTokens,
+		&current.UpdatedAt,
+		&current.UpdatedBy,
+	)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		if expected != nil {
+			return false, nil
+		}
+		insertQuery := `INSERT INTO ai_settings (
+    id, enabled, provider, base_url, model, api_key_ciphertext, max_tokens, updated_at, updated_by
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (id) DO NOTHING`
+		res, execErr := tx.ExecContext(
+			ctx,
+			bind(s.dialect, insertQuery),
+			aiSettingsRowID,
+			next.Enabled,
+			next.Provider,
+			next.BaseURL,
+			next.Model,
+			next.APIKeyCiphertext,
+			next.MaxTokens,
+			next.UpdatedAt,
+			next.UpdatedBy,
+		)
+		if execErr != nil {
+			return false, execErr
+		}
+		affected, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return false, rowsErr
+		}
+		if affected != 1 {
+			return false, nil
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return false, commitErr
+		}
+		return true, nil
+	}
+	if scanErr != nil {
+		return false, scanErr
+	}
+	if expected == nil || !sameAISettingsRow(current, *expected) {
+		return false, nil
+	}
+	curAt := current.UpdatedAt.UTC().Truncate(time.Microsecond)
+	if !next.UpdatedAt.After(curAt) {
+		next.UpdatedAt = curAt.Add(time.Microsecond)
+	}
+	updateQuery := `UPDATE ai_settings SET
+    enabled = ?,
+    provider = ?,
+    base_url = ?,
+    model = ?,
+    api_key_ciphertext = ?,
+    max_tokens = ?,
+    updated_at = ?,
+    updated_by = ?
+WHERE id = ?`
+	if _, execErr := tx.ExecContext(
+		ctx,
+		bind(s.dialect, updateQuery),
+		next.Enabled,
+		next.Provider,
+		next.BaseURL,
+		next.Model,
+		next.APIKeyCiphertext,
+		next.MaxTokens,
+		next.UpdatedAt,
+		next.UpdatedBy,
+		aiSettingsRowID,
+	); execErr != nil {
+		return false, execErr
+	}
+	if commitErr := tx.Commit(); commitErr != nil {
+		return false, commitErr
+	}
+	return true, nil
+}
+
+func sameAISettingsRow(a, b AISettings) bool {
+	return a.Enabled == b.Enabled &&
+		a.Provider == b.Provider &&
+		a.BaseURL == b.BaseURL &&
+		a.Model == b.Model &&
+		a.APIKeyCiphertext == b.APIKeyCiphertext &&
+		a.MaxTokens == b.MaxTokens &&
+		a.UpdatedBy == b.UpdatedBy &&
+		a.UpdatedAt.UTC().Truncate(time.Microsecond).Equal(b.UpdatedAt.UTC().Truncate(time.Microsecond))
 }

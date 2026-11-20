@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/eimsound/lazy-observe/internal/outbound"
 )
@@ -23,12 +24,14 @@ const (
 )
 
 type providerClient struct {
-	protocol  protocol
-	baseURL   string
-	apiKey    string
-	model     string
-	maxTokens int
-	client    *http.Client
+	protocol          protocol
+	baseURL           string
+	apiKey            string
+	model             string
+	maxTokens         int
+	client            *http.Client
+	streamClient      *http.Client
+	streamIdleTimeout time.Duration
 }
 
 func (p *providerClient) Chat(ctx context.Context, request ChatRequest) (ChatResponse, error) {
@@ -36,7 +39,7 @@ func (p *providerClient) Chat(ctx context.Context, request ChatRequest) (ChatRes
 	if err != nil {
 		return ChatResponse{}, err
 	}
-	resp, err := p.do(ctx, body)
+	resp, err := p.do(ctx, p.client, body)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -57,14 +60,19 @@ func (p *providerClient) ChatStream(ctx context.Context, request ChatRequest) (S
 	if err != nil {
 		return nil, err
 	}
-	resp, err := p.do(ctx, body)
+	httpClient := p.streamClient
+	if httpClient == nil {
+		httpClient = p.client
+	}
+	resp, err := p.do(ctx, httpClient, body)
 	if err != nil {
 		return nil, err
 	}
-	return newStream(resp.Body, p.protocol, p.apiKey), nil
+	streamBody := wrapIdleTimeout(resp.Body, p.streamIdleTimeout)
+	return newStream(streamBody, p.protocol, p.apiKey), nil
 }
 
-func (p *providerClient) do(ctx context.Context, body []byte) (*http.Response, error) {
+func (p *providerClient) do(ctx context.Context, httpClient *http.Client, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(), bytes.NewReader(body))
 	if err != nil {
 		return nil, &Error{Kind: ErrorProvider, Message: "build provider request", Err: err}
@@ -81,7 +89,7 @@ func (p *providerClient) do(ctx context.Context, body []byte) (*http.Response, e
 			req.Header.Set("Authorization", "Bearer "+p.apiKey)
 		}
 	}
-	resp, err := p.client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -91,8 +99,9 @@ func (p *providerClient) do(ctx context.Context, body []byte) (*http.Response, e
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return resp, nil
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	errBody := wrapIdleTimeout(resp.Body, p.streamIdleTimeout)
+	defer errBody.Close()
+	data, _ := io.ReadAll(io.LimitReader(errBody, 1<<20))
 	return nil, normalizeHTTP(resp.StatusCode, data, p.apiKey)
 }
 

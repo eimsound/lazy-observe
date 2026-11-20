@@ -131,28 +131,52 @@ func TestListIssuesUnderLimitIsNotTruncatedAndSkipsSecondPage(t *testing.T) {
 func TestGetIssueCapsEventsAndKeepsInnermostFrames(t *testing.T) {
 	frames := make([]any, 0, 40)
 	for i := range 40 {
-		frames = append(frames, map[string]any{"function": fmt.Sprintf("f%d", i), "filename": "a.js", "lineno": i})
+		frames = append(frames, map[string]any{
+			"function":     fmt.Sprintf("f%d", i),
+			"filename":     "a.js",
+			"lineno":       i,
+			"in_app":       true,
+			"symbolicated": true,
+		})
 	}
-	detail, _ := json.Marshal(map[string]any{
-		"message": "boom",
-		"exception": map[string]any{
-			"type":       "TypeError",
-			"value":      "x is undefined",
-			"stacktrace": map[string]any{"frames": frames},
-		},
-	})
-	events := make([]any, 0, 7)
+	eventSummaries := make([]any, 0, 7)
+	routes := map[string]func(*http.Request) (int, any){}
 	for i := range 7 {
-		events = append(events, map[string]any{"event_id": fmt.Sprintf("e%d", i), "symbolicated_event": string(detail)})
+		eid := fmt.Sprintf("e%d", i)
+		eventSummaries = append(eventSummaries, map[string]any{
+			"event_id":  eid,
+			"timestamp": 1700000000000 + i,
+			"trace_id":  "trace-1",
+		})
+		routes["/api/v1/issues/9/events/"+eid] = func(*http.Request) (int, any) {
+			return http.StatusOK, map[string]any{
+				"event_id":  eid,
+				"timestamp": 1700000000000 + i,
+				"level":     "error",
+				"release":   "v1.2.3",
+				"message":   "boom",
+				"exception": map[string]any{
+					"type":       "TypeError",
+					"value":      "x is undefined",
+					"stacktrace": map[string]any{"frames": frames},
+				},
+			}
+		}
 	}
-	h := newToolHarness(t, map[string]func(*http.Request) (int, any){
-		"/api/v1/issues/9": func(*http.Request) (int, any) {
-			return http.StatusOK, map[string]any{"id": 9, "project_id": 7, "events": events}
-		},
-	})
+	// Real gateway /api/v1/issues/:id DTO omits symbolicated_event and exposes fingerprint.
+	routes["/api/v1/issues/9"] = func(*http.Request) (int, any) {
+		return http.StatusOK, map[string]any{
+			"id":          9,
+			"project_id":  7,
+			"fingerprint": "secret-issue-fp",
+			"level":       "error",
+			"events":      eventSummaries,
+		}
+	}
+	h := newToolHarness(t, routes)
 	got, text := h.call("get_issue", map[string]any{"issue_id": 9})
-	if strings.Contains(text, "project_id") {
-		t.Fatalf("project_id leaked: %s", text)
+	if strings.Contains(text, "project_id") || strings.Contains(text, "secret-issue-fp") {
+		t.Fatalf("internal fields leaked: %s", text)
 	}
 	summaries := got["events"].([]any)
 	if len(summaries) != 5 || got["events_truncated"] != true {
@@ -160,12 +184,57 @@ func TestGetIssueCapsEventsAndKeepsInnermostFrames(t *testing.T) {
 	}
 	first := summaries[0].(map[string]any)
 	stack := first["stack_frames"].([]any)
-	if len(stack) != 30 || first["stack_truncated"] != true || first["exception_type"] != "TypeError" {
-		t.Fatalf("frames=%d truncated=%v type=%v", len(stack), first["stack_truncated"], first["exception_type"])
+	if len(stack) != 30 || first["stack_truncated"] != true || first["exception_type"] != "TypeError" ||
+		first["level"] != "error" || first["message"] != "boom" {
+		t.Fatalf("first event summary=%#v", first)
 	}
 	// Frames are ordered outermost→innermost; the crash site must survive the cap.
-	if last := stack[29].(map[string]any); last["function"] != "f39" {
-		t.Fatalf("innermost frame=%v want f39", last["function"])
+	if last := stack[29].(map[string]any); last["function"] != "f39" || last["symbolicated"] != true {
+		t.Fatalf("innermost frame=%#v want f39 symbolicated=true", last)
+	}
+	// Only the capped 5 events should be fetched, not e5 or e6.
+	if len(h.requestsTo("/api/v1/issues/9/events/e5")) != 0 {
+		t.Fatal("fetched event beyond cap")
+	}
+}
+
+func TestMCPEmptyAndNilResponseSafetyAndFallbackHandler(t *testing.T) {
+	if got := sanitizeIssues(nil, false); got == nil {
+		t.Fatal("sanitizeIssues(nil) returned nil")
+	}
+	if got := summarizeIssue(nil); got == nil {
+		t.Fatal("summarizeIssue(nil) returned nil")
+	}
+	if got := summarizeTraceSearch(nil, 10); got["count"] != 0 {
+		t.Fatalf("summarizeTraceSearch(nil) = %#v", got)
+	}
+	if got := flamegraphSummary(nil, 10); got["count"] != 0 {
+		t.Fatalf("flamegraphSummary(nil) = %#v", got)
+	}
+
+	// NewHTTPHandler with nil client and missing auth header must not panic when calling tools.
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer api.Close()
+	mcpHTTP := httptest.NewServer(NewHTTPHandler(api.URL, nil))
+	defer mcpHTTP.Close()
+	session, err := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "unauth", Version: "1"}, nil).Connect(
+		context.Background(),
+		&sdkmcp.StreamableClientTransport{Endpoint: mcpHTTP.URL, DisableStandaloneSSE: true},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	res, callErr := session.CallTool(context.Background(), &sdkmcp.CallToolParams{
+		Name:      "list_issues",
+		Arguments: map[string]any{},
+	})
+	if callErr == nil && (res == nil || !res.IsError) {
+		t.Fatalf("expected error from unauthorized upstream without panic, got res=%#v err=%v", res, callErr)
 	}
 }
 

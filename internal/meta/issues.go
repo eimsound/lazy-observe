@@ -327,9 +327,14 @@ func (s *Store) SaveIssueAnalysis(
 	analysis map[string]any,
 	at time.Time,
 ) (IssueView, error) {
+	s.issueMu.Lock()
+	defer s.issueMu.Unlock()
 	row, err := s.client.Issue.Query().Where(issue.IDEQ(id), issue.ProjectIDEQ(projectID)).Only(ctx)
 	if err != nil {
 		return IssueView{}, err
+	}
+	if row.AiAnalysisAt != nil && row.AiAnalysisAt.After(at) {
+		return issueView(row), nil
 	}
 	row, err = row.Update().SetAiAnalysis(analysis).SetAiAnalysisAt(at).Save(ctx)
 	if err != nil {
