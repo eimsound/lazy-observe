@@ -6,11 +6,5 @@ packages:
 allowBuilds:
   esbuild: true
 
-# 供应链：解析依赖时只接受发布满 7 天的版本（单位分钟，7 × 1440；单一来源见 scripts/release-age.env，
-# 与 renovate.json 的 minimumReleaseAge 一致，由 scripts/check-github-workflows.sh 校验）。
-# 只影响重新解析；--frozen-lockfile 按锁文件安装，已锁定的版本不受影响。
-# 注意：它也会挡住发布不满 7 天的安全补丁。急需时在本文件加 minimumReleaseAgeExclude 放行具体的包，例如
-#   minimumReleaseAgeExclude:
-#     - some-package@1.2.3
-# 放行要在 PR 里写明原因，修完后撤掉。
+# 只接受发布满 7 天的版本
 minimumReleaseAge: 10080
