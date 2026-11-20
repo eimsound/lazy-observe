@@ -24,8 +24,8 @@ type serverEssentials struct {
 	outboundPolicy outbound.Policy
 }
 
-func loadLLMPricing() (*llmcost.Table, error) {
-	return llmcost.Load("")
+func loadLLMPricing(cfg appconfig.Config) (*llmcost.Table, error) {
+	return llmcost.Load(cfg.AI.PricingFile)
 }
 
 func loadSecretBox(cfg appconfig.Config) (*secret.Box, error) {

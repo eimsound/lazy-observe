@@ -87,7 +87,7 @@ func runServer(cfg appconfig.Config) error {
 }
 
 func loadServerEssentials(cfg appconfig.Config) (serverEssentials, error) {
-	llmPricing, err := loadLLMPricing()
+	llmPricing, err := loadLLMPricing(cfg)
 	if err != nil {
 		return serverEssentials{}, fmt.Errorf("configure LLM pricing: %w", err)
 	}

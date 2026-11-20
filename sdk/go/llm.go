@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -151,19 +152,23 @@ type llmRequest struct {
 }
 
 type llmResponse struct {
-	Model        string
-	Completion   string
-	InputTokens  *int64
-	OutputTokens *int64
+	Model               string
+	Completion          string
+	InputTokens         *int64
+	OutputTokens        *int64
+	CacheReadTokens     *int64
+	CacheCreationTokens *int64
+	ReasoningTokens     *int64
 }
 
 func detectLLMSystem(path string) (llmSystem, bool) {
+	trimmed := strings.TrimRight(path, "/")
 	switch {
-	case strings.Contains(path, "/chat/completions"):
+	case strings.HasSuffix(trimmed, "/chat/completions"):
 		return llmOpenAI, true
-	case strings.Contains(path, "/v1/messages"):
+	case strings.HasSuffix(trimmed, "/v1/messages"):
 		return llmAnthropic, true
-	case strings.Contains(path, "/api/chat"):
+	case strings.HasSuffix(trimmed, "/api/chat"):
 		return llmOllama, true
 	default:
 		return "", false
@@ -171,6 +176,9 @@ func detectLLMSystem(path string) (llmSystem, bool) {
 }
 
 func isStreamingResponse(resp *http.Response, requested bool) bool {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return false
+	}
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	return requested || strings.Contains(contentType, "text/event-stream") ||
 		strings.Contains(contentType, "application/x-ndjson")
@@ -267,12 +275,23 @@ func parseLLMResponse(system llmSystem, body []byte, captureContent bool) llmRes
 	if json.Unmarshal(body, &raw) != nil {
 		return llmResponse{}
 	}
+	return parseLLMResponseObject(system, raw, captureContent)
+}
+
+func parseLLMResponseObject(system llmSystem, raw map[string]any, captureContent bool) llmResponse {
 	result := llmResponse{Model: stringValue(raw["model"])}
 	switch system {
 	case llmOpenAI:
 		usage := objectValue(raw["usage"])
-		result.InputTokens = int64Pointer(usage["prompt_tokens"])
-		result.OutputTokens = int64Pointer(usage["completion_tokens"])
+		result.InputTokens = firstInt64Pointer(usage["prompt_tokens"], usage["input_tokens"])
+		result.OutputTokens = firstInt64Pointer(usage["completion_tokens"], usage["output_tokens"])
+		result.CacheReadTokens = firstInt64Pointer(
+			objectValue(usage["prompt_tokens_details"])["cached_tokens"],
+			usage["cache_read_input_tokens"],
+		)
+		result.ReasoningTokens = int64Pointer(
+			objectValue(usage["completion_tokens_details"])["reasoning_tokens"],
+		)
 		if captureContent {
 			result.Completion = openAICompletion(raw)
 		}
@@ -280,6 +299,8 @@ func parseLLMResponse(system llmSystem, body []byte, captureContent bool) llmRes
 		usage := objectValue(raw["usage"])
 		result.InputTokens = int64Pointer(usage["input_tokens"])
 		result.OutputTokens = int64Pointer(usage["output_tokens"])
+		result.CacheReadTokens = int64Pointer(usage["cache_read_input_tokens"])
+		result.CacheCreationTokens = int64Pointer(usage["cache_creation_input_tokens"])
 		if captureContent {
 			result.Completion = anthropicCompletion(raw["content"])
 		}
@@ -294,7 +315,7 @@ func parseLLMResponse(system llmSystem, body []byte, captureContent bool) llmRes
 }
 
 func applyLLMResponse(span trace.Span, response llmResponse, captureContent bool) {
-	attrs := make([]attribute.KeyValue, 0, 4)
+	attrs := make([]attribute.KeyValue, 0, 8)
 	if response.Model != "" {
 		attrs = append(attrs, attribute.String("gen_ai.response.model", response.Model))
 	}
@@ -303,6 +324,18 @@ func applyLLMResponse(span trace.Span, response llmResponse, captureContent bool
 	}
 	if response.OutputTokens != nil {
 		attrs = append(attrs, attribute.Int64("gen_ai.usage.output_tokens", *response.OutputTokens))
+	}
+	if response.CacheReadTokens != nil {
+		attrs = append(attrs, attribute.Int64("gen_ai.usage.cache_read.input_tokens", *response.CacheReadTokens))
+	}
+	if response.CacheCreationTokens != nil {
+		attrs = append(
+			attrs,
+			attribute.Int64("gen_ai.usage.cache_creation.input_tokens", *response.CacheCreationTokens),
+		)
+	}
+	if response.ReasoningTokens != nil {
+		attrs = append(attrs, attribute.Int64("gen_ai.usage.reasoning_tokens", *response.ReasoningTokens))
 	}
 	if response.InputTokens == nil || response.OutputTokens == nil {
 		attrs = append(attrs, attribute.Bool("gen_ai.usage.missing", true))
@@ -319,9 +352,12 @@ type llmStreamBody struct {
 	system         llmSystem
 	span           trace.Span
 	captureContent bool
+
+	mu             sync.Mutex
 	result         llmResponse
 	buffer         bytes.Buffer
-	once           sync.Once
+	discardingLine bool
+	finished       bool
 }
 
 func newLLMStreamBody(body io.ReadCloser, system llmSystem, span trace.Span, capture bool) io.ReadCloser {
@@ -352,33 +388,71 @@ func (b *llmStreamBody) Close() error {
 }
 
 func (b *llmStreamBody) consume(chunk []byte) {
-	// Streaming JSON is line-oriented (SSE data lines or Ollama NDJSON). Keep
-	// incomplete data between Read calls by feeding it through a bounded buffer.
-	_, _ = b.buffer.Write(chunk)
-	for {
-		line, err := b.buffer.ReadString('\n')
-		if err != nil {
-			if len(line) <= llmBodyInspectionLimit {
-				b.buffer.WriteString(line)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.finished {
+		return
+	}
+	// Streaming JSON is line-oriented (SSE data lines or Ollama NDJSON). Bound
+	// buffered bytes per line to llmBodyInspectionLimit and skip oversized lines
+	// until the next newline without allocating unbounded memory.
+	for len(chunk) > 0 {
+		nl := bytes.IndexByte(chunk, '\n')
+		if b.discardingLine {
+			if nl < 0 {
+				return
 			}
+			chunk = chunk[nl+1:]
+			b.discardingLine = false
+			continue
+		}
+		if nl < 0 {
+			if b.buffer.Len()+len(chunk) > llmBodyInspectionLimit {
+				b.buffer.Reset()
+				b.discardingLine = true
+				return
+			}
+			_, _ = b.buffer.Write(chunk)
 			return
+		}
+		part := chunk[:nl]
+		chunk = chunk[nl+1:]
+		if b.buffer.Len()+len(part) > llmBodyInspectionLimit {
+			b.buffer.Reset()
+			continue
+		}
+		var line string
+		if b.buffer.Len() == 0 {
+			line = string(part)
+		} else {
+			_, _ = b.buffer.Write(part)
+			line = b.buffer.String()
+			b.buffer.Reset()
 		}
 		parseStreamLine(&b.result, b.system, line, b.captureContent)
 	}
 }
 
 func (b *llmStreamBody) finish(err error) {
-	b.once.Do(func() {
-		if b.buffer.Len() > 0 {
-			parseStreamLine(&b.result, b.system, b.buffer.String(), b.captureContent)
-		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			b.span.RecordError(err)
-			b.span.SetStatus(codes.Error, err.Error())
-		}
-		applyLLMResponse(b.span, b.result, b.captureContent)
-		b.span.End()
-	})
+	b.mu.Lock()
+	if b.finished {
+		b.mu.Unlock()
+		return
+	}
+	b.finished = true
+	if !b.discardingLine && b.buffer.Len() > 0 {
+		parseStreamLine(&b.result, b.system, b.buffer.String(), b.captureContent)
+	}
+	b.buffer.Reset()
+	result := b.result
+	b.mu.Unlock()
+
+	if err != nil && !errors.Is(err, io.EOF) {
+		b.span.RecordError(err)
+		b.span.SetStatus(codes.Error, err.Error())
+	}
+	applyLLMResponse(b.span, result, b.captureContent)
+	b.span.End()
 }
 
 func parseStreamLine(result *llmResponse, system llmSystem, line string, captureContent bool) {
@@ -393,7 +467,7 @@ func parseStreamLine(result *llmResponse, system llmSystem, line string, capture
 	if json.Unmarshal([]byte(line), &raw) != nil {
 		return
 	}
-	parsed := parseLLMResponse(system, []byte(line), captureContent)
+	parsed := parseLLMResponseObject(system, raw, captureContent)
 	mergeLLMResponse(result, parsed, captureContent)
 	if system == llmOpenAI && captureContent {
 		appendBoundedCompletion(&result.Completion, openAIStreamContent(raw))
@@ -407,10 +481,25 @@ func parseStreamLine(result *llmResponse, system llmSystem, line string, capture
 			if value := int64Pointer(usage["input_tokens"]); value != nil {
 				result.InputTokens = value
 			}
+			if value := int64Pointer(usage["cache_read_input_tokens"]); value != nil {
+				result.CacheReadTokens = value
+			}
+			if value := int64Pointer(usage["cache_creation_input_tokens"]); value != nil {
+				result.CacheCreationTokens = value
+			}
 		}
 		if usage := objectValue(raw["usage"]); usage != nil {
+			if value := int64Pointer(usage["input_tokens"]); value != nil {
+				result.InputTokens = value
+			}
 			if value := int64Pointer(usage["output_tokens"]); value != nil {
 				result.OutputTokens = value
+			}
+			if value := int64Pointer(usage["cache_read_input_tokens"]); value != nil {
+				result.CacheReadTokens = value
+			}
+			if value := int64Pointer(usage["cache_creation_input_tokens"]); value != nil {
+				result.CacheCreationTokens = value
 			}
 		}
 		if captureContent {
@@ -430,6 +519,15 @@ func mergeLLMResponse(dst *llmResponse, src llmResponse, captureContent bool) {
 	}
 	if src.OutputTokens != nil {
 		dst.OutputTokens = src.OutputTokens
+	}
+	if src.CacheReadTokens != nil {
+		dst.CacheReadTokens = src.CacheReadTokens
+	}
+	if src.CacheCreationTokens != nil {
+		dst.CacheCreationTokens = src.CacheCreationTokens
+	}
+	if src.ReasoningTokens != nil {
+		dst.ReasoningTokens = src.ReasoningTokens
 	}
 	if captureContent && src.Completion != "" {
 		appendBoundedCompletion(&dst.Completion, src.Completion)
@@ -478,9 +576,19 @@ func anthropicCompletion(value any) string {
 
 func objectValue(value any) map[string]any { result, _ := value.(map[string]any); return result }
 func stringValue(value any) string         { result, _ := value.(string); return result }
+
+func firstInt64Pointer(values ...any) *int64 {
+	for _, value := range values {
+		if parsed := int64Pointer(value); parsed != nil {
+			return parsed
+		}
+	}
+	return nil
+}
+
 func int64Pointer(value any) *int64 {
 	number, ok := value.(float64)
-	if !ok {
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
 		return nil
 	}
 	result := int64(number)

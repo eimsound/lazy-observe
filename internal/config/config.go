@@ -51,6 +51,7 @@ type Config struct {
 	Replay         Replay         `yaml:"replay"`
 	Blob           Blob           `yaml:"blob"`
 	Alert          Alert          `yaml:"alert"`
+	AI             AI             `yaml:"ai"`
 	ErrorInbox     ErrorInbox     `yaml:"error_inbox"`
 	Process        Process        `yaml:"process"`
 	Security       Security       `yaml:"security"`
@@ -152,6 +153,12 @@ type Alert struct {
 	StormThreshold int      `yaml:"storm_threshold"`
 	GroupWait      Duration `yaml:"group_wait"`
 	RepeatInterval Duration `yaml:"repeat_interval"`
+}
+
+// AI groups static LLM observability configuration. BYO AI provider credentials
+// remain managed exclusively through the admin UI.
+type AI struct {
+	PricingFile string `yaml:"pricing_file"`
 }
 
 type ErrorInbox struct {
@@ -309,6 +316,12 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 	fs.Var(&cfg.Retention.Replay, "retention-replay", "replay retention period")
 	fs.Var(&cfg.Replay.CleanupInterval, "replay-cleanup-interval", "replay cleanup interval")
 	fs.IntVar(&cfg.Alert.StormThreshold, "alert-storm-threshold", cfg.Alert.StormThreshold, "alert storm threshold")
+	fs.StringVar(
+		&cfg.AI.PricingFile,
+		"ai-pricing-file",
+		cfg.AI.PricingFile,
+		"optional JSON file overriding or extending built-in LLM token pricing",
+	)
 	fs.Int64Var(
 		&cfg.ErrorInbox.MaxItems,
 		"error-inbox-max-items",
@@ -452,6 +465,7 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		"LO_REDIS_ADDR":       &c.Redis.Addr,
 		"LO_REDIS_PASSWORD":   &c.Redis.Password,
 		"LO_REDIS_KEY_PREFIX": &c.Redis.KeyPrefix,
+		"LO_AI_PRICING_FILE":  &c.AI.PricingFile,
 		// Paths, not the secrets: the key material itself never travels via env.
 		"LO_SECURITY_SECRET_KEY_FILE":     &c.Security.SecretKeyFile,
 		"LO_SECURITY_ADMIN_PASSWORD_FILE": &c.Security.AdminPasswordFile,

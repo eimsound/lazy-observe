@@ -322,8 +322,44 @@ func TestAIKeyFileDefaultAndLegacyAISectionRejected(t *testing.T) {
 	if _, _, err := Load(
 		[]string{"--config", path},
 		func(string) (string, bool) { return "", false },
-	); err == nil || !strings.Contains(err.Error(), "ai") {
+	); err == nil || !strings.Contains(strings.ToLower(err.Error()), "ai") {
 		t.Fatalf("legacy ai section error=%v, want rejection mentioning the ai section", err)
+	}
+}
+
+func TestAIPricingFilePrecedence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "ai:\n  pricing_file: /etc/lazy-observe/file-prices.json\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.PricingFile != "/etc/lazy-observe/file-prices.json" {
+		t.Fatalf("file ai.pricing_file = %q", cfg.AI.PricingFile)
+	}
+	env := map[string]string{"LO_AI_PRICING_FILE": "/etc/lazy-observe/env-prices.json"}
+	cfg, _, err = Load(
+		[]string{"--config", path},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.PricingFile != "/etc/lazy-observe/env-prices.json" {
+		t.Fatalf("env ai.pricing_file = %q", cfg.AI.PricingFile)
+	}
+	cfg, _, err = Load(
+		[]string{"--config", path, "--ai-pricing-file", "/etc/lazy-observe/flag-prices.json"},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.PricingFile != "/etc/lazy-observe/flag-prices.json" {
+		t.Fatalf("flag ai.pricing_file = %q", cfg.AI.PricingFile)
 	}
 }
 
