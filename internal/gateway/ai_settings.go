@@ -24,11 +24,24 @@ type AISettingsStore interface {
 	UpsertAISettings(context.Context, meta.AISettings) error
 }
 
+// aiSettingsCASStore is an optional atomic compare-and-swap extension
+// implemented by *meta.Store so concurrent writers across replicas cannot
+// silently lose updates.
+type aiSettingsCASStore interface {
+	CompareAndSwapAISettings(ctx context.Context, expected *meta.AISettings, next meta.AISettings) (bool, error)
+}
+
 // aiDefaultMaxTokens applies when the stored max_tokens is unset.
 const aiDefaultMaxTokens = 1024
 
 // aiDefaultTimeout applies when the gateway has no explicit timeout override.
 const aiDefaultTimeout = 60 * time.Second
+
+// aiDefaultRefreshInterval controls how frequently dynamic-mode replicas poll
+// the metadata store for out-of-band AI setting rotations or revocations.
+const aiDefaultRefreshInterval = 5 * time.Second
+
+const aiSettingsCASRetries = 8
 
 // aiProviders is the whitelist the admin UI can choose from. Every provider
 // maps to a known wire protocol; base_url stays overridable for gateways.
@@ -47,6 +60,9 @@ type aiSnapshot struct {
 	model     string
 	maxTokens int
 	hasKey    bool
+	updatedBy string
+	updatedAt time.Time
+	revision  uint64
 	client    ai.Client
 }
 
@@ -54,17 +70,25 @@ type aiSnapshot struct {
 // the admin API persists changes and hot-swaps the client; in static mode it
 // mirrors the constructor Config for tests and embedders.
 type aiManager struct {
-	mu      sync.RWMutex
-	current aiSnapshot
+	mu              sync.RWMutex
+	current         aiSnapshot
+	hasStored       bool
+	stored          meta.AISettings
+	lastSync        time.Time
+	writeMu         sync.Mutex
+	store           AISettingsStore
+	box             *secret.Box
+	build           func(ai.Config) (ai.Client, error)
+	timeout         time.Duration
+	refreshInterval time.Duration
+	outbound        outbound.Policy
+	now             func() time.Time
+	logger          *slog.Logger
 
-	store     AISettingsStore
-	box       *secret.Box
-	build     func(ai.Config) (ai.Client, error)
-	timeout   time.Duration
-	outbound  outbound.Policy
-	now       func() time.Time
-	logger    *slog.Logger
-	updatedBy string // actor of the last successful write (dynamic mode)
+	startOnce sync.Once
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	doneCh    chan struct{}
 }
 
 func newAIManager(
@@ -72,6 +96,7 @@ func newAIManager(
 	box *secret.Box,
 	build func(ai.Config) (ai.Client, error),
 	timeout time.Duration,
+	refreshInterval time.Duration,
 	outboundPolicy outbound.Policy,
 	now func() time.Time,
 	logger *slog.Logger,
@@ -82,15 +107,81 @@ func newAIManager(
 	if timeout <= 0 {
 		timeout = aiDefaultTimeout
 	}
+	if refreshInterval <= 0 {
+		refreshInterval = aiDefaultRefreshInterval
+	}
 	if now == nil {
 		now = time.Now
 	}
+	doneCh := make(chan struct{})
+	close(doneCh)
 	return &aiManager{
-		store: store, box: box, build: build, timeout: timeout, outbound: outboundPolicy, now: now, logger: logger,
+		store:           store,
+		box:             box,
+		build:           build,
+		timeout:         timeout,
+		refreshInterval: refreshInterval,
+		outbound:        outboundPolicy,
+		now:             now,
+		logger:          logger,
+		doneCh:          doneCh,
 	}
 }
 
-// snapshot returns the current runtime configuration.
+// startSyncLoop periodically reconciles the in-memory AI snapshot with the
+// metadata store so key rotations, model changes, and disablements performed on
+// another replica take effect without a restart.
+func (m *aiManager) startSyncLoop() {
+	if m == nil || m.store == nil || m.refreshInterval <= 0 {
+		return
+	}
+	m.startOnce.Do(func() {
+		stopCh := make(chan struct{})
+		doneCh := make(chan struct{})
+		m.mu.Lock()
+		m.stopCh = stopCh
+		m.doneCh = doneCh
+		m.mu.Unlock()
+		go func() {
+			defer close(doneCh)
+			ticker := time.NewTicker(m.refreshInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopCh:
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					m.refreshFromStore(ctx)
+					cancel()
+				}
+			}
+		}()
+	})
+}
+
+// Close stops the background HA sync loop and waits for it to exit.
+func (m *aiManager) Close(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	stopCh := m.stopCh
+	doneCh := m.doneCh
+	m.mu.RUnlock()
+	if stopCh == nil {
+		return nil
+	}
+	m.stopOnce.Do(func() { close(stopCh) })
+	select {
+	case <-doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// snapshot returns an immutable copy of the current runtime configuration.
 func (m *aiManager) snapshot() aiSnapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -98,14 +189,36 @@ func (m *aiManager) snapshot() aiSnapshot {
 }
 
 // loadFromStore (re)builds the runtime state from the persisted row. Called at
-// startup (dynamic mode) and after every successful save. Never returns an
-// error: an unreadable AI config must not block a monitoring platform.
+// startup (dynamic mode) and by the HA refresh loop. Never returns an error:
+// an unreadable AI config must not block a monitoring platform.
 func (m *aiManager) loadFromStore(ctx context.Context) {
+	m.refreshFromStore(ctx)
+}
+
+func (m *aiManager) refreshFromStore(ctx context.Context) {
+	if m == nil || m.store == nil {
+		return
+	}
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
 	stored, ok, err := m.store.GetAISettings(ctx)
 	if err != nil {
 		if m.logger != nil {
-			m.logger.Error("read AI settings failed; AI features stay disabled", "error", err)
+			m.logger.Error("read AI settings failed; keeping last AI snapshot", "error", err)
 		}
+		return
+	}
+	m.applyStoredLocked(stored, ok)
+}
+
+func (m *aiManager) applyStoredLocked(stored meta.AISettings, ok bool) {
+	m.mu.RLock()
+	unchanged := m.hasStored == ok && (!ok || sameStoredAISettings(m.stored, stored)) && !m.lastSync.IsZero()
+	m.mu.RUnlock()
+	if unchanged {
+		m.mu.Lock()
+		m.lastSync = m.now()
+		m.mu.Unlock()
 		return
 	}
 	snap, err := m.buildFromStored(stored, ok)
@@ -113,11 +226,23 @@ func (m *aiManager) loadFromStore(ctx context.Context) {
 		m.logger.Error("build AI client failed; AI features stay disabled", "error", err)
 	}
 	m.mu.Lock()
+	snap.revision = m.current.revision + 1
 	m.current = snap
-	if ok {
-		m.updatedBy = stored.UpdatedBy
-	}
+	m.hasStored = ok
+	m.stored = stored
+	m.lastSync = m.now()
 	m.mu.Unlock()
+}
+
+func sameStoredAISettings(a, b meta.AISettings) bool {
+	return a.Enabled == b.Enabled &&
+		a.Provider == b.Provider &&
+		a.BaseURL == b.BaseURL &&
+		a.Model == b.Model &&
+		a.APIKeyCiphertext == b.APIKeyCiphertext &&
+		a.MaxTokens == b.MaxTokens &&
+		a.UpdatedBy == b.UpdatedBy &&
+		a.UpdatedAt.UTC().Truncate(time.Microsecond).Equal(b.UpdatedAt.UTC().Truncate(time.Microsecond))
 }
 
 func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot, error) {
@@ -134,6 +259,8 @@ func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot
 		baseURL:   stored.BaseURL,
 		model:     stored.Model,
 		maxTokens: maxTokens,
+		updatedBy: stored.UpdatedBy,
+		updatedAt: stored.UpdatedAt.UTC(),
 	}
 	if !snap.enabled {
 		if stored.APIKeyCiphertext != "" {
@@ -148,13 +275,19 @@ func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot
 	apiKey := ""
 	if stored.APIKeyCiphertext != "" {
 		if m.box == nil {
-			return aiSnapshot{}, errors.New("encryption is unavailable")
+			return aiSnapshot{
+				updatedBy: stored.UpdatedBy,
+				updatedAt: stored.UpdatedAt.UTC(),
+			}, errors.New("encryption is unavailable")
 		}
 		decrypted, err := m.box.Decrypt(stored.APIKeyCiphertext)
 		if err != nil {
 			// An undecryptable key is treated as a broken configuration: AI
 			// stays disabled rather than sending unauthenticated requests.
-			return aiSnapshot{}, fmt.Errorf("decrypt AI API key: %w", err)
+			return aiSnapshot{
+				updatedBy: stored.UpdatedBy,
+				updatedAt: stored.UpdatedAt.UTC(),
+			}, fmt.Errorf("decrypt AI API key: %w", err)
 		}
 		apiKey = decrypted
 	}
@@ -169,6 +302,7 @@ func (m *aiManager) buildFromStored(stored meta.AISettings, ok bool) (aiSnapshot
 		Outbound:  m.outbound,
 	})
 	if err != nil {
+		snap.enabled = false
 		return snap, err
 	}
 	snap.client = client
@@ -187,13 +321,28 @@ func (g *Gateway) aiState() aiSnapshot {
 // ---- Admin settings API ---------------------------------------------------
 
 type aiSettingsWire struct {
-	Enabled     *bool   `json:"enabled"`
-	Provider    *string `json:"provider"`
-	BaseURL     *string `json:"base_url"`
-	Model       *string `json:"model"`
-	APIKey      *string `json:"api_key"`
-	MaxTokens   *int    `json:"max_tokens"`
-	ClearAPIKey bool    `json:"clear_api_key"`
+	Enabled          *bool   `json:"enabled"`
+	Provider         *string `json:"provider"`
+	BaseURL          *string `json:"base_url"`
+	Model            *string `json:"model"`
+	APIKey           *string `json:"api_key"`
+	MaxTokens        *int    `json:"max_tokens"`
+	ClearAPIKey      bool    `json:"clear_api_key"`
+	ExpectedRevision *uint64 `json:"expected_revision"`
+}
+
+func aiSettingsResponse(snap aiSnapshot) fiber.Map {
+	return fiber.Map{
+		"enabled":     snap.enabled,
+		"provider":    snap.provider,
+		"base_url":    snap.baseURL,
+		"model":       snap.model,
+		"max_tokens":  snap.maxTokens,
+		"has_api_key": snap.hasKey,
+		"source":      "database",
+		"updated_by":  snap.updatedBy,
+		"revision":    snap.revision,
+	}
 }
 
 func (g *Gateway) aiSettingsGet(c fiber.Ctx) error {
@@ -203,17 +352,8 @@ func (g *Gateway) aiSettingsGet(c fiber.Ctx) error {
 			"error": "AI settings are managed by the server configuration",
 		})
 	}
-	snap := m.snapshot()
-	return c.JSON(fiber.Map{
-		"enabled":     snap.enabled,
-		"provider":    snap.provider,
-		"base_url":    snap.baseURL,
-		"model":       snap.model,
-		"max_tokens":  snap.maxTokens,
-		"has_api_key": snap.hasKey,
-		"source":      "database",
-		"updated_by":  m.updatedBy,
-	})
+	m.refreshFromStore(c.Context())
+	return c.JSON(aiSettingsResponse(m.snapshot()))
 }
 
 func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
@@ -241,90 +381,141 @@ func (g *Gateway) aiSettingsPut(c fiber.Ctx) error {
 	audit.ChangedFields = aiSettingsChangedFields(body)
 	actor := ""
 	if user, ok := c.Locals(userLocal).(meta.UserInfo); ok {
-		actor = user.Username
+		actor = strings.Clone(user.Username)
 	}
 
-	// Merge with the persisted row: absent fields keep their stored values.
-	// The merged values outlive this request in the running snapshot and AI
-	// client, so copy them: BodyParser fills form-encoded fields with strings
-	// that borrow Fiber's reusable request buffer.
-	stored, ok, err := m.store.GetAISettings(c.Context())
-	if err != nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "read AI settings failed"})
-	}
-	if !ok {
-		stored = meta.AISettings{UpdatedAt: m.now().UTC()}
-	}
-	next := stored
-	if body.Enabled != nil {
-		next.Enabled = *body.Enabled
-	}
-	if body.Provider != nil {
-		next.Provider = strings.Clone(strings.TrimSpace(*body.Provider))
-	}
-	if body.BaseURL != nil {
-		next.BaseURL = strings.Clone(strings.TrimSpace(*body.BaseURL))
-	}
-	if body.Model != nil {
-		next.Model = strings.Clone(strings.TrimSpace(*body.Model))
-	}
-	if body.MaxTokens != nil {
-		next.MaxTokens = *body.MaxTokens
-	}
-
-	// Key lifecycle: explicit new key replaces; clear_api_key empties;
-	// otherwise the stored ciphertext is kept.
-	if body.ClearAPIKey {
-		next.APIKeyCiphertext = ""
-	} else if body.APIKey != nil && strings.TrimSpace(*body.APIKey) != "" {
+	var sealedKey string
+	var hasNewKey bool
+	if !body.ClearAPIKey && body.APIKey != nil && strings.TrimSpace(*body.APIKey) != "" {
 		if m.box == nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "encryption is unavailable"})
 		}
-		sealed, sealErr := m.box.Encrypt(strings.TrimSpace(*body.APIKey))
+		var sealErr error
+		sealedKey, sealErr = m.box.Encrypt(strings.TrimSpace(*body.APIKey))
 		if sealErr != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "encrypt API key failed"})
 		}
-		next.APIKeyCiphertext = sealed
+		hasNewKey = true
 	}
 
-	if err := validateAISettings(next, m, body.BaseURL != nil); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(err)})
-	}
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
 
-	// Build the client before persisting: invalid configurations must not be
-	// saved, so the running state can never be worse than the stored state.
-	// When disabled, buildFromStored only re-derives the display snapshot
-	// (no client is constructed), so it cannot fail here.
-	snap, err := m.buildFromStored(next, true)
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(err)})
-	}
-	next.UpdatedAt = m.now().UTC()
-	next.UpdatedBy = actor
-	if err := m.store.UpsertAISettings(c.Context(), next); err != nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "save AI settings failed"})
-	}
+	casStore, hasCAS := m.store.(aiSettingsCASStore)
+	for attempt := 0; attempt < aiSettingsCASRetries; attempt++ {
+		// Merge with the persisted row: absent fields keep their stored values.
+		// The merged values outlive this request in the running snapshot and AI
+		// client, so copy them: BodyParser fills form-encoded fields with strings
+		// that borrow Fiber's reusable request buffer.
+		stored, ok, err := m.store.GetAISettings(c.Context())
+		if err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "read AI settings failed"})
+		}
+		m.applyStoredLocked(stored, ok)
+		currentSnap := m.snapshot()
+		if body.ExpectedRevision != nil && *body.ExpectedRevision != currentSnap.revision {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error":    "AI settings were modified concurrently",
+				"revision": currentSnap.revision,
+			})
+		}
 
-	m.mu.Lock()
-	m.current = snap
-	m.updatedBy = actor
-	m.mu.Unlock()
-	audit.TargetName = snap.provider
-	audit.Success = true
-	if m.logger != nil {
-		m.logger.Info("AI settings updated",
-			"enabled", snap.enabled, "provider", snap.provider, "model", snap.model, "by", actor)
-	}
+		next := stored
+		if !ok {
+			next = meta.AISettings{UpdatedAt: m.now().UTC()}
+		}
+		if body.Enabled != nil {
+			next.Enabled = *body.Enabled
+		}
+		if body.Provider != nil {
+			next.Provider = strings.Clone(strings.TrimSpace(*body.Provider))
+		}
+		if body.BaseURL != nil {
+			next.BaseURL = strings.Clone(strings.TrimSpace(*body.BaseURL))
+		}
+		if body.Model != nil {
+			next.Model = strings.Clone(strings.TrimSpace(*body.Model))
+		}
+		if body.MaxTokens != nil {
+			next.MaxTokens = *body.MaxTokens
+		}
 
-	return c.JSON(fiber.Map{
-		"enabled":     snap.enabled,
-		"provider":    snap.provider,
-		"base_url":    snap.baseURL,
-		"model":       snap.model,
-		"max_tokens":  snap.maxTokens,
-		"has_api_key": snap.hasKey,
-		"source":      "database",
-		"updated_by":  actor,
+		// Key lifecycle: explicit new key replaces; clear_api_key empties;
+		// otherwise the stored ciphertext is kept.
+		if body.ClearAPIKey {
+			next.APIKeyCiphertext = ""
+		} else if hasNewKey {
+			next.APIKeyCiphertext = sealedKey
+		}
+
+		if err := validateAISettings(next, m, body.BaseURL != nil); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(err)})
+		}
+
+		next.UpdatedAt = m.now().UTC().Truncate(time.Microsecond)
+		if ok {
+			prevAt := stored.UpdatedAt.UTC().Truncate(time.Microsecond)
+			if !next.UpdatedAt.After(prevAt) {
+				next.UpdatedAt = prevAt.Add(time.Microsecond)
+			}
+		}
+		next.UpdatedBy = actor
+
+		// Build the client before persisting: invalid configurations must not be
+		// saved, so the running state can never be worse than the stored state.
+		// When disabled, buildFromStored only re-derives the display snapshot
+		// (no client is constructed), so it cannot fail here.
+		snap, err := m.buildFromStored(next, true)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": outbound.SanitizeError(err)})
+		}
+
+		if hasCAS {
+			var expected *meta.AISettings
+			if ok {
+				cp := stored
+				expected = &cp
+			}
+			swapped, casErr := casStore.CompareAndSwapAISettings(c.Context(), expected, next)
+			if casErr != nil {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "save AI settings failed"})
+			}
+			if !swapped {
+				if body.ExpectedRevision != nil {
+					m.refreshLocked(c.Context())
+					return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+						"error":    "AI settings were modified concurrently",
+						"revision": m.snapshot().revision,
+					})
+				}
+				continue
+			}
+		} else if err := m.store.UpsertAISettings(c.Context(), next); err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "save AI settings failed"})
+		}
+
+		m.mu.Lock()
+		snap.revision = m.current.revision + 1
+		m.current = snap
+		m.hasStored = true
+		m.stored = next
+		m.lastSync = m.now()
+		m.mu.Unlock()
+		audit.TargetName = snap.provider
+		audit.Success = true
+		if m.logger != nil {
+			m.logger.Info("AI settings updated",
+				"enabled", snap.enabled,
+				"provider", snap.provider,
+				"model", snap.model,
+				"revision", snap.revision,
+				"by", snap.updatedBy)
+		}
+		return c.JSON(aiSettingsResponse(snap))
+	}
+	return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+		"error":    "AI settings were modified concurrently; retry",
+		"revision": m.snapshot().revision,
 	})
 }
 
@@ -349,6 +540,14 @@ func aiSettingsChangedFields(body aiSettingsWire) []string {
 		changed = append(changed, "api_key")
 	}
 	return changed
+}
+
+func (m *aiManager) refreshLocked(ctx context.Context) {
+	stored, ok, err := m.store.GetAISettings(ctx)
+	if err != nil {
+		return
+	}
+	m.applyStoredLocked(stored, ok)
 }
 
 func providerRequiresAPIKey(provider string) bool {

@@ -267,3 +267,89 @@ func TestSetIssuesStatusHandlesLeadingZeroAndListIssuesHandlesOverflowPage(t *te
 		}
 	})
 }
+
+func TestSaveIssueAnalysisConcurrencyAndRejectsStaleOverwrite(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		p, err := store.CreateProject(ctx, "IssueAI", "issue-ai-meta")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		changes, err := store.ApplyIssueDeltas(ctx, []errortrack.IssueDelta{{
+			ProjectID:   p.ID,
+			Fingerprint: "fp-analysis",
+			Title:       "boom",
+			Level:       "error",
+			Count:       1,
+			SessionBits: 1,
+			FirstSeen:   now,
+			LastSeen:    now,
+			LastEventID: "ev-1",
+			AcceptedAt:  now,
+			AppliedAt:   now,
+		}})
+		if err != nil || len(changes) != 1 {
+			t.Fatalf("ApplyIssueDeltas changes=%#v err=%v", changes, err)
+		}
+		issueID := changes[0].IssueID
+
+		newerAt := now.Add(2 * time.Minute)
+		olderAt := now.Add(time.Minute)
+		saved, err := store.SaveIssueAnalysis(ctx, p.ID, issueID, map[string]any{"summary": "newer"}, newerAt)
+		if err != nil || saved.AIAnalysis["summary"] != "newer" {
+			t.Fatalf("save newer analysis got=%#v err=%v", saved, err)
+		}
+		kept, err := store.SaveIssueAnalysis(ctx, p.ID, issueID, map[string]any{"summary": "stale"}, olderAt)
+		if err != nil {
+			t.Fatalf("save older analysis err=%v", err)
+		}
+		if kept.AIAnalysis["summary"] != "newer" {
+			t.Fatalf("stale analysis overwrote newer result: %#v", kept.AIAnalysis)
+		}
+
+		var wg sync.WaitGroup
+		errs := make(chan error, 16)
+		for i := range 8 {
+			wg.Add(2)
+			go func(idx int) {
+				defer wg.Done()
+				_, saveErr := store.SaveIssueAnalysis(
+					ctx,
+					p.ID,
+					issueID,
+					map[string]any{"summary": fmt.Sprintf("run-%d", idx)},
+					newerAt.Add(time.Duration(idx+1)*time.Second),
+				)
+				if saveErr != nil {
+					errs <- saveErr
+				}
+			}(i)
+			go func(idx int) {
+				defer wg.Done()
+				ts := now.Add(time.Duration(idx+1) * time.Second)
+				_, deltaErr := store.ApplyIssueDeltas(ctx, []errortrack.IssueDelta{{
+					ProjectID:   p.ID,
+					Fingerprint: "fp-analysis",
+					Title:       "boom",
+					Level:       "error",
+					Count:       1,
+					SessionBits: 1,
+					FirstSeen:   now,
+					LastSeen:    ts,
+					LastEventID: fmt.Sprintf("ev-%d", idx+2),
+					AcceptedAt:  ts,
+					AppliedAt:   ts,
+				}})
+				if deltaErr != nil {
+					errs <- deltaErr
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for runErr := range errs {
+			t.Fatalf("concurrent issue update/save error: %v", runErr)
+		}
+	})
+}

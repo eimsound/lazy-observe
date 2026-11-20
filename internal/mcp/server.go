@@ -257,14 +257,14 @@ func registerIssueTools(server *sdkmcp.Server, api *APIClient) {
 				return nil, nil, err
 			}
 			truncated := false
-			if root, _ := v.(map[string]any); len(anySlice(root["issues"])) == 50 {
+			if root, _ := v.(map[string]any); root != nil && len(anySlice(root["issues"])) == 50 {
 				nextQuery := cloneValues(q)
 				nextQuery.Set("page", "2")
 				next, nextErr := api.json(ctx, "/api/v1/issues", nextQuery)
 				if nextErr != nil {
 					return nil, nil, nextErr
 				}
-				if nextRoot, _ := next.(map[string]any); len(anySlice(nextRoot["issues"])) > 0 {
+				if nextRoot, _ := next.(map[string]any); nextRoot != nil && len(anySlice(nextRoot["issues"])) > 0 {
 					truncated = true
 				}
 			}
@@ -285,7 +285,7 @@ func registerIssueTools(server *sdkmcp.Server, api *APIClient) {
 			if err != nil {
 				return nil, nil, err
 			}
-			return nil, summarizeIssue(v), nil
+			return nil, enrichAndSummarizeIssue(ctx, api, in.IssueID, v), nil
 		},
 	)
 }
@@ -435,6 +435,9 @@ func registerProfileTools(server *sdkmcp.Server, api *APIClient) {
 }
 
 func NewHTTPHandler(baseURL string, client *http.Client) http.Handler {
+	if client == nil {
+		client = defaultHTTPClient()
+	}
 	return sdkmcp.NewStreamableHTTPHandler(func(req *http.Request) *sdkmcp.Server {
 		// The gateway mounts this handler through fasthttpadaptor, whose
 		// net/http header values borrow fasthttp's reusable request buffer even
@@ -500,6 +503,9 @@ func compactHistogram(v any, limit int) map[string]any {
 
 func summarizeTraceSearch(v any, limit int) map[string]any {
 	root, _ := v.(map[string]any)
+	if root == nil {
+		return map[string]any{"traces": []any{}, "count": 0, "truncated": false, "limit": limit}
+	}
 	data, _ := root["data"].([]any)
 	truncated := len(data) > limit
 	if truncated {
@@ -508,6 +514,9 @@ func summarizeTraceSearch(v any, limit int) map[string]any {
 	results := make([]any, 0, len(data))
 	for _, raw := range data {
 		trace, _ := raw.(map[string]any)
+		if trace == nil {
+			continue
+		}
 		spans, _ := trace["spans"].([]any)
 		processes, _ := trace["processes"].(map[string]any)
 		var start, end int64
@@ -571,25 +580,71 @@ func summarizeTraceSearch(v any, limit int) map[string]any {
 
 func sanitizeIssues(v any, truncated bool) any {
 	root, _ := v.(map[string]any)
+	if root == nil {
+		return map[string]any{
+			"issues":    []any{},
+			"count":     0,
+			"truncated": truncated,
+			"limit":     50,
+		}
+	}
 	issues, _ := root["issues"].([]any)
+	if issues == nil {
+		issues = []any{}
+	}
 	for _, raw := range issues {
 		if issue, _ := raw.(map[string]any); issue != nil {
 			delete(issue, "project_id")
 			delete(issue, "fingerprint")
 		}
 	}
+	root["issues"] = issues
 	root["count"] = len(issues)
 	root["truncated"] = truncated
 	root["limit"] = 50
 	return root
 }
 
+func enrichAndSummarizeIssue(ctx context.Context, api *APIClient, issueID int, v any) any {
+	root, _ := v.(map[string]any)
+	if root == nil {
+		return map[string]any{
+			"events":           []any{},
+			"events_truncated": false,
+			"event_limit":      5,
+		}
+	}
+	var fetcher func(eventID string) map[string]any
+	if api != nil && issueID > 0 {
+		fetcher = func(eventID string) map[string]any {
+			path := "/api/v1/issues/" + strconv.Itoa(issueID) + "/events/" + url.PathEscape(eventID)
+			raw, err := api.json(ctx, path, nil)
+			if err != nil {
+				return nil
+			}
+			detail, _ := raw.(map[string]any)
+			return detail
+		}
+	}
+	return summarizeIssueWithFetcher(root, fetcher)
+}
+
 func summarizeIssue(v any) any {
 	root, _ := v.(map[string]any)
 	if root == nil {
-		return v
+		return map[string]any{
+			"events":           []any{},
+			"events_truncated": false,
+			"event_limit":      5,
+		}
 	}
+	return summarizeIssueWithFetcher(root, nil)
+}
+
+func summarizeIssueWithFetcher(root map[string]any, fetchEvent func(eventID string) map[string]any) map[string]any {
 	delete(root, "project_id")
+	delete(root, "fingerprint")
+	issueLevel := stringValue(root["level"])
 	events, _ := root["events"].([]any)
 	truncated := len(events) > 5
 	if truncated {
@@ -598,49 +653,107 @@ func summarizeIssue(v any) any {
 	summaries := make([]any, 0, len(events))
 	for _, raw := range events {
 		event, _ := raw.(map[string]any)
-		summary := map[string]any{
-			"event_id":  event["event_id"],
-			"timestamp": event["timestamp"],
-			"level":     event["level"],
+		if event == nil {
+			continue
 		}
-		encoded := stringValue(event["symbolicated_event"])
-		var detail map[string]any
-		_ = json.Unmarshal([]byte(encoded), &detail)
-		if detail != nil {
-			summary["message"] = detail["message"]
-			ex, _ := detail["exception"].(map[string]any)
-			if ex != nil {
-				summary["exception_type"] = ex["type"]
-				summary["exception_value"] = ex["value"]
-				st, _ := ex["stacktrace"].(map[string]any)
-				frames := anySlice(st["frames"])
-				frameTruncated := len(frames) > 30
-				if frameTruncated {
-					frames = frames[len(frames)-30:]
-				}
-				compact := make([]any, 0, len(frames))
-				for _, rf := range frames {
-					f, _ := rf.(map[string]any)
-					compact = append(
-						compact,
-						map[string]any{
-							"function": f["function"],
-							"filename": f["filename"],
-							"line":     f["lineno"],
-							"in_app":   f["in_app"],
-						},
-					)
-				}
-				summary["stack_frames"] = compact
-				summary["stack_truncated"] = frameTruncated
+		detail := extractIssueEventDetail(event)
+		if detail == nil && fetchEvent != nil {
+			if eventID := stringValue(event["event_id"]); eventID != "" {
+				detail = fetchEvent(eventID)
 			}
 		}
-		summaries = append(summaries, summary)
+		summaries = append(summaries, buildIssueEventSummary(event, detail, issueLevel))
 	}
 	root["events"] = summaries
 	root["events_truncated"] = truncated
 	root["event_limit"] = 5
 	return root
+}
+
+func extractIssueEventDetail(event map[string]any) map[string]any {
+	if encoded := stringValue(event["symbolicated_event"]); encoded != "" {
+		var detail map[string]any
+		if json.Unmarshal([]byte(encoded), &detail) == nil && detail != nil {
+			return detail
+		}
+	}
+	if _, hasException := event["exception"]; hasException {
+		return event
+	}
+	if _, hasMessage := event["message"]; hasMessage {
+		return event
+	}
+	return nil
+}
+
+func buildIssueEventSummary(event, detail map[string]any, issueLevel string) map[string]any {
+	summary := map[string]any{
+		"event_id":  event["event_id"],
+		"timestamp": event["timestamp"],
+	}
+	if traceID := stringValue(event["trace_id"]); traceID != "" {
+		summary["trace_id"] = traceID
+	}
+	if sessionID := stringValue(event["session_id"]); sessionID != "" {
+		summary["session_id"] = sessionID
+	}
+	level := stringValue(event["level"])
+	if detail != nil {
+		if dl := stringValue(detail["level"]); dl != "" {
+			level = dl
+		}
+		if msg := stringValue(detail["message"]); msg != "" {
+			summary["message"] = msg
+		}
+		if rel := stringValue(detail["release"]); rel != "" {
+			summary["release"] = rel
+		}
+		if _, hasTrace := summary["trace_id"]; !hasTrace {
+			if contexts, _ := detail["contexts"].(map[string]any); contexts != nil {
+				if traceCtx, _ := contexts["trace"].(map[string]any); traceCtx != nil {
+					if tid := stringValue(traceCtx["trace_id"]); tid != "" {
+						summary["trace_id"] = tid
+					}
+				}
+			}
+		}
+		if ex, _ := detail["exception"].(map[string]any); ex != nil {
+			summary["exception_type"] = ex["type"]
+			summary["exception_value"] = ex["value"]
+			st, _ := ex["stacktrace"].(map[string]any)
+			frames := anySlice(st["frames"])
+			frameTruncated := len(frames) > 30
+			if frameTruncated {
+				frames = frames[len(frames)-30:]
+			}
+			compact := make([]any, 0, len(frames))
+			for _, rf := range frames {
+				f, _ := rf.(map[string]any)
+				if f == nil {
+					continue
+				}
+				frame := map[string]any{
+					"function": f["function"],
+					"filename": f["filename"],
+					"line":     f["lineno"],
+					"in_app":   f["in_app"],
+				}
+				if sym, ok := f["symbolicated"]; ok {
+					frame["symbolicated"] = sym
+				}
+				compact = append(compact, frame)
+			}
+			summary["stack_frames"] = compact
+			summary["stack_truncated"] = frameTruncated
+		}
+	}
+	if level == "" {
+		level = issueLevel
+	}
+	if level != "" {
+		summary["level"] = level
+	}
+	return summary
 }
 
 func summarizeReplayList(v any) map[string]any {
@@ -840,6 +953,9 @@ func unionServices(traces, profiles any, limit int) map[string]any {
 
 func capArray(v any, key string, limit int) map[string]any {
 	rows, _ := v.([]any)
+	if rows == nil {
+		rows = []any{}
+	}
 	truncated := len(rows) > limit
 	if truncated {
 		rows = rows[:limit]
@@ -855,6 +971,17 @@ type hotspot struct {
 
 func flamegraphSummary(v any, top int) map[string]any {
 	root, _ := v.(map[string]any)
+	if root == nil {
+		return map[string]any{
+			"summary":          "",
+			"hotspots":         []hotspot{},
+			"total":            int64(0),
+			"count":            0,
+			"truncated":        false,
+			"source_truncated": false,
+			"limit":            top,
+		}
+	}
 	total := int64(numberValue(root["value"]))
 	values := map[string]int64{}
 	sourceTruncated := false

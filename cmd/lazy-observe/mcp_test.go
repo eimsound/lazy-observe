@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -74,7 +76,74 @@ func TestMCPHelpNamesUserToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "lou_") {
-		t.Fatalf("mcp --help does not name the user API token prefix:\n%s", out)
+	for _, want := range []string{"lou_", "LO_MCP_DSN", "--dsn-file"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("mcp --help does not mention %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestMCPReadsDSNFromEnvAndFileWithoutCommandLineWarning(t *testing.T) {
+	served := stubServeMCP(t)
+
+	t.Setenv(mcpDSNEnvVar, "https://observe.example/p/envproj@lou_env_secret")
+	out, err := runMCPCommand()
+	if err != nil {
+		t.Fatalf("env DSN failed: %v", err)
+	}
+	if strings.Contains(out, "warning:") {
+		t.Fatalf("env DSN should not emit argv warning: %s", out)
+	}
+	if len(*served) != 1 || (*served)[0].Project != "envproj" || (*served)[0].Token != "lou_env_secret" {
+		t.Fatalf("env served client = %#v", *served)
+	}
+
+	dsnPath := filepath.Join(t.TempDir(), "mcp.dsn")
+	if writeErr := os.WriteFile(
+		dsnPath,
+		[]byte("https://observe.example/p/fileproj@lou_file_secret\n"),
+		0o600,
+	); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	out, err = runMCPCommand("--dsn-file", dsnPath)
+	if err != nil {
+		t.Fatalf("--dsn-file failed: %v", err)
+	}
+	if strings.Contains(out, "warning:") {
+		t.Fatalf("--dsn-file should not emit argv warning: %s", out)
+	}
+	if len(*served) != 2 || (*served)[1].Project != "fileproj" || (*served)[1].Token != "lou_file_secret" {
+		t.Fatalf("file served client = %#v", *served)
+	}
+
+	cmd := newMCPCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetIn(strings.NewReader("https://observe.example/p/stdinproj@lou_stdin_secret\n"))
+	cmd.SetArgs([]string{"--dsn-file", "-"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("--dsn-file - failed: %v", err)
+	}
+	if len(*served) != 3 || (*served)[2].Project != "stdinproj" || (*served)[2].Token != "lou_stdin_secret" {
+		t.Fatalf("stdin served client = %#v", *served)
+	}
+}
+
+func TestMCPFlagDSNWarnsWithoutLeakingTokenAndRejectsConflict(t *testing.T) {
+	stubServeMCP(t)
+	out, err := runMCPCommand("--dsn", "https://observe.example/p/checkout@lou_flag_secret_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "warning:") || !strings.Contains(out, "LO_MCP_DSN") {
+		t.Fatalf("expected process-listing warning for --dsn, got: %q", out)
+	}
+	if strings.Contains(out, "lou_flag_secret_123") {
+		t.Fatalf("warning leaked token: %q", out)
+	}
+	if _, err := runMCPCommand("--dsn", "https://observe.example/p/a@lou_1", "--dsn-file", "/tmp/x"); err == nil {
+		t.Fatal("expected error when both --dsn and --dsn-file are set")
 	}
 }

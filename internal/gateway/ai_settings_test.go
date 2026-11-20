@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,6 +237,7 @@ func TestAIManagerRestoresPersistedSettingsOnStartup(t *testing.T) {
 		AITimeout:       time.Second,
 		OutboundPolicy:  outbound.Policy{AllowPrivate: true},
 	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
 	state := gw.aiState()
 	if !state.enabled || state.provider != "deepseek" || state.model != "deepseek-chat" || !state.hasKey ||
 		state.client == nil {
@@ -266,6 +269,7 @@ func TestAIManagerCorruptCiphertextKeepsAIDisabled(t *testing.T) {
 		AITimeout:       time.Second,
 		OutboundPolicy:  outbound.Policy{AllowPrivate: true},
 	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
 	state := gw.aiState()
 	if state.enabled || state.hasKey || state.client != nil {
 		t.Fatalf("corrupt key state=%#v", state)
@@ -421,5 +425,162 @@ func TestAISettingsRejectsSSRFBaseURL(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("base_url=%q status=%d want 400 body=%s", badURL, resp.StatusCode, body)
 		}
+	}
+}
+
+func TestAISettingsConcurrentReadWriteNoRaceAndNoLostUpdates(t *testing.T) {
+	provider, gw, _, admin, _, key := dynamicAITestApp(t)
+	resp, body := requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"enabled": true, "provider": "openai", "base_url": provider.URL, "model": "initial-model",
+		"api_key": key, "max_tokens": 512,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed settings status=%d body=%s", resp.StatusCode, body)
+	}
+
+	var initial struct {
+		Revision uint64 `json:"revision"`
+	}
+	if err := json.Unmarshal(body, &initial); err != nil || initial.Revision == 0 {
+		t.Fatalf("expected positive revision in response: %s", body)
+	}
+
+	// Stale expected_revision must return 409 Conflict.
+	staleRev := initial.Revision + 99
+	resp, body = requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"model":             "should-conflict",
+		"expected_revision": staleRev,
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("stale expected_revision status=%d want 409 body=%s", resp.StatusCode, body)
+	}
+
+	// Concurrent readers (GET /api/ai/settings) + concurrent disjoint PUTs must
+	// not race on updatedBy and must preserve both disjoint updates.
+	var wg sync.WaitGroup
+	stopReaders := make(chan struct{})
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					r, _ := requestJSON(t, gw, http.MethodGet, "/api/ai/settings", admin, nil)
+					if r.StatusCode != http.StatusOK {
+						t.Errorf("concurrent GET status=%d", r.StatusCode)
+					}
+				}
+			}
+		}()
+	}
+
+	var putWG sync.WaitGroup
+	putWG.Add(2)
+	go func() {
+		defer putWG.Done()
+		r, b := requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+			"model": "updated-model",
+		})
+		if r.StatusCode != http.StatusOK {
+			t.Errorf("concurrent model PUT status=%d body=%s", r.StatusCode, b)
+		}
+	}()
+	go func() {
+		defer putWG.Done()
+		r, b := requestJSON(t, gw, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+			"max_tokens": 2048,
+		})
+		if r.StatusCode != http.StatusOK {
+			t.Errorf("concurrent max_tokens PUT status=%d body=%s", r.StatusCode, b)
+		}
+	}()
+	putWG.Wait()
+	close(stopReaders)
+	wg.Wait()
+
+	state := gw.aiState()
+	if state.model != "updated-model" || state.maxTokens != 2048 || state.updatedBy != "ai-settings-admin" {
+		t.Fatalf("lost concurrent update: state=%#v", state)
+	}
+}
+
+func TestAISettingsHAReplicaRefreshAndKeyRevocation(t *testing.T) {
+	var lastAuth atomic.Value
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastAuth.Store(r.Header.Get("Authorization"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model":   "ha-model",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "pong"}}},
+		})
+	}))
+	defer provider.Close()
+
+	box, err := secret.LoadOrCreate(t.TempDir() + "/secret.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := testStore(t)
+	admin := sessionCookie(t, store, "ha-ai-admin", "password", "admin")
+
+	newReplica := func() *Gateway {
+		gw := newMetadataTestGateway(store, Config{
+			Tokens:                    store,
+			Store:                     store,
+			AISettingsStore:           store,
+			AISecretBox:               box,
+			AIBuildClient:             ai.New,
+			AITimeout:                 time.Second,
+			AISettingsRefreshInterval: 20 * time.Millisecond,
+			OutboundPolicy:            outbound.Policy{AllowPrivate: true},
+		})
+		t.Cleanup(func() { _ = gw.Shutdown() })
+		return gw
+	}
+	replicaA := newReplica()
+	replicaB := newReplica()
+
+	// Enable AI on replica A with key-1.
+	resp, body := requestJSON(t, replicaA, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"enabled": true, "provider": "openai", "base_url": provider.URL, "model": "ha-model", "api_key": "key-1",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("replicaA enable status=%d body=%s", resp.StatusCode, body)
+	}
+
+	// Replica B must pick up the new settings automatically via background HA sync.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if st := replicaB.aiState(); st.enabled && st.client != nil && st.model == "ha-model" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replicaB did not sync enabled AI settings: %#v", replicaB.aiState())
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	resp, body = requestJSON(t, replicaB, http.MethodPost, "/api/ai/test", admin, nil)
+	if resp.StatusCode != http.StatusOK || lastAuth.Load() != "Bearer key-1" {
+		t.Fatalf("replicaB test status=%d auth=%v body=%s", resp.StatusCode, lastAuth.Load(), body)
+	}
+
+	// Rotate key on replica A, then revoke and disable.
+	resp, body = requestJSON(t, replicaA, http.MethodPut, "/api/ai/settings", admin, map[string]any{
+		"enabled": false, "clear_api_key": true,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("replicaA revoke status=%d body=%s", resp.StatusCode, body)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if st := replicaB.aiState(); !st.enabled && st.client == nil && !st.hasKey {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replicaB did not sync key revocation: %#v", replicaB.aiState())
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
 }
