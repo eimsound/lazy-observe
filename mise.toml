@@ -8,7 +8,7 @@ min_version = "2026.10.13"
 [tools]
 go = "1.26.11"
 node = "26.13.1"
-pnpm = "10.33.0"
+pnpm = "12.20.0"
 jq = "1.8.2"
 actionlint = "1.7.12"
 rg = "14.1.1"
