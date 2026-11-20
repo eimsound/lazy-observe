@@ -156,7 +156,7 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           BINARY: .cache/build/linux-${{ matrix.arch }}/lazy-observe
       - name: Record embedded artifact evidence
-        run: mise x go uv@0.13.7 -- bash scripts/check-embedded-artifact.sh ".cache/build/linux-${{ matrix.arch }}/lazy-observe" "linux/${{ matrix.arch }}"
+        run: mise x go uv -- bash scripts/check-embedded-artifact.sh ".cache/build/linux-${{ matrix.arch }}/lazy-observe" "linux/${{ matrix.arch }}"
         env:
           LO_ARTIFACT_EVIDENCE: .cache/artifact-evidence/linux-${{ matrix.arch }}.json
 
@@ -462,8 +462,9 @@ jobs:
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          # 装 mise.toml 钉的 node、pnpm，再加矩阵这一格的 node。
-          MISE_CI_TOOLS: node pnpm node@${{ matrix.node }}
+          # 装 mise.toml 钉的 pnpm 和矩阵这一格的 node。同名工具 mise 只装一个版本，所以不再写裸 node；
+          # mise.toml 的 node 由后面的 mise exec/run 按需补装。
+          MISE_CI_TOOLS: pnpm node@${{ matrix.node }}
       - name: Restore pnpm cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -505,7 +506,7 @@ jobs:
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          MISE_CI_TOOLS: node pnpm node@${{ matrix.node }}
+          MISE_CI_TOOLS: pnpm node@${{ matrix.node }}
       - name: Restore pnpm cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

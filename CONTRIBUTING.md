@@ -10,13 +10,13 @@ Hard constraints:
 
 - Go 1.26 with the exact module directive currently at 1.26.11.
 - `CGO_ENABLED=0` for Linux on amd64/arm64.
-- Node.js 26 (LTS, pinned in `mise.toml`) and pnpm 10.33.0 for CI-equivalent web/SDK work.
+- Node.js 26 (LTS, pinned in `mise.toml`) and pnpm (version pinned in `mise.toml`) for CI-equivalent web/SDK work.
 - No AGPL or GPL dependencies. Production Go dependencies must use Apache-2.0, MIT, or BSD-2/3-Clause licenses (`scripts/check-go-licenses.sh`); production JavaScript dependencies may additionally use ISC, 0BSD, or Unlicense, permissive licenses that ship alongside MIT (`scripts/check-js-licenses.sh`).
 - PoCs are local-only scratch code under `poc/<topic>/` (git-ignored, never committed); findings worth keeping go into `.agents/docs/research/<topic>.md`. Production code belongs under `cmd/` and `internal/`; client SDKs belong under `sdk/{go,node,browser,python}`.
 
 ## Development setup
 
-Install mise 2025.8.4 or newer, `curl`, `tar`, and either `sha256sum` or `shasum`. Then:
+Install mise 2026.10.13 or newer, `curl`, `tar`, and either `sha256sum` or `shasum`. Then:
 
 ```sh
 mise install
@@ -41,7 +41,7 @@ mise run web
 | `mise run mod-tidy-check` / `mise run sdk-go` | Verify the root module and the separate `sdk/go` module manifests need no `go mod tidy` changes |
 | `mise run test` | Run `CGO_ENABLED=0 go test ./...` |
 | `mise run vet` | Run `CGO_ENABLED=0 go vet ./...` |
-| `mise run lint` | mise-managed golangci-lint `v2.12.2` |
+| `mise run lint` | mise-managed golangci-lint (version pinned in `mise.toml`) |
 | `mise run test-meta-pg` | Run metadata tests against the embedded PostgreSQL baseline |
 | `mise run migration-check` | Validate the paired SQLite/PostgreSQL single baselines |
 | `mise run ent-generate-check` | Regenerate Ent and prove the tracked `internal/db/ent` has no drift or untracked files, generation is atomic and deterministic, and automatic migration code and root-module drift stay absent |

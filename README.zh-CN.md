@@ -23,7 +23,7 @@ lazy-observe 还没有发布过正式版本。想试用的话，请按下面的�
 
 ## 快速开始
 
-需要 mise 2025.8.4 或更高版本、`curl`、`tar`，以及 `sha256sum` 或其他 SHA-256 工具。mise 会安装本仓库锁定版本的 Go、Node.js 和 pnpm。
+需要 mise 2026.10.13 或更高版本、`curl`、`tar`，以及 `sha256sum` 或其他 SHA-256 工具。mise 会安装本仓库锁定版本的 Go、Node.js 和 pnpm。
 
 ```sh
 git clone https://github.com/eimsound/lazy-observe.git

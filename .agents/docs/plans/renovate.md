@@ -49,8 +49,34 @@ Trivy 的 sha 只在 `release.yml` 的扫描里用，PR CI 其它 job 不会校�
 | pep621 | `sdk/python/pyproject.toml` | `rangeStrategy: widen`：库里的 `>=` 下限是对使用方的兼容承诺，现有范围仍满足时不开 PR。代价是 Renovate 对 Python 基本空转（只有新版本让范围不再满足时才动），Dependabot 之前也是这样。minor/patch 一组、major 单独。运行时 7 天由 `[tool.uv] exclude-newer = "7 days"` 保证（#119）。 |
 | github-actions | 5 个 workflow | `helpers:pinGitHubActionDigestsToSemver`：保持 SHA 固定，行尾 `# vX.Y.Z` 注释与 SHA 一起改。`github-runner` depType 关掉（`ubuntu-24.04` 会被提 26.04）。minor/patch/digest 一组、major 单独。 |
 | dockerfile | `Dockerfile` | `FROM` 的 tag 与 digest 原生更新；minor/patch/digest 一组。浮动 tag（`debian:trixie-slim`）会提 digest 更新。gcr distroless 与 Docker Hub 的 debian 拿不到时间戳，见下。 |
-| mise | `mise.toml` 的 `[tools]` 与 `tasks.*.tools` | 原生识别，minor/patch 一组、major 单独；go 后端（`go:…/golines`、`govulncheck`）也识别。`scripts/ci-setup-mise.sh` 的 go-ci 工具清单（`actionlint`、`golangci-lint`、golines、go-licenses、`govulncheck`、`helm`、`uv@…`）和 `ci.yml` 里 `mise x go uv@…` 是 `mise.toml` 的重复固定点，Renovate 只升 `mise.toml`，这些地方会漂移（原 Dependabot 也没覆盖，建议单独切片让它们从 `mise.toml` 读）。合并 mise tools PR 前，把同一工具在这些位置的版本一起改。 |
+| mise | `mise.toml` 的 `[tools]` | 原生识别，minor/patch 一组、major 单独；go 后端（`go:…/golines`、`govulncheck`）与 `{ version = "…", lazy = true }` 的内联表写法也识别。工具版本只在 `[tools]` 写一次，没有别的重复固定点，合并 mise tools PR 不用再手工同步，见下节「mise 工具版本的单一来源」。 |
 | custom.regex | mise 引导、Victoria 三件套、Trivy、e2e 镜像、BuildKit | 见上。e2e 镜像用一条正则 + `docker` datasource，原生更新 tag 与 digest；BuildKit 的 `driver-opts: image=moby/buildkit:tag@digest` 同理。手工固定点不设周排期（`schedule: at any time`），满 7 天就开 PR。 |
+
+### mise 工具版本的单一来源
+
+Renovate 的 mise manager 只改 `mise.toml`，所以工具版本只在 `mise.toml` 的 `[tools]` 写一次，其余地方只写工具名：
+
+- `scripts/ci-setup-mise.sh` 的 profile 是工具名清单，用 `mise install <名字>` 装；mise 对「已在配置里的名字」装配置的那一版，不是 latest。
+  `MISE_CI_TOOLS` 仍可写 `node@22.23.5` 这样的显式版本（SDK 的 Node 矩阵用它）。
+- `ci.yml` 的 `mise x go uv -- …` 同理，取 `[tools]` 的 uv。
+- 任务不再写 `tools.*`：任务级 `tools` 只在 `mise run` 时才被解析，`mise install uv` 看不到，会装成 latest。
+- 原来任务级才有的 uv、golangci-lint、helm、goreleaser、go-licenses、govulncheck 搬进 `[tools]` 并标 `lazy = true`。
+  lazy 工具不会被裸 `mise install` 和 `mise run` 预装，只在 profile 按名字装、或任务/命令真正用到时才装，
+  所以每个 CI job 仍然只装自己那份；不标 lazy 的话，每个 `mise run` 都会装全量，`go install` 编译的 go-licenses、govulncheck 会拖慢所有 job。
+- `lazy = true` 需要 mise 2026.9 起，`min_version` 因此设为 2026.10.13（修了「任务装别的工具时丢 lazy shim」）。CI 与 Dockerfile 用的引导版本更新，不受影响；
+  本地 mise 低于该版本时 mise 直接拒绝加载配置，`README.md`、`README.zh-CN.md`、`CONTRIBUTING.md` 写的最低版本同步改了。
+- `mise install <名字>` 对不在配置里的名字会**静默装 latest**，mise 没有「拒装未配置工具」的选项（`--locked` 只要求 lockfile 里有下载 URL，本仓库没有 lockfile）。
+  所以 `ci-setup-mise.sh` 在安装前后各做一次 fail-closed 校验（`mise tool <名字> --config-source/--requested/--installed`）：
+  裸名字的版本必须来自本仓库 `mise.toml`（不认 `MISE_<TOOL>_VERSION`、`mise.local.toml`、全局配置）且是精确版本，profile 里不许写 `名字@版本`，
+  `MISE_CI_TOOLS` 的 `名字@版本` 必须是精确版本，同一工具不许请求两次（`mise install node node@22.23.5` 只装 22.23.5，裸 `node` 被悄悄丢掉，SDK Node 矩阵因此改成 `pnpm node@<矩阵>`）；装完再确认装上的就是那一版。任一不满足即退出 1，安装前那次失败时不会调用 `mise install`。
+  `scripts/ci-setup-mise-test.sh`（`workflow-check` 的一部分）守「未固定的工具必须失败且不安装」。新增 profile 工具时先写进 `[tools]`。
+- Renovate 对内联表的支持已实测（44.253.4，2026-11-20）：`--dry-run=extract` 识别全部 6 个 `{ version = …, lazy = true }` 工具且 `currentValue` 正确；
+  `--dry-run=lookup` 给出 uv、golangci-lint、helm、goreleaser 的 minor/patch 更新并归入 `renovate/mise-tools-minor-patch`，helm 4 单独成 `renovate/helm-4.x`，
+  govulncheck 按 `timestamp-optional` 规则单独成 PR；mise manager 没有自定义 `updateDependency`，用 Renovate 自身的 `doAutoReplace` 对内联表改写，6 个工具都只改了 `version` 字段、重新解析版本正确。
+
+文档（`CONTRIBUTING.md`、脚本注释）里也不再抄版本号，写「版本见 `mise.toml`」。
+
+剩余的、不在这套机制里的版本抄写：`ci.yml` 的 `sdk-node`、`sdk-browser` 矩阵里的 `26.13.1`（刻意写成 patch；26 那一格与 `[tools]` 的 node 同值，升 node 时要一起改，这是 SDK 兼容矩阵，不是工具安装）。
 
 ### 最小发布年龄
 

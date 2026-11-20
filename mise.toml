@@ -1,5 +1,10 @@
-min_version = "2025.8.4"
+# lazy = true 需要 2026.9 起的 lazy 工具；2026.10.13 起任务里装别的工具时不丢 lazy 工具的 shim。
+min_version = "2026.10.13"
 
+# 工具版本只在这里写一次：任务不再写 tools.*，scripts/ci-setup-mise.sh 的 profile 与 ci.yml 的 `mise x` 只写工具名，
+# 版本由 mise 从这里解析（Renovate 的 mise manager 只改这个文件）。
+# lazy = true：裸 `mise install` 与 `mise run` 不会预装，只有 profile 按名字（`mise install uv`）或
+# 任务/命令真正用到时才装，所以每个 CI job 仍然只装自己那份。
 [tools]
 go = "1.26.11"
 node = "26.13.1"
@@ -9,6 +14,14 @@ actionlint = "1.7.12"
 rg = "14.1.1"
 air = "1.67.1"
 "go:github.com/golangci/golines" = "0.15.0"
+# uv：check-embedded-artifact.sh、check-release-smoke.sh、e2e-multi-replica.sh 与 sdk-python 任务的受管 Python（scripts/lib/uv-python.sh）。
+uv = { version = "0.13.7", lazy = true }
+golangci-lint = { version = "2.12.2", lazy = true }
+helm = { version = "3.21.3", lazy = true }
+goreleaser = { version = "2.17.0", lazy = true }
+"go:github.com/google/go-licenses/v2" = { version = "2.0.1", lazy = true, lazy_bins = ["go-licenses"] }
+# 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
+"go:golang.org/x/vuln/cmd/govulncheck" = { version = "1.9.0", lazy = true, lazy_bins = ["govulncheck"] }
 
 [tasks.ent-generate]
 description = "Regenerate the tracked Ent client in internal/db/ent from internal/db/schema"
@@ -93,7 +106,6 @@ run = "mise run build-binary"
 description = "Build release binaries for linux and amd64/arm64"
 depends = ["web-assets"]
 # check-embedded-artifact.sh 的内嵌校验用 uv 受管的 Python（scripts/lib/uv-python.sh），不用系统 python3。
-tools.uv = "0.13.7"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -152,9 +164,8 @@ CGO_ENABLED=0 go mod tidy -diff
 '''
 
 [tasks.lint]
-description = "Run golangci-lint v2.12.2 and the alert lease clock check"
+description = "Run golangci-lint and the alert lease clock check"
 depends = ["alert-lease-clock-check"]
-tools."golangci-lint" = "2.12.2"
 # --allow-serial-runners: 并行 worktree 共用一份全局锁，拿不到锁时排队等待而不是以
 # "parallel golangci-lint is running" 退出。只影响等锁行为，不影响检查结果。
 run = "golangci-lint run --allow-serial-runners ./..."
@@ -199,7 +210,6 @@ run = "bash scripts/check-e2e-contract.sh"
 [tasks.e2e-ha]
 description = "Run the VM/VLogs/VTraces cluster and S3 multi-replica HA gate locally (Docker required); PR CI runs it for server code changes"
 # e2e-multi-replica.sh 的内联辅助用 uv 受管的 Python（scripts/lib/uv-python.sh），不用系统 python3。
-tools.uv = "0.13.7"
 depends = ["build-binary", "storage-bins"]
 run = '''
 #!/usr/bin/env bash
@@ -214,7 +224,6 @@ LO_E2E_BINARY="$binary_path" LO_E2E_STORAGE_BIN_DIR="$storage_path" \
 
 [tasks.perf-ha]
 description = "Run controlled query P95 and capacity-controlled weak-scaling gates in the real HA fixture"
-tools.uv = "0.13.7"
 depends = ["build-binary", "storage-bins"]
 run = '''
 #!/usr/bin/env bash
@@ -231,18 +240,14 @@ LO_E2E_BINARY="$binary_path" LO_E2E_STORAGE_BIN_DIR="$storage_path" \
 
 [tasks.helm-lint]
 description = "Lint the Helm chart"
-tools.helm = "3.21.3"
 run = '${HELM:-helm} lint deploy/helm/lazy-observe'
 
 [tasks.helm-template-test]
 description = "Check the Helm chart keeps key material out of the environment and honours image.digest"
-tools.helm = "3.21.3"
 run = "bash scripts/helm-template-test.sh"
 
 [tasks.workflow-check]
 description = "Statically validate GitHub Actions workflows without a runner"
-tools.actionlint = "1.7.12"
-tools.rg = "14.1.1"
 run = [
   "bash scripts/check-github-workflows.sh",
   "bash scripts/check-pipefail-pipelines.sh",
@@ -259,7 +264,6 @@ run = "bash scripts/ci-changes-test.sh"
 description = "Verify the Go SDK nested module (sdk/go) is tidy, then build, vet, lint, and test it"
 dir = "sdk/go"
 env = { CGO_ENABLED = "0" }
-tools."golangci-lint" = "2.12.2"
 run = [
   "go mod tidy -diff",
   "go build ./...",
@@ -331,7 +335,6 @@ description = "Create sdk/python/.venv with uv (interpreter from LO_SDK_PYTHON_V
 # 解释器由 uv 管理（uv python install），不用系统 Python，也不用 pip；CI 矩阵与本地用同一条命令：
 #   LO_SDK_PYTHON_VERSION=3.15t mise run sdk-python
 # 取值是 uv 的版本请求：3.9、3.13、3.15、3.15t（free-threaded）、3.16（预发布）等。
-tools.uv = "0.13.7"
 dir = "sdk/python"
 run = '''
 #!/usr/bin/env bash
@@ -349,7 +352,6 @@ description = "Verify the sdk-python-v* tag and build the PyPI sdist + wheel wit
 # 发布路径与 sdk-python 一样只用 uv：不用 setup-python、系统 Python 与 pip；sdk/python/pyproject.toml 的
 # [tool.uv] exclude-newer 同样约束 uv build 的构建后端（setuptools）解析。由 .github/workflows/sdk-release.yml 的 python job 调用，
 # 本地 dry run：SDK_TAG=sdk-python-v0.1.0 mise run sdk-python-release
-tools.uv = "0.13.7"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -396,7 +398,6 @@ CGO_ENABLED=0 go run ./cmd/ingest-bench \
 [tasks.gate-release-artifacts]
 description = "Gate existing linux embedded binaries and smoke the native zero-config artifact"
 # check-release-smoke.sh 的内嵌校验脚本用 uv 管理的固定版本 Python（scripts/lib/uv-python.sh，LO_SCRIPTS_PYTHON_VERSION 默认 3.13），不用系统 python3。
-tools.uv = "0.13.7"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -545,14 +546,11 @@ trap - EXIT
 
 [tasks.license-check]
 description = "Allow only Apache-2.0, MIT, and BSD licenses in the production Go package graph"
-tools."go:github.com/google/go-licenses/v2" = "2.0.1"
 run = "bash scripts/check-go-licenses.sh"
 
 [tasks.vulncheck]
 description = "Report reachable known vulnerabilities in the server module and the sdk/go module (govulncheck)"
-# 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
 # 漏洞库在运行时从 vuln.go.dev 拉取，所以结果会随新公告变化。
-tools."go:golang.org/x/vuln/cmd/govulncheck" = "1.9.0"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -567,27 +565,22 @@ exit "$status"
 
 [tasks.third-party-notices]
 description = "Regenerate third_party/go/THIRD_PARTY_NOTICES.txt from the linked Go dependency graph"
-tools."go:github.com/google/go-licenses/v2" = "2.0.1"
 run = "bash scripts/third-party-notices.sh"
 
 [tasks.snapshot]
 description = "Build a local GoReleaser snapshot"
-tools.goreleaser = "2.17.0"
 run = "goreleaser release --snapshot --clean"
 
 [tasks.release-snapshot-check]
 description = "Validate no-publish snapshot configuration"
-tools.goreleaser = "2.17.0"
 run = "bash scripts/check-release-prerequisites.sh --snapshot"
 
 [tasks.release-publish-check]
 description = "Validate tag, license, credentials, and release configuration"
-tools.goreleaser = "2.17.0"
 run = "bash scripts/check-release-prerequisites.sh"
 
 [tasks.release]
 description = "Publish a GoReleaser release from an exact v* tag"
-tools.goreleaser = "2.17.0"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail

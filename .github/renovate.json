@@ -505,7 +505,7 @@
       "groupSlug": "pip-minor-patch"
     },
     {
-      "description": "mise.toml 的 [tools] 与 tasks.*.tools：minor+patch 合一组，major 单独",
+      "description": "mise.toml 的 [tools]：minor+patch 合一组，major 单独",
       "matchManagers": [
         "mise"
       ],
