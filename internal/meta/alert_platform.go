@@ -33,6 +33,73 @@ type PlatformErrorSpikeRecovery struct {
 	Threshold   int
 }
 
+// PlatformAlertState is the durable state snapshot of a project's platform alert.
+type PlatformAlertState struct {
+	ProjectID   int
+	ProjectSlug string
+	Kind        string
+	Status      string
+	ActiveCycle int64
+	StartsAt    time.Time
+	EndsAt      *time.Time
+	UpdatedAt   time.Time
+}
+
+// ProjectFiringPlatformAlertStates lists active firing durable platform alerts
+// for projectID so native and platform policy planners share a single view of
+// active inhibition sources and storm groups across replicas.
+func (s *Store) ProjectFiringPlatformAlertStates(ctx context.Context, projectID int) ([]PlatformAlertState, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		bind(
+			s.dialect,
+			`SELECT st.project_id, p.slug, st.kind, st.status, st.active_cycle, st.starts_at, st.ends_at, st.updated_at
+			 FROM platform_alert_states AS st
+			 JOIN projects AS p ON p.id = st.project_id
+			 WHERE st.project_id = ? AND st.status = 'firing'
+			 ORDER BY st.kind`,
+		),
+		projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list firing platform alert states: %w", err)
+	}
+	defer rows.Close()
+	var states []PlatformAlertState
+	for rows.Next() {
+		var (
+			st       PlatformAlertState
+			startsAt sql.NullTime
+			endsAt   sql.NullTime
+		)
+		if err := rows.Scan(
+			&st.ProjectID,
+			&st.ProjectSlug,
+			&st.Kind,
+			&st.Status,
+			&st.ActiveCycle,
+			&startsAt,
+			&endsAt,
+			&st.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan firing platform alert state: %w", err)
+		}
+		if startsAt.Valid {
+			st.StartsAt = startsAt.Time.UTC()
+		}
+		if endsAt.Valid {
+			ts := endsAt.Time.UTC()
+			st.EndsAt = &ts
+		}
+		st.UpdatedAt = st.UpdatedAt.UTC()
+		states = append(states, st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate firing platform alert states: %w", err)
+	}
+	return states, nil
+}
+
 func alignPlatformErrorBucket(t time.Time) int64 {
 	sec := t.UTC().Unix()
 	return (sec / platformErrorRateBucketSeconds) * platformErrorRateBucketSeconds

@@ -252,3 +252,79 @@ func jsonPayloadEqual(left, right []byte) bool {
 	return json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil &&
 		reflect.DeepEqual(leftValue, rightValue)
 }
+
+func TestNotificationOutboxDepthAndFiringPlatformStates(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, _, channel := createOutboxFixture(t, store, "depth")
+
+		// Seed one pending due, one processing, and one dead outbox item.
+		pendingID, _, err := store.EnqueueNotification(ctx, NotificationOutboxEnqueue{
+			IdempotencyKey: "depth-pending", ProjectID: project.ID, ChannelID: channel.ID,
+			Payload: json.RawMessage(`{"status":"firing"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		procID, _, err := store.EnqueueNotification(ctx, NotificationOutboxEnqueue{
+			IdempotencyKey: "depth-processing", ProjectID: project.ID, ChannelID: channel.ID,
+			Payload: json.RawMessage(`{"status":"firing"}`), Priority: 10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		deadID, _, err := store.EnqueueNotification(ctx, NotificationOutboxEnqueue{
+			IdempotencyKey: "depth-dead", ProjectID: project.ID, ChannelID: channel.ID,
+			Payload: json.RawMessage(`{"status":"firing"}`), Priority: 20,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Claim deadID and mark dead; claim procID and leave processing.
+		claimed, err := store.ClaimNotifications(ctx, "depth-worker", 2, time.Minute)
+		if err != nil || len(claimed) != 2 || claimed[0].ID != deadID || claimed[1].ID != procID {
+			t.Fatalf("claimed=%#v err=%v", claimed, err)
+		}
+		if status, err := store.RetryNotification(ctx, deadID, "depth-worker", "boom", time.Minute, 1); err != nil ||
+			status != "dead" {
+			t.Fatalf("mark dead status=%q err=%v", status, err)
+		}
+		_ = pendingID
+
+		depth, err := store.NotificationOutboxDepth(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if depth.Pending != 1 || depth.Processing != 1 || depth.Dead != 1 || depth.Due != 1 {
+			t.Fatalf("unexpected outbox depth=%+v want pending=1 processing=1 dead=1 due=1", depth)
+		}
+
+		// Verify ProjectFiringPlatformAlertStates tracks active durable spikes.
+		now := time.Now().UTC().Truncate(time.Second)
+		for i := range 6 {
+			if _, err := store.RecordPlatformErrorRate(
+				ctx,
+				project.ID,
+				now.Add(time.Duration(i)*time.Second),
+				now.Add(time.Duration(i)*time.Second),
+				5*time.Minute,
+				1,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		firing, err := store.ProjectFiringPlatformAlertStates(ctx, project.ID)
+		if err != nil || len(firing) != 1 || firing[0].Kind != "error_rate_spike" ||
+			firing[0].ProjectSlug != project.Slug {
+			t.Fatalf("firing platform states=%#v err=%v", firing, err)
+		}
+		if _, err := store.ClearPlatformErrorRateState(ctx, project.ID, now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		firing, err = store.ProjectFiringPlatformAlertStates(ctx, project.ID)
+		if err != nil || len(firing) != 0 {
+			t.Fatalf("expected 0 firing platform states after clear, got %#v err=%v", firing, err)
+		}
+	})
+}
