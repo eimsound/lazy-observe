@@ -4,9 +4,14 @@ import type { ActiveSpan, BrowserClient, BrowserConfig, CaptureOptions, StartSpa
 let current: BrowserClient | undefined;
 
 export function init(config: BrowserConfig): BrowserClient {
-  if (current) void current.close();
-  current = new Client(config).start();
-  return current;
+  const previous = current;
+  current = undefined;
+  if (previous) void previous.close();
+  const client: BrowserClient = new Client(config, () => {
+    if (current === client) current = undefined;
+  }).start();
+  current = client;
+  return client;
 }
 
 export function captureException(error: unknown, options?: CaptureOptions): string | undefined {
@@ -25,7 +30,8 @@ export function wrapFetch(fetchImpl?: typeof fetch): typeof fetch {
   return current.wrapFetch(fetchImpl);
 }
 
-export { parseDsn } from "./dsn";
+export { parseDsn, redactDsn, type ParsedDsn, type ParseDsnOptions } from "./dsn";
+export { MAX_ERROR_EVENT_BYTES, sanitizeErrorEvent, sanitizeUrl } from "./sanitize";
 export { parseStack, isInApp } from "./stack";
 export { MinuteRateLimiter } from "./rate-limit";
 export { ReplayRingBuffer } from "./replay-buffer";
@@ -38,6 +44,7 @@ export type {
   BrowserDiagnostics,
   CaptureOptions,
   DeliveryConfig,
+  Dispose,
   ErrorEventPayload,
   ReplayConfig,
   StackFrame,

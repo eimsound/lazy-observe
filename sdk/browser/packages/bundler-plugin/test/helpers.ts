@@ -39,7 +39,7 @@ export async function makeOutputDir(): Promise<string> {
   return directory;
 }
 
-export function dsnFor(origin: string): string { return `${origin}/p/default@secret-token`; }
+export function dsnFor(origin: string): string { return `${origin}/p/default@los_secret-token`; }
 
 /** 一个不在任何 git 仓库里的空目录（模拟 Docker 构建排除了 .git），用来让 git 推断 release 失败。 */
 export async function makeNonGitDir(): Promise<string> {

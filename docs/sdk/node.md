@@ -65,6 +65,8 @@ The Express middleware extracts W3C `traceparent` explicitly and records request
 
 ## Pino and Winston
 
+`pino` and `winston-transport` are optional peer dependencies loaded lazily only when you call `lo.pino()` or `lo.winston()`. Install them in your application only if you use those integrations.
+
 ```ts
 const pinoLogger = lo.pino({ level: "info" });
 ```
@@ -91,6 +93,8 @@ try {
   throw error;
 }
 ```
+
+Error events pass through the built-in `sanitize` pipeline before queuing: URL credentials, query strings (`?…`), and fragments (`#…`) are stripped by default, overly long messages, tags, and stack frames are capped, and each event is trimmed to the 200 KiB gateway budget. The bounded `DeliveryQueue` splits batches by byte budget, drops permanent 4xx rejections immediately as `server_rejected`, and retries transient failures (`408`/`429`/`5xx`, timeouts, network errors) honoring `Retry-After` or Full Jitter exponential backoff.
 
 Setting `captureUnhandledErrors: true` installs an `uncaughtExceptionMonitor` listener. It observes both `uncaughtException` and unhandled promise rejections (under Node's default throw behavior) without suppressing Node's normal fatal exit semantics. Prefer explicit handling when possible.
 

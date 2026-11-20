@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { uploadSourceMaps } from "../src/index";
+import { parseDsn, redactDsn, uploadSourceMaps } from "../src/index";
 import { dsnFor, makeOutputDir, startServer } from "./helpers";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -23,7 +23,7 @@ describe("uploadSourceMaps", () => {
     const [request] = server.requests;
     expect(request.method).toBe("POST");
     expect(request.url).toBe("/api/releases/rel-1.0/sourcemaps");
-    expect(request.authorization).toBe("Bearer secret-token");
+    expect(request.authorization).toBe("Bearer los_secret-token");
     expect(request.body).toContain('name="app.js"; filename="app.js.map"');
     expect(request.body).toContain('name="style.css"; filename="style.css.map"');
     expect(request.body).toContain('"sources":["app.ts"]');
@@ -100,10 +100,47 @@ describe("uploadSourceMaps", () => {
 
   it("throws when a DSN is set but malformed, without echoing it", async () => {
     const { dir } = await setup();
-    const error = await uploadSourceMaps({ dsn: "not a dsn secret-token", release: "r", dir }).catch((e: Error) => e);
+    const error = await uploadSourceMaps({ dsn: "not a dsn los_secret-token", release: "r", dir }).catch((e: Error) => e);
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(/DSN must match/);
     expect((error as Error).message).not.toContain("secret-token");
+  });
+
+  it.each([
+    "https://observe.example/p/default@lo_project_secret_123",
+    "https://observe.example/p/default@lou_user_secret_123",
+    "https://observe.example/p/default@plain_secret_123",
+    "https://observe.example/p/default@los_",
+  ])("rejects non-los_ DSN %s before making any HTTP request and without leaking the token", async (badDsn) => {
+    const { server, dir } = await setup();
+    const error = await uploadSourceMaps({ dsn: badDsn, release: "r", dir }).catch((e: Error) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/source map upload token \(los_/);
+    expect((error as Error).message).not.toContain("secret_123");
+    expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(server.requests).toHaveLength(0);
+  });
+
+  it("enforces aligned DSN validation and redaction in parseDsn / redactDsn", () => {
+    expect(parseDsn("https://observe.example/p/my-app@los_abc123")).toEqual({
+      origin: "https://observe.example",
+      project: "my-app",
+      token: "los_abc123",
+    });
+    expect(redactDsn("https://observe.example/p/my-app@los_abc123")).toBe(
+      "https://observe.example/p/my-app@[redacted]",
+    );
+    expect(redactDsn("bad@los_abc123")).toBe("[invalid DSN]");
+    for (const bad of [
+      "ftp://observe.example/p/app@los_abc",
+      "https://user:pw@observe.example/p/app@los_abc",
+      "https://observe.example/p/app@los_abc?q=1",
+      "https://observe.example/p/app@los_abc#frag",
+      "https://observe.example/p/app@los_a@b",
+      "https://observe.example/p/app@los_%ZZ",
+    ]) {
+      expect(() => parseDsn(bad)).toThrow(/DSN must match/);
+    }
   });
 
   it("throws when the directory does not exist", async () => {

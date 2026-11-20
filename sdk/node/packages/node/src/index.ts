@@ -1,5 +1,13 @@
-export { parseDSN, type ParsedDSN } from "./dsn.js";
-export { parseV8Stack, type ErrorEvent, type StackFrame } from "./errors.js";
+export { parseDSN, redactDSN, type ParsedDSN, type ParseDSNOptions } from "./dsn.js";
+export {
+  MAX_ERROR_EVENT_BYTES,
+  parseV8Stack,
+  sanitizeErrorEvent,
+  sanitizeUrl,
+  type ErrorEvent,
+  type StackFrame,
+} from "./errors.js";
+export type { Dispose } from "./runtime.js";
 export {
   init,
   extractTraceparent,

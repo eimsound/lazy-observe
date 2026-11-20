@@ -31,7 +31,7 @@ export function createWrappedLLMFetch(tracer: Tracer, captureContent: boolean, b
     if (!system) return baseFetch(input, init);
 
     const body = await requestBody(input, init);
-    const request = parseLLMRequest(system, body);
+    const request = parseLLMRequest(system, body, captureContent);
     const attributes: Record<string, string> = {
       "gen_ai.operation.name": "chat",
       "gen_ai.provider.name": system,
@@ -149,15 +149,18 @@ async function readBoundedStreamText(body: ReadableStream<Uint8Array> | null): P
   return new TextDecoder().decode(merged);
 }
 
-function parseLLMRequest(system: LLMSystem, body: string): LLMRequest {
+function parseLLMRequest(system: LLMSystem, body: string, captureContent: boolean): LLMRequest {
   const raw = parseObject(body);
-  const prompt: Record<string, unknown> = { messages: raw.messages };
-  if (system === "anthropic" && raw.system !== undefined) prompt.system = raw.system;
-  return {
+  const result: LLMRequest = {
     model: stringValue(raw.model),
     stream: raw.stream === true,
-    prompt: JSON.stringify(prompt),
   };
+  if (captureContent) {
+    const prompt: Record<string, unknown> = { messages: raw.messages };
+    if (system === "anthropic" && raw.system !== undefined) prompt.system = raw.system;
+    result.prompt = JSON.stringify(prompt);
+  }
+  return result;
 }
 
 function parseLLMResponse(system: LLMSystem, body: string, captureContent: boolean): LLMResponse {

@@ -1,6 +1,6 @@
 import { SpanStatusCode } from "@opentelemetry/api";
 import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider, type ReadableSpan } from "@opentelemetry/sdk-trace";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createWrappedLLMFetch, detectLLMSystem } from "../src/llm.js";
 
 function harness(captureContent: boolean, implementation: typeof fetch) {
@@ -52,6 +52,38 @@ describe("LLM fetch instrumentation", () => {
     expect(attrs).not.toHaveProperty("gen_ai.prompt");
     expect(attrs).not.toHaveProperty("gen_ai.completion");
     await provider.shutdown();
+  });
+
+  it("does not serialize LLM messages when captureContent is false", async () => {
+    const requestPayload = JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "large sensitive prompt" }],
+      system: "secret system instructions",
+    });
+    const responsePayload = JSON.stringify({
+      model: "gpt-4o",
+      choices: [{ message: { content: "ok" } }],
+      usage: { prompt_tokens: 10, completion_tokens: 2 },
+    });
+    const { exporter, provider, wrapped } = harness(false, async () =>
+      new Response(responsePayload, { headers: { "content-type": "application/json" } }),
+    );
+
+    const stringifySpy = vi.spyOn(JSON, "stringify");
+    try {
+      const response = await wrapped("http://llm.test/v1/chat/completions", {
+        method: "POST",
+        body: requestPayload,
+      });
+      await response.text();
+      expect(stringifySpy).not.toHaveBeenCalled();
+      const attrs = onlySpan(exporter).attributes;
+      expect(attrs["gen_ai.request.model"]).toBe("gpt-4o");
+      expect(attrs).not.toHaveProperty("gen_ai.prompt");
+    } finally {
+      stringifySpy.mockRestore();
+      await provider.shutdown();
+    }
   });
 
   it.each([

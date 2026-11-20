@@ -7,6 +7,7 @@ export default defineConfig({
   // d.ts 由 oxc 按 isolatedDeclarations 生成：不依赖 TypeScript 的 JS API，TS 5/6/7 下产物一致；
   // 导出的类型必须显式标注，否则构建报错。
   dts: { generator: "oxc" },
+  shims: true,
   sourcemap: true,
   clean: true,
   // package.json 的 main/module/types/exports 指向 .js/.cjs/.d.ts，扩展名由 type: module 决定，不用 .mjs。

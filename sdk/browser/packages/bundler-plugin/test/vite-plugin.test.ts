@@ -73,7 +73,7 @@ describe("vite plugin", () => {
 
     it("with a DSN: the build fails with a clear message that names the release option", async () => {
       const root = await noGitRoot();
-      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@secret-token" });
+      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@los_secret-token" });
       expect(() => plugin.config({ root })).not.toThrow();
       expect(() => plugin.configResolved({ root, command: "build", build: { outDir: "dist" } })).toThrow(
         /unable to infer release.*set release explicitly/
@@ -82,14 +82,14 @@ describe("vite plugin", () => {
 
     it("with a DSN: serve does not fail, the release stays undefined", async () => {
       const root = await noGitRoot();
-      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@secret-token" });
+      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@los_secret-token" });
       expect(plugin.config({ root })).toEqual({ define: { __LAZY_OBSERVE_RELEASE__: "undefined" } });
       expect(() => plugin.configResolved({ root, command: "serve", build: { outDir: "dist" } })).not.toThrow();
     });
 
     it("with a DSN but upload: false: the build does not need a release", async () => {
       const root = await noGitRoot();
-      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@secret-token", upload: false });
+      const plugin = vite({ dsn: "http://127.0.0.1:1/p/default@los_secret-token", upload: false });
       expect(() => plugin.configResolved({ root, command: "build", build: { outDir: "dist" } })).not.toThrow();
     });
   });

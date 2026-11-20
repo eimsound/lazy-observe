@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { SpanContext } from "@opentelemetry/api";
+export {
+  estimateJsonBytes,
+  MAX_ERROR_EVENT_BYTES,
+  sanitizeErrorEvent,
+  sanitizeUrl,
+  trimErrorEventToBudget,
+  truncateText,
+} from "./sanitize.js";
 
 export interface StackFrame {
   function: string;
@@ -24,8 +32,6 @@ export interface ErrorEvent {
   contexts?: { trace?: { trace_id: string; span_id: string } };
   url?: string;
 }
-
-export const MAX_ERROR_EVENT_BYTES: number = 200 * 1024;
 
 const framePattern = /^\s*at\s+(?:(async)\s+)?(?:(.*?)\s+\()?((?:file:\/\/)?[^()]+?):(\d+)(?::(\d+))?\)?$/;
 
@@ -123,70 +129,4 @@ export function errorEvent(error: unknown, options: {
     ...(options.url ? { url: options.url } : {}),
     ...(sc?.traceId && sc.spanId ? { contexts: { trace: { trace_id: sc.traceId, span_id: sc.spanId } } } : {}),
   };
-}
-
-function truncateText(value: string, maxChars: number): string {
-  return value.length > maxChars ? `${value.slice(0, maxChars)}...[truncated]` : value;
-}
-
-function jsonByteLength(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), "utf8");
-}
-
-export function trimErrorEventToBudget(
-  event: ErrorEvent,
-  maxBytes: number = MAX_ERROR_EVENT_BYTES,
-): ErrorEvent | undefined {
-  if (jsonByteLength(event) <= maxBytes) return event;
-  const trimmed: ErrorEvent = {
-    ...event,
-    exception: {
-      ...event.exception,
-      stacktrace: { frames: event.exception.stacktrace.frames.map((frame) => ({ ...frame })) },
-    },
-    ...(event.tags ? { tags: { ...event.tags } } : {}),
-  };
-
-  const fits = () => jsonByteLength(trimmed) <= maxBytes;
-
-  if (trimmed.tags) {
-    for (const [key, value] of Object.entries(trimmed.tags)) {
-      if (value.length > 4_096) trimmed.tags[key] = truncateText(value, 4_096);
-    }
-    if (fits()) return trimmed;
-  }
-
-  trimmed.message = truncateText(trimmed.message, 8_192);
-  trimmed.exception.value = truncateText(trimmed.exception.value, 8_192);
-  if (trimmed.url) trimmed.url = truncateText(trimmed.url, 2_048);
-  if (fits()) return trimmed;
-
-  if (trimmed.tags) {
-    for (const [key, value] of Object.entries(trimmed.tags)) {
-      if (value.length > 512) trimmed.tags[key] = truncateText(value, 512);
-    }
-    if (fits()) return trimmed;
-    delete trimmed.tags;
-    if (fits()) return trimmed;
-  }
-
-  if (trimmed.exception.stacktrace.frames.length > 50) {
-    trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-50);
-    if (fits()) return trimmed;
-  }
-
-  trimmed.message = truncateText(trimmed.message, 1_024);
-  trimmed.exception.value = truncateText(trimmed.exception.value, 1_024);
-  for (const frame of trimmed.exception.stacktrace.frames) {
-    frame.filename = truncateText(frame.filename, 512);
-    frame.function = truncateText(frame.function, 256);
-    if (frame.abs_path) frame.abs_path = truncateText(frame.abs_path, 512);
-  }
-  if (fits()) return trimmed;
-
-  trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-10);
-  if (fits()) return trimmed;
-
-  trimmed.exception.stacktrace.frames = [];
-  return fits() ? trimmed : undefined;
 }

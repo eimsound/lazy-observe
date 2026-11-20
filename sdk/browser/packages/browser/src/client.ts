@@ -1,7 +1,19 @@
 import { parseDsn } from "./dsn";
-import { DeliveryQueue } from "./delivery";
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  DeliveryQueue,
+  MAX_KEEPALIVE_BYTES,
+  type DeliveryCloseOptions,
+} from "./delivery";
 import { MinuteRateLimiter } from "./rate-limit";
 import { ReplayController, replayDefaults, replayRequestMethod } from "./replay";
+import {
+  estimateJsonBytes,
+  MAX_ERROR_EVENT_BYTES,
+  sanitizeErrorEvent,
+  sanitizeUrl,
+  trimErrorEventToBudget,
+} from "./sanitize";
 import { parseStack } from "./stack";
 import {
   createTraceContext,
@@ -20,19 +32,21 @@ import type {
   BrowserClient,
   BrowserConfig,
   CaptureOptions,
+  Dispose,
   ErrorEventPayload,
   StartSpanOptions,
   TraceTarget,
 } from "./types";
-import { eventId, formatNonError, getSessionId, normalizePage, randomHex, safeSessionStorage, sanitizeUrl } from "./utils";
+import { eventId, formatNonError, getSessionId, normalizePage, randomHex, safeSessionStorage } from "./utils";
 import { startVitals } from "./vitals";
+
+export { trimErrorEventToBudget };
 
 const XHR_URL = Symbol("lazy-observe:xhr-url");
 const XHR_METHOD = Symbol("lazy-observe:xhr-method");
 const XHR_DONE = Symbol("lazy-observe:xhr-done");
 const XHR_HAS_TRACEPARENT = Symbol("lazy-observe:xhr-has-traceparent");
 
-const MAX_ERROR_EVENT_BYTES = 200 * 1024;
 const DEFAULT_ERROR_QUEUE_CAPACITY = 100;
 const DEFAULT_TRACE_QUEUE_CAPACITY = 1_000;
 const DEFAULT_REPLAY_QUEUE_CAPACITY = 10;
@@ -56,6 +70,147 @@ function browserContext(): ErrorEventPayload["contexts"] {
   };
 }
 
+export function startErrorListeners(
+  target: Window,
+  onError: (event: ErrorEvent) => void,
+  onRejection: (event: PromiseRejectionEvent) => void,
+): Dispose {
+  let disposed = false;
+  target.addEventListener("error", onError);
+  target.addEventListener("unhandledrejection", onRejection);
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    target.removeEventListener("error", onError);
+    target.removeEventListener("unhandledrejection", onRejection);
+  };
+}
+
+export function startLifecycleListeners(
+  win: Window,
+  doc: Document | undefined,
+  onUnload: () => void,
+  onVisibilityChange: () => void,
+): Dispose {
+  let disposed = false;
+  win.addEventListener("pagehide", onUnload);
+  doc?.addEventListener("visibilitychange", onVisibilityChange);
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    win.removeEventListener("pagehide", onUnload);
+    doc?.removeEventListener("visibilitychange", onVisibilityChange);
+  };
+}
+
+export function startFetchPatch(
+  win: Window,
+  wrap: (baseFetch: typeof fetch) => typeof fetch,
+  nativeFetch: typeof fetch | undefined,
+): Dispose {
+  if (!nativeFetch) return () => {};
+  const previous = win.fetch;
+  const traced = wrap(nativeFetch);
+  let active = true;
+  const wrapped = ((input: RequestInfo | URL, init?: RequestInit) => (
+    active ? traced(input, init) : previous.call(win, input, init)
+  )) as typeof fetch;
+  win.fetch = wrapped;
+  return () => {
+    if (!active) return;
+    active = false;
+    if (win.fetch === wrapped) win.fetch = previous;
+  };
+}
+
+export function startXhrPatch(
+  allowlist: TraceTarget[],
+  traces: TraceWindow,
+  onSpan: (span: RecordedSpan) => void,
+  onHttp: (method: string, url: string, status: number, durationMs: number) => void,
+): Dispose {
+  if (typeof XMLHttpRequest === "undefined") return () => {};
+  const prototype = XMLHttpRequest.prototype as XMLHttpRequest & Record<symbol, unknown>;
+  const originalOpen = prototype.open;
+  const originalSend = prototype.send;
+  const originalSetRequestHeader = prototype.setRequestHeader;
+  let active = true;
+
+  const wrappedOpen = function(this: XMLHttpRequest, method: string, url: string | URL, ...rest: unknown[]) {
+    if (active) {
+      const xhr = this as unknown as Record<symbol, unknown>;
+      xhr[XHR_URL] = String(url);
+      xhr[XHR_METHOD] = method;
+      delete xhr[XHR_DONE];
+      delete xhr[XHR_HAS_TRACEPARENT];
+    }
+    return originalOpen.call(this, method, url, ...(rest as [boolean, string?, string?]));
+  } as typeof XMLHttpRequest.prototype.open;
+
+  const wrappedSetRequestHeader = function(this: XMLHttpRequest, name: string, value: string) {
+    if (active && String(name).toLowerCase() === "traceparent") {
+      (this as unknown as Record<symbol, unknown>)[XHR_HAS_TRACEPARENT] = true;
+    }
+    return originalSetRequestHeader.call(this, name, value);
+  };
+
+  const wrappedSend = function(this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
+    if (!active) return originalSend.call(this, body);
+    const xhr = this as unknown as XMLHttpRequest & Record<symbol, unknown>;
+    const url = String(xhr[XHR_URL] ?? "");
+    const method = String(xhr[XHR_METHOD] ?? "GET");
+    const started = monotonicNow();
+    let requestSpan: Omit<RecordedSpan, "endTimeUnixNano" | "status"> | undefined;
+    if (shouldTrace(url, allowlist) && !xhr[XHR_HAS_TRACEPARENT]) {
+      const parent = traces.current();
+      const context = createTraceContext(parent);
+      try {
+        originalSetRequestHeader.call(this, "traceparent", traceparent(context));
+        xhr[XHR_HAS_TRACEPARENT] = true;
+        requestSpan = {
+          context,
+          parentSpanId: parent?.span_id,
+          name: `${method.toUpperCase()} ${requestPath(url)}`,
+          kind: 3,
+          startTimeUnixNano: unixNanoNow(),
+          attributes: { "http.request.method": method.toUpperCase(), "url.path": requestPath(url) },
+        };
+      } catch { /* request may already be sending */ }
+    }
+    const done = () => {
+      if (xhr[XHR_DONE]) return;
+      xhr[XHR_DONE] = true;
+      let status = 0;
+      try { status = this.status; } catch { /* network or aborted request */ }
+      if (requestSpan) {
+        onSpan({
+          ...requestSpan,
+          endTimeUnixNano: unixNanoAfter(requestSpan.startTimeUnixNano),
+          attributes: {
+            ...requestSpan.attributes,
+            ...(status > 0 ? { "http.response.status_code": status } : {}),
+          },
+          status: status === 0 || status >= 500 ? { code: 2 } : { code: 1 },
+        });
+      }
+      onHttp(method, url, status, monotonicNow() - started);
+    };
+    this.addEventListener("loadend", done, { once: true });
+    try { return originalSend.call(this, body); } catch (error) { done(); throw error; }
+  };
+
+  prototype.open = wrappedOpen;
+  prototype.setRequestHeader = wrappedSetRequestHeader;
+  prototype.send = wrappedSend;
+  return () => {
+    if (!active) return;
+    active = false;
+    if (prototype.open === wrappedOpen) prototype.open = originalOpen;
+    if (prototype.setRequestHeader === wrappedSetRequestHeader) prototype.setRequestHeader = originalSetRequestHeader;
+    if (prototype.send === wrappedSend) prototype.send = originalSend;
+  };
+}
+
 export class Client implements BrowserClient {
   readonly sessionId: string;
   private readonly transport: Transport;
@@ -67,13 +222,12 @@ export class Client implements BrowserClient {
   private readonly allowlist: TraceTarget[];
   private readonly serviceName: string;
   private readonly nativeFetch?: typeof fetch;
+  private readonly disposers: Dispose[] = [];
   private replay?: ReplayController;
   private droppedTelemetry = 0;
   private currentPage: string;
+  private started = false;
   private closed = false;
-  private restoreFetch?: () => void;
-  private restoreXhr?: () => void;
-  private disposeVitals?: () => void;
   private readonly onError = (event: ErrorEvent) => {
     if (event.error instanceof Error) {
       if (!event.error.stack && event.filename) {
@@ -103,7 +257,10 @@ export class Client implements BrowserClient {
     if (typeof document !== "undefined" && document.visibilityState === "hidden") void this.flush(true);
   };
 
-  constructor(private readonly config: BrowserConfig) {
+  constructor(
+    private readonly config: BrowserConfig,
+    private readonly onClose?: () => void,
+  ) {
     const dsn = parseDsn(config.dsn);
     this.nativeFetch = typeof window !== "undefined" && typeof window.fetch === "function" ? window.fetch.bind(window) : globalThis.fetch?.bind(globalThis);
     this.transport = new Transport(dsn, this.nativeFetch);
@@ -117,48 +274,65 @@ export class Client implements BrowserClient {
     const maxAttempts = delivery.maxAttempts ?? DEFAULT_DELIVERY_MAX_ATTEMPTS;
     const retryInitialMs = delivery.retryInitialMs ?? DEFAULT_DELIVERY_RETRY_INITIAL_MS;
     const retryMaxMs = delivery.retryMaxMs ?? DEFAULT_DELIVERY_RETRY_MAX_MS;
-    this.diagnosticDelivery = new DeliveryQueue({
+    this.diagnosticDelivery = new DeliveryQueue<DiagnosticMeasurement>({
       capacity: delivery.diagnosticQueueCapacity ?? DEFAULT_DIAGNOSTIC_QUEUE_CAPACITY,
       batchSize: 20,
       flushIntervalMs: 100,
       maxAttempts,
       retryInitialMs,
       retryMaxMs,
-      send: (measurements, options) => this.transport.diagnostics(measurements, options.keepalive),
+      requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+      maxBatchBytes: MAX_KEEPALIVE_BYTES,
+      keepaliveMaxBatchBytes: MAX_KEEPALIVE_BYTES,
+      batchOverheadBytes: 32,
+      estimateItemBytes: estimateJsonBytes,
+      send: (measurements, options) => this.transport.diagnostics(measurements, options.keepalive, options.signal),
       onDrop: (drop) => this.recordTelemetryDrop("diagnostic", drop, false),
     });
-    this.errorDelivery = new DeliveryQueue({
+    this.errorDelivery = new DeliveryQueue<ErrorEventPayload>({
       capacity: delivery.errorQueueCapacity ?? DEFAULT_ERROR_QUEUE_CAPACITY,
       batchSize: config.errorBatchSize ?? 10,
       flushIntervalMs: config.errorFlushIntervalMs ?? 5_000,
       maxAttempts,
       retryInitialMs,
       retryMaxMs,
-      send: (events, options) => this.transport.errors(events, options.keepalive),
+      requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+      maxBatchBytes: MAX_ERROR_EVENT_BYTES,
+      keepaliveMaxBatchBytes: MAX_KEEPALIVE_BYTES,
+      batchOverheadBytes: 16,
+      estimateItemBytes: estimateJsonBytes,
+      send: (events, options) => this.transport.errors(events, options.keepalive, options.signal),
       onDrop: (drop) => this.recordTelemetryDrop("error", drop),
     });
-    this.traceDelivery = new DeliveryQueue({
+    this.traceDelivery = new DeliveryQueue<RecordedSpan>({
       capacity: delivery.traceQueueCapacity ?? DEFAULT_TRACE_QUEUE_CAPACITY,
       batchSize: 64,
       flushIntervalMs: config.errorFlushIntervalMs ?? 5_000,
       maxAttempts,
       retryInitialMs,
       retryMaxMs,
-      send: (spans, options) => this.transport.traces(this.serviceName, spans, options.keepalive),
+      requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+      maxBatchBytes: MAX_ERROR_EVENT_BYTES,
+      keepaliveMaxBatchBytes: MAX_KEEPALIVE_BYTES,
+      batchOverheadBytes: 256,
+      estimateItemBytes: estimateJsonBytes,
+      send: (spans, options) => this.transport.traces(this.serviceName, spans, options.keepalive, options.signal),
       onDrop: (drop) => this.recordTelemetryDrop("trace", drop),
     });
   }
 
   start(): this {
-    if (typeof window === "undefined") return this;
+    if (this.closed || this.started || typeof window === "undefined") return this;
+    this.started = true;
     if (this.config.errors !== false) {
-      window.addEventListener("error", this.onError);
-      window.addEventListener("unhandledrejection", this.onRejection);
+      this.disposers.push(startErrorListeners(window, this.onError, this.onRejection));
     }
-    window.addEventListener("pagehide", this.onUnload);
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", this.onVisibilityChange);
-    }
+    this.disposers.push(startLifecycleListeners(
+      window,
+      typeof document === "undefined" ? undefined : document,
+      this.onUnload,
+      this.onVisibilityChange,
+    ));
     if (this.config.replay !== false) {
       this.replay = new ReplayController(
         replayDefaults(typeof this.config.replay === "object" ? this.config.replay : {}),
@@ -173,19 +347,27 @@ export class Client implements BrowserClient {
           onDrop: (drop) => this.recordTelemetryDrop("replay", drop),
         },
       );
-      void this.replay.start().catch(() => { this.replay = undefined; });
+      void this.replay.start();
     }
     if (this.config.vitals !== false) {
-      this.disposeVitals = startVitals(
+      this.disposers.push(startVitals(
         this.transport,
         () => this.currentPage,
         (sample) => this.replay?.vital(sample),
         (error) => this.recordVitalsFailure(error),
-      );
+      ));
     }
     if (this.config.fetchTracing !== false) {
       const autoPatch = typeof this.config.fetchTracing !== "object" || this.config.fetchTracing.autoPatch !== false;
-      if (autoPatch) { this.patchFetch(); this.patchXhr(); }
+      if (autoPatch) {
+        this.disposers.push(startFetchPatch(window, (base) => this.wrapFetch(base), this.nativeFetch));
+        this.disposers.push(startXhrPatch(
+          this.allowlist,
+          this.traces,
+          (span) => this.recordSpan(span),
+          (method, url, status, durationMs) => this.replay?.http(method, url, status, durationMs),
+        ));
+      }
     }
     return this;
   }
@@ -237,12 +419,12 @@ export class Client implements BrowserClient {
       try { const changed = this.config.beforeSend(payload); if (!changed) return undefined; payload = changed; }
       catch { return undefined; }
     }
-    const trimmed = trimErrorEventToBudget(payload, MAX_ERROR_EVENT_BYTES);
-    if (!trimmed) {
+    const sanitized = sanitizeErrorEvent(payload, MAX_ERROR_EVENT_BYTES);
+    if (!sanitized) {
       this.recordTelemetryDrop("error", { reason: "server_rejected", count: 1 });
       return undefined;
     }
-    payload = trimmed;
+    payload = sanitized;
     this.errorDelivery.enqueue(payload);
     this.replay?.error(payload);
     return payload.event_id;
@@ -305,104 +487,6 @@ export class Client implements BrowserClient {
     }) as typeof fetch;
   }
 
-  private patchFetch(): void {
-    if (!this.nativeFetch) return;
-    const previous = window.fetch;
-    const traced = this.wrapFetch(this.nativeFetch);
-    let active = true;
-    const wrapped = ((input: RequestInfo | URL, init?: RequestInit) => (
-      active ? traced(input, init) : previous.call(window, input, init)
-    )) as typeof fetch;
-    window.fetch = wrapped;
-    this.restoreFetch = () => {
-      active = false;
-      if (window.fetch === wrapped) window.fetch = previous;
-    };
-  }
-
-  private patchXhr(): void {
-    if (typeof XMLHttpRequest === "undefined") return;
-    const prototype = XMLHttpRequest.prototype as XMLHttpRequest & Record<symbol, unknown>;
-    const originalOpen = prototype.open;
-    const originalSend = prototype.send;
-    const originalSetRequestHeader = prototype.setRequestHeader;
-    const client = this;
-    let active = true;
-
-    const wrappedOpen = function(this: XMLHttpRequest, method: string, url: string | URL, ...rest: unknown[]) {
-      if (active) {
-        const xhr = this as unknown as Record<symbol, unknown>;
-        xhr[XHR_URL] = String(url);
-        xhr[XHR_METHOD] = method;
-        delete xhr[XHR_DONE];
-        delete xhr[XHR_HAS_TRACEPARENT];
-      }
-      return originalOpen.call(this, method, url, ...(rest as [boolean, string?, string?]));
-    } as typeof XMLHttpRequest.prototype.open;
-
-    const wrappedSetRequestHeader = function(this: XMLHttpRequest, name: string, value: string) {
-      if (active && String(name).toLowerCase() === "traceparent") {
-        (this as unknown as Record<symbol, unknown>)[XHR_HAS_TRACEPARENT] = true;
-      }
-      return originalSetRequestHeader.call(this, name, value);
-    };
-
-    const wrappedSend = function(this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
-      if (!active) return originalSend.call(this, body);
-      const xhr = this as unknown as XMLHttpRequest & Record<symbol, unknown>;
-      const url = String(xhr[XHR_URL] ?? "");
-      const method = String(xhr[XHR_METHOD] ?? "GET");
-      const started = monotonicNow();
-      let requestSpan: Omit<RecordedSpan, "endTimeUnixNano" | "status"> | undefined;
-      if (shouldTrace(url, client.allowlist) && !xhr[XHR_HAS_TRACEPARENT]) {
-        const parent = client.traces.current();
-        const context = createTraceContext(parent);
-        try {
-          originalSetRequestHeader.call(this, "traceparent", traceparent(context));
-          xhr[XHR_HAS_TRACEPARENT] = true;
-          requestSpan = {
-            context,
-            parentSpanId: parent?.span_id,
-            name: `${method.toUpperCase()} ${requestPath(url)}`,
-            kind: 3,
-            startTimeUnixNano: unixNanoNow(),
-            attributes: { "http.request.method": method.toUpperCase(), "url.path": requestPath(url) },
-          };
-        } catch { /* request may already be sending */ }
-      }
-      const done = () => {
-        if (xhr[XHR_DONE]) return;
-        xhr[XHR_DONE] = true;
-        let status = 0;
-        try { status = this.status; } catch { /* network or aborted request */ }
-        if (requestSpan) {
-          client.recordSpan({
-            ...requestSpan,
-            endTimeUnixNano: unixNanoAfter(requestSpan.startTimeUnixNano),
-            attributes: {
-              ...requestSpan.attributes,
-              ...(status > 0 ? { "http.response.status_code": status } : {}),
-            },
-            status: status === 0 || status >= 500 ? { code: 2 } : { code: 1 },
-          });
-        }
-        client.replay?.http(method, url, status, monotonicNow() - started);
-      };
-      this.addEventListener("loadend", done, { once: true });
-      try { return originalSend.call(this, body); } catch (error) { done(); throw error; }
-    };
-
-    prototype.open = wrappedOpen;
-    prototype.setRequestHeader = wrappedSetRequestHeader;
-    prototype.send = wrappedSend;
-    this.restoreXhr = () => {
-      active = false;
-      if (prototype.open === wrappedOpen) prototype.open = originalOpen;
-      if (prototype.setRequestHeader === wrappedSetRequestHeader) prototype.setRequestHeader = originalSetRequestHeader;
-      if (prototype.send === wrappedSend) prototype.send = originalSend;
-    };
-  }
-
   setPage(page: string): void { this.currentPage = normalizePage(page); this.replay?.page(this.currentPage); }
 
   diagnostics(): { droppedTelemetry: number } {
@@ -418,26 +502,17 @@ export class Client implements BrowserClient {
     await this.diagnosticDelivery.flush(keepalive);
   }
 
-  async close(): Promise<void> {
+  async close(options?: DeliveryCloseOptions): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    if (typeof window !== "undefined") {
-      window.removeEventListener("error", this.onError);
-      window.removeEventListener("unhandledrejection", this.onRejection);
-      window.removeEventListener("pagehide", this.onUnload);
-    }
-    if (typeof document !== "undefined") {
-      document.removeEventListener("visibilitychange", this.onVisibilityChange);
-    }
-    this.disposeVitals?.();
-    this.disposeVitals = undefined;
-    this.restoreFetch?.(); this.restoreXhr?.();
+    this.onClose?.();
+    for (const dispose of this.disposers.splice(0).reverse()) dispose();
     await Promise.all([
-      this.errorDelivery.close(),
-      this.traceDelivery.close(),
-      this.replay?.close(),
+      this.errorDelivery.close(options),
+      this.traceDelivery.close(options),
+      this.replay?.close(options),
     ]);
-    await this.diagnosticDelivery.close();
+    await this.diagnosticDelivery.close(options);
   }
 
   private recordSpan(span: RecordedSpan): void {
@@ -502,69 +577,4 @@ function syntheticStack(
     ? (colno && colno > 0 ? `${filename}:${lineno}:${colno}` : `${filename}:${lineno}`)
     : `${filename}:0:0`;
   return `${name}: ${message}\n    at <anonymous> (${loc})`;
-}
-
-function jsonByteLength(value: unknown): number {
-  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
-}
-
-function truncateText(value: string, maxChars: number): string {
-  return value.length > maxChars ? `${value.slice(0, maxChars)}...[truncated]` : value;
-}
-
-export function trimErrorEventToBudget(
-  payload: ErrorEventPayload,
-  maxBytes: number = MAX_ERROR_EVENT_BYTES,
-): ErrorEventPayload | undefined {
-  if (jsonByteLength(payload) <= maxBytes) return payload;
-  const trimmed: ErrorEventPayload = {
-    ...payload,
-    exception: {
-      ...payload.exception,
-      stacktrace: { frames: payload.exception.stacktrace.frames.map((frame) => ({ ...frame })) },
-    },
-    ...(payload.tags ? { tags: { ...payload.tags } } : {}),
-  };
-
-  const fits = () => jsonByteLength(trimmed) <= maxBytes;
-
-  if (trimmed.tags) {
-    for (const [key, value] of Object.entries(trimmed.tags)) {
-      if (value.length > 4_096) trimmed.tags[key] = truncateText(value, 4_096);
-    }
-    if (fits()) return trimmed;
-  }
-
-  if (trimmed.message) trimmed.message = truncateText(trimmed.message, 8_192);
-  trimmed.exception.value = truncateText(trimmed.exception.value, 8_192);
-  if (trimmed.url) trimmed.url = truncateText(trimmed.url, 2_048);
-  if (fits()) return trimmed;
-
-  if (trimmed.tags) {
-    for (const [key, value] of Object.entries(trimmed.tags)) {
-      if (value.length > 512) trimmed.tags[key] = truncateText(value, 512);
-    }
-    if (fits()) return trimmed;
-    delete trimmed.tags;
-    if (fits()) return trimmed;
-  }
-
-  if (trimmed.exception.stacktrace.frames.length > 50) {
-    trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-50);
-    if (fits()) return trimmed;
-  }
-
-  trimmed.message = trimmed.message ? truncateText(trimmed.message, 1_024) : trimmed.message;
-  trimmed.exception.value = truncateText(trimmed.exception.value, 1_024);
-  for (const frame of trimmed.exception.stacktrace.frames) {
-    frame.filename = truncateText(frame.filename, 512);
-    frame.function = truncateText(frame.function, 256);
-  }
-  if (fits()) return trimmed;
-
-  trimmed.exception.stacktrace.frames = trimmed.exception.stacktrace.frames.slice(-10);
-  if (fits()) return trimmed;
-
-  trimmed.exception.stacktrace.frames = [];
-  return fits() ? trimmed : undefined;
 }

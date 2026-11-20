@@ -66,7 +66,7 @@ The module-level `captureException()` targets the latest initialized client. `be
 
 ## Telemetry drop diagnostics
 
-Errors, spans, replay segments, and drop diagnostics use bounded in-memory queues. Web Vitals bypass those queues and are posted once per metric. No ingest failure is thrown into the page: every drop increments `client.diagnostics().droppedTelemetry`, emits one local `console.warn`, and is reported to `/api/events/diagnostics`.
+Errors, spans, replay segments, and drop diagnostics use bounded, protocol-aware in-memory queues that drop permanent 4xx rejections immediately as `server_rejected`, retry `408`/`429`/`5xx` and transient failures with `Retry-After` or Full Jitter exponential backoff, enforce per-attempt timeouts, and split batches by byte budget (staying under the 64 KiB `keepalive` cap on page unload and aligning with the 200 KiB error-event limit). Error events also pass through the built-in `sanitize` pipeline before queuing to strip URL credentials, query strings, and fragments and cap oversized fields and stack frames. Web Vitals bypass those queues and are posted once per metric. No ingest failure is thrown into the page: every drop increments `client.diagnostics().droppedTelemetry`, emits one local `console.warn`, and is reported to `/api/events/diagnostics`.
 
 | `reason` | Meaning |
 | --- | --- |
@@ -117,9 +117,11 @@ init({
 });
 ```
 
-`onErrorOnly: true` sets normal sampling to zero while preserving error look-back. `replay: false` disables recording. rrweb masks all inputs and blocks `[data-lo-block]` by default; a custom `blockSelector` replaces that selector. Replay loads rrweb asynchronously and uses gzip when `CompressionStream` is available.
+`onErrorOnly: true` sets normal sampling to zero while preserving error look-back. `replay: false` disables recording. `rrweb` is an optional peer dependency of `@lazy-observe/browser`: install `rrweb` when Session Replay is enabled; if it is absent, replay logs one warning and degrades silently without disrupting error or trace collection. rrweb masks all inputs and blocks `[data-lo-block]` by default; a custom `blockSelector` replaces that selector. Replay loads rrweb asynchronously and uses gzip when `CompressionStream` is available.
 
 ## React
+
+`@lazy-observe/react` declares `@lazy-observe/browser` and `react` as peer dependencies so applications control a single shared browser SDK instance.
 
 ```tsx
 import { ErrorBoundary, useRouteTracking } from "@lazy-observe/react";
@@ -140,7 +142,7 @@ Browser profiling and React `withProfiler` are not implemented.
 
 ## Source maps
 
-Uploading source maps needs a **source map upload token** (`los_…`), not the project API token that browsers use. The project API token is public (it ships in your pages), so the upload endpoint rejects it with `403 source_map_upload_token_required`. An upload token can only upload source maps to its own project; it cannot ingest or read anything.
+Uploading source maps needs a **source map upload token** (`los_…`), not the project API token that browsers use. `@lazy-observe/bundler-plugin` validates the `los_` prefix locally before uploading (and rejects `lo_…` / `lou_…` tokens without echoing the token), while the upload endpoint also rejects project API tokens with `403 source_map_upload_token_required`. An upload token can only upload source maps to its own project; it cannot ingest or read anything.
 
 1. An admin (the global role that also manages project API tokens) opens **Settings → Projects → Manage tokens → Source map upload tokens**, creates a token and copies the DSN shown once (`<origin>/p/<project>@los_…`).
 2. Store that DSN in a CI secret (for example `LO_DSN`) and expose it only to the build job. Never put it in a page, a bundle or a committed file. Revoke the token from the same dialog if it leaks.

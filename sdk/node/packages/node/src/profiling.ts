@@ -252,7 +252,7 @@ async function upload(
     method: "POST",
     headers: { Authorization: `Bearer ${options.token}` },
     body: form,
-    signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+    signal,
   });
   if (!response.ok) {
     throw new TransportError(
@@ -331,6 +331,7 @@ export function startProfiling(
     maxAttempts: options.maxAttempts,
     retryInitialMs: options.retryInitialMs,
     retryMaxMs: options.retryMaxMs,
+    requestTimeoutMs: 15_000,
     send: async (profiles, signal) => {
       const profile = profiles[0];
       if (!profile) return;

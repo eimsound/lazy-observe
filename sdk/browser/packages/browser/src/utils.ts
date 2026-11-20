@@ -18,15 +18,7 @@ export function normalizePage(value: string): string {
   }
 }
 
-/** Strip credentials, query string and fragment so error URLs do not leak tokens or PII. */
-export function sanitizeUrl(value: string): string {
-  try {
-    const url = new URL(value, typeof location === "undefined" ? undefined : location.href);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return value.split(/[?#]/, 1)[0];
-  }
-}
+export { sanitizeUrl } from "./sanitize";
 
 export function safeJsonStringify(value: unknown, maxLength = 2_048): string {
   const seen = new WeakSet<object>();
