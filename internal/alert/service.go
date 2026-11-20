@@ -895,8 +895,11 @@ func (s *Service) PutProjectAlertConfig(
 	return cfg, nil
 }
 
-// HandleIssueChange injects a committed issue lifecycle event into the same
-// grouping, silence and notification engine used by platform-event alerts.
+// HandleIssueChange evaluates silence and inhibition policy for a committed
+// issue lifecycle event and durably enqueues matching platform notifications
+// into notification_outbox before returning nil. Returning only after the
+// outbox write commits eliminates the crash window where an in-memory GroupWait
+// timer could be lost after issue_lifecycle_events was marked dispatched.
 func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.IssueChange) error {
 	cfg, p, err := s.cachedPlatformConfig(ctx, change.ProjectID)
 	if err != nil {
@@ -908,13 +911,52 @@ func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.Issue
 	labels := platformLabels(p.Slug, change.Kind)
 	labels["level"] = change.Level
 	labels["issue_id"] = strconv.Itoa(change.IssueID)
-	s.engine.Add(ctx, p.Slug, change.Kind, Alert{Status: "firing", Labels: labels, Annotations: map[string]string{
-		"summary": change.Title,
-		"title":   change.Title,
-		"issue":   "/issues/" + strconv.Itoa(change.IssueID),
-		"link":    "/issues/" + strconv.Itoa(change.IssueID),
-	}, StartsAt: change.SeenAt, Transient: true})
-	return nil
+	alertItem := Alert{
+		Status: "firing",
+		Labels: labels,
+		Annotations: map[string]string{
+			"summary": change.Title,
+			"title":   change.Title,
+			"issue":   "/issues/" + strconv.Itoa(change.IssueID),
+			"link":    "/issues/" + strconv.Itoa(change.IssueID),
+		},
+		StartsAt:  change.SeenAt,
+		Transient: true,
+	}
+	alertItem.Fingerprint = Fingerprint(alertItem.Labels)
+	policy, err := s.store.AlertPolicySnapshot(ctx, change.ProjectID, s.now().UTC())
+	if err != nil {
+		return err
+	}
+	for _, silenceMatchers := range policy.Silences {
+		if MatchLabels(alertItem.Labels, mapsToMatchers(silenceMatchers)) {
+			return nil
+		}
+	}
+	if len(policy.InhibitionRules) > 0 && len(policy.FiringEvents) > 0 {
+		rules := make([]InhibitionRule, 0, len(policy.InhibitionRules))
+		for _, item := range policy.InhibitionRules {
+			rules = append(rules, InhibitionRule{
+				SourceMatchers: mapsToMatchers(item.SourceMatchers),
+				TargetMatchers: mapsToMatchers(item.TargetMatchers),
+				EqualLabels:    item.EqualLabels,
+			})
+		}
+		sources := make([]Alert, 0, len(policy.FiringEvents))
+		for _, event := range policy.FiringEvents {
+			sources = append(sources, Alert{Status: "firing", Labels: event.Labels, Fingerprint: event.Fingerprint})
+		}
+		if IsInhibited(alertItem, sources, rules) {
+			return nil
+		}
+	}
+	notification := Notification{
+		Project: p.Slug,
+		Rule:    change.Kind,
+		Status:  "firing",
+		Alerts:  []Alert{alertItem},
+	}
+	return s.notifyPlatformLifecycle(ctx, notification, change.LifecycleID)
 }
 
 // RecordErrorEvent uses a durable five-minute sliding window. A spike fires
@@ -1070,6 +1112,10 @@ func platformLabels(slug, kind string) map[string]string {
 }
 
 func (s *Service) notifyPlatform(ctx context.Context, n Notification) error {
+	return s.notifyPlatformLifecycle(ctx, n, 0)
+}
+
+func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, lifecycleID int64) error {
 	cfg, _, err := s.store.ProjectAlertPolicyBySlug(ctx, n.Project)
 	if err != nil {
 		return err
@@ -1084,17 +1130,25 @@ func (s *Service) notifyPlatform(ctx context.Context, n Notification) error {
 	if marshalErr != nil {
 		return fmt.Errorf("encode platform notification: %w", marshalErr)
 	}
-	// Include rule, status, and repeat generation in the idempotency key so
-	// concurrent replicas deduplicate the same event while repeat deliveries
-	// and subsequent spike cycles are never permanently swallowed.
-	keyPayload := append(slices.Clone(payload), []byte(fmt.Sprintf("\x00platform\x00%s\x00%s", n.Rule, n.Status))...)
-	if n.Status == "firing" && s.repeatInterval > 0 && len(n.Alerts) > 0 && !n.Alerts[0].StartsAt.IsZero() {
-		elapsed := s.now().UTC().Sub(n.Alerts[0].StartsAt.UTC())
-		var generation int64
-		if elapsed > 0 {
-			generation = elapsed.Nanoseconds() / s.repeatInterval.Nanoseconds()
+	var keyPayload []byte
+	if lifecycleID > 0 {
+		// Pin durable issue_lifecycle_events deliveries to their committed row ID
+		// so retries after partial failure or worker restart deduplicate cleanly
+		// even if optional AI annotations arrive or time advances between attempts.
+		keyPayload = []byte(fmt.Sprintf("issue-lifecycle\x00%d\x00%s\x00%s", lifecycleID, n.Rule, n.Status))
+	} else {
+		// Include rule, status, and repeat generation in the idempotency key so
+		// concurrent replicas deduplicate the same event while repeat deliveries
+		// and subsequent spike cycles are never permanently swallowed.
+		keyPayload = append(slices.Clone(payload), []byte(fmt.Sprintf("\x00platform\x00%s\x00%s", n.Rule, n.Status))...)
+		if n.Status == "firing" && s.repeatInterval > 0 && len(n.Alerts) > 0 && !n.Alerts[0].StartsAt.IsZero() {
+			elapsed := s.now().UTC().Sub(n.Alerts[0].StartsAt.UTC())
+			var generation int64
+			if elapsed > 0 {
+				generation = elapsed.Nanoseconds() / s.repeatInterval.Nanoseconds()
+			}
+			keyPayload = append(keyPayload, []byte(fmt.Sprintf("\x00%d", generation))...)
 		}
-		keyPayload = append(keyPayload, []byte(fmt.Sprintf("\x00%d", generation))...)
 	}
 	var errs []error
 	for _, ch := range cfg.Channels {

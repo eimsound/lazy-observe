@@ -155,27 +155,76 @@ func (s *Store) ListSourceMapReleases(ctx context.Context, projectID, limit int)
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	rows, err := s.client.SourceMapArtifact.Query().Where(sourcemapartifact.ProjectIDEQ(projectID)).
-		Order(orderDesc(sourcemapartifact.FieldCreatedAt)).All(ctx)
+	rows, err := s.db.QueryContext(
+		ctx,
+		bind(
+			s.dialect,
+			`SELECT release, COUNT(*) AS files, COALESCE(SUM(size), 0) AS total_size, MAX(created_at) AS created_at
+			FROM source_map_artifacts
+			WHERE project_id = ?
+			GROUP BY release
+			ORDER BY MAX(created_at) DESC, release ASC
+			LIMIT ?`,
+		),
+		projectID,
+		limit,
+	)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	result := make([]SourceMapRelease, 0, limit)
-	byRelease := make(map[string]int)
-	for _, row := range rows {
-		i, ok := byRelease[row.Release]
-		if !ok {
-			if len(result) == limit {
-				continue
-			}
-			i = len(result)
-			byRelease[row.Release] = i
-			result = append(result, SourceMapRelease{Release: row.Release, CreatedAt: row.CreatedAt})
+	for rows.Next() {
+		var item SourceMapRelease
+		var rawCreatedAt any
+		if err := rows.Scan(&item.Release, &item.Files, &item.Size, &rawCreatedAt); err != nil {
+			return nil, fmt.Errorf("scan source map release: %w", err)
 		}
-		result[i].Files++
-		result[i].Size += row.Size
+		createdAt, err := parseAggregateTime(rawCreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse source map release created_at for %q: %w", item.Release, err)
+		}
+		item.CreatedAt = createdAt
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return result, nil
+}
+
+func parseAggregateTime(raw any) (time.Time, error) {
+	switch value := raw.(type) {
+	case time.Time:
+		return value.UTC(), nil
+	case string:
+		return parseAggregateTimeString(value)
+	case []byte:
+		return parseAggregateTimeString(string(value))
+	default:
+		return time.Time{}, fmt.Errorf("unsupported timestamp value type %T", raw)
+	}
+}
+
+func parseAggregateTimeString(text string) (time.Time, error) {
+	trimmed := strings.TrimSpace(text)
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999 +0000 UTC",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05 +0000 UTC",
+		"2006-01-02 15:04:05",
+	} {
+		if parsed, err := time.Parse(layout, trimmed); err == nil {
+			return parsed.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized timestamp %q", text)
 }
 
 func (s *Store) DeleteSourceMapArtifacts(ctx context.Context, projectID int, release string) error {

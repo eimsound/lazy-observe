@@ -3,13 +3,16 @@ package meta
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
-	dbent "github.com/eimsound/lazy-observe/internal/db/ent"
 	"math"
 	"math/bits"
+	"sort"
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
+	dbent "github.com/eimsound/lazy-observe/internal/db/ent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 )
@@ -49,11 +52,13 @@ func (s *Store) ApplyIssueDeltas(
 	ctx context.Context,
 	deltas []errortrack.IssueDelta,
 ) ([]errortrack.IssueChange, error) {
-	// SQLite remains serialized inside one process. PostgreSQL correctness does
-	// not depend on this mutex: each existing fingerprint row is locked below,
-	// and count is updated as count + delta in the database.
-	s.issueMu.Lock()
-	defer s.issueMu.Unlock()
+	// SQLite remains serialized inside one process. PostgreSQL uses row-level
+	// FOR UPDATE locks in deterministic (project_id, fingerprint) order, so
+	// avoiding the process-wide mutex allows concurrent writes across issues.
+	if s.dialect != dialect.Postgres {
+		s.issueMu.Lock()
+		defer s.issueMu.Unlock()
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -74,8 +79,18 @@ func (s *Store) applyIssueDeltasTx(
 	tx *sql.Tx,
 	deltas []errortrack.IssueDelta,
 ) ([]errortrack.IssueChange, error) {
+	ordered := deltas
+	if len(deltas) > 1 {
+		ordered = append([]errortrack.IssueDelta(nil), deltas...)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			if ordered[i].ProjectID != ordered[j].ProjectID {
+				return ordered[i].ProjectID < ordered[j].ProjectID
+			}
+			return ordered[i].Fingerprint < ordered[j].Fingerprint
+		})
+	}
 	changes := make([]errortrack.IssueChange, 0)
-	for _, delta := range deltas {
+	for _, delta := range ordered {
 		if delta.AcceptedAt.IsZero() || delta.AppliedAt.IsZero() {
 			return nil, errors.New("issue delta acceptance and application times are required")
 		}
@@ -261,13 +276,15 @@ func (s *Store) SetIssueStatus(
 	if changedAt.IsZero() {
 		return IssueView{}, errors.New("issue status change time is required")
 	}
-	s.issueMu.Lock()
-	defer s.issueMu.Unlock()
+	if s.dialect != dialect.Postgres {
+		s.issueMu.Lock()
+		defer s.issueMu.Unlock()
+	}
 	result, err := s.db.ExecContext(
 		ctx,
 		bind(s.dialect, `UPDATE issues SET status = ?, status_changed_at = ? WHERE project_id = ? AND id = ?`),
 		status,
-		changedAt,
+		changedAt.UTC(),
 		projectID,
 		id,
 	)
@@ -312,12 +329,14 @@ func (s *Store) SetIssuesStatus(
 	if changedAt.IsZero() {
 		return 0, errors.New("issue status change time is required")
 	}
-	s.issueMu.Lock()
-	defer s.issueMu.Unlock()
+	if s.dialect != dialect.Postgres {
+		s.issueMu.Lock()
+		defer s.issueMu.Unlock()
+	}
 	return s.client.Issue.Update().
 		Where(issue.ProjectIDEQ(projectID), issue.IDIn(validIDs...)).
 		SetStatus(issue.Status(status)).
-		SetStatusChangedAt(changedAt).
+		SetStatusChangedAt(changedAt.UTC()).
 		Save(ctx)
 }
 
@@ -327,16 +346,30 @@ func (s *Store) SaveIssueAnalysis(
 	analysis map[string]any,
 	at time.Time,
 ) (IssueView, error) {
-	s.issueMu.Lock()
-	defer s.issueMu.Unlock()
-	row, err := s.client.Issue.Query().Where(issue.IDEQ(id), issue.ProjectIDEQ(projectID)).Only(ctx)
+	payload, err := json.Marshal(analysis)
 	if err != nil {
 		return IssueView{}, err
 	}
-	if row.AiAnalysisAt != nil && row.AiAnalysisAt.After(at) {
-		return issueView(row), nil
+	at = at.UTC()
+	if s.dialect != dialect.Postgres {
+		s.issueMu.Lock()
+		defer s.issueMu.Unlock()
 	}
-	row, err = row.Update().SetAiAnalysis(analysis).SetAiAnalysisAt(at).Save(ctx)
+	// Perform the freshness guard atomically in SQL so concurrent goroutines
+	// and HA replicas on PostgreSQL cannot overwrite a newer analysis.
+	if _, err := s.db.ExecContext(
+		ctx,
+		bind(s.dialect, `UPDATE issues SET ai_analysis = ?, ai_analysis_at = ?
+			WHERE project_id = ? AND id = ? AND (ai_analysis_at IS NULL OR ai_analysis_at <= ?)`),
+		string(payload),
+		at,
+		projectID,
+		id,
+		at,
+	); err != nil {
+		return IssueView{}, err
+	}
+	row, err := s.client.Issue.Query().Where(issue.IDEQ(id), issue.ProjectIDEQ(projectID)).Only(ctx)
 	if err != nil {
 		return IssueView{}, err
 	}

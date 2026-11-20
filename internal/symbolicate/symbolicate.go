@@ -13,6 +13,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
@@ -26,6 +27,7 @@ const (
 	// source maps so large bundles cannot OOM the gateway process.
 	DefaultMaxCacheBytes int64 = 64 << 20
 
+	defaultLoadTimeout    = 15 * time.Second
 	estimatedMappingBytes = 24
 	sha256DigestBytes     = 32
 )
@@ -36,13 +38,21 @@ type cacheEntry struct {
 	mapConsumer *gosourcemap.Consumer
 }
 
+type inflightLoad struct {
+	done     chan struct{}
+	consumer *gosourcemap.Consumer
+	err      error
+}
+
 type Engine struct {
 	blobs        blob.Store
 	max          int
 	maxBytes     int64
+	loadTimeout  time.Duration
 	mu           sync.Mutex
 	lru          *list.List
 	items        map[string]*list.Element
+	inflight     map[string]*inflightLoad
 	currentBytes int64
 	hits         uint64
 }
@@ -59,12 +69,18 @@ func NewWithLimits(blobs blob.Store, maxEntries int, maxBytes int64) *Engine {
 		maxBytes = DefaultMaxCacheBytes
 	}
 	return &Engine{
-		blobs:    blobs,
-		max:      maxEntries,
-		maxBytes: maxBytes,
-		lru:      list.New(),
-		items:    make(map[string]*list.Element),
+		blobs:       blobs,
+		max:         maxEntries,
+		maxBytes:    maxBytes,
+		loadTimeout: defaultLoadTimeout,
+		lru:         list.New(),
+		items:       make(map[string]*list.Element),
+		inflight:    make(map[string]*inflightLoad),
 	}
+}
+
+func isSourceMapPlatform(platform string) bool {
+	return strings.EqualFold(platform, "javascript") || strings.EqualFold(platform, "node")
 }
 
 func (e *Engine) Symbolicate(
@@ -73,7 +89,7 @@ func (e *Engine) Symbolicate(
 	snapshotJSON json.RawMessage,
 	event errortrack.Event,
 ) (errortrack.Event, error) {
-	if e == nil || e.blobs == nil || !strings.EqualFold(event.Platform, "javascript") || event.Release == "" {
+	if e == nil || e.blobs == nil || !isSourceMapPlatform(event.Platform) || event.Release == "" {
 		return event, nil
 	}
 	var snapshot map[string]string
@@ -146,67 +162,136 @@ func (e *Engine) consumer(ctx context.Context, project, digest string) (*gosourc
 		e.mu.Unlock()
 		return consumer, nil
 	}
+	if call, ok := e.inflight[cacheKey]; ok {
+		done := call.done
+		e.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+			return call.consumer, call.err
+		}
+	}
+	call := &inflightLoad{done: make(chan struct{})}
+	e.inflight[cacheKey] = call
+	timeout := e.loadTimeout
+	if timeout <= 0 {
+		timeout = defaultLoadTimeout
+	}
 	e.mu.Unlock()
+
+	// Decouple blob fetch and parse from the leader's context cancellation so
+	// one canceled attempt cannot fail concurrent waiters sharing this load.
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	go e.runConsumerLoad(loadCtx, cancel, cacheKey, project, digest, call)
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-call.done:
+		return call.consumer, call.err
+	}
+}
+
+func (e *Engine) runConsumerLoad(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	cacheKey, project, digest string,
+	call *inflightLoad,
+) {
+	defer cancel()
+	completed := false
+	defer func() {
+		if r := recover(); r != nil {
+			e.mu.Lock()
+			call.consumer = nil
+			call.err = fmt.Errorf("%w: panic while loading source map: %v", ErrInvalidSourceMap, r)
+			if e.inflight[cacheKey] == call {
+				delete(e.inflight, cacheKey)
+			}
+			close(call.done)
+			e.mu.Unlock()
+			return
+		}
+		if !completed {
+			e.mu.Lock()
+			call.err = errors.New("source map load aborted")
+			if e.inflight[cacheKey] == call {
+				delete(e.inflight, cacheKey)
+			}
+			close(call.done)
+			e.mu.Unlock()
+		}
+	}()
+
+	consumer, entrySize, err := e.loadConsumer(ctx, project, digest)
+	e.mu.Lock()
+	call.consumer, call.err = consumer, err
+	if err == nil && consumer != nil && entrySize <= e.maxBytes {
+		if elem := e.items[cacheKey]; elem != nil {
+			call.consumer = elem.Value.(*cacheEntry).mapConsumer
+			e.lru.MoveToFront(elem)
+		} else {
+			e.items[cacheKey] = e.lru.PushFront(&cacheEntry{
+				key:         cacheKey,
+				sizeBytes:   entrySize,
+				mapConsumer: consumer,
+			})
+			e.currentBytes += entrySize
+			for e.lru.Len() > e.max || e.currentBytes > e.maxBytes {
+				last := e.lru.Back()
+				if last == nil {
+					break
+				}
+				evicted := last.Value.(*cacheEntry)
+				delete(e.items, evicted.key)
+				e.lru.Remove(last)
+				e.currentBytes -= evicted.sizeBytes
+			}
+		}
+	}
+	if e.inflight[cacheKey] == call {
+		delete(e.inflight, cacheKey)
+	}
+	completed = true
+	close(call.done)
+	e.mu.Unlock()
+}
+
+func (e *Engine) loadConsumer(ctx context.Context, project, digest string) (*gosourcemap.Consumer, int64, error) {
 	key := RevisionKey(project, digest)
 	r, err := e.blobs.Get(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	data, readErr := io.ReadAll(io.LimitReader(r, MaxSourceMapBytes+1))
 	closeErr := r.Close()
 	if readErr != nil {
-		return nil, readErr
+		return nil, 0, readErr
 	}
 	if closeErr != nil {
-		return nil, closeErr
+		return nil, 0, closeErr
 	}
 	if len(data) > MaxSourceMapBytes {
-		return nil, fmt.Errorf("%w: blob exceeds %d bytes", ErrInvalidSourceMap, MaxSourceMapBytes)
+		return nil, 0, fmt.Errorf("%w: blob exceeds %d bytes", ErrInvalidSourceMap, MaxSourceMapBytes)
 	}
 	normalized, segments, err := ValidateAndNormalize(data)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if segments == 0 {
 		// Valid v3 source map with empty mappings: nothing to resolve.
-		return nil, nil
+		return nil, 0, nil
 	}
 	consumer, err := safeParseSourceMap(key, normalized)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidSourceMap, err)
+		return nil, 0, fmt.Errorf("%w: %v", ErrInvalidSourceMap, err)
 	}
 	entrySize := int64(len(normalized)) + int64(segments)*estimatedMappingBytes
 	if entrySize <= 0 {
 		entrySize = 1
 	}
-	if entrySize > e.maxBytes {
-		// Still usable for this lookup, but skip caching to respect memory budget.
-		return consumer, nil
-	}
-	e.mu.Lock()
-	if elem := e.items[cacheKey]; elem != nil {
-		consumer = elem.Value.(*cacheEntry).mapConsumer
-		e.lru.MoveToFront(elem)
-	} else {
-		e.items[cacheKey] = e.lru.PushFront(&cacheEntry{
-			key:         cacheKey,
-			sizeBytes:   entrySize,
-			mapConsumer: consumer,
-		})
-		e.currentBytes += entrySize
-		for e.lru.Len() > e.max || e.currentBytes > e.maxBytes {
-			last := e.lru.Back()
-			if last == nil {
-				break
-			}
-			evicted := last.Value.(*cacheEntry)
-			delete(e.items, evicted.key)
-			e.lru.Remove(last)
-			e.currentBytes -= evicted.sizeBytes
-		}
-	}
-	e.mu.Unlock()
-	return consumer, nil
+	return consumer, entrySize, nil
 }
 
 func safeParseSourceMap(key string, data []byte) (consumer *gosourcemap.Consumer, err error) {

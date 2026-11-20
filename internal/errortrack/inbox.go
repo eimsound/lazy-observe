@@ -156,12 +156,13 @@ type LifecycleEvent struct {
 
 func (e LifecycleEvent) Change() IssueChange {
 	return IssueChange{
-		Kind:      e.Kind,
-		ProjectID: e.ProjectID,
-		IssueID:   e.IssueID,
-		Title:     e.Title,
-		Level:     e.Level,
-		SeenAt:    e.SeenAt,
+		LifecycleID: e.ID,
+		Kind:        e.Kind,
+		ProjectID:   e.ProjectID,
+		IssueID:     e.IssueID,
+		Title:       e.Title,
+		Level:       e.Level,
+		SeenAt:      e.SeenAt,
 	}
 }
 
@@ -618,6 +619,19 @@ func (i *Inbox) dispatchLifecycleEvents() {
 			if i.ctx.Err() != nil {
 				i.releaseRemainingLifecycle(events[idx:])
 				return
+			}
+			if !evt.ClaimUntil.IsZero() && !i.now().UTC().Before(evt.ClaimUntil) {
+				i.logger.Warn(
+					"skip issue lifecycle event after claim lease expired",
+					"lifecycle_id", evt.ID,
+					"issue_id", evt.IssueID,
+					"project_id", evt.ProjectID,
+					"kind", evt.Kind,
+					"owner", i.owner,
+					"claim_epoch", evt.ClaimEpoch,
+					"attempts", evt.Attempts,
+				)
+				continue
 			}
 			i.processLifecycleEvent(evt)
 		}

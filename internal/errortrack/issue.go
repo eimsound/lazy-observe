@@ -21,12 +21,13 @@ type IssueDelta struct {
 }
 
 type IssueChange struct {
-	Kind      string    `json:"kind"`
-	ProjectID int       `json:"project_id"`
-	IssueID   int       `json:"issue_id"`
-	Title     string    `json:"title"`
-	Level     string    `json:"level"`
-	SeenAt    time.Time `json:"seen_at"`
+	LifecycleID int64     `json:"lifecycle_id,omitempty"`
+	Kind        string    `json:"kind"`
+	ProjectID   int       `json:"project_id"`
+	IssueID     int       `json:"issue_id"`
+	Title       string    `json:"title"`
+	Level       string    `json:"level"`
+	SeenAt      time.Time `json:"seen_at"`
 }
 
 type IssueChangeFunc func(context.Context, IssueChange) error

@@ -6,11 +6,108 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"entgo.io/ent/dialect"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 )
+
+type inboxEventKey struct {
+	projectID int
+	eventID   string
+}
+
+type inboxQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+const inboxLookupChunkSize = 500
+
+func (s *Store) existingInboxDigests(
+	ctx context.Context,
+	querier inboxQuerier,
+	entries []errortrack.InboxEntry,
+) (map[inboxEventKey]string, error) {
+	byProject := make(map[int][]string)
+	for _, entry := range entries {
+		byProject[entry.ProjectID] = append(byProject[entry.ProjectID], entry.EventID)
+	}
+	existing := make(map[inboxEventKey]string)
+	for projectID, eventIDs := range byProject {
+		for start := 0; start < len(eventIDs); start += inboxLookupChunkSize {
+			end := min(start+inboxLookupChunkSize, len(eventIDs))
+			chunk := eventIDs[start:end]
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, projectID)
+			for _, eventID := range chunk {
+				args = append(args, eventID)
+			}
+			query := bind(
+				s.dialect,
+				`SELECT event_id, canonical_digest FROM telemetry_inbox WHERE project_id = ? AND event_id IN (`+
+					placeholders+`)`,
+			)
+			rows, err := querier.QueryContext(ctx, query, args...)
+			if err != nil {
+				return nil, fmt.Errorf("read accepted error events for project %d: %w", projectID, err)
+			}
+			for rows.Next() {
+				var eventID, digest string
+				if err := rows.Scan(&eventID, &digest); err != nil {
+					_ = rows.Close()
+					return nil, fmt.Errorf("scan accepted error event for project %d: %w", projectID, err)
+				}
+				existing[inboxEventKey{projectID: projectID, eventID: eventID}] = digest
+			}
+			if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+				return nil, fmt.Errorf("iterate accepted error events for project %d: %w", projectID, err)
+			}
+		}
+	}
+	return existing, nil
+}
+
+func filterPendingInboxEntries(
+	entries []errortrack.InboxEntry,
+	existing map[inboxEventKey]string,
+) ([]errortrack.InboxEntry, error) {
+	pending := make([]errortrack.InboxEntry, 0, len(entries))
+	for _, entry := range entries {
+		if digest, ok := existing[inboxEventKey{projectID: entry.ProjectID, eventID: entry.EventID}]; ok {
+			if digest != entry.CanonicalDigest {
+				return nil, fmt.Errorf(
+					"%w: project %d event %q",
+					errortrack.ErrConflict,
+					entry.ProjectID,
+					entry.EventID,
+				)
+			}
+			continue
+		}
+		pending = append(pending, entry)
+	}
+	return pending, nil
+}
+
+func exceedsInboxCapacity(
+	state errorInboxState,
+	entries []errortrack.InboxEntry,
+	capacity errortrack.InboxCapacity,
+) bool {
+	if int64(len(entries)) > capacity.MaxItems-state.activeItems {
+		return true
+	}
+	var newBytes int64
+	for _, entry := range entries {
+		if entry.PayloadBytes > capacity.MaxBytes || newBytes > capacity.MaxBytes-entry.PayloadBytes {
+			return true
+		}
+		newBytes += entry.PayloadBytes
+	}
+	return state.activeBytes > capacity.MaxBytes-newBytes
+}
 
 func (s *Store) AcceptErrorEvents(
 	ctx context.Context,
@@ -20,18 +117,14 @@ func (s *Store) AcceptErrorEvents(
 	if len(entries) == 0 || capacity.MaxItems <= 0 || capacity.MaxBytes <= 0 {
 		return fmt.Errorf("%w: error batch and capacity are required", errortrack.ErrInvalid)
 	}
-	type eventKey struct {
-		projectID int
-		eventID   string
-	}
-	seen := make(map[eventKey]string, len(entries))
+	seen := make(map[inboxEventKey]string, len(entries))
 	unique := make([]errortrack.InboxEntry, 0, len(entries))
 	for _, entry := range entries {
 		if entry.ProjectID <= 0 || entry.EventID == "" || entry.CanonicalDigest == "" || len(entry.Payload) == 0 ||
 			entry.PayloadBytes != int64(len(entry.Payload)) || entry.OccurredAt.IsZero() || entry.AcceptedAt.IsZero() {
 			return fmt.Errorf("%w: incomplete error Inbox entry", errortrack.ErrInvalid)
 		}
-		key := eventKey{projectID: entry.ProjectID, eventID: entry.EventID}
+		key := inboxEventKey{projectID: entry.ProjectID, eventID: entry.EventID}
 		if digest, ok := seen[key]; ok {
 			if digest != entry.CanonicalDigest {
 				return fmt.Errorf("%w: project %d event %q", errortrack.ErrConflict, entry.ProjectID, entry.EventID)
@@ -40,6 +133,20 @@ func (s *Store) AcceptErrorEvents(
 		}
 		seen[key] = entry.CanonicalDigest
 		unique = append(unique, entry)
+	}
+	// Perform idempotency lookup outside the telemetry_inbox_state exclusive lock
+	// so duplicate retries and conflicts never contend on the global state row
+	// and normal inserts do not hold the state lock across N lookup queries.
+	existing, err := s.existingInboxDigests(ctx, s.db, unique)
+	if err != nil {
+		return err
+	}
+	newEntries, err := filterPendingInboxEntries(unique, existing)
+	if err != nil {
+		return err
+	}
+	if len(newEntries) == 0 {
+		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -50,49 +157,44 @@ func (s *Store) AcceptErrorEvents(
 	if err != nil {
 		return fmt.Errorf("lock error Inbox capacity: %w", err)
 	}
-	newEntries := make([]errortrack.InboxEntry, 0, len(unique))
-	for _, entry := range unique {
-		var digest string
-		err := tx.QueryRowContext(
-			ctx,
-			bind(s.dialect, `SELECT canonical_digest FROM telemetry_inbox WHERE project_id = ? AND event_id = ?`),
-			entry.ProjectID,
-			entry.EventID,
-		).Scan(&digest)
-		if err == nil {
-			if digest != entry.CanonicalDigest {
-				return fmt.Errorf("%w: project %d event %q", errortrack.ErrConflict, entry.ProjectID, entry.EventID)
+	if exceedsInboxCapacity(state, newEntries, capacity) {
+		// Re-check under the state lock on the slow capacity-hit path so a
+		// concurrent duplicate or conflict is not misclassified as capacity full.
+		txExisting, lookupErr := s.existingInboxDigests(ctx, tx, newEntries)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		newEntries, lookupErr = filterPendingInboxEntries(newEntries, txExisting)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if len(newEntries) == 0 {
+			return tx.Commit()
+		}
+		if exceedsInboxCapacity(state, newEntries, capacity) {
+			if _, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox_state SET
+				rejections_total = rejections_total + 1, updated_at = ? WHERE id = 1`), unique[0].AcceptedAt.UTC()); err != nil {
+				return fmt.Errorf("record error Inbox capacity rejection: %w", err)
 			}
-			continue
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit error Inbox capacity rejection: %w", err)
+			}
+			return errortrack.ErrCapacity
 		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("read accepted error event %q: %w", entry.EventID, err)
-		}
-		newEntries = append(newEntries, entry)
-	}
-	var newBytes int64
-	capacityExceeded := int64(len(newEntries)) > capacity.MaxItems-state.activeItems
-	for _, entry := range newEntries {
-		if entry.PayloadBytes > capacity.MaxBytes || newBytes > capacity.MaxBytes-entry.PayloadBytes {
-			capacityExceeded = true
-			break
-		}
-		newBytes += entry.PayloadBytes
-	}
-	if state.activeBytes > capacity.MaxBytes-newBytes {
-		capacityExceeded = true
-	}
-	if capacityExceeded {
-		if _, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox_state SET
-			rejections_total = rejections_total + 1, updated_at = ? WHERE id = 1`), unique[0].AcceptedAt.UTC()); err != nil {
-			return fmt.Errorf("record error Inbox capacity rejection: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit error Inbox capacity rejection: %w", err)
-		}
-		return errortrack.ErrCapacity
 	}
 	snapshots := make(map[string]string)
+	var insertedCount int
+	var insertedBytes int64
+	insertQuery := bind(s.dialect, `INSERT INTO telemetry_inbox(
+		event_id, canonical_digest, payload, payload_bytes, occurred_at, accepted_at, source_map_snapshot,
+		status, available_at, claim_owner, claim_epoch, attempts, last_error, outcome, created_at, updated_at, project_id
+	) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0, 0, '', '', ?, ?, ?)
+	ON CONFLICT(project_id, event_id) DO NOTHING
+	RETURNING id`)
+	digestQuery := bind(
+		s.dialect,
+		`SELECT canonical_digest FROM telemetry_inbox WHERE project_id = ? AND event_id = ?`,
+	)
 	for _, entry := range newEntries {
 		snapshotKey := fmt.Sprintf("%d\x00%s", entry.ProjectID, entry.Release)
 		snapshot, ok := snapshots[snapshotKey]
@@ -104,15 +206,10 @@ func (s *Store) AcceptErrorEvents(
 			snapshot = string(snapshotJSON)
 			snapshots[snapshotKey] = snapshot
 		}
-		query := bind(s.dialect, `INSERT INTO telemetry_inbox(
-			event_id, canonical_digest, payload, payload_bytes, occurred_at, accepted_at, source_map_snapshot,
-			status, available_at, claim_owner, claim_epoch, attempts, last_error, outcome, created_at, updated_at, project_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0, 0, '', '', ?, ?, ?)
-		RETURNING id`)
 		var insertedID int64
-		if err := tx.QueryRowContext(
+		err := tx.QueryRowContext(
 			ctx,
-			query,
+			insertQuery,
 			entry.EventID,
 			entry.CanonicalDigest,
 			entry.Payload,
@@ -124,14 +221,28 @@ func (s *Store) AcceptErrorEvents(
 			entry.AcceptedAt.UTC(),
 			entry.AcceptedAt.UTC(),
 			entry.ProjectID,
-		).Scan(&insertedID); err != nil {
+		).Scan(&insertedID)
+		if errors.Is(err, sql.ErrNoRows) {
+			var digest string
+			if scanErr := tx.QueryRowContext(ctx, digestQuery, entry.ProjectID, entry.EventID).
+				Scan(&digest); scanErr != nil {
+				return fmt.Errorf("read concurrently accepted error event %q: %w", entry.EventID, scanErr)
+			}
+			if digest != entry.CanonicalDigest {
+				return fmt.Errorf("%w: project %d event %q", errortrack.ErrConflict, entry.ProjectID, entry.EventID)
+			}
+			continue
+		}
+		if err != nil {
 			return fmt.Errorf("accept error event %q: %w", entry.EventID, err)
 		}
+		insertedCount++
+		insertedBytes += entry.PayloadBytes
 	}
-	if len(newEntries) > 0 {
+	if insertedCount > 0 {
 		if _, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox_state SET
 			active_items = active_items + ?, active_bytes = active_bytes + ?, updated_at = ? WHERE id = 1`),
-			len(newEntries), newBytes, unique[0].AcceptedAt.UTC()); err != nil {
+			insertedCount, insertedBytes, unique[0].AcceptedAt.UTC()); err != nil {
 			return fmt.Errorf("reserve error Inbox capacity: %w", err)
 		}
 	}
@@ -340,8 +451,10 @@ func (s *Store) CompleteErrorEvent(
 		return nil, fmt.Errorf("%w: incomplete completion input", errortrack.ErrInvalid)
 	}
 	processedAt = processedAt.UTC()
-	s.issueMu.Lock()
-	defer s.issueMu.Unlock()
+	if s.dialect != dialect.Postgres {
+		s.issueMu.Lock()
+		defer s.issueMu.Unlock()
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin error Inbox completion: %w", err)

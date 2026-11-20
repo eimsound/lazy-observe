@@ -2308,3 +2308,113 @@ func TestBatchUpdateIssuesRejectsZeroIDAndListIssuesHandlesOverflowPage(t *testi
 		t.Fatalf("overflow page status=%d body=%s", resp.StatusCode, respBody)
 	}
 }
+
+func TestListIssuesDegradesGracefullyWhenVLogsTrendsTimeoutOrFail(t *testing.T) {
+	origTimeout := issueTrendTimeout
+	issueTrendTimeout = 60 * time.Millisecond
+	t.Cleanup(func() { issueTrendTimeout = origTimeout })
+
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{
+			name: "vlogs 503 error",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/select/logsql/stats_query_range" {
+					http.Error(w, "vlogs down", http.StatusServiceUnavailable)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			},
+		},
+		{
+			name: "vlogs timeout",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/select/logsql/stats_query_range" {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-time.After(2 * time.Second):
+						w.WriteHeader(http.StatusOK)
+						return
+					}
+				}
+				w.WriteHeader(http.StatusNoContent)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testStore(t)
+			ctx := context.Background()
+			p, err := store.CreateProject(ctx, "Degrade", "degrade")
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			if _, err := store.ApplyIssueDeltas(ctx, []errortrack.IssueDelta{{
+				ProjectID:   p.ID,
+				Fingerprint: "fp-degrade",
+				Title:       "DegradeErr: vlogs flaky",
+				Level:       "error",
+				Count:       5,
+				FirstSeen:   now,
+				LastSeen:    now,
+				LastEventID: "ev-degrade",
+				AcceptedAt:  now,
+				AppliedAt:   now,
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			cookie := sessionCookie(t, store, "degrade-admin", "password", "admin")
+			upstream := httptest.NewServer(tc.handler)
+			defer upstream.Close()
+			var logsBuf bytes.Buffer
+			gw := newMetadataTestGateway(store, Config{
+				Tokens: store,
+				Store:  store,
+				Logs:   upstream.URL,
+				Logger: slog.New(slog.NewTextHandler(&logsBuf, nil)),
+			})
+			t.Cleanup(func() { _ = gw.Shutdown() })
+
+			start := time.Now()
+			req := httptest.NewRequest(http.MethodGet, "/api/issues?sort=last_seen", nil)
+			req.Header.Set("X-LO-Project", p.Slug)
+			req.AddCookie(cookie)
+			resp, err := gw.App().Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			elapsed := time.Since(start)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d want=200 body=%s", resp.StatusCode, body)
+			}
+			if elapsed > time.Second {
+				t.Fatalf("listIssues took %s; expected independent short trend timeout", elapsed)
+			}
+			var decoded struct {
+				Issues []struct {
+					Title string  `json:"title"`
+					Count int64   `json:"count"`
+					Trend []int64 `json:"trend"`
+				} `json:"issues"`
+				Total int `json:"total"`
+			}
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("decode response: %v body=%s", err, body)
+			}
+			if decoded.Total != 1 || len(decoded.Issues) != 1 ||
+				decoded.Issues[0].Title != "DegradeErr: vlogs flaky" ||
+				decoded.Issues[0].Count != 5 ||
+				len(decoded.Issues[0].Trend) != issueTrendBuckets {
+				t.Fatalf("degraded list response=%#v", decoded)
+			}
+			if !strings.Contains(logsBuf.String(), "degrade issue list trends") {
+				t.Fatalf("expected structured warning log on trend degradation, got %q", logsBuf.String())
+			}
+		})
+	}
+}
