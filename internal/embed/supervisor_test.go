@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -402,4 +403,40 @@ func componentNamesFromPointers(defs []*component) []string {
 		names[i] = defs[i].name
 	}
 	return names
+}
+
+func TestReloadVMAgentReportsHTTPStatusErrors(t *testing.T) {
+	statusCode := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/-/reload" {
+			t.Errorf("unexpected reload request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(statusCode)
+		if statusCode != http.StatusOK {
+			_, _ = io.WriteString(w, "invalid scrape.yml")
+		}
+	}))
+	defer server.Close()
+
+	addr := strings.TrimPrefix(server.URL, "http://")
+	sup := &Supervisor{
+		components: []*component{
+			{
+				name:   "vmagent",
+				addr:   addr,
+				status: componentHealthy,
+				process: &managedProcess{
+					cmd:  &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}},
+					done: make(chan struct{}),
+				},
+			},
+		},
+	}
+	if err := sup.ReloadVMAgent(); err != nil {
+		t.Fatalf("expected HTTP 200 reload to succeed, got err=%v", err)
+	}
+	statusCode = http.StatusInternalServerError
+	if err := sup.ReloadVMAgent(); err == nil || !strings.Contains(err.Error(), "invalid scrape.yml") {
+		t.Fatalf("expected HTTP 500 reload error with body, got err=%v", err)
+	}
 }

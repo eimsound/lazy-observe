@@ -464,12 +464,27 @@ func (g *Gateway) isolatedMetricsStringList(
 	return response.Data, nil
 }
 
+var errQueryResponseTooLarge = errors.New("query response exceeded size limit")
+
 func (g *Gateway) isolatedQuery(
 	ctx context.Context,
 	project meta.ProjectInfo,
 	signal, path string,
 	query url.Values,
 ) ([]byte, error) {
+	return g.isolatedQueryWithLimit(ctx, project, signal, path, query, assistantMaxResponseBody)
+}
+
+func (g *Gateway) isolatedQueryWithLimit(
+	ctx context.Context,
+	project meta.ProjectInfo,
+	signal, path string,
+	query url.Values,
+	maxBytes int64,
+) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = assistantMaxResponseBody
+	}
 	query = cloneQueryValues(query)
 	var base string
 	switch signal {
@@ -509,13 +524,16 @@ func (g *Gateway) isolatedQuery(
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, assistantMaxResponseBody+1))
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, metricsBodyDrainLimit))
+		resp.Body.Close()
+	}()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > assistantMaxResponseBody {
-		return nil, errors.New("query response exceeded 8 MiB")
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("%w (%d MiB)", errQueryResponseTooLarge, maxBytes>>20)
 	}
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf(

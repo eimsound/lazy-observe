@@ -221,7 +221,11 @@ func InjectPromQL(query, project string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	var inspectErr error
 	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+		if inspectErr != nil {
+			return inspectErr
+		}
 		selector, ok := node.(*parser.VectorSelector)
 		if !ok {
 			return nil
@@ -231,15 +235,16 @@ func InjectPromQL(query, project string) (string, error) {
 				return nil
 			}
 		}
-		matcher, err := labels.NewMatcher(labels.MatchEqual, "project_id", project)
-		if err != nil {
-			return err
+		matcher, matcherErr := labels.NewMatcher(labels.MatchEqual, "project_id", project)
+		if matcherErr != nil {
+			inspectErr = matcherErr
+			return matcherErr
 		}
 		selector.LabelMatchers = append(selector.LabelMatchers, matcher)
 		return nil
 	})
-	if err != nil {
-		return "", err
+	if inspectErr != nil {
+		return "", inspectErr
 	}
 	return expr.String(), nil
 }
@@ -285,9 +290,24 @@ func seedBracedSelectors(query, project string) string {
 		if ch != '{' {
 			continue
 		}
-		j := i + 1
-		for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n' || query[j] == '\r') {
-			j++
+		j := skipPromQLSpace(query, i+1)
+		// Preserve Prometheus v3 UTF-8 quoted metric names at the first position
+		// inside `{...}` (for example `{"http.server.request.duration_count"}`),
+		// inserting `project_id=...` right after the quoted metric name.
+		if endMetric, isQuotedMetric := scanLeadingQuotedMetricName(query, j); isQuotedMetric {
+			out.WriteString(query[i+1 : endMetric])
+			next := skipPromQLSpace(query, endMetric)
+			if next < len(query) && query[next] == ',' {
+				out.WriteByte(',')
+				out.WriteString(trusted)
+				out.WriteByte(',')
+				i = next
+			} else {
+				out.WriteByte(',')
+				out.WriteString(trusted)
+				i = endMetric - 1
+			}
+			continue
 		}
 		out.WriteString(trusted)
 		if j >= len(query) || query[j] != '}' {
@@ -295,4 +315,43 @@ func seedBracedSelectors(query, project string) string {
 		}
 	}
 	return out.String()
+}
+
+func skipPromQLSpace(query string, pos int) int {
+	for pos < len(query) && (query[pos] == ' ' || query[pos] == '\t' || query[pos] == '\n' || query[pos] == '\r') {
+		pos++
+	}
+	return pos
+}
+
+// scanLeadingQuotedMetricName checks whether query[start:] begins with a
+// double-quoted UTF-8 metric name (not a quoted label matcher like `"a.b"="v"`).
+func scanLeadingQuotedMetricName(query string, start int) (int, bool) {
+	if start >= len(query) || query[start] != '"' {
+		return 0, false
+	}
+	escaped := false
+	end := -1
+	for k := start + 1; k < len(query); k++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if query[k] == '\\' {
+			escaped = true
+			continue
+		}
+		if query[k] == '"' {
+			end = k + 1
+			break
+		}
+	}
+	if end == -1 {
+		return 0, false
+	}
+	after := skipPromQLSpace(query, end)
+	if after < len(query) && (query[after] == '}' || query[after] == ',') {
+		return end, true
+	}
+	return 0, false
 }

@@ -261,3 +261,50 @@ func TestSetTenantHeadersRejectsNonPositiveProjectID(t *testing.T) {
 		}
 	}
 }
+
+func TestInjectPromQLPreservesUTF8QuotedMetricName(t *testing.T) {
+	if seeded := seedBracedSelectors(
+		`{"http.server.request.duration_count"}`,
+		"alpha",
+	); seeded != `{"http.server.request.duration_count",project_id="alpha"}` {
+		t.Fatalf("seedBracedSelectors placed matcher before quoted metric name: %q", seeded)
+	}
+	if seeded := seedBracedSelectors(
+		`{"http.server.request.duration_count", method="GET"}`,
+		"alpha",
+	); seeded != `{"http.server.request.duration_count",project_id="alpha", method="GET"}` {
+		t.Fatalf("seedBracedSelectors broke quoted metric name with matchers: %q", seeded)
+	}
+	queries := []string{
+		`{"http.server.request.duration_count"}`,
+		`{"http.server.request.duration_count", method="GET"}`,
+		`{"http.server.request.duration_count", project_id=~".*"}`,
+		`rate({"http.server.request.duration_bucket", "http.request.method"="POST"}[5m])`,
+		`{"label.name"="val"}`,
+	}
+	for _, q := range queries {
+		got, err := InjectPromQL(q, "alpha")
+		if err != nil {
+			t.Fatalf("InjectPromQL(%q) failed: %v", q, err)
+		}
+		expr, err := parser.NewParser(parser.Options{}).ParseExpr(got)
+		if err != nil {
+			t.Fatalf("re-parse %q (from %q): %v", got, q, err)
+		}
+		selectors := parser.ExtractSelectors(expr)
+		if len(selectors) == 0 {
+			t.Fatalf("no selectors in %q", got)
+		}
+		for _, matchers := range selectors {
+			found := false
+			for _, m := range matchers {
+				if m.Name == "project_id" && m.Type.String() == "=" && m.Value == "alpha" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("selector missing project_id=alpha in %q", got)
+			}
+		}
+	}
+}
