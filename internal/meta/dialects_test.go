@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -17,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres/v2"
 
 	"github.com/eimsound/lazy-observe/internal/embeddedpg"
 )
@@ -43,31 +42,18 @@ func TestMain(m *testing.M) {
 	}
 	port := uint32(listener.Addr().(*net.TCPAddr).Port)
 	_ = listener.Close()
-	// The downloaded archive goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
-	// CI can reuse it; runtime and data stay in the per-run temporary directory.
-	cachePath := embeddedpg.CachePath(filepath.Join(temp, "cache"))
-	// Prepare downloads with retries and a mandatory checksum; a failure here is final and
-	// never skips the PostgreSQL tests.
-	if err := embeddedpg.Prepare(embeddedpostgres.V18, cachePath); err != nil {
-		fmt.Fprintf(os.Stderr, "prepare embedded postgres archive: %v\n", err)
+	// The downloaded distribution goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
+	// CI can reuse it; the supervisor, runtime and data stay in the per-run temporary directory.
+	// A failure here is final and never skips the PostgreSQL tests.
+	config, err := embeddedpg.NewConfig(embeddedpg.CachePath(filepath.Join(temp, "cache")), temp)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "prepare embedded postgres: %v\n", err)
 		_ = os.RemoveAll(temp)
 		os.Exit(1)
 	}
-	config := embeddedpostgres.DefaultConfig().
-		Port(port).
-		CachePath(cachePath).
-		RuntimePath(filepath.Join(temp, "runtime")).
-		DataPath(filepath.Join(temp, "data")).
-		StartTimeout(2 * time.Minute).
-		Logger(io.Discard)
-	postgres := embeddedpostgres.NewDatabase(config)
+	postgres := embeddedpostgres.NewDatabase(config.Port(port))
 	if err := postgres.Start(); err != nil {
-		fmt.Fprintf(
-			os.Stderr,
-			"start embedded postgres: %v (%s)\n",
-			err,
-			embeddedpg.DownloadProbe(embeddedpostgres.V18),
-		)
+		fmt.Fprintf(os.Stderr, "start embedded postgres: %v\n", err)
 		_ = os.RemoveAll(temp)
 		os.Exit(1)
 	}

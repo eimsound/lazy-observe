@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres/v2"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -1241,22 +1241,15 @@ func startEmbeddedPostgresE2E(t *testing.T) string {
 	port := uint32(listener.Addr().(*net.TCPAddr).Port)
 	_ = listener.Close()
 	root := t.TempDir()
-	// The downloaded archive goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
-	// CI can reuse it; runtime and data stay in the per-run temporary directory.
-	cachePath := embeddedpg.CachePath(filepath.Join(root, "cache"))
-	if err := embeddedpg.Prepare(embeddedpostgres.V18, cachePath); err != nil {
-		t.Fatalf("prepare embedded postgres archive: %v", err)
+	// The downloaded distribution goes to LO_TEST_PG_CACHE when it is set so that repeated runs and
+	// CI can reuse it; the supervisor, runtime and data stay in the per-run temporary directory.
+	config, err := embeddedpg.NewConfig(embeddedpg.CachePath(filepath.Join(root, "cache")), root)
+	if err != nil {
+		t.Fatalf("prepare embedded postgres: %v", err)
 	}
-	config := embeddedpostgres.DefaultConfig().Port(port).
-		Database("lazy_observe_e2e").
-		CachePath(cachePath).
-		RuntimePath(filepath.Join(root, "runtime")).
-		DataPath(filepath.Join(root, "data")).
-		StartTimeout(2 * time.Minute).
-		Logger(io.Discard)
-	postgres := embeddedpostgres.NewDatabase(config)
+	postgres := embeddedpostgres.NewDatabase(config.Port(port).Database("lazy_observe_e2e"))
 	if err := postgres.Start(); err != nil {
-		t.Fatalf("start embedded postgres: %v (%s)", err, embeddedpg.DownloadProbe(embeddedpostgres.V18))
+		t.Fatalf("start embedded postgres: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := postgres.Stop(); err != nil {
