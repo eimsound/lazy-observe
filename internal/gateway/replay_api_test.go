@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,8 +14,10 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
@@ -357,4 +360,258 @@ func readBody(resp *http.Response) []byte {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return body
+}
+
+func TestReplayIdentityCompressionOverwriteProtectionAndTimestampClamp(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := userQueryToken(t, store, "replay-reader-2")
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	app := newMetadataTestGateway(store, Config{
+		Tokens:  store,
+		Store:   store,
+		Replays: store,
+		Blobs:   blobs,
+		Now:     func() time.Time { return fixedNow },
+	}).App()
+
+	// 1. Identity compression fallback must be accepted.
+	payload := []byte(
+		`[{"type":4,"data":{"href":"https://user:pass@example.test/pay?secret=1#frag"},"timestamp":` +
+			strconv.FormatInt(fixedNow.Add(-time.Minute).UnixMilli(), 10) + `}]`,
+	)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/replay/segments?session_id=id-sess&seq=0",
+		bytes.NewReader(payload),
+	)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-LO-Replay-Compression", "identity")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readBody(resp)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("identity upload status=%d want=202 body=%s", resp.StatusCode, body)
+	}
+
+	// 2. Overwriting existing (session_id, seq) with different payload must return 409.
+	tampered := []byte(`[{"type":3,"data":{"text":"tampered"},"timestamp":` +
+		strconv.FormatInt(fixedNow.UnixMilli(), 10) + `}]`)
+	req2 := httptest.NewRequest(
+		http.MethodPost,
+		"/api/replay/segments?session_id=id-sess&seq=0",
+		bytes.NewReader(tampered),
+	)
+	req2.Header.Set("Authorization", "Bearer "+token)
+	req2.Header.Set("X-LO-Replay-Compression", "identity")
+	resp2, err := app.Test(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2 := readBody(resp2)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("overwrite status=%d want=409 body=%s", resp2.StatusCode, body2)
+	}
+
+	// 3. Future / huge timestamps must be clamped to prevent retention escape.
+	futurePayload := []byte(
+		`[{"type":4,"data":{"href":"https://example.test/f"},"timestamp":253402214400000},{"type":3,"data":{},"timestamp":1e18}]`,
+	)
+	uploadReplay(t, app, token, "future-sess", 0, futurePayload, false, http.StatusAccepted)
+	project, err := store.ProjectBySlug(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := store.GetReplaySession(ctx, project.ID, "future-sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.LastSeenAt.After(fixedNow.Add(5 * time.Minute)) {
+		t.Fatalf("future timestamp escaped clamping: last_seen_at=%s now=%s", sess.LastSeenAt, fixedNow)
+	}
+
+	// 4. Query with non-UTC RFC3339 and verify page_url stripped query/fragment/userinfo.
+	listResp := replayRequest(
+		t,
+		app,
+		reader,
+		"default",
+		"/api/replay/sessions?start=2026-07-17T19:58:00%2B08:00&end=2026-07-17T20:01:00%2B08:00",
+	)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("non-UTC list status=%d body=%s", listResp.StatusCode, readBody(listResp))
+	}
+	var listing struct {
+		Sessions []replaySessionDTO `json:"sessions"`
+	}
+	decodeResponse(t, listResp, &listing)
+	foundID := false
+	for _, s := range listing.Sessions {
+		if s.SessionID == "id-sess" {
+			foundID = true
+			if s.PageURL != "https://example.test/pay" {
+				t.Fatalf("page_url=%q want=https://example.test/pay", s.PageURL)
+			}
+		}
+	}
+	if !foundID {
+		t.Fatalf("non-UTC list missed id-sess: %+v", listing.Sessions)
+	}
+
+	// 5. Huge page rejected with 400; long session_id rejected with 400; seq over quota rejected with 413.
+	badPage := replayRequest(t, app, reader, "default", "/api/replay/sessions?page=999999999999999")
+	if badPage.StatusCode != http.StatusBadRequest {
+		t.Fatalf("huge page status=%d want=400", badPage.StatusCode)
+	}
+	badPage.Body.Close()
+
+	longID := strings.Repeat("a", maxReplaySessionIDLen+1)
+	uploadReplay(t, app, token, longID, 0, []byte(`[]`), false, http.StatusBadRequest)
+	uploadReplay(
+		t,
+		app,
+		token,
+		"quota-sess",
+		maxReplaySegmentsPerSession,
+		[]byte(`[]`),
+		false,
+		http.StatusRequestEntityTooLarge,
+	)
+}
+
+type failingUpsertReplayStore struct {
+	ReplayStore
+	err error
+}
+
+func (s failingUpsertReplayStore) UpsertReplaySession(
+	context.Context, int, string, time.Time, time.Time, int, int64, bool, string, string,
+) error {
+	return s.err
+}
+
+func TestReplayFieldsSanitizationPersistedSummaryAndRollback(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := userQueryToken(t, store, "replay-san-reader")
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: blobs,
+		Now: func() time.Time { return fixedNow },
+	}).App()
+
+	// Segment 0 has a DOM snapshot with an unrelated href and a malformed event timestamp.
+	// It must not hijack page_url or cause detail read to 500.
+	seg0 := []byte(fmt.Sprintf(`[
+		{"type":2,"data":{"node":{"attributes":{"href":"javascript:evil"}}},"timestamp":%d},
+		{"type":5,"data":{"tag":"custom","payload":"not-an-object"},"timestamp":"bad-ts"}
+	]`, fixedNow.Add(-2*time.Minute).UnixMilli()))
+	uploadReplay(t, app, token, "san-sess", 0, seg0, false, http.StatusAccepted)
+
+	// Segment 1 backfills page_url (with UTF-8 multibyte chars > 2048 bytes) and release.
+	longPath := "/" + strings.Repeat("中", 900)
+	seg1 := []byte(fmt.Sprintf(`[
+		{"type":5,"data":{"tag":"lazy-observe:page","payload":{"page_url":"https://example.test%s?secret=1#frag","release":"rel-1.2\u0000"}},"timestamp":%d}
+	]`, longPath, fixedNow.Add(-time.Minute).UnixMilli()))
+	uploadReplay(t, app, token, "san-sess", 1, seg1, false, http.StatusAccepted)
+
+	project, err := store.ProjectBySlug(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := store.GetReplaySession(ctx, project.ID, "san-sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.PageURL == nil || strings.Contains(*row.PageURL, "javascript:") ||
+		strings.Contains(*row.PageURL, "secret=") || !utf8.ValidString(*row.PageURL) || len(*row.PageURL) > 2048 {
+		t.Fatalf("unexpected sanitized page_url=%v", row.PageURL)
+	}
+	if row.Release == nil || *row.Release != "rel-1.2" {
+		t.Fatalf("unexpected backfilled release=%v", row.Release)
+	}
+
+	// Corrupt the raw .json.gz for seq 0 while keeping .meta.json intact to verify
+	// getReplaySession serves from the persisted summary without decompressing raw blobs.
+	if err := blobs.Put(ctx, "replay/default/san-sess/0.json.gz", strings.NewReader("not-gzip")); err != nil {
+		t.Fatal(err)
+	}
+	detail := replayRequest(t, app, reader, "default", "/api/replay/sessions/san-sess")
+	if detail.StatusCode != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detail.StatusCode, readBody(detail))
+	}
+	var parsedDetail struct {
+		Segments []replaySegmentDTO `json:"segments"`
+	}
+	decodeResponse(t, detail, &parsedDetail)
+	if len(parsedDetail.Segments) != 2 {
+		t.Fatalf("segments=%d want=2", len(parsedDetail.Segments))
+	}
+
+	// Upsert failure must roll back new blobs and not leak internal error text.
+	failApp := newMetadataTestGateway(store, Config{
+		Tokens:  store,
+		Store:   store,
+		Replays: failingUpsertReplayStore{ReplayStore: store, err: errors.New("secret-db-dsn://internal")},
+		Blobs:   blobs,
+		Now:     func() time.Time { return fixedNow },
+	}).App()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/replay/segments?session_id=rollback-sess&seq=0",
+		bytes.NewReader([]byte(`[{"type":4,"data":{"href":"https://example.test/r"},"timestamp":1773720000000}]`)),
+	)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-LO-Replay-Compression", "identity")
+	failResp, err := failApp.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failBody := readBody(failResp)
+	if failResp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("upsert failure status=%d want=500", failResp.StatusCode)
+	}
+	if bytes.Contains(failBody, []byte("secret-db-dsn")) {
+		t.Fatalf("500 response leaked internal error: %s", failBody)
+	}
+	if _, err := blobs.Get(ctx, "replay/default/rollback-sess/0.json.gz"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("orphan segment blob was not rolled back: err=%v", err)
+	}
+	if _, err := blobs.Get(ctx, "replay/default/rollback-sess/0.meta.json"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("orphan summary blob was not rolled back: err=%v", err)
+	}
 }

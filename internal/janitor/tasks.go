@@ -174,26 +174,39 @@ func (c *Profiles) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 	if c.Metadata == nil || c.Blobs == nil {
 		return 0, nil
 	}
+	cutoff = cutoff.UTC().Round(0)
 	deleted := 0
+	failed := make(map[int]struct{})
+	var errs []error
 	for {
 		rows, err := c.Metadata.ListExpiredProfiles(ctx, cutoff, 100)
 		if err != nil {
-			return deleted, fmt.Errorf("list expired profiles: %w", err)
+			errs = append(errs, fmt.Errorf("list expired profiles: %w", err))
+			return deleted, errors.Join(errs...)
 		}
 		if len(rows) == 0 {
-			return deleted, nil
+			return deleted, errors.Join(errs...)
 		}
+		progressed := false
 		for _, row := range rows {
-			if err := c.Blobs.Delete(ctx, row.BlobKey); err != nil {
-				return deleted, fmt.Errorf("delete profile blob %d: %w", row.ID, err)
+			if _, skip := failed[row.ID]; skip {
+				continue
 			}
-			if err := c.Metadata.DeleteProfile(ctx, row.ID); err != nil {
-				return deleted, fmt.Errorf("delete profile metadata %d: %w", row.ID, err)
+			if err := c.Blobs.Delete(ctx, row.BlobKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				failed[row.ID] = struct{}{}
+				errs = append(errs, fmt.Errorf("delete profile blob %d: %w", row.ID, err))
+				continue
+			}
+			if err := c.Metadata.DeleteProfile(ctx, row.ID); err != nil && !meta.IsNotFound(err) {
+				failed[row.ID] = struct{}{}
+				errs = append(errs, fmt.Errorf("delete profile metadata %d: %w", row.ID, err))
+				continue
 			}
 			deleted++
+			progressed = true
 		}
-		if len(rows) < 100 {
-			return deleted, nil
+		if !progressed || len(rows) < 100 {
+			return deleted, errors.Join(errs...)
 		}
 	}
 }

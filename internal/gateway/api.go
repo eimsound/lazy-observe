@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/account"
 	"github.com/eimsound/lazy-observe/internal/alert"
+	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/gofiber/fiber/v3"
@@ -383,6 +385,24 @@ func (g *Gateway) deleteProject(c fiber.Ctx) error {
 	g.auditManagementFacts(c, facts)
 	if err != nil {
 		return managementAPIError(c, err)
+	}
+	if g.blobs != nil && facts.ProjectSlug != "" {
+		for _, prefix := range []string{
+			"profiles/" + safeProfileSegment(facts.ProjectSlug) + "/",
+			"replay/" + facts.ProjectSlug + "/",
+		} {
+			if err := g.blobs.DeletePrefix(c.Context(), prefix); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				g.logger.Warn(
+					"delete project blobs failed",
+					"project",
+					facts.ProjectSlug,
+					"prefix",
+					prefix,
+					"error",
+					err,
+				)
+			}
+		}
 	}
 	return c.SendStatus(fiber.StatusNoContent)
 }

@@ -6,6 +6,7 @@ package management
 import (
 	"context"
 	"errors"
+	"regexp"
 	"strings"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 )
 
 const minimumPasswordLength = 8
+
+var projectSlugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 
 type ErrorKind string
 
@@ -247,7 +250,7 @@ func (m *Manager) CreateProject(
 	facts := AuditFacts{
 		Action: "project.create", TargetType: "project", TargetName: input.Name, ProjectSlug: input.Slug,
 	}
-	if input.Name == "" || input.Slug == "" {
+	if input.Name == "" || !projectSlugPattern.MatchString(input.Slug) {
 		facts, err := failed(facts, ErrorInvalidInput, "bad request")
 		return ProjectView{}, facts, err
 	}

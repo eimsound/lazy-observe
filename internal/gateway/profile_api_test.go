@@ -5,8 +5,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,8 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
+	"github.com/eimsound/lazy-observe/internal/janitor"
+	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	pprofprofile "github.com/google/pprof/profile"
 )
@@ -426,4 +430,417 @@ func findFlameValue(node *flameNode, name string) int64 {
 		}
 	}
 	return 0
+}
+
+func TestProfileIngestRejectsDoubleGzipAndSkipsCorruptBlobs(t *testing.T) {
+	app, token, _, _ := profileTestApp(t)
+
+	inner := writeProfile(t, syntheticProfile(11, "main.busyLoop", "main.main"))
+	var doubleGzip bytes.Buffer
+	zw := gzip.NewWriter(&doubleGzip)
+	_, _ = zw.Write(inner)
+	_ = zw.Close()
+
+	resp := uploadProfileFixture(t, app, token, "svc", "cpu", doubleGzip.Bytes(), http.StatusUnprocessableEntity)
+	resp.Body.Close()
+}
+
+func TestProfileRawNonDefaultProjectAndContentType(t *testing.T) {
+	app, _, p2Token, store := profileTestApp(t)
+	reader := userQueryToken(t, store, "profile-reader")
+	data := writeProfile(t, syntheticProfile(42, "main.p2Work", "main.main"))
+
+	created := uploadProfileFixture(t, app, p2Token, "p2-svc", "cpu", data, http.StatusCreated)
+	rec := decodeProfileRecordContract(t, readBody(created))
+
+	// Default project must not see p2's raw profile.
+	crossResp := profileGET(t, app, reader, "default", "/api/profiles/"+strconvI(rec.ID)+"/raw")
+	if crossResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-project raw status=%d want=404", crossResp.StatusCode)
+	}
+	crossResp.Body.Close()
+
+	// Non-default project download must succeed with application/gzip and no Content-Encoding: gzip.
+	rawResp := profileGET(t, app, reader, "p2", "/api/profiles/"+strconvI(rec.ID)+"/raw")
+	if rawResp.StatusCode != http.StatusOK {
+		t.Fatalf("p2 raw status=%d body=%s", rawResp.StatusCode, readBody(rawResp))
+	}
+	if ct := rawResp.Header.Get("Content-Type"); ct != "application/gzip" {
+		t.Fatalf("Content-Type=%q want=application/gzip", ct)
+	}
+	if ce := rawResp.Header.Get("Content-Encoding"); ce != "" {
+		t.Fatalf("Content-Encoding=%q want empty", ce)
+	}
+	body := readBody(rawResp)
+	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+		t.Fatalf("raw response is not gzip bytes")
+	}
+}
+
+func TestProfileQueryNonUTCRFC3339(t *testing.T) {
+	app, token, _, store := profileTestApp(t)
+	reader := userQueryToken(t, store, "profile-reader")
+	data := writeProfile(t, syntheticProfile(15, "main.tzWork", "main.main"))
+	resp := uploadProfileFixture(t, app, token, "tz-svc", "cpu", data, http.StatusCreated)
+	resp.Body.Close()
+
+	// 2026-07-17T12:00:00Z == 2026-07-17T20:00:00+08:00
+	listResp := profileGET(
+		t,
+		app,
+		reader,
+		"default",
+		"/api/profiles?service=tz-svc&type=cpu&start=2026-07-17T19:59:55%2B08:00&end=2026-07-17T20:00:15%2B08:00",
+	)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", listResp.StatusCode, readBody(listResp))
+	}
+	var listing profileListResponse
+	decodeResponse(t, listResp, &listing)
+	if len(listing.Profiles) != 1 {
+		t.Fatalf("non-UTC profile list count=%d want=1", len(listing.Profiles))
+	}
+}
+
+func TestProfileCorruptAndMissingBlobsSkippedInFlamegraph(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := userQueryToken(t, store, "flame-skip-reader")
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs,
+	}).App()
+
+	good := writeProfile(t, syntheticProfile(19, "main.healthy", "main.main"))
+	uploadProfileFixture(t, app, token, "mixed", "cpu", good, http.StatusCreated).Body.Close()
+
+	project, err := store.ProjectBySlug(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseStart := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	// Inject one corrupt (double-gzipped) blob and one missing blob directly.
+	var doubleGz bytes.Buffer
+	zw := gzip.NewWriter(&doubleGz)
+	_, _ = zw.Write(good)
+	_ = zw.Close()
+	if err := blobs.Put(
+		ctx,
+		"profiles/default/mixed/cpu/corrupt.pb.gz",
+		bytes.NewReader(doubleGz.Bytes()),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateProfileMeta(
+		ctx, project.ID, "mixed", meta.ProfileTypeCPU,
+		baseStart, baseStart.Add(10*time.Second), int64(doubleGz.Len()),
+		strings.Repeat("c", 32), strings.Repeat("c", 64),
+		"profiles/default/mixed/cpu/corrupt.pb.gz", map[string]string{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateProfileMeta(
+		ctx, project.ID, "mixed", meta.ProfileTypeCPU,
+		baseStart, baseStart.Add(10*time.Second), 10,
+		strings.Repeat("d", 32), strings.Repeat("d", 64),
+		"profiles/default/mixed/cpu/missing.pb.gz", map[string]string{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	flame := profileGET(t, app, reader, "default", "/api/profiles/flamegraph?service=mixed&type=cpu")
+	if flame.StatusCode != http.StatusOK {
+		t.Fatalf("flame status=%d body=%s", flame.StatusCode, readBody(flame))
+	}
+	var tree flameNode
+	decodeResponse(t, flame, &tree)
+	if tree.Value != 19 || findFlameValue(&tree, "main.healthy") != 19 {
+		t.Fatalf("expected healthy profile value 19, got %+v", tree)
+	}
+}
+
+func TestProfileIngestFutureClampMetadataBoundsAndRateLimit(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs,
+		Now: func() time.Time { return fixedNow },
+	}).App()
+
+	data := writeProfile(t, syntheticProfile(7, "main.work", "main.main"))
+	postRaw := func(service, start, end, labels string) *http.Response {
+		t.Helper()
+		uploadID, _ := randomProfileID()
+		uploadID = strings.ReplaceAll(uploadID, "-", "")
+		var body bytes.Buffer
+		w := multipart.NewWriter(&body)
+		part, _ := w.CreateFormFile("profile", "profile.pb.gz")
+		_, _ = part.Write(data)
+		_ = w.WriteField("type", "cpu")
+		_ = w.WriteField("service", service)
+		_ = w.WriteField("start", start)
+		_ = w.WriteField("end", end)
+		if labels != "" {
+			_ = w.WriteField("labels", labels)
+		}
+		_ = w.WriteField("upload_id", uploadID)
+		_ = w.Close()
+		req := httptest.NewRequest(http.MethodPost, "/api/profiles", &body)
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// Future year 9999 must be clamped to fixedNow and cleaned by retention.
+	resp := postRaw("svc", "9999-01-01T00:00:00Z", "9999-01-01T00:01:00Z", `{"trace_id":"t1"}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("future profile status=%d body=%s", resp.StatusCode, readBody(resp))
+	}
+	rec := decodeProfileRecordContract(t, readBody(resp))
+	parsedEnd, _ := time.Parse(time.RFC3339Nano, rec.End)
+	if parsedEnd.After(fixedNow.Add(maxIngestClockSkew)) {
+		t.Fatalf("future profile end escaped clamp: %s", rec.End)
+	}
+	deleted, err := (&janitor.Profiles{Metadata: store, Blobs: blobs}).Clean(ctx, fixedNow.Add(8*24*time.Hour))
+	if err != nil || deleted != 1 {
+		t.Fatalf("clamped profile not cleaned by retention: deleted=%d err=%v", deleted, err)
+	}
+
+	// Oversized service name & oversized labels must be rejected with 400.
+	badSvc := postRaw(strings.Repeat("a", maxProfileServiceLen+1), "2026-07-17T11:59:00Z", "2026-07-17T11:59:10Z", "")
+	if badSvc.StatusCode != http.StatusBadRequest {
+		t.Fatalf("long service status=%d want=400", badSvc.StatusCode)
+	}
+	badSvc.Body.Close()
+
+	tooManyLabels := make(map[string]string)
+	for i := 0; i < maxProfileLabelsCount+1; i++ {
+		tooManyLabels["k"+strconvI(i)] = "v"
+	}
+	labelsJSON, _ := json.Marshal(tooManyLabels)
+	badLbl := postRaw("svc", "2026-07-17T11:59:00Z", "2026-07-17T11:59:10Z", string(labelsJSON))
+	if badLbl.StatusCode != http.StatusBadRequest {
+		t.Fatalf("too many labels status=%d want=400", badLbl.StatusCode)
+	}
+	badLbl.Body.Close()
+
+	// Rate limit enforced with 429 + Retry-After.
+	denyApp := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs,
+		Limits: fixedAllowLimiter{allowed: false},
+	}).App()
+	var rlBody bytes.Buffer
+	w := multipart.NewWriter(&rlBody)
+	part, _ := w.CreateFormFile("profile", "profile.pb.gz")
+	_, _ = part.Write(data)
+	_ = w.Close()
+	rlReq := httptest.NewRequest(http.MethodPost, "/api/profiles", &rlBody)
+	rlReq.Header.Set("Content-Type", w.FormDataContentType())
+	rlReq.Header.Set("Authorization", "Bearer "+token)
+	rlResp, err := denyApp.Test(rlReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rlResp.StatusCode != http.StatusTooManyRequests || rlResp.Header.Get("Retry-After") == "" {
+		t.Fatalf("rate limit status=%d retry=%q", rlResp.StatusCode, rlResp.Header.Get("Retry-After"))
+	}
+	rlResp.Body.Close()
+}
+
+type fixedAllowLimiter struct {
+	allowed bool
+	err     error
+}
+
+func (l fixedAllowLimiter) Allow(context.Context, string, int, time.Duration) (bool, error) {
+	return l.allowed, l.err
+}
+
+func TestProfileFlamegraphWindowBoundsHeterogeneousAndSnapshotAverage(t *testing.T) {
+	app, token, _, store := profileTestApp(t)
+	reader := userQueryToken(t, store, "flame-adv-reader")
+
+	// Window validation: single bound or span > 7 days rejected with 400.
+	halfWindow := profileGET(
+		t,
+		app,
+		reader,
+		"default",
+		"/api/profiles/flamegraph?service=svc&start=2026-07-17T00:00:00Z",
+	)
+	if halfWindow.StatusCode != http.StatusBadRequest {
+		t.Fatalf("half window status=%d want=400", halfWindow.StatusCode)
+	}
+	halfWindow.Body.Close()
+
+	hugeWindow := profileGET(
+		t,
+		app,
+		reader,
+		"default",
+		"/api/profiles/flamegraph?service=svc&start=2026-07-01T00:00:00Z&end=2026-07-20T00:00:00Z",
+	)
+	if hugeWindow.StatusCode != http.StatusBadRequest {
+		t.Fatalf("huge window status=%d want=400", hugeWindow.StatusCode)
+	}
+	hugeWindow.Body.Close()
+
+	// Heterogeneous SampleType CPU profiles must merge without 422.
+	p1 := syntheticProfile(10, "main.a", "main.main")
+	p2 := syntheticProfile(20, "main.b", "main.main")
+	p2.SampleType = []*pprofprofile.ValueType{{Type: "cpu", Unit: "nanoseconds"}}
+	p2.Sample[0].Value = []int64{20}
+	uploadProfileFixture(t, app, token, "hetero", "cpu", writeProfile(t, p1), http.StatusCreated).Body.Close()
+	uploadProfileFixture(t, app, token, "hetero", "cpu", writeProfile(t, p2), http.StatusCreated).Body.Close()
+
+	heteroResp := profileGET(t, app, reader, "default", "/api/profiles/flamegraph?service=hetero&type=cpu")
+	if heteroResp.StatusCode != http.StatusOK {
+		t.Fatalf("hetero flame status=%d body=%s", heteroResp.StatusCode, readBody(heteroResp))
+	}
+	var heteroTree flameNode
+	decodeResponse(t, heteroResp, &heteroTree)
+	if heteroTree.Value != 30 || heteroTree.Unit != "nanoseconds" {
+		t.Fatalf("hetero tree=%+v want value=30 unit=nanoseconds", heteroTree)
+	}
+
+	// Heap snapshot profiles must be averaged across snapshots instead of summed.
+	h1 := syntheticProfile(100, "main.alloc", "main.main")
+	h1.SampleType = []*pprofprofile.ValueType{{Type: "inuse_space", Unit: "bytes"}}
+	h1.Sample[0].Value = []int64{100}
+	h2 := syntheticProfile(200, "main.alloc", "main.main")
+	h2.SampleType = []*pprofprofile.ValueType{{Type: "inuse_space", Unit: "bytes"}}
+	h2.Sample[0].Value = []int64{200}
+	uploadProfileFixture(t, app, token, "heap-svc", "heap", writeProfile(t, h1), http.StatusCreated).Body.Close()
+	uploadProfileFixture(t, app, token, "heap-svc", "heap", writeProfile(t, h2), http.StatusCreated).Body.Close()
+
+	heapResp := profileGET(t, app, reader, "default", "/api/profiles/flamegraph?service=heap-svc&type=heap")
+	if heapResp.StatusCode != http.StatusOK {
+		t.Fatalf("heap flame status=%d body=%s", heapResp.StatusCode, readBody(heapResp))
+	}
+	var heapTree flameNode
+	decodeResponse(t, heapResp, &heapTree)
+	if heapTree.Value != 150 || heapTree.Unit != "bytes" {
+		t.Fatalf("heap snapshot tree=%+v want averaged value=150 unit=bytes", heapTree)
+	}
+
+	// Zero/negative samples ignored, int64 overflow clamped, and depth > 64 preserved.
+	deep := &pprofprofile.Profile{
+		SampleType: []*pprofprofile.ValueType{{Type: "cpu", Unit: "nanoseconds"}},
+	}
+	locs := make([]*pprofprofile.Location, 0, 80)
+	for i := 1; i <= 80; i++ {
+		fn := &pprofprofile.Function{ID: uint64(i), Name: "fn" + strconvI(i)}
+		loc := &pprofprofile.Location{ID: uint64(i), Line: []pprofprofile.Line{{Function: fn}}}
+		deep.Function = append(deep.Function, fn)
+		deep.Location = append(deep.Location, loc)
+		locs = append(locs, loc)
+	}
+	deep.Sample = []*pprofprofile.Sample{
+		{Location: locs, Value: []int64{-50}},
+		{Location: locs, Value: []int64{0}},
+		{Location: locs, Value: []int64{math.MaxInt64 - 5}},
+		{Location: locs, Value: []int64{100}},
+	}
+	deepTree := buildFlamegraph(deep, meta.ProfileTypeCPU, maxFlameDepth, maxFlameNodes)
+	if deepTree.Value != math.MaxInt64 {
+		t.Fatalf("overflow clamping failed: got %d", deepTree.Value)
+	}
+	if findFlameValue(deepTree, "fn1") != math.MaxInt64 {
+		t.Fatalf("depth 80 leaf frame was truncated")
+	}
+}
+
+func TestDeleteProjectCleansProfileAndReplayBlobs(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	); err != nil {
+		t.Fatal(err)
+	}
+	p, err := store.CreateProject(ctx, "Disposable", "disposable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blobs.Put(ctx, "profiles/disposable/svc/cpu/1.pb.gz", strings.NewReader("p")); err != nil {
+		t.Fatal(err)
+	}
+	if err := blobs.Put(ctx, "replay/disposable/sess/0.json.gz", strings.NewReader("r")); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := store.CreateUser(ctx, "profile-del-admin", "password", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, adminToken, err := store.CreateUserAPIToken(ctx, admin.ID, "admin-del")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Management: management.New(store), Profiles: store, Replays: store, Blobs: blobs,
+	}).App()
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/projects/"+strconvI(p.ID), nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete project status=%d body=%s", resp.StatusCode, readBody(resp))
+	}
+	resp.Body.Close()
+
+	if _, err := blobs.Get(ctx, "profiles/disposable/svc/cpu/1.pb.gz"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("profile blob still present after project delete: err=%v", err)
+	}
+	if _, err := blobs.Get(ctx, "replay/disposable/sess/0.json.gz"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("replay blob still present after project delete: err=%v", err)
+	}
 }

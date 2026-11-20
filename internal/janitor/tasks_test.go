@@ -88,6 +88,62 @@ func TestProfilesDeleteExpiredBlobAndMetadata(t *testing.T) {
 	}
 }
 
+type failingKeyBlobStore struct {
+	blob.Store
+	failKey string
+}
+
+func (f *failingKeyBlobStore) Delete(ctx context.Context, key string) error {
+	if key == f.failKey {
+		return errors.New("simulated delete failure")
+	}
+	return f.Store.Delete(ctx, key)
+}
+
+func TestProfilesCleanHandlesMissingBlobAndSingleRowError(t *testing.T) {
+	ctx := context.Background()
+	store, project := openTestStore(t)
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	localBlobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := now.Add(-8 * 24 * time.Hour)
+	for i, item := range []struct {
+		key      string
+		putBlob  bool
+		uploadID string
+	}{
+		{"profiles/default/svc/cpu/fail.pb.gz", true, strings.Repeat("1", 32)},
+		{"profiles/default/svc/cpu/missing.pb.gz", false, strings.Repeat("2", 32)},
+		{"profiles/default/svc/cpu/good.pb.gz", true, strings.Repeat("3", 32)},
+	} {
+		if item.putBlob {
+			if err := localBlobs.Put(ctx, item.key, strings.NewReader("data")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := store.CreateProfileMeta(
+			ctx, project.ID, "svc", meta.ProfileTypeCPU,
+			end.Add(-time.Duration(i+1)*time.Second), end, 4,
+			item.uploadID, strings.Repeat("a", 64), item.key, map[string]string{},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deleted, err := (&Profiles{
+		Metadata: store,
+		Blobs:    &failingKeyBlobStore{Store: localBlobs, failKey: "profiles/default/svc/cpu/fail.pb.gz"},
+	}).Clean(ctx, now.Add(-7*24*time.Hour))
+	if err == nil {
+		t.Fatal("expected error for failing blob")
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted=%d want=2 (missing + good)", deleted)
+	}
+}
+
 func revisionKey(digest string) string { return "sourcemaps/default/revisions/" + digest + ".map" }
 
 func digestOf(c byte) string { return strings.Repeat(string(c), 64) }
