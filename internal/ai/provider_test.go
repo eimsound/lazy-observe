@@ -464,3 +464,211 @@ func TestOllamaOmitsAuthorizationHeaderWhenKeyWhitespace(t *testing.T) {
 		t.Fatalf("unexpected Authorization header %q", authHeader)
 	}
 }
+
+func TestChatStreamAllowsLongRunningActiveStreamAndEnforcesIdleAndHeaderTimeouts(t *testing.T) {
+	// Active stream lasting longer than Timeout must succeed because chunks keep arriving.
+	activeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		for _, piece := range []string{"a", "b", "c", "d", "e"} {
+			_, _ = io.WriteString(
+				w,
+				"data: {\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"content\":\""+piece+"\"},\"finish_reason\":null}]}\n\n",
+			)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer activeServer.Close()
+
+	client, err := New(Config{
+		Provider:  "openai",
+		BaseURL:   activeServer.URL,
+		Model:     "gpt-test",
+		MaxTokens: 32,
+		Timeout:   70 * time.Millisecond,
+		Client:    activeServer.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := client.ChatStream(context.Background(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "stream"}},
+	})
+	if err != nil {
+		t.Fatalf("active long stream failed to open: %v", err)
+	}
+	var out strings.Builder
+	for stream.Next() {
+		out.WriteString(stream.Chunk().Content)
+	}
+	streamErr := stream.Err()
+	_ = stream.Close()
+	if streamErr != nil || out.String() != "abcde" {
+		t.Fatalf("active long stream got=%q err=%v want abcde/nil", out.String(), streamErr)
+	}
+
+	// Idle stall between chunks exceeding StreamIdleTimeout must fail with ErrorTimeout.
+	stalledServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(
+			w,
+			"data: {\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n",
+		)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-r.Context().Done():
+		}
+	}))
+	defer stalledServer.Close()
+
+	idleClient, err := New(Config{
+		Provider:          "openai",
+		BaseURL:           stalledServer.URL,
+		Model:             "gpt-test",
+		MaxTokens:         32,
+		Timeout:           200 * time.Millisecond,
+		StreamIdleTimeout: 50 * time.Millisecond,
+		Client:            stalledServer.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalledStream, err := idleClient.ChatStream(context.Background(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "stall"}},
+	})
+	if err != nil {
+		t.Fatalf("stalled stream open failed: %v", err)
+	}
+	if !stalledStream.Next() || stalledStream.Chunk().Content != "first" {
+		t.Fatalf("expected first chunk before stall, err=%v", stalledStream.Err())
+	}
+	if stalledStream.Next() {
+		t.Fatal("expected stalled stream to stop with timeout")
+	}
+	if !IsKind(stalledStream.Err(), ErrorTimeout) {
+		t.Fatalf("stalled stream err=%#v want ErrorTimeout", stalledStream.Err())
+	}
+	_ = stalledStream.Close()
+
+	// Delayed response header exceeding Timeout must fail with ErrorTimeout.
+	slowHeaderServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slowHeaderServer.Close()
+
+	headerClient, err := New(Config{
+		Provider:  "openai",
+		BaseURL:   slowHeaderServer.URL,
+		Model:     "gpt-test",
+		MaxTokens: 32,
+		Timeout:   40 * time.Millisecond,
+		Client:    slowHeaderServer.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := headerClient.ChatStream(context.Background(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "header-timeout"}},
+	}); !IsKind(err, ErrorTimeout) {
+		t.Fatalf("slow header stream err=%#v want ErrorTimeout", err)
+	}
+}
+
+func TestChatStreamPropagatesProviderErrorEventsAndRedactsSecrets(t *testing.T) {
+	const secret = "sk-stream-secret-value"
+	cases := []struct {
+		name     string
+		provider string
+		body     string
+		wantKind ErrorKind
+		wantSub  string
+	}{
+		{
+			name:     "anthropic overloaded error event",
+			provider: "anthropic",
+			body: "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n" +
+				"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded for sk-stream-secret-value\"}}\n\n",
+			wantKind: ErrorProvider,
+			wantSub:  "Overloaded for [REDACTED]",
+		},
+		{
+			name:     "anthropic rate limit error event",
+			provider: "anthropic",
+			body:     "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"too fast\"}}\n\n",
+			wantKind: ErrorRateLimited,
+			wantSub:  "too fast",
+		},
+		{
+			name:     "openai stream error payload",
+			provider: "openai",
+			body:     "data: {\"error\":{\"type\":\"invalid_api_key\",\"message\":\"bad key sk-stream-secret-value\"}}\n\n",
+			wantKind: ErrorUnauthorized,
+			wantSub:  "bad key [REDACTED]",
+		},
+		{
+			name:     "ollama ndjson error line",
+			provider: "ollama",
+			body:     "{\"error\":\"prompt is too long for sk-stream-secret-value\"}\n",
+			wantKind: ErrorContextTooLong,
+			wantSub:  "prompt is too long for [REDACTED]",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+
+			client, err := New(Config{
+				Provider:  tc.provider,
+				BaseURL:   srv.URL,
+				APIKey:    secret,
+				Model:     "test-model",
+				MaxTokens: 32,
+				Timeout:   time.Second,
+				Client:    srv.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream, err := client.ChatStream(context.Background(), ChatRequest{
+				Messages: []Message{{Role: "user", Content: "ping"}},
+			})
+			if err != nil {
+				t.Fatalf("ChatStream open err=%v", err)
+			}
+			defer stream.Close()
+			for stream.Next() {
+			}
+			streamErr := stream.Err()
+			if !IsKind(streamErr, tc.wantKind) {
+				t.Fatalf("stream.Err() = %#v, want kind %s", streamErr, tc.wantKind)
+			}
+			if strings.Contains(streamErr.Error(), secret) {
+				t.Fatalf("stream error leaked secret: %q", streamErr.Error())
+			}
+			if !strings.Contains(streamErr.Error(), tc.wantSub) {
+				t.Fatalf("stream error %q missing %q", streamErr.Error(), tc.wantSub)
+			}
+		})
+	}
+}
