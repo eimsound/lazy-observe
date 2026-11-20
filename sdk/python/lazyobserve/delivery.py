@@ -20,57 +20,22 @@ built with ``reinit_on_fork=False`` is left alone for its owner to rebuild
 
 from __future__ import annotations
 
-import datetime
-import email.utils
 import logging
-import math
 import os
 import queue
-import random
 import threading
 import time
 import weakref
 from typing import Callable, Generic, List, Optional, TypeVar
 
+from ._http import MAX_RETRY_AFTER, RetryableError, compute_retry_delay, parse_retry_after
+
 T = TypeVar("T")
 
 _CLOSE = object()
-MAX_RETRY_AFTER = 30.0
 
 DeliveryWarn = Callable[[str, Optional[BaseException], int], None]
 DeliverySender = Callable[[List[T], Optional[float]], None]
-
-
-class RetryableError(RuntimeError):
-    """Transient delivery failure that may carry a server-provided Retry-After delay."""
-
-    def __init__(self, message: str, *, retry_after: Optional[float] = None) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-def parse_retry_after(
-    header_value: Optional[str], *, max_delay: float = MAX_RETRY_AFTER
-) -> Optional[float]:
-    """Parse an HTTP ``Retry-After`` header (delta-seconds or HTTP-date), capped."""
-    if not header_value:
-        return None
-    raw = header_value.strip()
-    if not raw:
-        return None
-    try:
-        seconds = float(raw)
-    except ValueError:
-        try:
-            dt = email.utils.parsedate_to_datetime(raw)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
-            seconds = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-        except Exception:  # noqa: BLE001
-            return None
-    if not math.isfinite(seconds) or seconds <= 0:
-        return None
-    return min(seconds, max_delay)
 
 
 class DeliveryQueue(Generic[T]):
@@ -230,19 +195,13 @@ class DeliveryQueue(Generic[T]):
         self._last_error = err
 
     def _retry_delay(self, retry_index: int, err: Optional[BaseException] = None) -> float:
-        delay = self._retry_initial
-        for _ in range(retry_index):
-            if delay >= self._retry_max / 2:
-                delay = self._retry_max
-                break
-            delay *= 2.0
-        delay = min(delay, self._retry_max)
-        if delay > 0:
-            delay *= random.uniform(0.5, 1.0)
-        retry_after = getattr(err, "retry_after", None) if err is not None else None
-        if isinstance(retry_after, (int, float)) and math.isfinite(retry_after) and retry_after > 0:
-            delay = max(delay, min(float(retry_after), MAX_RETRY_AFTER))
-        return delay
+        return compute_retry_delay(
+            retry_index,
+            self._retry_initial,
+            self._retry_max,
+            err,
+            max_retry_after=MAX_RETRY_AFTER,
+        )
 
     def _wait(self, delay: float) -> bool:
         """Return False when the queue should stop waiting."""

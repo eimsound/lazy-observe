@@ -173,3 +173,80 @@ def test_exc_info_and_stack_info_are_preserved_in_otlp_record(client):
     assert attrs["exception.message"] == "bad input value"
     assert "_fail" in attrs["exception.stacktrace"]
     assert "code.stacktrace" in attrs
+
+
+def test_client_logger_instances_are_isolated_from_each_other_and_global_registry():
+    from tests.helpers import make_client
+
+    c1 = make_client(service_name="svc-alpha", tee_to_stderr=False)
+    c2 = make_client(service_name="svc-beta", tee_to_stderr=False)
+    p1 = _RecordingLoggerProvider()
+    p2 = _RecordingLoggerProvider()
+    c1.logger_provider = p1
+    c2.logger_provider = p2
+
+    global_client_logger = logging.getLogger("lazyobserve.client")
+    prev_global_handlers = list(global_client_logger.handlers)
+    sentinel_handler = logging.NullHandler()
+    global_client_logger.handlers[:] = [sentinel_handler]
+
+    try:
+        l1 = c1.logger_factory()
+        l2 = c2.logger_factory()
+
+        # Isolated loggers: neither touches the process-global singleton or each other.
+        assert l1 is not l2
+        assert l1 is not global_client_logger
+        assert l2 is not global_client_logger
+        assert global_client_logger.handlers == [sentinel_handler]
+
+        # Even when global active client points to c2 (or None), l1 still exports to c1.
+        lazyobserve._set_active(c2)
+        l1.info("hello from alpha")
+        lazyobserve._set_active(None)
+        l2.info("hello from beta")
+
+        assert len(p1.records) == 1
+        assert p1.records[0].body == "hello from alpha"
+        assert dict(p1.records[0].attributes)["service.name"] == "svc-alpha"
+
+        assert len(p2.records) == 1
+        assert p2.records[0].body == "hello from beta"
+        assert dict(p2.records[0].attributes)["service.name"] == "svc-beta"
+    finally:
+        global_client_logger.handlers[:] = prev_global_handlers
+        lazyobserve._set_active(None)
+        c1.shutdown(timeout=1.0)
+        c2.shutdown(timeout=1.0)
+
+
+def test_log_handler_explicit_client_binding_overrides_global_registry():
+    from tests.helpers import make_client
+
+    bound_client = make_client(service_name="bound-svc", tee_to_stderr=False)
+    active_client = make_client(service_name="active-svc", tee_to_stderr=False)
+    bound_provider = _RecordingLoggerProvider()
+    active_provider = _RecordingLoggerProvider()
+    bound_client.logger_provider = bound_provider
+    active_client.logger_provider = active_provider
+
+    lazyobserve._set_active(active_client)
+    try:
+        handler = LazyObserveLogHandler(client=bound_client)
+        record = logging.LogRecord(
+            name="app.worker",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="explicitly bound",
+            args=(),
+            exc_info=None,
+        )
+        handler.emit(record)
+        assert len(bound_provider.records) == 1
+        assert dict(bound_provider.records[0].attributes)["service.name"] == "bound-svc"
+        assert active_provider.records == []
+    finally:
+        lazyobserve._set_active(None)
+        bound_client.shutdown(timeout=1.0)
+        active_client.shutdown(timeout=1.0)

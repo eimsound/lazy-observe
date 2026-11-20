@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import copy
+import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .dsn import DSN
+
+_logger = logging.getLogger("lazyobserve")
 
 ERROR_QUEUE_SIZE = 100
 DELIVERY_MAX_ATTEMPTS = 3
@@ -59,9 +63,52 @@ class Config:
     #: finite number) selects the default, below 10 the windows run back to back.
     profiling_interval: float = PROFILING_INTERVAL
 
+    def __post_init__(self) -> None:
+        if isinstance(self.tags, dict):
+            self.tags = copy.deepcopy(self.tags)
+
 
 class InvalidConfigError(ValueError):
     """Raised for invalid SDK configuration."""
+
+
+def warn_unknown_fields(
+    source: str,
+    unknown: Sequence[str],
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Emit a single clear warning listing unrecognized configuration keys."""
+    if not unknown:
+        return
+    target = logger if logger is not None else _logger
+    target.warning(
+        "%s: ignoring unknown config field(s): %s",
+        source,
+        ", ".join(sorted(str(k) for k in unknown)),
+    )
+
+
+def config_from_mapping(
+    data: Mapping[str, Any],
+    *,
+    source: str = "lazyobserve.init",
+) -> Config:
+    """Construct a :class:`Config` from a mapping, deserializing nested ``delivery``
+    dicts and warning once on any unknown top-level or nested keys."""
+    known = Config.__dataclass_fields__
+    unknown: list[str] = [str(k) for k in data if k not in known]
+    filtered: Dict[str, Any] = {k: v for k, v in data.items() if k in known}
+
+    if "delivery" in filtered and isinstance(filtered["delivery"], dict):
+        raw_delivery = filtered["delivery"]
+        delivery_known = DeliveryConfig.__dataclass_fields__
+        unknown.extend(f"delivery.{k}" for k in raw_delivery if k not in delivery_known)
+        filtered["delivery"] = DeliveryConfig(
+            **{k: v for k, v in raw_delivery.items() if k in delivery_known}
+        )
+
+    warn_unknown_fields(source, unknown)
+    return Config(**filtered)
 
 
 def default_service_name() -> str:
@@ -102,6 +149,10 @@ def normalize_config(cfg: Config) -> Config:
     normalize_delivery(cfg.delivery)
     if cfg.tags is None:
         cfg.tags = {}
+    elif isinstance(cfg.tags, dict):
+        cfg.tags = copy.deepcopy(cfg.tags)
+    else:
+        raise InvalidConfigError("tags must be a dict")
     return cfg
 
 
@@ -109,9 +160,11 @@ def _coerce_delivery_config(value: object) -> DeliveryConfig:
     if value is None:
         return DeliveryConfig()
     if isinstance(value, DeliveryConfig):
-        return value
+        return copy.deepcopy(value)
     if isinstance(value, dict):
         known = DeliveryConfig.__dataclass_fields__
+        unknown = [f"delivery.{k}" for k in value if k not in known]
+        warn_unknown_fields("lazyobserve.config", unknown)
         try:
             return DeliveryConfig(**{k: v for k, v in value.items() if k in known})
         except TypeError as exc:

@@ -10,7 +10,7 @@ Three-line setup:
 
 from . import _registry  # noqa: F401
 from .client import Client, Diagnostics, init_client
-from .config import Config, DeliveryConfig, InvalidConfigError
+from .config import Config, DeliveryConfig, InvalidConfigError, config_from_mapping
 from .dsn import DSN, parse_dsn
 from .django import DjangoMiddleware
 from .logging import LazyObserveLogHandler
@@ -28,11 +28,11 @@ def init(config: "Config | dict | None" = None, **kwargs) -> Client:
     registry-bound integrations (``lazyobserve.DjangoMiddleware``,
     ``lazyobserve.drf.exception_handler``, ``LazyObserveLogHandler``) resolve it.
     """
-    known = Config.__dataclass_fields__
     if isinstance(config, dict):
-        config = Config(**{k: v for k, v in config.items() if k in known})
+        merged = {**config, **kwargs} if kwargs else config
+        config = config_from_mapping(merged, source="lazyobserve.init")
     elif kwargs:
-        config = Config(**{k: v for k, v in kwargs.items() if k in known})
+        config = config_from_mapping(kwargs, source="lazyobserve.init")
     if config is None:
         config = Config()
     client = init_client(config)

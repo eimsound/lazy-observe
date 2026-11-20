@@ -62,11 +62,13 @@ lo.shutdown(timeout=10.0)
 | `capture_db_statement` | `false` | Include SQL text on DB spans; bound parameters never captured |
 | `capture_llm_content` | `false` | Capture `gen_ai.prompt` / `gen_ai.completion`, truncated to 4 KiB |
 | `release`, `environment` | empty | Deployment metadata attached to error events |
-| `tags` | empty | Application tags copied at initialization and attached to error events |
+| `tags` | empty | Application tags deep-copied at initialization and attached to error events (subsequent caller mutations do not affect the running SDK) |
 | `export_interval` | `5s` | Metrics/log export interval |
-| `delivery` | zero-value defaults | Error queue bounds and retry budget |
+| `delivery` | zero-value defaults | Error queue bounds and retry budget (accepts `DeliveryConfig` or a nested `dict`) |
 | `profiling` | `false` | **Experimental.** Opt in to [continuous profiling](#continuous-profiling); only samples on Linux with a free-threaded CPython 3.15+ whose GIL is off |
 | `profiling_interval` | `60` (seconds) | Time between the starts of two 10-second profiling windows; `<= 0`, NaN and infinity fall back to 60; below 10 the windows run back to back |
+
+When `lazyobserve.init` receives a `dict` or keyword arguments containing unrecognized top-level or `delivery.*` keys, the SDK logs a single warning on the `lazyobserve` logger listing the ignored fields instead of silently swallowing typos.
 
 Signal matrix: all three of `metrics`/`logs`/`traces` false means all enabled;
 once any is true the three values form an explicit enabled set. To disable all
@@ -98,6 +100,22 @@ MIDDLEWARE = [
 
 A 5xx response that is directly written (no exception) remains visible in
 metrics/traces but does not create an Issue — identical to Fiber.
+
+### WSGI, ASGI, and streaming support boundaries
+
+- **WSGI and ASGI**: `DjangoMiddleware` (and `lo.django_middleware()`) declares
+  `sync_capable = True` and `async_capable = True`. Under ASGI, when Django
+  supplies an async `get_response`, the middleware executes natively on the
+  event loop without `sync_to_async` thread hopping.
+- **`StreamingHttpResponse`**: both synchronous and asynchronous
+  `StreamingHttpResponse` iterators are wrapped so the SERVER span,
+  `http.server.request.duration`, and `http.server.active_requests` remain open
+  until the stream finishes (or the response is closed). The OpenTelemetry
+  request context is detached when the middleware returns the response object so
+  it never leaks across requests.
+- **Database wrapper**: `lo.django_db()` uses Django's synchronous
+  `connection.execute_wrapper` and applies to synchronous ORM/cursor execution
+  (including async views that run ORM queries inside `sync_to_async`).
 
 ## DRF
 
@@ -198,7 +216,7 @@ flush).
 When metrics are enabled, the SDK collects:
 
 - `process.runtime.python.threads` — `threading.active_count()`
-- `process.runtime.python.memory.rss` — resident set size (`getrusage`)
+- `process.runtime.python.memory.rss` — live resident set size from `/proc/self/statm` on Linux, falling back to `resource.getrusage` on other Unix platforms (returns `0` when unavailable, e.g. Windows)
 - `process.runtime.python.gc.count` — cumulative GC cycles (`gc.get_stats()`)
 
 ## Continuous profiling
@@ -383,9 +401,9 @@ flight is left to finish. There is no disk spool.
 
 | Dependency | Use | License |
 | --- | --- | --- |
-| `opentelemetry-api` / `-sdk` | API, SDK | Apache-2.0 |
-| `opentelemetry-exporter-otlp-proto-http` | OTLP/HTTP exporters | Apache-2.0 |
-| `httpx` / `httpcore` | LLM transport wrapping | BSD-3-Clause |
+| `opentelemetry-api` / `-sdk` | API, SDK (`>=1.30,<2.0`) | Apache-2.0 |
+| `opentelemetry-exporter-otlp-proto-http` | OTLP/HTTP exporters (`>=1.30,<2.0`) | Apache-2.0 |
+| `httpx` | Internal telemetry HTTP transport and LLM transport wrapping (`>=0.24,<1.0`) | BSD-3-Clause |
 | `Django` | middleware / DB wrapper (optional) | BSD-3-Clause |
 | `djangorestframework` | DRF handler (optional) | BSD-3-Clause |
 | `protobuf` | OTLP protobuf (pinned by `opentelemetry-exporter-otlp-proto-http`) | BSD-3-Clause |

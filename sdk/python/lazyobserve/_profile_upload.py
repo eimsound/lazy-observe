@@ -14,17 +14,22 @@ from __future__ import annotations
 
 import datetime
 import secrets
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
-from ._http import open_no_redirect
-from .delivery import DeliveryQueue, DeliveryWarn, RetryableError, parse_retry_after
+from ._http import (
+    DEFAULT_PROFILE_SEND_TIMEOUT,
+    PROFILE_PAYLOAD_SIZE_LIMIT,
+    InternalHTTPTransport,
+    PayloadTooLargeError,
+    PermanentHTTPError,
+    check_payload_size,
+)
+from .delivery import DeliveryQueue, DeliveryWarn
 
 PROFILE_QUEUE_CAPACITY = 6
-PROFILE_SEND_TIMEOUT = 15.0
-MAX_PROFILE_SIZE = 10 << 20
+PROFILE_SEND_TIMEOUT = DEFAULT_PROFILE_SEND_TIMEOUT
+MAX_PROFILE_SIZE = PROFILE_PAYLOAD_SIZE_LIMIT
 _PROFILE_FLUSH_INTERVAL = 0.1
 _PROFILE_PATH = "/api/profiles"
 _PROFILE_FILE_NAME = "profile.pb.gz"
@@ -65,14 +70,20 @@ class ProfileUploader:
         retry_max: float = 1.0,
         warn: Optional[DeliveryWarn] = None,
         send_timeout: float = PROFILE_SEND_TIMEOUT,
-        opener: Optional[Callable[..., Any]] = None,
+        http_transport: Optional[InternalHTTPTransport] = None,
+        transport: Optional[Any] = None,
         name: str = "profile",
     ) -> None:
         self.url = endpoint.rstrip("/") + _PROFILE_PATH
         self.token = token
         self.service = service
         self.send_timeout = send_timeout
-        self._opener = opener or open_no_redirect
+        if http_transport is not None:
+            self._http = http_transport
+            self._owns_http = False
+        else:
+            self._http = InternalHTTPTransport(transport=transport, default_timeout=send_timeout)
+            self._owns_http = True
         self.delivery = DeliveryQueue(
             send=self._send,
             capacity=queue_capacity,
@@ -89,17 +100,21 @@ class ProfileUploader:
         )
 
     def enqueue(self, profile: CollectedProfile) -> bool:
-        if isinstance(profile, CollectedProfile) and len(profile.data) > MAX_PROFILE_SIZE:
-            self.delivery.record_drop(
-                "server_rejected",
-                ValueError(f"profile exceeds {MAX_PROFILE_SIZE} bytes"),
-                1,
-            )
-            return False
+        if isinstance(profile, CollectedProfile):
+            size_err = check_payload_size(len(profile.data), limit=MAX_PROFILE_SIZE, label="profile")
+            if size_err is not None:
+                self.delivery.record_drop("server_rejected", size_err, 1)
+                return False
         return self.delivery.enqueue(profile)
 
     def close(self, timeout: Optional[float] = None) -> Optional[BaseException]:
-        return self.delivery.close(timeout)
+        err = self.delivery.close(timeout)
+        if self._owns_http:
+            try:
+                self._http.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return err
 
     def dropped(self) -> int:
         return self.delivery.dropped()
@@ -109,46 +124,26 @@ class ProfileUploader:
             self._send_one(profile)
 
     def _send_one(self, profile: CollectedProfile) -> None:
-        if len(profile.data) > MAX_PROFILE_SIZE:
-            self.delivery.record_drop(
-                "server_rejected",
-                ValueError(f"profile exceeds {MAX_PROFILE_SIZE} bytes"),
-                1,
-            )
+        size_err = check_payload_size(len(profile.data), limit=MAX_PROFILE_SIZE, label="profile")
+        if size_err is not None:
+            self.delivery.record_drop("server_rejected", size_err, 1)
             return
         body, boundary = _encode_multipart(self.service, profile)
-        request = urllib.request.Request(
-            self.url,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": "Bearer " + self.token,
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Content-Length": str(len(body)),
-            },
-        )
         try:
-            with self._opener(request, timeout=self.send_timeout) as response:
-                response.read(4096)
-        except urllib.error.HTTPError as exc:
-            try:
-                exc.read(4096)
-            except Exception:  # noqa: BLE001
-                pass
-            finally:
-                exc.close()
-            if 400 <= exc.code < 500 and exc.code not in (408, 429):
-                self.delivery.record_drop("server_rejected", exc, 1)
-                return
-            message = f"upload profile: HTTP {exc.code}: {exc.reason}"
-            retry_after = parse_retry_after(
-                exc.headers.get("Retry-After") if exc.headers is not None else None
+            self._http.post(
+                self.url,
+                content=body,
+                headers={
+                    "Authorization": "Bearer " + self.token,
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(body)),
+                },
+                timeout=self.send_timeout,
+                action="upload profile",
             )
-            if retry_after is not None:
-                raise RetryableError(message, retry_after=retry_after) from exc
-            raise RuntimeError(message) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"upload profile: {exc.reason}") from exc
+        except (PermanentHTTPError, PayloadTooLargeError) as exc:
+            self.delivery.record_drop("server_rejected", exc, 1)
+            return
 
 
 def _encode_multipart(service: str, profile: CollectedProfile) -> Tuple[bytes, str]:

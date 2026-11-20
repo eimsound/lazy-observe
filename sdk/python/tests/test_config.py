@@ -150,18 +150,124 @@ def test_import_succeeds_without_unix_resource_module():
     import subprocess
     import sys
 
-    code = (
+    # Block ``resource`` before importing lazyobserve, then simulate non-Linux
+    # (e.g. Windows) when querying ``_memory_rss()`` so neither /proc/self/statm
+    # nor ``resource`` is available.
+    win_code = (
         "import sys; sys.modules['resource'] = None; "
         "import lazyobserve; from lazyobserve.client import _memory_rss; "
-        "assert _memory_rss() == 0; print('ok')"
+        "sys.platform = 'win32'; "
+        "assert _memory_rss() == 0; print('ok-win')"
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
+    win_proc = subprocess.run(
+        [sys.executable, "-c", win_code],
         check=True,
         capture_output=True,
         text=True,
     )
-    assert proc.stdout.strip() == "ok"
+    assert win_proc.stdout.strip() == "ok-win"
+
+    # Linux without ``resource`` still imports cleanly and reads live RSS from /proc/self/statm.
+    if sys.platform.startswith("linux"):
+        linux_code = (
+            "import sys; sys.modules['resource'] = None; "
+            "import lazyobserve; from lazyobserve.client import _memory_rss; "
+            "assert _memory_rss() > 0; print('ok-linux')"
+        )
+        linux_proc = subprocess.run(
+            [sys.executable, "-c", linux_code],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert linux_proc.stdout.strip() == "ok-linux"
+
+
+def test_memory_rss_prefers_proc_statm_on_linux_and_falls_back_to_rusage(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import lazyobserve.client as client_mod
+
+    statm = tmp_path / "statm"
+    statm.write_text("5000 1234 400 10 0 800 0\n", encoding="ascii")
+    monkeypatch.setattr(client_mod.os, "sysconf", lambda name: 4096)
+    assert client_mod._linux_proc_statm_rss(str(statm)) == 1234 * 4096
+
+    # Malformed statm returns None so _memory_rss falls back to getrusage.
+    bad_statm = tmp_path / "bad_statm"
+    bad_statm.write_text("only-one-field\n", encoding="ascii")
+    assert client_mod._linux_proc_statm_rss(str(bad_statm)) is None
+    assert client_mod._linux_proc_statm_rss(str(tmp_path / "missing")) is None
+
+    monkeypatch.setattr(client_mod.sys, "platform", "linux")
+    monkeypatch.setattr(client_mod, "_linux_proc_statm_rss", lambda: 999_000)
+    assert client_mod._memory_rss() == 999_000
+
+    # When /proc/self/statm fails, falls back to resource.getrusage.
+    monkeypatch.setattr(client_mod, "_linux_proc_statm_rss", lambda: None)
+    fake_resource = SimpleNamespace(
+        RUSAGE_SELF=0,
+        getrusage=lambda _who: SimpleNamespace(ru_maxrss=256),
+    )
+    monkeypatch.setitem(client_mod.sys.modules, "resource", fake_resource)
+    monkeypatch.setattr(client_mod.platform, "system", lambda: "Linux")
+    assert client_mod._memory_rss() == 256 * 1024
+
+    monkeypatch.setattr(client_mod.platform, "system", lambda: "Darwin")
+    assert client_mod._memory_rss() == 256
+
+
+def test_config_deep_copies_tags_against_caller_mutation():
+    caller_tags = {"env": "prod", "region": "us-east-1"}
+    cfg = Config(dsn="http://127.0.0.1:1/p/proj@tok", service_name="tags-test", tags=caller_tags)
+    caller_tags["env"] = "mutated"
+    caller_tags["extra"] = "leaked"
+    assert cfg.tags == {"env": "prod", "region": "us-east-1"}
+
+    init_tags = {"team": "payments"}
+    lo = lazyobserve.init(
+        {
+            "dsn": "http://127.0.0.1:1/p/proj@tok",
+            "service_name": "tags-init",
+            "traces": True,
+            "tags": init_tags,
+        }
+    )
+    try:
+        init_tags["team"] = "mutated"
+        assert lo.config.tags == {"team": "payments"}
+    finally:
+        lo.shutdown(timeout=1.0)
+
+
+def test_init_warns_once_on_unknown_fields_and_nested_delivery_keys(caplog):
+    with caplog.at_level("WARNING", logger="lazyobserve"):
+        lo = lazyobserve.init(
+            {
+                "dsn": "http://127.0.0.1:1/p/proj@tok",
+                "service_name": "warn-test",
+                "traces": True,
+                "serviceName": "typo-top",
+                "unknown_flag": True,
+                "delivery": {
+                    "max_attempts": 4,
+                    "bogus_retry": 99,
+                },
+            }
+        )
+    try:
+        assert not lo.degraded
+        assert lo.config.delivery.max_attempts == 4
+        unknown_warnings = [
+            rec.getMessage()
+            for rec in caplog.records
+            if "ignoring unknown config field(s)" in rec.getMessage()
+        ]
+        assert len(unknown_warnings) == 1
+        assert "delivery.bogus_retry" in unknown_warnings[0]
+        assert "serviceName" in unknown_warnings[0]
+        assert "unknown_flag" in unknown_warnings[0]
+    finally:
+        lo.shutdown(timeout=1.0)
 
 
 def test_build_client_cleans_up_created_providers_on_midway_failure(monkeypatch):
@@ -197,7 +303,7 @@ def test_build_client_cleans_up_created_providers_on_midway_failure(monkeypatch)
 
     monkeypatch.setattr("opentelemetry.sdk.metrics.MeterProvider", fake_meter_provider)
     monkeypatch.setattr(
-        "opentelemetry.sdk.metrics._internal.export.PeriodicExportingMetricReader",
+        "opentelemetry.sdk.metrics.export.PeriodicExportingMetricReader",
         fake_metric_reader,
     )
     monkeypatch.setattr("opentelemetry.sdk.trace.TracerProvider", fake_tracer_provider)
