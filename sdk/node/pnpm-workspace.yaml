@@ -2,6 +2,11 @@ packages:
   - packages/*
   - examples/*
 
+# pnpm 11 起依赖的安装脚本默认报错（strictDepBuilds）。esbuild 的二进制来自平台可选依赖，不需要 postinstall；
+# 显式拒绝，保持 pnpm 10 下「忽略」的行为。
+allowBuilds:
+  esbuild: false
+
 # 供应链：解析依赖时只接受发布满 7 天的版本（单位分钟，7 × 1440；单一来源见 scripts/release-age.env，
 # 与 renovate.json 的 minimumReleaseAge 一致，由 scripts/check-github-workflows.sh 校验）。
 # 只影响重新解析；--frozen-lockfile 按锁文件安装，已锁定的版本不受影响。

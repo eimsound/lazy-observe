@@ -2,8 +2,9 @@ packages:
   - packages/*
   - examples/*
 
-onlyBuiltDependencies:
-  - esbuild
+# pnpm 11 起 onlyBuiltDependencies 改为 allowBuilds（包名 → 是否允许运行安装脚本）。
+allowBuilds:
+  esbuild: true
 
 # 供应链：解析依赖时只接受发布满 7 天的版本（单位分钟，7 × 1440；单一来源见 scripts/release-age.env，
 # 与 renovate.json 的 minimumReleaseAge 一致，由 scripts/check-github-workflows.sh 校验）。
