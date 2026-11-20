@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,10 +23,18 @@ func TestScrapeTargetHTTPContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	member := sessionCookie(t, store, "scrape-contract", "password", "member")
-	metrics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	metrics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Query().Get("query"), "timestamp(") {
+			_, _ = w.Write(
+				[]byte(
+					`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752762010,"1752762000.25"]}]}}`,
+				),
+			)
+			return
+		}
 		_, _ = w.Write(
 			[]byte(
-				`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752762000.25,"1"]}]}}`,
+				`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1752762010,"1"]}]}}`,
 			),
 		)
 	}))

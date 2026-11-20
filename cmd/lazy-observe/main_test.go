@@ -34,8 +34,29 @@ func TestInitialScrapeConfigMustSucceedBeforeStorageStarts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.CreateScrapeTarget(ctx, meta.ScrapeTargetCreate{
+		ProjectSlug: "alpha", Name: "healthy", URL: "https://exporter.example.com:9100/metrics", Interval: "30s",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recoveredPath, err := writeInitialScrapeConfig(ctx, store, t.TempDir())
+	if err != nil {
+		t.Fatalf("single corrupt row must not block initial scrape config: %v", err)
+	}
+	rendered, err := os.ReadFile(recoveredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rendered), "exporter.example.com:9100") ||
+		strings.Contains(string(rendered), "://invalid") {
+		t.Fatalf("initial scrape config did not skip corrupt row cleanly:\n%s", rendered)
+	}
+	// Underlying metadata errors must still abort before storage starts.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := writeInitialScrapeConfig(ctx, store, t.TempDir()); err == nil {
-		t.Fatal("invalid target unexpectedly produced an initial scrape config")
+		t.Fatal("metadata store error unexpectedly produced an initial scrape config")
 	}
 }
 

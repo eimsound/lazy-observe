@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"path"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,13 @@ const tokenCacheTTL = 30 * time.Second
 // removed. It equals the compressed BodyLimit so compression never raises the
 // amount of memory one request may claim.
 const maxDecodedRequestBody = 52 << 20
+
+const (
+	maxRemoteWriteDecodedBody     = storagepkg.DefaultRemoteWriteMaxDecodedBytes
+	defaultRemoteWriteConcurrency = 16
+	defaultRemoteWriteRateLimit   = 600
+	defaultRemoteWriteRateWindow  = time.Minute
+)
 
 const (
 	defaultReadTimeout = 60 * time.Second
@@ -231,6 +239,8 @@ type Gateway struct {
 	requireCSRF              bool
 	secureSessionCookie      bool
 	initialAdminPasswordFile string
+	remoteWriteSem           chan struct{}
+	remoteWriteRateLimit     int
 }
 
 func newFiberApp(readTimeout, idleTimeout time.Duration) *fiber.App {
@@ -359,6 +369,8 @@ func New(cfg Config) *Gateway {
 		requireCSRF:              cfg.RequireCSRF,
 		secureSessionCookie:      cfg.SecureSessionCookie,
 		initialAdminPasswordFile: cfg.InitialAdminPasswordFile,
+		remoteWriteSem:           make(chan struct{}, defaultRemoteWriteConcurrency),
+		remoteWriteRateLimit:     defaultRemoteWriteRateLimit,
 	}
 	if cfg.AISettingsStore != nil {
 		// Dynamic mode: the admin UI manages the persisted AI configuration.
@@ -685,14 +697,14 @@ func (g *Gateway) registerSessionAPI() {
 	api.Put("/inhibition-rules/:id", g.memberRequired, g.updateInhibitionRule)
 	api.Delete("/inhibition-rules/:id", g.memberRequired, g.deleteInhibitionRule)
 	api.Get("/alerts", g.listAlerts)
-	api.Get("/scrape-targets", g.listScrapeTargets)
-	api.Post("/scrape-targets", g.memberRequired, g.createScrapeTarget)
-	api.Get("/scrape-targets/:id", g.getScrapeTarget)
-	api.Patch("/scrape-targets/:id", g.memberRequired, g.updateScrapeTarget)
-	api.Put("/scrape-targets/:id", g.memberRequired, g.updateScrapeTarget)
-	api.Delete("/scrape-targets/:id", g.memberRequired, g.deleteScrapeTarget)
-	api.Get("/scrape-targets/:id/health", g.scrapeTargetHealth)
-	api.Get("/hosts", g.hosts)
+	api.Get("/scrape-targets", g.loadSessionProject, g.listScrapeTargets)
+	api.Post("/scrape-targets", g.loadSessionProject, g.memberRequired, g.createScrapeTarget)
+	api.Get("/scrape-targets/:id", g.loadSessionProject, g.getScrapeTarget)
+	api.Patch("/scrape-targets/:id", g.loadSessionProject, g.memberRequired, g.updateScrapeTarget)
+	api.Put("/scrape-targets/:id", g.loadSessionProject, g.memberRequired, g.updateScrapeTarget)
+	api.Delete("/scrape-targets/:id", g.loadSessionProject, g.memberRequired, g.deleteScrapeTarget)
+	api.Get("/scrape-targets/:id/health", g.loadSessionProject, g.scrapeTargetHealth)
+	api.Get("/hosts", g.loadSessionProject, g.hosts)
 	api.Get("/issues", g.loadSessionProject, g.listIssues)
 	api.Get("/issues/:id", g.loadSessionProject, g.getIssue)
 	api.Get("/issues/:id/ai-analysis", g.loadSessionProject, g.getIssueAIAnalysis)
@@ -929,11 +941,47 @@ func (g *Gateway) metricsRemoteWrite(c fiber.Ctx) error {
 			"Prometheus remote-write 2.0 is not supported; use prometheus.WriteRequest",
 		)
 	}
-	body, err := storagepkg.InjectRemoteWriteProject(requestBody(c), currentProject(c).Slug, maxDecodedRequestBody)
+	if g.remoteWriteSem != nil {
+		select {
+		case g.remoteWriteSem <- struct{}{}:
+			defer func() { <-g.remoteWriteSem }()
+		default:
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusTooManyRequests).
+				JSON(fiber.Map{"error": "too many concurrent remote-write requests"})
+		}
+	}
+	p := currentProject(c)
+	if g.limits != nil && g.remoteWriteRateLimit > 0 {
+		allowed, limitErr := g.limits.Allow(
+			c.Context(),
+			"remote-write:project:"+strconv.Itoa(p.ID),
+			g.remoteWriteRateLimit,
+			defaultRemoteWriteRateWindow,
+		)
+		if limitErr != nil {
+			g.logger.Warn("remote-write rate limit check failed", "project", p.Slug, "error", limitErr)
+			return c.Status(fiber.StatusServiceUnavailable).
+				JSON(fiber.Map{"error": "rate limiter temporarily unavailable"})
+		}
+		if !allowed {
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusTooManyRequests).
+				JSON(fiber.Map{"error": "remote-write rate limit exceeded"})
+		}
+	}
+	raw := requestBody(c)
+	if len(raw) > maxRemoteWriteDecodedBody {
+		return fiber.NewError(
+			fiber.StatusRequestEntityTooLarge,
+			"Prometheus remote-write request exceeds size limit",
+		)
+	}
+	body, err := storagepkg.InjectRemoteWriteProject(raw, p.Slug, maxRemoteWriteDecodedBody)
 	if errors.Is(err, storagepkg.ErrRemoteWriteTooLarge) {
 		return fiber.NewError(
 			fiber.StatusRequestEntityTooLarge,
-			"Prometheus remote-write request exceeds decoded size limit",
+			"Prometheus remote-write request exceeds decoded size or cardinality limit",
 		)
 	}
 	if err != nil {
@@ -942,14 +990,17 @@ func (g *Gateway) metricsRemoteWrite(c fiber.Ctx) error {
 			"invalid Prometheus remote-write request: "+err.Error(),
 		)
 	}
-	c.Request().SetBody(body)
 	c.Request().Header.SetContentType("application/x-protobuf")
 	c.Request().Header.Set("Content-Encoding", "snappy")
 	c.Request().Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
-	return g.metricsWrite(c, "/prometheus/api/v1/write", false)
+	return g.metricsWriteWithBody(c, "/prometheus/api/v1/write", false, body)
 }
 
 func (g *Gateway) metricsWrite(c fiber.Ctx, path string, addProjectQuery bool) error {
+	return g.metricsWriteWithBody(c, path, addProjectQuery, nil)
+}
+
+func (g *Gateway) metricsWriteWithBody(c fiber.Ctx, path string, addProjectQuery bool, body []byte) error {
 	if !g.storage.MetricsIngestEnabled() {
 		return c.Status(fiber.StatusNotImplemented).
 			JSON(fiber.Map{"error": "metrics ingest is disabled: storage.metrics.ingest_url is not configured"})
@@ -959,7 +1010,7 @@ func (g *Gateway) metricsWrite(c fiber.Ctx, path string, addProjectQuery bool) e
 	if !g.storage.MetricsClustered() {
 		path = strings.TrimPrefix(path, "/prometheus")
 	}
-	opts := proxyOptions{reservedParams: true}
+	opts := proxyOptions{reservedParams: true, body: body}
 	if addProjectQuery {
 		opts.addQuery = url.Values{"extra_label": []string{"project_id=" + p.Slug}}
 	}
@@ -998,6 +1049,7 @@ type proxyOptions struct {
 	projectID      int
 	allowedParams  map[string]bool
 	metricsProject string
+	body           []byte
 }
 
 func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error {
@@ -1008,8 +1060,40 @@ func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error
 	if opts.reservedParams || opts.metricsProject != "" {
 		stripReserved(query)
 	}
+	body := opts.body
+	if body == nil {
+		// When Immutable is enabled (production gateway), requestBody already
+		// returns an owned copy via App.GetBytes; avoid a redundant full copy.
+		if c.App().Config().Immutable {
+			body = requestBody(c)
+		} else {
+			body = append([]byte(nil), requestBody(c)...)
+		}
+	}
+	contentType := string(c.Request().Header.ContentType())
+	mediaType := normalizedMediaType(contentType)
+	hasFormMatch := false
+	if (opts.reservedParams || opts.metricsProject != "") && mediaType == fiber.MIMEApplicationForm {
+		form, formErr := url.ParseQuery(string(body))
+		if formErr != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid form body")
+		}
+		stripReserved(form)
+		if opts.metricsProject != "" && g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
+			if injectErr := injectPromValues(form, opts.metricsProject); injectErr != nil {
+				return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+injectErr.Error())
+			}
+			hasFormMatch = len(form["match[]"]) > 0
+		}
+		body = []byte(form.Encode())
+	} else if opts.metricsProject != "" && c.Method() == http.MethodPost && len(body) > 0 && mediaType != "" {
+		return fiber.NewError(
+			fiber.StatusUnsupportedMediaType,
+			"metrics POST requests must use application/x-www-form-urlencoded",
+		)
+	}
 	if opts.metricsProject != "" {
-		defaultMatcher := path != "/api/v1/query" && path != "/api/v1/query_range"
+		defaultMatcher := path != "/api/v1/query" && path != "/api/v1/query_range" && !hasFormMatch
 		if err := g.applyMetricsIsolation(query, opts.metricsProject, defaultMatcher); err != nil {
 			return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+err.Error())
 		}
@@ -1026,24 +1110,6 @@ func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error
 		for _, value := range values {
 			query.Add(key, value)
 		}
-	}
-	body := append([]byte(nil), requestBody(c)...)
-	contentType := string(c.Request().Header.ContentType())
-	if (opts.reservedParams || opts.metricsProject != "") &&
-		strings.HasPrefix(contentType, fiber.MIMEApplicationForm) {
-		form, err := url.ParseQuery(string(body))
-		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "invalid form body")
-		}
-		stripReserved(form)
-		if opts.metricsProject != "" {
-			if g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
-				if err := injectPromValues(form, opts.metricsProject); err != nil {
-					return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+err.Error())
-				}
-			}
-		}
-		body = []byte(form.Encode())
 	}
 	target := strings.TrimRight(base, "/") + path
 	if encoded := query.Encode(); encoded != "" {
@@ -1150,6 +1216,19 @@ func stripReserved(values url.Values) {
 	values.Del("extra_filters")
 	values.Del("extra_filters[]")
 	values.Del("extra_label")
+}
+
+func normalizedMediaType(contentType string) string {
+	trimmed := strings.TrimSpace(contentType)
+	if trimmed == "" {
+		return ""
+	}
+	mediaType, _, err := mime.ParseMediaType(trimmed)
+	if err != nil {
+		base, _, _ := strings.Cut(trimmed, ";")
+		return strings.ToLower(strings.TrimSpace(base))
+	}
+	return mediaType
 }
 
 func copyRequestHeaders(dst http.Header, src *fasthttp.RequestHeader) {

@@ -1,10 +1,12 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -16,6 +18,12 @@ import (
 	"github.com/eimsound/lazy-observe/internal/scrape"
 	"github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/gofiber/fiber/v3"
+)
+
+const (
+	metricsInstantQueryTimeout  = 10 * time.Second
+	metricsInstantQueryMaxBytes = 8 << 20
+	metricsBodyDrainLimit       = 64 << 10
 )
 
 type scrapeTargetResponse struct {
@@ -58,16 +66,30 @@ func (g *Gateway) scrapeUnavailable(c fiber.Ctx) bool {
 	return false
 }
 
+func sessionProjectSlug(c fiber.Ctx) (string, bool) {
+	p := currentProject(c)
+	if p.ID <= 0 || p.Slug == "" {
+		_ = c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "project context is missing"})
+		return "", false
+	}
+	return p.Slug, true
+}
+
 func (g *Gateway) listScrapeTargets(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	v, err := g.scrapes.List(c.Context(), projectSlug(c))
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	v, err := g.scrapes.List(c.Context(), slug)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(scrapeTargetsJSON(v))
 }
+
 func (g *Gateway) getScrapeTarget(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -76,29 +98,42 @@ func (g *Gateway) getScrapeTarget(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	v, err := g.scrapes.Get(c.Context(), projectSlug(c), id)
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	v, err := g.scrapes.Get(c.Context(), slug, id)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(scrapeTargetJSON(v))
 }
+
 func (g *Gateway) createScrapeTarget(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
+		return nil
+	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
 		return nil
 	}
 	var in scrape.Input
 	if c.Bind().Body(&in) != nil {
 		return badRequest(c)
 	}
-	v, err := g.scrapes.Create(c.Context(), projectSlug(c), in)
+	v, err := g.scrapes.Create(c.Context(), slug, in)
 	if errors.Is(err, scrape.ErrInvalidTarget) {
 		return badRequestMessage(c, err.Error())
+	}
+	if errors.Is(err, scrape.ErrQuotaExceeded) {
+		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{"error": err.Error()})
 	}
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.Status(fiber.StatusCreated).JSON(scrapeTargetJSON(v))
 }
+
 func (g *Gateway) updateScrapeTarget(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -107,11 +142,15 @@ func (g *Gateway) updateScrapeTarget(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
 	var in scrape.Input
 	if c.Bind().Body(&in) != nil {
 		return badRequest(c)
 	}
-	v, err := g.scrapes.Update(c.Context(), projectSlug(c), id, in)
+	v, err := g.scrapes.Update(c.Context(), slug, id, in)
 	if errors.Is(err, scrape.ErrInvalidTarget) {
 		return badRequestMessage(c, err.Error())
 	}
@@ -120,6 +159,7 @@ func (g *Gateway) updateScrapeTarget(c fiber.Ctx) error {
 	}
 	return c.JSON(scrapeTargetJSON(v))
 }
+
 func (g *Gateway) deleteScrapeTarget(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
@@ -128,7 +168,11 @@ func (g *Gateway) deleteScrapeTarget(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	if err := g.scrapes.Delete(c.Context(), projectSlug(c), id); err != nil {
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	if err := g.scrapes.Delete(c.Context(), slug, id); err != nil {
 		return apiError(c, err)
 	}
 	return c.SendStatus(fiber.StatusNoContent)
@@ -146,7 +190,10 @@ type queryResponse struct {
 	} `json:"data"`
 }
 
-func (g *Gateway) instantQuery(ctx fiber.Ctx, slug, expr string) ([]metricSample, error) {
+func (g *Gateway) instantQuery(ctx context.Context, slug, expr string) ([]metricSample, error) {
+	if slug == "" {
+		return nil, errors.New("project slug is empty")
+	}
 	q := url.Values{"query": {expr}}
 	if g.storage.MetricsMode() == storage.MetricsPrometheus {
 		if err := injectPromValues(q, slug); err != nil {
@@ -155,8 +202,10 @@ func (g *Gateway) instantQuery(ctx fiber.Ctx, slug, expr string) ([]metricSample
 	} else {
 		q.Set("extra_filters[]", fmt.Sprintf(`{project_id=%q}`, slug))
 	}
+	queryCtx, cancel := context.WithTimeout(ctx, metricsInstantQueryTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(
-		ctx.Context(),
+		queryCtx,
 		http.MethodGet,
 		strings.TrimRight(g.storage.MetricsQueryBase(), "/")+"/api/v1/query?"+q.Encode(),
 		nil,
@@ -168,13 +217,23 @@ func (g *Gateway) instantQuery(ctx fiber.Ctx, slug, expr string) ([]metricSample
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, metricsBodyDrainLimit))
+		resp.Body.Close()
+	}()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("metrics query status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("metrics query status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, metricsInstantQueryMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > metricsInstantQueryMaxBytes {
+		return nil, errors.New("metrics query response exceeded limit")
 	}
 	var decoded queryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := json.Unmarshal(body, &decoded); err != nil {
 		return nil, err
 	}
 	if decoded.Status != "success" || decoded.Data.ResultType != "vector" {
@@ -192,8 +251,21 @@ func sampleFloat(s metricSample) (float64, bool) {
 		return 0, false
 	}
 	v, err := strconv.ParseFloat(raw, 64)
-	return v, err == nil
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return v, true
 }
+
+func unixSecondsToTime(seconds float64) *time.Time {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+		return nil
+	}
+	sec, frac := math.Modf(seconds)
+	t := time.Unix(int64(sec), int64(math.Round(frac*1e9))).UTC()
+	return &t
+}
+
 func sampleTime(s metricSample) *time.Time {
 	if len(s.Value) == 0 {
 		return nil
@@ -202,8 +274,31 @@ func sampleTime(s metricSample) *time.Time {
 	if json.Unmarshal(s.Value[0], &seconds) != nil {
 		return nil
 	}
-	t := time.Unix(int64(seconds), int64((seconds-float64(int64(seconds)))*1e9)).UTC()
-	return &t
+	return unixSecondsToTime(seconds)
+}
+
+func metricSeriesFingerprint(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		if k == "__name__" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte('\x00')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(labels[k])
+	}
+	return b.String()
 }
 
 func (g *Gateway) scrapeTargetHealth(c fiber.Ctx) error {
@@ -214,24 +309,92 @@ func (g *Gateway) scrapeTargetHealth(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	target, err := g.scrapes.Get(c.Context(), projectSlug(c), id)
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
+	target, err := g.scrapes.Get(c.Context(), slug, id)
 	if err != nil {
 		return apiError(c, err)
 	}
 	job := scrape.JobName(target)
-	result, err := g.instantQuery(c, projectSlug(c), fmt.Sprintf(`up{scrape_job=%q}`, job))
-	if err != nil {
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
+	upExpr := fmt.Sprintf(`up{scrape_job=%q}`, job)
+	tsExpr := fmt.Sprintf(`timestamp(up{scrape_job=%q})`, job)
+
+	type queryOut struct {
+		isTimestamp bool
+		samples     []metricSample
+		err         error
 	}
+	queryCtx, cancel := context.WithCancel(c.Context())
+	defer cancel()
+	ch := make(chan queryOut, 2)
+	go func() {
+		samples, qErr := g.instantQuery(queryCtx, slug, upExpr)
+		ch <- queryOut{isTimestamp: false, samples: samples, err: qErr}
+	}()
+	go func() {
+		samples, qErr := g.instantQuery(queryCtx, slug, tsExpr)
+		ch <- queryOut{isTimestamp: true, samples: samples, err: qErr}
+	}()
+
+	var upSamples, tsSamples []metricSample
+	var firstErr error
+	for range 2 {
+		out := <-ch
+		if out.err != nil {
+			if firstErr == nil {
+				firstErr = out.err
+				cancel()
+			}
+			continue
+		}
+		if out.isTimestamp {
+			tsSamples = out.samples
+		} else {
+			upSamples = out.samples
+		}
+	}
+	if firstErr != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": firstErr.Error()})
+	}
+
+	timestamps := make(map[string]float64, len(tsSamples))
+	for _, s := range tsSamples {
+		if ts, valid := sampleFloat(s); valid {
+			fp := metricSeriesFingerprint(s.Metric)
+			if existing, exists := timestamps[fp]; !exists || ts > existing {
+				timestamps[fp] = ts
+			}
+		}
+	}
+
 	status := "unknown"
 	var last *time.Time
-	if len(result) > 0 {
-		last = sampleTime(result[0])
-		if value, valid := sampleFloat(result[0]); valid {
-			if value == 1 {
-				status = "up"
+	var chosen bool
+	var chosenTS float64
+	var chosenKey string
+	for _, s := range upSamples {
+		fp := metricSeriesFingerprint(s.Metric)
+		ts, hasTS := timestamps[fp]
+		if !hasTS {
+			if fallback := sampleTime(s); fallback != nil {
+				ts = float64(fallback.UnixNano()) / 1e9
+			}
+		}
+		if !chosen || ts > chosenTS || (ts == chosenTS && fp > chosenKey) {
+			chosen = true
+			chosenTS = ts
+			chosenKey = fp
+			last = unixSecondsToTime(ts)
+			if value, valid := sampleFloat(s); valid {
+				if value == 1 {
+					status = "up"
+				} else {
+					status = "down"
+				}
 			} else {
-				status = "down"
+				status = "unknown"
 			}
 		}
 	}
@@ -252,7 +415,10 @@ func ptr(v float64) *float64 { return &v }
 func boolPtr(v bool) *bool   { return &v }
 
 func (g *Gateway) hosts(c fiber.Ctx) error {
-	slug := projectSlug(c)
+	slug, ok := sessionProjectSlug(c)
+	if !ok {
+		return nil
+	}
 	queries := []struct{ key, expr string }{
 		{"uname", `max by(instance,nodename) (node_uname_info)`},
 		{"up", `max by(instance) (up{scrape_job=~"scrape-.*"})`},
@@ -260,21 +426,46 @@ func (g *Gateway) hosts(c fiber.Ctx) error {
 		{"load", `max by(instance) (node_load1)`},
 		{
 			"memory",
-			`100 * (1 - max by(instance) (node_memory_MemAvailable_bytes) / max by(instance) (node_memory_MemTotal_bytes))`,
+			`100 * (1 - max by(instance) (node_memory_MemAvailable_bytes) / (max by(instance) (node_memory_MemTotal_bytes) > 0))`,
 		},
 		{
 			"disk",
-			`max by(instance) (100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}))`,
+			`max by(instance) (100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / (node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} > 0)))`,
 		},
 	}
-	all := make(map[string][]metricSample, len(queries))
-	for _, query := range queries {
-		result, err := g.instantQuery(c, slug, query.expr)
-		if err != nil {
-			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
-		}
-		all[query.key] = result
+
+	type hostQueryResult struct {
+		key     string
+		samples []metricSample
+		err     error
 	}
+	queryCtx, cancel := context.WithCancel(c.Context())
+	defer cancel()
+	ch := make(chan hostQueryResult, len(queries))
+	for _, query := range queries {
+		go func(key, expr string) {
+			result, err := g.instantQuery(queryCtx, slug, expr)
+			ch <- hostQueryResult{key: key, samples: result, err: err}
+		}(query.key, query.expr)
+	}
+
+	all := make(map[string][]metricSample, len(queries))
+	var firstErr error
+	for range queries {
+		res := <-ch
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+				cancel()
+			}
+			continue
+		}
+		all[res.key] = res.samples
+	}
+	if firstErr != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": firstErr.Error()})
+	}
+
 	hosts := map[string]*hostDTO{}
 	ensure := func(instance string) *hostDTO {
 		h := hosts[instance]
@@ -284,16 +475,8 @@ func (g *Gateway) hosts(c fiber.Ctx) error {
 		}
 		return h
 	}
-	for _, s := range all["up"] {
-		instance := s.Metric["instance"]
-		if instance == "" {
-			continue
-		}
-		h := ensure(instance)
-		if v, ok := sampleFloat(s); ok {
-			h.Up = boolPtr(v == 1)
-		}
-	}
+	// Only instances with node_* metrics represent hosts; non-host exporters
+	// that emit `up{scrape_job=~"scrape-.*"}` must not appear as host cards.
 	for _, s := range all["uname"] {
 		instance := s.Metric["instance"]
 		if instance == "" {
@@ -307,11 +490,29 @@ func (g *Gateway) hosts(c fiber.Ctx) error {
 	for _, item := range []struct {
 		key string
 		set func(*hostDTO, *float64)
-	}{{"cores", func(h *hostDTO, v *float64) { h.CPUCores = v }}, {"load", func(h *hostDTO, v *float64) { h.Load1 = v }}, {"memory", func(h *hostDTO, v *float64) { h.MemoryUsedPercent = v }}, {"disk", func(h *hostDTO, v *float64) { h.DiskUsedPercentMax = v }}} {
+	}{
+		{"cores", func(h *hostDTO, v *float64) { h.CPUCores = v }},
+		{"load", func(h *hostDTO, v *float64) { h.Load1 = v }},
+		{"memory", func(h *hostDTO, v *float64) { h.MemoryUsedPercent = v }},
+		{"disk", func(h *hostDTO, v *float64) { h.DiskUsedPercentMax = v }},
+	} {
 		for _, s := range all[item.key] {
-			if v, ok := sampleFloat(s); ok && s.Metric["instance"] != "" {
+			if v, valid := sampleFloat(s); valid && s.Metric["instance"] != "" {
 				item.set(ensure(s.Metric["instance"]), ptr(v))
 			}
+		}
+	}
+	for _, s := range all["up"] {
+		instance := s.Metric["instance"]
+		if instance == "" {
+			continue
+		}
+		h := hosts[instance]
+		if h == nil {
+			continue
+		}
+		if v, valid := sampleFloat(s); valid {
+			h.Up = boolPtr(v == 1)
 		}
 	}
 	result := make([]hostDTO, 0, len(hosts))

@@ -71,3 +71,36 @@ func TestCombinedHealthPreservesSupervisorRestartState(t *testing.T) {
 		t.Fatalf("combined health=%v", health)
 	}
 }
+
+func TestCollectPlatformEndpointsIncludesOffsetLoopbackAndExternalStorage(t *testing.T) {
+	cfg := appconfig.Defaults()
+	cfg.Listen = "0.0.0.0:4100"
+	cfg.Process.ComponentPortOffset = 100
+	cfg.Storage.Metrics.QueryURL = "http://vmselect.internal:8481"
+	cfg.Storage.Metrics.IngestURL = "https://vminsert.internal:443"
+	cfg.Storage.Logs.URL = "http://vlogs.internal:9428"
+	cfg.Storage.Traces.URL = "http://vtraces.internal:10428"
+
+	loopback := &internalLoopback{baseURL: "http://127.0.0.1:49876"}
+	ports, hostPorts := collectPlatformEndpoints(cfg, loopback, nil)
+
+	portSet := make(map[int]bool, len(ports))
+	for _, p := range ports {
+		portSet[p] = true
+	}
+	for _, want := range []int{3100, 4100, 18428, 18528, 19528, 20528, 21528, 22528, 49876, 8481, 9428, 10428} {
+		if !portSet[want] {
+			t.Errorf("platform ports missing %d: got=%v", want, ports)
+		}
+	}
+	if portSet[443] {
+		t.Errorf("standard HTTPS port 443 must not be globally blocked across all hosts: ports=%v", ports)
+	}
+	hpSet := make(map[string]bool, len(hostPorts))
+	for _, hp := range hostPorts {
+		hpSet[hp] = true
+	}
+	if !hpSet["vminsert.internal:443"] || !hpSet["127.0.0.1:49876"] {
+		t.Errorf("blockedHostPorts=%v missing expected endpoints", hostPorts)
+	}
+}
