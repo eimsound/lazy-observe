@@ -3,12 +3,15 @@ package scrape
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/outbound"
 )
 
 func openTestStore(t *testing.T) *meta.Store {
@@ -73,5 +76,212 @@ func TestTargetValidationRejectsLoopAndReservedLabels(t *testing.T) {
 		if err := service.validate(input, false); !errors.Is(err, ErrInvalidTarget) {
 			t.Errorf("input %#v: err=%v", input, err)
 		}
+	}
+}
+
+func TestTargetValidationHardeningPortSSRFMetaLabelsAndInterval(t *testing.T) {
+	service := NewService(Config{PlatformPorts: []int{43123}})
+	cases := []struct {
+		name  string
+		input Input
+	}{
+		{"leading-zero-gateway-port", Input{Name: "a", URL: "http://exporter.example.com:03100/metrics"}},
+		{"leading-zero-vm-port", Input{Name: "a", URL: "http://exporter.example.com:018428/metrics"}},
+		{"zero-port", Input{Name: "a", URL: "http://exporter.example.com:0/metrics"}},
+		{"loopback-ssrf", Input{Name: "a", URL: "http://127.0.0.1:9100/metrics"}},
+		{"ipv6-loopback-ssrf", Input{Name: "a", URL: "http://[::1]:9100/metrics"}},
+		{"metadata-ssrf", Input{Name: "a", URL: "http://169.254.169.254:80/latest/meta-data/"}},
+		{"private-ssrf", Input{Name: "a", URL: "http://10.0.0.5:9100/metrics"}},
+		{
+			"meta-label-address",
+			Input{
+				Name:   "a",
+				URL:    "http://exporter.example.com:9100/metrics",
+				Labels: map[string]string{"__address__": "127.0.0.1:18428"},
+			},
+		},
+		{
+			"meta-label-interval",
+			Input{
+				Name:   "a",
+				URL:    "http://exporter.example.com:9100/metrics",
+				Labels: map[string]string{"__scrape_interval__": "10ms"},
+			},
+		},
+		{
+			"meta-label-name",
+			Input{
+				Name:   "a",
+				URL:    "http://exporter.example.com:9100/metrics",
+				Labels: map[string]string{"__name__": "up"},
+			},
+		},
+		{
+			"whitespace-label",
+			Input{
+				Name:   "a",
+				URL:    "http://exporter.example.com:9100/metrics",
+				Labels: map[string]string{" project_id ": "other"},
+			},
+		},
+		{
+			"invalid-label-char",
+			Input{
+				Name:   "a",
+				URL:    "http://exporter.example.com:9100/metrics",
+				Labels: map[string]string{"env-name": "prod"},
+			},
+		},
+		{
+			"nanosecond-interval",
+			Input{Name: "a", URL: "http://exporter.example.com:9100/metrics", Interval: "2000000000ns"},
+		},
+		{"signed-interval", Input{Name: "a", URL: "http://exporter.example.com:9100/metrics", Interval: "+10s"}},
+		{"fractional-interval", Input{Name: "a", URL: "http://exporter.example.com:9100/metrics", Interval: "1.5s"}},
+		{"excessive-interval", Input{Name: "a", URL: "http://exporter.example.com:9100/metrics", Interval: "2h"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := service.validate(tc.input, false); !errors.Is(err, ErrInvalidTarget) {
+				t.Fatalf("input %#v accepted or wrong error: err=%v", tc.input, err)
+			}
+		})
+	}
+}
+
+func TestWriteConfigSetsFollowRedirectsFalseLimitsAndSkipsCorruptRow(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	_, _ = store.CreateProject(ctx, "One", "p1")
+	_, err := store.CreateScrapeTarget(ctx, meta.ScrapeTargetCreate{
+		ProjectSlug: "p1", Name: "corrupt", URL: "not-a-valid-url", Interval: "15s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := store.CreateScrapeTarget(ctx, meta.ScrapeTargetCreate{
+		ProjectSlug: "p1", Name: "healthy", URL: "https://exporter.example.com:9443/metrics", Interval: "1s",
+		Labels: map[string]string{"env": "prod", "__address__": "127.0.0.1:18428"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "scrape.yml")
+	if err := WriteConfig(ctx, store, path); err != nil {
+		t.Fatalf("corrupt row must not block WriteConfig: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(data)
+	for _, want := range []string{
+		"job_name: " + JobName(valid),
+		"follow_redirects: false",
+		"scrape_timeout: 1s",
+		"sample_limit:",
+		"label_limit:",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("config missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "__address__") {
+		t.Errorf("meta label leaked into scrape.yml:\n%s", rendered)
+	}
+}
+
+type staticResolver map[string][]netip.Addr
+
+func (r staticResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	addrs, ok := r[host]
+	if !ok {
+		return nil, errors.New("no such host")
+	}
+	return addrs, nil
+}
+
+func TestServiceQuotaRollbackConcurrentPatchAndDNSBlocking(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	_, _ = store.CreateProject(ctx, "One", "p1")
+
+	resolver := staticResolver{
+		"internal.example.com": {netip.MustParseAddr("169.254.169.254")},
+		"public.example.com":   {netip.MustParseAddr("93.184.216.34")},
+	}
+	var failReload bool
+	cfgPath := filepath.Join(t.TempDir(), "scrape.yml")
+	service := NewService(Config{
+		Store:                store,
+		ConfigPath:           cfgPath,
+		MaxTargetsPerProject: 2,
+		Resolver:             resolver,
+		OutboundPolicy:       outbound.Policy{},
+		Reload: func() error {
+			if failReload {
+				return errors.New("reload failed")
+			}
+			return nil
+		},
+	})
+
+	if _, err := service.Create(ctx, "p1", Input{
+		Name: "dns-ssrf", URL: "http://internal.example.com:9100/metrics", Interval: "15s",
+	}); !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("DNS resolving to metadata IP should be rejected, got err=%v", err)
+	}
+
+	failReload = true
+	if _, err := service.Create(ctx, "p1", Input{
+		Name: "rolled-back", URL: "http://public.example.com:9100/metrics", Interval: "15s",
+	}); err == nil {
+		t.Fatal("expected create to fail when reload fails")
+	}
+	failReload = false
+	if list, err := service.List(ctx, "p1"); err != nil || len(list) != 0 {
+		t.Fatalf("failed reload should roll back DB insert, got list=%+v err=%v", list, err)
+	}
+
+	first, err := service.Create(ctx, "p1", Input{
+		Name: "t1", URL: "http://public.example.com:9100/metrics", Interval: "15s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, "p1", Input{
+		Name: "t2", URL: "http://public.example.com:9101/metrics", Interval: "15s",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, "p1", Input{
+		Name: "t3", URL: "http://public.example.com:9102/metrics", Interval: "15s",
+	}); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("3rd target err=%v want ErrQuotaExceeded", err)
+	}
+
+	// Concurrent PATCHes modifying disjoint fields must not clobber each other.
+	disabled := false
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var errA, errB error
+	go func() {
+		defer wg.Done()
+		_, errA = service.Update(ctx, "p1", first.ID, Input{Name: "t1-renamed"})
+	}()
+	go func() {
+		defer wg.Done()
+		_, errB = service.Update(ctx, "p1", first.ID, Input{Enabled: &disabled})
+	}()
+	wg.Wait()
+	if errA != nil || errB != nil {
+		t.Fatalf("concurrent PATCH errors: errA=%v errB=%v", errA, errB)
+	}
+	got, err := service.Get(ctx, "p1", first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "t1-renamed" || got.Enabled {
+		t.Fatalf("lost update under concurrent PATCH: got=%+v want name=t1-renamed enabled=false", got)
 	}
 }

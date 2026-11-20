@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
@@ -59,6 +63,109 @@ func serverOutboundPolicy(cfg appconfig.Config) (outbound.Policy, error) {
 	}
 	policy.BlockedPorts = blocked
 	return policy, nil
+}
+
+// enrichServerOutboundPolicy adds runtime-bound platform ports (such as the
+// ephemeral TLS internal loopback listener and external storage ports) into
+// the shared outbound policy before services and gateway start.
+func enrichServerOutboundPolicy(
+	policy *outbound.Policy,
+	cfg appconfig.Config,
+	loopback *internalLoopback,
+	signals *serverSignalStorage,
+) {
+	if policy == nil {
+		return
+	}
+	if policy.BlockedPorts == nil {
+		policy.BlockedPorts = make(map[int]struct{})
+	}
+	ports, _ := collectPlatformEndpoints(cfg, loopback, signals)
+	for _, port := range ports {
+		policy.BlockedPorts[port] = struct{}{}
+	}
+}
+
+// collectPlatformEndpoints gathers all platform-owned TCP ports (default
+// embedded ports, configured listen port, offset embedded ports, TLS internal
+// loopback port, and non-standard external storage ports) plus exact host:port
+// entries for all configured storage endpoints so scrape targets cannot pivot
+// into internal platform services.
+func collectPlatformEndpoints(
+	cfg appconfig.Config,
+	loopback *internalLoopback,
+	signals *serverSignalStorage,
+) ([]int, []string) {
+	portSet := map[int]struct{}{
+		3100:  {},
+		18428: {},
+		19428: {},
+		20428: {},
+		21428: {},
+		22428: {},
+	}
+	if port := listenPort(cfg.Listen); port > 0 && port <= 65535 {
+		portSet[port] = struct{}{}
+	}
+	if offset := cfg.Process.ComponentPortOffset; offset != 0 {
+		for _, basePort := range []int{18428, 19428, 20428, 21428, 22428} {
+			if p := basePort + offset; p > 0 && p <= 65535 {
+				portSet[p] = struct{}{}
+			}
+		}
+	}
+	hostPortSet := make(map[string]struct{})
+	addURL := func(raw string, blockStandardPort bool) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" {
+			return
+		}
+		var port int
+		if rawPort := u.Port(); rawPort != "" {
+			p, _, normErr := outbound.NormalizePort(rawPort)
+			if normErr != nil {
+				return
+			}
+			port = p
+		} else if strings.EqualFold(u.Scheme, "https") {
+			port = 443
+		} else if strings.EqualFold(u.Scheme, "http") {
+			port = 80
+		} else {
+			return
+		}
+		if blockStandardPort || (port != 80 && port != 443) {
+			portSet[port] = struct{}{}
+		}
+		hostPortSet[net.JoinHostPort(strings.ToLower(u.Hostname()), strconv.Itoa(port))] = struct{}{}
+	}
+	if loopback != nil {
+		addURL(loopback.baseURL, true)
+	}
+	if signals != nil && signals.backend != nil {
+		addURL(signals.backend.MetricsQueryBase(), false)
+		addURL(signals.backend.MetricsIngestBase(), false)
+		addURL(signals.backend.LogsBase(), false)
+		addURL(signals.backend.TracesBase(), false)
+	}
+	addURL(cfg.Storage.Metrics.QueryURL, false)
+	addURL(cfg.Storage.Metrics.IngestURL, false)
+	addURL(cfg.Storage.Logs.URL, false)
+	addURL(cfg.Storage.Traces.URL, false)
+
+	ports := make([]int, 0, len(portSet))
+	for port := range portSet {
+		ports = append(ports, port)
+	}
+	hostPorts := make([]string, 0, len(hostPortSet))
+	for hp := range hostPortSet {
+		hostPorts = append(hostPorts, hp)
+	}
+	return ports, hostPorts
 }
 
 // secretKeyFile is the configured platform encryption key file; an empty

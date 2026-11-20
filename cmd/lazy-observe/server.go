@@ -63,10 +63,12 @@ func runServer(cfg appconfig.Config) error {
 	}
 	defer loopback.Close()
 
+	enrichServerOutboundPolicy(&essentials.outboundPolicy, cfg, loopback, signals)
+
 	monitoring := startSelfMonitoring(cfg, loopback.baseURL, metadata.selfProject, metadata.selfToken, logger)
 	defer monitoring.Shutdown()
 
-	services := startServerServices(ctx, cfg, monitoring.logger, essentials, metadata, signals, shared.limits)
+	services := startServerServices(ctx, cfg, monitoring.logger, essentials, metadata, signals, loopback, shared.limits)
 	defer services.Close()
 
 	runningGateway, err := startGateway(

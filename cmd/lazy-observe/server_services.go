@@ -85,6 +85,7 @@ func startServerServices(
 	essentials serverEssentials,
 	metadata *serverMetadata,
 	signals *serverSignalStorage,
+	loopback *internalLoopback,
 	limits sharedstate.Limiter,
 ) *serverServices {
 	alerts := alert.NewService(
@@ -98,7 +99,7 @@ func startServerServices(
 			SharedLimiter:  sharedAlertLimiter(cfg, limits),
 		},
 	)
-	scrapes, unavailableReason := startScrapeService(cfg, logger, metadata.store, signals)
+	scrapes, unavailableReason := startScrapeService(cfg, logger, essentials, metadata.store, signals, loopback)
 	startRetentionJanitor(ctx, cfg, logger, metadata)
 	return &serverServices{
 		alerts:                  alerts,
@@ -117,16 +118,22 @@ func sharedAlertLimiter(cfg appconfig.Config, limits sharedstate.Limiter) shared
 func startScrapeService(
 	cfg appconfig.Config,
 	logger *slog.Logger,
+	essentials serverEssentials,
 	store *meta.Store,
 	signals *serverSignalStorage,
+	loopback *internalLoopback,
 ) (*scrape.Service, string) {
 	if signals.ingestURL != "" {
+		platformPorts, blockedHostPorts := collectPlatformEndpoints(cfg, loopback, signals)
 		return scrape.NewService(
 			scrape.Config{
-				Store:         store,
-				ConfigPath:    signals.scrapeConfigPath,
-				Reload:        signals.supervisor.ReloadVMAgent,
-				PlatformPorts: []int{listenPort(cfg.Listen)},
+				Store:            store,
+				ConfigPath:       signals.scrapeConfigPath,
+				Reload:           signals.supervisor.ReloadVMAgent,
+				PlatformPorts:    platformPorts,
+				BlockedHostPorts: blockedHostPorts,
+				OutboundPolicy:   essentials.outboundPolicy,
+				Logger:           logger,
 			},
 		), ""
 	}

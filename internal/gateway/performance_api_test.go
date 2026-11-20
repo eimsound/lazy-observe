@@ -28,7 +28,7 @@ func TestPerformanceEndpointsUsesHistogramMetricsAndPreservesContract(t *testing
 			t.Errorf("project filter=%q", query.Get("extra_filters[]"))
 		}
 		expression := query.Get("query")
-		if strings.Contains(expression, "span") || !strings.Contains(expression, "[120s]") {
+		if strings.Contains(expression, "span") {
 			t.Errorf("query=%q", expression)
 		}
 
@@ -36,12 +36,18 @@ func TestPerformanceEndpointsUsesHistogramMetricsAndPreservesContract(t *testing
 		switch r.URL.Path {
 		case "/api/v1/query_range":
 			resultType = "matrix"
+			if !strings.Contains(expression, "[60s]") {
+				t.Errorf("range query=%q want [60s]", expression)
+			}
 			if query.Get("start") != start.Format(time.RFC3339Nano) ||
 				query.Get("end") != end.Format(time.RFC3339Nano) ||
 				query.Get("step") != "60" {
 				t.Errorf("range query=%v", query)
 			}
 		case "/api/v1/query":
+			if !strings.Contains(expression, "[120s]") {
+				t.Errorf("instant query=%q want [120s]", expression)
+			}
 			if query.Get("time") != end.Format(time.RFC3339Nano) {
 				t.Errorf("instant query=%v", query)
 			}
@@ -210,8 +216,9 @@ func TestPerformanceTrendRateWindow(t *testing.T) {
 		want   time.Duration
 	}{
 		{window: time.Hour, step: 5 * time.Second, want: time.Minute},
-		{window: time.Hour, step: 5 * time.Minute, want: 20 * time.Minute},
-		{window: 2 * time.Minute, step: time.Minute, want: 2 * time.Minute},
+		{window: time.Hour, step: 5 * time.Minute, want: 5 * time.Minute},
+		{window: 2 * time.Minute, step: time.Minute, want: time.Minute},
+		{window: 30 * time.Second, step: 10 * time.Second, want: 30 * time.Second},
 	} {
 		if got := performanceTrendRateWindow(test.window, test.step); got != test.want {
 			t.Errorf("window=%s step=%s got=%s want=%s", test.window, test.step, got, test.want)
@@ -281,4 +288,149 @@ func TestPerformanceEndpointsRejectInvalidWindowAndMalformedBackend(t *testing.T
 
 func closeFloat(got, want float64) bool {
 	return math.Abs(got-want) < 1e-12
+}
+
+func TestPerformanceEndpointsMergesNormalizedKeyCollisions(t *testing.T) {
+	start := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	end := start.Add(5 * time.Minute)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expression := r.URL.Query().Get("query")
+		resultType := "vector"
+		if r.URL.Path == "/api/v1/query_range" {
+			resultType = "matrix"
+		}
+		var result []map[string]any
+		makeSeries := func(method string, val float64) map[string]any {
+			item := map[string]any{
+				"metric": map[string]string{
+					"service.name":        "api",
+					"http.request.method": method,
+					"http.route":          "/items",
+				},
+			}
+			if resultType == "matrix" {
+				item["values"] = [][]any{{start.Unix(), fmt.Sprint(val)}}
+			} else {
+				item["value"] = []any{end.Unix(), fmt.Sprint(val)}
+			}
+			return item
+		}
+		switch {
+		case strings.Contains(expression, "histogram_quantiles"):
+			for _, pair := range []struct {
+				method string
+				val    float64
+			}{{"get", 0.020}, {"GET", 0.050}} {
+				item := makeSeries(pair.method, pair.val)
+				item["metric"].(map[string]string)["quantile"] = "0.95"
+				result = append(result, item)
+			}
+		case strings.Contains(expression, `http\.response\.status_code=~"5.."`):
+			result = []map[string]any{makeSeries("get", 0.5), makeSeries("GET", 0.0)}
+		default:
+			result = []map[string]any{makeSeries("get", 2.0), makeSeries("GET", 3.0)}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"data":   map[string]any{"resultType": resultType, "result": result},
+		})
+	}))
+	defer upstream.Close()
+	app := newTestGateway(Config{
+		Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 42, Slug: "alpha"}},
+		Metrics: upstream.URL,
+		Now:     func() time.Time { return end },
+	}).App()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/performance/endpoints?"+url.Values{
+		"start": {fmt.Sprint(start.Unix())},
+		"end":   {fmt.Sprint(end.Unix())},
+		"step":  {"60"},
+	}.Encode(), nil)
+	req.Header.Set("Authorization", "Bearer lou_valid")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got performanceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Endpoints) != 1 {
+		t.Fatalf("endpoints=%#v want 1 merged endpoint", got.Endpoints)
+	}
+	ep := got.Endpoints[0]
+	// Throughput must sum (2 + 3 = 5), not overwrite; weighted error rate = (2*0.5 + 3*0)/(2+3) = 0.2; P95 = max(20, 50) = 50.
+	if !closeFloat(ep.Throughput, 5.0) || !closeFloat(ep.ErrorRate, 0.2) || !closeFloat(ep.P95, 50.0) {
+		t.Fatalf("merged endpoint=%+v want throughput=5 errorRate=0.2 p95=50", ep)
+	}
+}
+
+func TestPerformanceEndpointsTruncatesHighCardinalityAndRejectsSubSecondWindow(t *testing.T) {
+	start := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	end := start.Add(5 * time.Minute)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resultType := "vector"
+		if r.URL.Path == "/api/v1/query_range" {
+			resultType = "matrix"
+		}
+		var result []map[string]any
+		if resultType == "vector" && strings.Contains(r.URL.Query().Get("query"), performanceDurationCountMetric) &&
+			!strings.Contains(r.URL.Query().Get("query"), `5..`) {
+			for i := range performanceMaxEndpoints + 15 {
+				result = append(result, map[string]any{
+					"metric": map[string]string{
+						"service.name":        "api",
+						"http.request.method": "GET",
+						"http.route":          fmt.Sprintf("/route/%03d", i),
+					},
+					"value": []any{end.Unix(), "1"},
+				})
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"data":   map[string]any{"resultType": resultType, "result": result},
+		})
+	}))
+	defer upstream.Close()
+	app := newTestGateway(Config{
+		Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 42, Slug: "alpha"}},
+		Metrics: upstream.URL,
+		Now:     func() time.Time { return end },
+	}).App()
+
+	// Sub-second time range must be rejected with 400.
+	subSecReq := httptest.NewRequest(http.MethodGet, "/api/v1/performance/endpoints?"+url.Values{
+		"start": {start.Format(time.RFC3339Nano)},
+		"end":   {start.Add(200 * time.Millisecond).Format(time.RFC3339Nano)},
+	}.Encode(), nil)
+	subSecReq.Header.Set("Authorization", "Bearer lou_valid")
+	subSecResp, err := app.Test(subSecReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subSecResp.Body.Close()
+	if subSecResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("sub-second window status=%d want=400", subSecResp.StatusCode)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/performance/endpoints?"+url.Values{
+		"start": {fmt.Sprint(start.Unix())},
+		"end":   {fmt.Sprint(end.Unix())},
+		"step":  {"60"},
+	}.Encode(), nil)
+	req.Header.Set("Authorization", "Bearer lou_valid")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got performanceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Truncated || len(got.Endpoints) != performanceMaxEndpoints {
+		t.Fatalf("truncated=%v len=%d want true/%d", got.Truncated, len(got.Endpoints), performanceMaxEndpoints)
+	}
 }
