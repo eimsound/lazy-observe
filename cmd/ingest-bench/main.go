@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -36,6 +37,8 @@ import (
 
 type result struct {
 	Version          int      `json:"version"`
+	GitCommit        string   `json:"git_commit,omitempty"`
+	GeneratedAt      string   `json:"generated_at,omitempty"`
 	DurationSeconds  float64  `json:"duration_seconds"`
 	Concurrency      int      `json:"concurrency"`
 	BatchSize        int      `json:"batch_size"`
@@ -49,6 +52,11 @@ type result struct {
 	GatePassed       bool     `json:"gate_passed"`
 	GateFailures     []string `json:"gate_failures,omitempty"`
 }
+
+const (
+	p99LatencyMultiplier = 3.0
+	minP99BudgetMS       = 10.0
+)
 
 func main() {
 	var binary, binDir, output, baseline string
@@ -69,11 +77,16 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	r.GitCommit = currentGitCommit()
+	r.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
 	r.GatePassed = true
 	if baseline != "" {
 		if err := applyGate(&r, baseline); err != nil {
 			fatal(err)
 		}
+	} else if r.RequestsFailed > 0 {
+		r.GateFailures = append(r.GateFailures, fmt.Sprintf("failed requests %d > 0", r.RequestsFailed))
+		r.GatePassed = false
 	}
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
@@ -253,6 +266,12 @@ func applyGate(current *result, path string) error {
 	if err := json.Unmarshal(data, &baseline); err != nil {
 		return fmt.Errorf("parse baseline: %w", err)
 	}
+	if current.RequestsFailed > 0 {
+		current.GateFailures = append(
+			current.GateFailures,
+			fmt.Sprintf("failed requests %d > 0", current.RequestsFailed),
+		)
+	}
 	if current.SamplesPerSecond < baseline.SamplesPerSecond*0.6 {
 		current.GateFailures = append(
 			current.GateFailures,
@@ -265,6 +284,20 @@ func applyGate(current *result, path string) error {
 			fmt.Sprintf("logs/s %.0f < baseline %.0f x 0.6", current.LogsPerSecond, baseline.LogsPerSecond),
 		)
 	}
+	if baseline.P99LatencyMS > 0 {
+		maxP99MS := math.Max(baseline.P99LatencyMS*p99LatencyMultiplier, minP99BudgetMS)
+		if current.P99LatencyMS > maxP99MS {
+			current.GateFailures = append(
+				current.GateFailures,
+				fmt.Sprintf(
+					"p99 latency %.2fms > budget %.2fms (baseline %.2fms)",
+					current.P99LatencyMS,
+					maxP99MS,
+					baseline.P99LatencyMS,
+				),
+			)
+		}
+	}
 	if baseline.MaxRSSBytes > 0 && current.MaxRSSBytes > baseline.MaxRSSBytes*3/2 {
 		current.GateFailures = append(
 			current.GateFailures,
@@ -273,6 +306,17 @@ func applyGate(current *result, path string) error {
 	}
 	current.GatePassed = len(current.GateFailures) == 0
 	return nil
+}
+
+func currentGitCommit() string {
+	if envCommit := strings.TrimSpace(os.Getenv("LO_PERF_COMMIT")); envCommit != "" {
+		return envCommit
+	}
+	out, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func freeAddress() (string, error) {

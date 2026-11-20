@@ -110,6 +110,8 @@ type scaleRoundEfficiency struct {
 
 type scaleGateResult struct {
 	Version                       int                           `json:"version"`
+	GitCommit                     string                        `json:"git_commit,omitempty"`
+	GeneratedAt                   string                        `json:"generated_at,omitempty"`
 	Scope                         string                        `json:"scope"`
 	ScalingModel                  string                        `json:"scaling_model"`
 	MeasurementUpstream           string                        `json:"measurement_upstream"`
@@ -604,6 +606,7 @@ func runScaleGate(args []string) error {
 		cfg.HAScaling.MinReplicaEfficiency,
 	)
 	result.Version = 6
+	result.GitCommit, result.GeneratedAt = resultMetadata()
 	result.Scope = "stateless_platform_gateway"
 	result.ScalingModel = "weak_scaling_with_single_high_concurrency_control"
 	result.MeasurementUpstream = "controlled_validating_otlp_sink"

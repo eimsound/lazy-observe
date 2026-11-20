@@ -25,6 +25,8 @@ var releasePayloadNames = []string{
 
 type releaseSizeResult struct {
 	Version        int    `json:"version"`
+	GitCommit      string `json:"git_commit,omitempty"`
+	GeneratedAt    string `json:"generated_at,omitempty"`
 	Binary         string `json:"binary"`
 	SizeBytes      int64  `json:"size_bytes"`
 	MaxBinaryBytes int64  `json:"max_binary_bytes"`
@@ -58,8 +60,10 @@ func runReleaseSize(args []string) error {
 	if err != nil {
 		return err
 	}
+	gitCommit, generatedAt := resultMetadata()
 	result := releaseSizeResult{
-		Version: 1, Binary: *binary, SizeBytes: info.Size(),
+		Version: 1, GitCommit: gitCommit, GeneratedAt: generatedAt,
+		Binary: *binary, SizeBytes: info.Size(),
 		MaxBinaryBytes: cfg.Release.MaxBinaryBytes,
 		Platform:       *platform,
 		EmbeddedFiles:  embeddedFiles,

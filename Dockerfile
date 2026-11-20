@@ -55,7 +55,7 @@ RUN set -eu; \
 # github_token is provided as a BuildKit secret (never an ARG/ENV, so it never
 # lands in the image config). Authenticates aqua against the GitHub API to stay
 # clear of the anonymous rate limit; tolerated as absent via `|| true`.
-RUN --mount=type=secret,id=github_token bash -c ' \
+RUN --mount=type=secret,id=github_token bash -euo pipefail -c ' \
   GITHUB_TOKEN="$(cat /run/secrets/github_token 2>/dev/null || true)"; \
   export GITHUB_TOKEN; \
   mise trust /src/mise.toml && mise install go node pnpm \
@@ -72,7 +72,7 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
     mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
-COPY --from=builder --chown=65532:65532 /out/lazy-observe /usr/local/bin/lazy-observe
+COPY --from=builder --chmod=0755 /out/lazy-observe /usr/local/bin/lazy-observe
 COPY --from=builder --chown=65532:65532 /out/data /data
 COPY LICENSE /usr/share/doc/lazy-observe/LICENSE
 COPY third_party/ /usr/share/doc/lazy-observe/third_party/

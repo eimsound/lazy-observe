@@ -1,4 +1,15 @@
-{{- if .Values.podDisruptionBudget.enabled }}
+{{- if and .Values.podDisruptionBudget.enabled (eq .Values.mode "standalone-ha") -}}
+{{- $effectiveReplicas := int (ternary .Values.hpa.minReplicas .Values.replicaCount .Values.hpa.enabled) -}}
+{{- $minAvailStr := toString .Values.podDisruptionBudget.minAvailable -}}
+{{- $render := false -}}
+{{- if gt $effectiveReplicas 1 -}}
+  {{- if hasSuffix "%" $minAvailStr -}}
+    {{- $render = true -}}
+  {{- else if gt $effectiveReplicas (int .Values.podDisruptionBudget.minAvailable) -}}
+    {{- $render = true -}}
+  {{- end -}}
+{{- end -}}
+{{- if $render }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -10,5 +21,6 @@ spec:
   selector:
     matchLabels:
       {{- include "lazy-observe.selectorLabels" . | nindent 6 }}
+{{- end }}
 {{- end }}
 

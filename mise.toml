@@ -233,6 +233,7 @@ storage=${STORAGE_BIN_DIR:-$PWD/.cache/storage-bin}
 output=${LO_PERF_OUTPUT_DIR:-bench/results}
 case "$binary" in /*) binary_path=$binary ;; *) binary_path=$PWD/$binary ;; esac
 case "$storage" in /*) storage_path=$storage ;; *) storage_path=$PWD/$storage ;; esac
+rm -f "$output/query.json" "$output/scale.json"
 LO_E2E_PERF_GATES=1 LO_PERF_OUTPUT_DIR="$output" \
 LO_E2E_BINARY="$binary_path" LO_E2E_STORAGE_BIN_DIR="$storage_path" \
   bash scripts/e2e-multi-replica.sh
@@ -345,6 +346,7 @@ uv venv --managed-python --python "$version" --clear .venv
 uv pip install --quiet --python .venv/bin/python -e ".[test]"
 .venv/bin/python -VV
 .venv/bin/python -m pytest -q tests
+bash ../../scripts/check-python-licenses.sh .venv/bin/python
 '''
 
 [tasks.sdk-python-release]
@@ -386,12 +388,14 @@ args=()
 if [[ -n ${BENCH_BASELINE:-} ]]; then
   args+=(--baseline "$BENCH_BASELINE")
 fi
+output=${BENCH_OUTPUT:-bench/result.json}
+rm -f "$output"
 CGO_ENABLED=0 go run ./cmd/ingest-bench \
   --binary "$binary" --storage-bin-dir "$storage" \
   --duration "${BENCH_DURATION:-30s}" \
   --concurrency "${BENCH_CONCURRENCY:-4}" \
   --batch-size "${BENCH_BATCH_SIZE:-200}" \
-  --output "${BENCH_OUTPUT:-bench/result.json}" \
+  --output "$output" \
   "${args[@]}"
 '''
 
@@ -404,6 +408,8 @@ set -euo pipefail
 
 output=${LO_PERF_OUTPUT_DIR:-bench/results}
 mkdir -p "$output"
+native="$(go env GOOS)-$(go env GOARCH)"
+rm -f "$output/release-linux-amd64.json" "$output/release-linux-arm64.json" "$output/release-smoke-$native.json"
 bash scripts/check-goreleaser-adapter.sh
 for platform in linux-amd64 linux-arm64; do
   CGO_ENABLED=0 go run ./cmd/perf-gate release-size \
@@ -411,7 +417,6 @@ for platform in linux-amd64 linux-arm64; do
     --binary "bin/lazy-observe-$platform" --platform "$platform" \
     --output "$output/release-$platform.json"
 done
-native="$(go env GOOS)-$(go env GOARCH)"
 case "$native" in linux-amd64|linux-arm64) ;; *)
   printf 'SKIP: native zero-config smoke is unsupported on %s\n' "$native" >&2
   exit 77

@@ -14,7 +14,9 @@ image:
   # helm-values-lazy-observe-<version>.yaml with this field filled in from the
   # image the release published (see docs/deployment.md).
   digest: ""
-  pullPolicy: IfNotPresent
+  # Leave empty to use Always when running the mutable :latest tag without a
+  # digest, and IfNotPresent for any pinned tag or digest.
+  pullPolicy: ""
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -29,6 +31,12 @@ service:
 ingress:
   enabled: false
   className: ""
+  # Reference annotations for nginx-ingress when serving OTLP/source-map uploads
+  # (up to 52 MiB) and Live Tail SSE streams over HTTPS:
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "52m"
+  #   nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   annotations: {}
   hosts:
     - host: lazy-observe.local
@@ -144,6 +152,36 @@ adminPassword:
   # so reading it needs `kubectl debug` (see NOTES).
   autoGenerate: true
 
+security:
+  # Mark session and CSRF cookies Secure. Enable when TLS terminates at an
+  # Ingress or reverse proxy in front of lazy-observe.
+  sessionSecureCookie: false
+
+automountServiceAccountToken: false
+
+# Defaults comply with Kubernetes Pod Security Standards "restricted" and match
+# the distroless nonroot UID/GID (65532:65532) so block-storage PVCs mounted at
+# /data are writable without EACCES.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+emptyDir:
+  dataSizeLimit: 1Gi
+  tmpSizeLimit: 256Mi
+
 process:
   startupTimeout: 20s
   shutdownTimeout: 15s
@@ -155,9 +193,11 @@ resources:
   requests:
     cpu: 250m
     memory: 512Mi
+    ephemeral-storage: 256Mi
   limits:
     cpu: "2"
     memory: 2Gi
+    ephemeral-storage: 2Gi
 
 hpa:
   enabled: false
@@ -179,4 +219,8 @@ podAnnotations: {}
 podLabels: {}
 nodeSelector: {}
 tolerations: []
+# Built-in podAntiAffinity preset used when `affinity` is empty:
+# "" (disabled), "soft" (preferred), or "hard" (required). Scoped by both
+# app.kubernetes.io/name and app.kubernetes.io/instance.
+podAntiAffinity: ""
 affinity: {}

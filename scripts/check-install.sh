@@ -50,6 +50,19 @@ FIXTURE_DIR="$fixture" PATH="$work/fake-bin:$PATH" PREFIX="$work/prefix" \
 [[ -x $work/prefix/bin/lazy-observe ]]
 [[ $("$work/prefix/bin/lazy-observe") == 'fixture binary' ]]
 
+# 尚不存在但祖先可写的自定义 PREFIX（例如 $HOME/.local/lazy-observe）不得误触发 sudo。
+cat >"$work/fake-bin/sudo" <<'EOF'
+#!/bin/sh
+printf 'unexpected sudo invocation: %s\n' "$*" >&2
+exit 99
+EOF
+chmod 0755 "$work/fake-bin/sudo"
+FIXTURE_DIR="$fixture" PATH="$work/fake-bin:$PATH" PREFIX="$work/new/nested/prefix" \
+  LO_INSTALL_OS=linux LO_INSTALL_ARCH=amd64 VERSION=v1.2.3 \
+  sh "$root/scripts/install.sh" >/dev/null
+[[ -x $work/new/nested/prefix/bin/lazy-observe ]]
+[[ $("$work/new/nested/prefix/bin/lazy-observe") == 'fixture binary' ]]
+
 printf '%064d  lazy-observe_linux_amd64.tar.gz\n' 0 >"$fixture/checksums.txt"
 if FIXTURE_DIR="$fixture" PATH="$work/fake-bin:$PATH" PREFIX="$work/bad-prefix" \
   LO_INSTALL_OS=linux LO_INSTALL_ARCH=amd64 VERSION=v1.2.3 \

@@ -76,6 +76,7 @@ if (licenses.length === 0) {
 }
 
 const violations = [];
+const resolvedVersions = new Map();
 for (const license of licenses.sort()) {
   const packages = groups[license];
   if (!Array.isArray(packages) || packages.length === 0) {
@@ -92,6 +93,15 @@ for (const license of licenses.sort()) {
     const declared = dependency && typeof dependency.license === "string"
       ? dependency.license
       : "";
+
+    if (validName) {
+      if (!resolvedVersions.has(name)) {
+        resolvedVersions.set(name, new Set());
+      }
+      for (const version of versions) {
+        resolvedVersions.get(name).add(version);
+      }
+    }
 
     if (
       !validName ||
@@ -111,6 +121,25 @@ for (const license of licenses.sort()) {
 
 if (violations.length !== 0) {
   fail(`production dependency license violations:\n  ${violations.join("\n  ")}`);
+}
+
+const noticePath = `${workspace}/THIRD_PARTY_LICENSES.md`;
+if (fs.existsSync(noticePath)) {
+  const notice = fs.readFileSync(noticePath, "utf8");
+  const drift = [];
+  const pinRe = /`((?:@[a-z0-9._-]+\/)?[a-z0-9._-]+)`\s+([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)/g;
+  for (const match of notice.matchAll(pinRe)) {
+    const [, pkg, documentedVersion] = match;
+    const actual = resolvedVersions.get(pkg);
+    if (!actual || actual.size === 0) {
+      drift.push(`${pkg} ${documentedVersion} (not found in production dependencies)`);
+    } else if (!actual.has(documentedVersion)) {
+      drift.push(`${pkg}: documented ${documentedVersion}, resolved ${Array.from(actual).sort().join(",")}`);
+    }
+  }
+  if (drift.length !== 0) {
+    fail(`${noticePath} version drift:\n  ${drift.join("\n  ")}`);
+  }
 }
 
 console.log(`PASS: ${workspace} production dependencies use the JavaScript license allowlist`);

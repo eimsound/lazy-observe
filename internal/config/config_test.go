@@ -112,6 +112,58 @@ func TestSecurityOutboundAllowlistConfigAndValidation(t *testing.T) {
 	}
 }
 
+func TestSecuritySessionSecureCookieFileEnvAndFlag(t *testing.T) {
+	if Defaults().Security.SessionSecureCookie {
+		t.Fatal("session_secure_cookie must default to false")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("security:\n  session_secure_cookie: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fromFile, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fromFile.Security.SessionSecureCookie {
+		t.Fatal("YAML security.session_secure_cookie=true was not loaded")
+	}
+	fromEnv, _, err := Load([]string{"--config", path}, func(key string) (string, bool) {
+		if key == "LO_SECURITY_SESSION_SECURE_COOKIE" {
+			return "false", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromEnv.Security.SessionSecureCookie {
+		t.Fatal("LO_SECURITY_SESSION_SECURE_COOKIE=false did not override YAML")
+	}
+	fromFlag, _, err := Load(
+		[]string{"--config", path, "--security-secure-cookie=true"},
+		func(key string) (string, bool) {
+			if key == "LO_SECURITY_SESSION_SECURE_COOKIE" {
+				return "false", true
+			}
+			return "", false
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fromFlag.Security.SessionSecureCookie {
+		t.Fatal("--security-secure-cookie=true did not override environment")
+	}
+	if _, _, err := Load(nil, func(key string) (string, bool) {
+		if key == "LO_SECURITY_SESSION_SECURE_COOKIE" {
+			return "not-a-bool", true
+		}
+		return "", false
+	}); err == nil {
+		t.Fatal("invalid LO_SECURITY_SESSION_SECURE_COOKIE value must fail")
+	}
+}
+
 func TestRetentionDefaults(t *testing.T) {
 	cfg := Defaults()
 	if !cfg.ServeWebUI {
