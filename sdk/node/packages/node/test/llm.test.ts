@@ -22,6 +22,10 @@ describe("LLM fetch instrumentation", () => {
     expect(detectLLMSystem("/proxy/v1/messages")).toBe("anthropic");
     expect(detectLLMSystem("/api/chat")).toBe("ollama");
     expect(detectLLMSystem("/v1/models")).toBeUndefined();
+    expect(detectLLMSystem("/v1/messages/count_tokens")).toBeUndefined();
+    expect(detectLLMSystem("/v1/messages/msg_123")).toBeUndefined();
+    expect(detectLLMSystem("/api/chat/history")).toBeUndefined();
+    expect(detectLLMSystem("/v1/chat/completions/abc")).toBeUndefined();
   });
 
   it.each([
@@ -98,5 +102,80 @@ describe("LLM fetch instrumentation", () => {
     expect(span.status.code).toBe(SpanStatusCode.ERROR);
     expect(span.events.some((event) => event.name === "exception")).toBe(true);
     await provider.shutdown();
+  });
+
+  it("ends span immediately on non-2xx streaming responses without leaking", async () => {
+    const { exporter, provider, wrapped } = harness(false, async () =>
+      new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await wrapped("http://llm.test/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const span = onlySpan(exporter);
+    expect(span.status.code).toBe(SpanStatusCode.ERROR);
+    await provider.shutdown();
+  });
+
+  it("captures cache and reasoning tokens for OpenAI and Anthropic streams and bounds oversized lines", async () => {
+    const oversizedLine = `data: ${"x".repeat((1 << 20) + 1024)}\n`;
+    const anthropicStream = [
+      oversizedLine,
+      `event: message_start`,
+      `data: {"type":"message_start","message":{"model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"cache_creation_input_tokens":5000,"cache_read_input_tokens":20000}}}`,
+      ``,
+      `event: content_block_delta`,
+      `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello cache"}}`,
+      ``,
+      `event: message_delta`,
+      `data: {"type":"message_delta","usage":{"output_tokens":42}}`,
+      ``,
+    ].join("\n");
+    const { exporter, provider, wrapped } = harness(true, async () =>
+      new Response(anthropicStream, { headers: { "content-type": "text/event-stream" } }),
+    );
+    const resp = await wrapped("http://llm.test/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "claude-sonnet-4", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    await resp.text();
+    const attrs = onlySpan(exporter).attributes;
+    expect(attrs).toMatchObject({
+      "gen_ai.response.model": "claude-sonnet-4-20250514",
+      "gen_ai.usage.input_tokens": 100,
+      "gen_ai.usage.output_tokens": 42,
+      "gen_ai.usage.cache_creation.input_tokens": 5000,
+      "gen_ai.usage.cache_read.input_tokens": 20000,
+      "gen_ai.completion": "hello cache",
+    });
+    await provider.shutdown();
+
+    const openai = harness(false, async () =>
+      Response.json({
+        model: "o3-mini",
+        choices: [{ message: { content: "ok" } }],
+        usage: {
+          prompt_tokens: 1000,
+          completion_tokens: 300,
+          prompt_tokens_details: { cached_tokens: 600 },
+          completion_tokens_details: { reasoning_tokens: 200 },
+        },
+      }),
+    );
+    const openaiResp = await openai.wrapped("http://llm.test/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "o3-mini", messages: [{ role: "user", content: "hi" }] }),
+    });
+    await openaiResp.text();
+    expect(onlySpan(openai.exporter).attributes).toMatchObject({
+      "gen_ai.usage.input_tokens": 1000,
+      "gen_ai.usage.output_tokens": 300,
+      "gen_ai.usage.cache_read.input_tokens": 600,
+      "gen_ai.usage.reasoning_tokens": 200,
+    });
+    await openai.provider.shutdown();
   });
 });
