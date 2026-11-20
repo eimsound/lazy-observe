@@ -1,7 +1,24 @@
-import { apiGet, API_ROOT, IS_MOCK } from "./client";
+import { apiGet, ApiError, API_ROOT, IS_MOCK } from "./client";
+import {
+  normalizeJaegerTraceListResponse,
+  normalizeTraceStringListResponse,
+  type JaegerKeyValue,
+  type JaegerProcess,
+  type JaegerSpan,
+  type JaegerSpanRef,
+  type JaegerTrace,
+} from "./traces-contract";
 
 // Mock data is only for VITE_MOCK builds; load it lazily so it never ships with real chunks.
 const loadMockTraces = () => import("./mock-traces");
+
+export type {
+  JaegerKeyValue,
+  JaegerProcess,
+  JaegerSpan,
+  JaegerSpanRef,
+  JaegerTrace,
+};
 
 /**
  * Traces API. The backend re-exposes Jaeger's JSON HTTP API verbatim, so these
@@ -9,46 +26,6 @@ const loadMockTraces = () => import("./mock-traces");
  * faithful means the same UI works against any Jaeger-compatible query service.
  * VITE_MOCK serves a deterministic offline generator instead.
  */
-
-/** A Jaeger tag / typed key-value pair. */
-export interface JaegerKeyValue {
-  key: string;
-  type?: string;
-  value: string | number | boolean;
-}
-
-export interface JaegerSpanRef {
-  refType: "CHILD_OF" | "FOLLOWS_FROM";
-  traceID: string;
-  spanID: string;
-}
-
-export interface JaegerSpan {
-  traceID: string;
-  spanID: string;
-  operationName: string;
-  /** Epoch microseconds. */
-  startTime: number;
-  /** Microseconds. */
-  duration: number;
-  references: JaegerSpanRef[];
-  tags: JaegerKeyValue[];
-  processID: string;
-  logs?: Array<{ timestamp: number; fields: JaegerKeyValue[] }>;
-  warnings?: string[] | null;
-}
-
-export interface JaegerProcess {
-  serviceName: string;
-  tags: JaegerKeyValue[];
-}
-
-export interface JaegerTrace {
-  traceID: string;
-  spans: JaegerSpan[];
-  processes: Record<string, JaegerProcess>;
-  warnings?: string[] | null;
-}
 
 export interface TraceSearchParams {
   service: string;
@@ -145,12 +122,12 @@ export async function getServices(
   project?: string,
 ): Promise<string[]> {
   if (IS_MOCK) return (await loadMockTraces()).mockServices();
-  const resp = await apiGet<{ data: string[] | null }>("/traces/services", {
+  const resp = await apiGet<unknown>("/traces/services", {
     base: API_ROOT,
     signal,
     project,
   });
-  return resp.data ?? [];
+  return normalizeTraceStringListResponse(resp);
 }
 
 export async function getOperations(
@@ -159,11 +136,11 @@ export async function getOperations(
   project?: string,
 ): Promise<string[]> {
   if (IS_MOCK) return (await loadMockTraces()).mockOperations(service);
-  const resp = await apiGet<{ data: string[] | null }>(
+  const resp = await apiGet<unknown>(
     `/traces/services/${encodeURIComponent(service)}/operations`,
     { base: API_ROOT, signal, project },
   );
-  return resp.data ?? [];
+  return normalizeTraceStringListResponse(resp);
 }
 
 export async function searchTraces(
@@ -172,7 +149,7 @@ export async function searchTraces(
   project?: string,
 ): Promise<JaegerTrace[]> {
   if (IS_MOCK) return (await loadMockTraces()).mockSearchTraces(params);
-  const resp = await apiGet<{ data: JaegerTrace[] | null }>("/traces/search", {
+  const resp = await apiGet<unknown>("/traces/search", {
     base: API_ROOT,
     params: {
       service: params.service,
@@ -186,7 +163,7 @@ export async function searchTraces(
     signal,
     project,
   });
-  return resp.data ?? [];
+  return normalizeJaegerTraceListResponse(resp);
 }
 
 export async function getTrace(
@@ -195,11 +172,11 @@ export async function getTrace(
   project?: string,
 ): Promise<JaegerTrace> {
   if (IS_MOCK) return (await loadMockTraces()).mockGetTrace(traceID);
-  const resp = await apiGet<{ data: JaegerTrace[] | null }>(
+  const resp = await apiGet<unknown>(
     `/traces/${encodeURIComponent(traceID)}`,
     { base: API_ROOT, signal, project },
   );
-  const trace = resp.data?.[0];
-  if (!trace) throw new Error(`trace ${traceID} not found`);
+  const trace = normalizeJaegerTraceListResponse(resp)[0];
+  if (!trace) throw new ApiError(`trace ${traceID} not found`, 404);
   return trace;
 }

@@ -1,5 +1,4 @@
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { AlertCircle, ArrowLeft, Loader2, TriangleAlert } from "lucide-react";
 import {
@@ -9,6 +8,7 @@ import {
   type RRWebEvent,
 } from "@/lib/api/replay";
 import { ApiError } from "@/lib/api/client";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatBytes, formatClockDuration, formatDateTime } from "@/lib/format";
 import { PageContainer } from "@/components/layout/page";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
@@ -24,24 +24,24 @@ export function ReplayDetailPage() {
   const navigate = useNavigate();
   const { sessionId } = useParams({ strict: false }) as { sessionId: string };
 
-  const detailQuery = useQuery<ReplaySessionDetail, ApiError>({
+  const detailQuery = useProjectQuery<ReplaySessionDetail, ApiError>({
     queryKey: ["replay", sessionId],
-    queryFn: ({ signal }) => getReplaySession(sessionId, signal),
+    queryFn: ({ signal, project }) => getReplaySession(sessionId, signal, project),
     retry: false,
     placeholderData: (previous) => previous,
   });
 
   // Load every segment in order, then concatenate into one event stream.
-  const segmentsQuery = useQuery<RRWebEvent[], ApiError>({
+  const segmentsQuery = useProjectQuery<RRWebEvent[], ApiError>({
     queryKey: ["replay-segments", sessionId, detailQuery.data?.segment_count],
     enabled: !!detailQuery.data,
     retry: false,
     placeholderData: (previous) => previous,
-    queryFn: async ({ signal }) => {
+    queryFn: async ({ signal, project }) => {
       const detail = detailQuery.data!;
       const all: RRWebEvent[] = [];
       for (const seg of detail.segments) {
-        const events = await getReplaySegment(sessionId, seg.seq, signal);
+        const events = await getReplaySegment(sessionId, seg.seq, signal, project);
         all.push(...events);
       }
       return all;

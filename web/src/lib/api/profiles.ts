@@ -63,11 +63,15 @@ function profileQueryParams(q: ProfileQuery) {
   };
 }
 
-export async function getProfileServices(signal?: AbortSignal): Promise<string[]> {
+export async function getProfileServices(
+  signal?: AbortSignal,
+  project?: string,
+): Promise<string[]> {
   if (IS_MOCK) return (await loadMockProfiles()).mockProfileServices();
   const response = await apiGet<ProfileServicesResponseDTO>("/profiles/services", {
     base: API_ROOT,
     signal,
+    project,
   });
   return normalizeProfileServicesResponse(response);
 }
@@ -75,12 +79,14 @@ export async function getProfileServices(signal?: AbortSignal): Promise<string[]
 export async function listProfiles(
   q: ProfileQuery,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<ProfileRecord[]> {
   if (IS_MOCK) return (await loadMockProfiles()).mockListProfiles(q);
   const response = await apiGet<ProfileListResponseDTO>("/profiles", {
     base: API_ROOT,
     params: profileQueryParams(q),
     signal,
+    project,
   });
   return normalizeProfileListResponse(response);
 }
@@ -88,6 +94,7 @@ export async function listProfiles(
 export async function getFlamegraph(
   q: ProfileQuery,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<FlameNode | null> {
   if (IS_MOCK) return (await loadMockProfiles()).mockFlamegraph(q);
   try {
@@ -95,6 +102,7 @@ export async function getFlamegraph(
       base: API_ROOT,
       params: profileQueryParams(q),
       signal,
+      project,
     });
   } catch (err) {
     // Gateway returns 404 when no profiles exist in the queried window; map to

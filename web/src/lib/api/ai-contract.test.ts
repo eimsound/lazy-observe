@@ -3,8 +3,13 @@ import { test } from "vitest";
 
 import {
   buildAssistantQueryPayload,
+  normalizeAiSettings,
+  normalizeAiStatus,
+  normalizeAiTestResult,
   normalizeAssistantAnswer,
+  normalizeAssistantExplain,
   normalizeAssistantLogs,
+  normalizeIssueAiAnalysis,
   resolveAssistantTimeRange,
 } from "./ai-contract.ts";
 
@@ -123,4 +128,107 @@ test("normalizeAssistantAnswer handles gateway logs envelope, metrics matrix, an
   });
   assert.equal(erroredAnswer.executionError, "parse error");
   assert.equal(erroredAnswer.result, undefined);
+
+  // Strict drift rejection: invalid signal or missing query must fail fast.
+  assert.throws(
+    () => normalizeAssistantAnswer({ signal: "traces", query: "x", explanation: "y" }),
+    /signal/,
+  );
+  assert.throws(
+    () => normalizeAssistantAnswer({ signal: "logs", query: "  ", explanation: "y" }),
+    /query/,
+  );
+});
+
+test("AI status, settings, test, and explain match gateway JSON shapes strictly", () => {
+  assert.deepEqual(
+    normalizeAiStatus({ enabled: true, provider: "openai", model: "gpt-4o-mini" }),
+    { enabled: true, provider: "openai", model: "gpt-4o-mini" },
+  );
+  assert.throws(() => normalizeAiStatus({ enabled: "yes", provider: "openai", model: "m" }));
+
+  // Mirrors aiSettingsResponse in internal/gateway/ai_settings.go (includes revision).
+  assert.deepEqual(
+    normalizeAiSettings({
+      enabled: true,
+      provider: "openai",
+      base_url: "https://api.openai.com",
+      model: "gpt-4o-mini",
+      max_tokens: 1024,
+      has_api_key: true,
+      source: "database",
+      updated_by: "admin",
+      revision: 3,
+    }),
+    {
+      enabled: true,
+      provider: "openai",
+      base_url: "https://api.openai.com",
+      model: "gpt-4o-mini",
+      max_tokens: 1024,
+      has_api_key: true,
+      source: "database",
+      updated_by: "admin",
+      revision: 3,
+    },
+  );
+  assert.throws(() =>
+    normalizeAiSettings({
+      enabled: true,
+      provider: "openai",
+      base_url: "",
+      model: "m",
+      max_tokens: -1,
+      has_api_key: false,
+      source: "database",
+      updated_by: "admin",
+    }),
+  );
+
+  // Mirrors aiTest in internal/gateway/ai_api.go.
+  assert.deepEqual(
+    normalizeAiTestResult({ latency_ms: 142, model: "gpt-4o-mini", echo: "pong" }),
+    { latency_ms: 142, model: "gpt-4o-mini", echo: "pong" },
+  );
+  assert.throws(() => normalizeAiTestResult({ latency_ms: "142", echo: "pong" }));
+
+  // Mirrors aiAssistantExplain in internal/gateway/ai_assistant.go.
+  assert.deepEqual(normalizeAssistantExplain({ explanation: "Counts 5xx per minute." }), {
+    explanation: "Counts 5xx per minute.",
+  });
+  assert.throws(() => normalizeAssistantExplain({}));
+});
+
+test("normalizeIssueAiAnalysis matches Go issueAIResponse (RFC3339 ai_analysis_at and omitted stale)", () => {
+  // Exact wire output of issueAIResponse(row, true) in internal/gateway/issue_ai_analysis.go:
+  // row.AIAnalysisAt is *time.Time -> RFC3339 string, and `stale` is omitted when not stale.
+  const freshWire = {
+    cached: true,
+    ai_analysis_at: "2026-11-21T09:00:00Z",
+    summary: "Null dereference on empty cart.",
+    probable_causes: [
+      { cause: "Missing null check", confidence: "high", evidence: "checkout.ts:42" },
+    ],
+    suggested_actions: ["Guard empty cart before reading items"],
+  };
+
+  const normalized = normalizeIssueAiAnalysis(freshWire);
+  assert.equal(normalized.cached, true);
+  assert.equal(normalized.stale, false);
+  assert.equal(normalized.ai_analysis_at, Date.parse("2026-11-21T09:00:00Z"));
+  assert.equal(normalized.probable_causes[0].confidence, "high");
+
+  const staleWire = { ...freshWire, cached: false, stale: true, ai_analysis_at: 1_795_165_200_000 };
+  const normalizedStale = normalizeIssueAiAnalysis(staleWire);
+  assert.equal(normalizedStale.stale, true);
+  assert.equal(normalizedStale.ai_analysis_at, 1_795_165_200_000);
+
+  assert.throws(
+    () =>
+      normalizeIssueAiAnalysis({
+        ...freshWire,
+        probable_causes: [{ cause: "x", confidence: "certain", evidence: "e" }],
+      }),
+    /confidence/,
+  );
 });

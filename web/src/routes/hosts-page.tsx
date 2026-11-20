@@ -1,5 +1,4 @@
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { Cpu, Database, Server } from "lucide-react";
 import {
@@ -10,6 +9,7 @@ import {
   type UsageRating,
 } from "@/lib/api/hosts";
 import { IS_MOCK } from "@/lib/settings";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
 import { Badge } from "@/components/ui/badge";
@@ -31,7 +31,10 @@ const RATING_BAR: Record<UsageRating, string> = {
 export function HostsPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const hosts = useQuery({ queryKey: ["hosts"], queryFn: ({ signal }) => listHosts(signal) });
+  const hosts = useProjectQuery({
+    queryKey: ["hosts"],
+    queryFn: ({ signal, project }) => listHosts(signal, project),
+  });
 
   function openHost(instance: string) {
     void navigate({ to: "/infrastructure/hosts/$instance", params: { instance } });

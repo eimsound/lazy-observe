@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowDown, ArrowUp, Database, Loader2, RefreshCw } from "lucide-react";
 import {
@@ -23,6 +23,7 @@ import dayjs from "@/lib/dayjs";
 import { rangeById, resolveRange } from "@/lib/api/ranges";
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import type { TimeSeries } from "@/lib/api/types";
 import { formatPercent } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -137,9 +138,9 @@ function WebVitalsTab({ getWindow }: { getWindow: () => PerfWindow }) {
   }, [currentSlug]);
 
   const pageParam = page === ALL_PAGES ? undefined : page;
-  const pagesQuery = useQuery<string[]>({
-    queryKey: ["vital-pages", currentSlug],
-    queryFn: ({ signal }) => getVitalPages(getWindow(), signal),
+  const pagesQuery = useProjectQuery<string[]>({
+    queryKey: ["vital-pages"],
+    queryFn: ({ signal, project }) => getVitalPages(getWindow(), signal, project),
     retry: false,
   });
   const pagesState = queryViewState({
@@ -221,10 +222,9 @@ function VitalCard({
   onSelect: () => void;
 }) {
   const { t } = useTranslation();
-  const { currentSlug } = useProject();
-  const query = useQuery<TimeSeries[]>({
-    queryKey: ["vital", currentSlug, meta.key, page ?? "all"],
-    queryFn: ({ signal }) => queryVitalSeries(meta.key, page, getWindow(), signal),
+  const query = useProjectQuery<TimeSeries[]>({
+    queryKey: ["vital", meta.key, page ?? "all"],
+    queryFn: ({ signal, project }) => queryVitalSeries(meta.key, page, getWindow(), signal, project),
     retry: false,
   });
 
@@ -298,10 +298,9 @@ function VitalTrend({
   getWindow: () => PerfWindow;
 }) {
   const { t } = useTranslation();
-  const { currentSlug } = useProject();
-  const query = useQuery<TimeSeries[]>({
-    queryKey: ["vital-trend", currentSlug, meta.key, page ?? "all"],
-    queryFn: ({ signal }) => queryVitalSeries(meta.key, page, getWindow(), signal),
+  const query = useProjectQuery<TimeSeries[]>({
+    queryKey: ["vital-trend", meta.key, page ?? "all"],
+    queryFn: ({ signal, project }) => queryVitalSeries(meta.key, page, getWindow(), signal, project),
     retry: false,
   });
   const viewState = queryViewState({
@@ -345,10 +344,9 @@ function VitalTrend({
 
 function VitalsByPageTable({ getWindow }: { getWindow: () => PerfWindow }) {
   const { t } = useTranslation();
-  const { currentSlug } = useProject();
-  const query = useQuery<PageVitals[]>({
-    queryKey: ["vitals-by-page", currentSlug],
-    queryFn: ({ signal }) => getVitalsByPage(getWindow(), signal),
+  const query = useProjectQuery<PageVitals[]>({
+    queryKey: ["vitals-by-page"],
+    queryFn: ({ signal, project }) => getVitalsByPage(getWindow(), signal, project),
     retry: false,
   });
   const viewState = queryViewState({
@@ -441,14 +439,13 @@ type EndpointSortKey = "route" | "throughput" | "p50" | "p95" | "p99" | "error_r
 
 function EndpointsTab({ getWindow }: { getWindow: () => PerfWindow }) {
   const { t } = useTranslation();
-  const { currentSlug } = useProject();
   const navigate = useNavigate();
   const [sortKey, setSortKey] = useState<EndpointSortKey>("p95");
   const [dir, setDir] = useState<"asc" | "desc">("desc");
 
-  const query = useQuery<EndpointStatsResult>({
-    queryKey: ["endpoints", currentSlug],
-    queryFn: ({ signal }) => getEndpointStats(getWindow(), signal),
+  const query = useProjectQuery<EndpointStatsResult>({
+    queryKey: ["endpoints"],
+    queryFn: ({ signal, project }) => getEndpointStats(getWindow(), signal, project),
     retry: false,
   });
 

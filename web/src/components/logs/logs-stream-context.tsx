@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -8,7 +7,7 @@ import {
 } from "@/lib/api/logs";
 import type { LogsExtraFilterParams } from "@/lib/logs-explorer";
 import { escapeLogsQLString } from "@/lib/logs-explorer";
-import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDateTime } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import {
@@ -75,7 +74,6 @@ export function LogsStreamContextDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const { t } = useTranslation();
-  const { currentSlug: project } = useProject();
   const [beforeCount, setBeforeCount] = useState(CONTEXT_PAGE_SIZE);
   const [afterCount, setAfterCount] = useState(CONTEXT_PAGE_SIZE);
   const [wrap, setWrap] = useState(true);
@@ -85,10 +83,9 @@ export function LogsStreamContextDialog({
     setAfterCount(CONTEXT_PAGE_SIZE);
   }, [anchor?.id]);
 
-  const context = useQuery({
+  const context = useProjectQuery({
     queryKey: [
       "logs-stream-context",
-      project,
       anchor?.id,
       start,
       end,
@@ -98,7 +95,7 @@ export function LogsStreamContextDialog({
     ],
     enabled: open && anchor !== null,
     retry: false,
-    queryFn: async ({ signal }) => {
+    queryFn: async ({ signal, project }) => {
       const beforeQuery = contextQuery(anchor!, "before", beforeCount);
       const afterQuery = contextQuery(anchor!, "after", afterCount);
       if (!beforeQuery || !afterQuery) {
@@ -110,6 +107,7 @@ export function LogsStreamContextDialog({
           start,
           end,
           limit: beforeCount,
+          project,
           ...filters,
         }, signal),
         queryLogs({
@@ -117,6 +115,7 @@ export function LogsStreamContextDialog({
           start,
           end,
           limit: afterCount,
+          project,
           ...filters,
         }, signal),
       ]);

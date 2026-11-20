@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, Copy, Loader2, Plus, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { labelNames, labelValues, metricNames } from "@/lib/api/metrics";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import type { ResolvedMetricsRange } from "@/lib/metrics-query";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,9 +43,10 @@ export function MetricsExplorer({ open, range, onOpenChange, onInsert }: Metrics
     setMatchers({});
   }, [project]);
 
-  const names = useQuery({
-    queryKey: ["metrics-explorer", project, range.start, range.end],
-    queryFn: ({ signal }) => metricNames(base, signal),
+  const names = useProjectQuery({
+    queryKey: ["metrics-explorer", range.start, range.end],
+    queryFn: ({ signal, project: activeProject }) =>
+      metricNames({ ...base, project: activeProject }, signal),
     enabled: open,
   });
   const selector = selectedMetric
@@ -53,14 +54,16 @@ export function MetricsExplorer({ open, range, onOpenChange, onInsert }: Metrics
       ? `{${Object.entries(matchers).map(([name, value]) => `${name}="${escapePromQL(value)}"`).join(",")}}`
       : ""}`
     : "";
-  const labels = useQuery({
-    queryKey: ["metrics-explorer-labels", project, selectedMetric, selector, range.start, range.end],
-    queryFn: ({ signal }) => labelNames({ ...base, match: selector || undefined }, signal),
+  const labels = useProjectQuery({
+    queryKey: ["metrics-explorer-labels", selectedMetric, selector, range.start, range.end],
+    queryFn: ({ signal, project: activeProject }) =>
+      labelNames({ ...base, project: activeProject, match: selector || undefined }, signal),
     enabled: open && Boolean(selectedMetric),
   });
-  const values = useQuery({
-    queryKey: ["metrics-explorer-values", project, selectedMetric, selectedLabel, selector, range.start, range.end],
-    queryFn: ({ signal }) => labelValues(selectedLabel, { ...base, match: selector }, signal),
+  const values = useProjectQuery({
+    queryKey: ["metrics-explorer-values", selectedMetric, selectedLabel, selector, range.start, range.end],
+    queryFn: ({ signal, project: activeProject }) =>
+      labelValues(selectedLabel, { ...base, project: activeProject, match: selector }, signal),
     enabled: open && Boolean(selectedMetric && selectedLabel),
   });
   const visibleMetrics = useMemo(() => {

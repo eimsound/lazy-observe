@@ -1,4 +1,14 @@
 import { apiGet, apiSend, ApiError, IS_MOCK, API_ROOT } from "./client";
+import {
+  normalizeAuthUser,
+  normalizeSessionList,
+  type Role,
+  type SessionInfo,
+  type User,
+} from "./auth-contract";
+
+export { AUTH_ERROR_CODES, normalizeAuthUser, normalizeSessionList, ROLES } from "./auth-contract";
+export type { Role, SessionInfo, User } from "./auth-contract";
 
 /**
  * Authentication API. Speaks the B1 session contract:
@@ -9,32 +19,6 @@ import { apiGet, apiSend, ApiError, IS_MOCK, API_ROOT } from "./client";
  * request via `credentials: include` (see client.ts). In VITE_MOCK mode a fake
  * session is kept in localStorage so RBAC views are demoable without a backend.
  */
-
-export type Role = "admin" | "member" | "viewer";
-
-export interface User {
-  id?: number;
-  username: string;
-  role: Role;
-  display_name?: string;
-  email?: string;
-  last_login_at?: string | null;
-  /**
-   * Set for the generated bootstrap admin password: the backend answers every
-   * API except /auth/me, /auth/password and /auth/logout with 403
-   * `password_change_required` until the password is changed.
-   */
-  must_change_password?: boolean;
-}
-
-export interface SessionInfo {
-  id: string;
-  created_at: string;
-  expires_at: string;
-  current: boolean;
-}
-
-export const ROLES: Role[] = ["admin", "member", "viewer"];
 
 const MOCK_SESSION_KEY = "lo-mock-session";
 
@@ -70,11 +54,12 @@ function writeMockSession(user: User | null): void {
 export async function getMe(signal?: AbortSignal): Promise<User | null> {
   if (IS_MOCK) return delay(readMockSession(), 150);
   try {
-    return await apiGet<User>("/auth/me", {
+    const raw = await apiGet<unknown>("/auth/me", {
       base: API_ROOT,
       signal,
       skipSessionExpiry: true,
     });
+    return normalizeAuthUser(raw);
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) return null;
     throw e;
@@ -130,7 +115,7 @@ export async function updateMe(profile: ProfileUpdate): Promise<User> {
     writeMockSession(merged);
     return delay(merged, 150);
   }
-  return apiSend<User>("PUT", "/auth/me", profile, { base: API_ROOT });
+  return normalizeAuthUser(await apiSend<unknown>("PUT", "/auth/me", profile, { base: API_ROOT }));
 }
 
 /** Change the signed-in user's password. */
@@ -151,7 +136,9 @@ export async function changePassword(currentPassword: string, newPassword: strin
 
 export async function listMySessions(signal?: AbortSignal): Promise<SessionInfo[]> {
   if (IS_MOCK) return delay([], 150);
-  return apiGet<SessionInfo[]>("/auth/sessions", { base: API_ROOT, signal });
+  return normalizeSessionList(
+    await apiGet<unknown>("/auth/sessions", { base: API_ROOT, signal }),
+  );
 }
 
 export async function revokeSession(id: string): Promise<void> {

@@ -75,9 +75,11 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       isLoading: projectsQuery.isLoading,
       setCurrent: (slug: string) => {
         if (slug === currentSlug) return;
+        if (!projects.some((p) => p.slug === slug)) return;
         setProjectSlug(slug);
         setCurrentSlug(slug);
-        // Drop and refetch everything cached under the previous project.
+        // Cancel in-flight queries and drop any legacy unkeyed results cached
+        // under the previous project.
         void switchProjectQueries(queryClient);
       },
     };

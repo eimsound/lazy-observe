@@ -55,6 +55,7 @@ export interface IssueListParams {
 export async function listIssues(
   params: IssueListParams,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<IssueListResult> {
   if (IS_MOCK) return (await loadMockIssues()).mockListIssues(params);
   const response = await apiGet<IssueListResponseDTO>("/issues", {
@@ -67,15 +68,21 @@ export async function listIssues(
       page: params.page || undefined,
     },
     signal,
+    project,
   });
   return normalizeIssueListResponse(response);
 }
 
-export async function getIssue(id: string, signal?: AbortSignal): Promise<IssueDetail> {
+export async function getIssue(
+  id: string,
+  signal?: AbortSignal,
+  project?: string,
+): Promise<IssueDetail> {
   if (IS_MOCK) return (await loadMockIssues()).mockGetIssue(id);
   const response = await apiGet<IssueDetailDTO>(`/issues/${encodeURIComponent(id)}`, {
     base: API_ROOT,
     signal,
+    project,
   });
   return normalizeIssueDetail(response);
 }
@@ -83,19 +90,24 @@ export async function getIssue(id: string, signal?: AbortSignal): Promise<IssueD
 export async function updateIssueStatus(
   id: string,
   status: IssueStatus,
+  project?: string,
 ): Promise<IssueSummary> {
   if (IS_MOCK) return (await loadMockIssues()).mockUpdateIssueStatus(id, status);
   const response = await apiSend<IssueSummaryDTO>(
     "PATCH",
     `/issues/${encodeURIComponent(id)}`,
     { status },
-    { base: API_ROOT },
+    { base: API_ROOT, project },
   );
   return normalizeIssueSummary(response);
 }
 
 /** Apply one status to many issues in a single request. */
-export async function batchUpdateIssueStatus(ids: string[], status: IssueStatus): Promise<number> {
+export async function batchUpdateIssueStatus(
+  ids: string[],
+  status: IssueStatus,
+  project?: string,
+): Promise<number> {
   if (IS_MOCK) {
     for (const id of ids) await (await loadMockIssues()).mockUpdateIssueStatus(id, status);
     return ids.length;
@@ -104,7 +116,7 @@ export async function batchUpdateIssueStatus(ids: string[], status: IssueStatus)
     "POST",
     "/issues/batch",
     { ids: ids.map(Number), status },
-    { base: API_ROOT },
+    { base: API_ROOT, project },
   );
   return response.updated;
 }
@@ -113,11 +125,12 @@ export async function getIssueEvent(
   issueId: string,
   eventId: string,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<ErrorEvent> {
   if (IS_MOCK) return (await loadMockIssues()).mockGetIssueEvent(issueId, eventId);
   const response = await apiGet<ErrorEventDTO>(
     `/issues/${encodeURIComponent(issueId)}/events/${encodeURIComponent(eventId)}`,
-    { base: API_ROOT, signal },
+    { base: API_ROOT, signal, project },
   );
   return normalizeErrorEvent(response);
 }

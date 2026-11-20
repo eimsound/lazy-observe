@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Pencil, Plus, RefreshCw, Target, Trash2 } from "lucide-react";
 import {
   listScrapeTargets,
@@ -14,6 +14,9 @@ import {
 } from "@/lib/api/scrape-targets";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { canManageAlerts } from "@/lib/auth/permissions";
+import { useProject } from "@/lib/project/project-provider";
+import { projectQueryKey } from "@/lib/project/project-scope";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatRelativeTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -57,12 +60,13 @@ function isValidUrl(url: string): boolean {
 export function ScrapeTargetsPage() {
   const { t } = useTranslation();
   const { role } = useAuth();
+  const { currentSlug: project } = useProject();
   const canManage = canManageAlerts(role);
   const queryClient = useQueryClient();
 
-  const targets = useQuery({
+  const targets = useProjectQuery({
     queryKey: ["scrape-targets"],
-    queryFn: ({ signal }) => listScrapeTargets(signal),
+    queryFn: ({ signal, project: activeProject }) => listScrapeTargets(signal, activeProject),
     retry: false,
   });
 
@@ -74,16 +78,17 @@ export function ScrapeTargetsPage() {
   const toggle = useMutation({
     mutationFn: (target: ScrapeTarget) => {
       const { id, ...rest } = target;
-      return updateScrapeTarget(id, { ...rest, enabled: !target.enabled });
+      return updateScrapeTarget(id, { ...rest, enabled: !target.enabled }, project);
     },
     onMutate: () => setToggleError(null),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["scrape-targets"] }),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["scrape-targets"]) }),
     onError: (err) => setToggleError(formatErrorMessage(err, t("scrapeTargets.saveError"))),
   });
 
   function refreshAll() {
-    void queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
-    void queryClient.invalidateQueries({ queryKey: ["target-health"] });
+    void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["scrape-targets"]) });
+    void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["target-health"]) });
   }
 
   return (
@@ -232,8 +237,8 @@ export function ScrapeTargetsPage() {
         confirmLabel={t("scrapeTargets.deleteTarget")}
         onConfirm={async () => {
           if (!deleting) return;
-          await deleteScrapeTarget(deleting.id);
-          void queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
+          await deleteScrapeTarget(deleting.id, project);
+          void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["scrape-targets"]) });
           setDeleting(null);
         }}
       />
@@ -243,9 +248,9 @@ export function ScrapeTargetsPage() {
 
 function HealthCell({ target }: { target: ScrapeTarget }) {
   const { t, i18n } = useTranslation();
-  const health = useQuery({
+  const health = useProjectQuery({
     queryKey: ["target-health", target.id, target.enabled, target.url],
-    queryFn: ({ signal }) => getTargetHealth(target.id, signal),
+    queryFn: ({ signal, project }) => getTargetHealth(target.id, signal, project),
     enabled: target.enabled,
     staleTime: 60_000,
     refetchOnWindowFocus: false,
@@ -280,6 +285,7 @@ function TargetFormDialog({
   editing: ScrapeTarget | null;
 }) {
   const { t } = useTranslation();
+  const { currentSlug: project } = useProject();
   const queryClient = useQueryClient();
 
   const [name, setName] = useState(editing?.name ?? "");
@@ -304,9 +310,11 @@ function TargetFormDialog({
 
   const mutation = useMutation({
     mutationFn: () =>
-      editing ? updateScrapeTarget(editing.id, input) : createScrapeTarget(input),
+      editing
+        ? updateScrapeTarget(editing.id, input, project)
+        : createScrapeTarget(input, project),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
+      void queryClient.invalidateQueries({ queryKey: projectQueryKey(project, ["scrape-targets"]) });
       onOpenChange(false);
     },
     onError: (e) => setError((e as Error).message || t("scrapeTargets.saveError")),

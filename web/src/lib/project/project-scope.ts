@@ -48,6 +48,19 @@ export function createProjectScope(storage: SlugStorage | null): ProjectScope {
 }
 
 /**
+ * Build a project-scoped React Query key while keeping the domain root at
+ * index 0 so root-prefix invalidations (e.g. `["issues"]`, `["scrape-targets"]`)
+ * continue to work and every project keeps an isolated cache entry.
+ */
+export function projectQueryKey<const TQueryKey extends readonly [string, ...unknown[]]>(
+  project: string,
+  queryKey: TQueryKey,
+): readonly [TQueryKey[0], string, ...unknown[]] {
+  const [root, ...rest] = queryKey;
+  return [root, project, ...rest];
+}
+
+/**
  * Query roots that must survive a project switch: global data, and roots whose
  * keys already carry the project (the logs workspace owns those executions and
  * their cancellation itself, see ADR 0008).

@@ -33,6 +33,7 @@ export type {
 export async function getLLMSummary(
   window: LLMWindow,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<LLMSummary> {
   const response = IS_MOCK
     ? await (await loadMockLlm()).mockLLMSummaryResponse(window, signal)
@@ -40,6 +41,7 @@ export async function getLLMSummary(
         base: API_ROOT,
         params: llmRangeParams(window),
         signal,
+        project,
       });
   return normalizeLLMSummaryResponse(response);
 }
@@ -48,6 +50,7 @@ export async function getLLMCalls(
   window: LLMWindow,
   filters: LLMCallFilters = {},
   signal?: AbortSignal,
+  project?: string,
 ): Promise<LLMCallsResult> {
   const normalizedFilters = {
     service: filters.service?.trim() || undefined,
@@ -60,6 +63,7 @@ export async function getLLMCalls(
         base: API_ROOT,
         params: { ...llmRangeParams(window), ...normalizedFilters },
         signal,
+        project,
       });
   return normalizeLLMCallsResponse(response);
 }
@@ -68,6 +72,7 @@ export async function getLLMTimeseries(
   window: LLMWindow,
   metric: LLMTrendMetric,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<LLMTimeseriesResult> {
   const step = llmStep(window);
   const response = IS_MOCK
@@ -76,6 +81,7 @@ export async function getLLMTimeseries(
         base: API_ROOT,
         params: { ...llmRangeParams(window), metric, step },
         signal,
+        project,
       });
   return normalizeLLMTimeseriesResponse(response);
 }

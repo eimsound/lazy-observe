@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { useRouter, useSearch } from "@tanstack/react-router";
+import { useSearch } from "@tanstack/react-router";
 import {
   AlertCircle,
   BarChart3,
@@ -34,27 +33,22 @@ import type {
 } from "@/lib/api/types";
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useRouterLocationSync } from "@/lib/router-url-sync";
 import dayjs, { dayjsLocale } from "@/lib/dayjs";
 import {
   clearMetricsHistory,
   dateParts,
   effectiveMetricsStep,
-  formatPrometheusDuration,
   getMetricsHistory,
-  METRICS_RANGE_PRESETS,
   metricsLabelColumns,
-  metricsRangeSeconds,
-  parsePrometheusDuration,
   pushMetricsHistory,
   resolveMetricsRange,
-  type MetricsGraphMode,
   type MetricsHistoryEntry,
   type MetricsQueryTab,
   type MetricsRange,
-  type MetricsResolution,
   type MetricsTableMode,
   type MetricsTimeFormat,
-  type ResolvedMetricsRange,
 } from "@/lib/metrics-query";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
@@ -78,43 +72,20 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import type { MetricsEvidenceSearch } from "./trace-evidence-links";
+import {
+  buildMetricsPanelsURL,
+  newMetricsPanel,
+  parseMetricsStateFromLocation,
+  type ExecutedMetricsQuery,
+  type InitialMetricsState,
+  type MetricsPanelState,
+} from "./metrics-search";
 import { queryViewState } from "./query-view-state";
 
-interface QueryPanelState {
-  id: string;
-  query: string;
-  activeTab: MetricsQueryTab;
-  range: MetricsRange;
-  resolution: MetricsResolution;
-  graphMode: MetricsGraphMode;
-  tableMode: MetricsTableMode;
-  timeFormat: MetricsTimeFormat;
-  yAxisZero: boolean;
-}
+type QueryPanelState = MetricsPanelState;
+type ExecutedQuery = ExecutedMetricsQuery;
 
-interface ExecutedQuery {
-  query: string;
-  runId: number;
-  /** Time window frozen when the query was executed or its range changed. */
-  range: ResolvedMetricsRange;
-}
-
-const DEFAULT_RANGE = METRICS_RANGE_PRESETS.find((item) => item.presetId === "1h") ?? METRICS_RANGE_PRESETS[0];
 const LOCAL_TIME_KEY = "lo-metrics-use-local-time";
-
-function newPanel(id: string, query = ""): QueryPanelState {
-  return {
-    id,
-    query,
-    activeTab: "table",
-    range: DEFAULT_RANGE,
-    resolution: { type: "auto", density: "medium" },
-    graphMode: "lines",
-    tableMode: "labels",
-    timeFormat: "readable",
-    yAxisZero: false,
-  };
-}
 
 function initialLocalTime() {
   try {
@@ -125,127 +96,19 @@ function initialLocalTime() {
   }
 }
 
-interface InitialMetricsState {
-  panels: QueryPanelState[];
-  executed: Record<string, ExecutedQuery>;
-}
-
-function initialMetricsState(
-  fallbackQuery = "",
-  evidenceWindow?: { start: number; end: number },
-): InitialMetricsState {
-  const params = new URLSearchParams(window.location.search);
-  const indices = [...new Set([...params.keys()].flatMap((key) => {
-    const match = /^g(\d+)\./.exec(key);
-    return match ? [Number(match[1])] : [];
-  }))].sort((left, right) => left - right);
-  const panels: QueryPanelState[] = [];
-  const executed: Record<string, ExecutedQuery> = {};
-  for (const index of indices) {
-    const panel = newPanel(`query-${panels.length + 1}`, params.get(`g${index}.expr`) ?? "");
-    const tab = params.get(`g${index}.tab`);
-    if (tab === "graph" || tab === "table") panel.activeTab = tab;
-    const rangeSeconds = parsePrometheusDuration(params.get(`g${index}.range_input`) ?? "");
-    const endInput = params.get(`g${index}.end_input`);
-    const endMs = endInput ? dayjs(endInput).valueOf() : Number.NaN;
-    if (rangeSeconds !== null) {
-      panel.range = Number.isFinite(endMs)
-        ? { mode: "absolute", startMs: endMs - rangeSeconds * 1000, endMs }
-        : { mode: "relative", presetId: formatPrometheusDuration(rangeSeconds), seconds: rangeSeconds };
-    }
-    const resType = params.get(`g${index}.res_type`);
-    if (resType === "auto") {
-      const density = params.get(`g${index}.res_density`);
-      if (density === "low" || density === "medium" || density === "high") {
-        panel.resolution = { type: "auto", density };
-      }
-    } else if (resType === "fixed" || resType === "custom") {
-      const step = Number(params.get(`g${index}.res_step`));
-      if (Number.isFinite(step) && step >= 1) panel.resolution = { type: resType, step };
-    }
-    panel.graphMode = params.get(`g${index}.display_mode`) === "stacked" ? "stacked" : "lines";
-    panel.tableMode = params.get(`g${index}.table_mode`) === "series" ? "series" : "labels";
-    panel.timeFormat = params.get(`g${index}.time_format`) === "timestamp"
-      ? "timestamp"
-      : "readable";
-    panel.yAxisZero = params.get(`g${index}.y_axis_min`) === "0";
-    panels.push(panel);
-    const query = panel.query.trim();
-    if (query && params.has(`g${index}.expr`)) {
-      executed[panel.id] = {
-        query,
-        runId: panels.length,
-        range: resolveMetricsRange(panel.range),
-      };
-    }
-  }
-  if (panels.length > 0) return { panels, executed };
-  const panel = newPanel("query-1", fallbackQuery);
-  if (evidenceWindow) {
-    panel.range = {
-      mode: "absolute",
-      startMs: evidenceWindow.start * 1_000,
-      endMs: evidenceWindow.end * 1_000,
-    };
-  }
-  return { panels: [panel], executed };
-}
-
-function buildPanelsURL(currentHref: string, panels: QueryPanelState[]): string {
-  const url = new URL(currentHref, window.location.origin);
-  for (const key of [...url.searchParams.keys()]) {
-    if (/^g\d+\./.test(key) || key === "q" || key === "run" || key === "start" || key === "end") {
-      url.searchParams.delete(key);
-    }
-  }
-  panels.forEach((panel, index) => {
-    const prefix = `g${index}.`;
-    const setOptional = (key: string, value: string | undefined) => {
-      if (value === undefined || value === "") url.searchParams.delete(key);
-      else url.searchParams.set(key, value);
-    };
-    const rangeSeconds = metricsRangeSeconds(panel.range);
-    const defaultRange = panel.range.mode === "relative" && rangeSeconds === DEFAULT_RANGE.seconds;
-    setOptional(prefix + "expr", panel.query.trim() ? panel.query : undefined);
-    setOptional(prefix + "tab", panel.activeTab === "table" ? undefined : panel.activeTab);
-    setOptional(
-      prefix + "range_input",
-      defaultRange ? undefined : formatPrometheusDuration(rangeSeconds),
-    );
-    if (panel.range.mode === "absolute" && panel.range.endMs !== undefined) {
-      url.searchParams.set(prefix + "end_input", dayjs(panel.range.endMs).toISOString());
-    }
-    if (panel.resolution.type === "auto" && panel.resolution.density !== "medium") {
-      url.searchParams.set(prefix + "res_type", "auto");
-      url.searchParams.set(prefix + "res_density", panel.resolution.density);
-    } else if (panel.resolution.type !== "auto") {
-      url.searchParams.set(prefix + "res_type", panel.resolution.type);
-      url.searchParams.set(prefix + "res_step", String(panel.resolution.step));
-    }
-    setOptional(prefix + "display_mode", panel.graphMode === "lines" ? undefined : panel.graphMode);
-    setOptional(prefix + "table_mode", panel.tableMode === "labels" ? undefined : panel.tableMode);
-    setOptional(
-      prefix + "time_format",
-      panel.timeFormat === "readable" ? undefined : panel.timeFormat,
-    );
-    if (panel.yAxisZero) url.searchParams.set(prefix + "y_axis_min", "0");
-  });
-  return `${url.pathname}${url.search}${url.hash}`;
-}
-
 export function MetricsPage() {
   const { t } = useTranslation();
-  const router = useRouter();
+  const {
+    routeLocation,
+    currentHistoryHref,
+    replaceLocation,
+    classifyLocationChange,
+  } = useRouterLocationSync();
   const search = useSearch({ strict: false }) as MetricsEvidenceSearch;
   const { currentSlug: project } = useProject();
   const initial = useRef<InitialMetricsState | null>(null);
   if (!initial.current) {
-    initial.current = initialMetricsState(
-      search.q,
-      search.start !== undefined && search.end !== undefined
-        ? { start: search.start, end: search.end }
-        : undefined,
-    );
+    initial.current = parseMetricsStateFromLocation(routeLocation, search);
   }
   const [panels, setPanels] = useState<QueryPanelState[]>(initial.current.panels);
   const panelsRef = useRef(panels);
@@ -254,6 +117,8 @@ export function MetricsPage() {
   const nextRunId = useRef(initial.current.panels.length + 1);
   const projectRef = useRef(project);
   projectRef.current = project;
+  const searchRef = useRef(search);
+  searchRef.current = search;
   const [localTime, setLocalTime] = useState(initialLocalTime);
   const [executed, setExecuted] = useState<Record<string, ExecutedQuery>>(initial.current.executed);
   const [history, setHistory] = useState<MetricsHistoryEntry[]>(() => getMetricsHistory(project));
@@ -272,12 +137,21 @@ export function MetricsPage() {
   }, [project]);
 
   useEffect(() => {
-    const currentHref = router.history.location.href;
-    const target = buildPanelsURL(currentHref, panels);
-    if (target !== currentHref) {
-      router.history.replace(target, router.history.location.state);
-    }
-  }, [panels, router]);
+    const target = buildMetricsPanelsURL(currentHistoryHref(), panels);
+    replaceLocation(target);
+  }, [panels, currentHistoryHref, replaceLocation]);
+
+  // Resync panels only on genuine external navigations (browser Back/Forward),
+  // never on URL writes authored by this page itself.
+  useEffect(() => {
+    if (classifyLocationChange(routeLocation) === "self") return;
+    if (searchRef.current.q) return;
+    const next = parseMetricsStateFromLocation(routeLocation, searchRef.current);
+    setPanels(next.panels);
+    setExecuted(next.executed);
+    nextPanelId.current = Math.max(nextPanelId.current, next.panels.length + 1);
+    nextRunId.current = Math.max(nextRunId.current, next.panels.length + 1);
+  }, [routeLocation, classifyLocationChange]);
 
   useEffect(() => {
     try {
@@ -336,7 +210,7 @@ export function MetricsPage() {
         : undefined;
 
     const currentPanels = panelsRef.current;
-    const target = currentPanels[0] ?? newPanel("query-1");
+    const target = currentPanels[0] ?? newMetricsPanel("query-1");
     const nextRange = evidenceRange ?? target.range;
     const updated: QueryPanelState = {
       ...target,
@@ -360,7 +234,7 @@ export function MetricsPage() {
 
   function addPanel(afterId?: string, duplicate?: QueryPanelState) {
     const id = `query-${nextPanelId.current++}`;
-    const panel = duplicate ? { ...duplicate, id } : newPanel(id);
+    const panel = duplicate ? { ...duplicate, id } : newMetricsPanel(id);
     setPanels((current) => {
       if (!afterId) return [...current, panel];
       const index = current.findIndex((item) => item.id === afterId);
@@ -401,13 +275,13 @@ export function MetricsPage() {
     }
   }
 
-  const serverTime = useQuery({
-    queryKey: ["metrics-server-time", project],
+  const serverTime = useProjectQuery({
+    queryKey: ["metrics-server-time"],
     enabled: !IS_MOCK,
     staleTime: 30_000,
     refetchInterval: 60_000,
     retry: false,
-    queryFn: ({ signal }) => queryServerClock(signal, project),
+    queryFn: ({ signal, project: activeProject }) => queryServerClock(signal, activeProject),
   });
   const driftSeconds = serverTime.data?.driftSeconds ?? 0;
 
@@ -662,10 +536,10 @@ function QueryResult({ project, panel, executed, localTime, onRetry }: {
   const { t } = useTranslation();
   const range = executed?.range;
   const step = range ? effectiveMetricsStep(panel.resolution, range.end - range.start) : 1;
-  const graph = useQuery<MetricsQueryEnvelope<TimeSeries[]>, ApiError>({
+  const graph = useProjectQuery<MetricsQueryEnvelope<TimeSeries[]>, ApiError>({
+    project,
     queryKey: [
       "metrics-panel",
-      project,
       panel.id,
       "graph",
       executed?.query,
@@ -677,16 +551,16 @@ function QueryResult({ project, panel, executed, localTime, onRetry }: {
     enabled: panel.activeTab === "graph" && Boolean(executed && range),
     retry: false,
     placeholderData: (previous) => previous,
-    queryFn: ({ signal }) => queryRangeDetailed(
+    queryFn: ({ signal, project: activeProject }) => queryRangeDetailed(
       { query: executed!.query, start: range!.start, end: range!.end, step },
       signal,
-      project,
+      activeProject,
     ),
   });
-  const table = useQuery<MetricsQueryEnvelope<MetricTableResult>, ApiError>({
+  const table = useProjectQuery<MetricsQueryEnvelope<MetricTableResult>, ApiError>({
+    project,
     queryKey: [
       "metrics-panel",
-      project,
       panel.id,
       "table",
       executed?.query,
@@ -696,7 +570,7 @@ function QueryResult({ project, panel, executed, localTime, onRetry }: {
     enabled: panel.activeTab === "table" && Boolean(executed && range),
     retry: false,
     placeholderData: (previous) => previous,
-    queryFn: ({ signal }) => queryInstantDetailed(executed!.query, range!.end, signal, project),
+    queryFn: ({ signal, project: activeProject }) => queryInstantDetailed(executed!.query, range!.end, signal, activeProject),
   });
   const result = panel.activeTab === "table" ? table : graph;
   const count = panel.activeTab === "table"

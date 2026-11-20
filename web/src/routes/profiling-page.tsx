@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
+import { type UseQueryResult } from "@tanstack/react-query";
 import { useSearch } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -35,6 +35,7 @@ import { countMatches } from "@/lib/flamegraph";
 import { IS_MOCK } from "@/lib/settings";
 import { ApiError } from "@/lib/api/client";
 import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDateTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
@@ -97,9 +98,9 @@ export function ProfilingPage() {
     }
   }, [currentSlug]);
 
-  const servicesQuery = useQuery<string[], ApiError>({
-    queryKey: ["profile-services", currentSlug],
-    queryFn: ({ signal }) => getProfileServices(signal),
+  const servicesQuery = useProjectQuery<string[], ApiError>({
+    queryKey: ["profile-services"],
+    queryFn: ({ signal, project }) => getProfileServices(signal, project),
     retry: false,
   });
 
@@ -124,20 +125,20 @@ export function ProfilingPage() {
     return { start, end };
   }, [rangeId, customWindow, nowMs]);
 
-  const flameQuery = useQuery<FlameNode | null, ApiError>({
-    queryKey: ["flamegraph", currentSlug, service, type, window.start, window.end],
+  const flameQuery = useProjectQuery<FlameNode | null, ApiError>({
+    queryKey: ["flamegraph", service, type, window.start, window.end],
     enabled: !!service,
     retry: false,
-    queryFn: ({ signal }) =>
-      getFlamegraph({ service, type, start: window.start, end: window.end }, signal),
+    queryFn: ({ signal, project }) =>
+      getFlamegraph({ service, type, start: window.start, end: window.end }, signal, project),
   });
 
-  const profilesQuery = useQuery<ProfileRecord[], ApiError>({
-    queryKey: ["profiles-list", currentSlug, service, type, window.start, window.end],
+  const profilesQuery = useProjectQuery<ProfileRecord[], ApiError>({
+    queryKey: ["profiles-list", service, type, window.start, window.end],
     enabled: !!service && drawerOpen,
     retry: false,
-    queryFn: ({ signal }) =>
-      listProfiles({ service, type, start: window.start, end: window.end }, signal),
+    queryFn: ({ signal, project }) =>
+      listProfiles({ service, type, start: window.start, end: window.end }, signal, project),
   });
 
   const tree = flameQuery.data;
@@ -297,7 +298,7 @@ function FlamegraphSection({
   onRetry,
 }: {
   query: string;
-  flameQuery: ReturnType<typeof useQuery<FlameNode | null, ApiError>>;
+  flameQuery: UseQueryResult<FlameNode | null, ApiError>;
   onRetry: () => void;
 }) {
   const { t } = useTranslation();

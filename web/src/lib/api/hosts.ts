@@ -22,7 +22,7 @@ function delay<T>(value: T, ms = 200): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(value), ms));
 }
 
-export async function listHosts(signal?: AbortSignal): Promise<Host[]> {
+export async function listHosts(signal?: AbortSignal, project?: string): Promise<Host[]> {
   if (IS_MOCK) return delay([...(await loadMockInfra()).mockHosts]);
-  return normalizeHostsResponse(await apiGet<unknown>("/hosts", { base: "/api", signal }));
+  return normalizeHostsResponse(await apiGet<unknown>("/hosts", { base: "/api", signal, project }));
 }

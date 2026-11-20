@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -28,6 +28,8 @@ import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { canManageIssues } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
+import { projectQueryKey } from "@/lib/project/project-scope";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatErrorMessage } from "@/lib/api/errors";
 import { formatRelativeTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
@@ -85,19 +87,19 @@ export function IssuesPage() {
   }, [currentSlug]);
 
   const levelParam = level === ALL_LEVELS ? "" : (level as IssueLevel);
-  const queryKey = ["issues", currentSlug, status, levelParam, q, sort, page] as const;
+  const queryKey = projectQueryKey(currentSlug, ["issues", status, levelParam, q, sort, page]);
 
-  const query = useQuery<IssueListResult, ApiError>({
-    queryKey,
-    queryFn: ({ signal }) =>
-      listIssues({ status, level: levelParam, q, sort, page }, signal),
+  const query = useProjectQuery<IssueListResult, ApiError>({
+    queryKey: ["issues", status, levelParam, q, sort, page],
+    queryFn: ({ signal, project }) =>
+      listIssues({ status, level: levelParam, q, sort, page }, signal, project),
     retry: false,
     placeholderData: (prev) => prev,
   });
 
   const mutation = useMutation({
     mutationFn: ({ id, next }: { id: string; next: IssueStatus }) =>
-      updateIssueStatus(id, next),
+      updateIssueStatus(id, next, currentSlug),
     onMutate: ({ id }) => {
       setActionError(null);
       const previous = queryClient.getQueryData<IssueListResult>(queryKey);
@@ -113,13 +115,13 @@ export function IssuesPage() {
       setActionError(formatErrorMessage(err, t("issues.statusUpdateError")));
     },
     onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: ["issues"] });
+      void queryClient.invalidateQueries({ queryKey: projectQueryKey(currentSlug, ["issues"]) });
     },
   });
 
   const batchMutation = useMutation({
     mutationFn: ({ ids, next }: { ids: string[]; next: IssueStatus }) =>
-      batchUpdateIssueStatus(ids, next),
+      batchUpdateIssueStatus(ids, next, currentSlug),
     onMutate: ({ ids }) => {
       setActionError(null);
       const previous = queryClient.getQueryData<IssueListResult>(queryKey);
@@ -135,7 +137,7 @@ export function IssuesPage() {
       setActionError(formatErrorMessage(err, t("issues.statusUpdateError")));
     },
     onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: ["issues"] });
+      void queryClient.invalidateQueries({ queryKey: projectQueryKey(currentSlug, ["issues"]) });
     },
   });
 
@@ -368,7 +370,7 @@ function IssueListBody({
   onApplyStatus,
   onRetry,
 }: {
-  query: ReturnType<typeof useQuery<IssueListResult, ApiError>>;
+  query: UseQueryResult<IssueListResult, ApiError>;
   issues: IssueSummary[];
   status: IssueStatus;
   canManage: boolean;

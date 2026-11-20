@@ -251,10 +251,16 @@ export async function* parseNdjsonStream<T = unknown>(
         break;
       }
       if (!value) continue;
-      for (const item of parser.push(value)) yield item;
+      for (const item of parser.push(value)) {
+        if (options.signal?.aborted) return;
+        yield item;
+      }
     }
     if (!options.signal?.aborted) {
-      for (const item of parser.finish()) yield item;
+      for (const item of parser.finish()) {
+        if (options.signal?.aborted) return;
+        yield item;
+      }
     }
   } finally {
     options.signal?.removeEventListener("abort", cancel);

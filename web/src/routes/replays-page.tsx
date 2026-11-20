@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { AlertCircle, Database, Loader2, MonitorPlay, TriangleAlert } from "lucide-react";
 import {
@@ -9,6 +8,8 @@ import {
 } from "@/lib/api/replay";
 import { IS_MOCK } from "@/lib/settings";
 import { ApiError } from "@/lib/api/client";
+import { useProject } from "@/lib/project/project-provider";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatBytes, formatClockDuration, formatDateTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
@@ -24,13 +25,22 @@ import { queryViewState } from "./query-view-state";
 export function ReplaysPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const { currentSlug } = useProject();
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [page, setPage] = useState(1);
+  const prevProjectRef = useRef(currentSlug);
 
-  const query = useQuery<ReplayListResult, ApiError>({
+  useEffect(() => {
+    if (prevProjectRef.current !== currentSlug) {
+      prevProjectRef.current = currentSlug;
+      setPage(1);
+    }
+  }, [currentSlug]);
+
+  const query = useProjectQuery<ReplayListResult, ApiError>({
     queryKey: ["replays", errorsOnly, page],
-    queryFn: ({ signal }) =>
-      listReplaySessions({ has_error: errorsOnly ? true : undefined, page }, signal),
+    queryFn: ({ signal, project }) =>
+      listReplaySessions({ has_error: errorsOnly ? true : undefined, page }, signal, project),
     retry: false,
     placeholderData: (prev) => prev,
   });

@@ -72,6 +72,7 @@ export interface ReplayListResult {
 export async function listReplaySessions(
   params: ReplayListParams,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<ReplayListResult> {
   if (IS_MOCK) return (await loadMockReplay()).mockListReplaySessions(params);
   return apiGet<ReplayListResult>("/replay/sessions", {
@@ -83,17 +84,20 @@ export async function listReplaySessions(
       page: params.page,
     },
     signal,
+    project,
   });
 }
 
 export async function getReplaySession(
   id: string,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<ReplaySessionDetail> {
   if (IS_MOCK) return (await loadMockReplay()).mockGetReplaySession(id);
   const response = await apiGet<unknown>(`/replay/sessions/${encodeURIComponent(id)}`, {
     base: API_ROOT,
     signal,
+    project,
   });
   return normalizeReplaySessionDetail(response);
 }
@@ -107,10 +111,11 @@ export async function getReplaySegment(
   id: string,
   seq: number,
   signal?: AbortSignal,
+  project?: string,
 ): Promise<RRWebEvent[]> {
   if (IS_MOCK) return (await loadMockReplay()).mockReplaySegment(id, seq);
   return apiGet<RRWebEvent[]>(
     `/replay/sessions/${encodeURIComponent(id)}/segments/${seq}`,
-    { base: API_ROOT, signal },
+    { base: API_ROOT, signal, project },
   );
 }

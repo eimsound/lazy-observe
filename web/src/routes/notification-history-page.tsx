@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
   ChevronLeft,
@@ -22,6 +22,8 @@ import {
 import { useAuth } from "@/lib/auth/auth-provider";
 import { canManageAlerts } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
+import { projectQueryKey } from "@/lib/project/project-scope";
+import { useProjectQuery } from "@/lib/project/use-project-query";
 import {
   INITIAL_CURSOR_PAGINATION,
   canGoBackCursor,
@@ -79,12 +81,13 @@ export function NotificationHistoryPage() {
 
   const statusParam = status === ALL_STATUS ? undefined : status;
 
-  const items = useQuery({
-    queryKey: ["notifications", currentSlug, { status: statusParam, before: pagination.before }],
-    queryFn: ({ signal }) =>
+  const items = useProjectQuery({
+    queryKey: ["notifications", { status: statusParam, before: pagination.before }],
+    queryFn: ({ signal, project }) =>
       listNotifications(
         { status: statusParam, before_id: pagination.before, limit: PAGE_SIZE },
         signal,
+        project,
       ),
     placeholderData: keepPreviousData,
     enabled: canManage,
@@ -92,9 +95,10 @@ export function NotificationHistoryPage() {
   });
 
   const retry = useMutation({
-    mutationFn: (id: number) => retryNotification(id),
+    mutationFn: (id: number) => retryNotification(id, currentSlug),
     onMutate: () => setRetryError(null),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: projectQueryKey(currentSlug, ["notifications"]) }),
     onError: (err) => setRetryError(formatErrorMessage(err, t("notifications.retryError"))),
   });
 
