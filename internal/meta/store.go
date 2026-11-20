@@ -14,6 +14,7 @@ import (
 	"hash/fnv"
 	"io/fs"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -163,6 +164,11 @@ var ErrInvalidProjectAPIToken = errors.New("invalid project API token")
 
 var ErrInvalidUserAPIToken = errors.New("invalid user API token")
 
+// ErrProjectSlugReserved is returned when creating a project with a slug that
+// belonged to a previously deleted project. Reusing a slug would expose the
+// prior project's retained metrics or uncollected blobs under the same key.
+var ErrProjectSlugReserved = errors.New("project slug was previously used and cannot be reused")
+
 const projectAPITokenPrefixLength = 11
 
 const userAPITokenPrefixLength = 12
@@ -170,8 +176,12 @@ const userAPITokenPrefixLength = 12
 const apiTokenLastUsedInterval = time.Minute
 
 const (
-	DefaultMigrationLockTimeout = time.Minute
-	migrationUnlockTimeout      = 5 * time.Second
+	DefaultMigrationLockTimeout    = time.Minute
+	migrationUnlockTimeout         = 5 * time.Second
+	DefaultPostgresMaxOpenConns    = 25
+	DefaultPostgresMaxIdleConns    = 10
+	DefaultPostgresConnMaxLifetime = 30 * time.Minute
+	DefaultPostgresConnMaxIdleTime = 5 * time.Minute
 )
 
 // OpenOptions controls metadata-store startup behavior. A zero lock timeout
@@ -181,6 +191,10 @@ type OpenOptions struct {
 	MigrationLockTimeout time.Duration
 	ApplicationVersion   string
 	SecretBox            *secret.Box
+	MaxOpenConns         int
+	MaxIdleConns         int
+	ConnMaxLifetime      time.Duration
+	ConnMaxIdleTime      time.Duration
 }
 
 // OpenStore opens a SQLite path/sqlite:// URL or a postgres:// URL. Plain paths
@@ -200,12 +214,12 @@ func OpenStoreWithOptions(ctx context.Context, dbURL string, options OpenOptions
 	if strings.TrimSpace(options.ApplicationVersion) == "" {
 		options.ApplicationVersion = "unknown"
 	}
-	driverName, entDialect, dsn, err := parseDBURL(dbURL)
+	driverName, entDialect, dsn, sqlitePath, err := parseDBURL(dbURL)
 	if err != nil {
 		return nil, err
 	}
 	if entDialect == dialect.SQLite {
-		if err := fsValidParent(dsn); err != nil {
+		if err := fsValidParent(sqlitePath); err != nil {
 			return nil, err
 		}
 	}
@@ -213,14 +227,12 @@ func OpenStoreWithOptions(ctx context.Context, dbURL string, options OpenOptions
 	if err != nil {
 		return nil, fmt.Errorf("open metadata database: %w", err)
 	}
-	if entDialect == dialect.SQLite {
+	switch entDialect {
+	case dialect.SQLite:
 		db.SetMaxOpenConns(1)
-		for _, pragma := range []string{"PRAGMA journal_mode = WAL", "PRAGMA foreign_keys = ON", "PRAGMA busy_timeout = 5000"} {
-			if _, err := db.ExecContext(ctx, pragma); err != nil {
-				db.Close()
-				return nil, fmt.Errorf("configure metadata database: %w", err)
-			}
-		}
+		db.SetMaxIdleConns(1)
+	case dialect.Postgres:
+		configurePostgresPool(db, options)
 	}
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
@@ -240,29 +252,173 @@ func OpenStoreWithOptions(ctx context.Context, dbURL string, options OpenOptions
 	return store, nil
 }
 
+func configurePostgresPool(db *sql.DB, options OpenOptions) {
+	maxOpen := options.MaxOpenConns
+	if maxOpen <= 0 {
+		maxOpen = DefaultPostgresMaxOpenConns
+	}
+	maxIdle := options.MaxIdleConns
+	if maxIdle <= 0 {
+		maxIdle = DefaultPostgresMaxIdleConns
+	}
+	if maxIdle > maxOpen {
+		maxIdle = maxOpen
+	}
+	maxLifetime := options.ConnMaxLifetime
+	if maxLifetime <= 0 {
+		maxLifetime = DefaultPostgresConnMaxLifetime
+	}
+	maxIdleTime := options.ConnMaxIdleTime
+	if maxIdleTime <= 0 {
+		maxIdleTime = DefaultPostgresConnMaxIdleTime
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(maxLifetime)
+	db.SetConnMaxIdleTime(maxIdleTime)
+}
+
+// PostgresDiagnostics summarizes the read-only health and schema state of a
+// PostgreSQL metadata database without creating tables or running migrations.
+type PostgresDiagnostics struct {
+	Initialized            bool
+	HasBootstrapAdmin      bool
+	PlatformKeyFingerprint string
+}
+
+// DiagnosePostgresReadOnly verifies connectivity, baseline schema version and
+// checksums, and optional bootstrap metadata against PostgreSQL without
+// issuing any DDL, migrations, or write queries.
+func DiagnosePostgresReadOnly(
+	ctx context.Context,
+	dbURL string,
+	options OpenOptions,
+) (PostgresDiagnostics, error) {
+	driverName, entDialect, dsn, _, err := parseDBURL(dbURL)
+	if err != nil {
+		return PostgresDiagnostics{}, err
+	}
+	if entDialect != dialect.Postgres {
+		return PostgresDiagnostics{}, errors.New("meta.db_url must be a PostgreSQL URL")
+	}
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return PostgresDiagnostics{}, fmt.Errorf("open metadata database: %w", err)
+	}
+	defer db.Close()
+	configurePostgresPool(db, options)
+	if err := db.PingContext(ctx); err != nil {
+		return PostgresDiagnostics{}, fmt.Errorf("connect metadata database: %w", err)
+	}
+
+	var relation sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('public.schema_version')`).Scan(&relation); err != nil {
+		return PostgresDiagnostics{}, fmt.Errorf("inspect schema_version table: %w", err)
+	}
+	if !relation.Valid {
+		return PostgresDiagnostics{Initialized: false}, nil
+	}
+
+	migrations, err := loadMigrationDefinitions("migrations/postgres")
+	if err != nil {
+		return PostgresDiagnostics{}, fmt.Errorf("read embedded migrations: %w", err)
+	}
+	if len(migrations) != 1 || migrations[0].version != 1 {
+		return PostgresDiagnostics{}, fmt.Errorf(
+			"pre-release database requires exactly one version-1 baseline, got %d files",
+			len(migrations),
+		)
+	}
+	var markerVersion sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_version`).Scan(&markerVersion); err != nil {
+		return PostgresDiagnostics{}, fmt.Errorf("read database baseline marker: %w", err)
+	}
+	if !markerVersion.Valid {
+		return PostgresDiagnostics{Initialized: false}, nil
+	}
+	if markerVersion.Int64 != int64(migrations[0].version) {
+		return PostgresDiagnostics{}, fmt.Errorf(
+			"metadata database baseline marker %d is incompatible with current pre-release baseline; recreate the database",
+			markerVersion.Int64,
+		)
+	}
+	if err := validateMigrationChecksums(ctx, db, migrations); err != nil {
+		return PostgresDiagnostics{}, err
+	}
+
+	diag := PostgresDiagnostics{Initialized: true}
+	var adminCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE username = $1`, BootstrapAdminUsername).
+		Scan(&adminCount); err != nil {
+		return PostgresDiagnostics{}, fmt.Errorf("inspect bootstrap admin: %w", err)
+	}
+	diag.HasBootstrapAdmin = adminCount > 0
+
+	var fingerprint string
+	err = db.QueryRowContext(ctx, `SELECT fingerprint FROM platform_key_fingerprints WHERE id = 1`).
+		Scan(&fingerprint)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return PostgresDiagnostics{}, fmt.Errorf("inspect platform key fingerprint: %w", err)
+	}
+	diag.PlatformKeyFingerprint = fingerprint
+	return diag, nil
+}
+
 // SetSecretBox configures the platform encryption box used to seal sensitive
 // metadata such as notification channel credentials.
 func (s *Store) SetSecretBox(box *secret.Box) {
 	s.secretBox.Store(box)
 }
 
-func parseDBURL(dbURL string) (driverName, entDialect, dsn string, err error) {
+func parseDBURL(dbURL string) (driverName, entDialect, dsn, sqlitePath string, err error) {
 	switch {
 	case strings.HasPrefix(dbURL, "postgres://"), strings.HasPrefix(dbURL, "postgresql://"):
-		return "pgx", dialect.Postgres, dbURL, nil
+		return "pgx", dialect.Postgres, dbURL, "", nil
 	case strings.HasPrefix(dbURL, "sqlite://"):
-		path := strings.TrimPrefix(dbURL, "sqlite://")
-		if path == "" {
-			return "", "", "", errors.New("sqlite metadata URL requires a path")
+		raw := strings.TrimPrefix(dbURL, "sqlite://")
+		if strings.TrimSpace(raw) == "" {
+			return "", "", "", "", errors.New("sqlite metadata URL requires a path")
 		}
-		return "sqlite", dialect.SQLite, path, nil
+		dsn, filePath := sqliteDSN(raw)
+		return "sqlite", dialect.SQLite, dsn, filePath, nil
 	case strings.Contains(dbURL, "://"):
-		return "", "", "", fmt.Errorf("unsupported metadata database URL %q", dbURL)
+		return "", "", "", "", fmt.Errorf("unsupported metadata database URL %q", dbURL)
 	case strings.TrimSpace(dbURL) == "":
-		return "", "", "", errors.New("metadata database path is empty")
+		return "", "", "", "", errors.New("metadata database path is empty")
 	default:
-		return "sqlite", dialect.SQLite, dbURL, nil
+		dsn, filePath := sqliteDSN(dbURL)
+		return "sqlite", dialect.SQLite, dsn, filePath, nil
 	}
+}
+
+// sqliteDSN embeds connection-level PRAGMAs and UTC time formatting in the
+// driver DSN so every newly opened or reconnected SQLite connection enforces
+// foreign_keys, busy_timeout, WAL mode, and UTC timestamps consistently.
+func sqliteDSN(raw string) (dsn, filePath string) {
+	base, rawQuery, hasQuery := strings.Cut(raw, "?")
+	values := url.Values{}
+	if hasQuery {
+		if parsed, err := url.ParseQuery(rawQuery); err == nil {
+			values = parsed
+		}
+	}
+	if !values.Has("_busy_timeout") && !values.Has("_timeout") {
+		values.Set("_busy_timeout", "5000")
+	}
+	if !values.Has("_foreign_keys") && !values.Has("_fk") {
+		values.Set("_foreign_keys", "1")
+	}
+	if !values.Has("_journal_mode") && !values.Has("_journal") {
+		values.Set("_journal_mode", "WAL")
+	}
+	if !values.Has("_timezone") {
+		values.Set("_timezone", "UTC")
+	}
+	if !values.Has("_time_format") {
+		values.Set("_time_format", "string_no_monotonic")
+	}
+	filePath = strings.TrimPrefix(base, "file:")
+	return base + "?" + values.Encode(), filePath
 }
 
 func fsValidParent(path string) error {
@@ -391,6 +547,17 @@ func (s *Store) AuthenticateUserAPIToken(ctx context.Context, token string) (Use
 }
 
 func (s *Store) CreateProject(ctx context.Context, name, slug string) (*Project, error) {
+	var reserved int
+	if err := s.db.QueryRowContext(
+		ctx,
+		bind(s.dialect, `SELECT COUNT(*) FROM deleted_project_slugs WHERE slug = ?`),
+		slug,
+	).Scan(&reserved); err != nil {
+		return nil, fmt.Errorf("check reserved project slug: %w", err)
+	}
+	if reserved > 0 {
+		return nil, ErrProjectSlugReserved
+	}
 	p, err := s.client.Project.Create().SetName(name).SetSlug(slug).Save(ctx)
 	if err == nil {
 		s.revision.Add(1)
@@ -439,6 +606,14 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var projectSlug string
+	if err := tx.QueryRowContext(ctx, bind(s.dialect, `SELECT slug FROM projects WHERE id = ?`), id).
+		Scan(&projectSlug); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &NotFoundError{project.Label}
+		}
+		return err
+	}
 	state, err := s.lockErrorInboxStateTx(ctx, tx)
 	if err != nil {
 		return err
@@ -497,11 +672,64 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 	if affected == 0 {
 		return &NotFoundError{project.Label}
 	}
+	if _, err := tx.ExecContext(
+		ctx,
+		bind(
+			s.dialect,
+			`INSERT INTO deleted_project_slugs(slug, deleted_at, blobs_cleaned_at) VALUES (?, ?, NULL)
+			 ON CONFLICT(slug) DO UPDATE SET deleted_at = excluded.deleted_at, blobs_cleaned_at = NULL`,
+		),
+		projectSlug,
+		time.Now().UTC().Round(0),
+	); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.revision.Add(1)
 	return nil
+}
+
+// ListPendingDeletedProjectBlobs returns slugs of deleted projects whose
+// associated blob prefixes have not been marked cleaned yet.
+func (s *Store) ListPendingDeletedProjectBlobs(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		bind(
+			s.dialect,
+			`SELECT slug FROM deleted_project_slugs WHERE blobs_cleaned_at IS NULL ORDER BY deleted_at, slug LIMIT ?`,
+		),
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	slugs := make([]string, 0)
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err != nil {
+			return nil, err
+		}
+		slugs = append(slugs, slug)
+	}
+	return slugs, rows.Err()
+}
+
+// MarkDeletedProjectBlobsCleaned records that all blob prefixes for a deleted
+// project have been reclaimed.
+func (s *Store) MarkDeletedProjectBlobsCleaned(ctx context.Context, slug string, cleanedAt time.Time) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		bind(s.dialect, `UPDATE deleted_project_slugs SET blobs_cleaned_at = ? WHERE slug = ?`),
+		cleanedAt.UTC().Round(0),
+		slug,
+	)
+	return err
 }
 
 func (s *Store) CreateProjectAPIToken(ctx context.Context, projectID int) (string, error) {
@@ -690,8 +918,8 @@ func (s *Store) CreateAccountSession(ctx context.Context, input AccountSession) 
 	return s.client.Session.Create().
 		SetToken(storedCredential(input.Token)).
 		SetUserID(input.UserID).
-		SetCreatedAt(input.CreatedAt).
-		SetExpiresAt(input.ExpiresAt).
+		SetCreatedAt(input.CreatedAt.UTC().Round(0)).
+		SetExpiresAt(input.ExpiresAt.UTC().Round(0)).
 		Exec(ctx)
 }
 
@@ -700,7 +928,7 @@ func (s *Store) AuthenticateAccountSession(ctx context.Context, token string, no
 	if err != nil {
 		return 0, err
 	}
-	if !sess.ExpiresAt.After(now) {
+	if !sess.ExpiresAt.After(now.UTC()) {
 		_ = s.client.Session.DeleteOneID(sess.ID).Exec(ctx)
 		return 0, errInvalidCredentials
 	}
@@ -719,7 +947,7 @@ func (s *Store) ListAccountSessions(
 	now time.Time,
 ) ([]AccountSessionRef, error) {
 	sessions, err := s.client.Session.Query().
-		Where(session.UserIDEQ(userID), session.ExpiresAtGT(now)).
+		Where(session.UserIDEQ(userID), session.ExpiresAtGT(now.UTC().Round(0))).
 		Order(orderDesc(session.FieldCreatedAt)).
 		All(ctx)
 	if err != nil {
@@ -1118,10 +1346,15 @@ func (s *Store) ListAudit(ctx context.Context, options AuditListOptions) ([]Audi
 	return result, nil
 }
 
-// DeleteAuditBefore removes audit rows older than cutoff and returns the
-// number of deleted rows.
+// DeleteAuditBefore removes audit rows older than cutoff in bounded batches
+// and returns the number of deleted rows.
 func (s *Store) DeleteAuditBefore(ctx context.Context, cutoff time.Time) (int, error) {
-	return s.client.AuditEvent.Delete().Where(auditevent.CreatedAtLT(cutoff)).Exec(ctx)
+	return s.deleteInBatches(
+		ctx,
+		"expired audit events",
+		`DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events WHERE created_at < ? ORDER BY id LIMIT ?)`,
+		cutoff.UTC().Round(0),
+	)
 }
 
 func auditRecord(event *AuditEvent) AuditRecord {
@@ -1170,6 +1403,61 @@ func (s *Store) acquireBootstrapCoordination(ctx context.Context) (func() error,
 		defer conn.Close()
 		return releasePostgresAdvisoryLock(conn, lockKey, "PostgreSQL bootstrap")
 	}, nil
+}
+
+// IsClustered reports whether this store uses a shared multi-replica backend
+// (PostgreSQL) that needs cross-replica coordination.
+func (s *Store) IsClustered() bool {
+	return s.dialect == dialect.Postgres
+}
+
+// TryAcquireJanitorLock attempts to acquire a non-blocking cluster-wide
+// advisory lock so only one HA replica runs a retention janitor cycle at a time.
+func (s *Store) TryAcquireJanitorLock(ctx context.Context) (func() error, bool, error) {
+	return s.tryAcquireSessionAdvisoryLock(ctx, "janitor-retention", "PostgreSQL janitor")
+}
+
+// TryAcquireScrapeLeader attempts to acquire a non-blocking cluster-wide
+// advisory lock designating the single HA replica responsible for active
+// vmagent target scraping.
+func (s *Store) TryAcquireScrapeLeader(ctx context.Context) (func() error, bool, error) {
+	return s.tryAcquireSessionAdvisoryLock(ctx, "scrape-leader", "PostgreSQL scrape leader")
+}
+
+func (s *Store) tryAcquireSessionAdvisoryLock(
+	ctx context.Context,
+	namespace, operation string,
+) (func() error, bool, error) {
+	if s.dialect != dialect.Postgres {
+		return func() error { return nil }, true, nil
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("reserve %s connection: %w", operation, err)
+	}
+	lockKey, err := postgresAdvisoryLockKey(ctx, conn, namespace)
+	if err != nil {
+		_ = conn.Close()
+		return nil, false, err
+	}
+	var acquired bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, lockKey).Scan(&acquired); err != nil {
+		_ = conn.Close()
+		return nil, false, fmt.Errorf("acquire %s lock: %w", operation, err)
+	}
+	if !acquired {
+		_ = conn.Close()
+		return nil, false, nil
+	}
+	var releaseOnce sync.Once
+	var releaseErr error
+	return func() error {
+		releaseOnce.Do(func() {
+			defer conn.Close()
+			releaseErr = releasePostgresAdvisoryLock(conn, lockKey, operation)
+		})
+		return releaseErr
+	}, true, nil
 }
 
 // Bootstrap idempotently creates the first admin and the default project. The

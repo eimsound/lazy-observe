@@ -529,6 +529,8 @@ func failedFromMetadata(facts AuditFacts, err error) (AuditFacts, error) {
 	switch {
 	case meta.IsNotFound(err):
 		return failed(facts, ErrorNotFound, "not found")
+	case errors.Is(err, meta.ErrProjectSlugReserved):
+		return failedWithReason(facts, ErrorConflict, err.Error(), "reserved_slug")
 	case meta.IsConstraintError(err):
 		return failed(facts, ErrorConflict, "conflict")
 	case meta.IsLastAdminProtected(err):

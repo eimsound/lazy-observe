@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -12,8 +13,15 @@ import (
 	"github.com/eimsound/lazy-observe/internal/blob"
 	appconfig "github.com/eimsound/lazy-observe/internal/config"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/secret"
+	"github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
+)
+
+const (
+	doctorMinTimeout   = 30 * time.Second
+	doctorProbeTimeout = 10 * time.Second
 )
 
 func newDoctorCommand() *cobra.Command {
@@ -39,14 +47,22 @@ func newDoctorCommand() *cobra.Command {
 	return command
 }
 
+func doctorTimeout(cfg appconfig.Config) time.Duration {
+	timeout := doctorMinTimeout
+	if lockTimeout := cfg.Meta.MigrationLockTimeout.Value(); lockTimeout > timeout {
+		timeout = lockTimeout
+	}
+	return timeout
+}
+
 func runDoctor(cfg appconfig.Config) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), doctorTimeout(cfg))
 	defer cancel()
 	var failures []string
 	check := func(name string, err error) {
 		if err != nil {
 			failures = append(failures, name+": "+err.Error())
-			fmt.Fprintf(os.Stdout, "FAIL %-18s %v\n", name, err)
+			fmt.Fprintf(os.Stdout, "FAIL %-22s %v\n", name, err)
 			return
 		}
 		fmt.Fprintf(os.Stdout, "PASS %s\n", name)
@@ -59,25 +75,60 @@ func runDoctor(cfg appconfig.Config) error {
 	if !cfg.Redis.Enabled {
 		check("redis", errors.New("redis.enabled must be true for shared sessions and rate limits"))
 	} else {
+		redisCtx, cancelRedis := context.WithTimeout(ctx, doctorProbeTimeout)
 		client := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
-		check("redis", client.Ping(ctx).Err())
+		check("redis", client.Ping(redisCtx).Err())
 		_ = client.Close()
+		cancelRedis()
 	}
+
+	var pgDiag meta.PostgresDiagnostics
+	var pgOK bool
 	if !strings.HasPrefix(cfg.Meta.DBURL, "postgres://") && !strings.HasPrefix(cfg.Meta.DBURL, "postgresql://") {
 		check("metadata-postgres", errors.New("meta.db_url must be a PostgreSQL URL"))
 	} else {
-		store, openErr := meta.OpenStoreWithOptions(ctx, cfg.Meta.DBURL, meta.OpenOptions{
+		diag, diagErr := meta.DiagnosePostgresReadOnly(ctx, cfg.Meta.DBURL, meta.OpenOptions{
 			MigrationLockTimeout: cfg.Meta.MigrationLockTimeout.Value(),
 			ApplicationVersion:   Version,
 		})
-		check("metadata-postgres", openErr)
-		if openErr == nil {
-			_ = store.Close()
+		check("metadata-postgres", diagErr)
+		if diagErr == nil {
+			pgDiag = diag
+			pgOK = true
 		}
 	}
+
+	if strings.TrimSpace(cfg.Security.SecretKeyFile) == "" {
+		check("secret-key", errors.New("security.secret_key_file must be configured and shared across HA replicas"))
+	} else {
+		box, loadErr := secret.Load(cfg.Security.SecretKeyFile)
+		if loadErr == nil && pgOK && pgDiag.PlatformKeyFingerprint != "" &&
+			box.Fingerprint() != pgDiag.PlatformKeyFingerprint {
+			loadErr = fmt.Errorf(
+				"platform encryption key fingerprint mismatch (recorded %s, file %s)",
+				pgDiag.PlatformKeyFingerprint,
+				box.Fingerprint(),
+			)
+		}
+		check("secret-key", loadErr)
+	}
+
+	if strings.TrimSpace(cfg.Security.AdminPasswordFile) != "" {
+		_, pwErr := meta.ReadAdminPasswordFile(cfg.Security.AdminPasswordFile)
+		check("admin-password", pwErr)
+	} else if !pgOK || !pgDiag.HasBootstrapAdmin {
+		check(
+			"admin-password",
+			errors.New("security.admin_password_file must be configured before initial HA bootstrap"),
+		)
+	} else {
+		check("admin-password", nil)
+	}
+
 	if cfg.Blob.Backend != "s3" {
 		check("blob-s3", errors.New("blob.backend must be s3 for replay and profile blobs"))
 	} else {
+		s3Ctx, cancelS3 := context.WithTimeout(ctx, doctorProbeTimeout)
 		blobs, openErr := blob.NewS3(
 			blob.S3Config{
 				Bucket:    cfg.Blob.S3.Bucket,
@@ -88,16 +139,50 @@ func runDoctor(cfg appconfig.Config) error {
 			},
 		)
 		if openErr == nil {
-			_, openErr = blobs.List(ctx, "doctor/")
+			_, openErr = blobs.List(s3Ctx, "doctor/")
 		}
+		cancelS3()
 		check("blob-s3", openErr)
 	}
-	for name, endpoint := range map[string]string{
-		"metrics": cfg.Storage.Metrics.QueryURL,
-		"logs":    cfg.Storage.Logs.URL,
-		"traces":  cfg.Storage.Traces.URL,
-	} {
-		check("storage-"+name, checkEndpoint(ctx, endpoint))
+
+	metricsIngestConfigured := strings.TrimSpace(cfg.Storage.Metrics.IngestURL) != ""
+	if !metricsIngestConfigured {
+		check("storage-metrics-ingest", errors.New("storage.metrics.ingest_url is not configured"))
+	}
+	probeClient := &http.Client{Timeout: doctorProbeTimeout}
+	backend, backendErr := storage.NewWithMetricsOptions(
+		storage.MetricsKind(cfg.Storage.Metrics.Kind),
+		cfg.Storage.Metrics.QueryURL,
+		cfg.Storage.Metrics.IngestURL,
+		cfg.Storage.Logs.URL,
+		cfg.Storage.Traces.URL,
+		storage.MetricsOptions{
+			Cluster:         cfg.Storage.Metrics.Cluster,
+			TenantAccountID: cfg.Storage.Metrics.TenantAccountID,
+		},
+		probeClient,
+	)
+	if backendErr != nil {
+		check("storage-metrics", backendErr)
+		if metricsIngestConfigured {
+			check("storage-metrics-ingest", backendErr)
+		}
+		check("storage-logs", checkEndpoint(ctx, probeClient, cfg.Storage.Logs.URL, "/health"))
+		check("storage-traces", checkEndpoint(ctx, probeClient, cfg.Storage.Traces.URL, "/health"))
+	} else {
+		probeCtx, cancelProbe := context.WithTimeout(ctx, doctorProbeTimeout)
+		health := backend.Health(probeCtx)
+		cancelProbe()
+		check("storage-metrics", health["metrics"])
+		if metricsIngestConfigured {
+			if ingestErr, ok := health["metrics-ingest"]; ok {
+				check("storage-metrics-ingest", ingestErr)
+			} else {
+				check("storage-metrics-ingest", health["metrics"])
+			}
+		}
+		check("storage-logs", health["logs"])
+		check("storage-traces", health["traces"])
 	}
 	if len(failures) != 0 {
 		return fmt.Errorf("HA readiness failed: %s", strings.Join(failures, "; "))
@@ -111,17 +196,34 @@ func runDoctor(cfg appconfig.Config) error {
 	return nil
 }
 
-func checkEndpoint(ctx context.Context, endpoint string) error {
-	if strings.TrimSpace(endpoint) == "" {
+func checkEndpoint(ctx context.Context, client *http.Client, endpoint string, paths ...string) error {
+	base := strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if base == "" {
 		return errors.New("endpoint is not configured")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return err
+	if client == nil {
+		client = &http.Client{Timeout: doctorProbeTimeout}
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
+	if len(paths) == 0 {
+		paths = []string{""}
 	}
-	return resp.Body.Close()
+	var lastErr error
+	for _, path := range paths {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		_ = resp.Body.Close()
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			return nil
+		}
+		lastErr = fmt.Errorf("%s returned HTTP %d", base+path, resp.StatusCode)
+	}
+	return lastErr
 }

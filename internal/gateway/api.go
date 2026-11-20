@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strconv"
@@ -426,11 +427,14 @@ func (g *Gateway) deleteProject(c fiber.Ctx) error {
 		return managementAPIError(c, err)
 	}
 	if g.blobs != nil && facts.ProjectSlug != "" {
+		allCleaned := true
 		for _, prefix := range []string{
 			"profiles/" + safeProfileSegment(facts.ProjectSlug) + "/",
 			"replay/" + facts.ProjectSlug + "/",
+			"sourcemaps/" + facts.ProjectSlug + "/",
 		} {
 			if err := g.blobs.DeletePrefix(c.Context(), prefix); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				allCleaned = false
 				g.logger.Warn(
 					"delete project blobs failed",
 					"project",
@@ -440,6 +444,25 @@ func (g *Gateway) deleteProject(c fiber.Ctx) error {
 					"error",
 					err,
 				)
+			}
+		}
+		if allCleaned {
+			if marker, ok := g.store.(interface {
+				MarkDeletedProjectBlobsCleaned(context.Context, string, time.Time) error
+			}); ok {
+				if err := marker.MarkDeletedProjectBlobsCleaned(
+					c.Context(),
+					facts.ProjectSlug,
+					g.now().UTC(),
+				); err != nil {
+					g.logger.Warn(
+						"mark deleted project blobs cleaned failed",
+						"project",
+						facts.ProjectSlug,
+						"error",
+						err,
+					)
+				}
 			}
 		}
 	}

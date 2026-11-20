@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/entsql"
 	entschema "entgo.io/ent/schema"
@@ -37,8 +35,8 @@ func (IssueLifecycleEvent) Fields() []ent.Field {
 		field.Int("attempts").Default(0).NonNegative(),
 		field.String("last_error").Default(""),
 		field.Time("dispatched_at").Optional().Nillable(),
-		field.Time("created_at").Default(time.Now).Immutable(),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("created_at").Default(UTCNow).Immutable(),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 	}
 }
 

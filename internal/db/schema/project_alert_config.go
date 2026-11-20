@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -17,8 +15,8 @@ func (ProjectAlertConfig) Fields() []ent.Field {
 		field.Bool("new_issue").Default(true),
 		field.Bool("regression").Default(true),
 		field.Int("error_rate_threshold_per_min").Default(0).NonNegative(),
-		field.Time("created_at").Default(time.Now).Immutable(),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("created_at").Default(UTCNow).Immutable(),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 		field.Int("project_id"),
 	}
 }

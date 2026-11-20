@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -21,7 +19,7 @@ func (AlertEvent) Fields() []ent.Field {
 		field.Time("ends_at").Optional().Nillable(),
 		field.Time("last_notified_at").Optional().Nillable(),
 		field.Bool("inhibited").Default(false),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 		field.Int("rule_id"),
 	}
 }

@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // keyBytes is the AES-256 key length.
@@ -65,7 +66,7 @@ func LoadOrCreate(path string) (*Box, error) {
 			if errors.Is(err, os.ErrExist) {
 				// Another replica created the key on a shared volume first;
 				// load its key so every replica converges on one platform key.
-				return Load(path)
+				return loadWithRetry(path)
 			}
 			return nil, err
 		}
@@ -157,11 +158,25 @@ func persistExclusive(path string, raw []byte) (retErr error) {
 	return nil
 }
 
+func loadWithRetry(path string) (*Box, error) {
+	var lastErr error
+	for attempt := range 20 {
+		box, err := Load(path)
+		if err == nil {
+			return box, nil
+		}
+		lastErr = err
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
 func isUnsupportedLinkError(err error) bool {
 	return errors.Is(err, syscall.EPERM) ||
 		errors.Is(err, syscall.ENOSYS) ||
 		errors.Is(err, syscall.ENOTSUP) ||
-		errors.Is(err, syscall.EOPNOTSUPP)
+		errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, syscall.EXDEV)
 }
 
 func writeExclusiveFallback(path string, encoded []byte) error {

@@ -400,7 +400,7 @@ func openBlobStore(cfg appconfig.Config) (blob.Store, error) {
 	)
 	switch cfg.Blob.Backend {
 	case "local":
-		store, err = blob.NewLocal(cfg.DataDir)
+		store, err = blob.NewLocal(filepath.Join(cfg.DataDir, "blobs"))
 	case "s3":
 		store, err = blob.NewS3(
 			blob.S3Config{

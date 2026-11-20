@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -16,8 +14,8 @@ func (NotificationChannel) Fields() []ent.Field {
 		field.String("name").NotEmpty().Unique(),
 		field.JSON("config", map[string]any{}).Default(map[string]any{}),
 		field.Bool("enabled").Default(true),
-		field.Time("created_at").Default(time.Now).Immutable(),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("created_at").Default(UTCNow).Immutable(),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 	}
 }
 

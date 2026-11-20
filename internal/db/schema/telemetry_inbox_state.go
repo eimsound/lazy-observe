@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/entsql"
 	entschema "entgo.io/ent/schema"
@@ -26,6 +24,6 @@ func (TelemetryInboxState) Fields() []ent.Field {
 		field.Int64("retries_total").Default(0).NonNegative(),
 		field.Int64("terminal_failures_total").Default(0).NonNegative(),
 		field.Int64("drops_total").Default(0).NonNegative(),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 	}
 }

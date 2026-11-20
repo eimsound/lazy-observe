@@ -32,6 +32,7 @@ const (
 	defaultRestartInitial = time.Second
 	defaultRestartMax     = time.Minute
 	defaultHealthInterval = 100 * time.Millisecond
+	maxLinePrefixBytes    = 64 << 10
 )
 
 type BinarySource interface {
@@ -125,6 +126,7 @@ type Supervisor struct {
 	restartInitial  time.Duration
 	restartMax      time.Duration
 	output          io.Writer
+	outputMu        sync.Mutex
 	command         func(name, binary string, args []string) *exec.Cmd
 	restartJitter   func() float64
 	restartWait     func(context.Context, time.Duration) error
@@ -138,10 +140,13 @@ type Supervisor struct {
 	shutdownErr     error
 }
 
+func (s *Supervisor) logf(format string, args ...any) {
+	s.outputMu.Lock()
+	defer s.outputMu.Unlock()
+	_, _ = fmt.Fprintf(s.output, format, args...)
+}
+
 func Start(ctx context.Context, cfg Config) (*Supervisor, error) {
-	if cfg.Source == nil {
-		return nil, errors.New("binary source is required")
-	}
 	if cfg.StartupTimeout <= 0 {
 		cfg.StartupTimeout = 20 * time.Second
 	}
@@ -175,19 +180,7 @@ func Start(ctx context.Context, cfg Config) (*Supervisor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve data directory: %w", err)
 	}
-	if cfg.ScrapeConfigPath == "" {
-		cfg.ScrapeConfigPath = filepath.Join(dataDir, "scrape", "scrape.yml")
-	}
-	if err := os.MkdirAll(filepath.Dir(cfg.ScrapeConfigPath), 0o755); err != nil {
-		return nil, fmt.Errorf("create scrape config directory: %w", err)
-	}
-	if _, err := os.Stat(cfg.ScrapeConfigPath); errors.Is(err, os.ErrNotExist) {
-		if err := os.WriteFile(cfg.ScrapeConfigPath, []byte("scrape_configs: []\n"), 0o644); err != nil {
-			return nil, fmt.Errorf("create initial scrape config: %w", err)
-		}
-	} else if err != nil {
-		return nil, fmt.Errorf("inspect scrape config: %w", err)
-	}
+	defs := componentDefinitions(cfg, dataDir)
 	lifecycleCtx, cancelLifecycle := context.WithCancel(ctx)
 	s := &Supervisor{
 		shutdownTimeout: cfg.ShutdownTimeout,
@@ -202,7 +195,32 @@ func Start(ctx context.Context, cfg Config) (*Supervisor, error) {
 		cancelLifecycle: cancelLifecycle,
 		fatal:           make(chan error, 1),
 	}
-	defs := componentDefinitions(cfg, dataDir)
+	if len(defs) == 0 {
+		s.logf("lazy-observe: 0 managed components healthy\n")
+		return s, nil
+	}
+	if cfg.Source == nil {
+		cancelLifecycle()
+		return nil, errors.New("binary source is required")
+	}
+	if cfg.ScrapeConfigPath == "" {
+		cfg.ScrapeConfigPath = filepath.Join(dataDir, "scrape", "scrape.yml")
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.ScrapeConfigPath), 0o755); err != nil {
+		cancelLifecycle()
+		return nil, fmt.Errorf("create scrape config directory: %w", err)
+	}
+	if _, err := os.Stat(cfg.ScrapeConfigPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(cfg.ScrapeConfigPath, []byte("scrape_configs: []\n"), 0o644); err != nil {
+			cancelLifecycle()
+			return nil, fmt.Errorf("create initial scrape config: %w", err)
+		}
+	} else if err != nil {
+		cancelLifecycle()
+		return nil, fmt.Errorf("inspect scrape config: %w", err)
+	}
+	// Recompute defs if ScrapeConfigPath defaulted above.
+	defs = componentDefinitions(cfg, dataDir)
 	for i := range defs {
 		path, err := cfg.Source.Path(defs[i].binary)
 		if err != nil {
@@ -223,7 +241,7 @@ func Start(ctx context.Context, cfg Config) (*Supervisor, error) {
 		s.lifecycle.Add(1)
 		go s.monitor(managed)
 	}
-	fmt.Fprintf(s.output, "lazy-observe: %d managed components healthy\n", len(defs))
+	s.logf("lazy-observe: %d managed components healthy\n", len(defs))
 	return s, nil
 }
 
@@ -311,7 +329,7 @@ func (s *Supervisor) startInitial(ctx context.Context, managed *component) error
 		return fmt.Errorf("start %s: %w", managed.name, err)
 	}
 	managed.setStatus(componentHealthy, nil)
-	fmt.Fprintf(s.output, "lazy-observe: %s ready pid=%d\n", managed.name, process.cmd.Process.Pid)
+	s.logf("lazy-observe: %s ready pid=%d\n", managed.name, process.cmd.Process.Pid)
 	return nil
 }
 
@@ -320,6 +338,9 @@ func (s *Supervisor) launch(
 	status componentStatus,
 	lastErr error,
 ) (*managedProcess, error) {
+	if err := ensureAddressAvailable(managed.addr); err != nil {
+		return nil, err
+	}
 	info, err := os.Stat(managed.binary)
 	if err != nil {
 		return nil, fmt.Errorf("locate binary: %w", err)
@@ -341,7 +362,7 @@ func (s *Supervisor) launch(
 	if cmd == nil {
 		return nil, errors.New("command factory returned nil")
 	}
-	writer := &linePrefixWriter{prefix: "[" + managed.name + "] ", dst: s.output}
+	writer := &linePrefixWriter{prefix: "[" + managed.name + "] ", dst: s.output, dstMu: &s.outputMu}
 	cmd.Stdout, cmd.Stderr = writer, writer
 	if err := startManagedCommand(cmd); err != nil {
 		return nil, err
@@ -354,6 +375,15 @@ func (s *Supervisor) launch(
 		close(process.done)
 	}()
 	return process, nil
+}
+
+func ensureAddressAvailable(addr string) error {
+	conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		return fmt.Errorf("listen address %s is already in use by another process", addr)
+	}
+	return nil
 }
 
 func (s *Supervisor) waitHealthy(
@@ -382,7 +412,12 @@ func (s *Supervisor) waitHealthy(
 		case <-ticker.C:
 			lastErr = checkHealth(ctx, client, "http://"+managed.addr+"/health")
 			if lastErr == nil {
-				return nil
+				select {
+				case <-process.done:
+					return unexpectedExitError(managed.name, process.err)
+				default:
+					return nil
+				}
 			}
 		}
 	}
@@ -420,7 +455,7 @@ func (s *Supervisor) monitor(managed *component) {
 		if retryIndex < int(^uint(0)>>1) {
 			retryIndex++
 		}
-		fmt.Fprintf(s.output, "lazy-observe: %s restarting in %s\n", managed.name, delay)
+		s.logf("lazy-observe: %s restarting in %s\n", managed.name, delay)
 		if err := s.restartWait(s.lifecycleCtx, delay); err != nil {
 			if s.lifecycleCtx.Err() != nil {
 				return
@@ -436,7 +471,7 @@ func (s *Supervisor) monitor(managed *component) {
 		process, err = s.launch(managed, componentRestarting, lastErr)
 		if err != nil {
 			managed.update(nil, componentRestarting, err)
-			fmt.Fprintf(s.output, "lazy-observe: %s restart failed: %v\n", managed.name, err)
+			s.logf("lazy-observe: %s restart failed: %v\n", managed.name, err)
 			continue
 		}
 		if err := s.waitHealthy(s.lifecycleCtx, managed, process, s.startupTimeout); err != nil {
@@ -446,13 +481,13 @@ func (s *Supervisor) monitor(managed *component) {
 			stopProcess(process)
 			<-process.done
 			managed.setStatus(componentRestarting, err)
-			fmt.Fprintf(s.output, "lazy-observe: %s restart did not become healthy: %v\n", managed.name, err)
+			s.logf("lazy-observe: %s restart did not become healthy: %v\n", managed.name, err)
 			process = nil
 			continue
 		}
 		managed.setStatus(componentHealthy, nil)
 		retryIndex = 0
-		fmt.Fprintf(s.output, "lazy-observe: %s recovered pid=%d\n", managed.name, process.cmd.Process.Pid)
+		s.logf("lazy-observe: %s recovered pid=%d\n", managed.name, process.cmd.Process.Pid)
 	}
 }
 
@@ -567,20 +602,50 @@ func (s *Supervisor) shutdown() error {
 	for _, managed := range s.components {
 		managed.setStatus(componentStopping, nil)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
-	defer cancel()
-	var errs []error
-	if err := s.stopComponents(ctx, false); err != nil {
-		errs = append(errs, err)
-	}
-	if ctx.Err() == nil {
-		if err := s.stopComponents(ctx, true); err != nil {
-			errs = append(errs, err)
+	hasAgents, hasStorage := false, false
+	for _, managed := range s.components {
+		if managed.storage {
+			hasStorage = true
+		} else {
+			hasAgents = true
 		}
 	}
-	if ctx.Err() != nil {
-		s.killAll()
-		errs = append(errs, fmt.Errorf("shutdown timed out after %s", s.shutdownTimeout))
+	agentBudget, storageBudget := s.shutdownTimeout, s.shutdownTimeout
+	if hasAgents && hasStorage {
+		agentBudget = s.shutdownTimeout / 3
+		if agentBudget <= 0 {
+			agentBudget = time.Millisecond
+		}
+		storageBudget = s.shutdownTimeout - agentBudget
+		if storageBudget <= 0 {
+			storageBudget = time.Millisecond
+		}
+	}
+
+	var errs []error
+	if hasAgents {
+		agentCtx, cancelAgent := context.WithTimeout(context.Background(), agentBudget)
+		if err := s.stopComponents(agentCtx, false); err != nil {
+			errs = append(errs, err)
+		}
+		if agentCtx.Err() != nil {
+			s.killComponents(false)
+			errs = append(errs, fmt.Errorf("agent shutdown timed out after %s", agentBudget))
+		}
+		cancelAgent()
+	}
+	if hasStorage {
+		// Storage engines always receive their own graceful SIGTERM budget so a
+		// wedged vmagent can never skip SIGTERM and force-SIGKILL storage.
+		storageCtx, cancelStorage := context.WithTimeout(context.Background(), storageBudget)
+		if err := s.stopComponents(storageCtx, true); err != nil {
+			errs = append(errs, err)
+		}
+		if storageCtx.Err() != nil {
+			s.killComponents(true)
+			errs = append(errs, fmt.Errorf("storage shutdown timed out after %s", storageBudget))
+		}
+		cancelStorage()
 	}
 	for _, managed := range s.components {
 		managed.setStatus(componentStopped, nil)
@@ -637,8 +702,11 @@ func (s *Supervisor) stopComponents(ctx context.Context, storage bool) error {
 	return errors.Join(errs...)
 }
 
-func (s *Supervisor) killAll() {
+func (s *Supervisor) killComponents(storage bool) {
 	for _, managed := range s.components {
+		if managed.storage != storage {
+			continue
+		}
 		process, _, _ := managed.snapshot()
 		if process == nil || process.cmd.Process == nil {
 			continue
@@ -647,6 +715,7 @@ func (s *Supervisor) killAll() {
 		case <-process.done:
 		default:
 			_ = process.cmd.Process.Kill()
+			<-process.done
 		}
 	}
 }
@@ -702,28 +771,45 @@ func waitForRestart(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-var outputMu sync.Mutex
-
 type linePrefixWriter struct {
 	mu     sync.Mutex
 	prefix string
 	dst    io.Writer
+	dstMu  *sync.Mutex
 	buf    bytes.Buffer
 }
 
 func (w *linePrefixWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	n, _ := w.buf.Write(p)
-	for {
-		line, err := w.buf.ReadString('\n')
-		if err != nil {
-			_, _ = w.buf.WriteString(line)
-			break
+	total := len(p)
+	for len(p) > 0 {
+		remaining := maxLinePrefixBytes - w.buf.Len()
+		if remaining <= 0 {
+			w.writeLine(w.buf.String() + "\n")
+			w.buf.Reset()
+			remaining = maxLinePrefixBytes
 		}
-		w.writeLine(line)
+		chunk := p
+		if len(chunk) > remaining {
+			chunk = chunk[:remaining]
+		}
+		_, _ = w.buf.Write(chunk)
+		p = p[len(chunk):]
+		for {
+			line, err := w.buf.ReadString('\n')
+			if err != nil {
+				_, _ = w.buf.WriteString(line)
+				break
+			}
+			w.writeLine(line)
+		}
+		if w.buf.Len() >= maxLinePrefixBytes {
+			w.writeLine(w.buf.String() + "\n")
+			w.buf.Reset()
+		}
 	}
-	return n, nil
+	return total, nil
 }
 
 func (w *linePrefixWriter) Flush() {
@@ -736,7 +822,9 @@ func (w *linePrefixWriter) Flush() {
 }
 
 func (w *linePrefixWriter) writeLine(line string) {
-	outputMu.Lock()
-	defer outputMu.Unlock()
+	if w.dstMu != nil {
+		w.dstMu.Lock()
+		defer w.dstMu.Unlock()
+	}
 	_, _ = fmt.Fprint(w.dst, w.prefix, line)
 }

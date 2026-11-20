@@ -15,9 +15,17 @@ type MetadataStore interface {
 	DeleteReplaySession(context.Context, int) error
 }
 
+type conditionalReplayDeleter interface {
+	DeleteExpiredReplaySession(context.Context, int, time.Time) (bool, error)
+}
+
+const DefaultGracePeriod = 15 * time.Minute
+
 type Cleaner struct {
-	Metadata MetadataStore
-	Blobs    blob.Store
+	Metadata    MetadataStore
+	Blobs       blob.Store
+	GracePeriod time.Duration
+	Now         func() time.Time
 }
 
 func (c *Cleaner) Clean(ctx context.Context, cutoff time.Time) (int, error) {
@@ -25,6 +33,11 @@ func (c *Cleaner) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 		return 0, nil
 	}
 	cutoff = cutoff.UTC().Round(0)
+	nowFn := c.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := nowFn().UTC()
 	deleted := 0
 	failed := make(map[int]struct{})
 	var errs []error
@@ -43,12 +56,36 @@ func (c *Cleaner) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 				continue
 			}
 			prefix := "replay/" + row.ProjectSlug + "/" + row.SessionID + "/"
+			if c.GracePeriod > 0 {
+				objects, listErr := c.Blobs.List(ctx, prefix)
+				if listErr != nil {
+					failed[row.ID] = struct{}{}
+					errs = append(errs, fmt.Errorf("list replay blobs for %s: %w", row.SessionID, listErr))
+					continue
+				}
+				if hasRecentReplayObject(objects, now, c.GracePeriod) {
+					failed[row.ID] = struct{}{}
+					continue
+				}
+			}
 			if err := c.Blobs.DeletePrefix(ctx, prefix); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				failed[row.ID] = struct{}{}
 				errs = append(errs, fmt.Errorf("delete replay blobs for %s: %w", row.SessionID, err))
 				continue
 			}
-			if err := c.Metadata.DeleteReplaySession(ctx, row.ID); err != nil && !meta.IsNotFound(err) {
+			if conditional, ok := c.Metadata.(conditionalReplayDeleter); ok {
+				removed, delErr := conditional.DeleteExpiredReplaySession(ctx, row.ID, cutoff)
+				if delErr != nil {
+					failed[row.ID] = struct{}{}
+					errs = append(errs, fmt.Errorf("delete replay metadata for %s: %w", row.SessionID, delErr))
+					continue
+				}
+				if !removed {
+					// A concurrent segment refreshed last_seen_at past cutoff.
+					failed[row.ID] = struct{}{}
+					continue
+				}
+			} else if err := c.Metadata.DeleteReplaySession(ctx, row.ID); err != nil && !meta.IsNotFound(err) {
 				failed[row.ID] = struct{}{}
 				errs = append(errs, fmt.Errorf("delete replay metadata for %s: %w", row.SessionID, err))
 				continue
@@ -60,4 +97,13 @@ func (c *Cleaner) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 			return deleted, errors.Join(errs...)
 		}
 	}
+}
+
+func hasRecentReplayObject(objects []blob.Object, now time.Time, grace time.Duration) bool {
+	for _, object := range objects {
+		if !object.ModTime.IsZero() && now.Sub(object.ModTime.UTC()) < grace {
+			return true
+		}
+	}
+	return false
 }

@@ -330,3 +330,65 @@ func TestClosedIssuesDeleteOnlyExpiredResolvedOrIgnored(t *testing.T) {
 		}
 	}
 }
+
+func TestSourceMapsReclaimsOrphansForDeletedProject(t *testing.T) {
+	ctx := context.Background()
+	store, _ := openTestStore(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanKey := "sourcemaps/gone-project/revisions/" + digestOf('e') + ".map"
+	if err := blobs.Put(ctx, orphanKey, strings.NewReader("map")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&SourceMaps{
+		Metadata: store,
+		Blobs:    blobs,
+		Now:      func() time.Time { return time.Now().UTC().Add(DefaultSourceMapGracePeriod + time.Minute) },
+	}).Clean(ctx, time.Now().UTC().Add(-90*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blobs.Get(ctx, orphanKey); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("deleted project orphan source map still exists: err=%v", err)
+	}
+}
+
+func TestDeletedProjectBlobsTaskCleansAllPrefixes(t *testing.T) {
+	ctx := context.Background()
+	store, _ := openTestStore(t)
+	p, err := store.CreateProject(ctx, "Gone", "gone-blobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{
+		"profiles/gone-blobs/svc/cpu/1.pb.gz",
+		"replay/gone-blobs/sess/0.json.gz",
+		"sourcemaps/gone-blobs/revisions/" + digestOf('a') + ".map",
+	}
+	for _, key := range keys {
+		if err := blobs.Put(ctx, key, strings.NewReader("data")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.DeleteProject(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (&DeletedProjectBlobs{Metadata: store, Blobs: blobs}).Clean(ctx, time.Now().UTC())
+	if err != nil || cleaned != 1 {
+		t.Fatalf("DeletedProjectBlobs cleaned=%d err=%v want 1", cleaned, err)
+	}
+	for _, key := range keys {
+		if _, err := blobs.Get(ctx, key); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("deleted project blob %s still exists: err=%v", key, err)
+		}
+	}
+	pending, err := store.ListPendingDeletedProjectBlobs(ctx, 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending deleted project blobs=%v err=%v", pending, err)
+	}
+}

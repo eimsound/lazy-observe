@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	appconfig "github.com/eimsound/lazy-observe/internal/config"
 	"github.com/eimsound/lazy-observe/internal/meta"
 )
 
@@ -78,10 +82,69 @@ func TestHADoctorReportsMissingExternalState(t *testing.T) {
 		t.Fatal("doctor unexpectedly passed")
 	}
 	message := err.Error()
-	for _, want := range []string{"redis.enabled", "meta.db_url", "blob.backend"} {
+	for _, want := range []string{
+		"redis.enabled",
+		"meta.db_url",
+		"blob.backend",
+		"security.secret_key_file",
+		"security.admin_password_file",
+		"storage.metrics.ingest_url",
+	} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("doctor error %q does not contain %q", message, want)
 		}
+	}
+}
+
+func TestDoctorCheckEndpointEnforcesHTTPStatusAndTimeout(t *testing.T) {
+	status := http.StatusInternalServerError
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte("body"))
+	}))
+	defer srv.Close()
+
+	if err := checkEndpoint(context.Background(), srv.Client(), srv.URL, "/health"); err == nil ||
+		!strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("500 endpoint err=%v want HTTP 500 failure", err)
+	}
+	status = http.StatusNotFound
+	if err := checkEndpoint(context.Background(), srv.Client(), srv.URL, "/health"); err == nil ||
+		!strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("404 endpoint err=%v want HTTP 404 failure", err)
+	}
+	status = http.StatusOK
+	if err := checkEndpoint(context.Background(), srv.Client(), srv.URL, "/health"); err != nil {
+		t.Fatalf("200 endpoint err=%v", err)
+	}
+
+	cfg := appconfig.Defaults()
+	if got := doctorTimeout(cfg); got != time.Minute {
+		t.Fatalf("doctorTimeout=%s want 1m (matching MigrationLockTimeout)", got)
+	}
+	cfg.Meta.MigrationLockTimeout = appconfig.Duration(5 * time.Second)
+	if got := doctorTimeout(cfg); got != doctorMinTimeout {
+		t.Fatalf("doctorTimeout=%s want %s", got, doctorMinTimeout)
+	}
+}
+
+func TestOpenBlobStoreUsesDedicatedBlobsSubdirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := appconfig.Defaults()
+	cfg.DataDir = dataDir
+	cfg.Blob.Backend = "local"
+	store, err := openBlobStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), "replay/demo/sess/0.json.gz", strings.NewReader("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "blobs", "replay", "demo", "sess", "0.json.gz")); err != nil {
+		t.Fatalf("blob not stored under dedicated blobs/ subdirectory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "replay")); !os.IsNotExist(err) {
+		t.Fatalf("blob leaked into DataDir root: err=%v", err)
 	}
 }
 

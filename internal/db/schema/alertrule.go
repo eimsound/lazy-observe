@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"time"
-
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/entsql"
 	"entgo.io/ent/schema/edge"
@@ -23,8 +21,8 @@ func (AlertRule) Fields() []ent.Field {
 		field.JSON("labels", map[string]string{}).Default(map[string]string{}),
 		field.JSON("annotations", map[string]string{}).Default(map[string]string{}),
 		field.Bool("enabled").Default(true),
-		field.Time("created_at").Default(time.Now).Immutable(),
-		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
+		field.Time("created_at").Default(UTCNow).Immutable(),
+		field.Time("updated_at").Default(UTCNow).UpdateDefault(UTCNow),
 		field.Int("project_id"),
 	}
 }

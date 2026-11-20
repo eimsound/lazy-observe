@@ -99,7 +99,7 @@ func startServerServices(
 			SharedLimiter:  sharedAlertLimiter(cfg, limits),
 		},
 	)
-	scrapes, unavailableReason := startScrapeService(cfg, logger, essentials, metadata.store, signals, loopback)
+	scrapes, unavailableReason := startScrapeService(ctx, cfg, logger, essentials, metadata.store, signals, loopback)
 	startRetentionJanitor(ctx, cfg, logger, metadata)
 	return &serverServices{
 		alerts:                  alerts,
@@ -116,6 +116,7 @@ func sharedAlertLimiter(cfg appconfig.Config, limits sharedstate.Limiter) shared
 }
 
 func startScrapeService(
+	ctx context.Context,
 	cfg appconfig.Config,
 	logger *slog.Logger,
 	essentials serverEssentials,
@@ -125,7 +126,7 @@ func startScrapeService(
 ) (*scrape.Service, string) {
 	if signals.ingestURL != "" {
 		platformPorts, blockedHostPorts := collectPlatformEndpoints(cfg, loopback, signals)
-		return scrape.NewService(
+		service := scrape.NewService(
 			scrape.Config{
 				Store:            store,
 				ConfigPath:       signals.scrapeConfigPath,
@@ -135,7 +136,11 @@ func startScrapeService(
 				OutboundPolicy:   essentials.outboundPolicy,
 				Logger:           logger,
 			},
-		), ""
+		)
+		if store != nil && store.IsClustered() {
+			go service.RunLeaderLoop(ctx, logger, scrape.DefaultLeaderSyncInterval)
+		}
+		return service, ""
 	}
 	const unavailableReason = "scrape management is disabled: storage.metrics.ingest_url is not configured"
 	logger.Warn(
@@ -153,10 +158,16 @@ func startRetentionJanitor(
 	metadata *serverMetadata,
 ) {
 	retentionJanitor := janitor.New(logger, janitor.DefaultInterval)
-	retentionJanitor.Register(
+	retentionJanitor.SetCoordinator(metadata.store)
+	retentionJanitor.RegisterWithInterval(
 		"replay",
 		cfg.Retention.Replay.Value(),
-		&replay.Cleaner{Metadata: metadata.store, Blobs: metadata.blobs},
+		cfg.Replay.CleanupInterval.Value(),
+		&replay.Cleaner{
+			Metadata:    metadata.store,
+			Blobs:       metadata.blobs,
+			GracePeriod: replay.DefaultGracePeriod,
+		},
 	)
 	retentionJanitor.Register(
 		"sourcemaps",
@@ -172,6 +183,26 @@ func startRetentionJanitor(
 		"alert_events",
 		cfg.Retention.AlertEvents.Value(),
 		janitor.AlertEvents{Metadata: metadata.store},
+	)
+	retentionJanitor.Register(
+		"notification_deliveries",
+		cfg.Retention.AlertEvents.Value(),
+		janitor.NotificationDeliveries{Metadata: metadata.store},
+	)
+	retentionJanitor.Register(
+		"notification_outbox",
+		cfg.Retention.AlertEvents.Value(),
+		janitor.NotificationOutbox{Metadata: metadata.store},
+	)
+	retentionJanitor.Register(
+		"sessions",
+		time.Minute,
+		janitor.Sessions{Metadata: metadata.store},
+	)
+	retentionJanitor.Register(
+		"deleted_project_blobs",
+		time.Minute,
+		&janitor.DeletedProjectBlobs{Metadata: metadata.store, Blobs: metadata.blobs},
 	)
 	retentionJanitor.Register(
 		"profiles",
