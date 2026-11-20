@@ -161,7 +161,7 @@ def test_upload_id_is_unique_and_hex32():
     assert len(set(ids)) == len(ids)
 
 
-def test_404_is_silent_and_counted_as_rejected():
+def test_404_is_silent_and_counted_as_server_rejected():
     opener = _FakeOpener([404, 201])
     drops = []
     uploader = _uploader(
@@ -174,10 +174,10 @@ def test_404_is_silent_and_counted_as_rejected():
     assert uploader.close(timeout=2.0) is None
     assert len(opener.requests) == 1
     assert uploader.dropped() == 1
-    assert drops == [("rejected", 1)]
+    assert drops == [("server_rejected", 1)]
 
 
-def test_409_conflict_is_silent_and_counted_as_rejected():
+def test_409_conflict_is_silent_and_counted_as_server_rejected():
     opener = _FakeOpener([409, 201])
     drops = []
     uploader = _uploader(
@@ -190,7 +190,107 @@ def test_409_conflict_is_silent_and_counted_as_rejected():
     assert uploader.close(timeout=2.0) is None
     assert len(opener.requests) == 1
     assert uploader.dropped() == 1
-    assert drops == [("rejected", 1)]
+    assert drops == [("server_rejected", 1)]
+
+
+def test_408_and_429_are_retried_until_accepted():
+    opener = _FakeOpener([408, 429, 201])
+    drops = []
+    uploader = _uploader(
+        opener,
+        max_attempts=3,
+        retry_initial=0.01,
+        retry_max=0.02,
+        warn=lambda reason, err, count: drops.append((reason, count)),
+    )
+    assert uploader.enqueue(_profile())
+    _wait_for(lambda: len(opener.requests) == 3)
+    assert uploader.close(timeout=2.0) is None
+    assert len(opener.requests) == 3
+    assert uploader.dropped() == 0
+    assert drops == []
+
+
+def test_profile_exceeding_10mb_is_rejected_before_upload():
+    from lazyobserve._profile_upload import MAX_PROFILE_SIZE
+
+    opener = _FakeOpener([201])
+    drops = []
+    uploader = _uploader(
+        opener,
+        max_attempts=3,
+        warn=lambda reason, err, count: drops.append((reason, count)),
+    )
+    oversized = _profile(b"x" * (MAX_PROFILE_SIZE + 1))
+    assert uploader.enqueue(oversized) is False
+    assert uploader.close(timeout=2.0) is None
+    assert opener.requests == []
+    assert uploader.dropped() == 1
+    assert drops == [("server_rejected", 1)]
+
+
+def test_profile_uploader_refuses_redirects_and_ignores_global_opener():
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    target_hits = []
+
+    class _Target(BaseHTTPRequestHandler):
+        def do_GET(self):
+            target_hits.append(("GET", self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+
+        def do_POST(self):
+            target_hits.append(("POST", self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), _Target)
+    target_port = target.server_address[1]
+    threading.Thread(target=target.serve_forever, daemon=True).start()
+
+    class _Redirect(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target_port}/steal")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), _Redirect)
+    redirect_port = redirect.server_address[1]
+    threading.Thread(target=redirect.serve_forever, daemon=True).start()
+
+    class _Hijack(urllib.request.BaseHandler):
+        def http_open(self, req):
+            raise AssertionError("global urllib opener must not be used")
+
+    prev_opener = urllib.request._opener
+    urllib.request.install_opener(urllib.request.build_opener(_Hijack()))
+    try:
+        uploader = ProfileUploader(
+            endpoint=f"http://127.0.0.1:{redirect_port}",
+            token="lo_secret",
+            service=SERVICE,
+            max_attempts=1,
+            retry_initial=0.0,
+        )
+        uploader.enqueue(_profile())
+        err = uploader.close(timeout=3.0)
+        assert err is not None
+        assert target_hits == []
+    finally:
+        urllib.request.install_opener(prev_opener)
+        redirect.shutdown()
+        redirect.server_close()
+        target.shutdown()
+        target.server_close()
 
 
 def test_5xx_is_retried_until_accepted():

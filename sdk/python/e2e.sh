@@ -108,7 +108,7 @@ STATUS=$(curl -sS -o "$WORK/boom.body" -w '%{http_code}' \
 	-H "traceparent: 00-$BOOM_TRACE-3333333333333333-01" \
 	"$EXAMPLE_URL/boom")
 test "$STATUS" = 500
-test "$(cat "$WORK/boom.body")" = "Internal Server Error"
+grep -q "Server Error (500)" "$WORK/boom.body"
 curl -fsS -H "traceparent: 00-$LLM_TRACE-4444444444444444-01" "$EXAMPLE_URL/chat" -o "$WORK/chat.json"
 jq -e '.model == "example-model" and .choices[0].message.content == "hello from fake llm"' "$WORK/chat.json" >/dev/null
 
@@ -151,7 +151,7 @@ while [ "$i" -lt 60 ]; do
 		-b "$WORK/session.cookie" -H "X-LO-Project: default" \
 		--data-urlencode 'status=open' --data-urlencode 'query=example boom' \
 		-o "$WORK/issues.json" || true
-	if jq -e 'any(.issues[]?; .title == "panic: example boom: not a real outage" and .count >= 1)' \
+	if jq -e 'any(.issues[]?; .title == "ValueError: example boom: not a real outage" and .count >= 1)' \
 		"$WORK/issues.json" >/dev/null 2>&1; then issue_ok=1; fi
 
 	curl -sS "$PLATFORM_URL/api/traces/$BOOM_TRACE" \

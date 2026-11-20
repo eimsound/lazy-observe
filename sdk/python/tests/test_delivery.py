@@ -262,3 +262,164 @@ def test_a_retry_is_not_sent_when_the_queue_is_cancelled_while_waiting():
     assert sent == [["a"]]  # the first attempt only; no second request after the cancel
     assert drops == [("shutdown_budget", 1)]
     assert queue.dropped() == 1
+
+
+def test_enqueue_accepts_falsy_non_none_items_and_rejects_none():
+    sent = []
+    q = DeliveryQueue(
+        send=lambda batch, _t: sent.extend(batch),
+        capacity=10,
+        batch_size=5,
+        flush_interval=0.01,
+        max_attempts=1,
+    )
+    assert q.enqueue(None) is False
+    assert q.enqueue(0) is True
+    assert q.enqueue("") is True
+    assert q.close(timeout=2.0) is None
+    assert sent == [0, ""]
+
+
+def test_drain_and_close_chunks_backlog_by_batch_size():
+    entered = threading.Event()
+    release = threading.Event()
+    batch_sizes = []
+
+    def sender(batch, _t):
+        batch_sizes.append(len(batch))
+        if len(batch_sizes) == 1:
+            entered.set()
+            release.wait(5)
+
+    q = DeliveryQueue(
+        send=sender,
+        capacity=100,
+        batch_size=20,
+        flush_interval=0.01,
+        max_attempts=1,
+    )
+    q.enqueue("first")
+    assert entered.wait(5)
+    for i in range(55):
+        assert q.enqueue(f"item-{i}")
+    release.set()
+    assert q.close(timeout=3.0) is None
+    assert all(size <= 20 for size in batch_sizes)
+    assert sum(batch_sizes) == 56
+
+
+def test_last_error_is_cleared_after_subsequent_successful_delivery():
+    calls = 0
+
+    def sender(batch, _t):
+        nonlocal calls
+        calls += 1
+        if batch == ["fail"]:
+            raise RuntimeError("transient outage")
+
+    q = DeliveryQueue(
+        send=sender,
+        capacity=10,
+        batch_size=1,
+        flush_interval=0.01,
+        max_attempts=1,
+        retry_initial=0.0,
+    )
+    q.enqueue("fail")
+    deadline = time.monotonic() + 2.0
+    while q.dropped() < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert q.dropped() == 1
+
+    q.enqueue("ok")
+    assert q.close(timeout=2.0) is None
+
+
+def test_flush_interval_zero_exits_cleanly_on_close_with_backlog():
+    entered = threading.Event()
+    release = threading.Event()
+    sent = []
+
+    def sender(batch, _t):
+        if not entered.is_set():
+            entered.set()
+            release.wait(5)
+        sent.extend(batch)
+
+    q = DeliveryQueue(
+        send=sender,
+        capacity=3,
+        batch_size=2,
+        flush_interval=0,
+        max_attempts=1,
+    )
+    q.enqueue("a")
+    assert entered.wait(5)
+    assert q.enqueue("b")
+    assert q.enqueue("c")
+    assert q.enqueue("d")  # queue is now full; close() cannot enqueue _CLOSE
+
+    closer = threading.Thread(target=lambda: q.close(timeout=3.0))
+    closer.start()
+    time.sleep(0.05)
+    release.set()
+    closer.join(timeout=3.0)
+    assert not closer.is_alive()
+    assert q._done.is_set()
+    assert sorted(sent) == ["a", "b", "c", "d"]
+
+
+def test_enqueue_and_close_race_never_silently_loses_accepted_items():
+    for _ in range(25):
+        sent = []
+        drops = []
+        q = DeliveryQueue(
+            send=lambda batch, _t: sent.extend(batch),
+            capacity=50,
+            batch_size=10,
+            flush_interval=0.005,
+            max_attempts=1,
+            warn=lambda reason, err, count: drops.append((reason, count)),
+        )
+        accepted = []
+
+        def producer():
+            for i in range(40):
+                if q.enqueue(f"e-{i}"):
+                    accepted.append(f"e-{i}")
+
+        t = threading.Thread(target=producer)
+        t.start()
+        time.sleep(0.001)
+        q.close(timeout=2.0)
+        t.join(timeout=2.0)
+        assert sorted(sent) == sorted(accepted)
+
+
+def test_retry_delay_applies_jitter_and_respects_retry_after():
+    from lazyobserve.delivery import MAX_RETRY_AFTER, RetryableError, parse_retry_after
+
+    q = DeliveryQueue(
+        send=lambda batch, _t: None,
+        capacity=4,
+        batch_size=1,
+        flush_interval=0.01,
+        max_attempts=3,
+        retry_initial=0.1,
+        retry_max=1.0,
+    )
+    try:
+        samples = [q._retry_delay(0) for _ in range(30)]
+        assert all(0.05 <= s <= 0.1 for s in samples)
+        assert len(set(samples)) > 1  # jitter varies delays
+
+        # Retry-After overrides short exponential backoff up to MAX_RETRY_AFTER
+        err = RetryableError("503", retry_after=1.0)
+        assert q._retry_delay(0, err) >= 1.0
+        capped = RetryableError("503", retry_after=999.0)
+        assert q._retry_delay(0, capped) == MAX_RETRY_AFTER
+        assert parse_retry_after("1") == 1.0
+        assert parse_retry_after("120") == MAX_RETRY_AFTER
+        assert parse_retry_after("invalid") is None
+    finally:
+        q.close(timeout=2.0)

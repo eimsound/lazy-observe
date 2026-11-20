@@ -7,14 +7,29 @@ Use through the returned logger (`lo.logger()`) or configure it in Django's
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 import threading
-from typing import Any, Dict, Optional, Set
+import traceback
+from typing import Any, Dict, Optional, Set, Tuple
 
 from opentelemetry import trace as otel_trace
 from opentelemetry._logs import LogRecord, SeverityNumber
+
+_INTERNAL_LOGGER_EXACT: Set[str] = {"lazyobserve"}
+_INTERNAL_LOGGER_PREFIXES: Tuple[str, ...] = (
+    "opentelemetry",
+    "urllib3",
+    "requests",
+    "httpx",
+    "httpcore",
+    "lazyobserve.internal",
+    "lazyobserve.delivery",
+    "lazyobserve.transport",
+    "lazyobserve.profiling",
+)
+
+_in_emit = threading.local()
 
 _RESERVED_KEYS: Set[str] = {
     "name",
@@ -57,16 +72,61 @@ def _span_context() -> tuple[Optional[str], Optional[str]]:
     return format(span_context.trace_id, "032x"), format(span_context.span_id, "016x")
 
 
-def _record_attributes(record: logging.LogRecord) -> Dict[str, Any]:
-    attrs: Dict[str, Any] = {"service.name": ""}
-    try:
-        from . import _registry
+def _is_internal_logger(record: logging.LogRecord) -> bool:
+    if getattr(record, "_lazyobserve_internal", False):
+        return True
+    name = getattr(record, "name", "") or ""
+    if name in _INTERNAL_LOGGER_EXACT:
+        return True
+    for prefix in _INTERNAL_LOGGER_PREFIXES:
+        if name == prefix or name.startswith(prefix + "."):
+            return True
+    return False
 
-        client = _registry.get_active_client()
-        if client is not None:
-            attrs["service.name"] = client.config.service_name
-    except Exception:  # noqa: BLE001
-        pass
+
+def _format_exc_info(record: logging.LogRecord) -> Tuple[Optional[str], Optional[str], str]:
+    exc_type_name: Optional[str] = None
+    exc_message: Optional[str] = None
+    exc_text = record.exc_text or ""
+    if record.exc_info:
+        if isinstance(record.exc_info, tuple) and len(record.exc_info) == 3:
+            exc_type, exc_value, exc_tb = record.exc_info
+            if exc_type is not None:
+                exc_type_name = getattr(exc_type, "__name__", str(exc_type))
+            if exc_value is not None:
+                exc_message = str(exc_value)
+            if not exc_text and (exc_type is not None or exc_value is not None):
+                try:
+                    exc_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb)).rstrip()
+                except Exception:  # noqa: BLE001
+                    exc_text = ""
+        elif isinstance(record.exc_info, BaseException):
+            exc = record.exc_info
+            exc_type_name = type(exc).__name__
+            exc_message = str(exc)
+            if not exc_text:
+                try:
+                    exc_text = "".join(
+                        traceback.format_exception(type(exc), exc, exc.__traceback__)
+                    ).rstrip()
+                except Exception:  # noqa: BLE001
+                    exc_text = ""
+    return exc_type_name, exc_message, exc_text
+
+
+def _record_attributes(
+    record: logging.LogRecord, client: Optional[Any] = None
+) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {"service.name": ""}
+    if client is None:
+        try:
+            from . import _registry
+
+            client = _registry.get_active_client()
+        except Exception:  # noqa: BLE001
+            client = None
+    if client is not None:
+        attrs["service.name"] = client.config.service_name
     trace_id, span_id = _span_context()
     if trace_id and span_id:
         attrs["trace_id"] = trace_id
@@ -93,33 +153,38 @@ class LazyObserveLogHandler(logging.Handler):
         self.tee_to_stderr = tee_to_stderr
 
     def emit(self, record: logging.LogRecord) -> None:
-        client = None
-        try:
-            from . import _registry
-
-            client = _registry.get_active_client()
-        except Exception:  # noqa: BLE001
-            client = None
-        if client is None:
-            # No SDK instance: still tee the record so logging is never quieter.
-            if self._should_tee():
-                self._emit_stderr(record)
+        if getattr(_in_emit, "active", False):
             return
-        self._emit(client, record)
-        if self._should_tee(record=record):
-            self._emit_stderr(record)
+        _in_emit.active = True
+        try:
+            client = None
+            try:
+                from . import _registry
 
-    def _should_tee(self, record: Optional[logging.LogRecord] = None) -> bool:
+                client = _registry.get_active_client()
+            except Exception:  # noqa: BLE001
+                client = None
+            if client is not None and not _is_internal_logger(record):
+                self._emit(client, record)
+            if self._should_tee(record=record, client=client):
+                self._emit_stderr(record)
+        finally:
+            _in_emit.active = False
+
+    def _should_tee(
+        self, record: Optional[logging.LogRecord] = None, client: Optional[Any] = None
+    ) -> bool:
         if self.tee_to_stderr is not None:
             return self.tee_to_stderr
-        try:
-            from . import _registry
+        if client is None:
+            try:
+                from . import _registry
 
-            client = _registry.get_active_client()
-            if client is not None:
-                return bool(client.config.tee_to_stderr)
-        except Exception:  # noqa: BLE001
-            pass
+                client = _registry.get_active_client()
+            except Exception:  # noqa: BLE001
+                client = None
+        if client is not None:
+            return bool(client.config.tee_to_stderr)
         return True
 
     def _emit(self, client: Any, record: logging.LogRecord) -> None:
@@ -127,6 +192,20 @@ class LazyObserveLogHandler(logging.Handler):
         if logger_provider is None:
             return
         body = record.getMessage()
+        attrs = _record_attributes(record, client=client)
+        exc_type_name, exc_message, exc_text = _format_exc_info(record)
+        if exc_type_name:
+            attrs["exception.type"] = exc_type_name
+        if exc_message:
+            attrs["exception.message"] = exc_message
+        if exc_text:
+            attrs["exception.stacktrace"] = exc_text
+            body = f"{body}\n{exc_text}" if body else exc_text
+        if record.stack_info:
+            stack_text = str(record.stack_info).rstrip()
+            if stack_text:
+                attrs["code.stacktrace"] = stack_text
+                body = f"{body}\n{stack_text}" if body else stack_text
         severity = _LEVEL_TO_SEVERITY.get(record.levelno, SeverityNumber.INFO)
         ts = int(record.created * 1_000_000_000)
         otel_record = LogRecord(
@@ -135,7 +214,7 @@ class LazyObserveLogHandler(logging.Handler):
             severity_number=severity,
             severity_text=record.levelname,
             body=body,
-            attributes=_record_attributes(record),
+            attributes=attrs,
         )
         try:
             logger = logger_provider.get_logger("lazyobserve")

@@ -8,12 +8,11 @@ import gc
 import logging
 import os
 import platform
-import resource
 import sys
 import threading
 import time
 import weakref
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from opentelemetry import metrics as _otel_metrics
 from opentelemetry import trace as _otel_trace
@@ -60,12 +59,37 @@ def _threads_count() -> int:
 
 def _memory_rss() -> int:
     try:
+        import resource
+
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if platform.system() == "Darwin":
             return int(usage)
         return int(usage) * 1024
     except Exception:  # noqa: BLE001
         return 0
+
+
+def _create_histogram_compat(
+    meter: Any,
+    name: str,
+    *,
+    unit: str,
+    description: str,
+    buckets: Sequence[float],
+) -> Any:
+    try:
+        return meter.create_histogram(
+            name,
+            unit=unit,
+            description=description,
+            explicit_bucket_boundaries_advisory=list(buckets),
+        )
+    except TypeError:
+        return meter.create_histogram(
+            name,
+            unit=unit,
+            description=description,
+        )
 
 
 def _gc_total() -> int:
@@ -105,6 +129,8 @@ class Client:
 
         self._dropped_telemetry = 0
         self._drop_lock = threading.Lock()
+        self._db_duration_histogram: Any = None
+        self._db_instrument_lock = threading.Lock()
         _track(self)
 
     def _reinit_after_fork(self) -> None:
@@ -117,7 +143,21 @@ class Client:
         ``diagnostics()`` is a process-local snapshot.
         """
         self._drop_lock = threading.Lock()
+        self._db_instrument_lock = threading.Lock()
         self._dropped_telemetry = 0
+
+    def db_duration_histogram(self, buckets: Sequence[float]) -> Any:
+        if self._db_duration_histogram is None:
+            with self._db_instrument_lock:
+                if self._db_duration_histogram is None:
+                    self._db_duration_histogram = _create_histogram_compat(
+                        self.meter(),
+                        "db.client.operation.duration",
+                        unit="s",
+                        description="Duration of database operations.",
+                        buckets=buckets,
+                    )
+        return self._db_duration_histogram
 
     # -- public API ---------------------------------------------------------
 
@@ -184,7 +224,6 @@ class Client:
         frames = [] if omit_stack else collect_frames(exc.__traceback__)
         tags = self._merged_tags(tags)
         trace_id, span_id = trace_context_from_current()
-        from . import _registry
 
         event = ErrorEvent(
             event_id=event_id,
@@ -411,81 +450,99 @@ def build_client(config: Any, parsed: Any) -> Client:
 
     headers = _headers(parsed.token)
     created: List[Any] = []
+    error_transport: Any = None
 
     meter_provider: Any = None
     tracer_provider: Any = None
-    if metrics_on:
-        metric_exporter = OTLPMetricExporter(
-            endpoint=parsed.endpoint + "/v1/metrics",
-            headers=headers,
-        )
-        reader = PeriodicExportingMetricReader(
-            metric_exporter, export_interval_millis=int(config.export_interval * 1000)
-        )
-        meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
-        created.append(meter_provider)
-
-    if traces_on:
-        trace_exporter = OTLPSpanExporter(
-            endpoint=parsed.endpoint + "/v1/traces", headers=headers
-        )
-        processor = BatchSpanProcessor(
-            trace_exporter,
-            max_queue_size=_OTEL_TRACE_QUEUE,
-            max_export_batch_size=_OTEL_TRACE_BATCH,
-        )
-        tracer_provider = TracerProvider(
-            resource=resource,
-            sampler=ParentBased(TraceIdRatioBased(config.sample_rate)),
-            active_span_processor=processor,
-        )
-        created.append(tracer_provider)
-
     logger_provider: Any = None
-    if logs_on:
-        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 
-        log_exporter = OTLPLogExporter(
-            endpoint=parsed.endpoint + "/v1/logs", headers=headers
+    try:
+        if metrics_on:
+            metric_exporter = OTLPMetricExporter(
+                endpoint=parsed.endpoint + "/v1/metrics",
+                headers=headers,
+            )
+            reader = PeriodicExportingMetricReader(
+                metric_exporter, export_interval_millis=int(config.export_interval * 1000)
+            )
+            meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+            created.append(meter_provider)
+
+        if traces_on:
+            trace_exporter = OTLPSpanExporter(
+                endpoint=parsed.endpoint + "/v1/traces", headers=headers
+            )
+            processor = BatchSpanProcessor(
+                trace_exporter,
+                max_queue_size=_OTEL_TRACE_QUEUE,
+                max_export_batch_size=_OTEL_TRACE_BATCH,
+            )
+            tracer_provider = TracerProvider(
+                resource=resource,
+                sampler=ParentBased(TraceIdRatioBased(config.sample_rate)),
+                active_span_processor=processor,
+            )
+            created.append(tracer_provider)
+
+        if logs_on:
+            from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+
+            log_exporter = OTLPLogExporter(
+                endpoint=parsed.endpoint + "/v1/logs", headers=headers
+            )
+            log_processor = _BatchLogRecordProcessor(
+                log_exporter,
+                max_queue_size=_OTEL_LOG_QUEUE,
+                max_export_batch_size=_OTEL_LOG_BATCH,
+                schedule_delay_millis=int(config.export_interval * 1000),
+            )
+            logger_provider = _LogsLoggerProvider(resource=resource)
+            logger_provider.add_log_record_processor(log_processor)
+            created.append(logger_provider)
+
+        import logging as _stdlib_logging
+
+        logger = _stdlib_logging.getLogger("lazyobserve")
+
+        client = Client(
+            config=config,
+            meter=meter_provider or _otel_metrics.NoOpMeterProvider(),
+            tracer_provider=tracer_provider or _otel_trace.NoOpTracerProvider(),
+            logger_provider=logger_provider,
+            logger=logger,
         )
-        log_processor = _BatchLogRecordProcessor(
-            log_exporter,
-            max_queue_size=_OTEL_LOG_QUEUE,
-            max_export_batch_size=_OTEL_LOG_BATCH,
-            schedule_delay_millis=int(config.export_interval * 1000),
+        if meter_provider is not None:
+            _register_runtime_metrics(client)
+            client._dropped_counter = _register_dropped_counter(client)
+
+        from .delivery import default_warn_factory
+        from .error_event import ErrorTransport
+
+        error_transport = ErrorTransport(
+            endpoint=parsed.endpoint,
+            token=parsed.token,
+            logger=logger,
+            queue_capacity=config.delivery.error_queue_capacity,
+            max_attempts=config.delivery.max_attempts,
+            retry_initial=config.delivery.retry_initial,
+            retry_max=config.delivery.retry_max,
+            warn=default_warn_factory(logger, "error", client.record_telemetry_drop),
         )
-        logger_provider = _LogsLoggerProvider(resource=resource)
-        logger_provider.add_log_record_processor(log_processor)
-        created.append(logger_provider)
-
-    import logging as _stdlib_logging
-
-    logger = _stdlib_logging.getLogger("lazyobserve")
-
-    client = Client(
-        config=config,
-        meter=meter_provider or _otel_metrics.NoOpMeterProvider(),
-        tracer_provider=tracer_provider or _otel_trace.NoOpTracerProvider(),
-        logger_provider=logger_provider,
-        logger=logger,
-    )
-    if meter_provider is not None:
-        _register_runtime_metrics(client)
-        client._dropped_counter = _register_dropped_counter(client)
-
-    from .delivery import default_warn_factory
-    from .error_event import ErrorTransport
-
-    client.error_transport = ErrorTransport(
-        endpoint=parsed.endpoint,
-        token=parsed.token,
-        logger=logger,
-        queue_capacity=config.delivery.error_queue_capacity,
-        max_attempts=config.delivery.max_attempts,
-        retry_initial=config.delivery.retry_initial,
-        retry_max=config.delivery.retry_max,
-        warn=default_warn_factory(logger, "error", client.record_telemetry_drop),
-    )
+        client.error_transport = error_transport
+    except Exception:
+        if error_transport is not None:
+            try:
+                error_transport.close(0.0)
+            except Exception:  # noqa: BLE001
+                pass
+        for provider in reversed(created):
+            stop = getattr(provider, "shutdown", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:  # noqa: BLE001
+                    pass
+        raise
     if config.profiling:
         # Experimental and optional: whatever goes wrong here must not degrade the
         # client. The probe (a 0.1 s trial sample) runs on the profiling thread.

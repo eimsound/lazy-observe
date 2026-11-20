@@ -17,6 +17,14 @@ def test_valid_dsn_https():
     assert dsn.token == "secr3t"
 
 
+def test_dsn_repr_hides_token():
+    dsn = parse_dsn("https://example.com:8443/p/slug@lo_super_secret_token")
+    rendered = repr(dsn)
+    assert "lo_super_secret_token" not in rendered
+    assert "https://example.com:8443" in rendered
+    assert "slug" in rendered
+
+
 def test_escaped_slug_and_token():
     dsn = parse_dsn("http://h/p/my%20app@tok%40en")
     assert dsn.project == "my app"
