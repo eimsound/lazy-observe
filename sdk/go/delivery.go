@@ -3,6 +3,10 @@ package lazyobserve
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,7 +17,64 @@ const (
 	deliveryDefaultRetryInitial  = 100 * time.Millisecond
 	deliveryDefaultRetryMax      = time.Second
 	deliveryDefaultMaxAttempts   = 3
+	deliveryMaxRetryAfter        = 30 * time.Second
 )
+
+var defaultDeliveryShutdownTimeout = 10 * time.Second
+
+type deliveryError struct {
+	statusCode int
+	retryAfter time.Duration
+	permanent  bool
+	err        error
+}
+
+func (e *deliveryError) Error() string { return e.err.Error() }
+
+func (e *deliveryError) Unwrap() error { return e.err }
+
+// deliveryHandledDropError signals that a sender already recorded per-item drops
+// (for example, while binary-splitting a 413 batch) and only wants the queue to
+// retain the terminal error without double-counting drops.
+type deliveryHandledDropError struct {
+	err error
+}
+
+func (e *deliveryHandledDropError) Error() string { return e.err.Error() }
+
+func (e *deliveryHandledDropError) Unwrap() error { return e.err }
+
+func isPermanentHTTPStatus(status int) bool {
+	return status >= http.StatusBadRequest && status < http.StatusInternalServerError &&
+		status != http.StatusRequestTimeout && status != http.StatusTooManyRequests
+}
+
+func parseRetryAfter(value string) time.Duration {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(trimmed); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(trimmed); err == nil {
+		if delay := time.Until(at); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func jitterDeliveryDelay(floor, ceiling time.Duration) time.Duration {
+	if ceiling <= floor {
+		return floor
+	}
+	span := int64(ceiling - floor)
+	return floor + time.Duration(rand.Int64N(span+1))
+}
 
 type deliveryOptions[T any] struct {
 	Capacity      int
@@ -24,6 +85,7 @@ type deliveryOptions[T any] struct {
 	RetryMax      time.Duration
 	Send          func(context.Context, []T) error
 	Wait          func(context.Context, time.Duration) error
+	Jitter        func(floor, ceiling time.Duration) time.Duration
 	Warn          func(reason string, err error, dropped int)
 }
 
@@ -48,8 +110,11 @@ func newDeliveryQueue[T any](options deliveryOptions[T]) *deliveryQueue[T] {
 	if options.Capacity <= 0 {
 		panic("delivery queue capacity must be positive")
 	}
-	if options.BatchSize <= 0 || options.BatchSize > options.Capacity {
-		options.BatchSize = min(options.Capacity, 1)
+	if options.BatchSize <= 0 {
+		options.BatchSize = 1
+	}
+	if options.BatchSize > options.Capacity {
+		options.BatchSize = options.Capacity
 	}
 	if options.FlushInterval <= 0 {
 		options.FlushInterval = deliveryDefaultFlushInterval
@@ -71,6 +136,9 @@ func newDeliveryQueue[T any](options deliveryOptions[T]) *deliveryQueue[T] {
 	}
 	if options.Wait == nil {
 		options.Wait = waitForDeliveryRetry
+	}
+	if options.Jitter == nil {
+		options.Jitter = jitterDeliveryDelay
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	queue := &deliveryQueue[T]{
@@ -124,6 +192,14 @@ func (q *deliveryQueue[T]) dropped() uint64 {
 }
 
 func (q *deliveryQueue[T]) close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultDeliveryShutdownTimeout)
+		defer cancel()
+	}
 	q.closeOnce.Do(func() {
 		q.stateMu.Lock()
 		q.closed = true
@@ -195,6 +271,12 @@ func (q *deliveryQueue[T]) deliver(batch []T) {
 	for attempt := 0; attempt < q.options.MaxAttempts; attempt++ {
 		lastErr = q.options.Send(q.runCtx, batch)
 		if lastErr == nil {
+			q.setDeliveryError(nil)
+			return
+		}
+		var handledDrop *deliveryHandledDropError
+		if errors.As(lastErr, &handledDrop) {
+			q.setDeliveryError(handledDrop.err)
 			return
 		}
 		if q.runCtx.Err() != nil {
@@ -202,12 +284,22 @@ func (q *deliveryQueue[T]) deliver(batch []T) {
 			q.recordDrop("shutdown_budget", lastErr, len(batch))
 			return
 		}
+		var dErr *deliveryError
+		if errors.As(lastErr, &dErr) && dErr.permanent {
+			q.setDeliveryError(lastErr)
+			q.recordDrop("server_rejected", lastErr, len(batch))
+			return
+		}
 		if attempt+1 == q.options.MaxAttempts {
 			q.setDeliveryError(lastErr)
 			q.recordDrop("retry_exhausted", lastErr, len(batch))
 			return
 		}
-		if err := q.options.Wait(q.runCtx, q.retryDelay(attempt)); err != nil {
+		var retryAfter time.Duration
+		if dErr != nil {
+			retryAfter = dErr.retryAfter
+		}
+		if err := q.options.Wait(q.runCtx, q.retryDelay(attempt, retryAfter)); err != nil {
 			q.setDeliveryError(errors.Join(lastErr, err))
 			q.recordDrop("shutdown_budget", lastErr, len(batch))
 			return
@@ -215,15 +307,25 @@ func (q *deliveryQueue[T]) deliver(batch []T) {
 	}
 }
 
-func (q *deliveryQueue[T]) retryDelay(retryIndex int) time.Duration {
-	delay := q.options.RetryInitial
+func (q *deliveryQueue[T]) retryDelay(retryIndex int, retryAfter time.Duration) time.Duration {
+	backoff := q.options.RetryInitial
 	for range retryIndex {
-		if delay >= q.options.RetryMax/2 {
-			return q.options.RetryMax
+		if backoff >= q.options.RetryMax/2 {
+			backoff = q.options.RetryMax
+			break
 		}
-		delay *= 2
+		backoff *= 2
 	}
-	return min(delay, q.options.RetryMax)
+	backoff = min(backoff, q.options.RetryMax)
+
+	if retryAfter > 0 {
+		maxRetryAfter := max(q.options.RetryMax, deliveryMaxRetryAfter)
+		clamped := min(retryAfter, maxRetryAfter)
+		floor := max(backoff, clamped)
+		ceiling := min(floor+floor/4, maxRetryAfter)
+		return q.options.Jitter(floor, ceiling)
+	}
+	return q.options.Jitter(backoff/2, backoff)
 }
 
 func (q *deliveryQueue[T]) dropBatchAndQueued(batch []T, err error) {

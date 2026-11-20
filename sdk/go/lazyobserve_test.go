@@ -1,9 +1,13 @@
 package lazyobserve
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sync"
@@ -168,6 +172,198 @@ func TestFiberPanicCapture(t *testing.T) {
 		!slices.ContainsFunc(spans[0].Events, func(e sdktrace.Event) bool { return e.Name == "exception" }) {
 		t.Fatalf("panic span not marked as error: %#v", spans)
 	}
+}
+
+func TestSlogWithGroupKeepsCorrelationTopLevel(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	handler := &correlatingHandler{
+		service: "orders",
+		tee:     slog.NewJSONHandler(&buf, nil),
+	}
+	ctx := sampledContext()
+	spanContext := trace.SpanContextFromContext(ctx)
+	logger := slog.New(handler).
+		With("env", "prod").
+		WithGroup("order").
+		With("currency", "USD").
+		WithGroup("item")
+	logger.InfoContext(ctx, "added", "sku", "abc")
+
+	var record map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &record); err != nil {
+		t.Fatalf("unmarshal log json: %v (%s)", err, buf.String())
+	}
+	if record["service.name"] != "orders" ||
+		record["trace_id"] != spanContext.TraceID().String() ||
+		record["span_id"] != spanContext.SpanID().String() ||
+		record["env"] != "prod" {
+		t.Fatalf("top-level correlation attrs missing: %#v", record)
+	}
+	orderGroup, ok := record["order"].(map[string]any)
+	if !ok || orderGroup["currency"] != "USD" {
+		t.Fatalf("order group unexpected: %#v", record)
+	}
+	if _, leaked := orderGroup["trace_id"]; leaked {
+		t.Fatalf("trace_id leaked into order group: %#v", orderGroup)
+	}
+	itemGroup, ok := orderGroup["item"].(map[string]any)
+	if !ok || itemGroup["sku"] != "abc" {
+		t.Fatalf("nested item group unexpected: %#v", orderGroup)
+	}
+}
+
+func TestDegradedRespectsTeeToStderrFalse(t *testing.T) {
+	t.Parallel()
+	disabled := false
+	lo := Init(Config{DSN: "not-a-dsn", TeeToStderr: &disabled})
+	if lo.Err() == nil {
+		t.Fatal("expected degraded client error")
+	}
+	if lo.Slog().Enabled(context.Background(), slog.LevelError) {
+		t.Fatal("degraded client ignored TeeToStderr: false")
+	}
+}
+
+func TestRegisterRuntimeMetricsReportsExpectedInstruments(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	client := &Client{meter: provider}
+	if err := client.registerRuntimeMetrics(); err != nil {
+		t.Fatal(err)
+	}
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &collected); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			seen[m.Name] = true
+		}
+	}
+	for _, want := range []string{
+		"process.runtime.go.goroutines",
+		"process.runtime.go.memory.heap_alloc",
+		"process.runtime.go.gc.count",
+	} {
+		if !seen[want] {
+			t.Fatalf("missing runtime metric %q in %v", want, seen)
+		}
+	}
+}
+
+func TestShutdownStopsProfilingBeforeErrorDrainTimeoutAndBoundsNoDeadline(t *testing.T) {
+	t.Run("profiling loop stops even when error drain times out", func(t *testing.T) {
+		unblock := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-unblock:
+			case <-r.Context().Done():
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(server.Close)
+		t.Cleanup(func() { close(unblock) })
+
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		cfg, err := normalizedConfig(Config{ServiceName: "shutdown-order"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		profileCtx, profileStop := context.WithCancel(context.Background())
+		client := &Client{
+			cfg:            cfg,
+			logger:         logger,
+			profileURL:     server.URL + "/api/profiles",
+			profileToken:   "secret",
+			profileClient:  &http.Client{Timeout: time.Second},
+			profileStop:    profileStop,
+			profileDone:    make(chan struct{}),
+			cpuProfiler:    fakeCPUProfiler(time.Second),
+			errorTransport: newErrorTransport(server.URL, "secret", logger, cfg.Delivery, nil),
+		}
+		client.profileDelivery = newProfileDelivery(client)
+		go client.profilingLoop(profileCtx)
+
+		client.CaptureException(context.Background(), errors.New("hanging delivery"))
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		_ = client.Shutdown(ctx)
+
+		select {
+		case <-client.profileDone:
+		case <-time.After(time.Second):
+			t.Fatal("profilingLoop was left running after error drain timeout")
+		}
+	})
+
+	t.Run("Shutdown(context.Background()) is bounded by default timeout", func(t *testing.T) {
+		prev := defaultDeliveryShutdownTimeout
+		defaultDeliveryShutdownTimeout = 40 * time.Millisecond
+		t.Cleanup(func() { defaultDeliveryShutdownTimeout = prev })
+
+		unblock := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-unblock:
+			case <-r.Context().Done():
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(server.Close)
+		t.Cleanup(func() { close(unblock) })
+
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		client := &Client{
+			cfg:            Config{ServiceName: "no-deadline"},
+			logger:         logger,
+			errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+		}
+		client.CaptureException(context.Background(), errors.New("hang"))
+		startedAt := time.Now()
+		err := client.Shutdown(context.Background())
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown(Background) err=%v want DeadlineExceeded", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed > 300*time.Millisecond {
+			t.Fatalf("Shutdown(Background) blocked for %s", elapsed)
+		}
+	})
+
+	t.Run("defer-created shutdown timeout flushes after process uptime exceeds timeout", func(t *testing.T) {
+		collector := &errorEventCollector{}
+		server := httptest.NewServer(http.HandlerFunc(collector.handler))
+		t.Cleanup(server.Close)
+
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		client := &Client{
+			cfg:            Config{ServiceName: "deferred-shutdown"},
+			logger:         logger,
+			errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+		}
+		var shutdownErr error
+		func() {
+			const shutdownBudget = 50 * time.Millisecond
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
+				defer cancel()
+				shutdownErr = client.Shutdown(ctx)
+			}()
+			// Simulate process running longer than shutdownBudget before exiting.
+			time.Sleep(80 * time.Millisecond)
+			client.CaptureException(context.Background(), errors.New("late error before exit"))
+		}()
+		if shutdownErr != nil {
+			t.Fatalf("deferred shutdown failed: %v", shutdownErr)
+		}
+		_, _, events := collector.snapshot()
+		if len(events) != 1 {
+			t.Fatalf("accepted events=%d want=1", len(events))
+		}
+	})
 }
 
 func sampledContext() context.Context {

@@ -34,9 +34,13 @@ if err := lo.Err(); err != nil {
     slog.Error("lazy-observe initialization failed", "error", err)
 }
 
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-defer func() { _ = lo.Shutdown(ctx) }()
+defer func() {
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    if err := lo.Shutdown(ctx); err != nil {
+        slog.Error("lazy-observe shutdown failed", "error", err)
+    }
+}()
 ```
 
 `Init` returns a safe degraded client instead of panicking on invalid configuration. The DSN must be `http(s)://host[:port]/p/<project>@<token>` without query or fragment data.
@@ -141,6 +145,6 @@ lo := lazyobserve.Init(lazyobserve.Config{
 })
 ```
 
-Each cycle records a 10-second CPU window followed by heap and goroutine snapshots, then uploads the three gzip pprof payloads to `/api/profiles`. Failed uploads back off up to 15 minutes and do not fail application requests. If `Shutdown` interrupts a CPU window, the window is uploaded only if it already ran at least 5 seconds; a shorter one is discarded (this is not counted as dropped telemetry). Heap and goroutine snapshots are instantaneous and are still collected; everything queued is uploaded within the `Shutdown` context deadline.
+Each cycle records a 10-second CPU window followed by heap and goroutine snapshots, then uploads the three gzip pprof payloads to `/api/profiles`. Uploads use the bounded `Delivery` retry budget (`MaxAttempts`, jittered exponential backoff, and server `Retry-After` honoring, dropping immediately on permanent 4xx or payloads over 10 MiB) and never fail application requests. If `Shutdown` interrupts a CPU window, the window is uploaded only if it already ran at least 5 seconds; a shorter one is discarded (this is not counted as dropped telemetry). Heap and goroutine snapshots are instantaneous and are still collected; everything queued is uploaded within the `Shutdown` context deadline.
 
 See the runnable [Fiber example](../../sdk/go/examples/fiber/) for a nested order trace, database child spans, correlated logs, controlled fast/slow/error routes, and a concurrent load generator that populates the Performance page.

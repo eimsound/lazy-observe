@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	rtmetrics "runtime/metrics"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +101,7 @@ type Client struct {
 	profileDone      chan struct{}
 	profileURL       string
 	profileToken     string
+	profileClient    *http.Client
 	profileDelivery  *deliveryQueue[collectedProfile]
 	cpuProfiler      *cpuProfiler // nil means systemCPUProfiler; tests inject fakes
 	errorTransport   *errorTransport
@@ -212,10 +215,11 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("create resource: %w", err)
 	}
 	c := &Client{
-		cfg:          cfg,
-		propagator:   propagation.TraceContext{},
-		profileURL:   parsed.endpoint + "/api/profiles",
-		profileToken: parsed.token,
+		cfg:           cfg,
+		propagator:    propagation.TraceContext{},
+		profileURL:    parsed.endpoint + "/api/profiles",
+		profileToken:  parsed.token,
+		profileClient: &http.Client{Timeout: profilingSendTimeout},
 	}
 	headers := map[string]string{"Authorization": "Bearer " + parsed.token}
 
@@ -314,7 +318,11 @@ func degraded(cfg Config, err error) *Client {
 	if cfg.ServiceName == "" {
 		cfg.ServiceName = defaultServiceName()
 	}
-	h := &correlatingHandler{service: cfg.ServiceName, tee: slog.NewTextHandler(os.Stderr, nil)}
+	var stderr slog.Handler
+	if cfg.TeeToStderr == nil || *cfg.TeeToStderr {
+		stderr = slog.NewTextHandler(os.Stderr, nil)
+	}
+	h := &correlatingHandler{service: cfg.ServiceName, tee: stderr}
 	return &Client{
 		cfg:        cfg,
 		initErr:    err,
@@ -376,7 +384,16 @@ func (c *Client) WrapDB(driverName, dataSourceName string) (*sql.DB, error) {
 }
 
 // Shutdown flushes all enabled signals and releases SDK resources.
+// When ctx has no deadline, Shutdown bounds cleanup with a default timeout.
 func (c *Client) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultDeliveryShutdownTimeout)
+		defer cancel()
+	}
 	c.shutdown.Do(func() {
 		c.shutdownErr = c.closeCreated(ctx)
 	})
@@ -385,13 +402,17 @@ func (c *Client) Shutdown(ctx context.Context) error {
 
 func (c *Client) closeCreated(ctx context.Context) error {
 	var errs []error
-	if c.errorTransport != nil {
-		// Error events are short-lived and user-triggered. Drain them before a
-		// profiling window or an OTel exporter can consume the shutdown budget.
-		errs = append(errs, c.errorTransport.close(ctx))
-	}
+	// Signal profilingLoop to stop immediately so CPU profiling never outlives
+	// shutdown if errorTransport drains consume the shutdown budget.
 	if c.profileStop != nil {
 		c.profileStop()
+	}
+	if c.errorTransport != nil {
+		// Error events are short-lived and user-triggered. Drain them before a
+		// profiling upload or an OTel exporter can consume the shutdown budget.
+		errs = append(errs, c.errorTransport.close(ctx))
+	}
+	if c.profileDone != nil {
 		select {
 		case <-c.profileDone:
 		case <-ctx.Done():
@@ -463,11 +484,23 @@ func (c *Client) registerRuntimeMetrics() error {
 		return err
 	}
 	_, err = m.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
-		var stats runtime.MemStats
-		runtime.ReadMemStats(&stats)
-		observer.ObserveInt64(goroutines, int64(runtime.NumGoroutine()))
-		observer.ObserveInt64(heap, int64(stats.HeapAlloc))
-		observer.ObserveInt64(gc, int64(stats.NumGC))
+		samples := [3]rtmetrics.Sample{
+			{Name: "/sched/goroutines:goroutines"},
+			{Name: "/memory/classes/heap/objects:bytes"},
+			{Name: "/gc/cycles/total:gc-cycles"},
+		}
+		rtmetrics.Read(samples[:])
+		if samples[0].Value.Kind() == rtmetrics.KindUint64 {
+			observer.ObserveInt64(goroutines, int64(samples[0].Value.Uint64()))
+		} else {
+			observer.ObserveInt64(goroutines, int64(runtime.NumGoroutine()))
+		}
+		if samples[1].Value.Kind() == rtmetrics.KindUint64 {
+			observer.ObserveInt64(heap, int64(samples[1].Value.Uint64()))
+		}
+		if samples[2].Value.Kind() == rtmetrics.KindUint64 {
+			observer.ObserveInt64(gc, int64(samples[2].Value.Uint64()))
+		}
 		return nil
 	}, goroutines, heap, gc)
 	return err

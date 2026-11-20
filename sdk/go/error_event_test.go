@@ -215,6 +215,290 @@ func TestClientShutdownReturnsTerminalErrorExportFailure(t *testing.T) {
 	}
 }
 
+func TestFrameModuleAndInAppFiltering(t *testing.T) {
+	t.Parallel()
+	moduleCases := []struct {
+		fn   string
+		want string
+	}{
+		{"main.handler", "main"},
+		{"main.handler.func1", "main"},
+		{"main.(*Server).handle.func1.1", "main"},
+		{"github.com/acme/orders/internal/pay.(*Client).Charge.func2", "github.com/acme/orders/internal/pay"},
+		{"github.com/acme/pkg.Map[github.com/other/pkg.Item]", "github.com/acme/pkg"},
+		{"net/http.(*conn).serve", "net/http"},
+		{"runtime.gopanic", "runtime"},
+		{"", ""},
+	}
+	for _, tc := range moduleCases {
+		if got := frameModule(tc.fn); got != tc.want {
+			t.Errorf("frameModule(%q) = %q, want %q", tc.fn, got, tc.want)
+		}
+	}
+
+	const mainMod = "github.com/acme/checkout"
+	deps := []string{
+		"github.com/valyala/fasthttp",
+		"github.com/gofiber/fiber/v3",
+		"github.com/thirdparty/lib",
+	}
+	inAppCases := []struct {
+		name string
+		fn   string
+		file string
+		want bool
+	}{
+		{"app main", "main.handleOrder.func1", "/app/main.go", true},
+		{"app internal pkg", "github.com/acme/checkout/orders.(*Service).Create", "/app/orders/create.go", true},
+		{
+			"sdk test file",
+			"github.com/eimsound/lazy-observe/sdk/go.TestCapture",
+			"/repo/sdk/go/error_event_test.go",
+			true,
+		},
+		{
+			"sdk prod file",
+			"github.com/eimsound/lazy-observe/sdk/go.(*Client).Fiber.func1",
+			"/repo/sdk/go/fiber.go",
+			false,
+		},
+		{
+			"fasthttp",
+			"github.com/valyala/fasthttp.(*Server).serveConn",
+			"/go/pkg/mod/github.com/valyala/fasthttp@v1.78.0/server.go",
+			false,
+		},
+		{
+			"fiber",
+			"github.com/gofiber/fiber/v3.(*App).next",
+			"/go/pkg/mod/github.com/gofiber/fiber/v3@v3.7.0/router.go",
+			false,
+		},
+		{"stdlib net/http", "net/http.(*conn).serve", "/usr/local/go/src/net/http/server.go", false},
+		{"stdlib runtime", "runtime.gopanic", "/usr/local/go/src/runtime/panic.go", false},
+		{"stdlib testing", "testing.tRunner", "/usr/local/go/src/testing/testing.go", false},
+		{"third-party dep", "github.com/thirdparty/lib.Call", "/app/trimmed/lib.go", false},
+		{
+			"mod cache path",
+			"github.com/other/mod.Run",
+			"/home/user/go/pkg/mod/github.com/other/mod@v1.0.0/mod.go",
+			false,
+		},
+		{"vendor path", "github.com/other/mod.Run", "/app/vendor/github.com/other/mod/mod.go", false},
+	}
+	for _, tc := range inAppCases {
+		if got := isInAppFrameWithBuildInfo(tc.fn, tc.file, mainMod, deps); got != tc.want {
+			t.Errorf("%s: isInAppFrame(%q, %q) = %v, want %v", tc.name, tc.fn, tc.file, got, tc.want)
+		}
+	}
+}
+
+func TestErrorTransport4xxDropsAsServerRejectedAndHonorsRetryAfter(t *testing.T) {
+	t.Parallel()
+	t.Run("422 rejected without retry", func(t *testing.T) {
+		t.Parallel()
+		var attempts atomic.Int64
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			http.Error(w, `{"error":"invalid event"}`, http.StatusUnprocessableEntity)
+		}))
+		t.Cleanup(server.Close)
+
+		var mu sync.Mutex
+		var droppedReasons []string
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		client := &Client{cfg: Config{ServiceName: "checkout"}, logger: logger}
+		client.errorTransport = newErrorTransport(
+			server.URL,
+			"secret",
+			logger,
+			defaultDeliveryConfig(t),
+			func(signal, reason string, count int) {
+				mu.Lock()
+				droppedReasons = append(droppedReasons, signal+":"+reason)
+				mu.Unlock()
+				client.recordTelemetryDrop(signal, reason, count)
+			},
+		)
+		client.CaptureException(context.Background(), errors.New("bad event"))
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := client.Shutdown(ctx); err == nil || !strings.Contains(err.Error(), "HTTP 422") {
+			t.Fatalf("Shutdown err=%v want HTTP 422", err)
+		}
+		if attempts.Load() != 1 {
+			t.Fatalf("422 attempts=%d want=1", attempts.Load())
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(droppedReasons) != 1 || droppedReasons[0] != "error:server_rejected" {
+			t.Fatalf("droppedReasons=%v want=[error:server_rejected]", droppedReasons)
+		}
+	})
+
+	t.Run("503 with Retry-After succeeds after wait", func(t *testing.T) {
+		t.Parallel()
+		var attempts atomic.Int64
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) == 1 {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "busy", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"accepted":1}`)
+		}))
+		t.Cleanup(server.Close)
+
+		var mu sync.Mutex
+		var waited []time.Duration
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		transport := newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil)
+		transport.delivery.options.Wait = func(_ context.Context, delay time.Duration) error {
+			mu.Lock()
+			waited = append(waited, delay)
+			mu.Unlock()
+			return nil
+		}
+		client := &Client{cfg: Config{ServiceName: "checkout"}, logger: logger, errorTransport: transport}
+		client.CaptureException(context.Background(), errors.New("transient"))
+		shutdownClient(t, client)
+		if attempts.Load() != 2 {
+			t.Fatalf("attempts=%d want=2", attempts.Load())
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(waited) != 1 || waited[0] < time.Second || waited[0] > 1250*time.Millisecond {
+			t.Fatalf("waited=%v want [1s, 1.25s]", waited)
+		}
+	})
+}
+
+func TestErrorEventSizeBudgetAnd413BatchSplit(t *testing.T) {
+	t.Parallel()
+	t.Run("oversized event truncated to <= 200KB before enqueue", func(t *testing.T) {
+		t.Parallel()
+		var mu sync.Mutex
+		var accepted []errorEvent
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var envelope struct {
+				Events []json.RawMessage `json:"events"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&envelope); err != nil {
+				http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+				return
+			}
+			for _, raw := range envelope.Events {
+				if len(raw) > maxErrorEventBytes {
+					http.Error(w, "event exceeds 200KB", http.StatusRequestEntityTooLarge)
+					return
+				}
+				var ev errorEvent
+				if err := json.Unmarshal(raw, &ev); err != nil {
+					http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+					return
+				}
+				mu.Lock()
+				accepted = append(accepted, ev)
+				mu.Unlock()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"accepted":1}`)
+		}))
+		t.Cleanup(server.Close)
+
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		client := &Client{
+			cfg: Config{
+				ServiceName: "checkout",
+				Tags:        map[string]string{"huge": strings.Repeat("值", 40_000)},
+			},
+			logger:         logger,
+			errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
+		}
+		hugeErr := errors.New(strings.Repeat("错\x00", 120_000))
+		client.CaptureException(context.Background(), hugeErr)
+		client.CaptureException(context.Background(), errors.New("sibling normal error"))
+		shutdownClient(t, client)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(accepted) != 2 {
+			t.Fatalf("accepted=%d want=2", len(accepted))
+		}
+		for _, ev := range accepted {
+			raw, err := json.Marshal(ev)
+			if err != nil || len(raw) > maxErrorEventBytes {
+				t.Fatalf("event size=%d err=%v exceeds %d", len(raw), err, maxErrorEventBytes)
+			}
+		}
+	})
+
+	t.Run("413 on batch splits and delivers healthy siblings", func(t *testing.T) {
+		t.Parallel()
+		var mu sync.Mutex
+		var acceptedIDs []string
+		var dropReasons []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Events []errorEvent `json:"events"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			for _, ev := range body.Events {
+				if strings.Contains(ev.Message, "poison-too-large") {
+					http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+					return
+				}
+			}
+			mu.Lock()
+			for _, ev := range body.Events {
+				acceptedIDs = append(acceptedIDs, ev.EventID)
+			}
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"accepted":1}`)
+		}))
+		t.Cleanup(server.Close)
+
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		client := &Client{cfg: Config{ServiceName: "checkout"}, logger: logger}
+		client.errorTransport = newErrorTransport(
+			server.URL,
+			"secret",
+			logger,
+			defaultDeliveryConfig(t),
+			func(signal, reason string, count int) {
+				mu.Lock()
+				dropReasons = append(dropReasons, signal+":"+reason)
+				mu.Unlock()
+				client.recordTelemetryDrop(signal, reason, count)
+			},
+		)
+		id1 := client.CaptureException(context.Background(), errors.New("ok-1"))
+		_ = client.CaptureException(context.Background(), errors.New("poison-too-large"))
+		id2 := client.CaptureException(context.Background(), errors.New("ok-2"))
+		id3 := client.CaptureException(context.Background(), errors.New("ok-3"))
+		shutdownClient(t, client)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(acceptedIDs) != 3 {
+			t.Fatalf("acceptedIDs=%v want 3 (%s, %s, %s)", acceptedIDs, id1, id2, id3)
+		}
+		if client.Diagnostics().DroppedTelemetry != 1 || len(dropReasons) != 1 ||
+			dropReasons[0] != "error:server_rejected" {
+			t.Fatalf(
+				"drops=%d reasons=%v want 1/error:server_rejected",
+				client.Diagnostics().DroppedTelemetry,
+				dropReasons,
+			)
+		}
+	})
+}
+
 func containsInAppFunction(frames []errorFrame, want string) bool {
 	for _, frame := range frames {
 		if frame.InApp && strings.Contains(frame.Function, want) {

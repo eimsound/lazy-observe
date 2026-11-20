@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,7 +14,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -22,10 +26,16 @@ import (
 )
 
 const (
-	errorBatchSize     = 20
-	errorFlushInterval = 100 * time.Millisecond
-	errorQueueSize     = 100
-	errorSendTimeout   = 5 * time.Second
+	errorBatchSize       = 20
+	errorFlushInterval   = 100 * time.Millisecond
+	errorQueueSize       = 100
+	errorSendTimeout     = 5 * time.Second
+	maxErrorEventBytes   = 200 << 10
+	maxErrorMessageBytes = 32 << 10
+	maxErrorURLBytes     = 4 << 10
+	maxErrorTagCount     = 64
+	maxErrorTagKeyBytes  = 128
+	maxErrorTagValBytes  = 1024
 )
 
 type errorFrame struct {
@@ -166,7 +176,16 @@ func (c *Client) captureException(ctx context.Context, err error, options errorC
 			SpanID:  spanContext.SpanID().String(),
 		}}
 	}
-	c.errorTransport.enqueue(event)
+	bounded, ok := boundErrorEvent(event, maxErrorEventBytes)
+	if !ok {
+		c.errorTransport.delivery.recordDrop(
+			"server_rejected",
+			fmt.Errorf("error event exceeds %d-byte limit", maxErrorEventBytes),
+			1,
+		)
+		return eventID
+	}
+	c.errorTransport.enqueue(bounded)
 	return eventID
 }
 
@@ -183,6 +202,66 @@ func (t *errorTransport) dropped() uint64 {
 }
 
 func (t *errorTransport) send(parent context.Context, events []errorEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	err := t.postBatch(parent, events)
+	if err == nil {
+		return nil
+	}
+	var dErr *deliveryError
+	if len(events) > 1 && errors.As(err, &dErr) && dErr.statusCode == http.StatusRequestEntityTooLarge {
+		accepted, lastRejectErr, retryableErr := t.sendSplitOnTooLarge(parent, events)
+		if retryableErr != nil {
+			return retryableErr
+		}
+		if accepted == 0 && lastRejectErr != nil {
+			return &deliveryHandledDropError{err: lastRejectErr}
+		}
+		return nil
+	}
+	return err
+}
+
+func (t *errorTransport) sendSplitOnTooLarge(parent context.Context, events []errorEvent) (int, error, error) {
+	mid := len(events) / 2
+	halves := [][]errorEvent{events[:mid], events[mid:]}
+	accepted := 0
+	var lastRejectErr error
+	for _, half := range halves {
+		err := t.postBatch(parent, half)
+		if err == nil {
+			accepted += len(half)
+			continue
+		}
+		var dErr *deliveryError
+		if errors.As(err, &dErr) && dErr.statusCode == http.StatusRequestEntityTooLarge {
+			if len(half) == 1 {
+				t.delivery.recordDrop("server_rejected", err, 1)
+				lastRejectErr = err
+				continue
+			}
+			subAccepted, subReject, retryableErr := t.sendSplitOnTooLarge(parent, half)
+			accepted += subAccepted
+			if subReject != nil {
+				lastRejectErr = subReject
+			}
+			if retryableErr != nil {
+				return accepted, lastRejectErr, retryableErr
+			}
+			continue
+		}
+		if errors.As(err, &dErr) && dErr.permanent {
+			t.delivery.recordDrop("server_rejected", err, len(half))
+			lastRejectErr = err
+			continue
+		}
+		return accepted, lastRejectErr, err
+	}
+	return accepted, lastRejectErr, nil
+}
+
+func (t *errorTransport) postBatch(parent context.Context, events []errorEvent) error {
 	body, err := json.Marshal(struct {
 		Events []errorEvent `json:"events"`
 	}{Events: events})
@@ -204,10 +283,150 @@ func (t *errorTransport) send(parent context.Context, events []errorEvent) error
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		response, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("send error events: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(response)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		return &deliveryError{
+			statusCode: resp.StatusCode,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			permanent:  isPermanentHTTPStatus(resp.StatusCode),
+			err: fmt.Errorf(
+				"send error events: HTTP %d: %s",
+				resp.StatusCode,
+				strings.TrimSpace(string(response)),
+			),
+		}
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+func boundErrorEvent(event errorEvent, limit int) (errorEvent, bool) {
+	event.Message = truncateUTF8Bytes(event.Message, maxErrorMessageBytes)
+	event.Exception.Value = truncateUTF8Bytes(event.Exception.Value, maxErrorMessageBytes)
+	event.URL = truncateUTF8Bytes(event.URL, maxErrorURLBytes)
+	event.Tags = boundErrorTags(event.Tags, maxErrorTagCount, maxErrorTagKeyBytes, maxErrorTagValBytes)
+	if eventFitsJSON(event, limit) {
+		return event, true
+	}
+
+	for _, textLimit := range []int{4 << 10, 1024, 256} {
+		event.Message = truncateUTF8Bytes(event.Message, textLimit)
+		event.Exception.Value = truncateUTF8Bytes(event.Exception.Value, textLimit)
+		if eventFitsJSON(event, limit) {
+			return event, true
+		}
+	}
+
+	event.URL = truncateUTF8Bytes(event.URL, 256)
+	event.Tags = essentialErrorTags(event.Tags, 256)
+	if eventFitsJSON(event, limit) {
+		return event, true
+	}
+
+	if len(event.Exception.Stacktrace.Frames) > 0 {
+		frames := slices.Clone(event.Exception.Stacktrace.Frames)
+		for i := range frames {
+			frames[i].AbsPath = ""
+		}
+		event.Exception.Stacktrace.Frames = frames
+		if eventFitsJSON(event, limit) {
+			return event, true
+		}
+		for _, maxFrames := range []int{32, 16, 8, 0} {
+			if len(frames) > maxFrames {
+				event.Exception.Stacktrace.Frames = frames[len(frames)-maxFrames:]
+			}
+			if eventFitsJSON(event, limit) {
+				return event, true
+			}
+		}
+	}
+	return errorEvent{}, false
+}
+
+func eventFitsJSON(event errorEvent, limit int) bool {
+	encoded, err := json.Marshal(event)
+	return err == nil && len(encoded) <= limit
+}
+
+func truncateUTF8Bytes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	const ellipsis = "..."
+	if limit <= len(ellipsis) {
+		trimmed := value[:limit]
+		for !utf8.ValidString(trimmed) {
+			trimmed = trimmed[:len(trimmed)-1]
+		}
+		return trimmed
+	}
+	trimmed := value[:limit-len(ellipsis)]
+	for !utf8.ValidString(trimmed) {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	return trimmed + ellipsis
+}
+
+var essentialTagKeys = []string{
+	"service.name",
+	"http.request.method",
+	"http.route",
+	"http.response.status_code",
+}
+
+func boundErrorTags(tags map[string]string, maxCount, maxKey, maxVal int) map[string]string {
+	if len(tags) == 0 {
+		return nil
+	}
+	out := make(map[string]string, min(len(tags), maxCount))
+	for _, key := range essentialTagKeys {
+		if value, ok := tags[key]; ok && len(out) < maxCount {
+			out[key] = truncateUTF8Bytes(value, maxVal)
+		}
+	}
+	if len(out) >= maxCount {
+		return out
+	}
+	keys := make([]string, 0, len(tags))
+	for key := range tags {
+		if _, exists := out[key]; !exists {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		if len(out) >= maxCount {
+			break
+		}
+		truncKey := truncateUTF8Bytes(key, maxKey)
+		if truncKey == "" {
+			continue
+		}
+		if _, exists := out[truncKey]; exists {
+			continue
+		}
+		out[truncKey] = truncateUTF8Bytes(tags[key], maxVal)
+	}
+	return out
+}
+
+func essentialErrorTags(tags map[string]string, maxVal int) map[string]string {
+	if len(tags) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(essentialTagKeys))
+	for _, key := range essentialTagKeys {
+		if value, ok := tags[key]; ok {
+			out[key] = truncateUTF8Bytes(value, maxVal)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func callerFrames(skip int) []errorFrame {
@@ -236,25 +455,87 @@ func callerFrames(skip int) []errorFrame {
 	return frames
 }
 
+// frameModule extracts the Go package import path from runtime.Frame.Function:
+// everything before the first '.' after the last '/' (ignoring generic type parameters).
 func frameModule(function string) string {
-	if index := strings.LastIndex(function, "."); index > 0 {
-		return function[:index]
+	if idx := strings.IndexByte(function, '['); idx >= 0 {
+		function = function[:idx]
 	}
-	return ""
+	searchStart := 0
+	if slash := strings.LastIndexByte(function, '/'); slash >= 0 {
+		searchStart = slash + 1
+	}
+	dot := strings.IndexByte(function[searchStart:], '.')
+	if dot <= 0 {
+		return ""
+	}
+	return function[:searchStart+dot]
+}
+
+var (
+	buildModulesOnce sync.Once
+	cachedMainModule string
+	cachedDepModules []string
+)
+
+func loadBuildModules() (string, []string) {
+	buildModulesOnce.Do(func() {
+		info, ok := debug.ReadBuildInfo()
+		if !ok || info == nil {
+			return
+		}
+		cachedMainModule = info.Main.Path
+		deps := make([]string, 0, len(info.Deps))
+		for _, dep := range info.Deps {
+			if dep != nil && dep.Path != "" {
+				deps = append(deps, dep.Path)
+			}
+		}
+		cachedDepModules = deps
+	})
+	return cachedMainModule, cachedDepModules
 }
 
 func isInAppFrame(function, filename string) bool {
-	if strings.HasPrefix(function, "runtime.") ||
-		strings.HasPrefix(function, "testing.") ||
-		strings.Contains(function, "github.com/gofiber/fiber/") {
+	mainModule, depModules := loadBuildModules()
+	return isInAppFrameWithBuildInfo(function, filename, mainModule, depModules)
+}
+
+func isInAppFrameWithBuildInfo(function, filename, mainModule string, depModules []string) bool {
+	pkg := frameModule(function)
+	if pkg == "" {
 		return false
 	}
-	base := filepath.Base(filename)
-	if (base == "fiber.go" || base == "error_event.go") &&
-		strings.Contains(function, "github.com/eimsound/lazy-observe/sdk/go") {
+	if pkg == instrumentationName && !strings.HasSuffix(filepath.Base(filename), "_test.go") {
 		return false
 	}
-	return true
+	if matchesModulePath(pkg, "github.com/valyala/fasthttp") ||
+		matchesModulePath(pkg, "github.com/gofiber/fiber") ||
+		matchesModulePath(pkg, "github.com/gofiber/utils") ||
+		strings.HasPrefix(pkg, "go.opentelemetry.io/") {
+		return false
+	}
+	if pkg == "main" || strings.HasPrefix(pkg, "main/") {
+		return true
+	}
+	if mainModule != "" && matchesModulePath(pkg, mainModule) {
+		return true
+	}
+	for _, dep := range depModules {
+		if matchesModulePath(pkg, dep) {
+			return false
+		}
+	}
+	slashFile := filepath.ToSlash(filename)
+	if strings.Contains(slashFile, "/pkg/mod/") || strings.Contains(slashFile, "/vendor/") {
+		return false
+	}
+	firstSegment, _, _ := strings.Cut(pkg, "/")
+	return strings.Contains(firstSegment, ".")
+}
+
+func matchesModulePath(pkg, modulePath string) bool {
+	return pkg == modulePath || strings.HasPrefix(pkg, modulePath+"/")
 }
 
 func exceptionType(err error, override string) string {

@@ -6,18 +6,20 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"runtime/pprof"
-	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	profilingCPUWindow   = 10 * time.Second
-	profilingQueueSize   = 6
-	profilingSendTimeout = 15 * time.Second
+	profilingCPUWindow       = 10 * time.Second
+	profilingQueueSize       = 6
+	profilingSendTimeout     = 15 * time.Second
+	profilingMaxPayloadBytes = 10 << 20
 	// profilingMinCancelledWindow is the shortest CPU window that is still
 	// uploaded when shutdown cancels it early (the owner's decision 14, shared
 	// with the Python SDK; see .agents/docs/plans/python-profiling.md). A window
@@ -62,20 +64,31 @@ func (c *Client) profilingLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		delay := c.cfg.ProfilingInterval - time.Since(cycleStart)
-		if delay < 0 {
-			delay = 0
-		}
+		delay := jitterProfilingDelay(c.cfg.ProfilingInterval - time.Since(cycleStart))
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
-				<-timer.C
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 			return
 		case <-timer.C:
 		}
 	}
+}
+
+func jitterProfilingDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	spread := min(delay/10, 5*time.Second)
+	if spread <= 0 {
+		return delay
+	}
+	return delay + time.Duration(rand.Int64N(int64(spread)+1))
 }
 
 func newProfileDelivery(c *Client) *deliveryQueue[collectedProfile] {
@@ -145,7 +158,10 @@ func collectCPUWindow(ctx context.Context, cpuWindow time.Duration, p *cpuProfil
 	case <-ctx.Done():
 		cancelled = true
 		if !timer.Stop() {
-			<-timer.C
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
 	case <-timer.C:
 	}
@@ -188,7 +204,7 @@ func collectSnapshotProfile(profileName, typeName string) (collectedProfile, boo
 
 func ensureGzip(data []byte) ([]byte, error) {
 	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-		return append([]byte(nil), data...), nil
+		return data, nil
 	}
 	var compressed bytes.Buffer
 	zw := gzip.NewWriter(&compressed)
@@ -201,49 +217,83 @@ func ensureGzip(data []byte) ([]byte, error) {
 	return compressed.Bytes(), nil
 }
 
+func (c *Client) httpProfileClient() *http.Client {
+	if c.profileClient != nil {
+		return c.profileClient
+	}
+	return &http.Client{Timeout: profilingSendTimeout}
+}
+
 func (c *Client) uploadProfile(ctx context.Context, collected collectedProfile) error {
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	header := make(textproto.MIMEHeader)
-	header.Set("Content-Disposition", `form-data; name="profile"; filename="profile.pb.gz"`)
-	header.Set("Content-Type", "application/octet-stream")
-	part, err := w.CreatePart(header)
-	if err != nil {
-		return err
+	if len(collected.data) > profilingMaxPayloadBytes {
+		return &deliveryError{
+			statusCode: http.StatusRequestEntityTooLarge,
+			permanent:  true,
+			err: fmt.Errorf(
+				"profile payload %d bytes exceeds %d-byte limit",
+				len(collected.data),
+				profilingMaxPayloadBytes,
+			),
+		}
 	}
-	if _, err := io.Copy(part, bytes.NewReader(collected.data)); err != nil {
-		return err
+	var prefix bytes.Buffer
+	w := multipart.NewWriter(&prefix)
+	fields := [][2]string{
+		{"upload_id", collected.uploadID},
+		{"type", collected.typeName},
+		{"service", c.cfg.ServiceName},
+		{"start", collected.start.Format(time.RFC3339Nano)},
+		{"end", collected.end.Format(time.RFC3339Nano)},
 	}
-	fields := map[string]string{
-		"upload_id": collected.uploadID,
-		"type":      collected.typeName,
-		"service":   c.cfg.ServiceName,
-		"start":     collected.start.Format(time.RFC3339Nano),
-		"end":       collected.end.Format(time.RFC3339Nano),
-	}
-	for name, value := range fields {
-		if err := w.WriteField(name, value); err != nil {
+	for _, field := range fields {
+		if err := w.WriteField(field[0], field[1]); err != nil {
 			return err
 		}
 	}
-	if err := w.Close(); err != nil {
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", `form-data; name="profile"; filename="profile.pb.gz"`)
+	header.Set("Content-Type", "application/octet-stream")
+	if _, err := w.CreatePart(header); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.profileURL, &body)
+	prefixBytes := prefix.Bytes()
+	suffix := "\r\n--" + w.Boundary() + "--\r\n"
+	contentType := w.FormDataContentType()
+	newBody := func() io.ReadCloser {
+		return io.NopCloser(io.MultiReader(
+			bytes.NewReader(prefixBytes),
+			bytes.NewReader(collected.data),
+			strings.NewReader(suffix),
+		))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.profileURL, newBody())
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.ContentLength = int64(len(prefixBytes) + len(collected.data) + len(suffix))
+	req.GetBody = func() (io.ReadCloser, error) { return newBody(), nil }
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+c.profileToken)
-	req.Header.Set("Content-Length", strconv.Itoa(body.Len()))
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpProfileClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("profile upload returned %s", resp.Status)
+		response, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		msg := strings.TrimSpace(string(response))
+		errMsg := fmt.Errorf("profile upload returned %s", resp.Status)
+		if msg != "" {
+			errMsg = fmt.Errorf("profile upload returned %s: %s", resp.Status, msg)
+		}
+		return &deliveryError{
+			statusCode: resp.StatusCode,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			permanent:  isPermanentHTTPStatus(resp.StatusCode),
+			err:        errMsg,
+		}
 	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return nil
 }

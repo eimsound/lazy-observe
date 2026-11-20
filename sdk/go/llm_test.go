@@ -227,6 +227,164 @@ func TestLLMTransportPassThroughAndError(t *testing.T) {
 	}
 }
 
+func TestLLMTransportDoesNotMutateCallerRequestAndSetsGetBody(t *testing.T) {
+	t.Parallel()
+	exporter, client := llmTestClient(t, false)
+	payload := `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`
+	origBody := io.NopCloser(strings.NewReader(payload))
+	origReq, err := http.NewRequestWithContext(
+		sampledContext(),
+		http.MethodPost,
+		"http://llm.test/v1/chat/completions",
+		origBody,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origReq.Header.Set("X-Custom", "keep")
+	origGetBody := origReq.GetBody
+
+	var seenTraceparent string
+	var retryBody string
+	transport := client.LLMTransport(roundTripFunc(func(outReq *http.Request) (*http.Response, error) {
+		seenTraceparent = outReq.Header.Get("Traceparent")
+		if outReq.GetBody == nil {
+			t.Error("cloned request GetBody is nil")
+		} else {
+			rc, getErr := outReq.GetBody()
+			if getErr != nil {
+				t.Errorf("GetBody failed: %v", getErr)
+			} else {
+				b, _ := io.ReadAll(rc)
+				_ = rc.Close()
+				retryBody = string(b)
+			}
+		}
+		_, _ = io.Copy(io.Discard, outReq.Body)
+		_ = outReq.Body.Close()
+		return llmHTTPResponse(
+			"application/json",
+			`{"model":"gpt-test","usage":{"prompt_tokens":1,"completion_tokens":2}}`,
+		), nil
+	}))
+
+	resp, err := transport.RoundTrip(origReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	if origReq.Body != origBody {
+		t.Fatal("RoundTrip mutated caller req.Body")
+	}
+	if origReq.Header.Get("Traceparent") != "" {
+		t.Fatalf("RoundTrip mutated caller req.Header: %v", origReq.Header)
+	}
+	if (origGetBody == nil) != (origReq.GetBody == nil) {
+		t.Fatal("RoundTrip mutated caller req.GetBody")
+	}
+	if seenTraceparent == "" || retryBody != payload {
+		t.Fatalf("seenTraceparent=%q retryBody=%q", seenTraceparent, retryBody)
+	}
+	if len(exporter.GetSpans()) != 1 {
+		t.Fatalf("spans=%d want=1", len(exporter.GetSpans()))
+	}
+}
+
+func TestLLMTransportStreamsOversizedRequestAndResponse(t *testing.T) {
+	t.Parallel()
+	exporter, client := llmTestClient(t, false)
+	largeReq := `{"model":"gpt-vision","messages":[{"role":"user","content":"` +
+		strings.Repeat("a", llmBodyInspectionLimit+64*1024) + `"}]}`
+	largeResp := `{"model":"gpt-vision","choices":[{"message":{"content":"` +
+		strings.Repeat("b", llmBodyInspectionLimit+64*1024) + `"}}]}`
+
+	var receivedReqLen int
+	httpClient := &http.Client{
+		Transport: client.LLMTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			data, err := io.ReadAll(req.Body)
+			if err != nil {
+				return nil, err
+			}
+			_ = req.Body.Close()
+			receivedReqLen = len(data)
+			return llmHTTPResponse("application/json", largeResp), nil
+		})),
+	}
+	resp, err := httpClient.Post("http://llm.test/v1/chat/completions", "application/json", strings.NewReader(largeReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotResp, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receivedReqLen != len(largeReq) {
+		t.Fatalf("receivedReqLen=%d want=%d", receivedReqLen, len(largeReq))
+	}
+	if len(gotResp) != len(largeResp) {
+		t.Fatalf("gotRespLen=%d want=%d", len(gotResp), len(largeResp))
+	}
+	attrs := spanAttributes(onlyLLMSpan(t, exporter).Attributes)
+	if attrs["gen_ai.usage.missing"] != true {
+		t.Fatalf("oversized response should mark usage missing: %#v", attrs)
+	}
+}
+
+type failingReadCloser struct {
+	prefix *bytes.Reader
+	err    error
+}
+
+func (f *failingReadCloser) Read(p []byte) (int, error) {
+	if f.prefix.Len() > 0 {
+		return f.prefix.Read(p)
+	}
+	return 0, f.err
+}
+
+func (f *failingReadCloser) Close() error { return nil }
+
+func TestLLMTransportPreservesResponseStatusAndHeadersOnBodyReadError(t *testing.T) {
+	t.Parallel()
+	exporter, client := llmTestClient(t, false)
+	bodyErr := errors.New("connection reset mid-body")
+	transport := client.LLMTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Status:     "502 Bad Gateway",
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "X-Request-Id": []string{"req-42"}},
+			Body:       &failingReadCloser{prefix: bytes.NewReader([]byte(`{"partial":`)), err: bodyErr},
+		}, nil
+	}))
+	req, err := http.NewRequest(
+		http.MethodPost,
+		"http://llm.test/v1/chat/completions",
+		strings.NewReader(`{"model":"m"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip swallowed response on body read error: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("X-Request-Id") != "req-42" {
+		t.Fatalf("resp status=%d header=%v", resp.StatusCode, resp.Header)
+	}
+	partial, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(partial) != `{"partial":` || !errors.Is(readErr, bodyErr) {
+		t.Fatalf("body partial=%q err=%v", string(partial), readErr)
+	}
+	span := onlyLLMSpan(t, exporter)
+	if span.Status.Code.String() != "Error" || len(span.Events) == 0 {
+		t.Fatalf("body read error not recorded on span: %#v", span)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
