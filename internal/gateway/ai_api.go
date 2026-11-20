@@ -29,7 +29,7 @@ func (g *Gateway) aiTest(c fiber.Ctx) error {
 		})
 	}
 	started := time.Now()
-	response, err := state.client.Chat(c.Context(), ai.ChatRequest{
+	response, err := state.client.Chat(ai.WithOperation(c.Context(), "connectivity_test"), ai.ChatRequest{
 		System:      "You are a connectivity check for lazy-observe.",
 		Messages:    []ai.Message{{Role: "user", Content: "Reply with exactly: pong"}},
 		Temperature: 0,
@@ -59,9 +59,5 @@ func (g *Gateway) aiTest(c fiber.Ctx) error {
 }
 
 func firstRunes(value string, limit int) string {
-	runes := []rune(value)
-	if len(runes) <= limit {
-		return value
-	}
-	return string(runes[:limit])
+	return ai.FirstRunes(value, limit)
 }
