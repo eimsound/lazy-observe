@@ -34,6 +34,8 @@ const (
 	EdgeIssues = "issues"
 	// EdgeReplaySessions holds the string denoting the replay_sessions edge name in mutations.
 	EdgeReplaySessions = "replay_sessions"
+	// EdgeReplaySegments holds the string denoting the replay_segments edge name in mutations.
+	EdgeReplaySegments = "replay_segments"
 	// EdgeSourceMapArtifacts holds the string denoting the source_map_artifacts edge name in mutations.
 	EdgeSourceMapArtifacts = "source_map_artifacts"
 	// EdgeAlertConfig holds the string denoting the alert_config edge name in mutations.
@@ -97,6 +99,13 @@ const (
 	ReplaySessionsInverseTable = "replay_sessions"
 	// ReplaySessionsColumn is the table column denoting the replay_sessions relation/edge.
 	ReplaySessionsColumn = "project_id"
+	// ReplaySegmentsTable is the table that holds the replay_segments relation/edge.
+	ReplaySegmentsTable = "replay_segments"
+	// ReplaySegmentsInverseTable is the table name for the ReplaySegment entity.
+	// It exists in this package in order to avoid circular dependency with the "replaysegment" package.
+	ReplaySegmentsInverseTable = "replay_segments"
+	// ReplaySegmentsColumn is the table column denoting the replay_segments relation/edge.
+	ReplaySegmentsColumn = "project_id"
 	// SourceMapArtifactsTable is the table that holds the source_map_artifacts relation/edge.
 	SourceMapArtifactsTable = "source_map_artifacts"
 	// SourceMapArtifactsInverseTable is the table name for the SourceMapArtifact entity.
@@ -289,6 +298,20 @@ func ByReplaySessions(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 	}
 }
 
+// ByReplaySegmentsCount orders the results by replay_segments count.
+func ByReplaySegmentsCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newReplaySegmentsStep(), opts...)
+	}
+}
+
+// ByReplaySegments orders the results by replay_segments terms.
+func ByReplaySegments(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newReplaySegmentsStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
 // BySourceMapArtifactsCount orders the results by source_map_artifacts count.
 func BySourceMapArtifactsCount(opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -412,6 +435,13 @@ func newReplaySessionsStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(ReplaySessionsInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.O2M, false, ReplaySessionsTable, ReplaySessionsColumn),
+	)
+}
+func newReplaySegmentsStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(ReplaySegmentsInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, ReplaySegmentsTable, ReplaySegmentsColumn),
 	)
 }
 func newSourceMapArtifactsStep() *sqlgraph.Step {

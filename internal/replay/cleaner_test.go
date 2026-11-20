@@ -228,3 +228,85 @@ func TestCleanerSkipsSessionWithRecentSegmentAndPreservesRefreshedMetadata(t *te
 		t.Fatalf("refreshed session was deleted: %v", err)
 	}
 }
+
+func TestCleanerSweepsOrphanReplayBlobsAndPreservesLegacySessions(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	); err != nil {
+		t.Fatal(err)
+	}
+	project, err := store.ProjectBySlug(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+
+	// Committed session with replay_segments row for seq 0.
+	if _, err := store.UpsertReplaySegment(ctx, meta.ReplaySegmentInput{
+		ProjectID:     project.ID,
+		SessionID:     "committed-sess",
+		Seq:           0,
+		StartedAt:     now.Add(-time.Hour),
+		LastSeenAt:    now.Add(-time.Hour),
+		EventCount:    1,
+		SizeBytes:     4,
+		PayloadSHA256: strings.Repeat("a", 64),
+		MarkersJSON:   "[]",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy session without replay_segments rows.
+	if err := store.UpsertReplaySession(
+		ctx, project.ID, "legacy-sess", now.Add(-time.Hour), now.Add(-time.Hour), 1, 4, false, "", "",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	committedKey := "replay/default/committed-sess/0.json.gz"
+	uncommittedSeqKey := "replay/default/committed-sess/99.json.gz"
+	orphanSessionKey := "replay/default/ghost-sess/0.json.gz"
+	legacyKey := "replay/default/legacy-sess/0.json.gz"
+	for _, key := range []string{committedKey, uncommittedSeqKey, orphanSessionKey, legacyKey} {
+		if err := blobs.Put(ctx, key, strings.NewReader("blob")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cutoff := now.Add(-72 * time.Hour)
+	// Within grace period: nothing swept.
+	if cleaned, err := (&Cleaner{Metadata: store, Blobs: blobs}).Clean(ctx, cutoff); err != nil || cleaned != 0 {
+		t.Fatalf("within-grace cleaned=%d err=%v want 0", cleaned, err)
+	}
+	// Past grace period: orphan session blob and uncommitted seq blob are swept;
+	// committed segment and legacy session blob remain intact.
+	cleaned, err := (&Cleaner{
+		Metadata: store,
+		Blobs:    blobs,
+		Now:      func() time.Time { return time.Now().UTC().Add(DefaultGracePeriod + time.Minute) },
+	}).Clean(ctx, cutoff)
+	if err != nil || cleaned != 2 {
+		t.Fatalf("past-grace cleaned=%d err=%v want 2", cleaned, err)
+	}
+	for _, keep := range []string{committedKey, legacyKey} {
+		if _, err := blobs.Get(ctx, keep); err != nil {
+			t.Fatalf("expected blob %s to remain: %v", keep, err)
+		}
+	}
+	for _, gone := range []string{uncommittedSeqKey, orphanSessionKey} {
+		if _, err := blobs.Get(ctx, gone); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("orphan blob %s still exists: err=%v", gone, err)
+		}
+	}
+}

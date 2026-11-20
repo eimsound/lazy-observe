@@ -165,6 +165,18 @@ func (f ProjectAlertConfigFunc) Mutate(ctx context.Context, m ent.Mutation) (ent
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProjectAlertConfigMutation", m)
 }
 
+// The ReplaySegmentFunc type is an adapter to allow the use of ordinary
+// function as ReplaySegment mutator.
+type ReplaySegmentFunc func(context.Context, *ent.ReplaySegmentMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f ReplaySegmentFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.ReplaySegmentMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ReplaySegmentMutation", m)
+}
+
 // The ReplaySessionFunc type is an adapter to allow the use of ordinary
 // function as ReplaySession mutator.
 type ReplaySessionFunc func(context.Context, *ent.ReplaySessionMutation) (ent.Value, error)

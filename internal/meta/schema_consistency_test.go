@@ -530,6 +530,28 @@ func assertSchemaCRUD(t *testing.T, store *Store) {
 	if err != nil || replay.SegmentCount != 2 || !replay.HasError {
 		t.Fatalf("replay upsert row=%#v err=%v", replay, err)
 	}
+	if _, err := store.UpsertReplaySegment(ctx, ReplaySegmentInput{
+		ProjectID:     p.ID,
+		SessionID:     "schema-seg-session",
+		Seq:           0,
+		StartedAt:     now,
+		LastSeenAt:    now.Add(time.Second),
+		EventCount:    3,
+		SizeBytes:     64,
+		PayloadSHA256: strings.Repeat("d", 64),
+		MarkersJSON:   `[{"type":"error","time":1}]`,
+		HasError:      true,
+		Release:       "v1",
+		PageURL:       "https://example.invalid/checkout",
+		MaxSegments:   200,
+		MaxBytes:      50 << 20,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	segs, err := store.ListReplaySegments(ctx, p.ID, "schema-seg-session", 10)
+	if err != nil || len(segs) != 1 || segs[0].Seq != 0 || !segs[0].StartedAt.Equal(now) {
+		t.Fatalf("replay segment CRUD rows=%#v err=%v", segs, err)
+	}
 	if err := store.RecordNotificationDelivery(ctx, channel.ID, rule.ID, "sent", "", 1); err != nil {
 		t.Fatal(err)
 	}

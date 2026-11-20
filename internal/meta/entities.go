@@ -18,6 +18,7 @@ type (
 	ProfileMeta       = dbent.ProfileMeta
 	Project           = dbent.Project
 	ProjectAPIToken   = dbent.ProjectAPIToken
+	ReplaySegment     = dbent.ReplaySegment
 	ReplaySession     = dbent.ReplaySession
 	SourceMapArtifact = dbent.SourceMapArtifact
 	User              = dbent.User

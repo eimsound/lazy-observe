@@ -28,6 +28,7 @@ func (Project) Edges() []ent.Edge {
 		edge.To("inhibition_rules", InhibitionRule.Type),
 		edge.To("issues", Issue.Type),
 		edge.To("replay_sessions", ReplaySession.Type),
+		edge.To("replay_segments", ReplaySegment.Type),
 		edge.To("source_map_artifacts", SourceMapArtifact.Type),
 		edge.To("alert_config", ProjectAlertConfig.Type).Unique(),
 		edge.To("scrape_targets", ScrapeTarget.Type),

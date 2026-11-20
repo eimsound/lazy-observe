@@ -21,6 +21,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectalertconfig"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
+	"github.com/eimsound/lazy-observe/internal/db/ent/replaysegment"
 	"github.com/eimsound/lazy-observe/internal/db/ent/replaysession"
 	"github.com/eimsound/lazy-observe/internal/db/ent/scrapetarget"
 	"github.com/eimsound/lazy-observe/internal/db/ent/silence"
@@ -43,6 +44,7 @@ type ProjectQuery struct {
 	withInhibitionRules       *InhibitionRuleQuery
 	withIssues                *IssueQuery
 	withReplaySessions        *ReplaySessionQuery
+	withReplaySegments        *ReplaySegmentQuery
 	withSourceMapArtifacts    *SourceMapArtifactQuery
 	withAlertConfig           *ProjectAlertConfigQuery
 	withScrapeTargets         *ScrapeTargetQuery
@@ -232,6 +234,28 @@ func (_q *ProjectQuery) QueryReplaySessions() *ReplaySessionQuery {
 			sqlgraph.From(project.Table, project.FieldID, selector),
 			sqlgraph.To(replaysession.Table, replaysession.FieldID),
 			sqlgraph.Edge(sqlgraph.O2M, false, project.ReplaySessionsTable, project.ReplaySessionsColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryReplaySegments chains the current query on the "replay_segments" edge.
+func (_q *ProjectQuery) QueryReplaySegments() *ReplaySegmentQuery {
+	query := (&ReplaySegmentClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(project.Table, project.FieldID, selector),
+			sqlgraph.To(replaysegment.Table, replaysegment.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, project.ReplaySegmentsTable, project.ReplaySegmentsColumn),
 		)
 		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
 		return fromU, nil
@@ -570,6 +594,7 @@ func (_q *ProjectQuery) Clone() *ProjectQuery {
 		withInhibitionRules:       _q.withInhibitionRules.Clone(),
 		withIssues:                _q.withIssues.Clone(),
 		withReplaySessions:        _q.withReplaySessions.Clone(),
+		withReplaySegments:        _q.withReplaySegments.Clone(),
 		withSourceMapArtifacts:    _q.withSourceMapArtifacts.Clone(),
 		withAlertConfig:           _q.withAlertConfig.Clone(),
 		withScrapeTargets:         _q.withScrapeTargets.Clone(),
@@ -656,6 +681,17 @@ func (_q *ProjectQuery) WithReplaySessions(opts ...func(*ReplaySessionQuery)) *P
 		opt(query)
 	}
 	_q.withReplaySessions = query
+	return _q
+}
+
+// WithReplaySegments tells the query-builder to eager-load the nodes that are connected to
+// the "replay_segments" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *ProjectQuery) WithReplaySegments(opts ...func(*ReplaySegmentQuery)) *ProjectQuery {
+	query := (&ReplaySegmentClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withReplaySegments = query
 	return _q
 }
 
@@ -803,7 +839,7 @@ func (_q *ProjectQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Proj
 	var (
 		nodes       = []*Project{}
 		_spec       = _q.querySpec()
-		loadedTypes = [13]bool{
+		loadedTypes = [14]bool{
 			_q.withAPITokens != nil,
 			_q.withSourceMapUploadTokens != nil,
 			_q.withAlertRules != nil,
@@ -811,6 +847,7 @@ func (_q *ProjectQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Proj
 			_q.withInhibitionRules != nil,
 			_q.withIssues != nil,
 			_q.withReplaySessions != nil,
+			_q.withReplaySegments != nil,
 			_q.withSourceMapArtifacts != nil,
 			_q.withAlertConfig != nil,
 			_q.withScrapeTargets != nil,
@@ -885,6 +922,13 @@ func (_q *ProjectQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Proj
 		if err := _q.loadReplaySessions(ctx, query, nodes,
 			func(n *Project) { n.Edges.ReplaySessions = []*ReplaySession{} },
 			func(n *Project, e *ReplaySession) { n.Edges.ReplaySessions = append(n.Edges.ReplaySessions, e) }); err != nil {
+			return nil, err
+		}
+	}
+	if query := _q.withReplaySegments; query != nil {
+		if err := _q.loadReplaySegments(ctx, query, nodes,
+			func(n *Project) { n.Edges.ReplaySegments = []*ReplaySegment{} },
+			func(n *Project, e *ReplaySegment) { n.Edges.ReplaySegments = append(n.Edges.ReplaySegments, e) }); err != nil {
 			return nil, err
 		}
 	}
@@ -1131,6 +1175,36 @@ func (_q *ProjectQuery) loadReplaySessions(ctx context.Context, query *ReplaySes
 	}
 	query.Where(predicate.ReplaySession(func(s *sql.Selector) {
 		s.Where(sql.InValues(s.C(project.ReplaySessionsColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.ProjectID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "project_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
+func (_q *ProjectQuery) loadReplaySegments(ctx context.Context, query *ReplaySegmentQuery, nodes []*Project, init func(*Project), assign func(*Project, *ReplaySegment)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[int]*Project)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+		if init != nil {
+			init(nodes[i])
+		}
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(replaysegment.FieldProjectID)
+	}
+	query.Where(predicate.ReplaySegment(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(project.ReplaySegmentsColumn), fks...))
 	}))
 	neighbors, err := query.All(ctx)
 	if err != nil {

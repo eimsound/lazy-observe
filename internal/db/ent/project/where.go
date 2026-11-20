@@ -401,6 +401,29 @@ func HasReplaySessionsWith(preds ...predicate.ReplaySession) predicate.Project {
 	})
 }
 
+// HasReplaySegments applies the HasEdge predicate on the "replay_segments" edge.
+func HasReplaySegments() predicate.Project {
+	return predicate.Project(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, ReplaySegmentsTable, ReplaySegmentsColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasReplaySegmentsWith applies the HasEdge predicate on the "replay_segments" edge with a given conditions (other predicates).
+func HasReplaySegmentsWith(preds ...predicate.ReplaySegment) predicate.Project {
+	return predicate.Project(func(s *sql.Selector) {
+		step := newReplaySegmentsStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
 // HasSourceMapArtifacts applies the HasEdge predicate on the "source_map_artifacts" edge.
 func HasSourceMapArtifacts() predicate.Project {
 	return predicate.Project(func(s *sql.Selector) {

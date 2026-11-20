@@ -266,7 +266,6 @@ type Gateway struct {
 	selfMonitoringToken      string
 	logger                   *slog.Logger
 	meterProvider            metric.MeterProvider
-	replayLocks              [64]sync.Mutex
 	requireCSRF              bool
 	secureSessionCookie      bool
 	initialAdminPasswordFile string
@@ -660,8 +659,8 @@ func (g *Gateway) registerTelemetryRoutes() {
 	g.browserIngestRoute("/api/events/diagnostics", g.sdkDiagnosticsIngest)
 	g.app.Post("/api/releases/:release/sourcemaps", g.uploadAuth.UploadMiddleware, g.uploadSourceMaps)
 	g.app.Get("/api/releases", g.queryRequired, g.listSourceMapReleases)
-	g.browserIngestRoute("/api/replay/segments", g.replayIngest)
-	g.app.Post("/api/profiles", g.auth.Middleware, g.profileIngest)
+	g.browserIngestRoute("/api/replay/segments", g.publicIngestAdmission(replayIngestPolicy), g.replayIngest)
+	g.app.Post("/api/profiles", g.auth.Middleware, g.publicIngestAdmission(profileIngestPolicy), g.profileIngest)
 	g.app.Get("/api/profiles/services", g.queryRequired, g.listProfileServices)
 	g.app.Get("/api/profiles/flamegraph", g.queryRequired, g.profileFlamegraph)
 	g.app.Get("/api/profiles/:id/raw", g.queryRequired, g.rawProfile)
@@ -804,9 +803,14 @@ func (g *Gateway) registerSessionAPI() {
 	)
 }
 
-func (g *Gateway) browserIngestRoute(path string, handler fiber.Handler) {
+func (g *Gateway) browserIngestRoute(path string, handlers ...fiber.Handler) {
 	g.app.Options(path, browserIngestCORS)
-	g.app.Post(path, browserIngestCORS, g.auth.Middleware, handler)
+	rest := make([]any, 0, len(handlers)+1)
+	rest = append(rest, g.auth.Middleware)
+	for _, h := range handlers {
+		rest = append(rest, h)
+	}
+	g.app.Post(path, browserIngestCORS, rest...)
 }
 
 func (g *Gateway) serveWebUI(c fiber.Ctx) error {

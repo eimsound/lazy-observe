@@ -2,8 +2,10 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -215,6 +217,146 @@ func TestIssueIDsForErrorEventsBulkAcrossDialects(t *testing.T) {
 		}
 		if len(got) != 2 || got["ev-1"] <= 0 || got["ev-2"] <= 0 {
 			t.Fatalf("bulk lookup=%v want ev-1 and ev-2 only", got)
+		}
+	})
+}
+
+func TestReplaySegmentAtomicUpsertQuotasConcurrencyAndDeleteAcrossDialects(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "ReplaySeg", "replay-seg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+
+		// 1. Atomic insert + idempotent duplicate + conflict rejection.
+		res, err := store.UpsertReplaySegment(ctx, ReplaySegmentInput{
+			ProjectID:     project.ID,
+			SessionID:     "sess-atomic",
+			Seq:           0,
+			StartedAt:     now,
+			LastSeenAt:    now.Add(time.Second),
+			EventCount:    5,
+			SizeBytes:     120,
+			PayloadSHA256: strings.Repeat("a", 64),
+			MarkersJSON:   `[{"type":"http","time":1000}]`,
+			HasError:      false,
+			Release:       "1.0.0",
+			PageURL:       "https://example.test/start",
+			MaxSegments:   3,
+			MaxBytes:      300,
+		})
+		if err != nil || res.Duplicate {
+			t.Fatalf("first upsert res=%+v err=%v", res, err)
+		}
+		dupRes, err := store.UpsertReplaySegment(ctx, ReplaySegmentInput{
+			ProjectID:     project.ID,
+			SessionID:     "sess-atomic",
+			Seq:           0,
+			StartedAt:     now,
+			LastSeenAt:    now.Add(time.Second),
+			EventCount:    5,
+			SizeBytes:     120,
+			PayloadSHA256: strings.Repeat("a", 64),
+			MarkersJSON:   `[{"type":"http","time":1000}]`,
+			MaxSegments:   3,
+			MaxBytes:      300,
+		})
+		if err != nil || !dupRes.Duplicate {
+			t.Fatalf("duplicate upsert res=%+v err=%v want Duplicate=true", dupRes, err)
+		}
+		if _, err := store.UpsertReplaySegment(ctx, ReplaySegmentInput{
+			ProjectID:     project.ID,
+			SessionID:     "sess-atomic",
+			Seq:           0,
+			StartedAt:     now,
+			LastSeenAt:    now.Add(time.Second),
+			EventCount:    5,
+			SizeBytes:     120,
+			PayloadSHA256: strings.Repeat("b", 64),
+			MarkersJSON:   `[]`,
+			MaxSegments:   3,
+			MaxBytes:      300,
+		}); !errors.Is(err, ErrReplaySegmentConflict) {
+			t.Fatalf("conflict upsert err=%v want ErrReplaySegmentConflict", err)
+		}
+
+		// 2. Byte quota enforced atomically in DB.
+		if _, err := store.UpsertReplaySegment(ctx, ReplaySegmentInput{
+			ProjectID:     project.ID,
+			SessionID:     "sess-atomic",
+			Seq:           1,
+			StartedAt:     now.Add(2 * time.Second),
+			LastSeenAt:    now.Add(3 * time.Second),
+			EventCount:    2,
+			SizeBytes:     200, // 120 + 200 > 300
+			PayloadSHA256: strings.Repeat("c", 64),
+			MarkersJSON:   `[]`,
+			MaxSegments:   3,
+			MaxBytes:      300,
+		}); !errors.Is(err, ErrReplayQuotaExceeded) {
+			t.Fatalf("byte quota err=%v want ErrReplayQuotaExceeded", err)
+		}
+
+		// 3. Concurrent inserts across segments must produce exact totals without regression.
+		const workers = 6
+		var wg sync.WaitGroup
+		errCh := make(chan error, workers)
+		for seq := range workers {
+			wg.Add(1)
+			go func(seq int) {
+				defer wg.Done()
+				_, upErr := store.UpsertReplaySegment(ctx, ReplaySegmentInput{
+					ProjectID:     project.ID,
+					SessionID:     "sess-concurrent",
+					Seq:           seq,
+					StartedAt:     now.Add(time.Duration(seq) * time.Second),
+					LastSeenAt:    now.Add(time.Duration(seq+1) * time.Second),
+					EventCount:    seq + 1,
+					SizeBytes:     100,
+					PayloadSHA256: strings.Repeat(string(rune('a'+seq)), 64),
+					MarkersJSON:   `[]`,
+					HasError:      seq == 3,
+					MaxSegments:   20,
+					MaxBytes:      10_000,
+				})
+				if upErr != nil {
+					errCh <- upErr
+				}
+			}(seq)
+		}
+		wg.Wait()
+		close(errCh)
+		for upErr := range errCh {
+			t.Fatalf("concurrent UpsertReplaySegment failed: %v", upErr)
+		}
+		sess, err := store.GetReplaySession(ctx, project.ID, "sess-concurrent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sess.SegmentCount != workers || sess.TotalBytes != workers*100 || !sess.HasError {
+			t.Fatalf("concurrent session summary=%+v want count=%d bytes=%d has_error=true",
+				sess, workers, workers*100)
+		}
+		segs, err := store.ListReplaySegments(ctx, project.ID, "sess-concurrent", 50)
+		if err != nil || len(segs) != workers {
+			t.Fatalf("listed segments=%d err=%v want=%d", len(segs), err, workers)
+		}
+		for i, seg := range segs {
+			if seg.Seq != i {
+				t.Fatalf("segment order[%d].Seq=%d want=%d", i, seg.Seq, i)
+			}
+		}
+
+		// 4. DeleteExpiredReplaySession removes both replay_sessions and replay_segments.
+		removed, err := store.DeleteExpiredReplaySession(ctx, sess.ID, now.Add(time.Hour))
+		if err != nil || !removed {
+			t.Fatalf("DeleteExpiredReplaySession removed=%v err=%v", removed, err)
+		}
+		remaining, err := store.ListReplaySegments(ctx, project.ID, "sess-concurrent", 50)
+		if err != nil || len(remaining) != 0 {
+			t.Fatalf("replay_segments left after session delete: %d err=%v", len(remaining), err)
 		}
 	})
 }

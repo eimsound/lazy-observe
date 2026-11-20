@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"math"
 	"net/http"
@@ -17,9 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/meta"
@@ -32,12 +31,11 @@ const (
 	maxReplaySessionIDLen       = 128
 	maxReplaySegmentsPerSession = 200
 	maxReplaySessionBytes       = 50 << 20
+	maxReplayEventsPerSegment   = 10_000
 	maxReplayMarkersPerSegment  = 200
 	maxReplayMarkersPerSession  = 1000
 	maxReplayPage               = 10_000
 	replayPageSize              = 50
-	replayProjectRateLimit      = 600
-	replaySessionRateLimit      = 120
 	maxReplayTimestampMs        = 253402300799999 // 9999-12-31T23:59:59.999Z
 )
 
@@ -47,7 +45,9 @@ var (
 )
 
 type ReplayStore interface {
-	UpsertReplaySession(context.Context, int, string, time.Time, time.Time, int, int64, bool, string, string) error
+	UpsertReplaySegment(context.Context, meta.ReplaySegmentInput) (meta.ReplaySegmentUpsertResult, error)
+	GetReplaySegment(context.Context, int, string, int) (*meta.ReplaySegment, error)
+	ListReplaySegments(context.Context, int, string, int) ([]*meta.ReplaySegment, error)
 	ListReplaySessions(context.Context, int, meta.ReplayListOptions) ([]*meta.ReplaySession, error)
 	CountReplaySessions(context.Context, int, meta.ReplayListOptions) (int, error)
 	GetReplaySession(context.Context, int, string) (*meta.ReplaySession, error)
@@ -124,7 +124,7 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 	}
 	sessionID := strings.TrimSpace(c.Query("session_id"))
 	seq, err := strconv.Atoi(c.Query("seq"))
-	if len(sessionID) == 0 || len(sessionID) > maxReplaySessionIDLen ||
+	if len(sessionID) == 0 || !validIngestText(sessionID, maxReplaySessionIDLen) ||
 		!replayIDPattern.MatchString(sessionID) || err != nil || seq < 0 {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid session_id or seq"})
 	}
@@ -132,14 +132,6 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "replay session quota exceeded"})
 	}
 	p := currentProject(c)
-	if allowed, err := g.allowIngestRate(
-		c,
-		"replay:ingest:project:"+strconv.Itoa(p.ID),
-		replayProjectRateLimit,
-		"replay ingest rate limit exceeded",
-	); !allowed {
-		return err
-	}
 	if allowed, err := g.allowIngestRate(
 		c,
 		"replay:ingest:session:"+strconv.Itoa(p.ID)+":"+sessionID,
@@ -154,10 +146,27 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		return c.Status(status).JSON(fiber.Map{"error": errMsg})
 	}
 	now := g.now().UTC().Round(0)
-	parsed, ok := parseReplaySegmentEvents(decoded, now, true)
-	if !ok {
-		return c.Status(http.StatusUnprocessableEntity).
-			JSON(fiber.Map{"error": "segment must contain a JSON event array"})
+	parsed, parseStatus, parseMsg := parseReplaySegmentEvents(decoded, now, true, maxReplayEventsPerSegment)
+	if parseStatus != 0 {
+		return c.Status(parseStatus).JSON(fiber.Map{"error": parseMsg})
+	}
+
+	payloadDigest := sha256.Sum256(decoded)
+	payloadSHA256 := hex.EncodeToString(payloadDigest[:])
+
+	existingSeg, segErr := g.replays.GetReplaySegment(c.Context(), p.ID, sessionID, seq)
+	if segErr == nil {
+		if existingSeg.PayloadSha256 != "" && existingSeg.PayloadSha256 == payloadSHA256 {
+			return c.Status(http.StatusAccepted).JSON(fiber.Map{"accepted": true, "seq": seq})
+		}
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "replay segment already exists"})
+	}
+	if !meta.IsNotFound(segErr) {
+		g.logger.Error(
+			"lookup replay segment failed",
+			"project", p.Slug, "session_id", sessionID, "seq", seq, "error", segErr,
+		)
+		return fiber.NewError(http.StatusInternalServerError, "store replay segment")
 	}
 
 	var stored bytes.Buffer
@@ -167,54 +176,23 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 	if writeErr != nil || closeErr != nil {
 		return fiber.NewError(http.StatusInternalServerError, "compress replay segment")
 	}
+	storedBytes := int64(stored.Len())
 
-	lock := g.replayLock(p.ID, sessionID)
-	lock.Lock()
-	defer lock.Unlock()
-	prefix := replayPrefix(p.Slug, sessionID)
-	key := fmt.Sprintf("%s%d.json.gz", prefix, seq)
-	metaKey := replaySegmentMetaKey(prefix, seq)
-
-	sameContent, conflict, checkErr := g.checkExistingReplaySegment(c.Context(), key, decoded)
-	if checkErr != nil {
+	// Pre-check session quotas from DB metadata before writing to blob storage.
+	if existingSess, sessErr := g.replays.GetReplaySession(c.Context(), p.ID, sessionID); sessErr == nil {
+		if existingSess.SegmentCount >= maxReplaySegmentsPerSession ||
+			existingSess.TotalBytes+storedBytes > maxReplaySessionBytes {
+			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "replay session quota exceeded"})
+		}
+	} else if !meta.IsNotFound(sessErr) {
 		g.logger.Error(
-			"check existing replay segment failed",
-			"project",
-			p.Slug,
-			"session_id",
-			sessionID,
-			"seq",
-			seq,
-			"error",
-			checkErr,
+			"lookup replay session before put failed",
+			"project", p.Slug, "session_id", sessionID, "error", sessErr,
 		)
 		return fiber.NewError(http.StatusInternalServerError, "store replay segment")
 	}
-	if sameContent {
-		return c.Status(http.StatusAccepted).JSON(fiber.Map{"accepted": true, "seq": seq})
-	}
-	if conflict {
-		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "replay segment already exists"})
-	}
 
-	existingObjects, err := g.blobs.List(c.Context(), prefix)
-	if err != nil {
-		g.logger.Error(
-			"list replay segments before put failed",
-			"project",
-			p.Slug,
-			"session_id",
-			sessionID,
-			"error",
-			err,
-		)
-		return fiber.NewError(http.StatusInternalServerError, "store replay segment")
-	}
-	existingCount, existingBytes := countReplaySegmentObjects(existingObjects)
-	if existingCount >= maxReplaySegmentsPerSession || existingBytes+int64(stored.Len()) > maxReplaySessionBytes {
-		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "replay session quota exceeded"})
-	}
-
+	key := fmt.Sprintf("%s%d.json.gz", replayPrefix(p.Slug, sessionID), seq)
 	if err := g.blobs.Put(c.Context(), key, bytes.NewReader(stored.Bytes())); err != nil {
 		if errors.Is(err, blob.ErrInvalidKey) {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid replay key"})
@@ -223,56 +201,41 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		return fiber.NewError(http.StatusInternalServerError, "store replay segment")
 	}
 
-	wroteMeta := false
-	segIndex := replaySegmentIndex{
-		Seq:        seq,
-		StartedAt:  parsed.segStartMs,
-		EventCount: parsed.eventCount,
-		SizeBytes:  int64(stored.Len()),
-		Markers:    parsed.markers,
-	}
-	if metaBytes, marshalErr := json.Marshal(segIndex); marshalErr == nil {
-		if putErr := g.blobs.Put(c.Context(), metaKey, bytes.NewReader(metaBytes)); putErr != nil {
-			g.logger.Warn("put replay segment summary failed", "project", p.Slug, "key", metaKey, "error", putErr)
-		} else {
-			wroteMeta = true
+	markersJSON := "[]"
+	if len(parsed.markers) > 0 {
+		if encoded, marshalErr := json.Marshal(parsed.markers); marshalErr == nil {
+			markersJSON = string(encoded)
 		}
 	}
 
-	objects, err := g.blobs.List(c.Context(), prefix)
+	_, err = g.replays.UpsertReplaySegment(c.Context(), meta.ReplaySegmentInput{
+		ProjectID:     p.ID,
+		SessionID:     sessionID,
+		Seq:           seq,
+		StartedAt:     parsed.startedAt,
+		LastSeenAt:    parsed.lastSeenAt,
+		EventCount:    parsed.eventCount,
+		SizeBytes:     storedBytes,
+		PayloadSHA256: payloadSHA256,
+		MarkersJSON:   markersJSON,
+		HasError:      c.Get("X-LO-Replay-Error") == "1",
+		Release:       parsed.release,
+		PageURL:       parsed.pageURL,
+		MaxSegments:   maxReplaySegmentsPerSession,
+		MaxBytes:      maxReplaySessionBytes,
+	})
 	if err != nil {
-		g.rollbackReplaySegment(c.Context(), key, metaKey, wroteMeta)
-		g.logger.Error(
-			"list replay segments after put failed",
-			"project",
-			p.Slug,
-			"session_id",
-			sessionID,
-			"error",
-			err,
-		)
-		return fiber.NewError(http.StatusInternalServerError, "store replay segment")
-	}
-	segCount, totalBytes := countReplaySegmentObjects(objects)
-	if segCount == 0 {
-		segCount = existingCount + 1
-		totalBytes = existingBytes + int64(stored.Len())
-	}
-	if err := g.replays.UpsertReplaySession(
-		c.Context(),
-		p.ID,
-		sessionID,
-		parsed.startedAt,
-		parsed.lastSeenAt,
-		segCount,
-		totalBytes,
-		c.Get("X-LO-Replay-Error") == "1",
-		parsed.release,
-		parsed.pageURL,
-	); err != nil {
-		g.rollbackReplaySegment(c.Context(), key, metaKey, wroteMeta)
-		g.logger.Error("upsert replay session failed", "project", p.Slug, "session_id", sessionID, "error", err)
-		return fiber.NewError(http.StatusInternalServerError, "store replay session")
+		switch {
+		case errors.Is(err, meta.ErrReplaySegmentConflict):
+			return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "replay segment already exists"})
+		case errors.Is(err, meta.ErrReplayQuotaExceeded):
+			g.rollbackReplaySegment(c.Context(), key)
+			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "replay session quota exceeded"})
+		default:
+			g.rollbackReplaySegment(c.Context(), key)
+			g.logger.Error("upsert replay segment failed", "project", p.Slug, "session_id", sessionID, "error", err)
+			return fiber.NewError(http.StatusInternalServerError, "store replay session")
+		}
 	}
 	return c.Status(http.StatusAccepted).JSON(fiber.Map{"accepted": true, "seq": seq})
 }
@@ -310,52 +273,12 @@ func decodeReplayBody(c fiber.Ctx) ([]byte, int, string) {
 	return nil, http.StatusUnprocessableEntity, "segment body must be gzip"
 }
 
-func (g *Gateway) checkExistingReplaySegment(
-	ctx context.Context,
-	key string,
-	decoded []byte,
-) (same, conflict bool, err error) {
-	r, err := g.blobs.Get(ctx, key)
-	if errors.Is(err, blob.ErrNotFound) {
-		return false, false, nil
-	}
-	if err != nil {
-		return false, false, err
-	}
-	existingRaw, readErr := io.ReadAll(io.LimitReader(r, maxReplaySegment+1))
-	closeErr := r.Close()
-	if readErr != nil || closeErr != nil {
-		return false, false, errors.Join(readErr, closeErr)
-	}
-	existingDecoded, gunzipErr := gunzipBounded(existingRaw, maxReplaySegment)
-	if gunzipErr == nil && bytes.Equal(existingDecoded, decoded) {
-		return true, false, nil
-	}
-	return false, true, nil
-}
-
-func (g *Gateway) rollbackReplaySegment(ctx context.Context, key, metaKey string, wroteMeta bool) {
-	if err := g.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+func (g *Gateway) rollbackReplaySegment(ctx context.Context, key string) {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), blobRollbackTimeout)
+	defer cancel()
+	if err := g.blobs.Delete(rollbackCtx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		g.logger.Warn("rollback replay segment blob failed", "key", key, "error", err)
 	}
-	if wroteMeta {
-		if err := g.blobs.Delete(ctx, metaKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
-			g.logger.Warn("rollback replay summary blob failed", "key", metaKey, "error", err)
-		}
-	}
-}
-
-func countReplaySegmentObjects(objects []blob.Object) (int, int64) {
-	count := 0
-	var total int64
-	for _, object := range objects {
-		if _, ok := replaySeq(object.Key); !ok {
-			continue
-		}
-		count++
-		total += object.Size
-	}
-	return count, total
 }
 
 func (g *Gateway) listReplaySessions(c fiber.Ctx) error {
@@ -419,18 +342,91 @@ func (g *Gateway) getReplaySession(c fiber.Ctx) error {
 		return nil
 	}
 	project := currentProject(c)
-	objects, err := g.blobs.List(c.Context(), replayPrefix(project.Slug, row.SessionID))
+	segRows, err := g.replays.ListReplaySegments(
+		c.Context(),
+		project.ID,
+		row.SessionID,
+		maxReplaySegmentsPerSession,
+	)
 	if err != nil {
 		g.logger.Error(
-			"list replay session blobs failed",
-			"project",
-			project.Slug,
-			"session_id",
-			row.SessionID,
-			"error",
-			err,
+			"list replay segments from metadata failed",
+			"project", project.Slug, "session_id", row.SessionID, "error", err,
 		)
 		return fiber.NewError(http.StatusInternalServerError, "list replay segments")
+	}
+
+	var (
+		segments []replaySegmentDTO
+		markers  []replayMarkerDTO
+	)
+	if len(segRows) > 0 {
+		segments = make([]replaySegmentDTO, 0, len(segRows))
+		markers = make([]replayMarkerDTO, 0)
+		for _, segRow := range segRows {
+			segments = append(segments, replaySegmentDTO{
+				Seq:        segRow.Seq,
+				StartedAt:  segRow.StartedAt.UTC().UnixMilli(),
+				EventCount: segRow.EventCount,
+				SizeBytes:  segRow.SizeBytes,
+			})
+			if segRow.MarkersJSON == "" || segRow.MarkersJSON == "[]" {
+				continue
+			}
+			var segMarkers []replayMarkerDTO
+			if unmarshalErr := json.Unmarshal([]byte(segRow.MarkersJSON), &segMarkers); unmarshalErr != nil {
+				g.logger.Warn(
+					"invalid replay segment markers_json",
+					"project", project.Slug, "session_id", row.SessionID, "seq", segRow.Seq, "error", unmarshalErr,
+				)
+				continue
+			}
+			if remaining := maxReplayMarkersPerSession - len(markers); remaining > 0 && len(segMarkers) > 0 {
+				if len(segMarkers) > remaining {
+					segMarkers = segMarkers[:remaining]
+				}
+				markers = append(markers, segMarkers...)
+			}
+		}
+	} else if row.SegmentCount > 0 {
+		// Smooth fallback for historical sessions written before replay_segments existed.
+		segments, markers, err = g.loadLegacyReplaySegments(c.Context(), project.Slug, row)
+		if err != nil {
+			g.logger.Error(
+				"list legacy replay session blobs failed",
+				"project", project.Slug, "session_id", row.SessionID, "error", err,
+			)
+			return fiber.NewError(http.StatusInternalServerError, "list replay segments")
+		}
+	} else {
+		segments = []replaySegmentDTO{}
+		markers = []replayMarkerDTO{}
+	}
+
+	sort.Slice(segments, func(i, j int) bool { return segments[i].Seq < segments[j].Seq })
+	sort.Slice(markers, func(i, j int) bool { return markers[i].Time < markers[j].Time })
+	if err := g.resolveReplayIssueMarkers(c.Context(), project.ID, markers); err != nil {
+		g.logger.Error(
+			"resolve replay issue markers failed",
+			"project", project.Slug, "session_id", row.SessionID, "error", err,
+		)
+		return fiber.NewError(http.StatusInternalServerError, "resolve replay Issue markers")
+	}
+	return c.JSON(struct {
+		replaySessionDTO
+		Segments []replaySegmentDTO `json:"segments"`
+		Markers  []replayMarkerDTO  `json:"markers"`
+	}{replaySessionDTO: replaySessionFromMeta(row), Segments: segments, Markers: markers})
+}
+
+func (g *Gateway) loadLegacyReplaySegments(
+	ctx context.Context,
+	projectSlug string,
+	row *meta.ReplaySession,
+) ([]replaySegmentDTO, []replayMarkerDTO, error) {
+	objects, err := g.blobs.List(ctx, replayPrefix(projectSlug, row.SessionID))
+	if err != nil {
+		return nil, nil, err
 	}
 	segObjects := make(map[int]blob.Object)
 	metaObjects := make(map[int]blob.Object)
@@ -464,7 +460,7 @@ func (g *Gateway) getReplaySession(c fiber.Ctx) error {
 			loaded         bool
 		)
 		if metaObj, hasMeta := metaObjects[seq]; hasMeta {
-			idx, metaErr := g.readReplaySegmentIndex(c.Context(), metaObj.Key)
+			idx, metaErr := g.readReplaySegmentIndex(ctx, metaObj.Key)
 			if metaErr == nil {
 				segment = replaySegmentDTO{
 					Seq:        seq,
@@ -476,17 +472,14 @@ func (g *Gateway) getReplaySession(c fiber.Ctx) error {
 				loaded = true
 			} else if !errors.Is(metaErr, blob.ErrNotFound) {
 				g.logger.Warn(
-					"read replay summary failed, falling back to segment",
-					"key",
-					metaObj.Key,
-					"error",
-					metaErr,
+					"read legacy replay summary failed, falling back to segment",
+					"key", metaObj.Key, "error", metaErr,
 				)
 			}
 		}
 		if !loaded {
 			var segErr error
-			segment, segmentMarkers, segErr = g.replaySegmentMetadata(c.Context(), object, seq, row.StartedAt)
+			segment, segmentMarkers, segErr = g.replaySegmentMetadata(ctx, object, seq, row.StartedAt)
 			if errors.Is(segErr, blob.ErrNotFound) {
 				g.logger.Warn("replay segment missing during read", "session_id", row.SessionID, "seq", seq)
 				continue
@@ -494,12 +487,7 @@ func (g *Gateway) getReplaySession(c fiber.Ctx) error {
 			if segErr != nil {
 				g.logger.Warn(
 					"skipping unreadable replay segment",
-					"session_id",
-					row.SessionID,
-					"seq",
-					seq,
-					"error",
-					segErr,
+					"session_id", row.SessionID, "seq", seq, "error", segErr,
 				)
 				continue
 			}
@@ -512,25 +500,7 @@ func (g *Gateway) getReplaySession(c fiber.Ctx) error {
 			markers = append(markers, segmentMarkers...)
 		}
 	}
-	sort.Slice(segments, func(i, j int) bool { return segments[i].Seq < segments[j].Seq })
-	sort.Slice(markers, func(i, j int) bool { return markers[i].Time < markers[j].Time })
-	if err := g.resolveReplayIssueMarkers(c.Context(), project.ID, markers); err != nil {
-		g.logger.Error(
-			"resolve replay issue markers failed",
-			"project",
-			project.Slug,
-			"session_id",
-			row.SessionID,
-			"error",
-			err,
-		)
-		return fiber.NewError(http.StatusInternalServerError, "resolve replay Issue markers")
-	}
-	return c.JSON(struct {
-		replaySessionDTO
-		Segments []replaySegmentDTO `json:"segments"`
-		Markers  []replayMarkerDTO  `json:"markers"`
-	}{replaySessionDTO: replaySessionFromMeta(row), Segments: segments, Markers: markers})
+	return segments, markers, nil
 }
 
 func (g *Gateway) readReplaySegmentIndex(ctx context.Context, key string) (replaySegmentIndex, error) {
@@ -628,14 +598,7 @@ func (g *Gateway) getReplaySegment(c fiber.Ctx) error {
 	if readErr != nil || closeErr != nil {
 		g.logger.Error(
 			"stream replay segment blob failed",
-			"project",
-			project.Slug,
-			"key",
-			key,
-			"read_err",
-			readErr,
-			"close_err",
-			closeErr,
+			"project", project.Slug, "key", key, "read_err", readErr, "close_err", closeErr,
 		)
 		return fiber.NewError(http.StatusInternalServerError, "read replay segment")
 	}
@@ -689,13 +652,21 @@ func replaySessionFromMeta(row *meta.ReplaySession) replaySessionDTO {
 	}
 }
 
-func parseReplaySegmentEvents(decoded []byte, now time.Time, requireObjects bool) (parsedReplaySegment, bool) {
+func parseReplaySegmentEvents(
+	decoded []byte,
+	now time.Time,
+	requireObjects bool,
+	maxEvents int,
+) (parsedReplaySegment, int, string) {
 	fallback := now.UTC().Round(0)
 	maxAllowed := fallback.Add(maxIngestClockSkew)
 
 	var rawEvents []json.RawMessage
 	if err := json.Unmarshal(decoded, &rawEvents); err != nil || rawEvents == nil {
-		return parsedReplaySegment{}, false
+		return parsedReplaySegment{}, http.StatusUnprocessableEntity, "segment must contain a JSON event array"
+	}
+	if maxEvents > 0 && len(rawEvents) > maxEvents {
+		return parsedReplaySegment{}, http.StatusRequestEntityTooLarge, "replay segment event quota exceeded"
 	}
 	var (
 		startedAt  time.Time
@@ -709,7 +680,7 @@ func parseReplaySegmentEvents(decoded []byte, now time.Time, requireObjects bool
 		trimmed := bytes.TrimSpace(rawEvent)
 		if len(trimmed) == 0 || trimmed[0] != '{' {
 			if requireObjects {
-				return parsedReplaySegment{}, false
+				return parsedReplaySegment{}, http.StatusUnprocessableEntity, "segment must contain a JSON event array"
 			}
 			continue
 		}
@@ -761,7 +732,7 @@ func parseReplaySegmentEvents(decoded []byte, now time.Time, requireObjects bool
 		pageURL:    pageURL,
 		release:    release,
 		markers:    markers,
-	}, true
+	}, 0, ""
 }
 
 func decodeReplayEventEnvelope(raw []byte) (replayEventEnvelope, bool) {
@@ -808,14 +779,7 @@ func parseSafeReplayMs(raw json.RawMessage) (int64, bool) {
 }
 
 func clampReplayTimestamp(ms int64, fallback, maxAllowed time.Time) time.Time {
-	at := time.UnixMilli(ms).UTC().Round(0)
-	if at.Before(minIngestTimestamp) {
-		return fallback
-	}
-	if at.After(maxAllowed) {
-		return fallback
-	}
-	return at
+	return clampIngestTimestamp(time.UnixMilli(ms), fallback, maxAllowed)
 }
 
 func extractReplayEventFields(ev replayEventEnvelope) (pageURL, release string) {
@@ -830,7 +794,7 @@ func extractReplayEventFields(ev replayEventEnvelope) (pageURL, release string) 
 				pageURL = sanitizeReplayPageURL(metaData.Href)
 			}
 			if metaData.Release != "" {
-				release = truncateReplayField(metaData.Release, 255)
+				release = truncateIngestText(metaData.Release, 255)
 			}
 		}
 	case 5:
@@ -854,7 +818,7 @@ func extractReplayEventFields(ev replayEventEnvelope) (pageURL, release string) 
 					pageURL = sanitizeReplayPageURL(rawURL)
 				}
 				if payload.Release != "" {
-					release = truncateReplayField(payload.Release, 255)
+					release = truncateIngestText(payload.Release, 255)
 				}
 			}
 		default:
@@ -863,7 +827,7 @@ func extractReplayEventFields(ev replayEventEnvelope) (pageURL, release string) 
 					Release string `json:"release"`
 				}
 				if json.Unmarshal(ev.Payload, &payload) == nil && payload.Release != "" {
-					release = truncateReplayField(payload.Release, 255)
+					release = truncateIngestText(payload.Release, 255)
 				}
 			}
 		}
@@ -872,7 +836,7 @@ func extractReplayEventFields(ev replayEventEnvelope) (pageURL, release string) 
 }
 
 func sanitizeReplayPageURL(raw string) string {
-	value := sanitizeReplayText(raw)
+	value := sanitizeIngestText(raw)
 	if value == "" {
 		return ""
 	}
@@ -886,21 +850,7 @@ func sanitizeReplayPageURL(raw string) string {
 	} else if idx := strings.IndexAny(value, "?#"); idx >= 0 {
 		value = value[:idx]
 	}
-	return truncateReplayField(value, 2048)
-}
-
-func sanitizeReplayText(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	if !utf8.ValidString(value) {
-		value = strings.ToValidUTF8(value, "")
-	}
-	if strings.ContainsRune(value, 0) {
-		value = strings.ReplaceAll(value, "\x00", "")
-	}
-	return strings.TrimSpace(value)
+	return truncateIngestText(value, 2048)
 }
 
 func (g *Gateway) replaySegmentMetadata(
@@ -922,8 +872,8 @@ func (g *Gateway) replaySegmentMetadata(
 	if err != nil {
 		return replaySegmentDTO{}, nil, fmt.Errorf("decompress replay segment %d: %w", seq, err)
 	}
-	parsed, ok := parseReplaySegmentEvents(decoded, fallback, false)
-	if !ok {
+	parsed, status, _ := parseReplaySegmentEvents(decoded, fallback, false, 0)
+	if status != 0 {
 		return replaySegmentDTO{}, nil, fmt.Errorf("decode replay segment %d", seq)
 	}
 	return replaySegmentDTO{
@@ -971,9 +921,9 @@ func replayErrorMarker(event replayEventEnvelope, fallback, maxAllowed time.Time
 	}
 	return replayMarkerDTO{
 		Type: "error", Time: at,
-		IssueID: truncateReplayField(payload.IssueID, 255),
-		EventID: truncateReplayField(payload.EventID, 255),
-		Title:   truncateReplayField(title, 512), Level: level,
+		IssueID: truncateIngestText(payload.IssueID, 255),
+		EventID: truncateIngestText(payload.EventID, 255),
+		Title:   truncateIngestText(title, 512), Level: level,
 	}
 }
 
@@ -1061,7 +1011,7 @@ func replayMarkerTimestamp(raw json.RawMessage) (int64, bool) {
 }
 
 func replaySafePath(raw string) string {
-	value := sanitizeReplayText(raw)
+	value := sanitizeIngestText(raw)
 	if parsed, err := url.Parse(value); err == nil {
 		value = parsed.Path
 	} else {
@@ -1090,31 +1040,10 @@ func replaySafePath(raw string) string {
 	} else if !strings.HasPrefix(value, "/") {
 		value = "/" + value
 	}
-	return truncateReplayField(value, 2048)
-}
-
-func truncateReplayField(value string, limit int) string {
-	value = sanitizeReplayText(value)
-	if len(value) > limit {
-		value = value[:limit]
-		for !utf8.ValidString(value) {
-			value = value[:len(value)-1]
-		}
-	}
-	return value
+	return truncateIngestText(value, 2048)
 }
 
 func replayPrefix(slug, sessionID string) string { return "replay/" + slug + "/" + sessionID + "/" }
-
-func replaySegmentMetaKey(prefix string, seq int) string {
-	return fmt.Sprintf("%s%d.meta.json", prefix, seq)
-}
-
-func (g *Gateway) replayLock(projectID int, sessionID string) *sync.Mutex {
-	h := fnv.New32a()
-	_, _ = fmt.Fprintf(h, "%d/%s", projectID, sessionID)
-	return &g.replayLocks[h.Sum32()%uint32(len(g.replayLocks))]
-}
 
 func replaySeq(key string) (int, bool) {
 	name := path.Base(key)

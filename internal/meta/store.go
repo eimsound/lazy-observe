@@ -51,6 +51,7 @@ type Store struct {
 	issueMu            sync.Mutex
 	aiSettingsMu       sync.Mutex
 	sourceMapMu        sync.Mutex
+	replayMu           sync.Mutex
 	revision           atomic.Uint64
 	secretBox          atomic.Pointer[secret.Box]
 }
@@ -651,6 +652,7 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 		`DELETE FROM issue_lifecycle_events WHERE project_id = ?`,
 		`DELETE FROM telemetry_inbox WHERE project_id = ?`,
 		`DELETE FROM issues WHERE project_id = ?`,
+		`DELETE FROM replay_segments WHERE project_id = ?`,
 		`DELETE FROM replay_sessions WHERE project_id = ?`,
 		`DELETE FROM source_map_artifacts WHERE project_id = ?`,
 		`DELETE FROM scrape_targets WHERE project_id = ?`,

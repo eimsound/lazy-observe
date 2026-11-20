@@ -46,6 +46,8 @@ type ProjectEdges struct {
 	Issues []*Issue `json:"issues,omitempty"`
 	// ReplaySessions holds the value of the replay_sessions edge.
 	ReplaySessions []*ReplaySession `json:"replay_sessions,omitempty"`
+	// ReplaySegments holds the value of the replay_segments edge.
+	ReplaySegments []*ReplaySegment `json:"replay_segments,omitempty"`
 	// SourceMapArtifacts holds the value of the source_map_artifacts edge.
 	SourceMapArtifacts []*SourceMapArtifact `json:"source_map_artifacts,omitempty"`
 	// AlertConfig holds the value of the alert_config edge.
@@ -60,7 +62,7 @@ type ProjectEdges struct {
 	IssueLifecycleEvents []*IssueLifecycleEvent `json:"issue_lifecycle_events,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [13]bool
+	loadedTypes [14]bool
 }
 
 // APITokensOrErr returns the APITokens value or an error if the edge
@@ -126,10 +128,19 @@ func (e ProjectEdges) ReplaySessionsOrErr() ([]*ReplaySession, error) {
 	return nil, &NotLoadedError{edge: "replay_sessions"}
 }
 
+// ReplaySegmentsOrErr returns the ReplaySegments value or an error if the edge
+// was not loaded in eager-loading.
+func (e ProjectEdges) ReplaySegmentsOrErr() ([]*ReplaySegment, error) {
+	if e.loadedTypes[7] {
+		return e.ReplaySegments, nil
+	}
+	return nil, &NotLoadedError{edge: "replay_segments"}
+}
+
 // SourceMapArtifactsOrErr returns the SourceMapArtifacts value or an error if the edge
 // was not loaded in eager-loading.
 func (e ProjectEdges) SourceMapArtifactsOrErr() ([]*SourceMapArtifact, error) {
-	if e.loadedTypes[7] {
+	if e.loadedTypes[8] {
 		return e.SourceMapArtifacts, nil
 	}
 	return nil, &NotLoadedError{edge: "source_map_artifacts"}
@@ -140,7 +151,7 @@ func (e ProjectEdges) SourceMapArtifactsOrErr() ([]*SourceMapArtifact, error) {
 func (e ProjectEdges) AlertConfigOrErr() (*ProjectAlertConfig, error) {
 	if e.AlertConfig != nil {
 		return e.AlertConfig, nil
-	} else if e.loadedTypes[8] {
+	} else if e.loadedTypes[9] {
 		return nil, &NotFoundError{label: projectalertconfig.Label}
 	}
 	return nil, &NotLoadedError{edge: "alert_config"}
@@ -149,7 +160,7 @@ func (e ProjectEdges) AlertConfigOrErr() (*ProjectAlertConfig, error) {
 // ScrapeTargetsOrErr returns the ScrapeTargets value or an error if the edge
 // was not loaded in eager-loading.
 func (e ProjectEdges) ScrapeTargetsOrErr() ([]*ScrapeTarget, error) {
-	if e.loadedTypes[9] {
+	if e.loadedTypes[10] {
 		return e.ScrapeTargets, nil
 	}
 	return nil, &NotLoadedError{edge: "scrape_targets"}
@@ -158,7 +169,7 @@ func (e ProjectEdges) ScrapeTargetsOrErr() ([]*ScrapeTarget, error) {
 // ProfileMetasOrErr returns the ProfileMetas value or an error if the edge
 // was not loaded in eager-loading.
 func (e ProjectEdges) ProfileMetasOrErr() ([]*ProfileMeta, error) {
-	if e.loadedTypes[10] {
+	if e.loadedTypes[11] {
 		return e.ProfileMetas, nil
 	}
 	return nil, &NotLoadedError{edge: "profile_metas"}
@@ -167,7 +178,7 @@ func (e ProjectEdges) ProfileMetasOrErr() ([]*ProfileMeta, error) {
 // TelemetryInboxOrErr returns the TelemetryInbox value or an error if the edge
 // was not loaded in eager-loading.
 func (e ProjectEdges) TelemetryInboxOrErr() ([]*TelemetryInbox, error) {
-	if e.loadedTypes[11] {
+	if e.loadedTypes[12] {
 		return e.TelemetryInbox, nil
 	}
 	return nil, &NotLoadedError{edge: "telemetry_inbox"}
@@ -176,7 +187,7 @@ func (e ProjectEdges) TelemetryInboxOrErr() ([]*TelemetryInbox, error) {
 // IssueLifecycleEventsOrErr returns the IssueLifecycleEvents value or an error if the edge
 // was not loaded in eager-loading.
 func (e ProjectEdges) IssueLifecycleEventsOrErr() ([]*IssueLifecycleEvent, error) {
-	if e.loadedTypes[12] {
+	if e.loadedTypes[13] {
 		return e.IssueLifecycleEvents, nil
 	}
 	return nil, &NotLoadedError{edge: "issue_lifecycle_events"}
@@ -278,6 +289,11 @@ func (_m *Project) QueryIssues() *IssueQuery {
 // QueryReplaySessions queries the "replay_sessions" edge of the Project entity.
 func (_m *Project) QueryReplaySessions() *ReplaySessionQuery {
 	return NewProjectClient(_m.config).QueryReplaySessions(_m)
+}
+
+// QueryReplaySegments queries the "replay_segments" edge of the Project entity.
+func (_m *Project) QueryReplaySegments() *ReplaySegmentQuery {
+	return NewProjectClient(_m.config).QueryReplaySegments(_m)
 }
 
 // QuerySourceMapArtifacts queries the "source_map_artifacts" edge of the Project entity.

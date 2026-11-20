@@ -21,6 +21,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/janitor"
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/profiling"
 	pprofprofile "github.com/google/pprof/profile"
 )
 
@@ -41,16 +42,16 @@ func TestFlamegraphKnownFunctionsMergeAndTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tree := buildFlamegraph(merged, meta.ProfileTypeCPU, 64, 10_000)
+	tree := profiling.BuildFlamegraph(merged, meta.ProfileTypeCPU, 64, 10_000)
 	if tree.Value != 12 || findFlameValue(tree, "main.work") != 12 || findFlameValue(tree, "main.main") != 12 {
 		t.Fatalf("merged tree values: %#v", tree)
 	}
 
-	depthCut := buildFlamegraph(p1, meta.ProfileTypeCPU, 1, 10_000)
+	depthCut := profiling.BuildFlamegraph(p1, meta.ProfileTypeCPU, 1, 10_000)
 	if len(depthCut.Children) != 1 || !depthCut.Children[0].Truncated {
 		t.Fatalf("depth truncation missing: %#v", depthCut)
 	}
-	nodeCut := buildFlamegraph(p1, meta.ProfileTypeCPU, 64, 1)
+	nodeCut := profiling.BuildFlamegraph(p1, meta.ProfileTypeCPU, 64, 1)
 	if !nodeCut.Truncated || len(nodeCut.Children) != 0 || nodeCut.Value != 7 {
 		t.Fatalf("node truncation missing: %#v", nodeCut)
 	}
@@ -207,7 +208,7 @@ func TestProfileAPIEndToEndAndProjectIsolation(t *testing.T) {
 	if flame.StatusCode != http.StatusOK {
 		t.Fatalf("flame status=%d body=%s", flame.StatusCode, readBody(flame))
 	}
-	var tree flameNode
+	var tree profiling.FlameNode
 	decodeResponse(t, flame, &tree)
 	if tree.Value != 24 || findFlameValue(&tree, "main.busyLoop") != 24 {
 		t.Fatalf("flame tree=%+v", tree)
@@ -420,7 +421,7 @@ func writeProfile(t *testing.T, p *pprofprofile.Profile) []byte {
 	return buf.Bytes()
 }
 
-func findFlameValue(node *flameNode, name string) int64 {
+func findFlameValue(node *profiling.FlameNode, name string) int64 {
 	if node.Name == name {
 		return node.Value
 	}
@@ -567,7 +568,7 @@ func TestProfileCorruptAndMissingBlobsSkippedInFlamegraph(t *testing.T) {
 	if flame.StatusCode != http.StatusOK {
 		t.Fatalf("flame status=%d body=%s", flame.StatusCode, readBody(flame))
 	}
-	var tree flameNode
+	var tree profiling.FlameNode
 	decodeResponse(t, flame, &tree)
 	if tree.Value != 19 || findFlameValue(&tree, "main.healthy") != 19 {
 		t.Fatalf("expected healthy profile value 19, got %+v", tree)
@@ -733,7 +734,7 @@ func TestProfileFlamegraphWindowBoundsHeterogeneousAndSnapshotAverage(t *testing
 	if heteroResp.StatusCode != http.StatusOK {
 		t.Fatalf("hetero flame status=%d body=%s", heteroResp.StatusCode, readBody(heteroResp))
 	}
-	var heteroTree flameNode
+	var heteroTree profiling.FlameNode
 	decodeResponse(t, heteroResp, &heteroTree)
 	if heteroTree.Value != 30 || heteroTree.Unit != "nanoseconds" {
 		t.Fatalf("hetero tree=%+v want value=30 unit=nanoseconds", heteroTree)
@@ -753,7 +754,7 @@ func TestProfileFlamegraphWindowBoundsHeterogeneousAndSnapshotAverage(t *testing
 	if heapResp.StatusCode != http.StatusOK {
 		t.Fatalf("heap flame status=%d body=%s", heapResp.StatusCode, readBody(heapResp))
 	}
-	var heapTree flameNode
+	var heapTree profiling.FlameNode
 	decodeResponse(t, heapResp, &heapTree)
 	if heapTree.Value != 150 || heapTree.Unit != "bytes" {
 		t.Fatalf("heap snapshot tree=%+v want averaged value=150 unit=bytes", heapTree)
@@ -777,7 +778,7 @@ func TestProfileFlamegraphWindowBoundsHeterogeneousAndSnapshotAverage(t *testing
 		{Location: locs, Value: []int64{math.MaxInt64 - 5}},
 		{Location: locs, Value: []int64{100}},
 	}
-	deepTree := buildFlamegraph(deep, meta.ProfileTypeCPU, maxFlameDepth, maxFlameNodes)
+	deepTree := profiling.BuildFlamegraph(deep, meta.ProfileTypeCPU, maxFlameDepth, maxFlameNodes)
 	if deepTree.Value != math.MaxInt64 {
 		t.Fatalf("overflow clamping failed: got %d", deepTree.Value)
 	}
@@ -874,5 +875,136 @@ func TestDeleteProjectCleansProfileAndReplayBlobs(t *testing.T) {
 	defer recreateResp.Body.Close()
 	if recreateResp.StatusCode != http.StatusConflict {
 		t.Fatalf("recreate deleted slug status=%d want 409 body=%s", recreateResp.StatusCode, readBody(recreateResp))
+	}
+}
+
+type keyMatchLimiter struct {
+	denyPrefix string
+	errPrefix  string
+	seenKeys   []string
+}
+
+func (l *keyMatchLimiter) Allow(_ context.Context, key string, _ int, _ time.Duration) (bool, error) {
+	l.seenKeys = append(l.seenKeys, key)
+	if l.errPrefix != "" && strings.HasPrefix(key, l.errPrefix) {
+		return false, errors.New("limiter backend unavailable")
+	}
+	if l.denyPrefix != "" && strings.HasPrefix(key, l.denyPrefix) {
+		return false, nil
+	}
+	return true, nil
+}
+
+type failingCreateProfileStore struct {
+	ProfileStore
+	err error
+}
+
+func (s failingCreateProfileStore) CreateProfileMeta(
+	context.Context,
+	int,
+	string,
+	meta.ProfileType,
+	time.Time,
+	time.Time,
+	int64,
+	string,
+	string,
+	string,
+	map[string]string,
+) (*meta.ProfileMeta, error) {
+	return nil, s.err
+}
+
+func TestProfileIngestSampleTypeIPLimitAndRollback(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Mismatched SampleType (heap payload uploaded as cpu) rejected with 422.
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs,
+	}).App()
+	heapPayload := syntheticProfile(100, "main.alloc", "main.main")
+	heapPayload.SampleType = []*pprofprofile.ValueType{{Type: "inuse_space", Unit: "bytes"}}
+	heapPayload.Sample[0].Value = []int64{100}
+	uploadProfileFixture(
+		t,
+		app,
+		token,
+		"svc",
+		"cpu",
+		writeProfile(t, heapPayload),
+		http.StatusUnprocessableEntity,
+	).Body.Close()
+
+	// 2. Per-IP rate limit enforced via unified publicIngestAdmission guard.
+	ipLimiter := &keyMatchLimiter{denyPrefix: "profile:ingest:ip:"}
+	ipApp := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs, Limits: ipLimiter,
+	}).App()
+	validData := writeProfile(t, syntheticProfile(11, "main.work", "main.main"))
+	ipResp := uploadProfileFixture(t, ipApp, token, "svc", "cpu", validData, http.StatusTooManyRequests)
+	if ipResp.Header.Get("Retry-After") == "" {
+		t.Fatalf("expected Retry-After header on IP rate limit")
+	}
+	ipResp.Body.Close()
+	sawProject, sawIP := false, false
+	for _, k := range ipLimiter.seenKeys {
+		if strings.HasPrefix(k, "profile:ingest:project:") {
+			sawProject = true
+		}
+		if strings.HasPrefix(k, "profile:ingest:ip:") {
+			sawIP = true
+		}
+	}
+	if !sawProject || !sawIP {
+		t.Fatalf("expected both project and IP limiter checks, got keys=%v", ipLimiter.seenKeys)
+	}
+
+	// 3. Limiter backend failure fails closed with 503.
+	errApp := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs,
+		Limits: &keyMatchLimiter{errPrefix: "profile:ingest:ip:"},
+	}).App()
+	uploadProfileFixture(t, errApp, token, "svc", "cpu", validData, http.StatusServiceUnavailable).Body.Close()
+
+	// 4. DB metadata failure rolls back the uploaded profile blob so no orphan remains.
+	failApp := newMetadataTestGateway(store, Config{
+		Tokens:   store,
+		Store:    store,
+		Profiles: failingCreateProfileStore{ProfileStore: store, err: errors.New("db write error")},
+		Blobs:    blobs,
+	}).App()
+	uploadProfileFixture(
+		t,
+		failApp,
+		token,
+		"rollback-svc",
+		"cpu",
+		validData,
+		http.StatusInternalServerError,
+	).Body.Close()
+	objects, err := blobs.List(ctx, "profiles/default/rollback-svc/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 0 {
+		t.Fatalf("orphan profile blob was not rolled back: %+v", objects)
 	}
 }

@@ -38,6 +38,8 @@ type Tx struct {
 	ProjectAPIToken *ProjectAPITokenClient
 	// ProjectAlertConfig is the client for interacting with the ProjectAlertConfig builders.
 	ProjectAlertConfig *ProjectAlertConfigClient
+	// ReplaySegment is the client for interacting with the ReplaySegment builders.
+	ReplaySegment *ReplaySegmentClient
 	// ReplaySession is the client for interacting with the ReplaySession builders.
 	ReplaySession *ReplaySessionClient
 	// ScrapeTarget is the client for interacting with the ScrapeTarget builders.
@@ -202,6 +204,7 @@ func (tx *Tx) init() {
 	tx.Project = NewProjectClient(tx.config)
 	tx.ProjectAPIToken = NewProjectAPITokenClient(tx.config)
 	tx.ProjectAlertConfig = NewProjectAlertConfigClient(tx.config)
+	tx.ReplaySegment = NewReplaySegmentClient(tx.config)
 	tx.ReplaySession = NewReplaySessionClient(tx.config)
 	tx.ScrapeTarget = NewScrapeTargetClient(tx.config)
 	tx.Session = NewSessionClient(tx.config)
