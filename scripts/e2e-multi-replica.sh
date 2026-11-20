@@ -534,6 +534,188 @@ curl -fsSG http://$VMSELECT_HOST:8481/select/41/prometheus/api/v1/query \
 p=json.load(open(sys.argv[1])); assert p.get("data",{}).get("result",[])==[]' "$WORK/metric-other-account.json"
 echo "PASS: VM cluster account 42 preserves project_id label isolation across replicas"
 
+# 跨副本吊销：revision 只是副本内的计数器（meta.Store.revision），没有跨副本广播。吊销后本副本立即清缓存，
+# 其它副本靠 tokenCacheTTL（internal/gateway/gateway.go，30s，自写入起算，不滑动）过期。项目 API Token（lo_）
+# 和 Source Map 上传 Token（los_）走这套缓存；用户 Token（lou_）每次请求都查库，不缓存。
+# 每类 token：A 创建，先在 B、再在 A 各用一次（两边都缓存住），在 A 上吊销；A 必须立即 401，B 必须在
+# TTL + 余量内开始 401，之后保持 401。三类在后台并行轮询 B，结果留到后段（doctor/drain 之前；
+# 性能门禁模式下在测量开始前）再收，不占用主线程的等待时间。
+REVOKE_TTL=30 # 与 tokenCacheTTL 保持一致
+REVOKE_MARGIN=15
+REVOKE_BOUND=$((REVOKE_TTL + REVOKE_MARGIN))
+printf '{"version":3,"file":"ha.js","sources":["ha.ts"],"names":[],"mappings":"AAAA"}' >"$WORK/ha-revoke.js.map"
+"$WORK/e2e-otlp-payload" -kind logs -name "ha-revoke-$RUN_ID" >"$WORK/revoke-log.pb"
+
+# probe_token <kind> <base> <token>：用该类 token 访问一个只认它的端点，打印 HTTP 状态码（传输失败打印 000）。
+# 末尾 exec curl，所以只能在子 shell（$(...) 或 &）里调用：后台轮询拿到的 $! 就是 curl 本身，清理时能直接结束它。
+probe_token() {
+  case "$1" in
+  project)
+    set -- -H 'Content-Type: application/x-protobuf' --data-binary @"$WORK/revoke-log.pb" \
+      -H "Authorization: Bearer $3" "$2/v1/logs"
+    ;;
+  sourcemap)
+    set -- -F "ha.js=@$WORK/ha-revoke.js.map;filename=ha.js.map" -H "Authorization: Bearer $3" \
+      "$2/api/releases/ha-revoke-$RUN_ID/sourcemaps"
+    ;;
+  user)
+    set -- -H "Authorization: Bearer $3" "$2/api/auth/me"
+    ;;
+  esac
+  exec curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null
+}
+expect_accepted() {
+  status=$(probe_token "$1" "$2" "$3") || :
+  case "$status" in
+  2??) ;;
+  *)
+    echo "FAIL: $1 token was not accepted by $2 before revocation (HTTP $status)" >&2
+    exit 1
+    ;;
+  esac
+}
+json_field() {
+  "$PY" -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
+}
+revoke_token() {
+  case "$1" in
+  project) path="projects/$PROJECT_TWO_ID/tokens/$REVOKE_PROJECT_ID" ;;
+  sourcemap) path="projects/$PROJECT_TWO_ID/source-map-upload-tokens/$REVOKE_SOURCEMAP_ID" ;;
+  user) path="auth/tokens/$REVOKE_USER_ID" ;;
+  esac
+  curl -fsS -X DELETE -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" "http://127.0.0.1:23101/api/$path" >/dev/null
+}
+token_of() {
+  case "$1" in
+  project) printf '%s' "$REVOKE_PROJECT_TOKEN" ;;
+  sourcemap) printf '%s' "$REVOKE_SOURCEMAP_TOKEN" ;;
+  user) printf '%s' "$REVOKE_USER_TOKEN" ;;
+  esac
+}
+expect_rejected_on_a() {
+  status=$(probe_token "$1" http://127.0.0.1:23101 "$(token_of "$1")") || :
+  [ "$status" = 401 ] || {
+    echo "FAIL: revoked $1 token still got HTTP $status on the revoking replica A, want 401 immediately" >&2
+    exit 1
+  }
+}
+
+REVOKE_PROJECT_JSON=$(curl -fsS -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"name":"ha-revoke"}' "http://127.0.0.1:23101/api/projects/$PROJECT_TWO_ID/tokens")
+REVOKE_PROJECT_TOKEN=$(printf '%s' "$REVOKE_PROJECT_JSON" | json_field value)
+REVOKE_PROJECT_ID=$(printf '%s' "$REVOKE_PROJECT_JSON" | json_field id)
+REVOKE_SOURCEMAP_JSON=$(curl -fsS -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"name":"ha-revoke"}' "http://127.0.0.1:23101/api/projects/$PROJECT_TWO_ID/source-map-upload-tokens")
+REVOKE_SOURCEMAP_TOKEN=$(printf '%s' "$REVOKE_SOURCEMAP_JSON" | json_field value)
+REVOKE_SOURCEMAP_ID=$(printf '%s' "$REVOKE_SOURCEMAP_JSON" | json_field id)
+REVOKE_USER_JSON=$(curl -fsS -b "$WORK/cookies" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"name":"ha-revoke"}' http://127.0.0.1:23101/api/auth/tokens)
+REVOKE_USER_TOKEN=$(printf '%s' "$REVOKE_USER_JSON" | json_field value)
+REVOKE_USER_ID=$(printf '%s' "$REVOKE_USER_JSON" | json_field id)
+case "$REVOKE_PROJECT_TOKEN:$REVOKE_SOURCEMAP_TOKEN:$REVOKE_USER_TOKEN" in
+lo_*:los_*:lou_*) ;;
+*)
+  echo "FAIL: unexpected token prefixes for the revocation test" >&2
+  exit 1
+  ;;
+esac
+
+for kind in project sourcemap user; do
+  expect_accepted "$kind" http://127.0.0.1:23102 "$(token_of "$kind")"
+done
+# A 的缓存条目写在这之后；下面 A 上的 401 必须在 TTL 过期之前拿到，才能证明是吊销清掉了缓存而不是条目碰巧过期。
+REVOKE_A_CACHED_AT=$(date +%s)
+for kind in project sourcemap user; do
+  expect_accepted "$kind" http://127.0.0.1:23101 "$(token_of "$kind")"
+done
+
+# 逐类吊销。两个 Authenticator 共用同一个 revision，吊销 lo_ 也会清掉 A 上 los_ 的缓存；所以吊销 lo_ 之后
+# 先在 A 上重新用一次 los_ 让它再缓存住，这样 los_ 的 401 只能来自它自己的吊销清缓存。
+revoke_token project
+REVOKED_AT_PROJECT=$(date +%s)
+expect_rejected_on_a project
+expect_accepted sourcemap http://127.0.0.1:23101 "$REVOKE_SOURCEMAP_TOKEN"
+revoke_token sourcemap
+REVOKED_AT_SOURCEMAP=$(date +%s)
+expect_rejected_on_a sourcemap
+revoke_token user
+REVOKED_AT_USER=$(date +%s)
+expect_rejected_on_a user
+REVOKE_A_GAP=$(($(date +%s) - REVOKE_A_CACHED_AT))
+# date +%s 只有秒精度，留 2 秒：实际间隔 <= REVOKE_A_GAP + 1 < TTL，A 上的条目还没过期。
+[ "$REVOKE_A_GAP" -le $((REVOKE_TTL - 2)) ] || {
+  echo "FAIL: replica A's revocation checks finished ${REVOKE_A_GAP}s after caching, too late to tell cache clearing from ${REVOKE_TTL}s TTL expiry" >&2
+  exit 1
+}
+echo "PASS: revoked project (lo_), source map upload (los_) and user (lou_) tokens are rejected by the revoking replica A immediately (${REVOKE_A_GAP}s after caching on A, TTL ${REVOKE_TTL}s)"
+
+# 副本 B：轮询到 401，截止时间从该 token 的吊销时刻起算；之后再确认保持 401，防止回弹。
+# B 的缓存条目写于吊销之前，过期点早于「吊销时刻 + TTL」；吊销之后 B 只会查到已吊销，不会再写入新条目。
+# 子进程（curl、sleep）都放后台再 wait：前台等待会推迟 TERM trap，清理时子进程会成为孤儿。
+await_revoked_on_b() {
+  kind=$1 token=$2 revoked_at=$3 result=$4
+  child=""
+  trap '[ -z "$child" ] || kill -TERM "$child" 2>/dev/null; exit 143' TERM
+  rejected_after=""
+  confirmed=0
+  while [ "$confirmed" -lt 3 ]; do
+    probe_token "$kind" http://127.0.0.1:23102 "$token" >"$result.status" &
+    child=$!
+    wait "$child" || :
+    child=""
+    status=$(cat "$result.status")
+    if [ -n "$rejected_after" ]; then
+      [ "$status" = 401 ] || {
+        echo "FAIL: replica B accepted a revoked $kind token again (HTTP $status) after rejecting it" >"$result"
+        return 1
+      }
+      confirmed=$((confirmed + 1))
+    elif [ "$status" = 401 ]; then
+      rejected_after=$(($(date +%s) - revoked_at))
+    elif [ $(($(date +%s) - revoked_at)) -gt "$REVOKE_BOUND" ]; then
+      echo "FAIL: replica B still answered HTTP $status for a revoked $kind token ${REVOKE_BOUND}s after revocation (TTL ${REVOKE_TTL}s)" >"$result"
+      return 1
+    fi
+    sleep 1 &
+    child=$!
+    wait "$child" || :
+    child=""
+  done
+  echo "PASS: replica B rejected the revoked $kind token ${rejected_after}s after revocation (bound ${REVOKE_BOUND}s)" >"$result"
+}
+REVOKE_PIDS=""
+for kind in project sourcemap user; do
+  case "$kind" in
+  project) revoked_at=$REVOKED_AT_PROJECT ;;
+  sourcemap) revoked_at=$REVOKED_AT_SOURCEMAP ;;
+  user) revoked_at=$REVOKED_AT_USER ;;
+  esac
+  await_revoked_on_b "$kind" "$(token_of "$kind")" "$revoked_at" "$WORK/revoke-$kind.result" &
+  PIDS="$PIDS $!"
+  REVOKE_PIDS="$REVOKE_PIDS $kind:$!"
+done
+# 收取 B 侧结果；只收一次，第二次调用直接返回。
+collect_revoke_results() {
+  [ -n "$REVOKE_PIDS" ] || return 0
+  revoke_failed=0
+  for entry in $REVOKE_PIDS; do
+    kind=${entry%%:*}
+    pid=${entry#*:}
+    if wait "$pid"; then :; else revoke_failed=1; fi
+    forget_pid "$pid"
+    cat "$WORK/revoke-$kind.result" >&2 2>/dev/null || {
+      echo "FAIL: the replica B revocation poller for the $kind token left no result" >&2
+      revoke_failed=1
+    }
+  done
+  REVOKE_PIDS=""
+  [ "$revoke_failed" = 0 ] || {
+    echo "FAIL: a revoked token stayed valid on replica B beyond the cache TTL plus margin" >&2
+    exit 1
+  }
+  echo "PASS: revoking a project, source map upload or user token on replica A invalidates it on replica B within the ${REVOKE_TTL}s cache TTL plus ${REVOKE_MARGIN}s margin"
+}
+
 DEFAULT_LOG="ha-vlogs-default-$RUN_ID"
 P2_LOG="ha-vlogs-p2-$RUN_ID"
 "$WORK/e2e-otlp-payload" -kind logs -name "$DEFAULT_LOG" >"$WORK/log-default.pb"
@@ -630,6 +812,8 @@ wait_trace_detail http://127.0.0.1:23102 "$PROJECT_TWO_SLUG" 2222222222222222222
 echo "PASS: VTraces vtinsert/vtselect/two-vtstorage cluster enforces native ProjectID isolation in both directions"
 
 if [ "${LO_E2E_PERF_GATES:-0}" = 1 ]; then
+  # 后台吊销轮询会持续打副本 B（摄取、上传 Source Map），先收完再灌夹具、测查询 P95，免得干扰测量。
+  collect_revoke_results
   PERF_COUNTS=$("$PY" -c 'import json,sys
 p=json.load(open(sys.argv[1]))["query"]["medium_fixture"]
 print(p["issues"], p["logs"], p["traces"])' "$ROOT/bench/performance-gates.json")
@@ -927,6 +1111,8 @@ DELIVERIES=$(cat "$WORK/webhook.count")
   exit 1
 }
 echo "PASS: two evaluator candidates queried one native rule and committed exactly one notification"
+
+collect_revoke_results
 
 env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
   "$BINARY" doctor --ha --config "$WORK/replica-b.yaml" >"$WORK/doctor.log"
