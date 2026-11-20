@@ -249,16 +249,11 @@ run = [
   "bash scripts/ci-setup-mise-test.sh",
   "bash scripts/check-e2e-contract.sh",
   "bash scripts/ci-changes-test.sh",
-  "bash scripts/check-pinned-releases-test.sh",
 ]
 
 [tasks.ci-changes-test]
 description = "Test that the CI change detector falls back to a full run for CI, toolchain, unclassified paths and missing base"
 run = "bash scripts/ci-changes-test.sh"
-
-[tasks.pinned-releases]
-description = "Report hand-pinned GitHub releases that are outdated (pass `-- --gate` for the minimum-release-age gate)"
-run = "bash scripts/check-pinned-releases.sh"
 
 [tasks.sdk-go]
 description = "Verify the Go SDK nested module (sdk/go) is tidy, then build, vet, lint, and test it"

@@ -1,0 +1,568 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "依赖升级的唯一来源（ADR 0015）。方案与各 manager 要点见 .agents/docs/plans/renovate.md。",
+    "minimumReleaseAge 必须与 scripts/release-age.env 的 MIN_RELEASE_AGE_DAYS 一致（check-github-workflows.sh 校验）。"
+  ],
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigestsToSemver"
+  ],
+  "ignorePresets": [
+    ":semanticPrefixFixDepsChoreOthers",
+    ":ignoreModulesAndTests"
+  ],
+  "enabledManagers": [
+    "github-actions",
+    "gomod",
+    "npm",
+    "pep621",
+    "dockerfile",
+    "mise",
+    "custom.regex"
+  ],
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**"
+  ],
+  "gomod": {
+    "managerFilePatterns": [
+      "/(^|/)go\\.mod$/",
+      "/(^|/)entc\\.mod$/"
+    ]
+  },
+  "timezone": "Asia/Shanghai",
+  "schedule": [
+    "after 3am on monday"
+  ],
+  "dependencyDashboard": {
+    "enabled": true
+  },
+  "semanticCommits": "enabled",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": null,
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 0,
+  "minimumReleaseAge": "7 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "minimumReleaseAge": "7 days"
+  },
+  "osvVulnerabilityAlerts": false,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "scripts/mise-release.env: 版本变量（无 digest）",
+      "managerFilePatterns": [
+        "/^scripts/mise-release\\.env$/"
+      ],
+      "matchStrings": [
+        "MISE_BOOTSTRAP_VERSION=(?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "jdx/mise",
+      "packageNameTemplate": "jdx/mise",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "scripts/mise-release.env: 两个架构的 sha256（行尾 # <tag> 是 currentValue，Renovate 同步改 tag 与 digest）",
+      "managerFilePatterns": [
+        "/^scripts/mise-release\\.env$/"
+      ],
+      "matchStrings": [
+        "MISE_BOOTSTRAP_SHA256_(?:AMD64|ARM64)=(?<currentDigest>[0-9a-f]{64}) # (?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-release-attachments",
+      "depNameTemplate": "jdx/mise",
+      "packageNameTemplate": "jdx/mise",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "scripts/download-storage-bins.sh: VictoriaMetrics（victoria-metrics 与 vmutils 共用同一版本）",
+      "managerFilePatterns": [
+        "/^scripts/download-storage-bins\\.sh$/"
+      ],
+      "matchStrings": [
+        "metrics_version=(?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "VictoriaMetrics/VictoriaMetrics",
+      "packageNameTemplate": "VictoriaMetrics/VictoriaMetrics",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts/download-storage-bins\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:metrics|vmutils)_sha=(?<currentDigest>[0-9a-f]{64}) # (?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-release-attachments",
+      "depNameTemplate": "VictoriaMetrics/VictoriaMetrics",
+      "packageNameTemplate": "VictoriaMetrics/VictoriaMetrics",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "scripts/download-storage-bins.sh: VictoriaLogs",
+      "managerFilePatterns": [
+        "/^scripts/download-storage-bins\\.sh$/"
+      ],
+      "matchStrings": [
+        "logs_version=(?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "VictoriaMetrics/VictoriaLogs",
+      "packageNameTemplate": "VictoriaMetrics/VictoriaLogs",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts/download-storage-bins\\.sh$/"
+      ],
+      "matchStrings": [
+        "logs_sha=(?<currentDigest>[0-9a-f]{64}) # (?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-release-attachments",
+      "depNameTemplate": "VictoriaMetrics/VictoriaLogs",
+      "packageNameTemplate": "VictoriaMetrics/VictoriaLogs",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "scripts/download-storage-bins.sh: VictoriaTraces",
+      "managerFilePatterns": [
+        "/^scripts/download-storage-bins\\.sh$/"
+      ],
+      "matchStrings": [
+        "traces_version=(?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "VictoriaMetrics/VictoriaTraces",
+      "packageNameTemplate": "VictoriaMetrics/VictoriaTraces",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts/download-storage-bins\\.sh$/"
+      ],
+      "matchStrings": [
+        "traces_sha=(?<currentDigest>[0-9a-f]{64}) # (?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-release-attachments",
+      "depNameTemplate": "VictoriaMetrics/VictoriaTraces",
+      "packageNameTemplate": "VictoriaMetrics/VictoriaTraces",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "scripts/install-trivy.sh: 版本变量（无 v 前缀，去掉 tag 的 v 再比较）",
+      "managerFilePatterns": [
+        "/^scripts/install-trivy\\.sh$/"
+      ],
+      "matchStrings": [
+        "trivy_version=(?<currentValue>[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "aquasecurity/trivy",
+      "packageNameTemplate": "aquasecurity/trivy",
+      "extractVersionTemplate": "^v(?<version>.+)$",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "scripts/install-trivy.sh: 两个架构的 sha256",
+      "managerFilePatterns": [
+        "/^scripts/install-trivy\\.sh$/"
+      ],
+      "matchStrings": [
+        "sha256=(?<currentDigest>[0-9a-f]{64}) # (?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "github-release-attachments",
+      "depNameTemplate": "aquasecurity/trivy",
+      "packageNameTemplate": "aquasecurity/trivy",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "scripts/e2e-multi-replica.sh: ${LO_E2E_*_IMAGE:-name:tag@sha256:digest} 的默认镜像（VM 集群三件套、seaweedfs、valkey、postgres）",
+      "managerFilePatterns": [
+        "/^scripts/e2e-multi-replica\\.sh$/"
+      ],
+      "matchStrings": [
+        ":-(?<depName>[a-z0-9./_-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[0-9a-f]{64})\\}"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "workflow 里 setup-buildx-action 的 driver-opts: image=moby/buildkit:tag@digest",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image=(?<depName>moby/buildkit):(?<currentValue>v[0-9][A-Za-z0-9._-]*)@(?<currentDigest>sha256:[0-9a-f]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "github-runner（ubuntu-24.04 → 26.04）不自动升",
+      "matchDepTypes": [
+        "github-runner"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "手工固定点（Victoria、mise 引导、Trivy、e2e/BuildKit 镜像）不设周排期：满 7 天（minimumReleaseAge）就开 PR",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "schedule": [
+        "at any time"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "mise 引导版本：版本变量与两个 sha 同一 PR",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "jdx/mise"
+      ],
+      "groupName": "mise bootstrap",
+      "groupSlug": "mise-bootstrap"
+    },
+    {
+      "description": "Trivy：版本变量与两个 sha 同一 PR",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "aquasecurity/trivy"
+      ],
+      "groupName": "trivy",
+      "groupSlug": "trivy"
+    },
+    {
+      "description": "VictoriaMetrics 二进制：版本变量 + victoria-metrics/vmutils 两架构共 4 个 sha 同一 PR",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "VictoriaMetrics/VictoriaMetrics"
+      ],
+      "groupName": "victoria-metrics",
+      "groupSlug": "victoria-metrics"
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "VictoriaMetrics/VictoriaLogs"
+      ],
+      "groupName": "victoria-logs",
+      "groupSlug": "victoria-logs"
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "VictoriaMetrics/VictoriaTraces"
+      ],
+      "groupName": "victoria-traces",
+      "groupSlug": "victoria-traces"
+    },
+    {
+      "description": "GitHub Actions：SHA 固定，连同行尾 # vX.Y.Z 注释一起改；minor+patch 合一组，major 单独",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "pinDigests": true
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "github-actions minor-patch",
+      "groupSlug": "github-actions-minor-patch"
+    },
+    {
+      "description": "Dockerfile FROM（含 digest）：minor/patch/digest 合一组，major 单独",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "docker minor-patch",
+      "groupSlug": "docker-minor-patch"
+    },
+    {
+      "description": "go 指令不自动抬：sdk/go 是发布给外部用的库（抬 go 指令等于抬使用方下限），根模块沿用手工节奏；mise.toml 的 go 工具版本仍由 mise manager 更新",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "golang"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "同仓模块，经 replace => ./sdk/go 引用，require 里的版本号没有意义",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/eimsound/lazy-observe/sdk/go"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "go.mod",
+        "entc.mod"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "gomod minor-patch",
+      "groupSlug": "gomod-minor-patch"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "sdk/go/go.mod"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "gomod minor-patch (sdk/go)",
+      "groupSlug": "gomod-minor-patch-sdk-go"
+    },
+    {
+      "description": "根模块（go.mod）OpenTelemetry 必须同批（otelslog 与 otel/log、semconv schema 版本互相绑定）。与 ent 一样必须排在 gomod minor-patch 规则之后，否则 groupName 被覆盖",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "go.mod"
+      ],
+      "matchPackageNames": [
+        "go.opentelemetry.io/**"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "opentelemetry",
+      "groupSlug": "opentelemetry"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "sdk/go/go.mod"
+      ],
+      "matchPackageNames": [
+        "go.opentelemetry.io/**"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "opentelemetry (sdk/go)",
+      "groupSlug": "opentelemetry-sdk-go"
+    },
+    {
+      "description": "Ent 运行时（go.mod）与生成器（entc.mod）同一 PR，entc.mod 里的 ent 版本必须与根 go.mod 一致；不分 minor/patch/major。必须排在 gomod minor-patch 规则之后（后者会覆盖 groupName，否则 ent 会被并进大组）。entc.mod 的 entc.sum 自动补不出来，PR 合并前按 .agents/docs/plans/renovate.md 与 .agents/docs/research/ent-renovate.md 手工补 sum",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "entgo.io/**"
+      ],
+      "groupName": "ent",
+      "groupSlug": "ent"
+    },
+    {
+      "description": "pnpm 工程：每个工程（含 examples，同一 lockfile）minor+patch 合一组，major 单独",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "web/**"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "npm minor-patch (web)",
+      "groupSlug": "npm-minor-patch-web"
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "sdk/node/**"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "npm minor-patch (sdk/node)",
+      "groupSlug": "npm-minor-patch-sdk-node"
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "sdk/browser/**"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "npm minor-patch (sdk/browser)",
+      "groupSlug": "npm-minor-patch-sdk-browser"
+    },
+    {
+      "description": "@types/node 的主版本跟随运行时 Node 主版本（mise.toml 的 node，当前 26）：升 mise.toml 的 node 主版本时同步改这里的上界",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "@types/node"
+      ],
+      "allowedVersions": "<27.0.0"
+    },
+    {
+      "description": "unplugin 3 只发 ESM：bundler-plugin 的 dist/index.cjs 会 require(\"unplugin\")，Node <22.12 报 ERR_REQUIRE_ESM；其可选 peer 会把 vite→lightningcss(MPL-2.0) 链进 --prod 许可证检查。迁移切片定下 engines、CJS 取舍与许可证门禁口径后撤掉",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "sdk/browser/**"
+      ],
+      "matchPackageNames": [
+        "unplugin"
+      ],
+      "allowedVersions": "<3.0.0"
+    },
+    {
+      "description": "Python SDK 是库：pyproject.toml 里的 >= 下限是对使用方的兼容承诺，不因为有新版就抬高",
+      "matchManagers": [
+        "pep621"
+      ],
+      "rangeStrategy": "widen"
+    },
+    {
+      "matchManagers": [
+        "pep621"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "pip minor-patch",
+      "groupSlug": "pip-minor-patch"
+    },
+    {
+      "description": "mise.toml 的 [tools] 与 tasks.*.tools：minor+patch 合一组，major 单独",
+      "matchManagers": [
+        "mise"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "mise tools minor-patch",
+      "groupSlug": "mise-tools-minor-patch"
+    },
+    {
+      "description": "pnpm 版本：mise.toml 与三个 package.json 的 packageManager 同一 PR。必须排在 npm 与 mise 的 minor-patch 规则之后，否则 mise.toml 里的 pnpm 被并进 mise tools 组",
+      "matchPackageNames": [
+        "pnpm"
+      ],
+      "matchManagers": [
+        "mise",
+        "npm"
+      ],
+      "groupName": "pnpm",
+      "groupSlug": "pnpm"
+    },
+    {
+      "description": "Quay、GCR 不返回 release 时间戳；Docker Hub 只能翻到前 1000 个标签（Renovate 请求 page_size=1000，Hub 每页只给 100 条，第 11 页起返回 403），标签超过 1000 的仓库（seaweedfs、postgres、debian、Victoria 集群镜像）整次查询回退成无时间戳；mise 的 go 后端 govulncheck 同样拿不到。默认的 timestamp-required 会让它们被无限期搁置，所以改为 timestamp-optional：有新版就开 PR，不受 7 天限制，也不设 dependencyDashboardApproval（ADR 0015「后果」）。每个依赖单独成 PR（不并入任何组）",
+      "matchManagers": [
+        "custom.regex",
+        "mise",
+        "dockerfile"
+      ],
+      "matchDepNames": [
+        "quay.io/victoriametrics/vmstorage",
+        "quay.io/victoriametrics/vminsert",
+        "quay.io/victoriametrics/vmselect",
+        "chrislusf/seaweedfs",
+        "postgres",
+        "go:golang.org/x/vuln/cmd/govulncheck",
+        "gcr.io/distroless/static-debian13",
+        "debian"
+      ],
+      "minimumReleaseAgeBehaviour": "timestamp-optional",
+      "groupName": null
+    },
+    {
+      "description": "e2e 夹具里的 postgres、valkey 只升 minor/patch，不升大版本（换大版本是产品决策，要单独切片）",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "postgres",
+        "valkey/valkey"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    }
+  ],
+  "prCreation": "not-pending",
+  "internalChecksAsSuccess": true
+}

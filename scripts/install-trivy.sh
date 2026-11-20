@@ -7,8 +7,11 @@ set -euo pipefail
 #
 # 供应链约束：
 #   - 不用 aquasecurity/trivy-action、setup-trivy（2026-03 这两个 action 的 tag 被劫持、v0.69.4
-#     二进制被投毒，见 GHSA-69fq-xp46-6x23）。升级时用 `gh release verify vX -R aquasecurity/trivy`
-#     核对 release 证明，再把两个架构的 sha256 抄进下面的 case。
+#     二进制被投毒，见 GHSA-69fq-xp46-6x23）。
+#   - 由 Renovate 升级（.github/renovate.json），靠 7 天最小发布年龄和下面的 sha256 校验；`gh release verify` 要调 API，
+#     会被 aquasecurity 的 IP allow list 拦住，不进 CI。改了本文件的 PR 会跑 trivy-pin job（直接执行本脚本）。
+#   - sha256 行行尾的 `# <tag>` 是 Renovate 的 github-release-attachments 用来同步 digest 的标记，
+#     人工升级要同时改 trivy_version、两个 sha256 和两处 `# <tag>`（tag 带 v 前缀，trivy_version 不带）。
 #   - 只写仓库内的 .cache/trivy（可用 LO_TRIVY_DIR 覆盖），不装到 PATH 或宿主机全局位置。
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -17,11 +20,11 @@ trivy_version=0.76.2
 case "$(uname -m)" in
 x86_64 | amd64)
   asset=Linux-64bit
-  sha256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+  sha256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf # v0.76.2
   ;;
 aarch64 | arm64)
   asset=Linux-ARM64
-  sha256=ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3
+  sha256=ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3 # v0.76.2
   ;;
 *)
   printf 'unsupported host architecture for the pinned Trivy: %s\n' "$(uname -m)" >&2

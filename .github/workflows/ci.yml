@@ -48,7 +48,7 @@ jobs:
       sdk_python: ${{ steps.detect.outputs.sdk_python }}
       sdk_journeys: ${{ steps.detect.outputs.sdk_journeys }}
       sdk_journeys_only: ${{ steps.detect.outputs.sdk_journeys_only }}
-      pins: ${{ steps.detect.outputs.pins }}
+      trivy_pin: ${{ steps.detect.outputs.trivy_pin }}
       build_matrix: ${{ steps.detect.outputs.build_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -619,22 +619,28 @@ jobs:
         env:
           LO_SDK_JOURNEYS_ONLY: ${{ needs.changes.outputs.sdk_journeys_only }}
 
-  # 手工固定点（Victoria、mise、Trivy 等 GitHub release 版本）的最小发布年龄门禁：Dependabot 看不到这些固定点，
-  # 它们的 cooldown 要靠这里兜底。只在固定点文件变化时跑（scripts/ci-changes.sh 的 pins 标志）。
-  # 要联网查 GitHub API，所以不放进离线的 workflow-check；runner 自带 curl 和 jq，不需要 mise。
-  # 每周的新版本报告在 pinned-releases.yml。
-  pinned-releases:
-    name: Pinned releases (minimum release age)
+  # Trivy 的 sha256 只在 release.yml 的扫描里用到，PR CI 其它 job 不会校验它；scripts/install-trivy.sh 改动时在这里
+  # 在两个架构上各真下载一次并 sha256sum --check（脚本按 uname -m 选 sha；两个 sha 行在 Renovate 里是两个独立依赖，
+  # 可能只错一个），版本与 sha 错配（Renovate 只升了一半、手抄错）就在 PR 里变红。
+  # 不查 GitHub API、不算发布年龄（那是 Renovate 的 minimumReleaseAge），不需要 token 和 mise。
+  trivy-pin:
+    name: Trivy pin (linux/${{ matrix.arch }})
     needs: changes
-    if: needs.changes.outputs.pins == 'true'
-    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.trivy_pin == 'true'
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Gate pinned release age
-        run: bash scripts/check-pinned-releases.sh --gate
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: Download Trivy and verify its sha256
+        run: bash scripts/install-trivy.sh
 
   # 唯一的 required check。被跳过的 job 算通过；任一 job 失败或被取消则失败。
   ci-ok:
@@ -656,7 +662,7 @@ jobs:
       - sdk-browser
       - sdk-python
       - sdk-journeys
-      - pinned-releases
+      - trivy-pin
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
