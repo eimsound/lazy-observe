@@ -19,6 +19,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/account"
@@ -61,6 +62,8 @@ const (
 const (
 	defaultProxyMaxIdleConnections        = 256
 	defaultProxyMaxIdleConnectionsPerHost = 128
+	defaultProxyResponseHeaderTimeout     = 60 * time.Second
+	proxyDrainBodyLimitBytes              = 64 << 10
 )
 
 type TokenStore interface {
@@ -179,6 +182,14 @@ type Config struct {
 	// no write timeout: log tail is a long-lived streaming response.
 	ReadTimeout time.Duration
 	IdleTimeout time.Duration
+	// LiveTailMaxGlobal, LiveTailMaxPerUser, LiveTailMaxPerProject,
+	// LiveTailMaxDuration, and LiveTailHeartbeat bound /api/v1/logs/tail
+	// streaming connections. Zero selects defaults.
+	LiveTailMaxGlobal     int
+	LiveTailMaxPerUser    int
+	LiveTailMaxPerProject int
+	LiveTailMaxDuration   time.Duration
+	LiveTailHeartbeat     time.Duration
 	// SecureSessionCookie marks the session and CSRF cookies with the Secure
 	// attribute. Enable only when TLS terminates in front of the gateway.
 	SecureSessionCookie bool
@@ -204,7 +215,15 @@ type Gateway struct {
 	ready                    bool
 	readyMu                  sync.RWMutex
 	drainOnce                sync.Once
+	shutdownCtx              context.Context
+	shutdownCancel           context.CancelFunc
 	client                   *http.Client
+	tailClient               *http.Client
+	liveTail                 *liveTailLimiter
+	liveTailMaxDuration      time.Duration
+	liveTailHeartbeat        time.Duration
+	proxyStreamErrors        atomic.Int64
+	proxyStreamErrCounter    metric.Int64Counter
 	now                      func() time.Time
 	alerts                   *alert.Service
 	issues                   IssueStore
@@ -273,7 +292,17 @@ func New(cfg Config) *Gateway {
 		// concurrency and prevents replicas from scaling independently.
 		transport.MaxIdleConns = defaultProxyMaxIdleConnections
 		transport.MaxIdleConnsPerHost = defaultProxyMaxIdleConnectionsPerHost
-		cfg.Client = &http.Client{Transport: transport}
+		transport.ResponseHeaderTimeout = defaultProxyResponseHeaderTimeout
+		cfg.Client = &http.Client{
+			Transport:     transport,
+			CheckRedirect: noFollowRedirects,
+		}
+	} else {
+		proxyClient := *cfg.Client
+		if proxyClient.CheckRedirect == nil {
+			proxyClient.CheckRedirect = noFollowRedirects
+		}
+		cfg.Client = &proxyClient
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -325,20 +354,37 @@ func New(cfg Config) *Gateway {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = defaultIdleTimeout
 	}
+	if cfg.LiveTailMaxDuration <= 0 {
+		cfg.LiveTailMaxDuration = defaultLiveTailMaxDuration
+	}
+	if cfg.LiveTailHeartbeat <= 0 {
+		cfg.LiveTailHeartbeat = defaultLiveTailHeartbeat
+	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	g := &Gateway{
 		app:        newFiberApp(cfg.ReadTimeout, cfg.IdleTimeout),
 		instanceID: cfg.InstanceID,
 		auth: NewAuthenticator(
 			cfg.Tokens,
 		),
-		uploadAuth:               newUploadAuthenticator(cfg.UploadTokens),
-		store:                    cfg.Store,
-		account:                  cfg.Account,
-		limits:                   cfg.Limits,
-		management:               cfg.Management,
-		health:                   cfg.Health,
-		readiness:                cfg.Readiness,
-		client:                   cfg.Client,
+		uploadAuth:     newUploadAuthenticator(cfg.UploadTokens),
+		store:          cfg.Store,
+		account:        cfg.Account,
+		limits:         cfg.Limits,
+		management:     cfg.Management,
+		health:         cfg.Health,
+		readiness:      cfg.Readiness,
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
+		client:         cfg.Client,
+		tailClient:     newLiveTailClient(cfg.Client),
+		liveTail: newLiveTailLimiter(
+			cfg.LiveTailMaxGlobal,
+			cfg.LiveTailMaxPerUser,
+			cfg.LiveTailMaxPerProject,
+		),
+		liveTailMaxDuration:      cfg.LiveTailMaxDuration,
+		liveTailHeartbeat:        cfg.LiveTailHeartbeat,
 		now:                      cfg.Now,
 		alerts:                   cfg.Alerts,
 		issues:                   cfg.Issues,
@@ -388,6 +434,10 @@ func New(cfg Config) *Gateway {
 	g.issueAI = newIssueAIService(g)
 	g.errorTracker = cfg.ErrorTracker
 	g.notifications = cfg.Notifications
+	if g.meterProvider != nil {
+		meter := g.meterProvider.Meter("github.com/eimsound/lazy-observe/internal/gateway")
+		g.proxyStreamErrCounter, _ = meter.Int64Counter("gateway.proxy.stream_errors")
+	}
 	g.routes()
 	return g
 }
@@ -427,13 +477,17 @@ func (g *Gateway) MarkReady() {
 	g.readyMu.Unlock()
 }
 
-// BeginDrain immediately removes the replica from service discovery. It is
-// idempotent so signal and error paths can safely converge on it.
+// BeginDrain immediately removes the replica from service discovery and cancels
+// long-lived streaming upstreams (such as Live Tail) so shutdown does not stall.
+// It is idempotent so signal and error paths can safely converge on it.
 func (g *Gateway) BeginDrain() {
 	g.drainOnce.Do(func() {
 		g.readyMu.Lock()
 		g.ready = false
 		g.readyMu.Unlock()
+		if g.shutdownCancel != nil {
+			g.shutdownCancel()
+		}
 	})
 }
 
@@ -585,36 +639,21 @@ func (g *Gateway) registerTelemetryRoutes() {
 		{"/api/v1/logs/field_values", "/select/logsql/field_values"},
 		{"/api/v1/logs/stream_field_names", "/select/logsql/stream_field_names"},
 		{"/api/v1/logs/stream_field_values", "/select/logsql/stream_field_values"},
-		{"/api/v1/logs/tail", "/select/logsql/tail"},
 	} {
-		g.app.All(
-			route.apiPath,
-			g.queryRequired,
-			g.tenantProxy(g.storage.LogsBase(), route.upstreamPath),
-		)
+		handler := g.tenantProxy(g.storage.LogsBase(), route.upstreamPath)
+		g.app.Get(route.apiPath, g.queryRequired, handler)
+		g.app.Post(route.apiPath, g.queryRequired, handler)
 	}
+	g.app.Get("/api/v1/logs/tail", g.queryRequired, g.logsLiveTail)
+	g.app.Post("/api/v1/logs/tail", g.queryRequired, g.logsLiveTail)
 	g.app.Get(
 		"/api/traces/services",
 		g.queryRequired,
 		g.tenantProxy(g.storage.TracesBase(), "/select/jaeger/api/services"),
 	)
-	g.app.Get("/api/traces/services/:svc/operations", g.queryRequired, func(c fiber.Ctx) error {
-		return g.tenantProxy(
-			g.storage.TracesBase(),
-			"/select/jaeger/api/services/"+url.PathEscape(c.Params("svc"))+"/operations",
-		)(
-			c,
-		)
-	})
+	g.app.Get("/api/traces/services/:svc/operations", g.queryRequired, g.traceOperations)
 	g.app.Get("/api/traces/search", g.queryRequired, g.traceSearch)
-	g.app.Get("/api/traces/:traceID", g.queryRequired, func(c fiber.Ctx) error {
-		return g.tenantProxy(
-			g.storage.TracesBase(),
-			"/select/jaeger/api/traces/"+url.PathEscape(c.Params("traceID")),
-		)(
-			c,
-		)
-	})
+	g.app.Get("/api/traces/:traceID", g.queryRequired, g.traceByID)
 	g.app.Get("/api/llm/summary", g.queryRequired, g.llmSummary)
 	g.app.Get("/api/llm/calls", g.queryRequired, g.llmCalls)
 	g.app.Get("/api/llm/timeseries", g.queryRequired, g.llmTimeseries)
@@ -821,21 +860,6 @@ func (g *Gateway) loadSessionProject(c fiber.Ctx) error {
 	return c.Next()
 }
 
-func (g *Gateway) traceSearch(c fiber.Ctx) error {
-	return g.proxy(c, g.storage.TracesBase(), "/select/jaeger/api/traces", proxyOptions{
-		projectID: currentProject(c).ID,
-		allowedParams: map[string]bool{
-			"service":     true,
-			"operation":   true,
-			"start":       true,
-			"end":         true,
-			"limit":       true,
-			"minDuration": true,
-			"tags":        true,
-		},
-	})
-}
-
 func (g *Gateway) healthz(c fiber.Ctx) error {
 	status := fiber.StatusOK
 	components := map[string]string{"gateway": "ok"}
@@ -988,7 +1012,10 @@ func (g *Gateway) metricsPrettify(c fiber.Ctx) error {
 func (g *Gateway) tenantProxy(base, path string) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		p := currentProject(c)
-		return g.proxy(c, base, path, proxyOptions{projectID: p.ID})
+		if p.ID <= 0 {
+			return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
+		}
+		return g.proxy(c, base, path, proxyOptions{projectID: p.ID, requireTenant: true})
 	}
 }
 
@@ -996,11 +1023,15 @@ type proxyOptions struct {
 	reservedParams bool
 	addQuery       url.Values
 	projectID      int
+	requireTenant  bool
 	allowedParams  map[string]bool
 	metricsProject string
 }
 
 func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error {
+	if (opts.requireTenant && opts.projectID <= 0) || opts.projectID < 0 {
+		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
+	}
 	query, err := url.ParseQuery(string(c.RequestCtx().QueryArgs().QueryString()))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid query parameters")
@@ -1056,51 +1087,51 @@ func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to construct upstream request")
 	}
-	copyRequestHeaders(req.Header, &c.Request().Header)
-	if opts.projectID != 0 {
+	copyProxyRequestHeaders(req.Header, &c.Request().Header, true)
+	if opts.projectID > 0 {
 		g.storage.SetTenantHeaders(req.Header, opts.projectID)
 	}
 	resp, err := g.client.Do(req)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadGateway, err.Error())
+		g.logger.Warn("gateway upstream proxy failed", "path", path, "error", err)
+		return fiber.NewError(fiber.StatusBadGateway, "upstream storage unavailable")
 	}
-	for key, values := range resp.Header {
-		if isHopByHop(key) {
-			continue
-		}
-		// Fiber installs a default text/plain Content-Type before a streaming
-		// response is proxied. Replace each upstream header field instead of
-		// comma-appending it to that default; Content-Type is a singleton field,
-		// and a combined value is not a valid media type.
-		c.Response().Header.Del(key)
-		for _, value := range values {
-			c.Response().Header.Add(key, value)
-		}
-	}
+	copyProxyResponseHeaders(c, resp.Header)
 	c.Status(resp.StatusCode)
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified || resp.ContentLength == 0 {
+		drainAndCloseBody(resp.Body)
+		return nil
+	}
+	statusCode := resp.StatusCode
 	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer resp.Body.Close()
-		var dst io.Writer = w
-		if path == "/select/logsql/tail" {
-			dst = flushingWriter{writer: w}
+		if _, copyErr := io.Copy(w, resp.Body); copyErr != nil {
+			g.recordProxyStreamError(path, statusCode, copyErr)
 		}
-		_, _ = io.Copy(dst, resp.Body)
 	})
 	return nil
 }
 
-type flushingWriter struct {
-	writer *bufio.Writer
+func (g *Gateway) recordProxyStreamError(targetPath string, statusCode int, err error) {
+	g.proxyStreamErrors.Add(1)
+	if g.proxyStreamErrCounter != nil {
+		g.proxyStreamErrCounter.Add(context.Background(), 1)
+	}
+	g.logger.Warn("gateway proxy stream interrupted", "path", targetPath, "status", statusCode, "error", err)
 }
 
-func (w flushingWriter) Write(p []byte) (int, error) {
-	n, err := w.writer.Write(p)
-	if err != nil {
-		return n, err
+func drainAndCloseBody(body io.ReadCloser) {
+	if body == nil {
+		return
 	}
-	return n, w.writer.Flush()
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, proxyDrainBodyLimitBytes))
+	_ = body.Close()
+}
+
+func noFollowRedirects(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func injectPromValues(values url.Values, project string) error {
@@ -1152,19 +1183,51 @@ func stripReserved(values url.Values) {
 	values.Del("extra_label")
 }
 
-func copyRequestHeaders(dst http.Header, src *fasthttp.RequestHeader) {
+func copyProxyRequestHeaders(dst http.Header, src *fasthttp.RequestHeader, allowAcceptEncoding bool) {
 	for key, value := range src.All() {
 		name := string(key)
-		if isHopByHop(name) || strings.EqualFold(name, "Content-Length") ||
-			strings.EqualFold(name, "AccountID") ||
-			strings.EqualFold(name, "ProjectID") ||
-			strings.EqualFold(name, "Host") ||
-			strings.EqualFold(name, "X-LO-Project") ||
-			strings.EqualFold(name, "Authorization") ||
-			strings.EqualFold(name, "Cookie") {
+		switch strings.ToLower(name) {
+		case "content-type",
+			"content-encoding",
+			"accept",
+			"user-agent",
+			"x-prometheus-remote-write-version",
+			"x-lazy-observe-perf-request":
+			dst.Add(name, string(value))
+		case "accept-encoding":
+			if allowAcceptEncoding {
+				dst.Add(name, string(value))
+			}
+		}
+	}
+}
+
+func copyProxyResponseHeaders(c fiber.Ctx, src http.Header) {
+	for key, values := range src {
+		switch strings.ToLower(key) {
+		case "content-type",
+			"content-encoding",
+			"content-disposition",
+			"cache-control",
+			"vary",
+			"retry-after",
+			"x-prometheus-remote-write-written-samples",
+			"x-prometheus-remote-write-written-histograms",
+			"x-prometheus-remote-write-written-exemplars",
+			"x-lazy-observe-perf-sink",
+			"x-lazy-observe-perf-receipt",
+			"x-lazy-observe-perf-request":
+		default:
 			continue
 		}
-		dst.Add(name, string(value))
+		// Fiber installs a default text/plain Content-Type before a streaming
+		// response is proxied. Replace each upstream header field instead of
+		// comma-appending it to that default; Content-Type is a singleton field,
+		// and a combined value is not a valid media type.
+		c.Response().Header.Del(key)
+		for _, value := range values {
+			c.Response().Header.Add(key, value)
+		}
 	}
 }
 
@@ -1360,23 +1423,6 @@ var errResponseWritten = errors.New("authentication response already written")
 func unauthorized(c fiber.Ctx) error {
 	_ = c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	return errResponseWritten
-}
-
-func isHopByHop(name string) bool {
-	switch strings.ToLower(name) {
-	case "connection",
-		"proxy-connection",
-		"keep-alive",
-		"proxy-authenticate",
-		"proxy-authorization",
-		"te",
-		"trailer",
-		"transfer-encoding",
-		"upgrade":
-		return true
-	default:
-		return false
-	}
 }
 
 func currentProject(c fiber.Ctx) meta.ProjectInfo {

@@ -12,7 +12,27 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/gofiber/fiber/v3"
+	"github.com/valyala/fasthttp"
 )
+
+func zstdOfZeros(t *testing.T, n int) []byte {
+	t.Helper()
+	zeros := make([]byte, n)
+	var out bytes.Buffer
+	if _, err := fasthttp.WriteZstdLevel(&out, zeros, fasthttp.CompressZstdBestCompression); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func zstdBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	if _, err := fasthttp.WriteZstdLevel(&out, data, fasthttp.CompressZstdDefault); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
 
 // gzipOfZeros returns a small gzip stream whose decoded size is n bytes.
 func gzipOfZeros(t *testing.T, n int) []byte {
@@ -94,20 +114,74 @@ func TestBoundedRequestDecodingRejectsDecompressionBombs(t *testing.T) {
 	}
 }
 
+func TestBoundedRequestDecodingRejectsZstdDecompressionBombs(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	app := newTestGateway(Config{
+		Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 7, Slug: "alpha"}},
+		Metrics: upstream.URL, Logs: upstream.URL, Traces: upstream.URL,
+	}).App()
+	bomb := zstdOfZeros(t, maxDecodedRequestBody+1)
+	if len(bomb) > 1<<20 {
+		t.Fatalf("fixture is not a zstd compression bomb: %d compressed bytes", len(bomb))
+	}
+	for _, test := range []struct {
+		name, path, contentType string
+		bearer                  bool
+	}{
+		{"otlp logs proxy", "/v1/logs", "application/x-protobuf", true},
+		{"otlp traces proxy", "/v1/traces", "application/x-protobuf", true},
+		{"browser errors", "/api/events/errors", "application/json", true},
+		{"unauthenticated login", "/api/auth/login", "application/json", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(bomb))
+			req.Header.Set("Content-Type", test.contentType)
+			req.Header.Set("Content-Encoding", "zstd")
+			if test.bearer {
+				req.Header.Set("Authorization", "Bearer lou_valid")
+			}
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d want=413 body=%s", resp.StatusCode, readBody(resp))
+			}
+		})
+	}
+	if calls := upstreamCalls.Load(); calls != 0 {
+		t.Fatalf("zstd decompression bomb reached storage upstream %d times", calls)
+	}
+}
+
 func TestBoundedRequestDecodingRejectsCorruptAndUnsupportedEncodings(t *testing.T) {
 	app := newTestGateway(Config{Tokens: &fakeTokens{project: meta.ProjectInfo{ID: 7, Slug: "alpha"}}}).App()
 	for _, test := range []struct {
-		name, encoding string
-		body           []byte
-		want           int
+		name, path string
+		encodings  []string
+		body       []byte
+		want       int
 	}{
-		{"corrupt gzip", "gzip", []byte("not gzip"), http.StatusBadRequest},
-		{"unknown encoding stacked on gzip", "zstd, gzip", gzipBytes(t, []byte("{}")), http.StatusUnsupportedMediaType},
+		{"corrupt gzip", "/api/events/errors", []string{"gzip"}, []byte("not gzip"), http.StatusBadRequest},
+		{"corrupt zstd", "/api/events/errors", []string{"zstd"}, []byte("not zstd"), http.StatusBadRequest},
+		{"unknown encoding stacked on gzip", "/api/events/errors", []string{"snappy, gzip"}, gzipBytes(t, []byte("{}")), http.StatusUnsupportedMediaType},
+		{"snappy rejected on logs ingest", "/v1/logs", []string{"snappy"}, []byte("payload"), http.StatusUnsupportedMediaType},
+		{"unknown encoding rejected on logs ingest", "/v1/logs", []string{"lz4"}, []byte("payload"), http.StatusUnsupportedMediaType},
+		{"multi-header unknown encoding rejected", "/v1/logs", []string{"gzip", "lz4"}, gzipBytes(t, []byte("{}")), http.StatusUnsupportedMediaType},
+		{"too many stacked layers rejected", "/v1/logs", []string{"gzip, gzip, gzip, gzip, gzip"}, gzipBytes(t, []byte("{}")), http.StatusUnsupportedMediaType},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/api/events/errors", bytes.NewReader(test.body))
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(test.body))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Content-Encoding", test.encoding)
+			for _, enc := range test.encodings {
+				req.Header.Add("Content-Encoding", enc)
+			}
 			req.Header.Set("Authorization", "Bearer lou_valid")
 			resp, err := app.Test(req)
 			if err != nil {
@@ -165,16 +239,15 @@ func TestProfileIngestBoundsPprofDecompression(t *testing.T) {
 	resp.Body.Close()
 }
 
-// A single coding the gateway does not decode (snappy, zstd) must reach the
-// storage upstream byte for byte with its Content-Encoding header. Fiber v3's
-// Ctx.Body decodes or rejects such codings itself; handlers read requestBody
-// instead so the upstream, which understands them, sees the original request.
-func TestProxyForwardsUndecodedContentEncodingUntouched(t *testing.T) {
+// Zstd is decoded bounded in middleware and stripped before reaching storage.
+// Snappy is exempted only on /api/v1/write (Prometheus remote-write), which
+// applies its own bounded snappy decode.
+func TestProxyDecodesZstdBoundedAndRestrictsSnappyToRemoteWrite(t *testing.T) {
 	type seen struct {
 		body     []byte
 		encoding string
 	}
-	received := make(chan seen, 1)
+	received := make(chan seen, 4)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		received <- seen{body: body, encoding: r.Header.Get("Content-Encoding")}
@@ -185,12 +258,13 @@ func TestProxyForwardsUndecodedContentEncodingUntouched(t *testing.T) {
 		Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 7, Slug: "alpha"}},
 		Metrics: upstream.URL, Logs: upstream.URL, Traces: upstream.URL,
 	}).App()
-	for _, coding := range []string{"zstd", "snappy"} {
-		t.Run(coding, func(t *testing.T) {
-			payload := []byte("\x28\xb5\x2f\xfd not really " + coding + " \x00\x01\x02")
-			req := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(payload))
+
+	plain := []byte("otlp-zstd-protobuf-payload")
+	for _, path := range []string{"/v1/logs", "/v1/traces"} {
+		t.Run("zstd_"+path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(zstdBytes(t, plain)))
 			req.Header.Set("Content-Type", "application/x-protobuf")
-			req.Header.Set("Content-Encoding", coding)
+			req.Header.Set("Content-Encoding", "zstd")
 			req.Header.Set("Authorization", "Bearer lou_valid")
 			resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 			if err != nil {
@@ -200,15 +274,56 @@ func TestProxyForwardsUndecodedContentEncodingUntouched(t *testing.T) {
 				t.Fatalf("status=%d want=204 body=%s", resp.StatusCode, readBody(resp))
 			}
 			got := <-received
-			if got.encoding != coding || !bytes.Equal(got.body, payload) {
+			if got.encoding != "" || !bytes.Equal(got.body, plain) {
 				t.Fatalf(
-					"upstream saw encoding=%q body=%q, want encoding=%q body=%q",
+					"upstream saw encoding=%q body=%q, want identity %q",
 					got.encoding,
 					got.body,
-					coding,
-					payload,
+					plain,
 				)
 			}
 		})
 	}
+
+	t.Run("multi_header_zstd_then_gzip", func(t *testing.T) {
+		doubleCompressed := gzipBytes(t, zstdBytes(t, plain))
+		req := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(doubleCompressed))
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		req.Header.Add("Content-Encoding", "zstd")
+		req.Header.Add("Content-Encoding", "gzip")
+		req.Header.Set("Authorization", "Bearer lou_valid")
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status=%d want=204 body=%s", resp.StatusCode, readBody(resp))
+		}
+		got := <-received
+		if got.encoding != "" || !bytes.Equal(got.body, plain) {
+			t.Fatalf("upstream saw encoding=%q body=%q want identity %q", got.encoding, got.body, plain)
+		}
+	})
+
+	t.Run("snappy_allowed_on_remote_write", func(t *testing.T) {
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/api/v1/write",
+			bytes.NewReader([]byte(remoteWriteBody(t, "evil"))),
+		)
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		req.Header.Set("Content-Encoding", "snappy")
+		req.Header.Set("Authorization", "Bearer lou_valid")
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status=%d want=204 body=%s", resp.StatusCode, readBody(resp))
+		}
+		got := <-received
+		if got.encoding != "snappy" {
+			t.Fatalf("remote-write encoding=%q want=snappy", got.encoding)
+		}
+	})
 }
