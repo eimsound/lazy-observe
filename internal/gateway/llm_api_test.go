@@ -177,6 +177,7 @@ func TestLLMSummaryUsesStatsPushdownAndTracksUnpricedCalls(t *testing.T) {
 		_, _ = io.WriteString(w, strings.Join([]string{
 			`{"resource_attr:service.name":"chat-api","service.name":"","span_attr:gen_ai.response.model":"claude-sonnet-4-20250514","span_attr:gen_ai.request.model":"claude-sonnet-4","span_attr:gen_ai.provider.name":"anthropic","span_attr:gen_ai.system":"anthropic","span_attr:gen_ai.usage.missing":"","calls":"2","input_tokens":"200","output_tokens":"400","cache_read_tokens":"40000","cache_creation_tokens":"10000","reasoning_tokens":"0"}`,
 			`{"resource_attr:service.name":"chat-api","service.name":"","span_attr:gen_ai.response.model":"deepseek-chat","span_attr:gen_ai.request.model":"","span_attr:gen_ai.provider.name":"openai","span_attr:gen_ai.system":"openai","span_attr:gen_ai.usage.missing":"","calls":"3","input_tokens":"1.5e+03","output_tokens":"500.0","cache_read_tokens":"NaN","cache_creation_tokens":"0","reasoning_tokens":"0"}`,
+			`{"resource_attr:service.name":"stream-api","service.name":"","span_attr:gen_ai.response.model":"gpt-4o","span_attr:gen_ai.request.model":"gpt-4o","span_attr:gen_ai.provider.name":"openai","span_attr:gen_ai.system":"openai","span_attr:gen_ai.usage.missing":"true","calls":"1","input_tokens":"0","output_tokens":"0","cache_read_tokens":"0","cache_creation_tokens":"0","reasoning_tokens":"0"}`,
 		}, "\n")+"\n")
 	}))
 	defer upstream.Close()
@@ -216,18 +217,42 @@ func TestLLMSummaryUsesStatsPushdownAndTracksUnpricedCalls(t *testing.T) {
 		TotalCost         float64             `json:"total_cost"`
 		Unpriced          bool                `json:"unpriced"`
 		UnpricedCalls     int64               `json:"unpriced_calls"`
+		UnpricedBreakdown []llmUnpricedDetail `json:"unpriced_breakdown"`
 		ByModel           []llmModelAggregate `json:"by_model"`
 	}
 	if err := json.Unmarshal(body, &summary); err != nil {
 		t.Fatal(err)
 	}
-	if summary.TotalCalls != 5 || summary.TotalInputTokens != 1700 || summary.TotalOutputTokens != 900 ||
-		!summary.Unpriced || summary.UnpricedCalls != 3 {
+	if summary.TotalCalls != 6 || summary.TotalInputTokens != 1700 || summary.TotalOutputTokens != 900 ||
+		!summary.Unpriced || summary.UnpricedCalls != 4 {
 		t.Fatalf("summary=%#v", summary)
 	}
 	// Anthropic cached cost: 200*0.003/1k + 10000*0.00375/1k + 40000*0.0003/1k + 400*0.015/1k = 0.0561
 	if math.Abs(summary.TotalCost-0.0561) > 1e-12 {
 		t.Fatalf("summary cost=%v want=0.0561", summary.TotalCost)
+	}
+	if len(summary.UnpricedBreakdown) != 2 {
+		t.Fatalf("unpriced_breakdown=%#v want 2 entries", summary.UnpricedBreakdown)
+	}
+	if summary.UnpricedBreakdown[0] != (llmUnpricedDetail{
+		Model:        "deepseek-chat",
+		Provider:     "openai",
+		Reason:       "unknown_model",
+		Calls:        3,
+		InputTokens:  1500,
+		OutputTokens: 500,
+	}) {
+		t.Fatalf("unpriced_breakdown[0]=%#v", summary.UnpricedBreakdown[0])
+	}
+	if summary.UnpricedBreakdown[1] != (llmUnpricedDetail{
+		Model:        "gpt-4o",
+		Provider:     "openai",
+		Reason:       "usage_missing",
+		Calls:        1,
+		InputTokens:  0,
+		OutputTokens: 0,
+	}) {
+		t.Fatalf("unpriced_breakdown[1]=%#v", summary.UnpricedBreakdown[1])
 	}
 }
 
@@ -327,7 +352,7 @@ func TestLLMRangeAndLimitProtection(t *testing.T) {
 	}
 }
 
-func TestIsolatedQueryFailClosedOnInvalidProjectID(t *testing.T) {
+func TestStreamLLMTracesQueryFailClosedOnInvalidProjectID(t *testing.T) {
 	called := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		called = true
@@ -336,65 +361,17 @@ func TestIsolatedQueryFailClosedOnInvalidProjectID(t *testing.T) {
 	defer upstream.Close()
 
 	g := newTestGateway(Config{Traces: upstream.URL, Logs: upstream.URL})
-	for _, signal := range []string{"logs", "traces"} {
-		for _, id := range []int{0, -1} {
-			_, err := g.isolatedQuery(
-				context.Background(),
-				meta.ProjectInfo{ID: id, Slug: "alpha"},
-				signal,
-				"/select/logsql/query",
-				url.Values{"query": {"*"}},
-			)
-			if err == nil {
-				t.Fatalf("isolatedQuery(%s, id=%d) succeeded; want fail-closed error", signal, id)
-			}
+	for _, id := range []int{0, -1} {
+		if err := g.streamLLMTracesQuery(
+			context.Background(),
+			meta.ProjectInfo{ID: id, Slug: "alpha"},
+			url.Values{"query": {"*"}},
+			func(map[string]json.RawMessage) error { return nil },
+		); err == nil {
+			t.Fatalf("streamLLMTracesQuery(id=%d) succeeded; want fail-closed error", id)
 		}
-	}
-	if err := g.streamLLMTracesQuery(
-		context.Background(),
-		meta.ProjectInfo{ID: 0, Slug: "alpha"},
-		url.Values{"query": {"*"}},
-		func(map[string]json.RawMessage) error { return nil },
-	); err == nil {
-		t.Fatal("streamLLMTracesQuery(id=0) succeeded; want fail-closed error")
 	}
 	if called {
 		t.Fatal("upstream must not be contacted when project.ID <= 0")
-	}
-}
-
-func TestIsolatedQueryDisablesTracesLatencyOffsetOnlyForLogsQL(t *testing.T) {
-	var got []url.Values
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = append(got, r.URL.Query())
-		_, _ = w.Write([]byte("{}\n"))
-	}))
-	defer upstream.Close()
-	g := newTestGateway(Config{Traces: upstream.URL, Logs: upstream.URL})
-	project := meta.ProjectInfo{ID: 42, Slug: "alpha"}
-	input := url.Values{"query": {"*"}}
-	for _, call := range []struct{ signal, path string }{
-		{"traces", "/select/logsql/query"},
-		{"traces", "/select/jaeger/api/traces/abc"},
-		{"logs", "/select/logsql/query"},
-	} {
-		if _, err := g.isolatedQuery(context.Background(), project, call.signal, call.path, input); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(got) != 3 {
-		t.Fatalf("requests=%v", got)
-	}
-	if got[0].Get("disable_latency_offset") != "true" || got[0].Get("query") != "*" {
-		t.Fatalf("traces LogsQL query=%v", got[0])
-	}
-	if got[1].Has("disable_latency_offset") {
-		t.Fatalf("Jaeger has no per-request offset switch: %v", got[1])
-	}
-	if got[2].Has("disable_latency_offset") {
-		t.Fatalf("VictoriaLogs query must not carry the traces-only argument: %v", got[2])
-	}
-	if input.Has("disable_latency_offset") {
-		t.Fatalf("caller query was mutated: %v", input)
 	}
 }

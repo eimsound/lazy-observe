@@ -26,6 +26,23 @@ LLM_CONTENT_LIMIT = 4 * 1024
 LLM_BODY_INSPECTION_LIMIT = 1 << 20
 _MAX_RETAINED_COMPLETION_BYTES = LLM_CONTENT_LIMIT + 4
 
+# Canonical GenAI span attribute keys shared across Go, Node, and Python SDKs.
+GEN_AI_ATTRS: t.Dict[str, str] = {
+    "operation_name": "gen_ai.operation.name",
+    "provider_name": "gen_ai.provider.name",
+    "system": "gen_ai.system",
+    "request_model": "gen_ai.request.model",
+    "response_model": "gen_ai.response.model",
+    "usage_input_tokens": "gen_ai.usage.input_tokens",
+    "usage_output_tokens": "gen_ai.usage.output_tokens",
+    "usage_cache_read_input_tokens": "gen_ai.usage.cache_read.input_tokens",
+    "usage_cache_creation_input_tokens": "gen_ai.usage.cache_creation.input_tokens",
+    "usage_reasoning_tokens": "gen_ai.usage.reasoning_tokens",
+    "usage_missing": "gen_ai.usage.missing",
+    "prompt": "gen_ai.prompt",
+    "completion": "gen_ai.completion",
+}
+
 _OPENAI_ANY = ("/chat/completions",)
 _ANTHROPIC_ANY = ("/v1/messages",)
 _OLLAMA_ANY = ("/api/chat",)
@@ -150,17 +167,17 @@ def _usage_attrs(system: str, payload: dict) -> t.Dict[str, t.Union[int, bool]]:
                 reasoning_tokens = _int_token(completion_details.get("reasoning_tokens"))
 
     if input_tokens is not None:
-        attrs["gen_ai.usage.input_tokens"] = input_tokens
+        attrs[GEN_AI_ATTRS["usage_input_tokens"]] = input_tokens
     if output_tokens is not None:
-        attrs["gen_ai.usage.output_tokens"] = output_tokens
+        attrs[GEN_AI_ATTRS["usage_output_tokens"]] = output_tokens
     if cache_read_tokens is not None:
-        attrs["gen_ai.usage.cache_read.input_tokens"] = cache_read_tokens
+        attrs[GEN_AI_ATTRS["usage_cache_read_input_tokens"]] = cache_read_tokens
     if cache_creation_tokens is not None:
-        attrs["gen_ai.usage.cache_creation.input_tokens"] = cache_creation_tokens
+        attrs[GEN_AI_ATTRS["usage_cache_creation_input_tokens"]] = cache_creation_tokens
     if reasoning_tokens is not None:
-        attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+        attrs[GEN_AI_ATTRS["usage_reasoning_tokens"]] = reasoning_tokens
     if input_tokens is None or output_tokens is None:
-        attrs["gen_ai.usage.missing"] = True
+        attrs[GEN_AI_ATTRS["usage_missing"]] = True
     return attrs
 
 
@@ -280,16 +297,16 @@ class _LLMStreamAccumulator:
             self._model = model
 
         usage_attrs = _usage_attrs(self._system, data)
-        if "gen_ai.usage.input_tokens" in usage_attrs:
-            self._input_tokens = int(usage_attrs["gen_ai.usage.input_tokens"])
-        if "gen_ai.usage.output_tokens" in usage_attrs:
-            self._output_tokens = int(usage_attrs["gen_ai.usage.output_tokens"])
-        if "gen_ai.usage.cache_read.input_tokens" in usage_attrs:
-            self._cache_read_tokens = int(usage_attrs["gen_ai.usage.cache_read.input_tokens"])
-        if "gen_ai.usage.cache_creation.input_tokens" in usage_attrs:
-            self._cache_creation_tokens = int(usage_attrs["gen_ai.usage.cache_creation.input_tokens"])
-        if "gen_ai.usage.reasoning_tokens" in usage_attrs:
-            self._reasoning_tokens = int(usage_attrs["gen_ai.usage.reasoning_tokens"])
+        if GEN_AI_ATTRS["usage_input_tokens"] in usage_attrs:
+            self._input_tokens = int(usage_attrs[GEN_AI_ATTRS["usage_input_tokens"]])
+        if GEN_AI_ATTRS["usage_output_tokens"] in usage_attrs:
+            self._output_tokens = int(usage_attrs[GEN_AI_ATTRS["usage_output_tokens"]])
+        if GEN_AI_ATTRS["usage_cache_read_input_tokens"] in usage_attrs:
+            self._cache_read_tokens = int(usage_attrs[GEN_AI_ATTRS["usage_cache_read_input_tokens"]])
+        if GEN_AI_ATTRS["usage_cache_creation_input_tokens"] in usage_attrs:
+            self._cache_creation_tokens = int(usage_attrs[GEN_AI_ATTRS["usage_cache_creation_input_tokens"]])
+        if GEN_AI_ATTRS["usage_reasoning_tokens"] in usage_attrs:
+            self._reasoning_tokens = int(usage_attrs[GEN_AI_ATTRS["usage_reasoning_tokens"]])
 
         if self._capture_content:
             self._append_completion(_completion_text(self._system, data))
@@ -337,21 +354,21 @@ class _LLMStreamAccumulator:
                 self._span.record_exception(error)
             self._span.set_status(otel_trace.StatusCode.ERROR, str(error))
         if model:
-            self._span.set_attribute("gen_ai.response.model", model)
+            self._span.set_attribute(GEN_AI_ATTRS["response_model"], model)
         if input_tokens is not None:
-            self._span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+            self._span.set_attribute(GEN_AI_ATTRS["usage_input_tokens"], input_tokens)
         if output_tokens is not None:
-            self._span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+            self._span.set_attribute(GEN_AI_ATTRS["usage_output_tokens"], output_tokens)
         if cache_read is not None:
-            self._span.set_attribute("gen_ai.usage.cache_read.input_tokens", cache_read)
+            self._span.set_attribute(GEN_AI_ATTRS["usage_cache_read_input_tokens"], cache_read)
         if cache_creation is not None:
-            self._span.set_attribute("gen_ai.usage.cache_creation.input_tokens", cache_creation)
+            self._span.set_attribute(GEN_AI_ATTRS["usage_cache_creation_input_tokens"], cache_creation)
         if reasoning is not None:
-            self._span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning)
+            self._span.set_attribute(GEN_AI_ATTRS["usage_reasoning_tokens"], reasoning)
         if input_tokens is None or output_tokens is None:
-            self._span.set_attribute("gen_ai.usage.missing", True)
+            self._span.set_attribute(GEN_AI_ATTRS["usage_missing"], True)
         if completion:
-            self._span.set_attribute("gen_ai.completion", completion)
+            self._span.set_attribute(GEN_AI_ATTRS["completion"], completion)
         self._span.end()
 
 
@@ -403,16 +420,16 @@ class _AsyncLLMByteStream(httpx.AsyncByteStream):
 
 def _build_span_attributes(system: str, payload: dict, request_model: str, capture_content: bool) -> t.Dict[str, t.Any]:
     attrs: t.Dict[str, t.Any] = {
-        "gen_ai.operation.name": "chat",
-        "gen_ai.provider.name": system,
-        "gen_ai.system": system,
+        GEN_AI_ATTRS["operation_name"]: "chat",
+        GEN_AI_ATTRS["provider_name"]: system,
+        GEN_AI_ATTRS["system"]: system,
     }
     if request_model:
-        attrs["gen_ai.request.model"] = request_model
+        attrs[GEN_AI_ATTRS["request_model"]] = request_model
     if capture_content:
         prompt = _prompt_text(payload)
         if prompt:
-            attrs["gen_ai.prompt"] = prompt
+            attrs[GEN_AI_ATTRS["prompt"]] = prompt
     return attrs
 
 
@@ -561,19 +578,19 @@ def apply_llm_response_attributes(span, system: str, body: bytes, capture_conten
     try:
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError):
-        span.set_attribute("gen_ai.usage.missing", True)
+        span.set_attribute(GEN_AI_ATTRS["usage_missing"], True)
         return
     if not isinstance(data, dict):
-        span.set_attribute("gen_ai.usage.missing", True)
+        span.set_attribute(GEN_AI_ATTRS["usage_missing"], True)
         return
     if response_model := _response_model(system, data):
-        span.set_attribute("gen_ai.response.model", response_model)
+        span.set_attribute(GEN_AI_ATTRS["response_model"], response_model)
     for key, value in _usage_attrs(system, data).items():
         span.set_attribute(key, value)
     if capture_content:
         completion = _completion_text(system, data)
         if completion:
-            span.set_attribute("gen_ai.completion", completion)
+            span.set_attribute(GEN_AI_ATTRS["completion"], completion)
 
 
 def build_llm_transport(client: t.Any, base: t.Any = None, client_kind: str = "sync"):

@@ -2,6 +2,24 @@ import { context, SpanKind, SpanStatusCode, trace, type Context, type Span, type
 
 const CONTENT_LIMIT = 4 * 1024;
 const BODY_INSPECTION_LIMIT = 1 << 20;
+
+/** Canonical GenAI span attribute keys shared across Go, Node, and Python SDKs. */
+export const GEN_AI_ATTRS = {
+  operation_name: "gen_ai.operation.name",
+  provider_name: "gen_ai.provider.name",
+  system: "gen_ai.system",
+  request_model: "gen_ai.request.model",
+  response_model: "gen_ai.response.model",
+  usage_input_tokens: "gen_ai.usage.input_tokens",
+  usage_output_tokens: "gen_ai.usage.output_tokens",
+  usage_cache_read_input_tokens: "gen_ai.usage.cache_read.input_tokens",
+  usage_cache_creation_input_tokens: "gen_ai.usage.cache_creation.input_tokens",
+  usage_reasoning_tokens: "gen_ai.usage.reasoning_tokens",
+  usage_missing: "gen_ai.usage.missing",
+  prompt: "gen_ai.prompt",
+  completion: "gen_ai.completion",
+} as const;
+
 type LLMSystem = "openai" | "anthropic" | "ollama";
 
 interface LLMRequest { model?: string; prompt?: string; stream: boolean }
@@ -33,12 +51,12 @@ export function createWrappedLLMFetch(tracer: Tracer, captureContent: boolean, b
     const body = await requestBody(input, init);
     const request = parseLLMRequest(system, body, captureContent);
     const attributes: Record<string, string> = {
-      "gen_ai.operation.name": "chat",
-      "gen_ai.provider.name": system,
+      [GEN_AI_ATTRS.operation_name]: "chat",
+      [GEN_AI_ATTRS.provider_name]: system,
       // Retained for compatibility with older OpenTelemetry GenAI consumers.
-      "gen_ai.system": system,
-      ...(request.model ? { "gen_ai.request.model": request.model } : {}),
-      ...(captureContent && request.prompt ? { "gen_ai.prompt": truncateContent(request.prompt) } : {}),
+      [GEN_AI_ATTRS.system]: system,
+      ...(request.model ? { [GEN_AI_ATTRS.request_model]: request.model } : {}),
+      ...(captureContent && request.prompt ? { [GEN_AI_ATTRS.prompt]: truncateContent(request.prompt) } : {}),
     };
     const parent = contexts.active();
     const span = tracer.startSpan(`chat ${system}`, { kind: SpanKind.CLIENT, attributes }, parent);
@@ -60,7 +78,7 @@ export function createWrappedLLMFetch(tracer: Tracer, captureContent: boolean, b
     try {
       const inspected = await readBoundedResponseText(response);
       if (inspected === undefined) {
-        span.setAttributes({ "gen_ai.usage.missing": true });
+        span.setAttributes({ [GEN_AI_ATTRS.usage_missing]: true });
       } else {
         applyLLMResponse(span, parseLLMResponse(system, inspected, captureContent), captureContent);
       }
@@ -195,14 +213,14 @@ function parseLLMResponseObject(system: LLMSystem, raw: Record<string, unknown>,
 
 function applyLLMResponse(span: Span, response: LLMResponse, captureContent: boolean): void {
   span.setAttributes({
-    ...(response.model ? { "gen_ai.response.model": response.model } : {}),
-    ...(response.inputTokens !== undefined ? { "gen_ai.usage.input_tokens": response.inputTokens } : {}),
-    ...(response.outputTokens !== undefined ? { "gen_ai.usage.output_tokens": response.outputTokens } : {}),
-    ...(response.cacheReadTokens !== undefined ? { "gen_ai.usage.cache_read.input_tokens": response.cacheReadTokens } : {}),
-    ...(response.cacheCreationTokens !== undefined ? { "gen_ai.usage.cache_creation.input_tokens": response.cacheCreationTokens } : {}),
-    ...(response.reasoningTokens !== undefined ? { "gen_ai.usage.reasoning_tokens": response.reasoningTokens } : {}),
-    ...(response.inputTokens === undefined || response.outputTokens === undefined ? { "gen_ai.usage.missing": true } : {}),
-    ...(captureContent && response.completion ? { "gen_ai.completion": truncateContent(response.completion) } : {}),
+    ...(response.model ? { [GEN_AI_ATTRS.response_model]: response.model } : {}),
+    ...(response.inputTokens !== undefined ? { [GEN_AI_ATTRS.usage_input_tokens]: response.inputTokens } : {}),
+    ...(response.outputTokens !== undefined ? { [GEN_AI_ATTRS.usage_output_tokens]: response.outputTokens } : {}),
+    ...(response.cacheReadTokens !== undefined ? { [GEN_AI_ATTRS.usage_cache_read_input_tokens]: response.cacheReadTokens } : {}),
+    ...(response.cacheCreationTokens !== undefined ? { [GEN_AI_ATTRS.usage_cache_creation_input_tokens]: response.cacheCreationTokens } : {}),
+    ...(response.reasoningTokens !== undefined ? { [GEN_AI_ATTRS.usage_reasoning_tokens]: response.reasoningTokens } : {}),
+    ...(response.inputTokens === undefined || response.outputTokens === undefined ? { [GEN_AI_ATTRS.usage_missing]: true } : {}),
+    ...(captureContent && response.completion ? { [GEN_AI_ATTRS.completion]: truncateContent(response.completion) } : {}),
   });
 }
 

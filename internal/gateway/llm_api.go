@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -105,6 +104,21 @@ type llmServiceAggregate struct {
 	llmAggregate
 }
 
+type llmUnpricedDetail struct {
+	Model        string `json:"model"`
+	Provider     string `json:"provider"`
+	Reason       string `json:"reason"`
+	Calls        int64  `json:"calls"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+}
+
+type llmUnpricedKey struct {
+	model    string
+	provider string
+	reason   string
+}
+
 func (g *Gateway) llmSummary(c fiber.Ctx) error {
 	start, end, ok := g.llmRange(c)
 	if !ok {
@@ -125,6 +139,7 @@ func (g *Gateway) llmSummary(c fiber.Ctx) error {
 
 	models := make(map[string]*llmAggregate)
 	services := make(map[string]*llmAggregate)
+	unpricedDetails := make(map[llmUnpricedKey]*llmUnpricedDetail)
 	var total llmAggregate
 	groupCount := 0
 	truncated := false
@@ -154,10 +169,11 @@ func (g *Gateway) llmSummary(c fiber.Ctx) error {
 		cacheReadTokens := rawNonNegativeInt64(row, "cache_read_tokens")
 		cacheCreationTokens := rawNonNegativeInt64(row, "cache_creation_tokens")
 		reasoningTokens := rawNonNegativeInt64(row, "reasoning_tokens")
-		cost, unpriced := computeLLMCost(
+		cost, unpriced, unpricedReason := computeLLMCost(
 			g.llmPricing,
 			model,
 			provider,
+			end,
 			usageMissing,
 			inputTokens,
 			outputTokens,
@@ -174,6 +190,29 @@ func (g *Gateway) llmSummary(c fiber.Ctx) error {
 			services[service] = &llmAggregate{}
 		}
 		addLLMAggregateDelta(services[service], calls, inputTokens, outputTokens, cost, unpriced)
+		if unpriced {
+			normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
+			if normalizedProvider == "" {
+				normalizedProvider = "unknown"
+			}
+			key := llmUnpricedKey{
+				model:    model,
+				provider: normalizedProvider,
+				reason:   unpricedReason,
+			}
+			detail := unpricedDetails[key]
+			if detail == nil {
+				detail = &llmUnpricedDetail{
+					Model:    model,
+					Provider: normalizedProvider,
+					Reason:   unpricedReason,
+				}
+				unpricedDetails[key] = detail
+			}
+			detail.Calls = saturatingAddInt64(detail.Calls, calls)
+			detail.InputTokens = saturatingAddInt64(detail.InputTokens, inputTokens)
+			detail.OutputTokens = saturatingAddInt64(detail.OutputTokens, outputTokens)
+		}
 		return nil
 	})
 	if err != nil {
@@ -196,6 +235,22 @@ func (g *Gateway) llmSummary(c fiber.Ctx) error {
 		return byService[i].Calls > byService[j].Calls ||
 			(byService[i].Calls == byService[j].Calls && byService[i].Service < byService[j].Service)
 	})
+	unpricedBreakdown := make([]llmUnpricedDetail, 0, len(unpricedDetails))
+	for _, detail := range unpricedDetails {
+		unpricedBreakdown = append(unpricedBreakdown, *detail)
+	}
+	sort.Slice(unpricedBreakdown, func(i, j int) bool {
+		if unpricedBreakdown[i].Calls != unpricedBreakdown[j].Calls {
+			return unpricedBreakdown[i].Calls > unpricedBreakdown[j].Calls
+		}
+		if unpricedBreakdown[i].Model != unpricedBreakdown[j].Model {
+			return unpricedBreakdown[i].Model < unpricedBreakdown[j].Model
+		}
+		if unpricedBreakdown[i].Provider != unpricedBreakdown[j].Provider {
+			return unpricedBreakdown[i].Provider < unpricedBreakdown[j].Provider
+		}
+		return unpricedBreakdown[i].Reason < unpricedBreakdown[j].Reason
+	})
 	return c.JSON(fiber.Map{
 		"total_calls":         total.Calls,
 		"total_input_tokens":  total.InputTokens,
@@ -203,6 +258,7 @@ func (g *Gateway) llmSummary(c fiber.Ctx) error {
 		"total_cost":          total.Cost,
 		"unpriced":            total.Unpriced,
 		"unpriced_calls":      total.UnpricedCalls,
+		"unpriced_breakdown":  unpricedBreakdown,
 		"by_model":            byModel,
 		"by_service":          byService,
 		"truncated":           truncated,
@@ -336,10 +392,11 @@ func (g *Gateway) llmTimeseries(c fiber.Ctx) error {
 			cacheReadTokens := rawNonNegativeInt64(row, "cache_read_tokens")
 			cacheCreationTokens := rawNonNegativeInt64(row, "cache_creation_tokens")
 			reasoningTokens := rawNonNegativeInt64(row, "reasoning_tokens")
-			cost, _ := computeLLMCost(
+			cost, _, _ := computeLLMCost(
 				g.llmPricing,
 				model,
 				provider,
+				bucketTime,
 				usageMissing,
 				inputTokens,
 				outputTokens,
@@ -505,82 +562,14 @@ func parseBoundedInt(raw string, fallback, low, high int) (int, error) {
 	return value, nil
 }
 
-type boundedStreamReader struct {
-	reader    io.Reader
-	remaining int64
-	exceeded  bool
-}
-
-func (r *boundedStreamReader) Read(p []byte) (int, error) {
-	if r.exceeded {
-		return 0, errors.New("LLM query response exceeded size limit")
-	}
-	if int64(len(p)) > r.remaining+1 {
-		p = p[:r.remaining+1]
-	}
-	n, err := r.reader.Read(p)
-	if int64(n) > r.remaining {
-		r.remaining = 0
-		r.exceeded = true
-		return 0, errors.New("LLM query response exceeded size limit")
-	}
-	r.remaining -= int64(n)
-	return n, err
-}
-
 func (g *Gateway) streamLLMTracesQuery(
 	ctx context.Context,
 	project meta.ProjectInfo,
 	query url.Values,
 	onRow func(map[string]json.RawMessage) error,
 ) error {
-	if project.ID <= 0 {
-		return errors.New("invalid project ID for tenant isolation")
-	}
-	params := cloneQueryValues(query)
-	const path = "/select/logsql/query"
-	disableTracesLatencyOffset(path, params)
-	target := strings.TrimRight(g.storage.TracesQueryBase(), "/") + path
-	if encoded := params.Encode(); encoded != "" {
-		target += "?" + encoded
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return err
-	}
-	g.storage.SetTenantHeaders(req.Header, project.ID)
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf(
-			"query backend returned HTTP %d: %s",
-			resp.StatusCode,
-			firstRunes(strings.TrimSpace(string(snippet)), 500),
-		)
-	}
-	limited := &boundedStreamReader{reader: resp.Body, remaining: llmMaxResponseBody}
-	return decodeNDJSONStream(limited, onRow)
-}
-
-func decodeNDJSONStream(r io.Reader, onRow func(map[string]json.RawMessage) error) error {
-	decoder := json.NewDecoder(r)
-	for {
-		var row map[string]json.RawMessage
-		err := decoder.Decode(&row)
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("decode VictoriaTraces span: %w", err)
-		}
-		if err := onRow(row); err != nil {
-			return err
-		}
-	}
+	return newLLMTracesQuerier(g.storage, g.client, llmMaxResponseBody, g.proxyTimeout).
+		StreamLogsQL(ctx, project, query, onRow)
 }
 
 func extractLLMCalls(body []byte, pricing llmPricingLookup) ([]llmCall, error) {
@@ -618,10 +607,11 @@ func extractLLMCallRow(row map[string]json.RawMessage, pricing llmPricingLookup)
 	cacheCreationTokens := rawNonNegativeInt64(row, "span_attr:gen_ai.usage.cache_creation.input_tokens")
 	reasoningTokens := rawNonNegativeInt64(row, "span_attr:gen_ai.usage.reasoning_tokens")
 	usageMissing := rawBool(row, "span_attr:gen_ai.usage.missing")
-	cost, unpriced := computeLLMCost(
+	cost, unpriced, _ := computeLLMCost(
 		pricing,
 		model,
 		provider,
+		callTime,
 		usageMissing,
 		inputTokens,
 		outputTokens,
@@ -653,27 +643,29 @@ func extractLLMCallRow(row map[string]json.RawMessage, pricing llmPricingLookup)
 func computeLLMCost(
 	pricing llmPricingLookup,
 	model, provider string,
+	at time.Time,
 	usageMissing bool,
 	inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, reasoningTokens int64,
-) (float64, bool) {
+) (float64, bool, string) {
 	if usageMissing {
-		return 0, true
+		return 0, true, "usage_missing"
 	}
 	if pricing == nil {
-		return 0, true
+		return 0, true, "unknown_model"
 	}
 	cost, unpriced := pricing.CostWithUsage(model, llmcost.Usage{
 		Provider:            provider,
+		Timestamp:           at,
 		InputTokens:         inputTokens,
 		OutputTokens:        outputTokens,
 		CacheReadTokens:     cacheReadTokens,
 		CacheCreationTokens: cacheCreationTokens,
 		ReasoningTokens:     reasoningTokens,
 	})
-	if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
-		return 0, true
+	if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 || unpriced {
+		return 0, true, "unknown_model"
 	}
-	return cost, unpriced
+	return cost, false, ""
 }
 
 func parseRowTime(row map[string]json.RawMessage, preferStartNano bool) (time.Time, bool) {

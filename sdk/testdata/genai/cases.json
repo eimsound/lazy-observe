@@ -1,0 +1,793 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "openai_non_streaming_basic",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4.1-mini",
+          "messages": [
+            { "role": "user", "content": "secret prompt" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"gpt-4.1-mini-2025-04-14\",\"choices\":[{\"message\":{\"content\":\"hello world\"}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4.1-mini",
+          "gen_ai.response.model": "gpt-4.1-mini-2025-04-14",
+          "gen_ai.usage.input_tokens": 11,
+          "gen_ai.usage.output_tokens": 7
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing",
+          "gen_ai.prompt",
+          "gen_ai.completion"
+        ]
+      }
+    },
+    {
+      "name": "anthropic_non_streaming_basic",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/messages",
+        "body": {
+          "model": "claude-sonnet-4",
+          "messages": [
+            { "role": "user", "content": "secret prompt" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"hello claude\"}],\"usage\":{\"input_tokens\":13,\"output_tokens\":9}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat anthropic",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "anthropic",
+          "gen_ai.system": "anthropic",
+          "gen_ai.request.model": "claude-sonnet-4",
+          "gen_ai.response.model": "claude-sonnet-4-20250514",
+          "gen_ai.usage.input_tokens": 13,
+          "gen_ai.usage.output_tokens": 9
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing",
+          "gen_ai.prompt",
+          "gen_ai.completion"
+        ]
+      }
+    },
+    {
+      "name": "ollama_non_streaming_basic",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/api/chat",
+        "body": {
+          "model": "llama3.2",
+          "messages": [
+            { "role": "user", "content": "secret prompt" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"llama3.2\",\"message\":{\"role\":\"assistant\",\"content\":\"hello ollama\"},\"prompt_eval_count\":17,\"eval_count\":5}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat ollama",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "ollama",
+          "gen_ai.system": "ollama",
+          "gen_ai.request.model": "llama3.2",
+          "gen_ai.response.model": "llama3.2",
+          "gen_ai.usage.input_tokens": 17,
+          "gen_ai.usage.output_tokens": 5
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing",
+          "gen_ai.prompt",
+          "gen_ai.completion"
+        ]
+      }
+    },
+    {
+      "name": "openai_non_streaming_cache_and_reasoning",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "o3-mini",
+          "messages": [
+            { "role": "user", "content": "reason carefully" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"o3-mini-2025-01-31\",\"choices\":[{\"message\":{\"content\":\"done\"}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":300,\"prompt_tokens_details\":{\"cached_tokens\":600},\"completion_tokens_details\":{\"reasoning_tokens\":200}}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "o3-mini",
+          "gen_ai.response.model": "o3-mini-2025-01-31",
+          "gen_ai.usage.input_tokens": 1000,
+          "gen_ai.usage.output_tokens": 300,
+          "gen_ai.usage.cache_read.input_tokens": 600,
+          "gen_ai.usage.reasoning_tokens": 200
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ]
+      }
+    },
+    {
+      "name": "anthropic_non_streaming_prompt_cache",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/v1/messages",
+        "body": {
+          "model": "claude-sonnet-4",
+          "messages": [
+            { "role": "user", "content": "summarize cache" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"cached answer\"}],\"usage\":{\"input_tokens\":100,\"output_tokens\":200,\"cache_creation_input_tokens\":5000,\"cache_read_input_tokens\":20000}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat anthropic",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "anthropic",
+          "gen_ai.system": "anthropic",
+          "gen_ai.request.model": "claude-sonnet-4",
+          "gen_ai.response.model": "claude-sonnet-4-20250514",
+          "gen_ai.usage.input_tokens": 100,
+          "gen_ai.usage.output_tokens": 200,
+          "gen_ai.usage.cache_creation.input_tokens": 5000,
+          "gen_ai.usage.cache_read.input_tokens": 20000
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ],
+        "prompt_present": true,
+        "prompt_contains": "summarize cache",
+        "completion_exact": "cached answer"
+      }
+    },
+    {
+      "name": "openai_streaming_sse_with_cache_and_reasoning",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "stream": true,
+          "messages": [
+            { "role": "user", "content": "stream please" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "chunks": [
+          "data: {\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+          "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":60},\"completion_tokens_details\":{\"reasoning_tokens\":10}}}\n\n",
+          "data: [DONE]\n\n"
+        ],
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": false,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.response.model": "gpt-4o-2024-11-20",
+          "gen_ai.usage.input_tokens": 100,
+          "gen_ai.usage.output_tokens": 20,
+          "gen_ai.usage.cache_read.input_tokens": 60,
+          "gen_ai.usage.reasoning_tokens": 10
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ],
+        "prompt_present": true,
+        "prompt_contains": "stream please",
+        "completion_exact": "hello"
+      }
+    },
+    {
+      "name": "anthropic_streaming_sse_with_cache",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/v1/messages",
+        "body": {
+          "model": "claude-sonnet-4",
+          "stream": true,
+          "messages": [
+            { "role": "user", "content": "anthropic stream" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "chunks": [
+          "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":5000,\"cache_read_input_tokens\":20000}}}\n\n",
+          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"cached \"}}\n\n",
+          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"stream\"}}\n\n",
+          "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n"
+        ],
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat anthropic",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": false,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "anthropic",
+          "gen_ai.system": "anthropic",
+          "gen_ai.request.model": "claude-sonnet-4",
+          "gen_ai.response.model": "claude-sonnet-4-20250514",
+          "gen_ai.usage.input_tokens": 100,
+          "gen_ai.usage.output_tokens": 42,
+          "gen_ai.usage.cache_creation.input_tokens": 5000,
+          "gen_ai.usage.cache_read.input_tokens": 20000
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ],
+        "prompt_present": true,
+        "prompt_contains": "anthropic stream",
+        "completion_exact": "cached stream"
+      }
+    },
+    {
+      "name": "ollama_streaming_ndjson",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/api/chat",
+        "body": {
+          "model": "llama3.2",
+          "stream": true,
+          "messages": [
+            { "role": "user", "content": "ndjson hi" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/x-ndjson",
+        "chunks": [
+          "{\"model\":\"llama3.2\",\"message\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"done\":false}\n",
+          "{\"model\":\"llama3.2\",\"message\":{\"role\":\"assistant\",\"content\":\"lo!\"},\"done\":false}\n",
+          "{\"model\":\"llama3.2\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"prompt_eval_count\":17,\"eval_count\":5}\n"
+        ],
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat ollama",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": false,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "ollama",
+          "gen_ai.system": "ollama",
+          "gen_ai.request.model": "llama3.2",
+          "gen_ai.response.model": "llama3.2",
+          "gen_ai.usage.input_tokens": 17,
+          "gen_ai.usage.output_tokens": 5
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ],
+        "prompt_present": true,
+        "prompt_contains": "ndjson hi",
+        "completion_exact": "Hello!"
+      }
+    },
+    {
+      "name": "openai_streaming_sse_missing_usage",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "stream": true,
+          "messages": [
+            { "role": "user", "content": "no usage chunk" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "chunks": [
+          "data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+          "data: [DONE]\n\n"
+        ],
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": false,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.response.model": "gpt-4o",
+          "gen_ai.usage.missing": true
+        },
+        "absent_attributes": [
+          "gen_ai.usage.input_tokens",
+          "gen_ai.usage.output_tokens"
+        ],
+        "prompt_present": true,
+        "completion_exact": "hi"
+      }
+    },
+    {
+      "name": "openai_http_400_non_streaming_error",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "messages": [
+            { "role": "user", "content": "bad request" }
+          ]
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body": "{\"error\":{\"message\":\"invalid model parameter\"}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "ERROR",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.usage.missing": true
+        },
+        "absent_attributes": [
+          "gen_ai.usage.input_tokens",
+          "gen_ai.usage.output_tokens"
+        ]
+      }
+    },
+    {
+      "name": "openai_http_429_streaming_error_no_leak",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "stream": true,
+          "messages": [
+            { "role": "user", "content": "rate limited" }
+          ]
+        }
+      },
+      "response": {
+        "status": 429,
+        "content_type": "application/json",
+        "body": "{\"error\":{\"message\":\"rate limited\"}}",
+        "consume_body": false
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "ERROR",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.usage.missing": true
+        },
+        "absent_attributes": [
+          "gen_ai.usage.input_tokens",
+          "gen_ai.usage.output_tokens"
+        ]
+      }
+    },
+    {
+      "name": "anthropic_http_500_streaming_sse_error_no_leak",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/messages",
+        "body": {
+          "model": "claude-sonnet-4",
+          "stream": true,
+          "messages": [
+            { "role": "user", "content": "server failure" }
+          ]
+        }
+      },
+      "response": {
+        "status": 500,
+        "content_type": "text/event-stream",
+        "body": "event: error\ndata: {\"error\":{\"message\":\"overloaded\"}}\n\n",
+        "consume_body": false
+      },
+      "expect": {
+        "span_name": "chat anthropic",
+        "span_kind": "CLIENT",
+        "status": "ERROR",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "anthropic",
+          "gen_ai.system": "anthropic",
+          "gen_ai.request.model": "claude-sonnet-4",
+          "gen_ai.usage.missing": true
+        },
+        "absent_attributes": [
+          "gen_ai.usage.input_tokens",
+          "gen_ai.usage.output_tokens"
+        ]
+      }
+    },
+    {
+      "name": "ollama_http_503_error",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/api/chat",
+        "body": {
+          "model": "llama3.2",
+          "messages": [
+            { "role": "user", "content": "unavailable" }
+          ]
+        }
+      },
+      "response": {
+        "status": 503,
+        "content_type": "application/json",
+        "body": "{\"error\":\"model loading\"}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat ollama",
+        "span_kind": "CLIENT",
+        "status": "ERROR",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "ollama",
+          "gen_ai.system": "ollama",
+          "gen_ai.request.model": "llama3.2",
+          "gen_ai.usage.missing": true
+        },
+        "absent_attributes": [
+          "gen_ai.usage.input_tokens",
+          "gen_ai.usage.output_tokens"
+        ]
+      }
+    },
+    {
+      "name": "openai_zero_tokens_preserved",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "messages": [
+            { "role": "user", "content": "empty" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"gpt-4o\",\"choices\":[{\"message\":{\"content\":\"\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.response.model": "gpt-4o",
+          "gen_ai.usage.input_tokens": 0,
+          "gen_ai.usage.output_tokens": 0,
+          "gen_ai.usage.cache_read.input_tokens": 0,
+          "gen_ai.usage.reasoning_tokens": 0
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ]
+      }
+    },
+    {
+      "name": "ollama_zero_tokens_preserved",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/api/chat",
+        "body": {
+          "model": "llama3.2",
+          "messages": [
+            { "role": "user", "content": "empty" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"llama3.2\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"prompt_eval_count\":0,\"eval_count\":0}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat ollama",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "ollama",
+          "gen_ai.system": "ollama",
+          "gen_ai.request.model": "llama3.2",
+          "gen_ai.response.model": "llama3.2",
+          "gen_ai.usage.input_tokens": 0,
+          "gen_ai.usage.output_tokens": 0
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ]
+      }
+    },
+    {
+      "name": "openai_boolean_tokens_rejected",
+      "capture_content": false,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "messages": [
+            { "role": "user", "content": "bad usage types" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"gpt-4o\",\"choices\":[{\"message\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":true,\"completion_tokens\":false}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.response.model": "gpt-4o",
+          "gen_ai.usage.missing": true
+        },
+        "absent_attributes": [
+          "gen_ai.usage.input_tokens",
+          "gen_ai.usage.output_tokens"
+        ]
+      }
+    },
+    {
+      "name": "openai_multibyte_utf8_cjk_truncation",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "messages": [
+            { "role": "user", "content": "{{repeat:密:2000}}" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"gpt-4o\",\"choices\":[{\"message\":{\"content\":\"{{repeat:界:2000}}\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.response.model": "gpt-4o",
+          "gen_ai.usage.input_tokens": 10,
+          "gen_ai.usage.output_tokens": 20
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ],
+        "prompt_present": true,
+        "prompt_max_utf8_bytes": 4096,
+        "completion_exact": "{{repeat:界:1365}}",
+        "completion_max_utf8_bytes": 4096
+      }
+    },
+    {
+      "name": "openai_multibyte_utf8_emoji_boundary_truncation",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "messages": [
+            { "role": "user", "content": "a{{repeat:🚀:1024}}" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"model\":\"gpt-4o\",\"choices\":[{\"message\":{\"content\":\"a{{repeat:🚀:1024}}\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}",
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": true,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.response.model": "gpt-4o",
+          "gen_ai.usage.input_tokens": 10,
+          "gen_ai.usage.output_tokens": 20
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ],
+        "prompt_present": true,
+        "prompt_max_utf8_bytes": 4096,
+        "completion_exact": "a{{repeat:🚀:1023}}",
+        "completion_max_utf8_bytes": 4096
+      }
+    },
+    {
+      "name": "openai_streaming_multibyte_utf8_truncation",
+      "capture_content": true,
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o",
+          "stream": true,
+          "messages": [
+            { "role": "user", "content": "stream cjk" }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "chunks": [
+          "data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"{{repeat:界:1000}}\"}}]}\n\n",
+          "data: {\"choices\":[{\"delta\":{\"content\":\"{{repeat:界:1000}}\"}}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":16}}\n\n",
+          "data: [DONE]\n\n"
+        ],
+        "consume_body": true
+      },
+      "expect": {
+        "span_name": "chat openai",
+        "span_kind": "CLIENT",
+        "status": "UNSET",
+        "ended_before_consume": false,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": "openai",
+          "gen_ai.system": "openai",
+          "gen_ai.request.model": "gpt-4o",
+          "gen_ai.response.model": "gpt-4o",
+          "gen_ai.usage.input_tokens": 8,
+          "gen_ai.usage.output_tokens": 16
+        },
+        "absent_attributes": [
+          "gen_ai.usage.missing"
+        ],
+        "prompt_present": true,
+        "prompt_contains": "stream cjk",
+        "prompt_max_utf8_bytes": 4096,
+        "completion_exact": "{{repeat:界:1365}}",
+        "completion_max_utf8_bytes": 4096
+      }
+    }
+  ]
+}
