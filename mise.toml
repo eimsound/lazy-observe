@@ -17,7 +17,7 @@ air = "1.67.1"
 # uv：check-embedded-artifact.sh、check-release-smoke.sh、e2e-multi-replica.sh 与 sdk-python 任务的受管 Python（scripts/lib/uv-python.sh）。
 uv = { version = "0.13.7", lazy = true }
 golangci-lint = { version = "2.12.2", lazy = true }
-helm = { version = "3.21.3", lazy = true }
+helm = { version = "4.3.2", lazy = true }
 goreleaser = { version = "2.17.0", lazy = true }
 "go:github.com/google/go-licenses/v2" = { version = "2.0.1", lazy = true, lazy_bins = ["go-licenses"] }
 # 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
