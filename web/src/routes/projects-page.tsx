@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -30,6 +30,7 @@ import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { SnippetBlock } from "@/components/common/snippet-block";
 import { SourceMapUploadTokens } from "@/components/projects/source-map-upload-tokens";
@@ -86,6 +87,8 @@ export function ProjectsPage() {
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
+          ) : projects.isError ? (
+            <QueryErrorState error={projects.error} onRetry={() => void projects.refetch()} />
           ) : projects.data && projects.data.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -161,17 +164,22 @@ export function ProjectsPage() {
         </CardContent>
       </Card>
 
-      <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} />
-      <UpdateProjectDialog
-        key={editingProject?.id ?? "closed"}
-        project={editingProject}
-        onOpenChange={(open) => !open && setEditingProject(null)}
-      />
-      <TokensDialog
-        project={tokensProject}
-        onOpenChange={(o) => !o && setTokensProject(null)}
-        canManage={canManage}
-      />
+      {createOpen && <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} />}
+      {editingProject && (
+        <UpdateProjectDialog
+          key={editingProject.id}
+          project={editingProject}
+          onOpenChange={(open) => !open && setEditingProject(null)}
+        />
+      )}
+      {tokensProject && (
+        <TokensDialog
+          key={tokensProject.id}
+          project={tokensProject}
+          onOpenChange={(o) => !o && setTokensProject(null)}
+          canManage={canManage}
+        />
+      )}
       <ConfirmDialog
         open={!!deletingProject}
         onOpenChange={(open) => !open && setDeletingProject(null)}
@@ -289,9 +297,18 @@ function CreateProjectDialog({
   const [slug, setSlug] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!open) {
+      setName("");
+      setSlug("");
+      setError(null);
+    }
+  }, [open]);
+
   const mutation = useMutation({
     mutationFn: () => createProject(name.trim(), slug.trim()),
     onSuccess: () => {
+      reset();
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       onOpenChange(false);
     },
@@ -311,7 +328,7 @@ function CreateProjectDialog({
     <Dialog
       open={open}
       onOpenChange={(o) => {
-        if (o) reset();
+        reset();
         onOpenChange(o);
       }}
     >
@@ -352,7 +369,14 @@ function CreateProjectDialog({
           )}
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={mutation.isPending}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              reset();
+              onOpenChange(false);
+            }}
+            disabled={mutation.isPending}
+          >
             {t("common.cancel")}
           </Button>
           <Button
@@ -501,6 +525,8 @@ function TokensDialog({
               <Skeleton className="h-8 w-full" />
               <Skeleton className="h-8 w-full" />
             </div>
+          ) : tokens.isError ? (
+            <QueryErrorState error={tokens.error} onRetry={() => void tokens.refetch()} />
           ) : tokens.data && tokens.data.length > 0 ? (
             <table className="w-full text-sm">
               <thead>

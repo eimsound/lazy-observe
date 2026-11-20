@@ -1,11 +1,11 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
-import { ArrowLeft, Server } from "lucide-react";
+import { ArrowLeft, RefreshCw, Server } from "lucide-react";
 import { listHosts } from "@/lib/api/hosts";
 import { queryRange } from "@/lib/api/metrics";
-import { PageContainer } from "@/components/layout/page";
+import { PageActions, PageContainer } from "@/components/layout/page";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,16 +63,19 @@ function hostMetricPanels(instance: string): MetricPanelDefinition[] {
   ];
 }
 
+interface HostMetricWindow {
+  start: number;
+  end: number;
+  step: number;
+}
+
 function MetricPanel({
   instance,
   titleKey,
   queries,
-}: MetricPanelDefinition & { instance: string }) {
+  window,
+}: MetricPanelDefinition & { instance: string; window: HostMetricWindow }) {
   const { t } = useTranslation();
-  const window = useMemo(() => {
-    const end = Math.floor(Date.now() / 1000);
-    return { start: end - WINDOW_SECONDS, end, step: STEP_SECONDS };
-  }, []);
   const results = useQueries({
     queries: queries.map((query) => ({
       queryKey: ["host-metric", instance, query, window.start, window.end, window.step],
@@ -110,13 +113,30 @@ function MetricPanel({
 export function HostDetailPage() {
   const { t } = useTranslation();
   const { instance } = useParams({ from: "/app/infrastructure/hosts/$instance" });
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const window = useMemo<HostMetricWindow>(() => {
+    const end = Math.floor(nowMs / 1000);
+    return { start: end - WINDOW_SECONDS, end, step: STEP_SECONDS };
+  }, [nowMs]);
 
   const hosts = useQuery({ queryKey: ["hosts"], queryFn: ({ signal }) => listHosts(signal) });
   const host = hosts.data?.find((h) => h.instance === instance);
   const panels = useMemo(() => hostMetricPanels(instance), [instance]);
 
+  function refresh() {
+    setNowMs((prev) => Math.max(prev + 1000, Date.now()));
+    void hosts.refetch();
+  }
+
   return (
     <PageContainer>
+      <PageActions>
+        <Button variant="outline" size="sm" onClick={refresh}>
+          <RefreshCw className="size-3.5" />
+          {t("common.refresh")}
+        </Button>
+      </PageActions>
       <div className="mb-4">
         <Button asChild variant="ghost" size="sm" className="mb-2 gap-1.5 text-muted-foreground">
           <Link to="/infrastructure/hosts">
@@ -157,7 +177,7 @@ export function HostDetailPage() {
 
       <div className="grid gap-3 lg:grid-cols-2">
         {panels.map((panel) => (
-          <MetricPanel key={panel.titleKey} instance={instance} {...panel} />
+          <MetricPanel key={panel.titleKey} instance={instance} window={window} {...panel} />
         ))}
       </div>
     </PageContainer>

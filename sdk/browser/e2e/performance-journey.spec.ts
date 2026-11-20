@@ -234,7 +234,12 @@ test("performance investigation journey uses ranked endpoints and contextual evi
     new URL(response.url()).pathname === "/api/v1/performance/endpoints" && response.ok()
   ));
   await staleNotice.getByRole("button", { name: /^Retry$|^重试$/ }).click();
-  await recoveredResponse;
+  const recoveredContract = await (await recoveredResponse).json() as EndpointResponse;
+  const recoveredSlow = recoveredContract.endpoints.find((endpoint) => (
+    endpoint.service === "lazy-observe-fiber-example" && endpoint.route === "/performance/slow"
+  ));
+  expect(recoveredSlow).toBeDefined();
+  expect(recoveredContract.end).toBeGreaterThan(uiContract.end);
   await expect(staleNotice).toHaveCount(0);
   await expect(endpointRow).toBeVisible();
   expect(page.url()).toBe(retainedURL);
@@ -245,9 +250,9 @@ test("performance investigation journey uses ranked endpoints and contextual evi
   expect(traceURL.pathname).toBe("/traces");
   expect(traceURL.searchParams.get("service")).toBe("lazy-observe-fiber-example");
   expect(traceURL.searchParams.get("operation")).toBe("GET /performance/slow");
-  expect(traceURL.searchParams.get("start")).toBe(String(uiContract.start * 1_000));
-  expect(traceURL.searchParams.get("end")).toBe(String(uiContract.end * 1_000));
-  expect(traceURL.searchParams.get("minDuration")).toBe(`${Math.ceil(uiSlow!.p95 * 1_000)}us`);
+  expect(traceURL.searchParams.get("start")).toBe(String(recoveredContract.start * 1_000));
+  expect(traceURL.searchParams.get("end")).toBe(String(recoveredContract.end * 1_000));
+  expect(traceURL.searchParams.get("minDuration")).toBe(`${Math.ceil(recoveredSlow!.p95 * 1_000)}us`);
   await expect(page.getByText(/\d+ traces|\d+ 条链路/)).toBeVisible();
   await page.locator('main [role="button"][tabindex="0"]').first().click();
   await expect(page).toHaveURL(/\/traces\/[a-f0-9]{32}$/);

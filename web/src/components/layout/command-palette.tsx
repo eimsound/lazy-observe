@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
 import { FolderKanban, LayoutGrid, Search, Waypoints } from "lucide-react";
-import { NAV_GROUPS } from "@/config/nav";
+import { canAccessNavItem, NAV_GROUPS } from "@/config/nav";
+import { useAuth } from "@/lib/auth/auth-provider";
 import { useProject } from "@/lib/project/project-provider";
 import { cn } from "@/lib/utils";
 import {
@@ -35,6 +36,7 @@ export function CommandPalette({
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const { role } = useAuth();
   const { projects, setCurrent } = useProject();
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
@@ -52,7 +54,7 @@ export function CommandPalette({
     const items: CommandItem[] = [];
     for (const group of NAV_GROUPS) {
       for (const item of group.items) {
-        if (item.adminOnly) continue;
+        if (!canAccessNavItem(item, role)) continue;
         items.push({
           id: `page:${item.to}`,
           icon: <LayoutGrid className="size-4" />,
@@ -80,7 +82,7 @@ export function CommandPalette({
       });
     }
     return items;
-  }, [t, navigate, onOpenChange, projects, setCurrent]);
+  }, [t, navigate, onOpenChange, projects, setCurrent, role]);
 
   const commands = useMemo(() => {
     const trimmed = query.trim().toLowerCase();

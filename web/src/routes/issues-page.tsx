@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -25,6 +25,10 @@ import {
 } from "@/lib/api/issues";
 import { IS_MOCK } from "@/lib/settings";
 import { ApiError } from "@/lib/api/client";
+import { useAuth } from "@/lib/auth/auth-provider";
+import { canManageIssues } from "@/lib/auth/permissions";
+import { useProject } from "@/lib/project/project-provider";
+import { formatErrorMessage } from "@/lib/api/errors";
 import { formatRelativeTime } from "@/lib/format";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
@@ -56,6 +60,9 @@ const STATUS_TAB_KEY: Record<IssueStatus, string> = {
 
 export function IssuesPage() {
   const { t } = useTranslation();
+  const { role } = useAuth();
+  const { currentSlug } = useProject();
+  const canManage = canManageIssues(role);
   const queryClient = useQueryClient();
 
   const [status, setStatus] = useState<IssueStatus>("open");
@@ -65,11 +72,23 @@ export function IssuesPage() {
   const [sort, setSort] = useState<IssueSort>("last_seen");
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [actionError, setActionError] = useState<string | null>(null);
+  const prevProjectRef = useRef(currentSlug);
+
+  useEffect(() => {
+    if (prevProjectRef.current !== currentSlug) {
+      prevProjectRef.current = currentSlug;
+      setPage(1);
+      setSelected(new Set());
+      setActionError(null);
+    }
+  }, [currentSlug]);
 
   const levelParam = level === ALL_LEVELS ? "" : (level as IssueLevel);
+  const queryKey = ["issues", currentSlug, status, levelParam, q, sort, page] as const;
 
   const query = useQuery<IssueListResult, ApiError>({
-    queryKey: ["issues", status, levelParam, q, sort, page],
+    queryKey,
     queryFn: ({ signal }) =>
       listIssues({ status, level: levelParam, q, sort, page }, signal),
     retry: false,
@@ -79,6 +98,42 @@ export function IssuesPage() {
   const mutation = useMutation({
     mutationFn: ({ id, next }: { id: string; next: IssueStatus }) =>
       updateIssueStatus(id, next),
+    onMutate: ({ id }) => {
+      setActionError(null);
+      const previous = queryClient.getQueryData<IssueListResult>(queryKey);
+      queryClient.setQueryData<IssueListResult>(queryKey, (old) =>
+        old ? { ...old, issues: old.issues.filter((i) => i.id !== id) } : old,
+      );
+      return { previous };
+    },
+    onError: (err, _vars, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(queryKey, context.previous);
+      }
+      setActionError(formatErrorMessage(err, t("issues.statusUpdateError")));
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["issues"] });
+    },
+  });
+
+  const batchMutation = useMutation({
+    mutationFn: ({ ids, next }: { ids: string[]; next: IssueStatus }) =>
+      batchUpdateIssueStatus(ids, next),
+    onMutate: ({ ids }) => {
+      setActionError(null);
+      const previous = queryClient.getQueryData<IssueListResult>(queryKey);
+      queryClient.setQueryData<IssueListResult>(queryKey, (old) =>
+        old ? { ...old, issues: old.issues.filter((i) => !ids.includes(i.id)) } : old,
+      );
+      return { previous };
+    },
+    onError: (err, _vars, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(queryKey, context.previous);
+      }
+      setActionError(formatErrorMessage(err, t("issues.statusUpdateError")));
+    },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["issues"] });
     },
@@ -93,16 +148,12 @@ export function IssuesPage() {
   function changeStatus(status: IssueStatus) {
     setStatus(status);
     setPage(1);
+    setActionError(null);
     resetSelection();
   }
 
   function applyStatus(ids: string[], next: IssueStatus) {
-    // Optimistic: drop the affected rows from the current tab immediately.
-    queryClient.setQueryData<IssueListResult>(
-      ["issues", status, levelParam, q, sort, page],
-      (old) =>
-        old ? { ...old, issues: old.issues.filter((i) => !ids.includes(i.id)) } : old,
-    );
+    if (!canManage) return;
     resetSelection();
     if (ids.length === 1) {
       mutation.mutate({ id: ids[0], next });
@@ -110,17 +161,6 @@ export function IssuesPage() {
     }
     batchMutation.mutate({ ids, next });
   }
-
-  const batchMutation = useMutation({
-    mutationFn: ({ ids, next }: { ids: string[]; next: IssueStatus }) =>
-      batchUpdateIssueStatus(ids, next),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["issues"] });
-    },
-    onError: () => {
-      void queryClient.invalidateQueries({ queryKey: ["issues"] });
-    },
-  });
 
   function toggleSelect(id: string) {
     setSelected((prev) => {
@@ -228,8 +268,18 @@ export function IssuesPage() {
         </CardContent>
       </Card>
 
+      {actionError && (
+        <div
+          className="mb-3 flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          role="alert"
+        >
+          <AlertCircle className="size-4 shrink-0" />
+          <span>{actionError}</span>
+        </div>
+      )}
+
       {/* Bulk action bar */}
-      {selectedIds.length > 0 && (
+      {canManage && selectedIds.length > 0 && (
         <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
           <span className="font-medium">
             {t("issues.selectedCount", { count: selectedIds.length })}
@@ -261,6 +311,7 @@ export function IssuesPage() {
         query={query}
         issues={issues}
         status={status}
+        canManage={canManage}
         allSelected={issues.length > 0 && selected.size === issues.length}
         selected={selected}
         onToggleSelect={toggleSelect}
@@ -309,6 +360,7 @@ function IssueListBody({
   query,
   issues,
   status,
+  canManage,
   allSelected,
   selected,
   onToggleSelect,
@@ -319,6 +371,7 @@ function IssueListBody({
   query: ReturnType<typeof useQuery<IssueListResult, ApiError>>;
   issues: IssueSummary[];
   status: IssueStatus;
+  canManage: boolean;
   allSelected: boolean;
   selected: Set<string>;
   onToggleSelect: (id: string) => void;
@@ -391,13 +444,15 @@ function IssueListBody({
       <Card>
         <CardContent className="p-0">
         <div className="flex items-center gap-3 border-b border-border px-3 py-2 text-xs font-medium text-muted-foreground">
-          <input
-            type="checkbox"
-            className="size-4 accent-primary"
-            checked={allSelected}
-            onChange={onToggleSelectAll}
-            aria-label={t("common.all")}
-          />
+          {canManage && (
+            <input
+              type="checkbox"
+              className="size-4 accent-primary"
+              checked={allSelected}
+              onChange={onToggleSelectAll}
+              aria-label={t("common.all")}
+            />
+          )}
           <span className="flex-1">{t("issues.colIssue")}</span>
         </div>
         <ul>
@@ -406,6 +461,7 @@ function IssueListBody({
               key={issue.id}
               issue={issue}
               status={status}
+              canManage={canManage}
               checked={selected.has(issue.id)}
               onToggleSelect={() => onToggleSelect(issue.id)}
               onApplyStatus={(next) => onApplyStatus(issue.id, next)}
@@ -421,12 +477,14 @@ function IssueListBody({
 function IssueRow({
   issue,
   status,
+  canManage,
   checked,
   onToggleSelect,
   onApplyStatus,
 }: {
   issue: IssueSummary;
   status: IssueStatus;
+  canManage: boolean;
   checked: boolean;
   onToggleSelect: () => void;
   onApplyStatus: (next: IssueStatus) => void;
@@ -436,13 +494,15 @@ function IssueRow({
 
   return (
     <li className="flex items-center gap-3 border-b border-border/60 px-3 py-2.5 last:border-b-0 hover:bg-muted/30">
-      <input
-        type="checkbox"
-        className="size-4 accent-primary"
-        checked={checked}
-        onChange={onToggleSelect}
-        aria-label={issue.title}
-      />
+      {canManage && (
+        <input
+          type="checkbox"
+          className="size-4 accent-primary"
+          checked={checked}
+          onChange={onToggleSelect}
+          aria-label={issue.title}
+        />
+      )}
       <button
         type="button"
         onClick={() => navigate({ to: "/issues/$issueId", params: { issueId: issue.id } })}
@@ -467,28 +527,30 @@ function IssueRow({
         <div className="text-xs text-muted-foreground">{t("issues.users", { count: issue.user_count })}</div>
       </div>
 
-      <div className="flex shrink-0 gap-1">
-        {status === "open" ? (
-          <>
+      {canManage && (
+        <div className="flex shrink-0 gap-1">
+          {status === "open" ? (
+            <>
+              <RowAction
+                title={t("issues.resolve")}
+                icon={<CheckCircle2 className="size-4" />}
+                onClick={() => onApplyStatus("resolved")}
+              />
+              <RowAction
+                title={t("issues.ignore")}
+                icon={<VolumeX className="size-4" />}
+                onClick={() => onApplyStatus("ignored")}
+              />
+            </>
+          ) : (
             <RowAction
-              title={t("issues.resolve")}
-              icon={<CheckCircle2 className="size-4" />}
-              onClick={() => onApplyStatus("resolved")}
+              title={t("issues.reopen")}
+              icon={<RotateCcw className="size-4" />}
+              onClick={() => onApplyStatus("open")}
             />
-            <RowAction
-              title={t("issues.ignore")}
-              icon={<VolumeX className="size-4" />}
-              onClick={() => onApplyStatus("ignored")}
-            />
-          </>
-        ) : (
-          <RowAction
-            title={t("issues.reopen")}
-            icon={<RotateCcw className="size-4" />}
-            onClick={() => onApplyStatus("open")}
-          />
-        )}
-      </div>
+          )}
+        </div>
+      )}
     </li>
   );
 }

@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Pencil, Plus, Target, Trash2 } from "lucide-react";
+import { Loader2, Pencil, Plus, RefreshCw, Target, Trash2 } from "lucide-react";
 import {
   listScrapeTargets,
   createScrapeTarget,
@@ -18,6 +18,8 @@ import { formatRelativeTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { formatErrorMessage } from "@/lib/api/errors";
+import { QueryErrorState } from "@/components/common/query-error-state";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { KvEditor } from "@/components/common/kv-editor";
 import { pairsToRecord, recordToPairs, type Pair } from "@/components/common/kv-pairs";
@@ -61,24 +63,37 @@ export function ScrapeTargetsPage() {
   const targets = useQuery({
     queryKey: ["scrape-targets"],
     queryFn: ({ signal }) => listScrapeTargets(signal),
+    retry: false,
   });
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ScrapeTarget | null>(null);
   const [deleting, setDeleting] = useState<ScrapeTarget | null>(null);
+  const [toggleError, setToggleError] = useState<string | null>(null);
 
   const toggle = useMutation({
     mutationFn: (target: ScrapeTarget) => {
       const { id, ...rest } = target;
       return updateScrapeTarget(id, { ...rest, enabled: !target.enabled });
     },
+    onMutate: () => setToggleError(null),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["scrape-targets"] }),
+    onError: (err) => setToggleError(formatErrorMessage(err, t("scrapeTargets.saveError"))),
   });
+
+  function refreshAll() {
+    void queryClient.invalidateQueries({ queryKey: ["scrape-targets"] });
+    void queryClient.invalidateQueries({ queryKey: ["target-health"] });
+  }
 
   return (
     <PageContainer>
-      {canManage && (
-        <PageActions>
+      <PageActions>
+        <Button variant="outline" size="sm" onClick={refreshAll} disabled={targets.isFetching}>
+          {targets.isFetching ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          {t("common.refresh")}
+        </Button>
+        {canManage && (
           <Button
             onClick={() => {
               setEditing(null);
@@ -89,7 +104,13 @@ export function ScrapeTargetsPage() {
             <Plus className="size-4" />
             {t("scrapeTargets.newTarget")}
           </Button>
-        </PageActions>
+        )}
+      </PageActions>
+
+      {toggleError && (
+        <p className="mb-3 text-sm text-destructive" role="alert">
+          {toggleError}
+        </p>
       )}
 
       <Card>
@@ -100,6 +121,8 @@ export function ScrapeTargetsPage() {
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
+          ) : targets.isError ? (
+            <QueryErrorState error={targets.error} onRetry={() => void targets.refetch()} />
           ) : targets.data && targets.data.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -194,7 +217,12 @@ export function ScrapeTargetsPage() {
       )}
 
       {formOpen && (
-        <TargetFormDialog open={formOpen} onOpenChange={setFormOpen} editing={editing} />
+        <TargetFormDialog
+          key={editing?.id ?? "new"}
+          open={formOpen}
+          onOpenChange={setFormOpen}
+          editing={editing}
+        />
       )}
       <ConfirmDialog
         open={!!deleting}
@@ -218,11 +246,14 @@ function HealthCell({ target }: { target: ScrapeTarget }) {
   const health = useQuery({
     queryKey: ["target-health", target.id, target.enabled, target.url],
     queryFn: ({ signal }) => getTargetHealth(target.id, signal),
-    refetchInterval: 30_000,
+    enabled: target.enabled,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+    retry: false,
   });
 
-  const status = health.data?.status ?? "unknown";
-  const lastScrape = health.data?.last_scrape_at;
+  const status: TargetHealthStatus = target.enabled ? (health.data?.status ?? "unknown") : "unknown";
+  const lastScrape = target.enabled ? health.data?.last_scrape_at : undefined;
 
   return (
     <div className="flex items-center gap-2">

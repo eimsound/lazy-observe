@@ -13,6 +13,7 @@ test("system health diagnostics expose only known components and stable states",
       gateway: "ok",
       logs: "component restarting at http://127.0.0.1:9428/private",
       traces: "dial tcp 10.0.0.4:10428",
+      error_inbox: "active_items=0 active_bytes=0",
       malicious_component: "secret-key",
     },
   }), {
@@ -21,8 +22,38 @@ test("system health diagnostics expose only known components and stable states",
       { name: "gateway", state: "ok" },
       { name: "logs", state: "restarting" },
       { name: "traces", state: "unavailable" },
+      { name: "error_inbox", state: "ok" },
     ],
   });
+});
+
+test("error_inbox distinguishes healthy summary strings from diagnostics unavailable", () => {
+  assert.deepEqual(
+    normalizeHealthDiagnostics({
+      status: "ok",
+      components: {
+        gateway: "ok",
+        error_inbox: "active_items=12 active_bytes=4096",
+      },
+    }).components,
+    [
+      { name: "gateway", state: "ok" },
+      { name: "error_inbox", state: "ok" },
+    ],
+  );
+  assert.deepEqual(
+    normalizeHealthDiagnostics({
+      status: "degraded",
+      components: {
+        gateway: "ok",
+        error_inbox: "diagnostics unavailable",
+      },
+    }).components,
+    [
+      { name: "gateway", state: "ok" },
+      { name: "error_inbox", state: "unavailable" },
+    ],
+  );
 });
 
 test("Inbox diagnostics discard payloads, event identities, and raw errors", () => {

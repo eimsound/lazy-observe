@@ -91,3 +91,26 @@ test("rejects legacy summaries missing a real trend or pagination metadata", () 
     /total/,
   );
 });
+
+test("normalizes non-canonical SDK levels such as fatal, warn, and debug without breaking the list", () => {
+  const list = normalizeIssueListResponse({
+    issues: [
+      { ...summary, id: 1, level: "fatal" as never },
+      { ...summary, id: 2, level: "warn" as never },
+      { ...summary, id: 3, level: "debug" as never },
+      { ...summary, id: 4, level: "CRITICAL" as never },
+    ],
+    total: 4,
+    page: 1,
+    page_size: 50,
+  });
+
+  assert.deepEqual(
+    list.issues.map((item) => item.level),
+    ["error", "warning", "info", "error"],
+  );
+  assert.throws(
+    () => normalizeIssueListResponse({ issues: [{ ...summary, level: "" as never }], total: 1, page: 1, page_size: 50 }),
+    /issue level is invalid/,
+  );
+});

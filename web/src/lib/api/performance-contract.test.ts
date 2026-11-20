@@ -60,7 +60,7 @@ test("rejects legacy arrays and incomplete endpoint statistics", () => {
   );
 });
 
-test("rejects impossible rates and non-finite derived values", () => {
+test("clamps extrapolated error_rate above 1 while rejecting negative or non-finite values", () => {
   const valid = {
     start: 1,
     end: 2,
@@ -80,9 +80,14 @@ test("rejects impossible rates and non-finite derived values", () => {
     ],
     truncated: false,
   };
+  const clamped = normalizeEndpointStatsResponse({
+    ...valid,
+    endpoints: [{ ...valid.endpoints[0], error_rate: 1.1 }],
+  });
+  assert.equal(clamped.endpoints[0]?.error_rate, 1);
   assert.throws(
-    () => normalizeEndpointStatsResponse({ ...valid, endpoints: [{ ...valid.endpoints[0], error_rate: 1.1 }] }),
-    /must be at most 1/,
+    () => normalizeEndpointStatsResponse({ ...valid, endpoints: [{ ...valid.endpoints[0], error_rate: -0.1 }] }),
+    /non-negative finite number/,
   );
   assert.throws(
     () => normalizeEndpointStatsResponse({ ...valid, endpoints: [{ ...valid.endpoints[0], p95: Number.NaN }] }),

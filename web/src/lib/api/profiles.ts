@@ -1,4 +1,4 @@
-import { apiGet, API_ROOT, IS_MOCK } from "./client";
+import { apiGet, apiGetResponse, ApiError, API_ROOT, IS_MOCK } from "./client";
 import {
   normalizeProfileListResponse,
   normalizeProfileServicesResponse,
@@ -88,19 +88,30 @@ export async function listProfiles(
 export async function getFlamegraph(
   q: ProfileQuery,
   signal?: AbortSignal,
-): Promise<FlameNode> {
+): Promise<FlameNode | null> {
   if (IS_MOCK) return (await loadMockProfiles()).mockFlamegraph(q);
-  return apiGet<FlameNode>("/profiles/flamegraph", {
-    base: API_ROOT,
-    params: profileQueryParams(q),
-    signal,
-  });
+  try {
+    return await apiGet<FlameNode>("/profiles/flamegraph", {
+      base: API_ROOT,
+      params: profileQueryParams(q),
+      signal,
+    });
+  } catch (err) {
+    // Gateway returns 404 when no profiles exist in the queried window; map to
+    // null so the UI transitions cleanly into the empty state instead of keeping
+    // a stale flamegraph from a prior type/window.
+    if (err instanceof ApiError && err.status === 404) {
+      return null;
+    }
+    throw err;
+  }
 }
 
 /**
  * Href for downloading a profile's raw pprof blob. In mock mode this is a
  * self-contained data: URL (there is no server); against a real backend it's
- * the `/api/profiles/:id/raw` endpoint (served same-origin, auth via cookie).
+ * the `/api/profiles/:id/raw` endpoint (real downloads should use
+ * `downloadRawProfile` so `X-LO-Project` is attached for non-default projects).
  */
 export function profileRawHref(rec: ProfileRecord): string {
   if (IS_MOCK) {
@@ -109,6 +120,48 @@ export function profileRawHref(rec: ProfileRecord): string {
     return `data:text/plain;charset=utf-8,${encodeURIComponent(body)}`;
   }
   return `${API_ROOT}/profiles/${encodeURIComponent(rec.id)}/raw`;
+}
+
+/**
+ * Fetches a raw pprof profile blob through the shared API client so the active
+ * project scope (`X-LO-Project`) and session cookie are included on non-default
+ * projects.
+ */
+export async function fetchRawProfileBlob(
+  rec: ProfileRecord,
+  project?: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  if (IS_MOCK) {
+    const body = `# mock pprof profile\nservice: ${rec.service}\ntype: ${rec.type}\nid: ${rec.id}\n` +
+      "(This is a placeholder produced by VITE_MOCK; a real backend returns a gzipped pprof blob.)\n";
+    return new Blob([body], { type: "text/plain;charset=utf-8" });
+  }
+  const res = await apiGetResponse(`/profiles/${encodeURIComponent(rec.id)}/raw`, {
+    base: API_ROOT,
+    project,
+    signal,
+  });
+  return res.blob();
+}
+
+export async function downloadRawProfile(
+  rec: ProfileRecord,
+  filename: string,
+  project?: string,
+): Promise<void> {
+  const blob = await fetchRawProfileBlob(rec, project);
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }
 
 /** Total sample count of a flamegraph tree (the root value). */

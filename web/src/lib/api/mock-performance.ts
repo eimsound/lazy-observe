@@ -1,3 +1,4 @@
+import { ApiError } from "./client";
 import type { TimeSeries } from "./types";
 import type {
   PageVitals,
@@ -114,6 +115,13 @@ function resolveAfter<T>(value: T, delay: number, signal?: AbortSignal): Promise
 }
 
 export function mockEndpointStats(window: PerfWindow): Promise<EndpointStatsResult> {
+  const mockControl = globalThis as { __loMockFailNextEndpoints?: boolean };
+  if (mockControl.__loMockFailNextEndpoints) {
+    mockControl.__loMockFailNextEndpoints = false;
+    return new Promise((_, reject) =>
+      setTimeout(() => reject(new ApiError("mock endpoint refresh failed", 500)), 120),
+    );
+  }
   const rows: EndpointStat[] = ENDPOINTS.map((e) => {
     const rng = makeRng(`endpoint|${e.route}|${e.method}`);
     const p50 = rng.int(8, 120);
