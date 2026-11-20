@@ -90,9 +90,9 @@ func parseChunk(protocol protocol, data []byte) (ChatChunk, bool, bool, error) {
 			return ChatChunk{}, false, true, nil
 		}
 		return ChatChunk{
-				Content: value.Delta.Text,
-			}, value.Type == "content_block_delta" && value.Delta.Type == "text_delta" &&
-				value.Delta.Text != "", false, nil
+			Content: value.Delta.Text,
+		}, value.Type == "content_block_delta" && value.Delta.Type == "text_delta" &&
+			value.Delta.Text != "", false, nil
 	case protocolOllama:
 		var value struct {
 			Model   string  `json:"model"`
