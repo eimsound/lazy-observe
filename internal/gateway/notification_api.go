@@ -52,16 +52,34 @@ func (g *Gateway) requeueNotification(c fiber.Ctx) error {
 		return c.Status(fiber.StatusServiceUnavailable).
 			JSON(fiber.Map{"error": "notification history unavailable"})
 	}
+	proj := currentProject(c)
+	audit := auditEvent{
+		Action:      "notification.requeue",
+		TargetType:  "notification_outbox",
+		ProjectID:   proj.ID,
+		ProjectSlug: proj.Slug,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "requeue_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	id, err := strconv.ParseInt(c.Params("id"), 10, 64)
 	if err != nil || id <= 0 {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
-	updated, err := store.RequeueNotification(c.Context(), id, currentProject(c).ID)
+	audit.TargetID = int(id)
+	updated, err := store.RequeueNotification(c.Context(), id, proj.ID)
 	if err != nil {
+		audit.FailureReason = alertFailureReason(err, "requeue_failed")
 		return apiError(c, err)
 	}
 	if !updated {
+		audit.FailureReason = "not_found"
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 	}
+	audit.Success = true
 	return c.SendStatus(fiber.StatusNoContent)
 }

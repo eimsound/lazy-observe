@@ -351,14 +351,29 @@ func (g *Gateway) putProjectAlertConfig(c fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
+	audit := auditEvent{
+		Action:     "project_alert_config.update",
+		TargetType: "project_alert_config",
+		TargetID:   id,
+		ProjectID:  id,
+	}
+	defer func() {
+		if !audit.Success && audit.FailureReason == "" {
+			audit.FailureReason = "update_failed"
+		}
+		g.auditManagement(c, audit)
+	}()
 	var body projectAlertConfigRequest
-	if c.Bind().Body(&body) != nil || body.ErrorRateThresholdPerMinute < 0 {
+	if c.Bind().Body(&body) != nil {
+		audit.FailureReason = "invalid_request"
 		return badRequest(c)
 	}
 	config, err := g.alerts.PutProjectAlertConfig(c.Context(), id, body.input())
 	if err != nil {
-		return apiError(c, err)
+		audit.FailureReason = alertFailureReason(err, "update_failed")
+		return alertAPIError(c, err)
 	}
+	audit.Success = true
 	return c.JSON(projectAlertConfigJSON(config))
 }
 
