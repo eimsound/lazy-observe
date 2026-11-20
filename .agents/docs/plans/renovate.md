@@ -170,6 +170,8 @@ curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
 
 **Go 依赖 PR（`gomod minor-patch`、`opentelemetry`、`ent`、major）**：改了进二进制的模块版本时 `license-check` 会红，agent 跑 `mise run third-party-notices` 后把 `third_party/go/THIRD_PARTY_NOTICES.txt` 提交进该分支。
 
+`entc.mod` 里另有显式固定的 `golang.org/x/tools // indirect`：ent v0.14.6 自带的 x/tools v0.30.0 在 go 1.27 下加载标准库报 `package "context" without types`（#152）。它也归 `ent` 组，只升 x/tools 的 PR 同样按下面的命令补 sum。升 go 的 minor 版本时先确认 `mise run ent-generate-check` 能过，不能过就抬 x/tools。
+
 **`renovate/ent` PR（`entc.mod` 补 sum）**：PR 的 `entgo.io/ent` 在 `go.mod` 与 `entc.mod` 里必须是同一版本（错位时生成的 `.entc` 临时程序会报 `has no field`）；Renovate 补不出 `entc.sum`，agent 在仓库根目录执行（命令已实测，来自 `.agents/docs/research/ent-renovate.md`）：
 
 ```bash
