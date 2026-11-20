@@ -2,6 +2,7 @@ package meta
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -387,38 +388,73 @@ func (s *Store) PutProjectAlertConfig(
 	projectID int,
 	input ProjectAlertConfigUpdate,
 ) (ProjectAlertConfigView, error) {
-	if _, err := s.client.Project.Get(ctx, projectID); err != nil {
-		return ProjectAlertConfigView{}, err
-	}
-	row, err := s.client.ProjectAlertConfig.Query().Where(projectalertconfig.ProjectIDEQ(projectID)).Only(ctx)
-	if IsNotFound(err) {
-		row, err = s.client.ProjectAlertConfig.Create().
-			SetProjectID(projectID).
-			SetNewIssue(input.NewIssue).
-			SetRegression(input.Regression).
-			SetErrorRateThresholdPerMin(input.ErrorRateThresholdPerMinute).
-			AddChannelIDs(input.ChannelIDs...).
-			Save(ctx)
-	} else if err == nil {
-		row, err = row.Update().
-			SetNewIssue(input.NewIssue).
-			SetRegression(input.Regression).
-			SetErrorRateThresholdPerMin(input.ErrorRateThresholdPerMinute).
-			ClearChannels().
-			AddChannelIDs(input.ChannelIDs...).
-			Save(ctx)
-	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return ProjectAlertConfigView{}, err
+		return ProjectAlertConfigView{}, fmt.Errorf("begin project alert config update: %w", err)
 	}
-	row, err = s.client.ProjectAlertConfig.Query().
-		Where(projectalertconfig.IDEQ(row.ID)).
-		WithChannels().
-		Only(ctx)
-	if err != nil {
-		return ProjectAlertConfigView{}, err
+	defer tx.Rollback()
+
+	var existingProject int
+	if err := tx.QueryRowContext(
+		ctx,
+		bind(s.dialect, `SELECT id FROM projects WHERE id = ?`),
+		projectID,
+	).Scan(&existingProject); errors.Is(err, sql.ErrNoRows) {
+		return ProjectAlertConfigView{}, &NotFoundError{Label: project.Label}
+	} else if err != nil {
+		return ProjectAlertConfigView{}, fmt.Errorf("verify project for alert config: %w", err)
 	}
-	return s.projectAlertConfigView(row)
+
+	var configID int
+	upsertQuery := `INSERT INTO project_alert_configs(
+			new_issue, regression, error_rate_threshold_per_min, created_at, updated_at, project_id
+		) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+		ON CONFLICT(project_id) DO UPDATE SET
+			new_issue = excluded.new_issue,
+			regression = excluded.regression,
+			error_rate_threshold_per_min = excluded.error_rate_threshold_per_min,
+			updated_at = CURRENT_TIMESTAMP
+		RETURNING id`
+	if err := tx.QueryRowContext(
+		ctx,
+		bind(s.dialect, upsertQuery),
+		input.NewIssue,
+		input.Regression,
+		input.ErrorRateThresholdPerMinute,
+		projectID,
+	).Scan(&configID); err != nil {
+		return ProjectAlertConfigView{}, fmt.Errorf("upsert project alert config: %w", err)
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		bind(s.dialect, `DELETE FROM project_alert_config_channels WHERE project_alert_config_id = ?`),
+		configID,
+	); err != nil {
+		return ProjectAlertConfigView{}, fmt.Errorf("clear project alert config channels: %w", err)
+	}
+	seen := make(map[int]struct{}, len(input.ChannelIDs))
+	for _, channelID := range input.ChannelIDs {
+		if _, dup := seen[channelID]; dup {
+			continue
+		}
+		seen[channelID] = struct{}{}
+		if _, err := tx.ExecContext(
+			ctx,
+			bind(
+				s.dialect,
+				`INSERT INTO project_alert_config_channels(project_alert_config_id, notification_channel_id) VALUES (?, ?)`,
+			),
+			configID,
+			channelID,
+		); err != nil {
+			return ProjectAlertConfigView{}, fmt.Errorf("link project alert config channel %d: %w", channelID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ProjectAlertConfigView{}, fmt.Errorf("commit project alert config: %w", err)
+	}
+	return s.ProjectAlertConfig(ctx, projectID)
 }
 
 func (s *Store) projectAlertConfigView(row *dbent.ProjectAlertConfig) (ProjectAlertConfigView, error) {
@@ -554,6 +590,17 @@ func (s *Store) CreateSilence(ctx context.Context, input SilenceCreate) (Silence
 		return SilenceView{}, err
 	}
 	row.Edges.Project = projectRow
+	return silenceView(row)
+}
+
+func (s *Store) SilenceByID(ctx context.Context, projectSlug string, id int) (SilenceView, error) {
+	row, err := s.client.Silence.Query().
+		Where(silence.IDEQ(id), silence.HasProjectWith(project.SlugEQ(projectSlug))).
+		WithProject().
+		Only(ctx)
+	if err != nil {
+		return SilenceView{}, err
+	}
 	return silenceView(row)
 }
 

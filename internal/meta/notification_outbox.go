@@ -405,17 +405,20 @@ func (s *Store) ListNotificationOutbox(
 }
 
 // RequeueNotification moves a dead notification back to pending so the
-// dispatch workers pick it up again. Only dead rows of the project are
-// requeued; the returned bool reports whether one row changed.
+// dispatch workers pick it up again. Attempts are reset to 0 and the database
+// clock is used so eligibility matches ClaimNotifications across SQLite and PG.
+// Only dead rows of the project are requeued; the returned bool reports
+// whether one row changed.
 func (s *Store) RequeueNotification(ctx context.Context, id int64, projectID int) (bool, error) {
 	result, err := s.db.ExecContext(
 		ctx,
 		bind(
 			s.dialect,
-			`UPDATE notification_outbox SET status = 'pending', available_at = ?, claim_owner = NULL, claim_until = NULL
+			`UPDATE notification_outbox
+			 SET status = 'pending', attempts = 0, available_at = CURRENT_TIMESTAMP,
+			     claim_owner = NULL, claim_until = NULL, updated_at = CURRENT_TIMESTAMP
 			 WHERE id = ? AND project_id = ? AND status = 'dead'`,
 		),
-		time.Now().UTC(),
 		id,
 		projectID,
 	)

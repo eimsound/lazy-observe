@@ -145,6 +145,35 @@ func TestAlertEngineMembershipLeaseAndFencing(t *testing.T) {
 		if err := store.PutAlertRuleState(ctx, state, "engine-b", leaseB.Epoch); !errors.Is(err, ErrStaleRuleFence) {
 			t.Fatalf("released lease write error=%v", err)
 		}
+		// Re-acquiring after release must advance epoch monotonically rather
+		// than resetting back to 1.
+		leaseAfterRelease, err := store.AcquireAlertRuleLease(ctx, rule.ID, "engine-a", time.Minute)
+		if err != nil || leaseAfterRelease.Epoch != leaseB.Epoch+1 {
+			t.Fatalf("re-acquire after release=%#v want epoch=%d err=%v", leaseAfterRelease, leaseB.Epoch+1, err)
+		}
+		if err := store.PauseAlertRuleEvaluation(ctx, rule.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ActivateAlertRuleEvaluation(ctx, rule.ID, "native"); err != nil {
+			t.Fatal(err)
+		}
+		leaseAfterPause, err := store.AcquireAlertRuleLease(ctx, rule.ID, "engine-b", time.Minute)
+		if err != nil || leaseAfterPause.Epoch <= leaseAfterRelease.Epoch {
+			t.Fatalf(
+				"re-acquire after pause=%#v want epoch>%d err=%v",
+				leaseAfterPause,
+				leaseAfterRelease.Epoch,
+				err,
+			)
+		}
+		renewed, stale, err := store.RenewAlertRuleLeases(ctx, "engine-b", []AlertRuleLease{
+			leaseAfterPause,
+			{RuleID: rule.ID, OwnerID: "engine-b", Epoch: leaseAfterRelease.Epoch},
+		}, time.Minute)
+		if err != nil || len(renewed) != 1 || len(stale) != 1 ||
+			renewed[0].Epoch != leaseAfterPause.Epoch || stale[0].Epoch != leaseAfterRelease.Epoch {
+			t.Fatalf("batch renew renewed=%#v stale=%#v err=%v", renewed, stale, err)
+		}
 
 		if _, err := store.db.ExecContext(
 			ctx,

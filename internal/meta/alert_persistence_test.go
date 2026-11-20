@@ -2,8 +2,10 @@ package meta
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -371,6 +373,235 @@ func TestSilenceAndInhibitionPersistenceIsProjectScoped(t *testing.T) {
 		policy, err := store.AlertPolicySnapshot(ctx, silences[0].ProjectID, now)
 		if err != nil || len(policy.Silences) != 1 || len(policy.InhibitionRules) != 1 {
 			t.Fatalf("alpha policy=%+v err=%v", policy, err)
+		}
+	})
+}
+
+func TestUpdateAlertRuleResetsStateAndFencesInFlightEvaluation(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		if _, err := store.CreateProject(ctx, "Fence", "fence"); err != nil {
+			t.Fatal(err)
+		}
+		rule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug: "fence", Name: "HighErr", Signal: "metrics", Expression: "up == 0", For: "0s",
+			Severity: "critical",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.HeartbeatAlertEngine(ctx, "engine-a", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireAlertRuleLease(ctx, rule.ID, "engine-a", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		state := AlertRuleState{
+			RuleID: rule.ID, Fingerprint: "fp-a", Status: "firing", FiringSince: &now, LastEvaluatedAt: now,
+			Labels: map[string]string{"alertname": "HighErr"}, Annotations: map[string]string{},
+		}
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID: rule.ID, MemberID: "engine-a", LeaseEpoch: lease.Epoch, States: []AlertRuleState{state},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Updating expression must clear alert_rule_states, resolve firing
+		// alert_events, and advance the lease epoch to fence in-flight commits.
+		newExpr := "up == 2"
+		if _, err := store.UpdateAlertRule(ctx, "fence", rule.ID, AlertRuleUpdate{Expression: &newExpr}); err != nil {
+			t.Fatal(err)
+		}
+		states, err := store.AlertRuleStates(ctx, rule.ID)
+		if err != nil || len(states) != 0 {
+			t.Fatalf("states after expr change=%#v err=%v", states, err)
+		}
+		events, err := store.ListAlertEvents(ctx, "fence", "", nil)
+		if err != nil || len(events) != 1 || events[0].Status != "resolved" {
+			t.Fatalf("events after expr change=%#v err=%v", events, err)
+		}
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID: rule.ID, MemberID: "engine-a", LeaseEpoch: lease.Epoch, States: []AlertRuleState{state},
+		}); !errors.Is(err, ErrStaleRuleFence) {
+			t.Fatalf("in-flight commit after expr update err=%v want ErrStaleRuleFence", err)
+		}
+		nextLease, err := store.AcquireAlertRuleLease(ctx, rule.ID, "engine-a", time.Minute)
+		if err != nil || nextLease.Epoch <= lease.Epoch {
+			t.Fatalf("lease after update=%#v want epoch>%d err=%v", nextLease, lease.Epoch, err)
+		}
+	})
+}
+
+func TestDeleteAlertRuleWithFiringEventsSucceeds(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "DeleteRule", "delete-rule")
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := store.CreateNotificationChannel(ctx, NotificationChannelCreate{
+			Type: "webhook", Name: "del-rule-hook", Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug: project.Slug, Name: "Deletable", Signal: "metrics", Expression: "up == 0", For: "0s",
+			Severity: "warning", ChannelIDs: []int{channel.ID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.HeartbeatAlertEngine(ctx, "engine-del", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireAlertRuleLease(ctx, rule.ID, "engine-del", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		ruleID := rule.ID
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID: rule.ID, MemberID: "engine-del", LeaseEpoch: lease.Epoch,
+			States: []AlertRuleState{{
+				RuleID: rule.ID, Fingerprint: "fp-del", Status: "firing", FiringSince: &now, LastEvaluatedAt: now,
+				Labels: map[string]string{"alertname": "Deletable"}, Annotations: map[string]string{},
+			}},
+			Notifications: []NotificationOutboxEnqueue{{
+				IdempotencyKey: "del-rule-outbox", ProjectID: project.ID, RuleID: &ruleID, ChannelID: channel.ID,
+				Payload: json.RawMessage(`{"status":"firing"}`),
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordNotificationDelivery(ctx, channel.ID, rule.ID, "sent", "", 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DeleteAlertRule(ctx, project.Slug, rule.ID); err != nil {
+			t.Fatalf("DeleteAlertRule with existing alert_events failed: %v", err)
+		}
+		events, err := store.ListAlertEvents(ctx, project.Slug, "", nil)
+		if err != nil || len(events) != 0 {
+			t.Fatalf("events after rule delete=%#v err=%v", events, err)
+		}
+		outbox, err := store.ListNotificationOutbox(ctx, NotificationOutboxListOptions{ProjectID: project.ID})
+		if err != nil || len(outbox) != 1 || outbox[0].RuleID != nil {
+			t.Fatalf("outbox after rule delete=%#v err=%v", outbox, err)
+		}
+	})
+}
+
+func TestPutProjectAlertConfigConcurrentFirstWrite(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "ConcurrentCfg", "concurrent-cfg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := store.CreateNotificationChannel(ctx, NotificationChannelCreate{
+			Type: "webhook", Name: "concurrent-cfg-hook", Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const workers = 6
+		start := make(chan struct{})
+		errs := make(chan error, workers)
+		var wg sync.WaitGroup
+		for i := range workers {
+			wg.Add(1)
+			go func(threshold int) {
+				defer wg.Done()
+				<-start
+				_, putErr := store.PutProjectAlertConfig(ctx, project.ID, ProjectAlertConfigUpdate{
+					NewIssue: true, Regression: true, ErrorRateThresholdPerMinute: threshold + 1,
+					ChannelIDs: []int{channel.ID, channel.ID},
+				})
+				errs <- putErr
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for putErr := range errs {
+			if putErr != nil {
+				t.Fatalf("concurrent PutProjectAlertConfig failed: %v", putErr)
+			}
+		}
+		cfg, err := store.ProjectAlertConfig(ctx, project.ID)
+		if err != nil || len(cfg.ChannelIDs) != 1 || cfg.ChannelIDs[0] != channel.ID {
+			t.Fatalf("final project alert config=%#v err=%v", cfg, err)
+		}
+	})
+}
+
+func TestPlatformErrorRateDurableSpikeRecoveryAndNextCycle(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "Spike", "spike")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.PutProjectAlertConfig(ctx, project.ID, ProjectAlertConfigUpdate{
+			NewIssue: false, Regression: false, ErrorRateThresholdPerMinute: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		t0 := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		window := 5 * time.Minute
+		var fired PlatformErrorSpikeTransition
+		for i := range 6 {
+			tr, err := store.RecordPlatformErrorRate(
+				ctx,
+				project.ID,
+				t0.Add(time.Duration(i)*time.Second),
+				t0.Add(time.Duration(i)*time.Second),
+				window,
+				1,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tr.Transition == "firing" {
+				fired = tr
+			}
+		}
+		if fired.Transition != "firing" || fired.Cycle != 1 {
+			t.Fatalf("first spike transition=%#v want firing cycle=1", fired)
+		}
+		// While still within window, no recovery occurs.
+		recoveries, err := store.CheckPlatformErrorRateRecoveries(ctx, t0.Add(2*time.Minute), window)
+		if err != nil || len(recoveries) != 0 {
+			t.Fatalf("premature recoveries=%#v err=%v", recoveries, err)
+		}
+		// Once window elapses with no new errors, durable state resolves.
+		recoveries, err = store.CheckPlatformErrorRateRecoveries(ctx, t0.Add(6*time.Minute), window)
+		if err != nil || len(recoveries) != 1 || recoveries[0].Cycle != 1 || recoveries[0].ProjectID != project.ID {
+			t.Fatalf("recoveries=%#v err=%v", recoveries, err)
+		}
+		// A second spike advances active_cycle to 2.
+		t1 := t0.Add(10 * time.Minute)
+		var second PlatformErrorSpikeTransition
+		for i := range 6 {
+			tr, err := store.RecordPlatformErrorRate(
+				ctx,
+				project.ID,
+				t1.Add(time.Duration(i)*time.Second),
+				t1.Add(time.Duration(i)*time.Second),
+				window,
+				1,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tr.Transition == "firing" {
+				second = tr
+			}
+		}
+		if second.Transition != "firing" || second.Cycle != 2 {
+			t.Fatalf("second spike transition=%#v want firing cycle=2", second)
 		}
 	})
 }

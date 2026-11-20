@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -280,8 +282,20 @@ func (e *Engine) flush(key string) {
 		return
 	}
 	switch result {
-	case deliverySent, deliverySuppressed:
+	case deliverySent:
 		current.lastSent = e.cfg.Now()
+		for _, a := range alerts {
+			if a.Transient {
+				delete(current.alerts, a.Fingerprint)
+			}
+		}
+		if len(current.alerts) == 0 {
+			delete(e.groups, key)
+			e.updateStormLocked(project)
+		}
+	case deliverySuppressed:
+		// Do not advance lastSent when alerts were silenced so un-silenced
+		// persistent alerts are not delayed for the full repeat interval.
 		for _, a := range alerts {
 			if a.Transient {
 				delete(current.alerts, a.Fingerprint)
@@ -307,7 +321,7 @@ func (e *Engine) deliver(ctx context.Context, n Notification) deliveryResult {
 		if err != nil {
 			return deliveryFailed
 		}
-		kept := n.Alerts[:0]
+		kept := make([]Alert, 0, len(n.Alerts))
 		for _, a := range n.Alerts {
 			if !matchesAny(a.Labels, sets) {
 				kept = append(kept, a)
@@ -324,7 +338,7 @@ func (e *Engine) deliver(ctx context.Context, n Notification) deliveryResult {
 			return deliveryFailed
 		}
 		sources := e.activeAlerts(n.Project)
-		kept := n.Alerts[:0]
+		kept := make([]Alert, 0, len(n.Alerts))
 		for _, a := range n.Alerts {
 			if !IsInhibited(a, sources, rules) {
 				kept = append(kept, a)
@@ -353,6 +367,19 @@ func (e *Engine) activeAlerts(project string) []Alert {
 		}
 	}
 	return out
+}
+
+// Remove drops a group without delivering a resolved notification. It is used
+// when a platform alert configuration is disabled or reset.
+func (e *Engine) Remove(project, rule string) {
+	key := project + "\x00" + rule
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if g := e.groups[key]; g != nil {
+		stopTimer(g.timer)
+		delete(e.groups, key)
+		e.updateStormLocked(project)
+	}
 }
 
 // Reevaluate schedules active groups that have never been sent. It is used
@@ -401,6 +428,35 @@ func matchesAny(labels map[string]string, sets [][]Matcher) bool {
 	return false
 }
 
+// CompileMatcherRegex compiles a Prometheus/Alertmanager matcher regex anchored
+// to match the entire label value (`^(?:...)$`).
+func CompileMatcherRegex(pattern string) (*regexp.Regexp, error) {
+	return regexp.Compile("^(?:" + pattern + ")$")
+}
+
+// ValidateMatchers verifies that a matcher slice is non-empty and every entry
+// has a non-empty label name, supported operator (`=` or `=~`), and valid regex.
+func ValidateMatchers(matchers []Matcher) error {
+	if len(matchers) == 0 {
+		return errors.New("at least one matcher is required")
+	}
+	for i, m := range matchers {
+		if strings.TrimSpace(m.Name) == "" {
+			return fmt.Errorf("matcher %d name is required", i)
+		}
+		switch strings.TrimSpace(m.Op) {
+		case "=":
+		case "=~":
+			if _, err := CompileMatcherRegex(m.Value); err != nil {
+				return fmt.Errorf("matcher %d regex %q is invalid: %w", i, m.Value, err)
+			}
+		default:
+			return fmt.Errorf("matcher %d operator %q is unsupported", i, m.Op)
+		}
+	}
+	return nil
+}
+
 func MatchLabels(labels map[string]string, matchers []Matcher) bool {
 	for _, m := range matchers {
 		value, ok := labels[m.Name]
@@ -413,7 +469,7 @@ func MatchLabels(labels map[string]string, matchers []Matcher) bool {
 				return false
 			}
 		case "=~":
-			re, err := regexp.Compile(m.Value)
+			re, err := CompileMatcherRegex(m.Value)
 			if err != nil || !re.MatchString(value) {
 				return false
 			}

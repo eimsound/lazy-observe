@@ -2,9 +2,13 @@ package meta
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"entgo.io/ent/dialect"
 	dbent "github.com/eimsound/lazy-observe/internal/db/ent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/alertevent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/alertrule"
@@ -218,72 +222,155 @@ func (s *Store) AlertRule(ctx context.Context, projectSlug string, id int) (Aler
 }
 
 // UpdateAlertRule applies the caller's domain decision as one persistence
-// result. Rule fields, evaluation authority, channel edges, and firing-event
-// resolution either commit together or all roll back.
+// result. Rule fields, evaluation authority, channel edges, rule state reset,
+// lease epoch bump, and firing-event resolution either commit together or all
+// roll back.
 func (s *Store) UpdateAlertRule(
 	ctx context.Context,
 	projectSlug string,
 	id int,
 	input AlertRuleUpdate,
 ) (AlertRuleView, error) {
-	tx, err := s.client.Tx(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AlertRuleView{}, fmt.Errorf("begin alert rule update: %w", err)
 	}
 	defer tx.Rollback()
 
-	row, err := tx.AlertRule.Query().
-		Where(alertrule.IDEQ(id), alertrule.HasProjectWith(project.SlugEQ(projectSlug))).
-		Only(ctx)
-	if err != nil {
-		return AlertRuleView{}, err
+	selectQuery := `SELECT r.name, r.signal, r.evaluation_engine, r.expr, r."for", r.severity,
+		r.labels, r.annotations, r.enabled
+		FROM alert_rules AS r
+		JOIN projects AS p ON p.id = r.project_id
+		WHERE r.id = ? AND p.slug = ?`
+	if s.dialect == dialect.Postgres {
+		selectQuery += ` FOR UPDATE OF r`
 	}
-	update := row.Update()
+	var (
+		name, signal, evalEngine, expr, forDur, severity string
+		labelsRaw, annotationsRaw                        []byte
+		enabled                                          bool
+	)
+	if err := tx.QueryRowContext(ctx, bind(s.dialect, selectQuery), id, projectSlug).Scan(
+		&name, &signal, &evalEngine, &expr, &forDur, &severity, &labelsRaw, &annotationsRaw, &enabled,
+	); errors.Is(err, sql.ErrNoRows) {
+		return AlertRuleView{}, &NotFoundError{Label: alertrule.Label}
+	} else if err != nil {
+		return AlertRuleView{}, fmt.Errorf("load alert rule for update: %w", err)
+	}
+
+	oldExpr, oldSignal, oldEnabled := expr, signal, enabled
 	if input.Name != nil {
-		update.SetName(*input.Name)
+		name = *input.Name
 	}
 	if input.Signal != nil {
-		update.SetSignal(alertrule.Signal(*input.Signal))
+		signal = *input.Signal
 	}
 	if input.Expression != nil {
-		update.SetExpr(*input.Expression)
+		expr = *input.Expression
 	}
 	if input.For != nil {
-		update.SetFor(*input.For)
+		forDur = *input.For
 	}
 	if input.Severity != nil {
-		update.SetSeverity(*input.Severity)
+		severity = *input.Severity
 	}
 	if input.Labels != nil {
-		update.SetLabels(input.Labels)
+		encoded, marshalErr := json.Marshal(nonNilStringMap(input.Labels))
+		if marshalErr != nil {
+			return AlertRuleView{}, fmt.Errorf("encode alert rule labels: %w", marshalErr)
+		}
+		labelsRaw = encoded
 	}
 	if input.Annotations != nil {
-		update.SetAnnotations(input.Annotations)
+		encoded, marshalErr := json.Marshal(nonNilStringMap(input.Annotations))
+		if marshalErr != nil {
+			return AlertRuleView{}, fmt.Errorf("encode alert rule annotations: %w", marshalErr)
+		}
+		annotationsRaw = encoded
 	}
 	if input.Enabled != nil {
-		update.SetEnabled(*input.Enabled)
-	}
-	if input.ChannelIDs != nil {
-		update.ClearChannels().AddChannelIDs((*input.ChannelIDs)...)
+		enabled = *input.Enabled
 	}
 	if input.EvaluationEngine != nil {
-		update.SetEvaluationEngine(alertrule.EvaluationEngine(*input.EvaluationEngine))
+		evalEngine = *input.EvaluationEngine
 	}
 	if input.ActivateEvaluation {
-		update.SetEvaluationEngine(alertrule.EvaluationEngineNative)
+		evalEngine = string(alertrule.EvaluationEngineNative)
 	}
-	if input.ResolveFiring {
-		if _, err := tx.AlertEvent.Update().
-			Where(alertevent.RuleIDEQ(id), alertevent.StatusEQ(alertevent.StatusFiring)).
-			SetStatus(alertevent.StatusResolved).
-			SetInhibited(false).
-			SetEndsAt(time.Now().UTC()).
-			Save(ctx); err != nil {
-			return AlertRuleView{}, fmt.Errorf("resolve alert rule events: %w", err)
+
+	resetState := input.ResolveFiring || expr != oldExpr || signal != oldSignal || enabled != oldEnabled
+	if _, err := tx.ExecContext(
+		ctx,
+		bind(
+			s.dialect,
+			`UPDATE alert_rules SET name = ?, signal = ?, evaluation_engine = ?, expr = ?, "for" = ?,
+				severity = ?, labels = ?, annotations = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+			 WHERE id = ?`,
+		),
+		name, signal, evalEngine, expr, forDur, severity, string(labelsRaw), string(annotationsRaw), enabled, id,
+	); err != nil {
+		return AlertRuleView{}, fmt.Errorf("update alert rule: %w", err)
+	}
+	if input.ChannelIDs != nil {
+		if _, err := tx.ExecContext(
+			ctx,
+			bind(s.dialect, `DELETE FROM alert_rule_channels WHERE alert_rule_id = ?`),
+			id,
+		); err != nil {
+			return AlertRuleView{}, fmt.Errorf("clear alert rule channels: %w", err)
+		}
+		seen := make(map[int]struct{}, len(*input.ChannelIDs))
+		for _, channelID := range *input.ChannelIDs {
+			if _, dup := seen[channelID]; dup {
+				continue
+			}
+			seen[channelID] = struct{}{}
+			if _, err := tx.ExecContext(
+				ctx,
+				bind(
+					s.dialect,
+					`INSERT INTO alert_rule_channels(alert_rule_id, notification_channel_id) VALUES (?, ?)`,
+				),
+				id,
+				channelID,
+			); err != nil {
+				return AlertRuleView{}, fmt.Errorf("link alert rule channel %d: %w", channelID, err)
+			}
 		}
 	}
-	if _, err := update.Save(ctx); err != nil {
-		return AlertRuleView{}, fmt.Errorf("update alert rule: %w", err)
+	if resetState {
+		// Advance the fencing epoch and soft-expire any active lease so an
+		// in-flight evaluation of the old expression cannot commit back stale
+		// state after this update commits (locked after alert_rules to match
+		// CommitNativeAlertEvaluation lock order).
+		if _, err := tx.ExecContext(
+			ctx,
+			s.alertClockSQL(
+				`UPDATE alert_rule_leases SET owner_id = '', epoch = epoch + 1, expires_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE rule_id = ?`,
+			),
+			id,
+		); err != nil {
+			return AlertRuleView{}, fmt.Errorf("fence alert rule lease on update: %w", err)
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			bind(s.dialect, `DELETE FROM alert_rule_states WHERE rule_id = ?`),
+			id,
+		); err != nil {
+			return AlertRuleView{}, fmt.Errorf("reset alert rule states: %w", err)
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			bind(
+				s.dialect,
+				`UPDATE alert_events SET status = 'resolved', inhibited = FALSE, ends_at = ?, updated_at = CURRENT_TIMESTAMP
+				 WHERE rule_id = ? AND status = 'firing'`,
+			),
+			time.Now().UTC(),
+			id,
+		); err != nil {
+			return AlertRuleView{}, fmt.Errorf("resolve alert rule events: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return AlertRuleView{}, fmt.Errorf("commit alert rule update: %w", err)
@@ -292,13 +379,35 @@ func (s *Store) UpdateAlertRule(
 }
 
 func (s *Store) DeleteAlertRule(ctx context.Context, projectSlug string, id int) error {
-	row, err := s.client.AlertRule.Query().
-		Where(alertrule.IDEQ(id), alertrule.HasProjectWith(project.SlugEQ(projectSlug))).
-		Only(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin alert rule delete: %w", err)
 	}
-	return s.client.AlertRule.DeleteOne(row).Exec(ctx)
+	defer tx.Rollback()
+	var found int
+	if err := tx.QueryRowContext(
+		ctx,
+		bind(
+			s.dialect,
+			`SELECT r.id FROM alert_rules AS r JOIN projects AS p ON p.id = r.project_id WHERE r.id = ? AND p.slug = ?`,
+		),
+		id,
+		projectSlug,
+	).Scan(&found); errors.Is(err, sql.ErrNoRows) {
+		return &NotFoundError{Label: alertrule.Label}
+	} else if err != nil {
+		return fmt.Errorf("lookup alert rule for delete: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM alert_events WHERE rule_id = ?`), id); err != nil {
+		return fmt.Errorf("delete alert rule events: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM alert_rules WHERE id = ?`), id); err != nil {
+		return fmt.Errorf("delete alert rule: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit alert rule delete: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) alertRuleByID(ctx context.Context, id int) (AlertRuleView, error) {

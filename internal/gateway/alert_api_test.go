@@ -482,3 +482,190 @@ func TestChannelCredentialsRedactedAndSSRFBlocked(t *testing.T) {
 		}
 	}
 }
+
+func TestAlertAPIValidationDeleteAndChannelPatchNormalization(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	if _, err := store.CreateProject(ctx, "Validate", "validate"); err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "val-admin", "password", "admin")
+	alerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
+	t.Cleanup(alerts.Close)
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	doReq := func(method, path string, payload any) (*http.Response, []byte) {
+		t.Helper()
+		var body io.Reader
+		if payload != nil {
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = bytes.NewReader(raw)
+		}
+		req := httptest.NewRequest(method, path, body)
+		req.AddCookie(admin)
+		req.Header.Set("X-LO-Project", "validate")
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := gw.App().Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		out, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, out
+	}
+
+	// 1. Invalid evaluation_engine and invalid `for` duration must return 400 (not 500).
+	for _, payload := range []map[string]any{
+		{"name": "BadEngine", "expr": "up == 0", "evaluation_engine": "vmalert"},
+		{"name": "BadFor", "expr": "up == 0", "for": "not-a-duration"},
+	} {
+		resp, body := doReq(http.MethodPost, "/api/alert-rules", payload)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST /api/alert-rules %v status=%d want 400 body=%s", payload["name"], resp.StatusCode, body)
+		}
+	}
+
+	// Create valid rule, attach firing alert_event, verify PATCH rejects bad `for`/`evaluation_engine`,
+	// and verify DELETE succeeds with 204 even while alert_events exist.
+	resp, ruleBody := doReq(http.MethodPost, "/api/alert-rules", map[string]any{
+		"name": "ValidRule", "expr": "up == 0", "for": "1m",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create valid rule status=%d body=%s", resp.StatusCode, ruleBody)
+	}
+	var createdRule alertRuleResponse
+	if err := json.Unmarshal(ruleBody, &createdRule); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := doReq(http.MethodPatch, "/api/alert-rules/"+createdRule.ID, map[string]any{"for": "bad-dur"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH bad for status=%d want 400 body=%s", resp.StatusCode, body)
+	}
+	resp, body = doReq(
+		http.MethodPatch,
+		"/api/alert-rules/"+createdRule.ID,
+		map[string]any{"evaluation_engine": "legacy"},
+	)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH bad evaluation_engine status=%d want 400 body=%s", resp.StatusCode, body)
+	}
+	numRuleID, _ := strconv.Atoi(createdRule.ID)
+	if _, err := store.CreateAlertEvent(ctx, meta.AlertEventCreate{
+		RuleID:      numRuleID,
+		Fingerprint: "del-fp",
+		Status:      "firing",
+		Labels: map[string]string{
+			"alertname": "ValidRule",
+		},
+		Annotations: map[string]string{},
+		StartsAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp, body = doReq(http.MethodDelete, "/api/alert-rules/"+createdRule.ID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE rule with firing event status=%d want 204 body=%s", resp.StatusCode, body)
+	}
+
+	// 2. Silence create & update validate matchers, regex syntax, and time windows.
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, badSilence := range []map[string]any{
+		{
+			"matchers":  []map[string]string{{"name": "", "op": "=", "value": "x"}},
+			"starts_at": now, "ends_at": now.Add(time.Hour),
+		},
+		{
+			"matchers":  []map[string]string{{"name": "alertname", "op": "=~", "value": "[invalid"}},
+			"starts_at": now, "ends_at": now.Add(time.Hour),
+		},
+		{
+			"matchers":  []map[string]string{{"name": "alertname", "op": "!=", "value": "x"}},
+			"starts_at": now, "ends_at": now.Add(time.Hour),
+		},
+	} {
+		resp, body = doReq(http.MethodPost, "/api/silences", badSilence)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST invalid silence status=%d want 400 body=%s", resp.StatusCode, body)
+		}
+	}
+	resp, silBody := doReq(http.MethodPost, "/api/silences", map[string]any{
+		"matchers":  []map[string]string{{"name": "alertname", "op": "=~", "value": "High.*"}},
+		"starts_at": now, "ends_at": now.Add(time.Hour), "comment": "ok",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST valid silence status=%d body=%s", resp.StatusCode, silBody)
+	}
+	var createdSilence silenceResponse
+	if err := json.Unmarshal(silBody, &createdSilence); err != nil {
+		t.Fatal(err)
+	}
+	for _, badPatch := range []map[string]any{
+		{"matchers": []map[string]string{}},
+		{"matchers": []map[string]string{{"name": "alertname", "op": "=~", "value": "(unclosed"}}},
+		{"starts_at": now.Add(2 * time.Hour)},
+		{"ends_at": now.Add(-time.Minute)},
+	} {
+		resp, body = doReq(http.MethodPatch, "/api/silences/"+createdSilence.ID, badPatch)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("PATCH invalid silence %v status=%d want 400 body=%s", badPatch, resp.StatusCode, body)
+		}
+	}
+
+	// 3. PATCH /api/channels/:id omitting `type` still normalizes smtp_host/smtp_port
+	//    and enforces SSRF validation.
+	resp, smtpBody := doReq(http.MethodPost, "/api/channels", map[string]any{
+		"type": "smtp",
+		"name": "patch-smtp",
+		"config": map[string]any{
+			"host": "smtp.example.com", "port": "587", "from": "a@example.com", "to": "b@example.com",
+		},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create smtp channel status=%d body=%s", resp.StatusCode, smtpBody)
+	}
+	var smtpCh notificationChannelResponse
+	if err := json.Unmarshal(smtpBody, &smtpCh); err != nil {
+		t.Fatal(err)
+	}
+	// Omitting `type` with loopback smtp_host must be normalized and rejected (400).
+	resp, body = doReq(http.MethodPatch, "/api/channels/"+smtpCh.ID, map[string]any{
+		"config": map[string]any{
+			"smtp_host": "127.0.0.1", "smtp_port": "25", "from": "a@example.com", "to": "b@example.com",
+		},
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH smtp channel without type (loopback) status=%d want 400 body=%s", resp.StatusCode, body)
+	}
+	// Omitting `type` with valid public smtp_host normalizes to `host`/`port`.
+	resp, patchedBody := doReq(http.MethodPatch, "/api/channels/"+smtpCh.ID, map[string]any{
+		"config": map[string]any{
+			"smtp_host": "mail.example.com", "smtp_port": "465", "from": "a@example.com", "to": "b@example.com",
+		},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH smtp channel without type (valid) status=%d body=%s", resp.StatusCode, patchedBody)
+	}
+	var patchedCh notificationChannelResponse
+	if err := json.Unmarshal(patchedBody, &patchedCh); err != nil {
+		t.Fatal(err)
+	}
+	if patchedCh.Config["host"] != "mail.example.com" || patchedCh.Config["port"] != "465" {
+		t.Fatalf("smtp_host/smtp_port not normalized on typeless PATCH: %#v", patchedCh.Config)
+	}
+	if _, leaked := patchedCh.Config["smtp_host"]; leaked {
+		t.Fatalf("legacy smtp_host leaked after typeless PATCH: %#v", patchedCh.Config)
+	}
+}

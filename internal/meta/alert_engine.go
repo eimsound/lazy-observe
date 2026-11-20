@@ -195,7 +195,9 @@ func (s *Store) PauseAlertRuleEvaluation(ctx context.Context, ruleID int) error 
 	}
 	if _, err := tx.ExecContext(
 		ctx,
-		bind(s.dialect, `DELETE FROM alert_rule_leases WHERE rule_id = ?`),
+		s.alertClockSQL(
+			`UPDATE alert_rule_leases SET owner_id = '', epoch = epoch + 1, expires_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE rule_id = ?`,
+		),
 		ruleID,
 	); err != nil {
 		return fmt.Errorf("revoke alert rule lease: %w", err)
@@ -262,10 +264,66 @@ func (s *Store) RenewAlertRuleLease(
 	return lease, nil
 }
 
+func (s *Store) RenewAlertRuleLeases(
+	ctx context.Context,
+	memberID string,
+	leases []AlertRuleLease,
+	ttl time.Duration,
+) (renewed []AlertRuleLease, stale []AlertRuleLease, err error) {
+	if err := validateAlertEngineMember(memberID, ttl); err != nil {
+		return nil, nil, err
+	}
+	if len(leases) == 0 {
+		return nil, nil, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin batch alert rule lease renewal: %w", err)
+	}
+	defer tx.Rollback()
+	expiry, expiryArg := s.alertLeaseExpiry(ttl)
+	query := s.alertClockSQL(
+		`UPDATE alert_rule_leases SET expires_at = ` + expiry + `, updated_at = CURRENT_TIMESTAMP
+		WHERE rule_id = ? AND owner_id = ? AND epoch = ? AND expires_at > CURRENT_TIMESTAMP
+		AND EXISTS (SELECT 1 FROM alert_engine_members WHERE member_id = ? AND expires_at > CURRENT_TIMESTAMP)
+		RETURNING rule_id, owner_id, epoch, expires_at, updated_at`,
+	)
+	for _, candidate := range leases {
+		if candidate.RuleID <= 0 || candidate.Epoch <= 0 {
+			stale = append(stale, candidate)
+			continue
+		}
+		var updated AlertRuleLease
+		scanErr := tx.QueryRowContext(
+			ctx,
+			query,
+			expiryArg,
+			candidate.RuleID,
+			memberID,
+			candidate.Epoch,
+			memberID,
+		).Scan(&updated.RuleID, &updated.OwnerID, &updated.Epoch, &updated.ExpiresAt, &updated.UpdatedAt)
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			stale = append(stale, candidate)
+			continue
+		}
+		if scanErr != nil {
+			return nil, nil, fmt.Errorf("renew alert rule lease %d: %w", candidate.RuleID, scanErr)
+		}
+		renewed = append(renewed, updated)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit batch alert rule lease renewal: %w", err)
+	}
+	return renewed, stale, nil
+}
+
 func (s *Store) ReleaseAlertRuleLease(ctx context.Context, ruleID int, memberID string, epoch int64) (bool, error) {
 	result, err := s.db.ExecContext(
 		ctx,
-		bind(s.dialect, `DELETE FROM alert_rule_leases WHERE rule_id = ? AND owner_id = ? AND epoch = ?`),
+		s.alertClockSQL(
+			`UPDATE alert_rule_leases SET owner_id = '', expires_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE rule_id = ? AND owner_id = ? AND epoch = ?`,
+		),
 		ruleID,
 		memberID,
 		epoch,

@@ -139,7 +139,7 @@ CREATE TABLE alert_events (
     updated_at TIMESTAMPTZ NOT NULL,
     rule_id INTEGER NOT NULL,
     CONSTRAINT alert_events_alert_rules_events
-        FOREIGN KEY (rule_id) REFERENCES alert_rules (id) ON DELETE NO ACTION
+        FOREIGN KEY (rule_id) REFERENCES alert_rules (id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX alert_events_fingerprint_rule ON alert_events (fingerprint, rule_id);
 CREATE INDEX alert_events_status ON alert_events (status);
@@ -465,3 +465,26 @@ CREATE TABLE platform_key_fingerprints (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+
+CREATE TABLE platform_error_rate_buckets (
+    project_id INTEGER NOT NULL,
+    bucket_epoch BIGINT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+    PRIMARY KEY (project_id, bucket_epoch),
+    CONSTRAINT platform_error_rate_buckets_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+
+CREATE TABLE platform_alert_states (
+    project_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('firing', 'resolved')),
+    active_cycle BIGINT NOT NULL DEFAULT 0 CHECK (active_cycle >= 0),
+    starts_at TIMESTAMPTZ NULL,
+    ends_at TIMESTAMPTZ NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, kind),
+    CONSTRAINT platform_alert_states_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+CREATE INDEX platform_alert_states_kind_status ON platform_alert_states (kind, status);
