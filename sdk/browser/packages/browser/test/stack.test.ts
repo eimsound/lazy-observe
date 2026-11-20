@@ -60,4 +60,28 @@ eval code@https://app.example/main.js:20:7`, origin);
   ])("parses Safari %s sample", (_kind, stack, fn, filename) => {
     expect(parseStack(stack, origin)[0]).toMatchObject({ function: fn, filename });
   });
+
+  it("preserves Firefox/Safari function frames ending in Error while skipping Chrome Error header lines", () => {
+    const firefox = parseStack(`handleError@https://app.example/app.js:42:13
+onError@https://app.example/handler.js:18:5`, origin);
+    expect(firefox).toEqual([
+      { function: "onError", filename: "https://app.example/handler.js", lineno: 18, colno: 5, in_app: true },
+      { function: "handleError", filename: "https://app.example/app.js", lineno: 42, colno: 13, in_app: true },
+    ]);
+
+    const chrome = parseStack(`TypeError: invalid user@example.com:8080
+    at handleError (https://app.example/app.js:42:13)`, origin);
+    expect(chrome).toEqual([
+      { function: "handleError", filename: "https://app.example/app.js", lineno: 42, colno: 13, in_app: true },
+    ]);
+  });
+
+  it("places line-only frames into lineno rather than colno", () => {
+    const frames = parseStack(`submit@https://app.example/form.js:42
+    at run (https://app.example:8443/app.js:19)`, origin);
+    expect(frames).toEqual([
+      { function: "run", filename: "https://app.example:8443/app.js", lineno: 19, colno: undefined, in_app: false },
+      { function: "submit", filename: "https://app.example/form.js", lineno: 42, colno: undefined, in_app: true },
+    ]);
+  });
 });

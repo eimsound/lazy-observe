@@ -1,4 +1,5 @@
-import { gzipSync } from "node:zlib";
+import { gzip } from "node:zlib";
+import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
 import { Session } from "node:inspector";
 import {
@@ -12,13 +13,16 @@ import {
 } from "pprof-format";
 import {
   DeliveryQueue,
+  parseRetryAfterMs,
+  TransportError,
   type DeliveryCloseOptions,
   type DeliveryDrop,
 } from "./delivery.js";
 
+const gzipAsync = promisify(gzip);
 const CPU_WINDOW_MS = 10_000;
 const CPU_PERIOD_NANOS = 1_000_000;
-const MAX_COLLECTION_BACKOFF_MS = 15 * 60_000;
+export const MAX_COLLECTION_BACKOFF_MS: number = 15 * 60_000;
 
 export interface V8CallFrame {
   functionName: string;
@@ -197,10 +201,18 @@ interface CollectedProfile {
   start: Date;
   end: Date;
   data: Uint8Array;
+  compressed?: Buffer;
 }
 
 export function createProfileUploadID(): string {
   return randomBytes(16).toString("hex");
+}
+
+export function computeCollectionDelay(intervalMs: number, elapsedMs: number, failures: number): number {
+  if (failures > 0) {
+    return Math.min(MAX_COLLECTION_BACKOFF_MS, intervalMs * (2 ** Math.min(failures, 8)));
+  }
+  return Math.max(0, intervalMs - elapsedMs);
 }
 
 function post(session: Session, method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -227,8 +239,9 @@ async function upload(
   collected: CollectedProfile,
   signal: AbortSignal,
 ): Promise<void> {
+  const compressed = collected.compressed ?? (collected.compressed = await gzipAsync(collected.data));
   const form = new FormData();
-  form.append("profile", new Blob([gzipSync(collected.data)], { type: "application/octet-stream" }), "profile.pb.gz");
+  form.append("profile", new Blob([new Uint8Array(compressed)], { type: "application/octet-stream" }), "profile.pb.gz");
   form.append("upload_id", collected.uploadId);
   form.append("type", collected.type);
   form.append("service", options.service);
@@ -241,10 +254,21 @@ async function upload(
     body: form,
     signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
   });
-  if (!response.ok) throw new Error(`profile export failed: HTTP ${response.status}`);
+  if (!response.ok) {
+    throw new TransportError(
+      response.status,
+      `profile export failed: HTTP ${response.status}`,
+      parseRetryAfterMs(response.headers.get("retry-after")),
+    );
+  }
 }
 
-async function collect(session: Session, signal: AbortSignal): Promise<CollectedProfile[]> {
+async function collect(
+  session: Session,
+  signal: AbortSignal,
+  cpuWindowMs: number = CPU_WINDOW_MS,
+): Promise<CollectedProfile[]> {
+  if (signal.aborted) return [];
   const start = new Date();
   let cpuStarted = false;
   let heapStarted = false;
@@ -253,10 +277,14 @@ async function collect(session: Session, signal: AbortSignal): Promise<Collected
     heapStarted = true;
     await post(session, "Profiler.start");
     cpuStarted = true;
-    await wait(CPU_WINDOW_MS, signal);
+    await wait(cpuWindowMs, signal);
+    // Abort during the sampling window: stop inspector cleanly in finally and do not emit
+    // a truncated shutdown sample.
+    if (signal.aborted) return [];
     const cpuResult = await post(session, "Profiler.stop");
     cpuStarted = false;
     const cpuEnd = new Date();
+    if (signal.aborted) return [];
     const heapResult = await post(session, "HeapProfiler.stopSampling");
     heapStarted = false;
     const heapEnd = new Date();
@@ -282,9 +310,20 @@ async function collect(session: Session, signal: AbortSignal): Promise<Collected
   }
 }
 
-export function startProfiling(options: ProfilingOptions): (closeOptions?: DeliveryCloseOptions) => Promise<void> {
+export interface ProfilingTestHooks {
+  cpuWindowMs?: number;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+export function startProfiling(
+  options: ProfilingOptions,
+  hooks: ProfilingTestHooks = {},
+): (closeOptions?: DeliveryCloseOptions) => Promise<void> {
   const session = new Session();
   const controller = new AbortController();
+  const sleep = hooks.sleep ?? wait;
+  const cpuWindowMs = hooks.cpuWindowMs ?? CPU_WINDOW_MS;
+  let uploadFailures = 0;
   const delivery = new DeliveryQueue<CollectedProfile>({
     capacity: options.queueCapacity,
     batchSize: 1,
@@ -292,12 +331,18 @@ export function startProfiling(options: ProfilingOptions): (closeOptions?: Deliv
     maxAttempts: options.maxAttempts,
     retryInitialMs: options.retryInitialMs,
     retryMaxMs: options.retryMaxMs,
-    send: (profiles, signal) => {
+    send: async (profiles, signal) => {
       const profile = profiles[0];
-      if (!profile) return Promise.resolve();
-      return upload(options, profile, signal);
+      if (!profile) return;
+      await upload(options, profile, signal);
+      uploadFailures = 0;
     },
-    onDrop: options.onDrop,
+    onDrop: (drop) => {
+      if (drop.reason === "retry_exhausted" || drop.reason === "server_rejected") {
+        uploadFailures++;
+      }
+      options.onDrop(drop);
+    },
   });
   let warned = false;
   let stopped = false;
@@ -317,12 +362,13 @@ export function startProfiling(options: ProfilingOptions): (closeOptions?: Deliv
       try { session.disconnect(); } catch { /* disconnected */ }
       return;
     }
-    let failures = 0;
+    let collectFailures = 0;
     while (!controller.signal.aborted) {
       const cycleStart = Date.now();
       let failed = false;
       try {
-        const profiles = await collect(session, controller.signal);
+        const profiles = await collect(session, controller.signal, cpuWindowMs);
+        if (controller.signal.aborted) break;
         for (const profile of profiles) delivery.enqueue(profile);
       } catch (error) {
         if (inspectorUnavailable(error)) {
@@ -331,12 +377,14 @@ export function startProfiling(options: ProfilingOptions): (closeOptions?: Deliv
         }
         failed = true;
       }
-      failures = failed ? failures + 1 : 0;
+      collectFailures = failed ? collectFailures + 1 : 0;
       if (controller.signal.aborted) break;
-      const delay = failures > 0
-        ? Math.min(MAX_COLLECTION_BACKOFF_MS, options.intervalMs * (2 ** Math.min(failures, 8)))
-        : Math.max(0, options.intervalMs - (Date.now() - cycleStart));
-      await wait(delay, controller.signal);
+      const delay = computeCollectionDelay(
+        options.intervalMs,
+        Date.now() - cycleStart,
+        Math.max(collectFailures, uploadFailures),
+      );
+      await sleep(delay, controller.signal);
     }
     try { session.disconnect(); } catch { /* disconnected */ }
   };

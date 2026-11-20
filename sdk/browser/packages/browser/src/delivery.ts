@@ -1,4 +1,6 @@
-export type DeliveryDropReason = "queue_full" | "retry_exhausted" | "shutdown_budget";
+import { isServerRejection, MAX_RETRY_AFTER_MS, TransportError } from "./transport";
+
+export type DeliveryDropReason = "queue_full" | "retry_exhausted" | "shutdown_budget" | "server_rejected";
 
 export interface DeliveryDrop {
   reason: DeliveryDropReason;
@@ -23,14 +25,22 @@ export interface DeliveryQueueOptions<T> {
   maxAttempts: number;
   retryInitialMs: number;
   retryMaxMs: number;
+  maxRetryAfterMs?: number;
   send: (batch: T[], options: DeliverySendOptions) => Promise<void>;
   wait?: (delayMs: number) => Promise<void>;
   onDrop?: (drop: DeliveryDrop) => void;
+  isNonRetryable?: (error: unknown) => boolean;
+  retryAfterMs?: (error: unknown) => number | undefined;
+  random?: () => number;
 }
 
 export class DeliveryQueue<T> {
   private readonly items: T[] = [];
   private readonly wait: (delayMs: number) => Promise<void>;
+  private readonly isNonRetryable: (error: unknown) => boolean;
+  private readonly retryAfterMs: (error: unknown) => number | undefined;
+  private readonly random: () => number;
+  private readonly maxRetryAfterMs: number;
   private timer?: ReturnType<typeof setTimeout>;
   private running?: Promise<void>;
   private resident = 0;
@@ -52,6 +62,10 @@ export class DeliveryQueue<T> {
       throw new Error("delivery timing values cannot be negative");
     }
     this.wait = options.wait ?? waitForRetry;
+    this.isNonRetryable = options.isNonRetryable ?? isServerRejection;
+    this.retryAfterMs = options.retryAfterMs ?? defaultRetryAfterMs;
+    this.random = options.random ?? Math.random;
+    this.maxRetryAfterMs = options.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS;
   }
 
   enqueue(item: T): boolean {
@@ -123,13 +137,19 @@ export class DeliveryQueue<T> {
     for (let attempt = 0; attempt < this.options.maxAttempts; attempt++) {
       try {
         await this.options.send(batch, { keepalive });
+        this.lastError = undefined;
         return;
       } catch (error) {
         lastError = error;
+        if (this.isNonRetryable(error)) {
+          this.lastError = error;
+          this.recordDrop({ reason: "server_rejected", count: batch.length, error });
+          return;
+        }
       }
       if (attempt + 1 < this.options.maxAttempts) {
         try {
-          await this.wait(this.retryDelay(attempt));
+          await this.wait(this.retryDelay(attempt, lastError));
         } catch (error) {
           lastError = error;
           break;
@@ -140,9 +160,16 @@ export class DeliveryQueue<T> {
     this.recordDrop({ reason: "retry_exhausted", count: batch.length, error: lastError });
   }
 
-  private retryDelay(retryIndex: number): number {
+  private retryDelay(retryIndex: number, error?: unknown): number {
+    const retryAfter = this.retryAfterMs(error);
+    if (retryAfter !== undefined && Number.isFinite(retryAfter) && retryAfter >= 0) {
+      return Math.min(retryAfter, this.maxRetryAfterMs);
+    }
     const scaled = this.options.retryInitialMs * (2 ** retryIndex);
-    return Math.min(Number.isFinite(scaled) ? scaled : this.options.retryMaxMs, this.options.retryMaxMs);
+    const base = Math.min(Number.isFinite(scaled) ? scaled : this.options.retryMaxMs, this.options.retryMaxMs);
+    if (base <= 0) return 0;
+    const factor = 0.5 + 0.5 * Math.min(1, Math.max(0, this.random()));
+    return Math.round(base * factor);
   }
 
   private recordDrop(drop: DeliveryDrop): void {
@@ -155,6 +182,10 @@ export class DeliveryQueue<T> {
     clearTimeout(this.timer);
     this.timer = undefined;
   }
+}
+
+function defaultRetryAfterMs(error: unknown): number | undefined {
+  return error instanceof TransportError ? error.retryAfterMs : undefined;
 }
 
 function waitForRetry(delayMs: number): Promise<void> {

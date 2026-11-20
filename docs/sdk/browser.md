@@ -99,7 +99,7 @@ const client = init({ dsn, fetchTracing: { autoPatch: false } });
 const tracedFetch = client.wrapFetch(window.fetch.bind(window));
 ```
 
-Existing `traceparent` fetch headers are preserved. The wrapper does not create/export browser spans; it creates a sampled W3C context for propagation and error correlation.
+Existing `traceparent` fetch headers are preserved without creating a duplicate client span. When no `traceparent` header is present, the wrapper generates a sampled W3C context for propagation and error correlation and exports a browser client span to `/v1/traces`.
 
 ## Session Replay
 
@@ -168,7 +168,7 @@ Plugin options:
 | `dsn` | unset | Gateway DSN carrying a source map upload token (`los_…`), from a CI secret. Missing or empty: the build prints a warning, uploads nothing and succeeds |
 | `release` | seven-character Git SHA | Release key used for upload and symbolication. Only needed to upload: without a DSN a missing `.git` does not fail the build. With a DSN and no release and no Git checkout, `vite build` fails with `unable to infer release from git; set release explicitly` |
 | `upload` | true | Upload emitted `.map` files after build |
-| `stripSourceMaps` | false | Delete local `.map` files after successful upload |
+| `stripSourceMaps` | false | Delete local `.map` files after successful upload, or when upload is skipped without a DSN (keeps local `.map` files if a configured upload fails) |
 
 Vite defines `__LAZY_OBSERVE_RELEASE__`; pass the same value to browser initialization:
 

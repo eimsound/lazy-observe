@@ -258,11 +258,10 @@ importers:
         version: 0.23.7(typescript@7.0.2)
 
   packages/react:
-    dependencies:
+    devDependencies:
       '@lazy-observe/browser':
         specifier: workspace:*
         version: link:../browser
-    devDependencies:
       '@testing-library/react':
         specifier: ^16.3.3
         version: 16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)

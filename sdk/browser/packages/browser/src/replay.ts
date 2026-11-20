@@ -42,6 +42,8 @@ export interface ReplayDeliveryOptions {
   retryMaxMs?: number;
   wait?: (delayMs: number) => Promise<void>;
   onDrop?: (drop: DeliveryDrop) => void;
+  storage?: Storage;
+  loadRrweb?: () => Promise<typeof import("rrweb")>;
 }
 
 interface ReplaySegment {
@@ -51,11 +53,41 @@ interface ReplaySegment {
   encoded?: Promise<{ body: BodyInit; compressed: boolean }>;
 }
 
+const REPLAY_SEQ_STORAGE_PREFIX = "lazy-observe:replay-seq:";
+
+function replaySeqKey(sessionId: string): string {
+  return `${REPLAY_SEQ_STORAGE_PREFIX}${sessionId}`;
+}
+
+function readPersistedSequence(storage: Storage | undefined, key: string): number {
+  try {
+    const raw = storage?.getItem(key);
+    if (raw == null) return 0;
+    const parsed = Number(raw);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writePersistedSequence(storage: Storage | undefined, key: string, nextSequence: number): void {
+  try {
+    storage?.setItem(key, String(nextSequence));
+  } catch {
+    /* storage unavailable or quota exceeded */
+  }
+}
+
 export class ReplaySegmentDelivery {
   private readonly queue: DeliveryQueue<ReplaySegment>;
-  private nextSequence = 0;
+  private readonly storage?: Storage;
+  private readonly seqKey: string;
+  private nextSequence: number;
 
   constructor(sessionId: string, transport: ReplayTransport, options: ReplayDeliveryOptions = {}) {
+    this.storage = options.storage;
+    this.seqKey = replaySeqKey(sessionId);
+    this.nextSequence = readPersistedSequence(this.storage, this.seqKey);
     this.queue = new DeliveryQueue({
       capacity: options.capacity ?? 10,
       batchSize: 1,
@@ -66,8 +98,11 @@ export class ReplaySegmentDelivery {
       wait: options.wait,
       onDrop: options.onDrop,
       send: async ([segment], sendOptions) => {
-        segment.encoded ??= encodeReplayEvents(segment.events);
-        const encoded = await segment.encoded;
+        // On page unload (keepalive), avoid awaiting async CompressionStream so fetch()
+        // is dispatched synchronously before the browser tears down the event loop.
+        const encoded = sendOptions.keepalive && !segment.encoded
+          ? encodeReplayEventsSync(segment.events)
+          : await (segment.encoded ??= encodeReplayEvents(segment.events));
         await transport.replay(
           sessionId,
           segment.seq,
@@ -82,12 +117,16 @@ export class ReplaySegmentDelivery {
 
   enqueue(events: TimedReplayEvent[], error: boolean): boolean {
     if (!events.length) return true;
+    const seq = Math.max(this.nextSequence, readPersistedSequence(this.storage, this.seqKey));
     const accepted = this.queue.enqueue({
-      seq: this.nextSequence,
+      seq,
       events: [...events],
       error,
     });
-    if (accepted) this.nextSequence++;
+    if (accepted) {
+      this.nextSequence = seq + 1;
+      writePersistedSequence(this.storage, this.seqKey, this.nextSequence);
+    }
     return accepted;
   }
 
@@ -160,11 +199,13 @@ export function buildReplayVitalMarker(sample: ReplayVitalSample): ReplayVitalMa
 export class ReplayController {
   private readonly ring: ReplayRingBuffer<TimedReplayEvent>;
   private readonly sampled: boolean;
+  private readonly loadRrweb: () => Promise<typeof import("rrweb")>;
   private stopRecording?: StopRecording;
   private timer?: ReturnType<typeof setInterval>;
   private addCustomEvent?: (tag: string, payload: unknown) => void;
   private pendingCustomEvents: CustomEvent[] = [];
   private readonly delivery: ReplaySegmentDelivery;
+  private closed = false;
 
   constructor(
     private readonly config: Required<ReplayConfig>,
@@ -174,24 +215,32 @@ export class ReplayController {
   ) {
     this.ring = new ReplayRingBuffer(config.bufferMs, Math.max(config.maxSegmentBytes * 2, 5_000_000));
     this.sampled = !config.onErrorOnly && Math.random() < config.sampleRate;
+    this.loadRrweb = deliveryOptions.loadRrweb ?? (() => import("rrweb"));
     this.delivery = new ReplaySegmentDelivery(sessionId, transport, deliveryOptions);
   }
 
   async start(): Promise<void> {
-    if (typeof window === "undefined") return;
+    if (this.closed || typeof window === "undefined") return;
     if (!this.sampled && !this.config.onErrorFullCapture) return;
-    const rrweb = await import("rrweb");
+    const rrweb = await this.loadRrweb();
+    if (this.closed) return;
     const stop = rrweb.record({
-      emit: (event) => {
-        this.ring.push(event as TimedReplayEvent);
+      emit: (event, isCheckout) => {
+        if (this.closed) return;
+        this.ring.push(event as TimedReplayEvent, Boolean(isCheckout));
         // rrweb rejects addCustomEvent until recording has produced its initial
         // snapshot. Retry queued markers after each recorder emission.
         queueMicrotask(() => this.flushPendingCustomEvents());
         if (this.sampled && this.ring.byteLength >= this.config.maxSegmentBytes) this.scheduleUpload(false, true);
       },
+      checkoutEveryNms: this.config.checkoutEveryNms,
       maskAllInputs: true,
       blockSelector: this.config.blockSelector
     });
+    if (this.closed) {
+      stop?.();
+      return;
+    }
     this.addCustomEvent = rrweb.addCustomEvent;
     if (stop) this.stopRecording = stop;
     this.flushPendingCustomEvents();
@@ -199,6 +248,7 @@ export class ReplayController {
   }
 
   private custom(tag: string, payload: unknown): void {
+    if (this.closed) return;
     if (this.addCustomEvent) {
       try {
         this.addCustomEvent(tag, payload);
@@ -212,7 +262,7 @@ export class ReplayController {
   }
 
   private flushPendingCustomEvents(): void {
-    if (!this.addCustomEvent || !this.pendingCustomEvents.length) return;
+    if (this.closed || !this.addCustomEvent || !this.pendingCustomEvents.length) return;
     const pending = this.pendingCustomEvents;
     this.pendingCustomEvents = [];
     for (let index = 0; index < pending.length; index++) {
@@ -229,6 +279,7 @@ export class ReplayController {
   page(page: string): void { this.custom("lazy-observe:page", { page }); }
 
   error(event: ErrorEventPayload): void {
+    if (this.closed) return;
     this.custom(REPLAY_CUSTOM_EVENT_TAGS.error, {
       timestamp: event.timestamp,
       event_id: event.event_id,
@@ -258,11 +309,23 @@ export class ReplayController {
   }
 
   async close(): Promise<void> {
-    if (this.timer) clearInterval(this.timer);
+    if (this.closed) return;
+    this.closed = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
     this.stopRecording?.();
+    this.stopRecording = undefined;
+    this.addCustomEvent = undefined;
+    this.pendingCustomEvents = [];
     await this.flush();
     await this.delivery.close();
   }
+}
+
+function encodeReplayEventsSync(events: TimedReplayEvent[]): { body: BodyInit; compressed: boolean } {
+  return { body: new TextEncoder().encode(JSON.stringify(events)), compressed: false };
 }
 
 async function encodeReplayEvents(events: TimedReplayEvent[]): Promise<{ body: BodyInit; compressed: boolean }> {
@@ -275,11 +338,14 @@ async function encodeReplayEvents(events: TimedReplayEvent[]): Promise<{ body: B
 export function replayDefaults(config: ReplayConfig = {}): Required<ReplayConfig> {
   const sampleRate = config.sampleRate ?? 0.1;
   if (sampleRate < 0 || sampleRate > 1) throw new Error("replay.sampleRate must be between 0 and 1");
+  const bufferMs = config.bufferMs ?? 60_000;
+  const checkoutEveryNms = config.checkoutEveryNms ?? Math.max(1_000, Math.floor(bufferMs / 2));
   return {
     sampleRate,
     onErrorFullCapture: config.onErrorFullCapture ?? true,
     onErrorOnly: config.onErrorOnly ?? false,
-    bufferMs: config.bufferMs ?? 60_000,
+    bufferMs,
+    checkoutEveryNms,
     flushIntervalMs: config.flushIntervalMs ?? 10_000,
     maxSegmentBytes: config.maxSegmentBytes ?? 500_000,
     blockSelector: config.blockSelector ?? "[data-lo-block]"

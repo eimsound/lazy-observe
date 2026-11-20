@@ -47,6 +47,7 @@ export interface ReplayConfig {
   onErrorFullCapture?: boolean;
   onErrorOnly?: boolean;
   bufferMs?: number;
+  checkoutEveryNms?: number;
   flushIntervalMs?: number;
   maxSegmentBytes?: number;
   blockSelector?: string;

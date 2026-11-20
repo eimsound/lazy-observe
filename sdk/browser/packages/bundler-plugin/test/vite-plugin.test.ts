@@ -105,4 +105,14 @@ describe("vite plugin", () => {
     expect(await build(vite({ dsn: dsnFor(server.origin), release: "r" }), dir, "serve")).toEqual([]);
     expect(server.requests).toHaveLength(0);
   });
+
+  it("strips local maps when stripSourceMaps is true even without a DSN", async () => {
+    const { server, dir } = await setup();
+    const warnings = await build(vite({ release: "vite-1", stripSourceMaps: true }), dir);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/no DSN/);
+    expect(server.requests).toHaveLength(0);
+    await expect(fs.stat(path.join(dir, "assets", "app.js.map"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(dir, "assets", "app.js"))).resolves.toBeTruthy();
+  });
 });

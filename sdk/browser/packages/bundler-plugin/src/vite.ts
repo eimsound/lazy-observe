@@ -1,5 +1,5 @@
 import path from "node:path";
-import { inferRelease, uploadSourceMaps } from "./upload";
+import { inferRelease, stripLocalSourceMaps, uploadSourceMaps } from "./upload";
 
 export interface LazyObservePluginOptions {
   /** 缺失或为空时构建照常成功，只警告并跳过上传（此时也不要求能推断出 release）。 */
@@ -40,7 +40,11 @@ export function vite(options: LazyObservePluginOptions): LazyObserveVitePlugin {
       release = building && options.upload !== false && options.dsn?.trim() ? inferRelease(options.release, root) : undefined;
     },
     async writeBundle() {
-      if (!building || options.upload === false) return;
+      if (!building) return;
+      if (options.upload === false) {
+        if (options.stripSourceMaps) await stripLocalSourceMaps(outputDir);
+        return;
+      }
       await uploadSourceMaps({
         dsn: options.dsn,
         release,

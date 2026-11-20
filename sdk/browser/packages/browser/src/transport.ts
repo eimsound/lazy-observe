@@ -24,9 +24,30 @@ export interface DiagnosticMeasurement {
   dropped: number;
 }
 
+export const MAX_KEEPALIVE_BYTES: number = 60 * 1024;
+export const DEFAULT_TRANSPORT_TIMEOUT_MS: number = 10_000;
+export const MAX_RETRY_AFTER_MS: number = 30_000;
+
+/** Parse an HTTP Retry-After header (delta-seconds or HTTP-date) into milliseconds. */
+export function parseRetryAfterMs(header: string | null | undefined, now = Date.now()): number | undefined {
+  const raw = header?.trim();
+  if (!raw) return undefined;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const seconds = Number(raw);
+    return Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1_000)) : undefined;
+  }
+  const timestamp = Date.parse(raw);
+  if (Number.isFinite(timestamp)) return Math.max(0, timestamp - now);
+  return undefined;
+}
+
 /** A non-2xx ingest response, so callers can tell a refusal from a network failure. */
 export class TransportError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly retryAfterMs?: number,
+  ) {
     super(message);
     this.name = "TransportError";
   }
@@ -44,17 +65,45 @@ export function isServerRejection(error: unknown): boolean {
   return status >= 400 && status < 500;
 }
 
+function bodyByteLength(body: BodyInit): number {
+  if (typeof body === "string") return new TextEncoder().encode(body).byteLength;
+  if (typeof Blob !== "undefined" && body instanceof Blob) return body.size;
+  if (ArrayBuffer.isView(body)) return body.byteLength;
+  if (body instanceof ArrayBuffer) return body.byteLength;
+  return 0;
+}
+
 export class Transport {
-  constructor(private readonly dsn: ParsedDsn, private readonly fetcher: typeof fetch | undefined) {}
+  constructor(
+    private readonly dsn: ParsedDsn,
+    private readonly fetcher: typeof fetch | undefined,
+    private readonly timeoutMs: number = DEFAULT_TRANSPORT_TIMEOUT_MS,
+  ) {}
   private async post(path: string, body: BodyInit, extra: Record<string, string> = {}, keepalive = false): Promise<void> {
     if (!this.fetcher) throw new Error("fetch is unavailable");
-    const response = await this.fetcher(`${this.dsn.endpoint}${path}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${this.dsn.token}`, ...extra },
-      body,
-      keepalive
-    });
-    if (!response.ok) throw new TransportError(response.status, `lazy-observe transport returned ${response.status}`);
+    const effectiveKeepalive = keepalive && bodyByteLength(body) <= MAX_KEEPALIVE_BYTES;
+    let controller: AbortController | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (!effectiveKeepalive && this.timeoutMs > 0 && typeof AbortController !== "undefined") {
+      controller = new AbortController();
+      timer = setTimeout(() => controller?.abort(), this.timeoutMs);
+    }
+    try {
+      const init: RequestInit = {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.dsn.token}`, ...extra },
+        body,
+        keepalive: effectiveKeepalive,
+        ...(controller ? { signal: controller.signal } : {}),
+      };
+      const response = await this.fetcher(`${this.dsn.endpoint}${path}`, init);
+      if (!response.ok) {
+        const retryAfterMs = parseRetryAfterMs(response.headers?.get?.("retry-after"));
+        throw new TransportError(response.status, `lazy-observe transport returned ${response.status}`, retryAfterMs);
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
   errors(events: ErrorEventPayload[], keepalive = false): Promise<void> {
     return this.post("/api/events/errors", JSON.stringify({ events }), { "Content-Type": "application/json" }, keepalive);
@@ -87,8 +136,8 @@ export class Transport {
     };
     return this.post("/v1/traces", JSON.stringify(payload), { "Content-Type": "application/json" }, keepalive);
   }
-  vitals(vitals: VitalPayload[]): Promise<void> {
-    return this.post("/api/events/vitals", JSON.stringify({ vitals }), { "Content-Type": "application/json" });
+  vitals(vitals: VitalPayload[], keepalive = true): Promise<void> {
+    return this.post("/api/events/vitals", JSON.stringify({ vitals }), { "Content-Type": "application/json" }, keepalive);
   }
   diagnostics(measurements: DiagnosticMeasurement[], keepalive = false): Promise<void> {
     return this.post(

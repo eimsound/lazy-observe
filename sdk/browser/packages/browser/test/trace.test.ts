@@ -34,6 +34,9 @@ describe("traceparent", () => {
     expect(shouldTrace("/api", [], "https://app.example")).toBe(true);
     expect(shouldTrace("https://other.example/api", [], "https://app.example")).toBe(false);
     expect(shouldTrace("https://api.example/v1", ["https://api.example/"], "https://app.example")).toBe(true);
+    expect(shouldTrace("https://api.example.evil.com/v1", ["https://api.example"], "https://app.example")).toBe(false);
+    expect(shouldTrace("https://api.example/v1-other", ["https://api.example/v1"], "https://app.example")).toBe(false);
+    expect(shouldTrace("https://api.example/v1/orders", ["https://api.example/v1"], "https://app.example")).toBe(true);
   });
 });
 

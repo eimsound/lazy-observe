@@ -37,7 +37,7 @@ describe(`load smoke on Node ${process.version}`, () => {
   it("require() and import() resolve to the same ESM instance", async () => {
     const { stdout } = await node(["-e", `
       const required = require("${name}");
-      import("${name}").then((imported) => console.log(required.uploadSourceMaps === imported.uploadSourceMaps));
+      import("${name}").then((imported) => console.log(String(required.uploadSourceMaps === imported.uploadSourceMaps)));
     `]);
     expect(stdout.trim()).toBe("true");
   });
