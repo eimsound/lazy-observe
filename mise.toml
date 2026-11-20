@@ -6,7 +6,7 @@ min_version = "2026.10.13"
 # lazy = true：裸 `mise install` 与 `mise run` 不会预装，只有 profile 按名字（`mise install uv`）或
 # 任务/命令真正用到时才装，所以每个 CI job 仍然只装自己那份。
 [tools]
-go = "1.26.11"
+go = "1.27.4"
 node = "26.13.1"
 pnpm = "12.20.0"
 jq = "1.8.2"
