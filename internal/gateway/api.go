@@ -10,7 +10,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/alert"
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const sessionTTL = 7 * 24 * time.Hour
@@ -106,13 +106,13 @@ func userAPITokenJSON(token account.Token) tokenResponse {
 	}
 }
 
-func (g *Gateway) login(c *fiber.Ctx) error {
+func (g *Gateway) login(c fiber.Ctx) error {
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	_ = c.BodyParser(&body)
-	result, err := g.account.Login(c.UserContext(), account.LoginInput{
+	_ = c.Bind().Body(&body)
+	result, err := g.account.Login(c.Context(), account.LoginInput{
 		Username: body.Username, Password: body.Password, SourceIP: c.IP(),
 	})
 	if err != nil {
@@ -122,7 +122,7 @@ func (g *Gateway) login(c *fiber.Ctx) error {
 	if g.requireCSRF {
 		csrf, csrfErr := newCSRFToken()
 		if csrfErr != nil {
-			_, _ = g.account.Logout(c.UserContext(), result.Token, result.User)
+			_, _ = g.account.Logout(c.Context(), result.Token, result.User)
 			return g.loginServiceUnavailable(c, "csrf_token", csrfErr)
 		}
 		c.Cookie(g.buildCSRFCookie(csrf, result.ExpiresAt))
@@ -136,7 +136,7 @@ func (g *Gateway) login(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) loginServiceUnavailable(c *fiber.Ctx, stage string, err error) error {
+func (g *Gateway) loginServiceUnavailable(c fiber.Ctx, stage string, err error) error {
 	if err != nil {
 		g.logger.Error("authentication service unavailable", "stage", stage, "error", err)
 	} else {
@@ -146,7 +146,7 @@ func (g *Gateway) loginServiceUnavailable(c *fiber.Ctx, stage string, err error)
 		JSON(fiber.Map{"code": "service_unavailable", "error": "authentication service unavailable"})
 }
 
-func (g *Gateway) loginError(c *fiber.Ctx, err error) error {
+func (g *Gateway) loginError(c fiber.Ctx, err error) error {
 	switch account.Code(err) {
 	case account.CodeInvalidCredentials:
 		return c.Status(fiber.StatusUnauthorized).
@@ -164,9 +164,9 @@ func (g *Gateway) loginError(c *fiber.Ctx, err error) error {
 	}
 }
 
-func (g *Gateway) me(c *fiber.Ctx) error {
+func (g *Gateway) me(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	full, err := g.account.CurrentUser(c.UserContext(), u.ID)
+	full, err := g.account.CurrentUser(c.Context(), u.ID)
 	if err != nil {
 		return accountAPIError(c, err)
 	}
@@ -177,9 +177,9 @@ func (g *Gateway) me(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) logout(c *fiber.Ctx) error {
+func (g *Gateway) logout(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	facts, err := g.account.Logout(c.UserContext(), c.Cookies("lo_session"), accountUser(u))
+	facts, err := g.account.Logout(c.Context(), c.Cookies("lo_session"), accountUser(u))
 	if err != nil {
 		// The server-side session still exists (ADR 0006): report the failure
 		// and keep the cookie so the client can retry the logout.
@@ -195,9 +195,9 @@ func (g *Gateway) logout(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func (g *Gateway) listCurrentUserTokens(c *fiber.Ctx) error {
+func (g *Gateway) listCurrentUserTokens(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	tokens, err := g.account.ListUserTokens(c.UserContext(), u.ID)
+	tokens, err := g.account.ListUserTokens(c.Context(), u.ID)
 	if err != nil {
 		return accountAPIError(c, err)
 	}
@@ -208,12 +208,12 @@ func (g *Gateway) listCurrentUserTokens(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-func (g *Gateway) createCurrentUserToken(c *fiber.Ctx) error {
+func (g *Gateway) createCurrentUserToken(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	var body struct {
 		Name string `json:"name"`
 	}
-	if c.BodyParser(&body) != nil || strings.TrimSpace(body.Name) == "" {
+	if c.Bind().Body(&body) != nil || strings.TrimSpace(body.Name) == "" {
 		g.auditManagement(
 			c,
 			auditEvent{
@@ -228,7 +228,7 @@ func (g *Gateway) createCurrentUserToken(c *fiber.Ctx) error {
 		return badRequest(c)
 	}
 	name := strings.TrimSpace(body.Name)
-	issued, err := g.account.IssueUserToken(c.UserContext(), accountUser(u), name)
+	issued, err := g.account.IssueUserToken(c.Context(), accountUser(u), name)
 	if err != nil {
 		g.auditAccountFacts(c, account.Facts(err))
 		return accountAPIError(c, err)
@@ -238,7 +238,7 @@ func (g *Gateway) createCurrentUserToken(c *fiber.Ctx) error {
 		JSON(issuedTokenResponse{tokenResponse: userAPITokenJSON(issued.Token), Value: issued.Value})
 }
 
-func (g *Gateway) revokeCurrentUserToken(c *fiber.Ctx) error {
+func (g *Gateway) revokeCurrentUserToken(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	tokenID, ok := pathID(c, "tokenID")
 	if !ok {
@@ -254,7 +254,7 @@ func (g *Gateway) revokeCurrentUserToken(c *fiber.Ctx) error {
 		)
 		return nil
 	}
-	facts, err := g.account.RevokeUserToken(c.UserContext(), accountUser(u), tokenID)
+	facts, err := g.account.RevokeUserToken(c.Context(), accountUser(u), tokenID)
 	g.auditAccountFacts(c, facts)
 	if err != nil {
 		return accountAPIError(c, err)
@@ -262,8 +262,8 @@ func (g *Gateway) revokeCurrentUserToken(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func (g *Gateway) listProjects(c *fiber.Ctx) error {
-	projects, err := g.management.ListProjects(c.UserContext())
+func (g *Gateway) listProjects(c fiber.Ctx) error {
+	projects, err := g.management.ListProjects(c.Context())
 	if err != nil {
 		return managementAPIError(c, err)
 	}
@@ -274,19 +274,19 @@ func (g *Gateway) listProjects(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-func (g *Gateway) getProject(c *fiber.Ctx) error {
+func (g *Gateway) getProject(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
 	}
-	p, err := g.management.GetProject(c.UserContext(), id)
+	p, err := g.management.GetProject(c.Context(), id)
 	if err != nil {
 		return managementAPIError(c, err)
 	}
 	return c.JSON(projectJSON(p))
 }
 
-func (g *Gateway) getProjectAlertConfig(c *fiber.Ctx) error {
+func (g *Gateway) getProjectAlertConfig(c fiber.Ctx) error {
 	if g.alerts == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "alert service unavailable"})
 	}
@@ -294,14 +294,14 @@ func (g *Gateway) getProjectAlertConfig(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	config, err := g.alerts.GetProjectAlertConfig(c.UserContext(), id)
+	config, err := g.alerts.GetProjectAlertConfig(c.Context(), id)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(projectAlertConfigJSON(config))
 }
 
-func (g *Gateway) putProjectAlertConfig(c *fiber.Ctx) error {
+func (g *Gateway) putProjectAlertConfig(c fiber.Ctx) error {
 	if g.alerts == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "alert service unavailable"})
 	}
@@ -310,26 +310,26 @@ func (g *Gateway) putProjectAlertConfig(c *fiber.Ctx) error {
 		return nil
 	}
 	var body projectAlertConfigRequest
-	if c.BodyParser(&body) != nil || body.ErrorRateThresholdPerMinute < 0 {
+	if c.Bind().Body(&body) != nil || body.ErrorRateThresholdPerMinute < 0 {
 		return badRequest(c)
 	}
-	config, err := g.alerts.PutProjectAlertConfig(c.UserContext(), id, body.input())
+	config, err := g.alerts.PutProjectAlertConfig(c.Context(), id, body.input())
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(projectAlertConfigJSON(config))
 }
 
-func (g *Gateway) createProject(c *fiber.Ctx) error {
+func (g *Gateway) createProject(c fiber.Ctx) error {
 	var body struct{ Name, Slug string }
-	if c.BodyParser(&body) != nil {
+	if c.Bind().Body(&body) != nil {
 		g.auditManagementFacts(c, management.AuditFacts{
 			Action: "project.create", TargetType: "project", Success: false, FailureReason: "invalid_request",
 		})
 		return badRequest(c)
 	}
 	p, facts, err := g.management.CreateProject(
-		c.UserContext(),
+		c.Context(),
 		management.CreateProjectInput{Name: body.Name, Slug: body.Slug},
 	)
 	g.auditManagementFacts(c, facts)
@@ -339,7 +339,7 @@ func (g *Gateway) createProject(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(projectJSON(p))
 }
 
-func (g *Gateway) updateProject(c *fiber.Ctx) error {
+func (g *Gateway) updateProject(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -354,8 +354,8 @@ func (g *Gateway) updateProject(c *fiber.Ctx) error {
 		return nil
 	}
 	var body struct{ Name, Slug string }
-	invalid := c.BodyParser(&body) != nil
-	p, facts, err := g.management.UpdateProject(c.UserContext(), management.UpdateProjectInput{
+	invalid := c.Bind().Body(&body) != nil
+	p, facts, err := g.management.UpdateProject(c.Context(), management.UpdateProjectInput{
 		ID: id, Name: body.Name, Slug: body.Slug, Invalid: invalid,
 	})
 	g.auditManagementFacts(c, facts)
@@ -365,7 +365,7 @@ func (g *Gateway) updateProject(c *fiber.Ctx) error {
 	return c.JSON(projectJSON(p))
 }
 
-func (g *Gateway) deleteProject(c *fiber.Ctx) error {
+func (g *Gateway) deleteProject(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -379,7 +379,7 @@ func (g *Gateway) deleteProject(c *fiber.Ctx) error {
 		)
 		return nil
 	}
-	facts, err := g.management.DeleteProject(c.UserContext(), id)
+	facts, err := g.management.DeleteProject(c.Context(), id)
 	g.auditManagementFacts(c, facts)
 	if err != nil {
 		return managementAPIError(c, err)
@@ -387,12 +387,12 @@ func (g *Gateway) deleteProject(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func (g *Gateway) listProjectAPITokens(c *fiber.Ctx) error {
+func (g *Gateway) listProjectAPITokens(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
 	}
-	tokens, err := g.management.ListProjectTokens(c.UserContext(), id)
+	tokens, err := g.management.ListProjectTokens(c.Context(), id)
 	if err != nil {
 		return managementAPIError(c, err)
 	}
@@ -403,7 +403,7 @@ func (g *Gateway) listProjectAPITokens(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-func (g *Gateway) createProjectAPIToken(c *fiber.Ctx) error {
+func (g *Gateway) createProjectAPIToken(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -420,8 +420,8 @@ func (g *Gateway) createProjectAPIToken(c *fiber.Ctx) error {
 	var body struct {
 		Name string `json:"name"`
 	}
-	invalid := len(c.Body()) != 0 && c.BodyParser(&body) != nil
-	issued, facts, err := g.management.IssueProjectToken(c.UserContext(), management.IssueProjectTokenInput{
+	invalid := len(requestBody(c)) != 0 && c.Bind().Body(&body) != nil
+	issued, facts, err := g.management.IssueProjectToken(c.Context(), management.IssueProjectTokenInput{
 		ProjectID: id, Name: body.Name, Invalid: invalid,
 	})
 	g.auditManagementFacts(c, facts)
@@ -434,7 +434,7 @@ func (g *Gateway) createProjectAPIToken(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) revokeProjectAPIToken(c *fiber.Ctx) error {
+func (g *Gateway) revokeProjectAPIToken(c fiber.Ctx) error {
 	projectID, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -452,7 +452,7 @@ func (g *Gateway) revokeProjectAPIToken(c *fiber.Ctx) error {
 	if err != nil || tokenID <= 0 {
 		tokenID = 0
 	}
-	facts, err := g.management.RevokeProjectToken(c.UserContext(), projectID, tokenID)
+	facts, err := g.management.RevokeProjectToken(c.Context(), projectID, tokenID)
 	g.auditManagementFacts(c, facts)
 	if err != nil {
 		return managementAPIError(c, err)
@@ -460,12 +460,12 @@ func (g *Gateway) revokeProjectAPIToken(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func (g *Gateway) listSourceMapUploadTokens(c *fiber.Ctx) error {
+func (g *Gateway) listSourceMapUploadTokens(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
 	}
-	tokens, err := g.management.ListSourceMapUploadTokens(c.UserContext(), id)
+	tokens, err := g.management.ListSourceMapUploadTokens(c.Context(), id)
 	if err != nil {
 		return managementAPIError(c, err)
 	}
@@ -476,7 +476,7 @@ func (g *Gateway) listSourceMapUploadTokens(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-func (g *Gateway) createSourceMapUploadToken(c *fiber.Ctx) error {
+func (g *Gateway) createSourceMapUploadToken(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -493,9 +493,9 @@ func (g *Gateway) createSourceMapUploadToken(c *fiber.Ctx) error {
 	var body struct {
 		Name string `json:"name"`
 	}
-	invalid := len(c.Body()) != 0 && c.BodyParser(&body) != nil
+	invalid := len(requestBody(c)) != 0 && c.Bind().Body(&body) != nil
 	issued, facts, err := g.management.IssueSourceMapUploadToken(
-		c.UserContext(),
+		c.Context(),
 		management.IssueSourceMapUploadTokenInput{ProjectID: id, Name: body.Name, Invalid: invalid},
 	)
 	g.auditManagementFacts(c, facts)
@@ -508,7 +508,7 @@ func (g *Gateway) createSourceMapUploadToken(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) revokeSourceMapUploadToken(c *fiber.Ctx) error {
+func (g *Gateway) revokeSourceMapUploadToken(c fiber.Ctx) error {
 	projectID, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -526,7 +526,7 @@ func (g *Gateway) revokeSourceMapUploadToken(c *fiber.Ctx) error {
 	if err != nil || tokenID <= 0 {
 		tokenID = 0
 	}
-	facts, err := g.management.RevokeSourceMapUploadToken(c.UserContext(), projectID, tokenID)
+	facts, err := g.management.RevokeSourceMapUploadToken(c.Context(), projectID, tokenID)
 	g.auditManagementFacts(c, facts)
 	if err != nil {
 		return managementAPIError(c, err)
@@ -534,35 +534,35 @@ func (g *Gateway) revokeSourceMapUploadToken(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func (g *Gateway) listUsers(c *fiber.Ctx) error {
-	users, err := g.management.ListUsers(c.UserContext())
+func (g *Gateway) listUsers(c fiber.Ctx) error {
+	users, err := g.management.ListUsers(c.Context())
 	if err != nil {
 		return managementAPIError(c, err)
 	}
 	return c.JSON(users)
 }
 
-func (g *Gateway) getUser(c *fiber.Ctx) error {
+func (g *Gateway) getUser(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
 	}
-	u, err := g.management.GetUser(c.UserContext(), id)
+	u, err := g.management.GetUser(c.Context(), id)
 	if err != nil {
 		return managementAPIError(c, err)
 	}
 	return c.JSON(u)
 }
 
-func (g *Gateway) createUser(c *fiber.Ctx) error {
+func (g *Gateway) createUser(c fiber.Ctx) error {
 	var body struct{ Username, Password, Role, DisplayName, Email string }
-	if c.BodyParser(&body) != nil {
+	if c.Bind().Body(&body) != nil {
 		g.auditManagementFacts(c, management.AuditFacts{
 			Action: "user.create", TargetType: "user", Success: false, FailureReason: "invalid_request",
 		})
 		return badRequest(c)
 	}
-	u, facts, err := g.management.CreateUser(c.UserContext(), management.CreateUserInput{
+	u, facts, err := g.management.CreateUser(c.Context(), management.CreateUserInput{
 		Username:    body.Username,
 		Password:    body.Password,
 		Role:        body.Role,
@@ -576,7 +576,7 @@ func (g *Gateway) createUser(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(u)
 }
 
-func (g *Gateway) updateUser(c *fiber.Ctx) error {
+func (g *Gateway) updateUser(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -592,13 +592,13 @@ func (g *Gateway) updateUser(c *fiber.Ctx) error {
 		DisplayName *string `json:"display_name"`
 		Email       *string `json:"email"`
 	}
-	if c.BodyParser(&body) != nil {
+	if c.Bind().Body(&body) != nil {
 		g.auditManagementFacts(c, management.AuditFacts{
 			Action: "user.update", TargetType: "user", TargetID: id, Success: false, FailureReason: "invalid_request",
 		})
 		return badRequest(c)
 	}
-	u, facts, err := g.management.UpdateUser(c.UserContext(), management.UpdateUserInput{
+	u, facts, err := g.management.UpdateUser(c.Context(), management.UpdateUserInput{
 		ID: id, Username: body.Username, Password: body.Password, Role: body.Role,
 		DisplayName: body.DisplayName, Email: body.Email,
 	})
@@ -609,7 +609,7 @@ func (g *Gateway) updateUser(c *fiber.Ctx) error {
 	return c.JSON(u)
 }
 
-func (g *Gateway) deleteUser(c *fiber.Ctx) error {
+func (g *Gateway) deleteUser(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		g.auditManagement(
@@ -618,7 +618,7 @@ func (g *Gateway) deleteUser(c *fiber.Ctx) error {
 		)
 		return nil
 	}
-	facts, err := g.management.DeleteUser(c.UserContext(), id)
+	facts, err := g.management.DeleteUser(c.Context(), id)
 	g.auditManagementFacts(c, facts)
 	if err != nil {
 		return managementAPIError(c, err)
@@ -626,7 +626,7 @@ func (g *Gateway) deleteUser(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func pathID(c *fiber.Ctx, name string) (int, bool) {
+func pathID(c fiber.Ctx, name string) (int, bool) {
 	id, err := strconv.Atoi(c.Params(name))
 	if err != nil || id <= 0 {
 		_ = badRequest(c)
@@ -635,11 +635,11 @@ func pathID(c *fiber.Ctx, name string) (int, bool) {
 	return id, true
 }
 
-func badRequest(c *fiber.Ctx) error {
+func badRequest(c fiber.Ctx) error {
 	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "bad request"})
 }
 
-func apiError(c *fiber.Ctx, err error) error {
+func apiError(c fiber.Ctx, err error) error {
 	if meta.IsNotFound(err) {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 	}
@@ -649,7 +649,7 @@ func apiError(c *fiber.Ctx, err error) error {
 	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
 }
 
-func managementAPIError(c *fiber.Ctx, err error) error {
+func managementAPIError(c fiber.Ctx, err error) error {
 	switch {
 	case management.IsErrorKind(err, management.ErrorInvalidInput):
 		if err.Error() == "bad request" {

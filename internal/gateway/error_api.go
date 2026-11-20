@@ -19,7 +19,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const maxErrorEventSize = 200 << 10
@@ -28,12 +28,12 @@ type errorEnvelope struct {
 	Events []json.RawMessage `json:"events"`
 }
 
-func (g *Gateway) errorsIngest(c *fiber.Ctx) error {
+func (g *Gateway) errorsIngest(c fiber.Ctx) error {
 	if g.errorTracker == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "issue storage unavailable"})
 	}
 	var envelope errorEnvelope
-	if err := json.Unmarshal(c.Body(), &envelope); err != nil || envelope.Events == nil {
+	if err := json.Unmarshal(requestBody(c), &envelope); err != nil || envelope.Events == nil {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid error event batch"})
 	}
 	if len(envelope.Events) > 100 {
@@ -55,7 +55,7 @@ func (g *Gateway) errorsIngest(c *fiber.Ctx) error {
 		accepted[i] = errortrack.AcceptedEvent{Raw: envelope.Events[i], Event: event}
 	}
 	if err := g.errorTracker.Accept(
-		c.UserContext(),
+		c.Context(),
 		errortrack.Project{ID: project.ID, Slug: project.Slug},
 		accepted,
 	); err != nil {
@@ -99,7 +99,7 @@ type vitalInput struct {
 	Timestamp json.RawMessage `json:"timestamp"`
 }
 
-func (g *Gateway) vitalsIngest(c *fiber.Ctx) error {
+func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 	if !g.storage.MetricsIngestEnabled() {
 		return c.Status(fiber.StatusNotImplemented).
 			JSON(fiber.Map{"error": "Web Vitals ingest is disabled: storage.metrics.ingest_url is not configured"})
@@ -107,7 +107,7 @@ func (g *Gateway) vitalsIngest(c *fiber.Ctx) error {
 	var body struct {
 		Vitals []vitalInput `json:"vitals"`
 	}
-	if err := json.Unmarshal(c.Body(), &body); err != nil || body.Vitals == nil {
+	if err := json.Unmarshal(requestBody(c), &body); err != nil || body.Vitals == nil {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid vitals batch"})
 	}
 	project := currentProject(c)
@@ -154,7 +154,7 @@ func (g *Gateway) vitalsIngest(c *fiber.Ctx) error {
 		)
 	}
 	if samples.Len() > 0 {
-		if err := g.importPrometheusSamples(c.UserContext(), samples.String()); err != nil {
+		if err := g.importPrometheusSamples(c.Context(), samples.String()); err != nil {
 			return err
 		}
 	}
@@ -232,7 +232,7 @@ type sdkDiagnosticInput struct {
 	Dropped       int64           `json:"dropped"`
 }
 
-func (g *Gateway) sdkDiagnosticsIngest(c *fiber.Ctx) error {
+func (g *Gateway) sdkDiagnosticsIngest(c fiber.Ctx) error {
 	if !g.storage.MetricsIngestEnabled() {
 		return c.Status(fiber.StatusNotImplemented).
 			JSON(fiber.Map{"error": "SDK diagnostics ingest is disabled: storage.metrics.ingest_url is not configured"})
@@ -240,7 +240,11 @@ func (g *Gateway) sdkDiagnosticsIngest(c *fiber.Ctx) error {
 	var body struct {
 		Measurements []sdkDiagnosticInput `json:"measurements"`
 	}
-	if err := json.Unmarshal(c.Body(), &body); err != nil || body.Measurements == nil || len(body.Measurements) > 100 {
+	if err := json.Unmarshal(
+		requestBody(c),
+		&body,
+	); err != nil || body.Measurements == nil ||
+		len(body.Measurements) > 100 {
 		return c.Status(http.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid SDK diagnostics batch"})
 	}
 	project := currentProject(c)
@@ -301,7 +305,7 @@ func (g *Gateway) sdkDiagnosticsIngest(c *fiber.Ctx) error {
 		)
 	}
 	if samples.Len() > 0 {
-		if err := g.importPrometheusSamples(c.UserContext(), samples.String()); err != nil {
+		if err := g.importPrometheusSamples(c.Context(), samples.String()); err != nil {
 			return err
 		}
 	}
@@ -479,7 +483,7 @@ func issueSummary(row meta.IssueView, trend []int64) issueSummaryDTO {
 	}
 }
 
-func (g *Gateway) listIssues(c *fiber.Ctx) error {
+func (g *Gateway) listIssues(c fiber.Ctx) error {
 	if !g.ensureIssues(c) {
 		return nil
 	}
@@ -493,15 +497,15 @@ func (g *Gateway) listIssues(c *fiber.Ctx) error {
 	}
 	project := currentProject(c)
 	opts := meta.IssueListOptions{Status: status, Level: level, Query: c.Query("q"), Sort: sortBy, Page: page}
-	issues, err := g.issues.ListIssues(c.UserContext(), project.ID, opts)
+	issues, err := g.issues.ListIssues(c.Context(), project.ID, opts)
 	if err != nil {
 		return apiError(c, err)
 	}
-	total, err := g.issues.CountIssues(c.UserContext(), project.ID, opts)
+	total, err := g.issues.CountIssues(c.Context(), project.ID, opts)
 	if err != nil {
 		return apiError(c, err)
 	}
-	trends, err := g.queryIssueTrends(c.UserContext(), project.ID, issues)
+	trends, err := g.queryIssueTrends(c.Context(), project.ID, issues)
 	if err != nil {
 		return fiber.NewError(http.StatusBadGateway, err.Error())
 	}
@@ -512,7 +516,7 @@ func (g *Gateway) listIssues(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"issues": result, "total": total, "page": max(page, 1), "page_size": meta.IssuePageSize})
 }
 
-func (g *Gateway) getIssue(c *fiber.Ctx) error {
+func (g *Gateway) getIssue(c fiber.Ctx) error {
 	if !g.ensureIssues(c) {
 		return nil
 	}
@@ -520,7 +524,7 @@ func (g *Gateway) getIssue(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	row, err := g.issues.GetIssue(c.UserContext(), currentProject(c).ID, id)
+	row, err := g.issues.GetIssue(c.Context(), currentProject(c).ID, id)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -528,7 +532,7 @@ func (g *Gateway) getIssue(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(http.StatusBadGateway, err.Error())
 	}
-	trends, err := g.queryIssueTrends(c.UserContext(), currentProject(c).ID, []meta.IssueView{row})
+	trends, err := g.queryIssueTrends(c.Context(), currentProject(c).ID, []meta.IssueView{row})
 	if err != nil {
 		return fiber.NewError(http.StatusBadGateway, err.Error())
 	}
@@ -547,7 +551,7 @@ func (g *Gateway) getIssue(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) patchIssue(c *fiber.Ctx) error {
+func (g *Gateway) patchIssue(c fiber.Ctx) error {
 	if !g.ensureIssues(c) {
 		return nil
 	}
@@ -558,18 +562,18 @@ func (g *Gateway) patchIssue(c *fiber.Ctx) error {
 	var body struct {
 		Status string `json:"status"`
 	}
-	if json.Unmarshal(c.Body(), &body) != nil ||
+	if json.Unmarshal(requestBody(c), &body) != nil ||
 		(body.Status != "open" && body.Status != "resolved" && body.Status != "ignored") {
 		return badRequest(c)
 	}
-	row, err := g.issues.SetIssueStatus(c.UserContext(), currentProject(c).ID, id, body.Status, g.now().UTC())
+	row, err := g.issues.SetIssueStatus(c.Context(), currentProject(c).ID, id, body.Status, g.now().UTC())
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(issueSummary(row, nil))
 }
 
-func (g *Gateway) batchUpdateIssues(c *fiber.Ctx) error {
+func (g *Gateway) batchUpdateIssues(c fiber.Ctx) error {
 	if !g.ensureIssues(c) {
 		return nil
 	}
@@ -577,12 +581,12 @@ func (g *Gateway) batchUpdateIssues(c *fiber.Ctx) error {
 		IDs    []int  `json:"ids"`
 		Status string `json:"status"`
 	}
-	if json.Unmarshal(c.Body(), &body) != nil || len(body.IDs) == 0 || len(body.IDs) > 500 ||
+	if json.Unmarshal(requestBody(c), &body) != nil || len(body.IDs) == 0 || len(body.IDs) > 500 ||
 		(body.Status != "open" && body.Status != "resolved" && body.Status != "ignored") {
 		return badRequest(c)
 	}
 	updated, err := g.issues.SetIssuesStatus(
-		c.UserContext(),
+		c.Context(),
 		currentProject(c).ID,
 		body.IDs,
 		body.Status,
@@ -594,7 +598,7 @@ func (g *Gateway) batchUpdateIssues(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"updated": updated})
 }
 
-func (g *Gateway) getIssueEvent(c *fiber.Ctx) error {
+func (g *Gateway) getIssueEvent(c fiber.Ctx) error {
 	if !g.ensureIssues(c) {
 		return nil
 	}
@@ -602,7 +606,7 @@ func (g *Gateway) getIssueEvent(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	row, err := g.issues.GetIssue(c.UserContext(), currentProject(c).ID, id)
+	row, err := g.issues.GetIssue(c.Context(), currentProject(c).ID, id)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -616,7 +620,7 @@ func (g *Gateway) getIssueEvent(c *fiber.Ctx) error {
 	return c.JSON(events[0])
 }
 
-func (g *Gateway) ensureIssues(c *fiber.Ctx) bool {
+func (g *Gateway) ensureIssues(c fiber.Ctx) bool {
 	if g.issues == nil {
 		_ = c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "issue storage unavailable"})
 		return false
@@ -624,7 +628,7 @@ func (g *Gateway) ensureIssues(c *fiber.Ctx) bool {
 	return true
 }
 
-func (g *Gateway) queryIssueEvents(c *fiber.Ctx, fingerprint, eventID string, limit int) ([]issueEventDTO, error) {
+func (g *Gateway) queryIssueEvents(c fiber.Ctx, fingerprint, eventID string, limit int) ([]issueEventDTO, error) {
 	query := `_stream:{event_type="error"} AND fingerprint:=` + strconv.Quote(fingerprint)
 	if eventID != "" {
 		query += ` AND event_id:=` + strconv.Quote(eventID)
@@ -636,7 +640,7 @@ func (g *Gateway) queryIssueEvents(c *fiber.Ctx, fingerprint, eventID string, li
 		"query": []string{query},
 		"limit": []string{strconv.Itoa(limit)},
 	}.Encode()
-	req, err := http.NewRequestWithContext(c.UserContext(), http.MethodGet, target, nil)
+	req, err := http.NewRequestWithContext(c.Context(), http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -21,7 +21,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/state"
 	"github.com/eimsound/lazy-observe/internal/symbolicate"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/redis/go-redis/v9"
 )
 

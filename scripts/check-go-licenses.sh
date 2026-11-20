@@ -5,7 +5,13 @@ main_module=$(go list -m -f '{{.Path}}')
 
 reviewed_non_go_packages=$(printf '%s\n' \
   github.com/cespare/xxhash/v2 \
+  github.com/gofiber/utils/v2/simd \
   github.com/golang/snappy \
+  github.com/klauspost/compress/huff0 \
+  github.com/klauspost/compress/internal/cpuinfo \
+  github.com/klauspost/compress/zstd \
+  github.com/klauspost/compress/zstd/internal/xxhash \
+  github.com/molecule-man/go-brrr/internal/encoder \
   github.com/segmentio/asm/ascii \
   github.com/segmentio/asm/base64 \
   github.com/segmentio/asm/keyset \

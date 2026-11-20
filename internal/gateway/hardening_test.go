@@ -54,7 +54,7 @@ func TestGatewayReadTimeoutClosesSlowClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { _ = gw.App().Listener(ln) }()
+	go func() { _ = gw.Serve(ln) }()
 	t.Cleanup(func() { _ = gw.App().Shutdown() })
 
 	conn, err := net.Dial("tcp", ln.Addr().String())

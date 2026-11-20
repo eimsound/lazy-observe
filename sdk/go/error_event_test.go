@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -115,13 +115,13 @@ func TestFiberReportsPanicAndReturnedServerError(t *testing.T) {
 		propagator:     propagation.TraceContext{},
 		errorTransport: newErrorTransport(server.URL, "secret", logger, defaultDeliveryConfig(t), nil),
 	}
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	app.Use(client.Fiber())
-	app.Get("/panic", func(*fiber.Ctx) error { panic("boom") })
-	app.Get("/server-error", func(*fiber.Ctx) error {
+	app.Get("/panic", func(fiber.Ctx) error { panic("boom") })
+	app.Get("/server-error", func(fiber.Ctx) error {
 		return fiber.NewError(http.StatusServiceUnavailable, "upstream unavailable")
 	})
-	app.Get("/client-error", func(*fiber.Ctx) error {
+	app.Get("/client-error", func(fiber.Ctx) error {
 		return fiber.NewError(http.StatusBadRequest, "bad input")
 	})
 
@@ -135,7 +135,7 @@ func TestFiberReportsPanicAndReturnedServerError(t *testing.T) {
 	} {
 		req := httptest.NewRequest(http.MethodGet, test.path, nil)
 		req.Header.Set("traceparent", "00-11111111111111111111111111111111-2222222222222222-01")
-		resp, err := app.Test(req, -1)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 0})
 		if err != nil {
 			t.Fatal(err)
 		}

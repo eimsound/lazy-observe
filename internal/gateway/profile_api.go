@@ -20,7 +20,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	pprofprofile "github.com/google/pprof/profile"
 )
 
@@ -92,7 +92,7 @@ func newProfileListResponse(rows []*meta.ProfileMeta) profileListResponse {
 	return profileListResponse{Profiles: profiles}
 }
 
-func (g *Gateway) profileIngest(c *fiber.Ctx) error {
+func (g *Gateway) profileIngest(c fiber.Ctx) error {
 	if g.profiles == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "profile storage unavailable"})
 	}
@@ -153,7 +153,7 @@ func (g *Gateway) profileIngest(c *fiber.Ctx) error {
 	project := currentProject(c)
 	payloadDigest := sha256.Sum256(data)
 	payloadSHA256 := hex.EncodeToString(payloadDigest[:])
-	existing, err := g.profiles.GetProfileByUploadID(c.UserContext(), project.ID, uploadID)
+	existing, err := g.profiles.GetProfileByUploadID(c.Context(), project.ID, uploadID)
 	if err == nil {
 		return existingProfileUploadResponse(
 			c,
@@ -182,11 +182,11 @@ func (g *Gateway) profileIngest(c *fiber.Ctx) error {
 		start.Unix(),
 		uuid,
 	)
-	if err := g.blobs.Put(c.UserContext(), key, bytes.NewReader(data)); err != nil {
+	if err := g.blobs.Put(c.Context(), key, bytes.NewReader(data)); err != nil {
 		return fiber.NewError(http.StatusInternalServerError, "store profile blob")
 	}
 	row, err := g.profiles.CreateProfileMeta(
-		c.UserContext(),
+		c.Context(),
 		project.ID,
 		service,
 		profileType,
@@ -199,8 +199,8 @@ func (g *Gateway) profileIngest(c *fiber.Ctx) error {
 		labels,
 	)
 	if err != nil {
-		_ = g.blobs.Delete(c.UserContext(), key)
-		existing, lookupErr := g.profiles.GetProfileByUploadID(c.UserContext(), project.ID, uploadID)
+		_ = g.blobs.Delete(c.Context(), key)
+		existing, lookupErr := g.profiles.GetProfileByUploadID(c.Context(), project.ID, uploadID)
 		if lookupErr == nil {
 			return existingProfileUploadResponse(
 				c,
@@ -220,7 +220,7 @@ func (g *Gateway) profileIngest(c *fiber.Ctx) error {
 }
 
 func existingProfileUploadResponse(
-	c *fiber.Ctx,
+	c fiber.Ctx,
 	existing *meta.ProfileMeta,
 	service string,
 	profileType meta.ProfileType,
@@ -246,11 +246,11 @@ func validProfileUploadID(value string) bool {
 	return err == nil
 }
 
-func (g *Gateway) listProfileServices(c *fiber.Ctx) error {
+func (g *Gateway) listProfileServices(c fiber.Ctx) error {
 	if g.profiles == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "profile storage unavailable"})
 	}
-	services, err := g.profiles.ListProfileServices(c.UserContext(), currentProject(c).ID)
+	services, err := g.profiles.ListProfileServices(c.Context(), currentProject(c).ID)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -260,7 +260,7 @@ func (g *Gateway) listProfileServices(c *fiber.Ctx) error {
 	return c.JSON(profileServicesResponse{Services: services})
 }
 
-func (g *Gateway) listProfiles(c *fiber.Ctx) error {
+func (g *Gateway) listProfiles(c fiber.Ctx) error {
 	if g.profiles == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "profile storage unavailable"})
 	}
@@ -268,14 +268,14 @@ func (g *Gateway) listProfiles(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	rows, err := g.profiles.ListProfiles(c.UserContext(), currentProject(c).ID, opts)
+	rows, err := g.profiles.ListProfiles(c.Context(), currentProject(c).ID, opts)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(newProfileListResponse(rows))
 }
 
-func (g *Gateway) profileFlamegraph(c *fiber.Ctx) error {
+func (g *Gateway) profileFlamegraph(c fiber.Ctx) error {
 	if g.profiles == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "profile storage unavailable"})
 	}
@@ -283,7 +283,7 @@ func (g *Gateway) profileFlamegraph(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	rows, err := g.profiles.ListProfiles(c.UserContext(), currentProject(c).ID, opts)
+	rows, err := g.profiles.ListProfiles(c.Context(), currentProject(c).ID, opts)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -292,7 +292,7 @@ func (g *Gateway) profileFlamegraph(c *fiber.Ctx) error {
 	}
 	profiles := make([]*pprofprofile.Profile, 0, len(rows))
 	for _, row := range rows {
-		r, err := g.blobs.Get(c.UserContext(), row.BlobKey)
+		r, err := g.blobs.Get(c.Context(), row.BlobKey)
 		if err != nil {
 			return fiber.NewError(http.StatusInternalServerError, "read profile blob")
 		}
@@ -310,7 +310,7 @@ func (g *Gateway) profileFlamegraph(c *fiber.Ctx) error {
 	return c.JSON(buildFlamegraph(merged, opts.Type, maxFlameDepth, maxFlameNodes))
 }
 
-func (g *Gateway) rawProfile(c *fiber.Ctx) error {
+func (g *Gateway) rawProfile(c fiber.Ctx) error {
 	if g.profiles == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "profile storage unavailable"})
 	}
@@ -318,14 +318,14 @@ func (g *Gateway) rawProfile(c *fiber.Ctx) error {
 	if err != nil || id <= 0 {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 	}
-	row, err := g.profiles.GetProfile(c.UserContext(), currentProject(c).ID, id)
+	row, err := g.profiles.GetProfile(c.Context(), currentProject(c).ID, id)
 	if meta.IsNotFound(err) {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 	}
 	if err != nil {
 		return apiError(c, err)
 	}
-	r, err := g.blobs.Get(c.UserContext(), row.BlobKey)
+	r, err := g.blobs.Get(c.Context(), row.BlobKey)
 	if errors.Is(err, blob.ErrNotFound) {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 	}
@@ -338,7 +338,7 @@ func (g *Gateway) rawProfile(c *fiber.Ctx) error {
 	return c.SendStream(r)
 }
 
-func profileQuery(c *fiber.Ctx, flame bool) (meta.ProfileListOptions, bool) {
+func profileQuery(c fiber.Ctx, flame bool) (meta.ProfileListOptions, bool) {
 	opts := meta.ProfileListOptions{Service: strings.TrimSpace(c.Query("service"))}
 	if flame && opts.Service == "" {
 		_ = badRequest(c)

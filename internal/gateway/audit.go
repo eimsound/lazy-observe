@@ -8,7 +8,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/account"
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const managementAuditEvent = "management_audit"
@@ -49,7 +49,7 @@ func (event auditEvent) owned() auditEvent {
 	return event
 }
 
-func (g *Gateway) auditManagementFacts(c *fiber.Ctx, facts management.AuditFacts) {
+func (g *Gateway) auditManagementFacts(c fiber.Ctx, facts management.AuditFacts) {
 	g.auditManagement(c, auditEvent{
 		Action:        facts.Action,
 		TargetType:    facts.TargetType,
@@ -64,7 +64,7 @@ func (g *Gateway) auditManagementFacts(c *fiber.Ctx, facts management.AuditFacts
 	})
 }
 
-func (g *Gateway) auditAccountFacts(c *fiber.Ctx, facts account.AuditFacts) {
+func (g *Gateway) auditAccountFacts(c fiber.Ctx, facts account.AuditFacts) {
 	g.auditManagement(c, auditEvent{
 		Action:        facts.Action,
 		ActorUsername: facts.ActorUsername,
@@ -81,7 +81,7 @@ func (g *Gateway) auditAccountFacts(c *fiber.Ctx, facts account.AuditFacts) {
 // auditManagement emits a deliberately allow-listed event. Callers cannot pass
 // arbitrary request bodies, credentials, token values, error messages, or
 // provider configuration through this API.
-func (g *Gateway) auditManagement(c *fiber.Ctx, event auditEvent) {
+func (g *Gateway) auditManagement(c fiber.Ctx, event auditEvent) {
 	// g.logger can be the self-monitoring OpenTelemetry handler, which batches
 	// records and exports them after this request returns. Request-derived
 	// strings (form-encoded BodyParser fields, Method, Path) may borrow Fiber's
@@ -134,13 +134,13 @@ func (g *Gateway) auditManagement(c *fiber.Ctx, event auditEvent) {
 	if event.FailureReason != "" {
 		attrs = append(attrs, "failure_reason", event.FailureReason)
 	}
-	g.logger.Log(c.UserContext(), slog.LevelInfo, "management audit", attrs...)
+	g.logger.Log(c.Context(), slog.LevelInfo, "management audit", attrs...)
 	g.persistAudit(c, event, actor)
 }
 
 // persistAudit best-effort writes the audit event to the metadata store.
 // Persistence failures are logged but never fail the surrounding request.
-func (g *Gateway) persistAudit(c *fiber.Ctx, event auditEvent, actor meta.UserInfo) {
+func (g *Gateway) persistAudit(c fiber.Ctx, event auditEvent, actor meta.UserInfo) {
 	if g.store == nil {
 		return
 	}
@@ -161,7 +161,7 @@ func (g *Gateway) persistAudit(c *fiber.Ctx, event auditEvent, actor meta.UserIn
 		HTTPMethod:    c.Method(),
 		HTTPPath:      c.Path(),
 	}
-	if err := g.store.RecordAudit(c.UserContext(), record); err != nil {
+	if err := g.store.RecordAudit(c.Context(), record); err != nil {
 		g.logger.Debug("audit persistence failed", "action", event.Action, "error", err)
 	}
 }

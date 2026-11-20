@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 type staticHealth map[string]error
@@ -92,7 +92,7 @@ func TestManagedComponentRestartProbeContract(t *testing.T) {
 func TestDrainWaitsForInflightRequest(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	g := newTestGateway(Config{Instrumentation: func(c *fiber.Ctx) error {
+	g := newTestGateway(Config{Instrumentation: func(c fiber.Ctx) error {
 		if c.Path() == "/healthz" {
 			close(started)
 			<-release
@@ -104,7 +104,7 @@ func TestDrainWaitsForInflightRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- g.App().Listener(listener) }()
+	go func() { serveDone <- g.Serve(listener) }()
 
 	responseDone := make(chan error, 1)
 	go func() {

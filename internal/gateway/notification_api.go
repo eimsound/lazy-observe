@@ -5,10 +5,10 @@ import (
 	"strings"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
-func (g *Gateway) listNotifications(c *fiber.Ctx) error {
+func (g *Gateway) listNotifications(c fiber.Ctx) error {
 	store := g.notifications
 	if store == nil {
 		return c.Status(fiber.StatusServiceUnavailable).
@@ -39,14 +39,14 @@ func (g *Gateway) listNotifications(c *fiber.Ctx) error {
 		}
 		options.Limit = limit
 	}
-	items, err := store.ListNotificationOutbox(c.UserContext(), options)
+	items, err := store.ListNotificationOutbox(c.Context(), options)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(items)
 }
 
-func (g *Gateway) requeueNotification(c *fiber.Ctx) error {
+func (g *Gateway) requeueNotification(c fiber.Ctx) error {
 	store := g.notifications
 	if store == nil {
 		return c.Status(fiber.StatusServiceUnavailable).
@@ -56,7 +56,7 @@ func (g *Gateway) requeueNotification(c *fiber.Ctx) error {
 	if err != nil || id <= 0 {
 		return badRequest(c)
 	}
-	updated, err := store.RequeueNotification(c.UserContext(), id, currentProject(c).ID)
+	updated, err := store.RequeueNotification(c.Context(), id, currentProject(c).ID)
 	if err != nil {
 		return apiError(c, err)
 	}

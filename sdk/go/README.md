@@ -1,6 +1,8 @@
 # lazy-observe Go SDK
 
-Explicit Fiber, `slog`, and `database/sql` instrumentation backed by isolated OpenTelemetry providers. Importing this package installs no hooks and changes no global state.
+Explicit Fiber v3, `slog`, and `database/sql` instrumentation backed by isolated OpenTelemetry providers. Importing this package installs no hooks and changes no global state.
+
+> **Breaking: Fiber v3 only.** `lo.Fiber()` now returns a Fiber v3 handler (`func(fiber.Ctx) error`, module `github.com/gofiber/fiber/v3`). Fiber v2 (`*fiber.Ctx`, `github.com/gofiber/fiber/v2`) is no longer supported and there is no v2 compatibility layer: an application still on v2 cannot pass `lo.Fiber()` to `app.Use`. Migrate the application to Fiber v3 first, following the official [v2 to v3 migration guide](https://docs.gofiber.io/whats_new#-migration-guide). The SDK has not been released yet, so no earlier tagged version is affected. Migration points that touch SDK usage are listed under [Fiber v3 migration notes](#fiber-v3-migration-notes).
 
 ## Three-line setup
 
@@ -49,11 +51,28 @@ Go `bool` has no “unset” value, so signal switches use a compact matrix rule
 
 ### Fiber request buffers and `Immutable`
 
-Fiber v2 without `fiber.Config{Immutable: true}` returns strings from `c.Method()`, `c.Path()`, `c.Hostname()`, `c.Get()`, `c.Params()`, and similar accessors that borrow pooled request buffers; the next request overwrites them in place. `lo.Fiber()` copies every request value it keeps past the handler (span attributes and name, metric attributes, error-event tags, panic log fields, incoming `traceparent`/`tracestate`) at the moment it reads it, so its telemetry is correct whether or not your app enables `Immutable`. You do not need to turn on `Immutable` for the SDK.
+Fiber v3 without `fiber.Config{Immutable: true}` returns strings from `c.Method()`, `c.Path()`, `c.Hostname()`, `c.Get()`, `c.Params()`, and similar accessors that borrow pooled request buffers; the next request overwrites them in place. `lo.Fiber()` copies every request value it keeps past the handler (span attributes and name, metric attributes, error-event tags, panic log fields, incoming `traceparent`/`tracestate`) at the moment it reads it, so its telemetry is correct whether or not your app enables `Immutable`. You do not need to turn on `Immutable` for the SDK.
 
 Your own handlers still follow Fiber's rule: if you put a request value into a span attribute, metric attribute, log record, map, or goroutine, copy it first, for example `strings.Clone(c.Params("id"))`.
 
 **Fixed:** earlier versions of `lo.Fiber()` kept the borrowed strings, so in apps without `Immutable` the exported `http.request.method`, `url.path`, `server.address`, `url.scheme`, trace state, metric attributes, and error tags could show another request's values once Fiber reused the buffer.
+
+### Fiber v3 migration notes
+
+These are the Fiber v2 to v3 changes an application meets when it adopts `lo.Fiber()`; the full list is in the official [migration guide](https://docs.gofiber.io/whats_new#-migration-guide).
+
+- Handlers take the `fiber.Ctx` interface instead of `*fiber.Ctx`.
+- `c.UserContext()` and `c.SetUserContext()` are gone. Use `c.Context()` and `c.SetContext()`; `lo.Fiber()` stores the server span there, so `slog.InfoContext(c.Context(), ...)` and `tracer.Start(c.Context(), ...)` keep working. `c.Context()` is safe to keep after the handler returns. The `fiber.Ctx` value itself implements `context.Context` but is pooled and reused, and it never reports cancellation, so do not hand `c` to a goroutine or a client that outlives the request.
+- v2 `c.Context()` (the `*fasthttp.RequestCtx`) is now `c.RequestCtx()`.
+- `c.BodyParser`, `c.QueryParser` and friends are `c.Bind().Body()`, `c.Bind().Query()`; `c.QueryBool` and the other typed query helpers are `fiber.Query[bool](c, "key", false)`.
+- `c.Protocol()` now returns the HTTP version (`HTTP/1.1`); the request scheme (`http` or `https`) is `c.Scheme()`. `lo.Fiber()` uses `Scheme()` for `url.scheme`.
+- Proxy headers are ignored unless the app trusts the peer. v2 trusted every peer by default (`EnableTrustedProxyCheck: false`), so `c.Hostname()` read `X-Forwarded-Host` and the scheme came from `X-Forwarded-Proto`, `X-Forwarded-Protocol`, `X-Forwarded-Ssl` or `X-Url-Scheme`. In v3, `c.Hostname()`, `c.Scheme()` and `c.IP()` read them only when `fiber.Config{TrustProxy: true}` and `TrustProxyConfig` trust the connecting address (`c.IP()` also needs `ProxyHeader`). Behind a reverse proxy without that configuration, `server.address` and the host in error-event URLs are the `Host` the proxy sent, not `X-Forwarded-Host`. `url.scheme` still falls back to a raw `X-Forwarded-Proto` header, as before; the other three scheme headers count only behind a trusted proxy.
+- Every `GET` route also answers `HEAD` by running the same chain, so `HEAD` requests now produce spans and `http.server.request.duration` points under the `GET` route's `http.route`. Set `fiber.Config{DisableHeadAutoRegister: true}` to keep v2 routing.
+- `DisableStartupMessage` moved from `fiber.Config` to `fiber.ListenConfig`: `app.Listen(addr, fiber.ListenConfig{DisableStartupMessage: true})`.
+- `app.Test(req, msTimeout)` is `app.Test(req, fiber.TestConfig{Timeout: d, FailOnTimeout: true})`; a zero `Timeout` waits without limit (v2 `-1`).
+- `Ctx.Body()` decodes `Content-Encoding` itself in v3 and, for a coding it cannot undo, answers 415 or 501 and returns the error text in place of the bytes. Read `c.Request().Body()` if you must see the raw bytes of such a request.
+
+Fiber v3 request strings follow the same zero-copy rule as v2: without `Immutable` they are valid only until the handler returns, and `lo.Fiber()` still copies everything it keeps. The v3 `c.App().GetString` and `c.App().GetBytes` helpers detach a value only when `Immutable` is on, so use `strings.Clone` or `utils.CopyString` when your app does not enable it.
 
 The SDK never calls `otel.SetTracerProvider`, `otel.SetMeterProvider`, `slog.SetDefault`, or registers drivers in `init`; applications opt into every integration explicitly.
 
@@ -123,7 +142,7 @@ See the runnable [`examples/fiber`](examples/fiber/) project for nested applicat
 | Module | Use | License |
 |---|---|---|
 | `github.com/XSAM/otelsql` | explicit `database/sql` wrapping | Apache-2.0 |
-| `github.com/gofiber/fiber/v2` | Fiber v2 middleware | MIT |
+| `github.com/gofiber/fiber/v3` | Fiber v3 middleware | MIT |
 | `go.opentelemetry.io/contrib/bridges/otelslog` | slog-to-OTel bridge | Apache-2.0 |
 | `go.opentelemetry.io/otel` and OTel SDK/exporters | API, SDK, OTLP/HTTP | Apache-2.0 |
 | `modernc.org/sqlite` | example-only SQLite driver | BSD-3-Clause |

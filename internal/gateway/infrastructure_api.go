@@ -15,7 +15,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/scrape"
 	"github.com/eimsound/lazy-observe/internal/storage"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 type scrapeTargetResponse struct {
@@ -46,7 +46,7 @@ func scrapeTargetsJSON(targets []meta.ScrapeTargetView) []scrapeTargetResponse {
 	return response
 }
 
-func (g *Gateway) scrapeUnavailable(c *fiber.Ctx) bool {
+func (g *Gateway) scrapeUnavailable(c fiber.Ctx) bool {
 	if g.scrapes == nil {
 		reason := g.scrapeUnavailableReason
 		if reason == "" {
@@ -58,17 +58,17 @@ func (g *Gateway) scrapeUnavailable(c *fiber.Ctx) bool {
 	return false
 }
 
-func (g *Gateway) listScrapeTargets(c *fiber.Ctx) error {
+func (g *Gateway) listScrapeTargets(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	v, err := g.scrapes.List(c.UserContext(), projectSlug(c))
+	v, err := g.scrapes.List(c.Context(), projectSlug(c))
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(scrapeTargetsJSON(v))
 }
-func (g *Gateway) getScrapeTarget(c *fiber.Ctx) error {
+func (g *Gateway) getScrapeTarget(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
@@ -76,21 +76,21 @@ func (g *Gateway) getScrapeTarget(c *fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	v, err := g.scrapes.Get(c.UserContext(), projectSlug(c), id)
+	v, err := g.scrapes.Get(c.Context(), projectSlug(c), id)
 	if err != nil {
 		return apiError(c, err)
 	}
 	return c.JSON(scrapeTargetJSON(v))
 }
-func (g *Gateway) createScrapeTarget(c *fiber.Ctx) error {
+func (g *Gateway) createScrapeTarget(c fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
 	var in scrape.Input
-	if c.BodyParser(&in) != nil {
+	if c.Bind().Body(&in) != nil {
 		return badRequest(c)
 	}
-	v, err := g.scrapes.Create(c.UserContext(), projectSlug(c), in)
+	v, err := g.scrapes.Create(c.Context(), projectSlug(c), in)
 	if errors.Is(err, scrape.ErrInvalidTarget) {
 		return badRequestMessage(c, err.Error())
 	}
@@ -99,7 +99,7 @@ func (g *Gateway) createScrapeTarget(c *fiber.Ctx) error {
 	}
 	return c.Status(fiber.StatusCreated).JSON(scrapeTargetJSON(v))
 }
-func (g *Gateway) updateScrapeTarget(c *fiber.Ctx) error {
+func (g *Gateway) updateScrapeTarget(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
@@ -108,10 +108,10 @@ func (g *Gateway) updateScrapeTarget(c *fiber.Ctx) error {
 		return nil
 	}
 	var in scrape.Input
-	if c.BodyParser(&in) != nil {
+	if c.Bind().Body(&in) != nil {
 		return badRequest(c)
 	}
-	v, err := g.scrapes.Update(c.UserContext(), projectSlug(c), id, in)
+	v, err := g.scrapes.Update(c.Context(), projectSlug(c), id, in)
 	if errors.Is(err, scrape.ErrInvalidTarget) {
 		return badRequestMessage(c, err.Error())
 	}
@@ -120,7 +120,7 @@ func (g *Gateway) updateScrapeTarget(c *fiber.Ctx) error {
 	}
 	return c.JSON(scrapeTargetJSON(v))
 }
-func (g *Gateway) deleteScrapeTarget(c *fiber.Ctx) error {
+func (g *Gateway) deleteScrapeTarget(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
@@ -128,7 +128,7 @@ func (g *Gateway) deleteScrapeTarget(c *fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	if err := g.scrapes.Delete(c.UserContext(), projectSlug(c), id); err != nil {
+	if err := g.scrapes.Delete(c.Context(), projectSlug(c), id); err != nil {
 		return apiError(c, err)
 	}
 	return c.SendStatus(fiber.StatusNoContent)
@@ -146,7 +146,7 @@ type queryResponse struct {
 	} `json:"data"`
 }
 
-func (g *Gateway) instantQuery(ctx *fiber.Ctx, slug, expr string) ([]metricSample, error) {
+func (g *Gateway) instantQuery(ctx fiber.Ctx, slug, expr string) ([]metricSample, error) {
 	q := url.Values{"query": {expr}}
 	if g.storage.MetricsMode() == storage.MetricsPrometheus {
 		if err := injectPromValues(q, slug); err != nil {
@@ -156,7 +156,7 @@ func (g *Gateway) instantQuery(ctx *fiber.Ctx, slug, expr string) ([]metricSampl
 		q.Set("extra_filters[]", fmt.Sprintf(`{project_id=%q}`, slug))
 	}
 	req, err := http.NewRequestWithContext(
-		ctx.UserContext(),
+		ctx.Context(),
 		http.MethodGet,
 		strings.TrimRight(g.storage.MetricsQueryBase(), "/")+"/api/v1/query?"+q.Encode(),
 		nil,
@@ -206,7 +206,7 @@ func sampleTime(s metricSample) *time.Time {
 	return &t
 }
 
-func (g *Gateway) scrapeTargetHealth(c *fiber.Ctx) error {
+func (g *Gateway) scrapeTargetHealth(c fiber.Ctx) error {
 	id, ok := pathID(c, "id")
 	if !ok {
 		return nil
@@ -214,7 +214,7 @@ func (g *Gateway) scrapeTargetHealth(c *fiber.Ctx) error {
 	if g.scrapeUnavailable(c) {
 		return nil
 	}
-	target, err := g.scrapes.Get(c.UserContext(), projectSlug(c), id)
+	target, err := g.scrapes.Get(c.Context(), projectSlug(c), id)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -251,7 +251,7 @@ type hostDTO struct {
 func ptr(v float64) *float64 { return &v }
 func boolPtr(v bool) *bool   { return &v }
 
-func (g *Gateway) hosts(c *fiber.Ctx) error {
+func (g *Gateway) hosts(c fiber.Ctx) error {
 	slug := projectSlug(c)
 	queries := []struct{ key, expr string }{
 		{"uname", `max by(instance,nodename) (node_uname_info)`},
@@ -322,6 +322,6 @@ func (g *Gateway) hosts(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-func badRequestMessage(c *fiber.Ctx, message string) error {
+func badRequestMessage(c fiber.Ctx, message string) error {
 	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": message})
 }

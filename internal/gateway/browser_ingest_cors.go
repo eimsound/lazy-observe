@@ -1,14 +1,14 @@
 package gateway
 
 import (
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const browserIngestAllowedHeaders = "Authorization, Content-Type, Content-Encoding, X-LO-Replay-Compression, X-LO-Replay-Error"
 
 // browserIngestCORS permits token-authenticated browser SDK writes without
 // exposing the platform's management and query APIs cross-origin.
-func browserIngestCORS(c *fiber.Ctx) error {
+func browserIngestCORS(c fiber.Ctx) error {
 	if c.Get(fiber.HeaderOrigin) != "" {
 		c.Set(fiber.HeaderAccessControlAllowOrigin, "*")
 		c.Set(fiber.HeaderAccessControlAllowMethods, fiber.MethodPost)

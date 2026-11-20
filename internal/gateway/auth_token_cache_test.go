@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 // tokenCacheAliasingRounds is sized so that the pre-fix bug (a borrowed
@@ -36,7 +36,7 @@ func (staticProjectTokens) Revision() uint64 { return 1 }
 func tokenCacheProbeApp(tokens staticProjectTokens) *fiber.App {
 	auth := NewAuthenticator(tokens)
 	app := newFiberApp(defaultReadTimeout, defaultIdleTimeout)
-	app.Post("/ingest", auth.Middleware, func(c *fiber.Ctx) error {
+	app.Post("/ingest", auth.Middleware, func(c fiber.Ctx) error {
 		return c.SendString(currentProject(c).Slug)
 	})
 	return app

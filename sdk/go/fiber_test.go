@@ -10,7 +10,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -65,12 +65,12 @@ func TestFiberTelemetryDoesNotBorrowRequestBuffers(t *testing.T) {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		propagator: propagation.TraceContext{},
 	}
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	if app.Config().Immutable {
 		t.Fatal("probe app must keep Fiber's default zero-copy strings")
 	}
 	app.Use(client.Fiber())
-	app.All("/probe/:id", func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
+	app.All("/probe/:id", func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
 
 	wantCounts := map[string]int64{}
 	for round := range fiberAliasingRounds {
@@ -80,7 +80,7 @@ func TestFiberTelemetryDoesNotBorrowRequestBuffers(t *testing.T) {
 		req.Header.Set(fiber.HeaderXForwardedProto, probe.scheme)
 		req.Header.Set("traceparent", fmt.Sprintf("00-%032x-%016x-01", round+1, round+1))
 		req.Header.Set("tracestate", probe.traceState)
-		resp, err := app.Test(req, -1)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 0})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -163,4 +163,51 @@ func spanStringAttrs(attrs []attribute.KeyValue) map[string]string {
 		out[string(kv.Key)] = kv.Value.String()
 	}
 	return out
+}
+
+// Fiber v3 moved the scheme to Ctx.Scheme; Ctx.Protocol is now the HTTP version
+// ("HTTP/1.1"). Comparing Protocol against "https" compiles but is never true,
+// so a TLS request would be reported as http.
+func TestFiberReportsTLSRequestsAsHTTPS(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	traceProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	t.Cleanup(func() { _ = traceProvider.Shutdown(context.Background()) })
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
+	t.Cleanup(func() { _ = meterProvider.Shutdown(context.Background()) })
+	client := &Client{
+		cfg:        Config{ServiceName: "fiber-scheme"},
+		meter:      meterProvider,
+		tracer:     traceProvider,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		propagator: propagation.TraceContext{},
+	}
+	app := fiber.New()
+	app.Use(client.Fiber())
+	app.Get("/probe", func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
+
+	for _, tt := range []struct{ target, forwarded, want string }{
+		{"https://secure.example/probe", "", "https"},
+		{"http://plain.example/probe", "", "http"},
+		{"http://plain.example/probe", "https", "https"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+		if tt.forwarded != "" {
+			req.Header.Set(fiber.HeaderXForwardedProto, tt.forwarded)
+		}
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	spans := exporter.GetSpans()
+	if len(spans) != 3 {
+		t.Fatalf("spans=%d want 3", len(spans))
+	}
+	for i, want := range []string{"https", "http", "https"} {
+		if got := spanStringAttrs(spans[i].Attributes)["url.scheme"]; got != want {
+			t.Errorf("request %d: url.scheme=%q want %q", i, got, want)
+		}
+	}
 }

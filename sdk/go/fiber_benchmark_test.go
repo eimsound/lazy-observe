@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -84,15 +84,15 @@ func (*benchmarkSpanExporter) Shutdown(context.Context) error { return nil }
 func benchmarkFiberRequest(b *testing.B, name string, middleware fiber.Handler) {
 	b.Helper()
 	b.Run(name, func(b *testing.B) {
-		app := fiber.New(fiber.Config{DisableStartupMessage: true})
+		app := fiber.New()
 		if middleware != nil {
 			app.Use(middleware)
 		}
-		app.Get("/orders/:id", func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
+		app.Get("/orders/:id", func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
 		b.ReportAllocs()
 		b.ResetTimer()
 		for range b.N {
-			response, err := app.Test(httptest.NewRequest("GET", "/orders/42", nil), -1)
+			response, err := app.Test(httptest.NewRequest("GET", "/orders/42", nil), fiber.TestConfig{Timeout: 0})
 			if err != nil {
 				b.Fatal(err)
 			}

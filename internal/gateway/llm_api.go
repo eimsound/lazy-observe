@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -60,12 +60,12 @@ type llmServiceAggregate struct {
 	llmAggregate
 }
 
-func (g *Gateway) llmSummary(c *fiber.Ctx) error {
+func (g *Gateway) llmSummary(c fiber.Ctx) error {
 	start, end, ok := g.llmRange(c)
 	if !ok {
 		return nil
 	}
-	calls, sourceTruncated, err := g.queryLLMCalls(c.UserContext(), currentProject(c), start, end)
+	calls, sourceTruncated, err := g.queryLLMCalls(c.Context(), currentProject(c), start, end)
 	if err != nil {
 		return llmBackendError(c, err)
 	}
@@ -107,7 +107,7 @@ func (g *Gateway) llmSummary(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) llmCalls(c *fiber.Ctx) error {
+func (g *Gateway) llmCalls(c fiber.Ctx) error {
 	start, end, ok := g.llmRange(c)
 	if !ok {
 		return nil
@@ -116,7 +116,7 @@ func (g *Gateway) llmCalls(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	calls, sourceTruncated, err := g.queryLLMCalls(c.UserContext(), currentProject(c), start, end)
+	calls, sourceTruncated, err := g.queryLLMCalls(c.Context(), currentProject(c), start, end)
 	if err != nil {
 		return llmBackendError(c, err)
 	}
@@ -143,7 +143,7 @@ type llmTimeseriesPoint struct {
 	Value float64   `json:"value"`
 }
 
-func (g *Gateway) llmTimeseries(c *fiber.Ctx) error {
+func (g *Gateway) llmTimeseries(c fiber.Ctx) error {
 	start, end, ok := g.llmRange(c)
 	if !ok {
 		return nil
@@ -172,7 +172,7 @@ func (g *Gateway) llmTimeseries(c *fiber.Ctx) error {
 	if bucketCount <= 0 || bucketCount > llmMaxBuckets {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "time range produces too many buckets"})
 	}
-	calls, sourceTruncated, err := g.queryLLMCalls(c.UserContext(), currentProject(c), start, end)
+	calls, sourceTruncated, err := g.queryLLMCalls(c.Context(), currentProject(c), start, end)
 	if err != nil {
 		return llmBackendError(c, err)
 	}
@@ -197,7 +197,7 @@ func (g *Gateway) llmTimeseries(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"metric": metric, "step": step.String(), "points": points, "truncated": sourceTruncated})
 }
 
-func (g *Gateway) llmRange(c *fiber.Ctx) (time.Time, time.Time, bool) {
+func (g *Gateway) llmRange(c fiber.Ctx) (time.Time, time.Time, bool) {
 	end := g.now().UTC()
 	start := end.Add(-llmDefaultWindow)
 	var err error
@@ -370,6 +370,6 @@ func addLLMAggregate(aggregate *llmAggregate, call llmCall) {
 	aggregate.Unpriced = aggregate.Unpriced || call.Unpriced
 }
 
-func llmBackendError(c *fiber.Ctx, err error) error {
+func llmBackendError(c fiber.Ctx, err error) error {
 	return c.Status(http.StatusBadGateway).JSON(fiber.Map{"error": "LLM span query failed", "detail": err.Error()})
 }

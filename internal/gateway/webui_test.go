@@ -3,9 +3,13 @@ package gateway
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
+
+	"github.com/eimsound/lazy-observe/internal/meta"
 )
 
 func TestWebUIServesAssetsAndSPAFallback(t *testing.T) {
@@ -78,4 +82,46 @@ func newRequest(t *testing.T, path string) *http.Request {
 		t.Fatal(err)
 	}
 	return req
+}
+
+// Fiber v3 auto-registers a HEAD route for every GET route and runs the GET
+// chain for it. The gateway keeps the v2 contract instead: HEAD on an API or
+// probe path is not routed to the GET handler (so it never proxies to storage)
+// and falls through to serveWebUI, which still answers HEAD for the SPA.
+func TestHeadDoesNotRunGetHandlers(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	ui := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte(`<html></html>`)}}
+	app := newTestGateway(Config{
+		WebUI:   ui,
+		Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 7, Slug: "alpha"}},
+		Metrics: upstream.URL, Logs: upstream.URL, Traces: upstream.URL,
+	}).App()
+
+	for _, tt := range []struct {
+		path string
+		want int
+	}{
+		{"/api/traces/search", http.StatusNotFound},
+		{"/livez", http.StatusNotFound},
+		{"/", http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodHead, tt.path, nil)
+		req.Header.Set("Authorization", "Bearer lou_valid")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != tt.want {
+			t.Fatalf("HEAD %s: status=%d want=%d", tt.path, resp.StatusCode, tt.want)
+		}
+	}
+	if n := upstreamCalls.Load(); n != 0 {
+		t.Fatalf("HEAD reached the storage upstream %d times", n)
+	}
 }

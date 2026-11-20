@@ -22,7 +22,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/ai"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -257,7 +257,7 @@ func (s *issueAIService) allow(ctx context.Context, projectID int) bool {
 	return err == nil && allowed
 }
 
-func (g *Gateway) getIssueAIAnalysis(c *fiber.Ctx) error {
+func (g *Gateway) getIssueAIAnalysis(c fiber.Ctx) error {
 	if !g.ensureIssues(c) {
 		return nil
 	}
@@ -265,7 +265,7 @@ func (g *Gateway) getIssueAIAnalysis(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	row, err := g.issues.GetIssue(c.UserContext(), currentProject(c).ID, id)
+	row, err := g.issues.GetIssue(c.Context(), currentProject(c).ID, id)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -276,7 +276,7 @@ func (g *Gateway) getIssueAIAnalysis(c *fiber.Ctx) error {
 	return c.JSON(issueAIResponse(row, true))
 }
 
-func (g *Gateway) postIssueAIAnalysis(c *fiber.Ctx) error {
+func (g *Gateway) postIssueAIAnalysis(c fiber.Ctx) error {
 	if !g.assistantReady(c) || !g.ensureIssues(c) {
 		return nil
 	}
@@ -285,7 +285,7 @@ func (g *Gateway) postIssueAIAnalysis(c *fiber.Ctx) error {
 		return nil
 	}
 	project := currentProject(c)
-	row, err := g.issues.GetIssue(c.UserContext(), project.ID, id)
+	row, err := g.issues.GetIssue(c.Context(), project.ID, id)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -294,10 +294,10 @@ func (g *Gateway) postIssueAIAnalysis(c *fiber.Ctx) error {
 		g.auditIssueAI(c, id, true, false)
 		return c.JSON(issueAIResponse(row, true))
 	}
-	if !g.issueAI.allow(c.UserContext(), project.ID) {
+	if !g.issueAI.allow(c.Context(), project.ID) {
 		return c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": "Issue AI analysis rate limit exceeded"})
 	}
-	row, raw, err := g.generateAndStoreIssueAI(c.UserContext(), project, row)
+	row, raw, err := g.generateAndStoreIssueAI(c.Context(), project, row)
 	if err != nil {
 		var contractErr *issueAIContractError
 		if errors.As(err, &contractErr) {
@@ -330,7 +330,7 @@ func (g *Gateway) generateAndStoreIssueAI(
 	return storedRow, raw, err
 }
 
-func (g *Gateway) auditIssueAI(c *fiber.Ctx, issueID int, cached, refresh bool) {
+func (g *Gateway) auditIssueAI(c fiber.Ctx, issueID int, cached, refresh bool) {
 	user, _ := c.Locals(userLocal).(meta.UserInfo)
 	project := currentProject(c)
 	g.logger.Info(

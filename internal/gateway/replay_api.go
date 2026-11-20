@@ -23,7 +23,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -86,7 +86,7 @@ type replayEventEnvelope struct {
 	} `json:"data"`
 }
 
-func (g *Gateway) replayIngest(c *fiber.Ctx) error {
+func (g *Gateway) replayIngest(c fiber.Ctx) error {
 	if g.replays == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "replay storage unavailable"})
 	}
@@ -95,7 +95,7 @@ func (g *Gateway) replayIngest(c *fiber.Ctx) error {
 	if !replayIDPattern.MatchString(sessionID) || err != nil || seq < 0 {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid session_id or seq"})
 	}
-	body := c.Body()
+	body := requestBody(c)
 	var decoded []byte
 	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
 		zr, err := gzip.NewReader(bytes.NewReader(body))
@@ -137,13 +137,13 @@ func (g *Gateway) replayIngest(c *fiber.Ctx) error {
 	if writeErr != nil || closeErr != nil {
 		return fiber.NewError(http.StatusInternalServerError, "compress replay segment")
 	}
-	if err := g.blobs.Put(c.UserContext(), key, bytes.NewReader(stored.Bytes())); err != nil {
+	if err := g.blobs.Put(c.Context(), key, bytes.NewReader(stored.Bytes())); err != nil {
 		if errors.Is(err, blob.ErrInvalidKey) {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid replay key"})
 		}
 		return fiber.NewError(http.StatusInternalServerError, err.Error())
 	}
-	objects, err := g.blobs.List(c.UserContext(), prefix)
+	objects, err := g.blobs.List(c.Context(), prefix)
 	if err != nil {
 		return fiber.NewError(http.StatusInternalServerError, err.Error())
 	}
@@ -156,7 +156,7 @@ func (g *Gateway) replayIngest(c *fiber.Ctx) error {
 		pageURL, release = replayFields(events)
 	}
 	if err := g.replays.UpsertReplaySession(
-		c.UserContext(),
+		c.Context(),
 		p.ID,
 		sessionID,
 		startedAt,
@@ -172,7 +172,7 @@ func (g *Gateway) replayIngest(c *fiber.Ctx) error {
 	return c.Status(http.StatusAccepted).JSON(fiber.Map{"accepted": true, "seq": seq})
 }
 
-func (g *Gateway) listReplaySessions(c *fiber.Ctx) error {
+func (g *Gateway) listReplaySessions(c fiber.Ctx) error {
 	if g.replays == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "replay storage unavailable"})
 	}
@@ -205,11 +205,11 @@ func (g *Gateway) listReplaySessions(c *fiber.Ctx) error {
 		}
 		opts.Page = page
 	}
-	rows, err := g.replays.ListReplaySessions(c.UserContext(), currentProject(c).ID, opts)
+	rows, err := g.replays.ListReplaySessions(c.Context(), currentProject(c).ID, opts)
 	if err != nil {
 		return apiError(c, err)
 	}
-	total, err := g.replays.CountReplaySessions(c.UserContext(), currentProject(c).ID, opts)
+	total, err := g.replays.CountReplaySessions(c.Context(), currentProject(c).ID, opts)
 	if err != nil {
 		return apiError(c, err)
 	}
@@ -222,12 +222,12 @@ func (g *Gateway) listReplaySessions(c *fiber.Ctx) error {
 	)
 }
 
-func (g *Gateway) getReplaySession(c *fiber.Ctx) error {
+func (g *Gateway) getReplaySession(c fiber.Ctx) error {
 	row, ok := g.replaySession(c)
 	if !ok {
 		return nil
 	}
-	objects, err := g.blobs.List(c.UserContext(), replayPrefix(currentProject(c).Slug, row.SessionID))
+	objects, err := g.blobs.List(c.Context(), replayPrefix(currentProject(c).Slug, row.SessionID))
 	if err != nil {
 		return fiber.NewError(http.StatusInternalServerError, err.Error())
 	}
@@ -238,7 +238,7 @@ func (g *Gateway) getReplaySession(c *fiber.Ctx) error {
 		if !ok {
 			continue
 		}
-		segment, segmentMarkers, err := g.replaySegmentMetadata(c.UserContext(), object, seq, row.StartedAt)
+		segment, segmentMarkers, err := g.replaySegmentMetadata(c.Context(), object, seq, row.StartedAt)
 		if err != nil {
 			return fiber.NewError(http.StatusInternalServerError, err.Error())
 		}
@@ -247,7 +247,7 @@ func (g *Gateway) getReplaySession(c *fiber.Ctx) error {
 	}
 	sort.Slice(segments, func(i, j int) bool { return segments[i].Seq < segments[j].Seq })
 	sort.Slice(markers, func(i, j int) bool { return markers[i].Time < markers[j].Time })
-	if err := g.resolveReplayIssueMarkers(c.UserContext(), currentProject(c).ID, markers); err != nil {
+	if err := g.resolveReplayIssueMarkers(c.Context(), currentProject(c).ID, markers); err != nil {
 		return fiber.NewError(http.StatusInternalServerError, "resolve replay Issue markers")
 	}
 	return c.JSON(struct {
@@ -285,7 +285,7 @@ func (g *Gateway) resolveReplayIssueMarkers(ctx context.Context, projectID int, 
 	return nil
 }
 
-func (g *Gateway) getReplaySegment(c *fiber.Ctx) error {
+func (g *Gateway) getReplaySegment(c fiber.Ctx) error {
 	row, ok := g.replaySession(c)
 	if !ok {
 		return nil
@@ -295,7 +295,7 @@ func (g *Gateway) getReplaySegment(c *fiber.Ctx) error {
 		return badRequest(c)
 	}
 	r, err := g.blobs.Get(
-		c.UserContext(),
+		c.Context(),
 		fmt.Sprintf("%s%d.json.gz", replayPrefix(currentProject(c).Slug, row.SessionID), seq),
 	)
 	if errors.Is(err, blob.ErrNotFound) {
@@ -314,7 +314,7 @@ func (g *Gateway) getReplaySegment(c *fiber.Ctx) error {
 	return c.Send(body)
 }
 
-func (g *Gateway) replaySession(c *fiber.Ctx) (*meta.ReplaySession, bool) {
+func (g *Gateway) replaySession(c fiber.Ctx) (*meta.ReplaySession, bool) {
 	if g.replays == nil || g.blobs == nil {
 		_ = c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "replay storage unavailable"})
 		return nil, false
@@ -324,7 +324,7 @@ func (g *Gateway) replaySession(c *fiber.Ctx) (*meta.ReplaySession, bool) {
 		_ = c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 		return nil, false
 	}
-	row, err := g.replays.GetReplaySession(c.UserContext(), currentProject(c).ID, sessionID)
+	row, err := g.replays.GetReplaySession(c.Context(), currentProject(c).ID, sessionID)
 	if meta.IsNotFound(err) {
 		_ = c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 		return nil, false

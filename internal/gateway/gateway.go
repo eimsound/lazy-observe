@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -35,8 +36,8 @@ import (
 	"github.com/eimsound/lazy-observe/internal/state"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/eimsound/lazy-observe/internal/webui"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/recover"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
 	"go.opentelemetry.io/otel/metric"
@@ -232,18 +233,22 @@ type Gateway struct {
 func newFiberApp(readTimeout, idleTimeout time.Duration) *fiber.App {
 	return fiber.New(fiber.Config{
 		// Immutable makes Ctx.Get, Params, Query, Cookies, FormValue, Path,
-		// Method, BodyParser fields and friends return owned copies instead of
+		// Method, Bind().Body fields and friends return owned copies instead of
 		// borrowing fasthttp's request buffers, which are reused by the next
 		// request. Borrowed strings once leaked into the project token cache:
 		// a cached key silently became a later request's token, so another
 		// project's token, or one never issued, authenticated as the cached
 		// project. Handlers still copy values they keep beyond a request; this
 		// setting is the default-safe backstop for the ones that slip through.
-		Immutable:             true,
-		DisableStartupMessage: true,
-		BodyLimit:             maxDecodedRequestBody,
-		ReadTimeout:           readTimeout,
-		IdleTimeout:           idleTimeout,
+		Immutable: true,
+		// Fiber v3 gives every GET route a HEAD twin that runs the whole GET
+		// chain, so HEAD on a query route would proxy a HEAD to storage and run
+		// the read. v2 had no such routes: HEAD fell through to serveWebUI,
+		// which answers 404 for API and probe paths. Keep that contract.
+		DisableHeadAutoRegister: true,
+		BodyLimit:               maxDecodedRequestBody,
+		ReadTimeout:             readTimeout,
+		IdleTimeout:             idleTimeout,
 	})
 }
 
@@ -399,7 +404,16 @@ func (g *Gateway) AttachErrorTracker(tracker ErrorIntake) error {
 	return nil
 }
 
-func (g *Gateway) Listen(addr string) error { return g.app.Listen(addr) }
+// listenConfig keeps Fiber's startup banner off stdout: Fiber v3 moved
+// DisableStartupMessage from fiber.Config to fiber.ListenConfig, so every
+// Listen/Listener call has to pass it.
+var listenConfig = fiber.ListenConfig{DisableStartupMessage: true}
+
+func (g *Gateway) Listen(addr string) error { return g.app.Listen(addr, listenConfig) }
+
+// Serve accepts connections on ln until Shutdown or Drain. The listener is
+// served as supplied, so TLS stays whatever the caller wrapped it with.
+func (g *Gateway) Serve(ln net.Listener) error { return g.app.Listener(ln, listenConfig) }
 
 // MarkReady opens the readiness gate after startup initialization and metadata
 // migrations have completed. New gateways deliberately start unready.
@@ -457,7 +471,7 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 	// process (and every in-flight request with it).
 	g.app.Use(recover.New(recover.Config{
 		EnableStackTrace: true,
-		StackTraceHandler: func(c *fiber.Ctx, value any) {
+		StackTraceHandler: func(c fiber.Ctx, value any) {
 			// g.logger may export asynchronously; never hand it borrowed
 			// request memory.
 			g.logger.Error(
@@ -474,7 +488,7 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 	g.app.Get("/livez", g.livez)
 	g.app.Get("/readyz", g.readyz)
 	if g.instrumentation != nil {
-		g.app.Use(func(c *fiber.Ctx) error {
+		g.app.Use(func(c fiber.Ctx) error {
 			// OTLP exports are never observed, and the private token is a second
 			// marker for any future internal endpoint. Either condition prevents
 			// self-generated telemetry from recursively producing more telemetry.
@@ -497,8 +511,8 @@ func (g *Gateway) registerPlatformRoutes() {
 		baseURL = "http://127.0.0.1:3100"
 	}
 	mcpHandler := fasthttpadaptor.NewFastHTTPHandler(observemcp.NewHTTPHandler(baseURL, nil))
-	g.app.All("/mcp", g.mcpRequired, func(c *fiber.Ctx) error {
-		mcpHandler(c.Context())
+	g.app.All("/mcp", g.mcpRequired, func(c fiber.Ctx) error {
+		mcpHandler(c.RequestCtx())
 		return nil
 	})
 }
@@ -580,7 +594,7 @@ func (g *Gateway) registerTelemetryRoutes() {
 		g.queryRequired,
 		g.tenantProxy(g.storage.TracesBase(), "/select/jaeger/api/services"),
 	)
-	g.app.Get("/api/traces/services/:svc/operations", g.queryRequired, func(c *fiber.Ctx) error {
+	g.app.Get("/api/traces/services/:svc/operations", g.queryRequired, func(c fiber.Ctx) error {
 		return g.tenantProxy(
 			g.storage.TracesBase(),
 			"/select/jaeger/api/services/"+url.PathEscape(c.Params("svc"))+"/operations",
@@ -589,7 +603,7 @@ func (g *Gateway) registerTelemetryRoutes() {
 		)
 	})
 	g.app.Get("/api/traces/search", g.queryRequired, g.traceSearch)
-	g.app.Get("/api/traces/:traceID", g.queryRequired, func(c *fiber.Ctx) error {
+	g.app.Get("/api/traces/:traceID", g.queryRequired, func(c fiber.Ctx) error {
 		return g.tenantProxy(
 			g.storage.TracesBase(),
 			"/select/jaeger/api/traces/"+url.PathEscape(c.Params("traceID")),
@@ -700,7 +714,7 @@ func (g *Gateway) browserIngestRoute(path string, handler fiber.Handler) {
 	g.app.Post(path, browserIngestCORS, g.auth.Middleware, handler)
 }
 
-func (g *Gateway) serveWebUI(c *fiber.Ctx) error {
+func (g *Gateway) serveWebUI(c fiber.Ctx) error {
 	if g.webUI == nil || (c.Method() != fiber.MethodGet && c.Method() != fiber.MethodHead) {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
@@ -739,7 +753,7 @@ func (g *Gateway) serveWebUI(c *fiber.Ctx) error {
 // mcpRequired authenticates MCP with a user API token and the project selected
 // by X-LO-Project. MCP only exposes reads, so project (ingest) tokens are
 // refused like on every other query route.
-func (g *Gateway) mcpRequired(c *fiber.Ctx) error {
+func (g *Gateway) mcpRequired(c fiber.Ctx) error {
 	token := bearerCredential(c)
 	if token == "" {
 		return unauthorizedResponse(c)
@@ -752,7 +766,7 @@ func (g *Gateway) mcpRequired(c *fiber.Ctx) error {
 
 // ingestOnlyToken rejects a project API token on a read route. Project tokens
 // are embedded in browser pages and SDK configuration, so they are ingest-only.
-func ingestOnlyToken(c *fiber.Ctx) error {
+func ingestOnlyToken(c fiber.Ctx) error {
 	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 		"code":  "ingest_only_token",
 		"error": "project API tokens can only ingest telemetry; use a session or a user API token to query",
@@ -761,7 +775,7 @@ func ingestOnlyToken(c *fiber.Ctx) error {
 
 // uploadOnlyToken rejects a source map upload token anywhere but the upload route
 // (ADR 0018). It is confidential but narrowly scoped: it can neither ingest nor read.
-func uploadOnlyToken(c *fiber.Ctx) error {
+func uploadOnlyToken(c fiber.Ctx) error {
 	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 		"code":  "upload_only_token",
 		"error": "source map upload tokens can only upload source maps to their project",
@@ -771,7 +785,7 @@ func uploadOnlyToken(c *fiber.Ctx) error {
 // sourceMapUploadTokenRequired rejects a credential that is not an upload token on
 // the upload route: the project API token is public (ADR 0010) and must not be
 // able to overwrite a release's source maps (ADR 0018).
-func sourceMapUploadTokenRequired(c *fiber.Ctx) error {
+func sourceMapUploadTokenRequired(c fiber.Ctx) error {
 	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 		"code":  "source_map_upload_token_required",
 		"error": "source map upload requires a source map upload token (los_...); create one in the project settings",
@@ -780,21 +794,21 @@ func sourceMapUploadTokenRequired(c *fiber.Ctx) error {
 
 // nonQueryToken answers a bearer credential that cannot query: an upload token or a
 // project API token.
-func nonQueryToken(c *fiber.Ctx, token string) error {
+func nonQueryToken(c fiber.Ctx, token string) error {
 	if strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) {
 		return uploadOnlyToken(c)
 	}
 	return ingestOnlyToken(c)
 }
 
-func unauthorizedResponse(c *fiber.Ctx) error {
+func unauthorizedResponse(c fiber.Ctx) error {
 	_ = unauthorized(c)
 	return nil
 }
 
-func (g *Gateway) loadSessionProject(c *fiber.Ctx) error {
+func (g *Gateway) loadSessionProject(c fiber.Ctx) error {
 	slug := projectSlug(c)
-	p, err := g.store.ProjectBySlug(c.UserContext(), slug)
+	p, err := g.store.ProjectBySlug(c.Context(), slug)
 	if err != nil {
 		_ = unauthorized(c)
 		return nil
@@ -803,7 +817,7 @@ func (g *Gateway) loadSessionProject(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-func (g *Gateway) traceSearch(c *fiber.Ctx) error {
+func (g *Gateway) traceSearch(c fiber.Ctx) error {
 	return g.proxy(c, g.storage.TracesBase(), "/select/jaeger/api/traces", proxyOptions{
 		projectID: currentProject(c).ID,
 		allowedParams: map[string]bool{
@@ -818,11 +832,11 @@ func (g *Gateway) traceSearch(c *fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) healthz(c *fiber.Ctx) error {
+func (g *Gateway) healthz(c fiber.Ctx) error {
 	status := fiber.StatusOK
 	components := map[string]string{"gateway": "ok"}
 	if g.health != nil {
-		for name, err := range g.health.Health(c.UserContext()) {
+		for name, err := range g.health.Health(c.Context()) {
 			if err != nil {
 				status = fiber.StatusServiceUnavailable
 				components[name] = err.Error()
@@ -832,7 +846,7 @@ func (g *Gateway) healthz(c *fiber.Ctx) error {
 		}
 	}
 	if g.errorTracker != nil {
-		diagnostics, err := g.errorTracker.Diagnostics(c.UserContext())
+		diagnostics, err := g.errorTracker.Diagnostics(c.Context())
 		if err != nil {
 			status = fiber.StatusServiceUnavailable
 			components["error_inbox"] = "diagnostics unavailable"
@@ -848,11 +862,11 @@ func (g *Gateway) healthz(c *fiber.Ctx) error {
 		JSON(fiber.Map{"status": map[bool]string{true: "ok", false: "degraded"}[status == fiber.StatusOK], "components": components})
 }
 
-func (g *Gateway) livez(c *fiber.Ctx) error {
+func (g *Gateway) livez(c fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{"status": "ok"})
 }
 
-func (g *Gateway) readyz(c *fiber.Ctx) error {
+func (g *Gateway) readyz(c fiber.Ctx) error {
 	g.readyMu.RLock()
 	ready := g.ready
 	g.readyMu.RUnlock()
@@ -867,7 +881,7 @@ func (g *Gateway) readyz(c *fiber.Ctx) error {
 		checker = g.health
 	}
 	if checker != nil {
-		for name, err := range checker.Health(c.UserContext()) {
+		for name, err := range checker.Health(c.Context()) {
 			if err != nil {
 				components[name] = err.Error()
 				ready = false
@@ -877,7 +891,7 @@ func (g *Gateway) readyz(c *fiber.Ctx) error {
 		}
 	}
 	if g.errorTracker != nil {
-		if err := g.errorTracker.Readiness(c.UserContext()); err != nil {
+		if err := g.errorTracker.Readiness(c.Context()); err != nil {
 			components["error_inbox"] = err.Error()
 			ready = false
 		} else {
@@ -892,11 +906,11 @@ func (g *Gateway) readyz(c *fiber.Ctx) error {
 		JSON(fiber.Map{"status": map[bool]string{true: "ready", false: "not_ready"}[ready], "components": components})
 }
 
-func (g *Gateway) metricsIngest(c *fiber.Ctx) error {
+func (g *Gateway) metricsIngest(c fiber.Ctx) error {
 	return g.metricsWrite(c, "/opentelemetry/v1/metrics", true)
 }
 
-func (g *Gateway) metricsRemoteWrite(c *fiber.Ctx) error {
+func (g *Gateway) metricsRemoteWrite(c fiber.Ctx) error {
 	if !g.storage.MetricsIngestEnabled() {
 		return c.Status(fiber.StatusNotImplemented).
 			JSON(fiber.Map{"error": "metrics ingest is disabled: storage.metrics.ingest_url is not configured"})
@@ -911,7 +925,7 @@ func (g *Gateway) metricsRemoteWrite(c *fiber.Ctx) error {
 			"Prometheus remote-write 2.0 is not supported; use prometheus.WriteRequest",
 		)
 	}
-	body, err := storagepkg.InjectRemoteWriteProject(c.Body(), currentProject(c).Slug, maxDecodedRequestBody)
+	body, err := storagepkg.InjectRemoteWriteProject(requestBody(c), currentProject(c).Slug, maxDecodedRequestBody)
 	if errors.Is(err, storagepkg.ErrRemoteWriteTooLarge) {
 		return fiber.NewError(
 			fiber.StatusRequestEntityTooLarge,
@@ -931,7 +945,7 @@ func (g *Gateway) metricsRemoteWrite(c *fiber.Ctx) error {
 	return g.metricsWrite(c, "/prometheus/api/v1/write", false)
 }
 
-func (g *Gateway) metricsWrite(c *fiber.Ctx, path string, addProjectQuery bool) error {
+func (g *Gateway) metricsWrite(c fiber.Ctx, path string, addProjectQuery bool) error {
 	if !g.storage.MetricsIngestEnabled() {
 		return c.Status(fiber.StatusNotImplemented).
 			JSON(fiber.Map{"error": "metrics ingest is disabled: storage.metrics.ingest_url is not configured"})
@@ -948,7 +962,7 @@ func (g *Gateway) metricsWrite(c *fiber.Ctx, path string, addProjectQuery bool) 
 	return g.proxy(c, base, path, opts)
 }
 
-func (g *Gateway) metricsQuery(c *fiber.Ctx) error {
+func (g *Gateway) metricsQuery(c fiber.Ctx) error {
 	p := currentProject(c)
 	// proxy only isolates when metricsProject is non-empty; fail closed instead of forwarding an unfiltered query.
 	if p.Slug == "" {
@@ -961,14 +975,14 @@ func (g *Gateway) metricsQuery(c *fiber.Ctx) error {
 // opening a data-read path. It is still project-authenticated, but only the
 // query parameter is forwarded; storage isolation parameters and arbitrary
 // client-supplied options are deliberately discarded.
-func (g *Gateway) metricsPrettify(c *fiber.Ctx) error {
+func (g *Gateway) metricsPrettify(c fiber.Ctx) error {
 	return g.proxy(c, g.storage.MetricsQueryBase(), "/prettify-query", proxyOptions{
 		allowedParams: map[string]bool{"query": true},
 	})
 }
 
 func (g *Gateway) tenantProxy(base, path string) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		p := currentProject(c)
 		return g.proxy(c, base, path, proxyOptions{projectID: p.ID})
 	}
@@ -982,8 +996,8 @@ type proxyOptions struct {
 	metricsProject string
 }
 
-func (g *Gateway) proxy(c *fiber.Ctx, base, path string, opts proxyOptions) error {
-	query, err := url.ParseQuery(string(c.Context().QueryArgs().QueryString()))
+func (g *Gateway) proxy(c fiber.Ctx, base, path string, opts proxyOptions) error {
+	query, err := url.ParseQuery(string(c.RequestCtx().QueryArgs().QueryString()))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid query parameters")
 	}
@@ -1009,7 +1023,7 @@ func (g *Gateway) proxy(c *fiber.Ctx, base, path string, opts proxyOptions) erro
 			query.Add(key, value)
 		}
 	}
-	body := append([]byte(nil), c.Body()...)
+	body := append([]byte(nil), requestBody(c)...)
 	contentType := string(c.Request().Header.ContentType())
 	if (opts.reservedParams || opts.metricsProject != "") &&
 		strings.HasPrefix(contentType, fiber.MIMEApplicationForm) {
@@ -1032,7 +1046,7 @@ func (g *Gateway) proxy(c *fiber.Ctx, base, path string, opts proxyOptions) erro
 		target += "?" + encoded
 	}
 	req, err := http.NewRequestWithContext(
-		c.UserContext(),
+		c.Context(),
 		c.Method(),
 		target,
 		bytes.NewReader(body),
@@ -1062,7 +1076,7 @@ func (g *Gateway) proxy(c *fiber.Ctx, base, path string, opts proxyOptions) erro
 		}
 	}
 	c.Status(resp.StatusCode)
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer resp.Body.Close()
 		var dst io.Writer = w
 		if path == "/select/logsql/tail" {
@@ -1135,7 +1149,7 @@ func stripReserved(values url.Values) {
 }
 
 func copyRequestHeaders(dst http.Header, src *fasthttp.RequestHeader) {
-	src.VisitAll(func(key, value []byte) {
+	for key, value := range src.All() {
 		name := string(key)
 		if isHopByHop(name) || strings.EqualFold(name, "Content-Length") ||
 			strings.EqualFold(name, "AccountID") ||
@@ -1144,13 +1158,13 @@ func copyRequestHeaders(dst http.Header, src *fasthttp.RequestHeader) {
 			strings.EqualFold(name, "X-LO-Project") ||
 			strings.EqualFold(name, "Authorization") ||
 			strings.EqualFold(name, "Cookie") {
-			return
+			continue
 		}
 		dst.Add(name, string(value))
-	})
+	}
 }
 
-func (g *Gateway) queryRequired(c *fiber.Ctx) error {
+func (g *Gateway) queryRequired(c fiber.Ctx) error {
 	if token := bearerCredential(c); strings.HasPrefix(token, "lou_") {
 		u, err := g.loadUserAPIToken(c, token)
 		if err != nil {
@@ -1174,7 +1188,7 @@ func (g *Gateway) queryRequired(c *fiber.Ctx) error {
 	return g.loadQueryProject(c)
 }
 
-func (g *Gateway) loadQueryProject(c *fiber.Ctx) error {
+func (g *Gateway) loadQueryProject(c fiber.Ctx) error {
 	slug := strings.TrimSpace(c.Get("X-LO-Project"))
 	if slug == "" {
 		slug = "default"
@@ -1183,7 +1197,7 @@ func (g *Gateway) loadQueryProject(c *fiber.Ctx) error {
 		_ = unauthorized(c)
 		return nil
 	}
-	p, err := g.store.ProjectBySlug(c.UserContext(), slug)
+	p, err := g.store.ProjectBySlug(c.Context(), slug)
 	if err != nil {
 		_ = unauthorized(c)
 		return nil
@@ -1192,7 +1206,7 @@ func (g *Gateway) loadQueryProject(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-func bearerCredential(c *fiber.Ctx) string {
+func bearerCredential(c fiber.Ctx) string {
 	authorization := strings.TrimSpace(c.Get("Authorization"))
 	scheme, token, ok := strings.Cut(authorization, " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") {
@@ -1205,7 +1219,7 @@ func bearerCredential(c *fiber.Ctx) string {
 	return token
 }
 
-func (g *Gateway) sessionRequired(c *fiber.Ctx) error {
+func (g *Gateway) sessionRequired(c fiber.Ctx) error {
 	if strings.TrimSpace(c.Cookies("lo_session")) == "" {
 		_ = unauthorized(c)
 		return nil
@@ -1225,7 +1239,7 @@ func (g *Gateway) sessionRequired(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-func (g *Gateway) userRequired(c *fiber.Ctx) error {
+func (g *Gateway) userRequired(c fiber.Ctx) error {
 	if token := bearerCredential(c); token != "" {
 		if !strings.HasPrefix(token, "lou_") {
 			// ADR 0010: project API tokens are ingest-only; refuse them on the
@@ -1245,8 +1259,8 @@ func (g *Gateway) userRequired(c *fiber.Ctx) error {
 	return g.sessionRequired(c)
 }
 
-func (g *Gateway) loadUserAPIToken(c *fiber.Ctx, token string) (meta.UserInfo, error) {
-	u, err := g.account.AuthenticateUserToken(c.UserContext(), token)
+func (g *Gateway) loadUserAPIToken(c fiber.Ctx, token string) (meta.UserInfo, error) {
+	u, err := g.account.AuthenticateUserToken(c.Context(), token)
 	if err != nil {
 		if account.Code(err) == account.CodeInvalidCredentials {
 			return meta.UserInfo{}, unauthorized(c)
@@ -1261,12 +1275,12 @@ func (g *Gateway) loadUserAPIToken(c *fiber.Ctx, token string) (meta.UserInfo, e
 	return accountUserInfo(u), nil
 }
 
-func (g *Gateway) loadSession(c *fiber.Ctx) error {
+func (g *Gateway) loadSession(c fiber.Ctx) error {
 	token := strings.TrimSpace(c.Cookies("lo_session"))
 	if token == "" {
 		return fmt.Errorf("session cookie missing")
 	}
-	u, err := g.account.AuthenticateSession(c.UserContext(), token)
+	u, err := g.account.AuthenticateSession(c.Context(), token)
 	if err != nil {
 		return err
 	}
@@ -1290,7 +1304,7 @@ var passwordChangeRoutes = map[string]struct{}{
 // when a flagged user calls anything outside passwordChangeRoutes. The flag is
 // read from metadata on every request (ADR 0006), so a password change takes
 // effect immediately for every session adapter and replica.
-func passwordChangeBlocks(c *fiber.Ctx, user account.User) bool {
+func passwordChangeBlocks(c fiber.Ctx, user account.User) bool {
 	if !user.MustChangePassword {
 		return false
 	}
@@ -1318,7 +1332,7 @@ func accountUser(user meta.UserInfo) account.User {
 	}
 }
 
-func (g *Gateway) adminRequired(c *fiber.Ctx) error {
+func (g *Gateway) adminRequired(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	if u.Role != "admin" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
@@ -1326,7 +1340,7 @@ func (g *Gateway) adminRequired(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-func (g *Gateway) memberRequired(c *fiber.Ctx) error {
+func (g *Gateway) memberRequired(c fiber.Ctx) error {
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
 	if u.Role == "viewer" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
@@ -1339,7 +1353,7 @@ func (g *Gateway) memberRequired(c *fiber.Ctx) error {
 // Fiber's error handler (which would rewrite the status to 500).
 var errResponseWritten = errors.New("authentication response already written")
 
-func unauthorized(c *fiber.Ctx) error {
+func unauthorized(c fiber.Ctx) error {
 	_ = c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	return errResponseWritten
 }
@@ -1361,7 +1375,7 @@ func isHopByHop(name string) bool {
 	}
 }
 
-func currentProject(c *fiber.Ctx) meta.ProjectInfo {
+func currentProject(c fiber.Ctx) meta.ProjectInfo {
 	p, _ := c.Locals(projectLocal).(meta.ProjectInfo)
 	return p
 }
@@ -1425,7 +1439,7 @@ func newAuthenticator() *Authenticator {
 
 // Middleware authenticates ingest routes with a project API token. A source map
 // upload token is refused explicitly: it is a different credential kind.
-func (a *Authenticator) Middleware(c *fiber.Ctx) error {
+func (a *Authenticator) Middleware(c fiber.Ctx) error {
 	token := bearerCredential(c)
 	if strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) {
 		return uploadOnlyToken(c)
@@ -1436,7 +1450,7 @@ func (a *Authenticator) Middleware(c *fiber.Ctx) error {
 // UploadMiddleware authenticates the source map upload route. Only a source map
 // upload token is accepted; project API tokens and user tokens get 403 with
 // source_map_upload_token_required, anything else 401.
-func (a *Authenticator) UploadMiddleware(c *fiber.Ctx) error {
+func (a *Authenticator) UploadMiddleware(c fiber.Ctx) error {
 	token := bearerCredential(c)
 	if token != "" && !strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) &&
 		(strings.HasPrefix(token, "lo_") || strings.HasPrefix(token, "lou_")) {
@@ -1445,11 +1459,11 @@ func (a *Authenticator) UploadMiddleware(c *fiber.Ctx) error {
 	return a.authenticateRequest(c, token)
 }
 
-func (a *Authenticator) authenticateRequest(c *fiber.Ctx, token string) error {
+func (a *Authenticator) authenticateRequest(c fiber.Ctx, token string) error {
 	if token == "" || !a.configured {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
-	p, err := a.authenticate(c.UserContext(), token)
+	p, err := a.authenticate(c.Context(), token)
 	if err != nil {
 		if !errors.Is(err, a.invalid) && !meta.IsNotFound(err) {
 			return c.Status(fiber.StatusServiceUnavailable).

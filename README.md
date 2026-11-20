@@ -110,7 +110,7 @@ request. The example's routes are listed in
 
 | Language | Package | Integrations | Guide |
 | --- | --- | --- | --- |
-| Go | `github.com/eimsound/lazy-observe/sdk/go` | Fiber v2, `slog`, `database/sql`, runtime metrics, CPU, heap, and goroutine profiles | [Go SDK](docs/sdk/go.md) |
+| Go | `github.com/eimsound/lazy-observe/sdk/go` | Fiber v3, `slog`, `database/sql`, runtime metrics, CPU, heap, and goroutine profiles | [Go SDK](docs/sdk/go.md) |
 | Node.js | `@lazy-observe/node` | Express, Pino, Winston, runtime metrics, errors, CPU and heap profiles | [Node SDK](docs/sdk/node.md) |
 | Browser | `@lazy-observe/browser`, `@lazy-observe/react` | Errors, Web Vitals, fetch and XHR tracing, session replay, React error boundary and route tracking | [Browser SDK](docs/sdk/browser.md) |
 | Browser builds | `@lazy-observe/bundler-plugin` | Source map upload from Vite (plugin) and any bundler (CLI) | [Source maps](docs/sdk/browser.md#source-maps) |

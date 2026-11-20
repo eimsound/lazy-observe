@@ -11,6 +11,7 @@ import (
 	"time"
 
 	lazyobserve "github.com/eimsound/lazy-observe/sdk/go"
+	"github.com/gofiber/fiber/v3"
 	_ "modernc.org/sqlite"
 )
 
@@ -47,7 +48,7 @@ func main() {
 	app := newExampleApp(lo, db, envOrDefault("LO_LLM_URL", "http://127.0.0.1:3330"))
 	go func() {
 		port := envOrDefault("PORT", "3320")
-		if err := app.Listen("127.0.0.1:" + port); err != nil {
+		if err := app.Listen("127.0.0.1:"+port, fiber.ListenConfig{DisableStartupMessage: true}); err != nil {
 			slog.Error("Fiber stopped", "error", err)
 		}
 	}()

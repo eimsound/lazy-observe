@@ -14,7 +14,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/account"
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 type revokeOtherSessionsFailure struct{ account.Sessions }
