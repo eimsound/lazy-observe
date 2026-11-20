@@ -48,6 +48,8 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 
 ## 流程步骤
 
+实现、修复或审查后端、Web、SDK 或部署/CI 改动面时，按需查阅 `.agents/skills/pitfalls/SKILL.md` 核对已知共性坑。
+
 ### feature
 
 1. 读 `.agents/docs/requirements.md` 对应小节、相关 ADR、`.agents/docs/GLOSSARY.md` 术语。

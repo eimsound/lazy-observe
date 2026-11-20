@@ -23,3 +23,4 @@
 - 非平凡工作从 `.agents/skills/do/SKILL.md` 开始，`do` 覆盖的情境不要只凭 skill description 选；
   负责人要主线程只对话、子线程干活时，在 `do` 之上再遵循 `.agents/skills/main/SKILL.md`。
 - issue tracker、triage labels、domain docs（`.agents/docs/GLOSSARY.md`、`.agents/docs/adr/`）的配置在 `.agents/docs/agents/`。
+- 修改或审查后端、Web、SDK 或部署/CI 链路时，按改动面查阅 `.agents/skills/pitfalls/SKILL.md` 规避已知共性坑。

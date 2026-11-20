@@ -1,6 +1,6 @@
 # 上游 skill 的维护
 
-`.agents/skills/` 下除 `do`、`main`、`spec-to-plan` 外，都是 `mattpocock/skills`（MIT，见
+`.agents/skills/` 下除 `do`、`main`、`spec-to-plan`、`pitfalls` 外，都是 `mattpocock/skills`（MIT，见
 `.agents/skills/LICENSE-mattpocock-skills`）的副本，版本固定在根目录的 `skills-lock.json`。
 
 ## 规则
