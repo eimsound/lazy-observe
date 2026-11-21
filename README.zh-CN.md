@@ -119,6 +119,10 @@ mise run dev
 
 - [架构](.agents/docs/architecture.md)
 - [部署](docs/deployment.md)
+- [运维手册（备份、恢复、升级、回滚与应急）](docs/operations.md)
+- [Grafana 与 Perses 对接](docs/grafana-perses.md)
+- [Docker Compose 部署](deploy/compose/README.md)
+- [systemd 服务部署](deploy/systemd/README.md)
 - [SDK 与服务端兼容性](docs/version-matrix.md)
 - [架构决策记录](.agents/docs/adr/)
 - [贡献指南](CONTRIBUTING.md)

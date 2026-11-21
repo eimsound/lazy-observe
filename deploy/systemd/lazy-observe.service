@@ -1,0 +1,81 @@
+# systemd service unit for lazy-observe.
+#
+# Install:
+#   sudo install -m 0644 deploy/systemd/lazy-observe.service /etc/systemd/system/lazy-observe.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lazy-observe
+#
+# See deploy/systemd/README.md for user creation, directory permissions,
+# configuration layout, and zero-downtime drain with SIGUSR1.
+
+[Unit]
+Description=lazy-observe self-hosted observability platform
+Documentation=https://github.com/eimsound/lazy-observe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged system account so persistent /var/lib/lazy-observe and
+# /etc/lazy-observe/secret.key keep stable ownership across restarts, backups,
+# and offline CLI operations (`lazy-observe admin ...`, `lazy-observe doctor`).
+# If you prefer systemd-managed ephemeral identity for a quick test, replace
+# User/Group with `DynamicUser=yes` and let systemd own StateDirectory, noting
+# that offline CLI tools and host backups must then account for dynamic UIDs.
+User=lazy-observe
+Group=lazy-observe
+
+WorkingDirectory=/var/lib/lazy-observe
+StateDirectory=lazy-observe
+StateDirectoryMode=0750
+
+# /etc/lazy-observe is provisioned by the operator as 0750 root:lazy-observe
+# (see deploy/systemd/README.md). Do not set ConfigurationDirectory= here,
+# because systemd would mark /etc/lazy-observe writable and bypass ProtectSystem=strict.
+EnvironmentFile=-/etc/lazy-observe/lazy-observe.env
+ExecStart=/usr/local/bin/lazy-observe server --config /etc/lazy-observe/config.yaml
+
+# Graceful shutdown:
+#   - KillMode=mixed sends SIGTERM only to the main `lazy-observe` process so
+#     its built-in supervisor can drain HTTP/error-inbox (drain_timeout=20s),
+#     stop vmagent first, and then flush/stop embedded Victoria storage children
+#     in order (shutdown_timeout=15s). Any stragglers are cleaned up on timeout.
+#   - Send SIGUSR1 to the main PID ahead of stop/restart to fail /readyz with
+#     HTTP 503 while an upstream load balancer drains traffic.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits (Victoria storage + gateway connections require ample FDs).
+LimitNOFILE=65536
+TasksMax=4096
+
+# Sandboxing & least privilege.
+# Note: /var/lib/lazy-observe MUST NOT be mounted noexec, because lazy-observe
+# extracts and executes verified embedded Victoria binaries under <data_dir>/bin.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/lazy-observe
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lazy-observe
+
+[Install]
+WantedBy=multi-user.target
