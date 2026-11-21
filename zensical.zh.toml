@@ -1,0 +1,89 @@
+[project]
+site_name = "lazy-observe"
+site_description = "基于 VictoriaMetrics、VictoriaLogs 与 VictoriaTraces 的单二进制自托管全栈可观测性平台。"
+site_url = "https://eimsound.github.io/lazy-observe/zh/"
+repo_url = "https://github.com/eimsound/lazy-observe"
+repo_name = "eimsound/lazy-observe"
+docs_dir = "docs/zh"
+site_dir = "site/zh"
+
+nav = [
+  { "概览" = "index.md" },
+  { "快速上手" = "quickstart.md" },
+  { "部署与运维" = [
+    { "部署指南" = "deployment.md" },
+    { "运维手册" = "operations.md" },
+    { "Grafana 与 Perses" = "grafana-perses.md" },
+  ] },
+  { "客户端 SDK" = [
+    { "Go" = "sdk/go.md" },
+    { "Node.js" = "sdk/node.md" },
+    { "Browser 与 React" = "sdk/browser.md" },
+    { "Python" = "sdk/python.md" },
+  ] },
+  { "参考" = [
+    { "平台对比" = "comparison.md" },
+    { "版本兼容矩阵" = "version-matrix.md" },
+  ] },
+]
+
+[project.theme]
+variant = "modern"
+language = "zh"
+features = [
+  "content.code.copy",
+  "navigation.footer",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.sections",
+  "navigation.top",
+  "search.highlight",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "切换到浅色模式"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "切换到深色模式"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "跟随系统主题"
+
+[[project.extra.alternate]]
+name = "English"
+link = "/lazy-observe/"
+lang = "en"
+
+[[project.extra.alternate]]
+name = "简体中文"
+link = "/lazy-observe/zh/"
+lang = "zh"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+toc.permalink = true
+pymdownx.betterem = {}
+pymdownx.details = {}
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.superfences.custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+pymdownx.tabbed.alternate_style = true
+pymdownx.tabbed.combine_header_slug = true
+pymdownx.tasklist.custom_checkbox = true

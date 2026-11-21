@@ -8,7 +8,7 @@
 - 禁止引入 AGPL/GPL 的生产或运行时依赖。白名单以 `scripts/check-go-licenses.sh`（Apache-2.0、MIT、BSD-2/3-Clause）和
   `scripts/check-js-licenses.sh`（另加 ISC、0BSD、Unlicense）为准；白名单外的许可证先改本条和脚本，再引入依赖。仅有两项开发期例外：
   - Air（GPL-3.0）：本地开发 CLI，不得链接进 Go 代码或打包进产物。
-  - MPL-2.0（目前只有 `lightningcss`）：只能在 devDependencies 或构建工具依赖树里，不得进生产或运行时依赖树，不得链接进 Go 二进制或产品。
+  - MPL-2.0（目前有 `lightningcss` 与 `pathspec`）：只能在 devDependencies 或构建工具依赖树里（其中 `pathspec` 仅限文档静态站构建工具依赖树），不得进生产或运行时依赖树，不得链接进 Go 二进制或产品。
 - 如实汇报：列出运行的每条命令及真实结果；没跑的检查不说通过。
 - CI 入口是 mise tasks；测试命令变更时同步改 `mise.toml`。
 - 非生成的 Go 文件用 `golines -m 120 --chain-split-dots` 格式化（就地加 `-w`），不格式化 `internal/db/ent`。

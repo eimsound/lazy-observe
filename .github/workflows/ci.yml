@@ -69,6 +69,7 @@ jobs:
       sdk_journeys: ${{ steps.detect.outputs.sdk_journeys }}
       sdk_journeys_only: ${{ steps.detect.outputs.sdk_journeys_only }}
       trivy_pin: ${{ steps.detect.outputs.trivy_pin }}
+      docs: ${{ steps.detect.outputs.docs }}
       build_matrix: ${{ steps.detect.outputs.build_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -893,6 +894,46 @@ jobs:
       - name: Download Trivy and verify its sha256
         run: bash scripts/install-trivy.sh
 
+  docs:
+    name: Docs site (Zensical)
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      # 只读复用 base 的 mise 缓存（uv 在里面），配 --skip-tools 避免安装无关工具。
+      - name: Restore mise cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/mise
+          key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
+          restore-keys: |
+            mise-base-${{ runner.os }}-${{ runner.arch }}-
+            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore uv cache
+        id: uv-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-docs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/docs/pyproject.toml') }}
+          restore-keys: uv-docs-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MISE_CI_TOOLS: uv
+      - run: mise run --skip-tools docs-build
+      - name: Save uv cache
+        if: github.ref == 'refs/heads/main' && steps.uv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ steps.uv-cache.outputs.cache-primary-key }}
+
   # 唯一的 required check。被跳过的 job 算通过；任一 job 失败或被取消则失败。
   ci-ok:
     # check 名必须就是 ci-ok：分支保护按这个名字匹配 required check。
@@ -914,6 +955,7 @@ jobs:
       - sdk-python
       - sdk-journeys
       - trivy-pin
+      - docs
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

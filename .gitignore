@@ -3,6 +3,8 @@
 /dist/
 /data/
 /.cache/
+/site/
+tools/docs/.venv/
 /lazy-observe
 /.pnpm-store/
 /internal/db/.ent.tmp.*/
