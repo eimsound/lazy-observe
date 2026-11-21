@@ -1,4 +1,5 @@
 import type { LogRow } from "@/lib/api/logs";
+import { hashString } from "@/lib/hash";
 
 /** Pure model for the logs explorer views: settings, defaults, and field access. */
 
@@ -80,19 +81,69 @@ export interface RowField {
   value: unknown;
 }
 
+function bigintReplacer(_key: string, item: unknown): unknown {
+  return typeof item === "bigint" ? item.toString() : item;
+}
+
 export function safeJsonStringify(value: unknown, pretty = false): string {
   try {
     return (
-      JSON.stringify(
-        value,
-        (_key, item: unknown) =>
-          typeof item === "bigint" ? item.toString() : item,
-        pretty ? 2 : undefined,
-      ) ?? String(value)
+      (pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value)) ??
+      String(value)
     );
   } catch {
-    return String(value);
+    try {
+      return (
+        JSON.stringify(value, bigintReplacer, pretty ? 2 : undefined) ??
+        String(value)
+      );
+    } catch {
+      return String(value);
+    }
   }
+}
+
+/**
+ * Builds position-independent, collision-resistant stable keys for log rows
+ * without eagerly serializing `row.raw` on the hot path.
+ *
+ * Pass 1 buckets rows by lightweight O(1) coarse identity (`timeRaw + stream + message`).
+ * Only buckets with > 1 colliding rows fall back to `safeJsonStringify(row.raw)`
+ * + FNV-1a hashing + occurrence counter so distinct payloads and exact duplicates
+ * remain uniquely and stably keyed across refreshes.
+ */
+export function buildStableLogRowKeys(rows: ReadonlyArray<LogRow>): string[] {
+  const count = rows.length;
+  const keys = new Array<string>(count);
+  const buckets = new Map<string, number | number[]>();
+
+  for (let i = 0; i < count; i++) {
+    const row = rows[i];
+    const coarse = `${row.timeRaw}\0${row.stream}\0${row.message}`;
+    const existing = buckets.get(coarse);
+    if (existing === undefined) {
+      buckets.set(coarse, i);
+      keys[i] = coarse;
+    } else if (typeof existing === "number") {
+      buckets.set(coarse, [existing, i]);
+    } else {
+      existing.push(i);
+    }
+  }
+
+  for (const [coarse, bucket] of buckets) {
+    if (typeof bucket === "number") continue;
+    const seen = new Map<string, number>();
+    for (const idx of bucket) {
+      const serialized = safeJsonStringify(rows[idx].raw);
+      const fingerprint = `${coarse}\0${hashString(serialized).toString(36)}-${serialized.length}`;
+      const occurrence = seen.get(fingerprint) ?? 0;
+      seen.set(fingerprint, occurrence + 1);
+      keys[idx] = `${fingerprint}#${occurrence}`;
+    }
+  }
+
+  return keys;
 }
 
 export function stringifyFieldValue(value: unknown): string {
