@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -74,14 +74,19 @@ export function LogsStreamContextDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const { t } = useTranslation();
-  const [beforeCount, setBeforeCount] = useState(CONTEXT_PAGE_SIZE);
-  const [afterCount, setAfterCount] = useState(CONTEXT_PAGE_SIZE);
+  const anchorId = anchor?.id;
+  const [windowCounts, setWindowCounts] = useState<{
+    anchorId: string | undefined;
+    before: number;
+    after: number;
+  }>({
+    anchorId,
+    before: CONTEXT_PAGE_SIZE,
+    after: CONTEXT_PAGE_SIZE,
+  });
+  const beforeCount = windowCounts.anchorId === anchorId ? windowCounts.before : CONTEXT_PAGE_SIZE;
+  const afterCount = windowCounts.anchorId === anchorId ? windowCounts.after : CONTEXT_PAGE_SIZE;
   const [wrap, setWrap] = useState(true);
-
-  useEffect(() => {
-    setBeforeCount(CONTEXT_PAGE_SIZE);
-    setAfterCount(CONTEXT_PAGE_SIZE);
-  }, [anchor?.id]);
 
   const context = useProjectQuery({
     queryKey: [
@@ -173,7 +178,12 @@ export function LogsStreamContextDialog({
             variant="outline"
             size="sm"
             disabled={context.isFetching}
-            onClick={() => setBeforeCount((count) => count + CONTEXT_PAGE_SIZE)}
+            onClick={() => setWindowCounts((current) => {
+              const base = current.anchorId === anchorId
+                ? current
+                : { anchorId, before: CONTEXT_PAGE_SIZE, after: CONTEXT_PAGE_SIZE };
+              return { ...base, before: base.before + CONTEXT_PAGE_SIZE };
+            })}
           >
             {context.isFetching && <Loader2 className="animate-spin" />}
             {t("logs.loadOlderContext")}
@@ -213,7 +223,12 @@ export function LogsStreamContextDialog({
             variant="outline"
             size="sm"
             disabled={context.isFetching}
-            onClick={() => setAfterCount((count) => count + CONTEXT_PAGE_SIZE)}
+            onClick={() => setWindowCounts((current) => {
+              const base = current.anchorId === anchorId
+                ? current
+                : { anchorId, before: CONTEXT_PAGE_SIZE, after: CONTEXT_PAGE_SIZE };
+              return { ...base, after: base.after + CONTEXT_PAGE_SIZE };
+            })}
           >
             {context.isFetching && <Loader2 className="animate-spin" />}
             {t("logs.loadNewerContext")}

@@ -1,5 +1,5 @@
 import { Braces, Check, ChevronDown, ChevronRight, Copy } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { useVirtualWindow } from "@/lib/use-virtual-window";
@@ -45,21 +45,24 @@ export function LogsJsonView({
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const [prevRowKeys, setPrevRowKeys] = useState(rowKeys);
 
   // Prune expanded keys that no longer exist in the current result set.
-  useEffect(() => {
-    setExpandedIds((prev) => {
-      if (prev.size === 0) return prev;
+  if (prevRowKeys !== rowKeys) {
+    setPrevRowKeys(rowKeys);
+    if (expandedIds.size > 0) {
       const activeKeys = new Set(rowKeys);
       let changed = false;
       const next = new Set<string>();
-      for (const key of prev) {
+      for (const key of expandedIds) {
         if (activeKeys.has(key)) next.add(key);
         else changed = true;
       }
-      return changed ? next : prev;
-    });
-  }, [rowKeys]);
+      if (changed) {
+        setExpandedIds(next);
+      }
+    }
+  }
 
   const toggleExpanded = useCallback((rowKey: string) => {
     setExpandedIds((prev) => {
@@ -95,7 +98,14 @@ export function LogsJsonView({
     [rowKeys, expandedIds],
   );
 
-  const virtual = useVirtualWindow({
+  const {
+    scrollRef,
+    measureElement,
+    isVirtualized,
+    paddingTop,
+    paddingBottom,
+    items,
+  } = useVirtualWindow({
     count: rows.length,
     estimateSize: estimateRowSize,
     overscan: JSON_OVERSCAN,
@@ -142,17 +152,17 @@ export function LogsJsonView({
         <EmptyLogs />
       ) : (
         <div
-          ref={virtual.scrollRef}
+          ref={scrollRef}
           role="list"
-          data-virtualized={virtual.isVirtualized ? "true" : "false"}
+          data-virtualized={isVirtualized ? "true" : "false"}
           tabIndex={0}
           className="max-h-[640px] overflow-auto py-2 font-mono text-xs leading-relaxed text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
           <div className="w-max min-w-full">
-            {virtual.paddingTop > 0 && (
-              <div aria-hidden="true" style={{ height: virtual.paddingTop }} />
+            {paddingTop > 0 && (
+              <div aria-hidden="true" style={{ height: paddingTop }} />
             )}
-            {virtual.items.map((item) => {
+            {items.map((item) => {
               const row = rows[item.index];
               if (!row) return null;
               const rowKey = rowKeys[item.index] ?? String(item.index);
@@ -163,7 +173,7 @@ export function LogsJsonView({
               return (
                 <div
                   key={itemKey}
-                  ref={virtual.measureElement}
+                  ref={measureElement}
                   role="listitem"
                   data-virtual-index={item.index}
                   className="group flex items-start gap-1.5 px-2 py-0.5 hover:bg-muted/40"
@@ -214,8 +224,8 @@ export function LogsJsonView({
                 </div>
               );
             })}
-            {virtual.paddingBottom > 0 && (
-              <div aria-hidden="true" style={{ height: virtual.paddingBottom }} />
+            {paddingBottom > 0 && (
+              <div aria-hidden="true" style={{ height: paddingBottom }} />
             )}
           </div>
         </div>

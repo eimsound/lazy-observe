@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   BarChart3,
   Check,
@@ -66,19 +66,18 @@ export function LogsTimeControls({
   onRefresh: () => void;
 }) {
   const { t } = useTranslation();
-  const [durationInput, setDurationInput] = useState(
-    formatPrometheusDuration(metricsRangeSeconds(range)),
+  const formattedDuration = formatPrometheusDuration(metricsRangeSeconds(range));
+  const [durationDraft, setDurationDraft] = useState<{ range: MetricsRange; value: string } | null>(
+    null,
   );
-
-  useEffect(() => {
-    setDurationInput(formatPrometheusDuration(metricsRangeSeconds(range)));
-  }, [range]);
+  const durationInput =
+    durationDraft && durationDraft.range === range ? durationDraft.value : formattedDuration;
 
   const parsedDuration = parsePrometheusDuration(durationInput);
 
   function commitDuration() {
+    setDurationDraft(null);
     if (parsedDuration === null) {
-      setDurationInput(formatPrometheusDuration(metricsRangeSeconds(range)));
       return;
     }
     onRangeChange(setMetricsRangeSeconds(range, parsedDuration));
@@ -139,7 +138,7 @@ export function LogsTimeControls({
           aria-label={t("logs.duration")}
           aria-invalid={parsedDuration === null}
           disabled={disabled}
-          onChange={(event) => setDurationInput(event.target.value)}
+          onChange={(event) => setDurationDraft({ range, value: event.target.value })}
           onBlur={commitDuration}
           onKeyDown={(event) => {
             if (event.key === "Enter") {

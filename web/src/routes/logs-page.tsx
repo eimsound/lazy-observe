@@ -57,11 +57,10 @@ export function LogsPage() {
     routeLocation,
     currentHistoryHref,
     replaceLocation,
-    classifyLocationChange,
+    subscribeExternalLocation,
   } = useRouterLocationSync();
 
-  const [selected, setSelected] = useState<LogRow | null>(null);
-  const selectedProject = useRef(project);
+  const [selection, setSelection] = useState<LogsContextAnchor | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [contextAnchor, setContextAnchor] = useState<LogsContextAnchor | null>(null);
   const [historyCursor, setHistoryCursor] = useState(-1);
@@ -71,7 +70,7 @@ export function LogsPage() {
 
   const resetTransientUi = useCallback(() => {
     setHistoryCursor(-1);
-    setSelected(null);
+    setSelection(null);
     setDrawerOpen(false);
     setContextAnchor(null);
   }, []);
@@ -101,10 +100,9 @@ export function LogsPage() {
 
   useLogsPresentationUrlSync({
     presentation,
-    routeLocation,
     currentHistoryHref,
     replaceLocation,
-    classifyLocationChange,
+    subscribeExternalLocation,
     view,
     onExternalNavigation: resetTransientUi,
   });
@@ -193,8 +191,7 @@ export function LogsPage() {
   }, [changeRange]);
 
   const openRowDetail = useCallback((row: LogRow) => {
-    selectedProject.current = project;
-    setSelected(row);
+    setSelection({ project, row });
     setDrawerOpen(true);
   }, [project]);
 
@@ -447,8 +444,8 @@ export function LogsPage() {
       </div>
 
       <LogDetailDrawer
-        row={selectedProject.current === project ? selected : null}
-        open={drawerOpen && selectedProject.current === project}
+        row={selection?.project === project ? selection.row : null}
+        open={drawerOpen && selection?.project === project}
         onOpenChange={setDrawerOpen}
         onAddFilter={(field, value) => {
           setDrawerOpen(false);

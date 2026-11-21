@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronRight, Home } from "lucide-react";
 import type { FlameNode } from "@/lib/api/profiles";
@@ -48,10 +48,6 @@ export function Flamegraph({ tree, total, query, className }: FlamegraphProps) {
 
   // Re-anchor the focus to the (possibly new) tree on every data refresh,
   // tolerating a stale path by walking child names.
-  useEffect(() => {
-    setFocusPath((prev) => resolveFocus(tree, prev));
-  }, [tree]);
-
   const safePath = useMemo(() => resolveFocus(tree, focusPath), [tree, focusPath]);
   const layout = useMemo(() => computeLayout(safePath, query), [safePath, query]);
   const searchActive = query.trim().length > 0;

@@ -78,6 +78,7 @@ import type { MetricsEvidenceSearch } from "./trace-evidence-links";
 import {
   buildMetricsPanelsURL,
   newMetricsPanel,
+  parseMetricsSearch,
   parseMetricsStateFromLocation,
   type ExecutedMetricsQuery,
   type InitialMetricsState,
@@ -99,45 +100,85 @@ function initialLocalTime() {
   }
 }
 
+function createInitialMetricsState(
+  routeLocation: string,
+  search: MetricsEvidenceSearch,
+): { state: InitialMetricsState; initialDeepLinkKey: string | null; initialDeepLinkQuery: string | null } {
+  const parsed = parseMetricsStateFromLocation(routeLocation, search);
+  if (!search.q) {
+    return { state: parsed, initialDeepLinkKey: null, initialDeepLinkQuery: null };
+  }
+  const key = JSON.stringify([search.q, search.run ?? "", search.start ?? null, search.end ?? null]);
+  const trimmed = search.q.trim();
+  const target = parsed.panels[0] ?? newMetricsPanel("query-1");
+  const evidenceRange: MetricsRange | undefined =
+    search.start !== undefined && search.end !== undefined
+      ? { mode: "absolute", startMs: search.start * 1_000, endMs: search.end * 1_000 }
+      : undefined;
+  const nextRange = evidenceRange ?? target.range;
+  const updated: QueryPanelState = { ...target, query: search.q, range: nextRange };
+  const panels = parsed.panels.length > 0 ? [updated, ...parsed.panels.slice(1)] : [updated];
+  const executed = { ...parsed.executed };
+  if (search.run === "1" && trimmed) {
+    executed[updated.id] = {
+      query: trimmed,
+      runId: panels.length + 1,
+      range: resolveMetricsRange(nextRange),
+    };
+  }
+  return {
+    state: { panels, executed },
+    initialDeepLinkKey: key,
+    initialDeepLinkQuery: search.run === "1" && trimmed ? trimmed : null,
+  };
+}
+
 export function MetricsPage() {
   const { t } = useTranslation();
   const {
     routeLocation,
     currentHistoryHref,
     replaceLocation,
-    classifyLocationChange,
+    subscribeExternalLocation,
   } = useRouterLocationSync();
   const search = useSearch({ strict: false }) as MetricsEvidenceSearch;
   const { currentSlug: project } = useProject();
-  const initial = useRef<InitialMetricsState | null>(null);
-  if (!initial.current) {
-    initial.current = parseMetricsStateFromLocation(routeLocation, search);
-  }
-  const [panels, setPanels] = useState<QueryPanelState[]>(initial.current.panels);
+  const [initial] = useState(() => createInitialMetricsState(routeLocation, search));
+  const [panels, setPanels] = useState<QueryPanelState[]>(initial.state.panels);
   const panelsRef = useRef(panels);
-  panelsRef.current = panels;
-  const nextPanelId = useRef(initial.current.panels.length + 1);
-  const nextRunId = useRef(initial.current.panels.length + 1);
+  const nextPanelId = useRef(initial.state.panels.length + 1);
+  const nextRunId = useRef(initial.state.panels.length + 2);
   const projectRef = useRef(project);
-  projectRef.current = project;
-  const searchRef = useRef(search);
-  searchRef.current = search;
   const [localTime, setLocalTime] = useState(initialLocalTime);
-  const [executed, setExecuted] = useState<Record<string, ExecutedQuery>>(initial.current.executed);
-  const [history, setHistory] = useState<MetricsHistoryEntry[]>(() => getMetricsHistory(project));
+  const [executed, setExecuted] = useState<Record<string, ExecutedQuery>>(initial.state.executed);
+  const [history, setHistory] = useState<MetricsHistoryEntry[]>(() => (
+    initial.initialDeepLinkQuery
+      ? pushMetricsHistory(project, [initial.initialDeepLinkQuery])
+      : getMetricsHistory(project)
+  ));
   const [prettifying, setPrettifying] = useState<Record<string, boolean>>({});
   const [editorErrors, setEditorErrors] = useState<Record<string, string>>({});
+  const [trackedProject, setTrackedProject] = useState(project);
   const previousProject = useRef(project);
-  const lastDeepLinkKey = useRef<string | null>(null);
+  const lastDeepLinkKey = useRef<string | null>(initial.initialDeepLinkKey);
+
+  if (trackedProject !== project) {
+    setTrackedProject(project);
+    setHistory(getMetricsHistory(project));
+    setPanels([newMetricsPanel("query-1")]);
+    setExecuted({});
+    setPrettifying({});
+    setEditorErrors({});
+  }
 
   useEffect(() => {
-    setHistory(getMetricsHistory(project));
+    panelsRef.current = panels;
+    projectRef.current = project;
+  });
+
+  useEffect(() => {
     if (previousProject.current !== project) {
       previousProject.current = project;
-      setPanels([newMetricsPanel("query-1")]);
-      setExecuted({});
-      setPrettifying({});
-      setEditorErrors({});
       nextPanelId.current = 2;
       nextRunId.current = 1;
       lastDeepLinkKey.current = null;
@@ -149,17 +190,62 @@ export function MetricsPage() {
     replaceLocation(target);
   }, [panels, currentHistoryHref, replaceLocation]);
 
-  // Resync panels only on genuine external navigations (browser Back/Forward),
-  // never on URL writes authored by this page itself.
-  useEffect(() => {
-    if (classifyLocationChange(routeLocation) === "self") return;
-    if (searchRef.current.q) return;
-    const next = parseMetricsStateFromLocation(routeLocation, searchRef.current);
+  // Resync panels and deep links only on genuine external navigations (browser
+  // Back/Forward or same-page deep links like "Open in Metrics" from AI), never
+  // on URL writes authored by this page itself.
+  useEffect(() => subscribeExternalLocation((nextLocation) => {
+    const params = new URL(nextLocation, "https://lazy-observe.invalid").searchParams;
+    const nextSearch = parseMetricsSearch(Object.fromEntries(params.entries()));
+    if (nextSearch.q) {
+      const key = JSON.stringify([
+        nextSearch.q,
+        nextSearch.run ?? "",
+        nextSearch.start ?? null,
+        nextSearch.end ?? null,
+      ]);
+      if (lastDeepLinkKey.current === key) return;
+      lastDeepLinkKey.current = key;
+
+      const trimmed = nextSearch.q.trim();
+      const evidenceRange: MetricsRange | undefined =
+        nextSearch.start !== undefined && nextSearch.end !== undefined
+          ? {
+            mode: "absolute",
+            startMs: nextSearch.start * 1_000,
+            endMs: nextSearch.end * 1_000,
+          }
+          : undefined;
+
+      const currentPanels = panelsRef.current;
+      const target = currentPanels[0] ?? newMetricsPanel("query-1");
+      const nextRange = evidenceRange ?? target.range;
+      const updated: QueryPanelState = {
+        ...target,
+        query: nextSearch.q,
+        range: nextRange,
+      };
+      setPanels(currentPanels.length > 0 ? [updated, ...currentPanels.slice(1)] : [updated]);
+      if (nextSearch.run === "1" && trimmed) {
+        const frozenRange = resolveMetricsRange(nextRange);
+        setExecuted((prev) => ({
+          ...prev,
+          [updated.id]: {
+            query: trimmed,
+            runId: nextRunId.current++,
+            range: frozenRange,
+          },
+        }));
+        setHistory(pushMetricsHistory(projectRef.current, [trimmed]));
+      }
+      return;
+    }
+    lastDeepLinkKey.current = null;
+    const next = parseMetricsStateFromLocation(nextLocation, nextSearch);
     setPanels(next.panels);
     setExecuted(next.executed);
     nextPanelId.current = Math.max(nextPanelId.current, next.panels.length + 1);
     nextRunId.current = Math.max(nextRunId.current, next.panels.length + 1);
-  }, [routeLocation, classifyLocationChange]);
+  }), [subscribeExternalLocation]);
 
   useEffect(() => {
     try {
@@ -195,50 +281,6 @@ export function MetricsPage() {
     }));
     setHistory(pushMetricsHistory(project, [trimmed]));
   }
-
-  // Deep links (?q=…&run=1[&start=…&end=…]) work both on initial arrival and
-  // for same-page navigation (e.g. "Open in Metrics" from the AI assistant).
-  useEffect(() => {
-    if (!search.q) {
-      lastDeepLinkKey.current = null;
-      return;
-    }
-    const key = JSON.stringify([search.q, search.run ?? "", search.start ?? null, search.end ?? null]);
-    if (lastDeepLinkKey.current === key) return;
-    lastDeepLinkKey.current = key;
-
-    const trimmed = search.q.trim();
-    const evidenceRange: MetricsRange | undefined =
-      search.start !== undefined && search.end !== undefined
-        ? {
-          mode: "absolute",
-          startMs: search.start * 1_000,
-          endMs: search.end * 1_000,
-        }
-        : undefined;
-
-    const currentPanels = panelsRef.current;
-    const target = currentPanels[0] ?? newMetricsPanel("query-1");
-    const nextRange = evidenceRange ?? target.range;
-    const updated: QueryPanelState = {
-      ...target,
-      query: search.q ?? "",
-      range: nextRange,
-    };
-    setPanels(currentPanels.length > 0 ? [updated, ...currentPanels.slice(1)] : [updated]);
-    if (search.run === "1" && trimmed) {
-      const frozenRange = resolveMetricsRange(nextRange);
-      setExecuted((prev) => ({
-        ...prev,
-        [updated.id]: {
-          query: trimmed,
-          runId: nextRunId.current++,
-          range: frozenRange,
-        },
-      }));
-      setHistory(pushMetricsHistory(projectRef.current, [trimmed]));
-    }
-  }, [search.q, search.run, search.start, search.end]);
 
   function addPanel(afterId?: string, duplicate?: QueryPanelState) {
     const id = `query-${nextPanelId.current++}`;

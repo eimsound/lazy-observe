@@ -498,6 +498,8 @@ export interface UseVirtualWindowResult extends VirtualRange {
 const useIsomorphicLayoutEffect =
   typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
+const EMPTY_MEASURED_SIZES: ReadonlyMap<string | number, number> = new Map();
+
 export function useVirtualWindow({
   count,
   estimateSize,
@@ -515,41 +517,38 @@ export function useVirtualWindow({
   const [viewportHeight, setViewportHeight] = useState(() =>
     sanitizeSize(defaultViewportHeight),
   );
-  const [measureVersion, setMeasureVersion] = useState(0);
+  // Immutable snapshot of measured heights scoped by `resetKey` so render stays
+  // pure while child `measureElement` ref callbacks record into `measureStoreRef`.
+  const [measuredState, setMeasuredState] = useState<{
+    resetKey: string | number | undefined;
+    sizes: ReadonlyMap<string | number, number>;
+  }>(() => ({ resetKey, sizes: EMPTY_MEASURED_SIZES }));
+  const [trackedResetKey, setTrackedResetKey] = useState(resetKey);
+  const resetChangedInRender = !Object.is(trackedResetKey, resetKey);
+  if (resetChangedInRender) {
+    setTrackedResetKey(resetKey);
+    if (scrollTop !== 0) {
+      setScrollTop(0);
+    }
+  }
+  const effectiveScrollTop = resetChangedInRender ? 0 : scrollTop;
+  const activeMeasuredSizes =
+    Object.is(measuredState.resetKey, resetKey) && measuredState.sizes.size > 0
+      ? measuredState.sizes
+      : undefined;
 
-  // Swap the measured-height Map synchronously during render when `resetKey` changes
-  // so child `measureElement` ref callbacks during this commit write into the fresh
-  // Map and are never wiped by a post-commit layout effect.
   const measureStoreRef = useRef<VirtualMeasureStore>({
     resetKey,
     sizes: new Map(),
   });
-  const resetChangedInRender = syncMeasureStoreForResetKey(
-    measureStoreRef.current,
-    resetKey,
-  );
-  if (resetChangedInRender) {
-    scrollTopRef.current = 0;
-  }
-  const activeMeasuredSizes = measureStoreRef.current.sizes;
-  const effectiveScrollTop = resetChangedInRender ? 0 : scrollTop;
-
-  const committedScrollTopRef = useRef(0);
-  committedScrollTopRef.current = effectiveScrollTop;
-
+  const committedScrollTopRef = useRef(effectiveScrollTop);
   const getItemKeyRef = useRef(getItemKey);
-  getItemKeyRef.current = getItemKey;
 
-  const layout = useMemo(() => {
-    const measured =
-      activeMeasuredSizes.size > 0 && measureVersion > 0
-        ? activeMeasuredSizes
-        : undefined;
-    return buildVirtualLayout(count, estimateSize, measured, getItemKey);
-  }, [count, estimateSize, getItemKey, activeMeasuredSizes, measureVersion]);
-
+  const layout = useMemo(
+    () => buildVirtualLayout(count, estimateSize, activeMeasuredSizes, getItemKey),
+    [count, estimateSize, getItemKey, activeMeasuredSizes],
+  );
   const layoutRef = useRef(layout);
-  layoutRef.current = layout;
 
   const range = useMemo(
     () =>
@@ -563,21 +562,31 @@ export function useVirtualWindow({
       }),
     [layout, effectiveScrollTop, viewportHeight, overscan, virtualizeThreshold, enabled],
   );
-
   const rangeRef = useRef(range);
-  rangeRef.current = range;
-
   const viewportHeightRef = useRef(viewportHeight);
-  viewportHeightRef.current = viewportHeight;
-
   const overscanRef = useRef(overscan);
-  overscanRef.current = overscan;
-
   const thresholdRef = useRef(virtualizeThreshold);
-  thresholdRef.current = virtualizeThreshold;
-
   const enabledRef = useRef(enabled);
-  enabledRef.current = enabled;
+
+  useIsomorphicLayoutEffect(() => {
+    committedScrollTopRef.current = effectiveScrollTop;
+    getItemKeyRef.current = getItemKey;
+    layoutRef.current = layout;
+    rangeRef.current = range;
+    viewportHeightRef.current = viewportHeight;
+    overscanRef.current = overscan;
+    thresholdRef.current = virtualizeThreshold;
+    enabledRef.current = enabled;
+  }, [
+    effectiveScrollTop,
+    getItemKey,
+    layout,
+    range,
+    viewportHeight,
+    overscan,
+    virtualizeThreshold,
+    enabled,
+  ]);
 
   const items = useMemo(
     () => computeVirtualItems(layout, range.startIndex, range.endIndex),
@@ -589,13 +598,15 @@ export function useVirtualWindow({
     setScrollElement(node);
   }, []);
 
-  // Reset DOM scroll position when viewing a distinct entity (`resetKey`).
-  // Measured heights were already isolated synchronously in render so child
-  // `measureElement` measurements from this commit stay intact.
+  // Reset DOM scroll position and ensure the mutable measure store is swapped
+  // when viewing a distinct entity (`resetKey`). Any child `measureElement`
+  // callback that ran earlier in the same commit already called
+  // `syncMeasureStoreForResetKey`, so this is idempotent and preserves first-frame heights.
   const prevLayoutResetKeyRef = useRef(resetKey);
   useIsomorphicLayoutEffect(() => {
     if (Object.is(prevLayoutResetKeyRef.current, resetKey)) return;
     prevLayoutResetKeyRef.current = resetKey;
+    syncMeasureStoreForResetKey(measureStoreRef.current, resetKey);
 
     scrollTopRef.current = 0;
     if (scrollElementRef.current) {
@@ -722,15 +733,30 @@ export function useVirtualWindow({
 
   // Keep cached measured sizes consistent when the underlying item set changes.
   useEffect(() => {
-    if (pruneMeasuredSizes(measureStoreRef.current.sizes, count, getItemKey)) {
-      setMeasureVersion((v) => v + 1);
+    syncMeasureStoreForResetKey(measureStoreRef.current, resetKey);
+    if (!pruneMeasuredSizes(measureStoreRef.current.sizes, count, getItemKey)) {
+      return;
     }
-  }, [count, getItemKey]);
+    let cancelled = false;
+    const snapshot = new Map(measureStoreRef.current.sizes);
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setMeasuredState((prev) =>
+        Object.is(prev.resetKey, resetKey)
+          ? { resetKey, sizes: snapshot }
+          : prev,
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [count, getItemKey, resetKey]);
 
   // Single shared ResizeObserver for variable-height rows.
   const itemObserverRef = useRef<ResizeObserver | null>(null);
 
   const recordElementHeight = useCallback((el: HTMLElement): number => {
+    syncMeasureStoreForResetKey(measureStoreRef.current, resetKey);
     const indexAttr = el.dataset.virtualIndex;
     if (indexAttr === undefined) return 0;
     const index = Number(indexAttr);
@@ -765,7 +791,14 @@ export function useVirtualWindow({
       return delta;
     }
     return Number.EPSILON; // Signal a height change without scrollTop adjustment.
-  }, []);
+  }, [resetKey]);
+
+  const recordElementHeightRef = useRef(recordElementHeight);
+  const resetKeyRef = useRef(resetKey);
+  useIsomorphicLayoutEffect(() => {
+    recordElementHeightRef.current = recordElementHeight;
+    resetKeyRef.current = resetKey;
+  }, [recordElementHeight, resetKey]);
 
   useEffect(() => {
     return () => {
@@ -782,7 +815,7 @@ export function useVirtualWindow({
         let scrollCorrection = 0;
         for (const entry of entries) {
           if (!(entry.target instanceof HTMLElement)) continue;
-          const result = recordElementHeight(entry.target);
+          const result = recordElementHeightRef.current(entry.target);
           if (result !== 0) {
             changed = true;
             if (result !== Number.EPSILON) {
@@ -796,12 +829,16 @@ export function useVirtualWindow({
           scrollTopRef.current = nextTop;
         }
         if (changed) {
-          setMeasureVersion((v) => v + 1);
+          const activeResetKey = resetKeyRef.current;
+          setMeasuredState({
+            resetKey: activeResetKey,
+            sizes: new Map(measureStoreRef.current.sizes),
+          });
         }
       });
     }
     return itemObserverRef.current;
-  }, [recordElementHeight]);
+  }, []);
 
   const measureElement = useCallback<RefCallback<HTMLElement>>(
     (el) => {
@@ -815,13 +852,16 @@ export function useVirtualWindow({
           scrollElementRef.current.scrollTop = nextTop;
           scrollTopRef.current = nextTop;
         }
-        setMeasureVersion((v) => v + 1);
+        setMeasuredState({
+          resetKey,
+          sizes: new Map(measureStoreRef.current.sizes),
+        });
       }
       return () => {
         itemObserverRef.current?.unobserve(el);
       };
     },
-    [ensureItemObserver, recordElementHeight],
+    [ensureItemObserver, recordElementHeight, resetKey],
   );
 
   const scrollToIndex = useCallback(

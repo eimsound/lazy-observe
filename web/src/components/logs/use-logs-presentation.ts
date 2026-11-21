@@ -12,9 +12,7 @@ import {
 } from "./logs-presentation-state";
 
 export function useLogsPresentationState(routeLocation: string) {
-  const initialRef = useRef<InitialLogsState | null>(null);
-  if (!initialRef.current) initialRef.current = parseLogsPresentationState(routeLocation);
-  const initial = initialRef.current;
+  const [initial] = useState<InitialLogsState>(() => parseLogsPresentationState(routeLocation));
 
   const [localTime, setLocalTime] = useState(readLocalTimePreference);
   const [autocomplete, setAutocomplete] = useState(initial.autocomplete);
@@ -60,20 +58,18 @@ export type LogsPresentationStateHandle = ReturnType<typeof useLogsPresentationS
 
 interface UseLogsPresentationUrlSyncOptions {
   presentation: LogsPresentationStateHandle;
-  routeLocation: string;
   currentHistoryHref: () => string;
   replaceLocation: (location: string) => void;
-  classifyLocationChange: (location: string) => "self" | "external";
+  subscribeExternalLocation: (onExternal: (nextLocation: string) => void) => () => void;
   view: LogsViewMode;
   onExternalNavigation: () => void;
 }
 
 export function useLogsPresentationUrlSync({
   presentation,
-  routeLocation,
   currentHistoryHref,
   replaceLocation,
-  classifyLocationChange,
+  subscribeExternalLocation,
   view,
   onExternalNavigation,
 }: UseLogsPresentationUrlSyncOptions) {
@@ -90,7 +86,10 @@ export function useLogsPresentationUrlSync({
     setTableSettings,
   } = presentation;
   const onExternalNavigationRef = useRef(onExternalNavigation);
-  onExternalNavigationRef.current = onExternalNavigation;
+
+  useEffect(() => {
+    onExternalNavigationRef.current = onExternalNavigation;
+  });
 
   useEffect(() => {
     // TanStack queues history writes for a microtask, so read the router's
@@ -117,11 +116,8 @@ export function useLogsPresentationUrlSync({
 
   // Only resync presentation state on genuine external navigations (back/forward
   // or deep links), never in response to URL writes authored by this page itself.
-  useEffect(() => {
-    if (classifyLocationChange(routeLocation) === "self") {
-      return;
-    }
-    const next = parseLogsPresentationState(routeLocation);
+  useEffect(() => subscribeExternalLocation((nextLocation) => {
+    const next = parseLogsPresentationState(nextLocation);
     setAutocomplete(next.autocomplete);
     setHideLogs(next.hideLogs);
     setChart(next.chart);
@@ -134,9 +130,8 @@ export function useLogsPresentationUrlSync({
       pageSize: next.view === "live" ? current.pageSize : next.tableSettings.pageSize,
     }));
     onExternalNavigationRef.current();
-  }, [
-    routeLocation,
-    classifyLocationChange,
+  }), [
+    subscribeExternalLocation,
     setAutocomplete,
     setChart,
     setGroupSettings,

@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -72,16 +72,35 @@ export function MetricsTimeRangePicker({
     formatDateTimeInput(selectedMs, localTime)
   );
   const [viewMonth, setViewMonth] = useState<MonthRef>(() => monthRef(selectedMs, localTime));
+  const [prevProps, setPrevProps] = useState({ value, localTime });
 
-  useEffect(() => {
-    if (!open) return;
-    const endMs = value.mode === "absolute" && value.endMs !== undefined
-      ? value.endMs
-      : dayjs().valueOf();
-    setSelectedMs(endMs);
-    setDateTimeInput(formatDateTimeInput(endMs, localTime));
-    setViewMonth(monthRef(endMs, localTime));
-  }, [localTime, open, value]);
+  if (prevProps.value !== value || prevProps.localTime !== localTime) {
+    const valueChanged = prevProps.value !== value;
+    setPrevProps({ value, localTime });
+    if (open) {
+      const nextMs =
+        valueChanged && value.mode === "absolute" && value.endMs !== undefined
+          ? value.endMs
+          : selectedMs;
+      if (nextMs !== selectedMs) {
+        setSelectedMs(nextMs);
+      }
+      setDateTimeInput(formatDateTimeInput(nextMs, localTime));
+      setViewMonth(monthRef(nextMs, localTime));
+    }
+  }
+
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen);
+    if (nextOpen) {
+      const endMs = value.mode === "absolute" && value.endMs !== undefined
+        ? value.endMs
+        : dayjs().valueOf();
+      setSelectedMs(endMs);
+      setDateTimeInput(formatDateTimeInput(endMs, localTime));
+      setViewMonth(monthRef(endMs, localTime));
+    }
+  }
 
   const timezone = dayjs.tz.guess() || t("metrics.localTime");
   const dateTimeInvalid = parseDateTimeInput(dateTimeInput, localTime) === null;
@@ -124,7 +143,7 @@ export function MetricsTimeRangePicker({
   }
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <div className="relative">
         <PopoverTrigger asChild>
           <Button
