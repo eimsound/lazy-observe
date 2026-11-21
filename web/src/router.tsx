@@ -54,6 +54,10 @@ const DiagnosticsPage = lazyRouteComponent(
 const AlertEventsPage = lazyRouteComponent(() => import("@/routes/alert-events-page"), "AlertEventsPage");
 const AlertRulesPage = lazyRouteComponent(() => import("@/routes/alert-rules-page"), "AlertRulesPage");
 const SilencesPage = lazyRouteComponent(() => import("@/routes/silences-page"), "SilencesPage");
+const InhibitionRulesPage = lazyRouteComponent(
+  () => import("@/routes/inhibition-rules-page"),
+  "InhibitionRulesPage",
+);
 const ChannelsPage = lazyRouteComponent(() => import("@/routes/channels-page"), "ChannelsPage");
 const NotificationHistoryPage = lazyRouteComponent(
   () => import("@/routes/notification-history-page"),
@@ -295,6 +299,12 @@ const alertSilencesRoute = createRoute({
   component: SilencesPage,
 });
 
+const alertInhibitionsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/alerts/inhibitions",
+  component: InhibitionRulesPage,
+});
+
 const alertChannelsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/alerts/channels",
@@ -365,6 +375,7 @@ const routeTree = rootRoute.addChildren([
     alertEventsRoute,
     alertRulesRoute,
     alertSilencesRoute,
+    alertInhibitionsRoute,
     alertChannelsRoute,
     alertNotificationsRoute,
     projectsRoute,

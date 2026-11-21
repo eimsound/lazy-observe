@@ -2,6 +2,9 @@ import type {
   AlertRule,
   AlertRuleInput,
   AlertEvent,
+  InhibitionRule,
+  InhibitionRuleInput,
+  InhibitionRulePatch,
   NotificationChannel,
   ChannelInput,
   Silence,
@@ -146,6 +149,29 @@ export const mockSilences: Silence[] = [
   },
 ];
 
+export const mockInhibitionRules: InhibitionRule[] = [
+  {
+    id: "inh_host_down",
+    source_matchers: [{ name: "alertname", op: "=", value: "TargetDown" }],
+    target_matchers: [{ name: "severity", op: "=~", value: "warning|info" }],
+    equal_labels: ["instance"],
+    enabled: true,
+    comment: "主机目标不可达时，抑制同一实例的低级别告警",
+    created_at: ago(60 * 24 * 7),
+    updated_at: ago(60 * 6),
+  },
+  {
+    id: "inh_critical_over_warn",
+    source_matchers: [{ name: "severity", op: "=", value: "critical" }],
+    target_matchers: [{ name: "severity", op: "=", value: "warning" }],
+    equal_labels: ["service", "alertname"],
+    enabled: false,
+    comment: "同一服务触发紧急告警时抑制同类警告",
+    created_at: ago(60 * 24 * 3),
+    updated_at: ago(60 * 24),
+  },
+];
+
 // ── rule ops ─────────────────────────────────────────────────────────────────
 
 export function createMockRule(input: AlertRuleInput): AlertRule {
@@ -231,6 +257,48 @@ export function updateMockSilence(id: string, input: SilenceInput): Silence {
 export function deleteMockSilence(id: string): void {
   const idx = mockSilences.findIndex((s) => s.id === id);
   if (idx >= 0) mockSilences.splice(idx, 1);
+}
+
+// ── inhibition rule ops ──────────────────────────────────────────────────────
+
+export function createMockInhibitionRule(input: InhibitionRuleInput): InhibitionRule {
+  const now = dayjs().toISOString();
+  const rule: InhibitionRule = {
+    id: nextId("inh"),
+    source_matchers: input.source_matchers,
+    target_matchers: input.target_matchers,
+    equal_labels: input.equal_labels,
+    enabled: input.enabled,
+    comment: input.comment,
+    created_at: now,
+    updated_at: now,
+  };
+  mockInhibitionRules.unshift(rule);
+  return rule;
+}
+
+export function updateMockInhibitionRule(
+  id: string,
+  input: InhibitionRulePatch,
+): InhibitionRule {
+  const idx = mockInhibitionRules.findIndex((r) => r.id === id);
+  if (idx < 0) throw new Error("inhibition rule not found");
+  const current = mockInhibitionRules[idx];
+  mockInhibitionRules[idx] = {
+    ...current,
+    ...(input.source_matchers !== undefined ? { source_matchers: input.source_matchers } : {}),
+    ...(input.target_matchers !== undefined ? { target_matchers: input.target_matchers } : {}),
+    ...(input.equal_labels !== undefined ? { equal_labels: input.equal_labels } : {}),
+    ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+    ...(input.comment !== undefined && input.comment !== "" ? { comment: input.comment } : {}),
+    updated_at: dayjs().toISOString(),
+  };
+  return mockInhibitionRules[idx];
+}
+
+export function deleteMockInhibitionRule(id: string): void {
+  const idx = mockInhibitionRules.findIndex((r) => r.id === id);
+  if (idx >= 0) mockInhibitionRules.splice(idx, 1);
 }
 
 // ── events (derived) ─────────────────────────────────────────────────────────

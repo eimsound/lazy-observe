@@ -17,6 +17,7 @@ import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import {
   SeverityBadge,
   StatusBadge,
+  InhibitedBadge,
   LabelChips,
 } from "@/components/alerts/severity";
 import { Card, CardContent } from "@/components/ui/card";
@@ -151,7 +152,10 @@ export function AlertEventsPage() {
                         )}
                       </td>
                       <td className="px-4 py-3">
-                        <StatusBadge status={e.status} />
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <StatusBadge status={e.status} />
+                          {e.inhibited && <InhibitedBadge />}
+                        </div>
                       </td>
                     </tr>
                   ))}

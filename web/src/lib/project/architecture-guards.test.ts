@@ -119,6 +119,7 @@ test("sensitive and entity-edit dialogs are always conditionally mounted (never 
     { file: "routes/channels-page.tsx", component: "ChannelFormDialog", requireKey: true },
     { file: "routes/alert-rules-page.tsx", component: "RuleFormDialog", requireKey: true },
     { file: "routes/silences-page.tsx", component: "SilenceFormDialog", requireKey: true },
+    { file: "routes/inhibition-rules-page.tsx", component: "InhibitionFormDialog", requireKey: true },
     { file: "routes/scrape-targets-page.tsx", component: "TargetFormDialog", requireKey: true },
   ];
 
