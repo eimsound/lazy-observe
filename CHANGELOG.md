@@ -167,6 +167,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Greenlet-based code (gevent, eventlet) is not supported. See
   `docs/sdk/python.md#continuous-profiling` for the support range, measured
   overhead, and warning codes (#98, #100, #103).
+- Added optional native OTLP/gRPC ingest (`otlp_grpc`, `LO_OTLP_GRPC_*`,
+  disabled by default, default listen `:4317`, `max_recv_bytes` default 52 MiB)
+  supporting `TraceService`, `MetricsService`, and `LogsService` with gzip
+  compression, optional native TLS, `authorization: Bearer lo_...` project-token
+  authentication, and project isolation.
+- Added unified per-project ingest rate limiting and backpressure
+  (`ingest_rate_limit`, `LO_INGEST_RATE_LIMIT_*`, disabled by default) shared
+  across HTTP ingest routes and OTLP/gRPC with `requests_per_second`, `burst`,
+  optional `bytes_per_second`, and bounded `max_tracked_projects`; exceeded
+  requests fail before upstream forwarding with HTTP `429` + `Retry-After`
+  (`ingest_rate_limited`) or gRPC `ResourceExhausted` + `google.rpc.RetryInfo`.
+- Added an opt-in Prometheus operational metrics endpoint (`GET /metrics`,
+  `metrics_endpoint`, `LO_METRICS_ENDPOINT_*`, disabled by default) exposing
+  low-cardinality gateway and OTLP/gRPC operational series with fail-closed auth
+  (admin session or admin `lou_...` token by default, optional static
+  `bearer_token`, or explicit `allow_unauthenticated`, which is rejected when
+  `bearer_token` is set).
+- Added privacy-safe, low-cardinality geography and device dimensions
+  (`device_type`, `browser_family`, `os_family`, `country`) to Web Vitals ingest
+  (`POST /api/events/vitals`), a project-scoped `GET /api/v1/performance/vitals`
+  breakdown API (`by_page`, `by_device`, `by_browser`, `by_os`, `by_country`),
+  browser SDK support (`country`, `vitals: { country }`, `setCountry()`), and
+  Performance page breakdown visualizations and filters. Country extraction from
+  edge headers (`CF-IPCountry`, `CloudFront-Viewer-Country`,
+  `X-Vercel-IP-Country`, `X-Country-Code`) applies only behind
+  `security.trusted_proxies`; raw IP addresses and raw User-Agent strings are
+  never written as metric labels.
+- Added a visual PromQL query builder on the Metrics page with bidirectional
+  synchronization against the CodeMirror expression editor.
+- Added an Alert Inhibition Rules management page in the web console for
+  listing, creating, editing, toggling, and deleting project-scoped inhibition
+  rules with RBAC enforcement.
+- Added an explicit `topology` server configuration (`""`, `"all-in-one"`,
+  `"standalone"`, `"ha"`, fail-closed on `"ha"` unless PostgreSQL, Redis, S3,
+  shared `secret_key_file`, and external signal endpoints are all set), LIFO
+  startup lifecycle coordination, Replay segment indexing with orphan blob
+  cleanup, and streaming pprof flamegraph processing.
+- Added day-two operations and deployment documentation: `docs/operations.md`
+  (All-in-One and HA backup/restore, `doctor --ha` preflight, upgrades,
+  rollbacks, key rotation, and password recovery), `docs/grafana-perses.md` with
+  provisioning manifests (`deploy/integrations/grafana/datasources.yaml` and
+  `deploy/integrations/perses/datasources.yaml`), hardened Docker Compose
+  (`deploy/compose/`) and systemd (`deploy/systemd/`) reference deployments, and
+  an open-source platform comparison guide (`docs/comparison.md`).
+- Extended `cmd/ingest-bench` and `cmd/perf-gate` with storage readback
+  verification, diverse realistic payload generators, aggregate gateway +
+  supervised child process RSS tracking, and query p99 latency gates.
+- Added a real-backend Playwright E2E suite (`mise run web-e2e-real`,
+  `scripts/e2e-web-real.sh`, `web/e2e-real/`) exercising the embedded Web UI
+  against a live temporary gateway and pinned Victoria binaries without
+  `VITE_MOCK=1`.
+- Added a Python SDK lowest-direct dependency regression CI check using
+  `uv --resolution=lowest-direct`.
 
 ### Security
 
@@ -256,6 +309,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   user API tokens; #132). There is still no per-project quota on total source
   map storage, only the existing per-release limit of 200 files and 50 MB
   (#116).
+- Hardened the release supply chain (`.github/workflows/release.yml` and
+  `.github/workflows/sdk-release.yml`): multi-architecture OCI layouts scanned
+  by Trivy are merged and pushed immutably via `crane` without re-running the
+  Dockerfile, signed with Cosign (`cosign sign --recursive`), and attested with
+  SLSA build provenance and SPDX SBOMs via `actions/attest` (migrated from
+  `actions/attest-build-provenance`); GitHub Releases remain in draft until
+  archives, container signing/attestations, and digest-pinned Helm values all
+  succeed.
+- Hardened login anti-DoS, session revocation, exclusive platform-key file
+  creation, outbound notification SSRF/SMTP protections with encrypted and
+  redacted channel credentials, and gateway/web input boundaries (including
+  declarative route authorization policies in `internal/gateway/route_policy.go`
+  and sub-second cross-replica revocation invalidation in `Authenticator`).
 
 ### Changed
 
@@ -786,6 +852,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `@vitejs/plugin-react` 5.2 (#46), and `tsup` 9 (#17), plus grouped
   minor/patch bumps for GitHub Actions, the web workspace, and the SDK Go and
   JS manifests (#13, #14, #15, #22).
+- Restored Renovate's global schedule in `.github/renovate.json` from
+  `at any time` back to `after 3am on monday` (Asia/Shanghai), and tightened
+  GitHub Actions cache keys to stay below the 10 GB repository cache limit.
+- Upgraded pinned storage and toolchain versions: embedded VictoriaLogs
+  `v1.53.0` → `v1.54.0` (with `third_party/victoria/SOURCES.txt` synced),
+  `pnpm` `12.20.0` → `12.21.0`, bootstrap `mise` `v2026.11.7` → `v2026.11.8`,
+  and `@playwright/test` to `1.65.1`.
+- Split standard and streaming storage proxies in the gateway, added optional
+  read/write endpoint splitting for VictoriaLogs and VictoriaTraces
+  (`storage.logs.{query_url,ingest_url}` and
+  `storage.traces.{query_url,ingest_url}`), unified `MetricsClient` with an
+  event-driven `vmagent` scrape reconciler, unified dual-track alert rule
+  planning with precompiled matchers and full write auditing, extracted the AI
+  domain and streaming LLM query client with 14-tool real-gateway MCP contract
+  tests and shared three-SDK GenAI fixtures, and completed ADR 0004 (keeping Ent
+  behind the metadata persistence seam).
+- Split the Go Fiber example (`sdk/go/examples/fiber`) into its own nested
+  `go.mod` so example-only dependencies (`modernc.org/sqlite`) stay out of
+  `sdk/go/go.mod`; unified Node/Browser delivery queues and sanitization
+  pipelines; and unified the Python SDK internal HTTP transport with native
+  ASGI and `StreamingHttpResponse` support.
+- Split oversized web Logs exploration modules by responsibility, tightened web
+  RBAC matrices, project-switch state resets, transport 401 handling, and URL
+  state management, and added bidirectional Helm configuration contract and
+  single-source CI route tests.
+- Rewrote `README.md` and `README.zh-CN.md` for external evaluators with a
+  Mermaid architecture overview, verified 5-minute quickstart (source build and
+  Docker Compose), complete documentation index, and explicit design trade-offs.
+- Hardened CI and toolchain reliability (#273): added `--retry-delay 2
+  --retry-all-errors --connect-timeout 20 --max-time 120` to `mise` release
+  downloads in `scripts/ci-setup-mise.sh` and `Dockerfile`, refreshed apt
+  indices with retry/fallback during Playwright Chromium installation in
+  `sdk/browser/e2e.sh`, `scripts/e2e-web-real.sh`, and `mise.toml` (`tasks.web`),
+  switched `actionlint` to `aqua:rhysd/actionlint` (`1.7.12`), and enabled a
+  weekly Sunday 17:00 UTC schedule with concurrency control on
+  `.github/workflows/bench.yml`.
 
 ### Removed
 
@@ -961,6 +1063,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `release` (for example `release: process.env.RELEASE`). The CLI already
   skipped without a DSN; with a DSN and no release it now exits 1 with the
   same message (#122).
+- Closed a TOCTOU race between alert rule snapshot reads and lease acquisition,
+  and resolved alert state-machine, lease fencing, and notification Outbox
+  defects found during a repository-wide review.
+- Fixed core startup bootstrap, graceful shutdown, `doctor --ha`, dual-database
+  consistency, Blob storage edge cases, and `embedded-postgres` test port races
+  (`Port(0)`).
+- Fixed Live Tail leaks and first-packet blocking, trace double-encoding and
+  proxy boundaries, Prometheus remote-write/scrape/Hosts/Performance/PromQL
+  isolation defects, LLM span projection/pricing/dirty-span sanitization, Error
+  Tracking HA fencing/source-map stability/fingerprinting/VictoriaLogs readback,
+  continuous profiling and Replay dual-database time queries and concurrency
+  consistency, and AI configuration HA sync / Issue AI queue budgeting / MCP
+  contract defects.
+- Fixed web console credential redaction, RBAC state mismatches, auth redirect
+  loops, open-redirect validation, AI contract alignment, and query workspace
+  state issues.
+- Fixed client SDK defects across all four languages: Go SDK DSN token
+  redaction, delivery degradation, Fiber routing, and shutdown timeouts; Node
+  and Browser SDK replay, delivery, stack parsing, and bundler plugin edge
+  cases; and Python SDK error-reporting contracts, Django/DRF isolation and
+  route cardinality, logging recursion, and cross-platform concurrency.
+- Fixed Helm security context and PDB template issues, SDK release validation,
+  CI path routing, and performance/license gate defects.
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
