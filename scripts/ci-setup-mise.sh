@@ -44,7 +44,9 @@ else
   mkdir -p "$install_dir"
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
-  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$work/$mise_asset" \
+  curl --proto '=https' --tlsv1.2 -fsSL \
+    --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 --max-time 120 \
+    -o "$work/$mise_asset" \
     "https://github.com/jdx/mise/releases/download/${MISE_BOOTSTRAP_VERSION}/${mise_asset}"
   printf '%s  %s\n' "$mise_sha256" "$work/$mise_asset" | sha256sum --check --strict -
   install -m 0755 "$work/$mise_asset" "$mise_bin"
@@ -78,7 +80,7 @@ else
     ci_tools=(
       go
       rg
-      actionlint
+      aqua:rhysd/actionlint
       golangci-lint
       go:github.com/golangci/golines
       go:github.com/google/go-licenses/v2

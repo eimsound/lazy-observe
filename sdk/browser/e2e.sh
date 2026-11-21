@@ -117,11 +117,31 @@ printf 'building SDK workspace and examples from this repo...\n'
 (cd "$SDK_DIR/../go/examples/fiber" && CGO_ENABLED=0 go build -o "$WORK/fiber-example" .)
 (cd "$SDK_DIR/../node" && pnpm install --frozen-lockfile && pnpm build)
 # --with-deps 要用 apt 装系统库，需要 root 或免密 sudo（CI runner 满足）；
-# 没有这个权限的开发机只装浏览器本身，系统库缺失时 Playwright 启动 Chromium 会如实报错。
-playwright_args="--only-shell chromium"
-if [ "$(id -u)" = 0 ] || sudo -n true >/dev/null 2>&1; then
-	playwright_args="--with-deps $playwright_args"
-fi
+# 托管 runner 偶发 apt 索引过期或镜像半同步导致 fonts-unifont 等字体包找不到，先容错刷新索引并允许失败重试/降级到仅装浏览器，
+# 系统库若真缺失，后续启动 Chromium 会如实报错。没有 root/免密 sudo 的开发机不调用 apt/sudo，只装浏览器本身。
+install_playwright_chromium() {
+	if [ "$(id -u)" = 0 ] || sudo -n true >/dev/null 2>&1; then
+		apt_prefix=
+		if [ "$(id -u)" != 0 ]; then
+			apt_prefix="sudo -n"
+		fi
+		if command -v apt-get >/dev/null 2>&1; then
+			# shellcheck disable=SC2086 # 有意按空白拆分 sudo -n 前缀
+			$apt_prefix apt-get update -qq >/dev/null 2>&1 || true
+		fi
+		if ! pnpm exec playwright install --with-deps --only-shell chromium; then
+			printf 'warning: playwright install --with-deps failed; retrying after apt-get update and falling back to browser-only install\n' >&2
+			if command -v apt-get >/dev/null 2>&1; then
+				# shellcheck disable=SC2086 # 有意按空白拆分 sudo -n 前缀
+				$apt_prefix apt-get update -qq >/dev/null 2>&1 || true
+			fi
+			pnpm exec playwright install --with-deps --only-shell chromium ||
+				pnpm exec playwright install --only-shell chromium
+		fi
+	else
+		pnpm exec playwright install --only-shell chromium
+	fi
+}
 (
 	cd "$SDK_DIR"
 	# bundler-plugin 的 bin（lazy-observe-sourcemaps）指向 dist/cli.js，examples/react 依赖它；
@@ -131,8 +151,7 @@ fi
 	pnpm --filter @lazy-observe/bundler-plugin build
 	pnpm install --frozen-lockfile
 	pnpm build
-	# shellcheck disable=SC2086 # 有意按空白拆分参数
-	pnpm exec playwright install $playwright_args
+	install_playwright_chromium
 )
 
 
