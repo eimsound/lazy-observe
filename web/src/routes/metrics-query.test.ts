@@ -148,6 +148,49 @@ test("PromQL autocomplete distinguishes metrics, labels, and label values", () =
   assert.equal(value.token, "GE");
 });
 
+test("PromQL autocomplete recognizes MetricsQL fill/fill_left/fill_right and group_left/group_right modifiers", () => {
+  const afterFillSpace = analyzePromQLContext("a + fill(0) ", 12);
+  assert.equal(afterFillSpace.kind, "metric");
+  assert.equal(afterFillSpace.token, "");
+
+  const afterFillLeft = analyzePromQLContext("a + fill_left(0) ", 17);
+  assert.equal(afterFillLeft.kind, "metric");
+  assert.equal(afterFillLeft.token, "");
+
+  const metricAfterFill = analyzePromQLContext("a + fill(0) http_req", 20);
+  assert.equal(metricAfterFill.kind, "metric");
+  assert.equal(metricAfterFill.token, "http_req");
+
+  const labelAfterNegativeFill = analyzePromQLContext("a + fill(-1) http_requests_total{met", 36);
+  assert.equal(labelAfterNegativeFill.kind, "label");
+  assert.equal(labelAfterNegativeFill.metric, "http_requests_total");
+  assert.equal(labelAfterNegativeFill.token, "met");
+
+  const labelAfterFillRight = analyzePromQLContext("a + fill_right(-1) http_requests_total{met", 42);
+  assert.equal(labelAfterFillRight.kind, "label");
+  assert.equal(labelAfterFillRight.metric, "http_requests_total");
+  assert.equal(labelAfterFillRight.token, "met");
+
+  const valueAfterFill = analyzePromQLContext('a + fill(0) http_requests_total{method="GE', 42);
+  assert.equal(valueAfterFill.kind, "value");
+  assert.equal(valueAfterFill.metric, "http_requests_total");
+  assert.equal(valueAfterFill.label, "method");
+  assert.equal(valueAfterFill.token, "GE");
+
+  const labelInsideGroupLeft = analyzePromQLContext("a * on(pod) group_left(no", 25);
+  assert.equal(labelInsideGroupLeft.kind, "label");
+  assert.equal(labelInsideGroupLeft.token, "no");
+
+  const labelInsideGroupRight = analyzePromQLContext("a * on(pod) group_right(ro", 26);
+  assert.equal(labelInsideGroupRight.kind, "label");
+  assert.equal(labelInsideGroupRight.token, "ro");
+
+  const labelAfterGroupLeft = analyzePromQLContext("a * on(pod) group_left(node) kube_pod_info{na", 45);
+  assert.equal(labelAfterGroupLeft.kind, "label");
+  assert.equal(labelAfterGroupLeft.metric, "kube_pod_info");
+  assert.equal(labelAfterGroupLeft.token, "na");
+});
+
 test("label-value insertion adds balanced quotes and function insertion adds a call", () => {
   const raw = 'http_requests_total{method=GE}';
   const cursor = raw.indexOf("GE") + 2;
