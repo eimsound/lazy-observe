@@ -15,8 +15,204 @@ fi
 # 版本与两个架构的 sha256 只在 scripts/mise-release.env 维护，Dockerfile 的 builder 阶段读同一份文件。
 # 升级时先 `gh release view -R jdx/mise <tag> --json assets` 确认资产名，再改那一个文件。
 # 不用上游安装脚本：它本身不固定、也不做校验。
-if command -v mise >/dev/null 2>&1; then
-  mise_bin=$(command -v mise)
+install_dir=${HOME}/.local/bin
+mise_bin=${install_dir}/mise
+in_ci=0
+if [[ ${GITHUB_ACTIONS:-} == true || -n ${GITHUB_PATH:-} ]]; then
+  in_ci=1
+fi
+
+curl_common_args=(
+  --proto '=https'
+  --tlsv1.2
+  --proto-redir '=https'
+  -fsS
+  --connect-timeout 20
+  --max-time 120
+  --retry 5
+  --retry-all-errors
+  --retry-max-time 90
+)
+
+extract_release_asset_api_url() {
+  local release_json=$1 asset_name=$2
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg name "$asset_name" '[.assets[]? | select(.name == $name) | .url][0] // empty' "$release_json" 2>/dev/null || true
+    return 0
+  fi
+
+  awk -v target="$asset_name" '
+    { buf = buf $0 "\n" }
+    END {
+      n = length(buf)
+      depth = 0
+      assets_arr_depth = 0
+      cur_name = ""
+      cur_url = ""
+      found = ""
+      for (i = 1; i <= n; i++) {
+        c = substr(buf, i, 1)
+        if (c == "{") {
+          depth++
+          kind[depth] = "{"
+          state[depth] = "key"
+          last_key[depth] = ""
+          if (assets_arr_depth > 0 && depth == assets_arr_depth + 1) {
+            cur_name = ""
+            cur_url = ""
+          }
+        } else if (c == "}") {
+          if (assets_arr_depth > 0 && depth == assets_arr_depth + 1) {
+            if (cur_name == target && cur_url ~ /^https:\/\/api\.github\.com\/repos\/jdx\/mise\/releases\/assets\/[0-9]+$/) {
+              found = cur_url
+              break
+            }
+          }
+          depth--
+        } else if (c == "[") {
+          depth++
+          kind[depth] = "["
+          state[depth] = ""
+          last_key[depth] = ""
+          if (assets_arr_depth == 0 && depth == 2 && kind[1] == "{" && last_key[1] == "assets" && state[1] == "val") {
+            assets_arr_depth = depth
+          }
+        } else if (c == "]") {
+          if (depth == assets_arr_depth) {
+            assets_arr_depth = 0
+          }
+          depth--
+        } else if (c == ":") {
+          if (depth > 0 && kind[depth] == "{" && state[depth] == "colon") {
+            state[depth] = "val"
+          }
+        } else if (c == ",") {
+          if (depth > 0 && kind[depth] == "{") {
+            state[depth] = "key"
+            last_key[depth] = ""
+          }
+        } else if (c == "\"") {
+          str = ""
+          i++
+          while (i <= n) {
+            ch = substr(buf, i, 1)
+            if (ch == "\"") {
+              break
+            }
+            if (ch == "\\") {
+              i++
+              if (i <= n) {
+                esc = substr(buf, i, 1)
+                if (esc == "\"" || esc == "\\" || esc == "/") {
+                  str = str esc
+                } else {
+                  str = str "\\" esc
+                }
+              }
+            } else {
+              str = str ch
+            }
+            i++
+          }
+          if (depth > 0 && kind[depth] == "{") {
+            if (state[depth] == "key") {
+              last_key[depth] = str
+              state[depth] = "colon"
+            } else if (state[depth] == "val") {
+              if (assets_arr_depth > 0 && depth == assets_arr_depth + 1) {
+                if (last_key[depth] == "name") {
+                  cur_name = str
+                } else if (last_key[depth] == "url") {
+                  cur_url = str
+                }
+              }
+              state[depth] = "after_val"
+            }
+          }
+        }
+      }
+      if (found != "") {
+        print found
+      }
+    }
+  ' "$release_json"
+}
+
+download_mise_via_github_api() {
+  local work_dir=$1 asset=$2 dest=$3
+  local token=${GITHUB_TOKEN:-}
+  local api_headers=$work_dir/github-api.headers
+  local asset_headers=$work_dir/github-asset.headers
+  local release_json=$work_dir/release.json
+  local asset_api_url redirect_meta http_code rest cdn_url
+
+  if [[ -z $token || $token == *$'\n'* || $token == *$'\r'* ]]; then
+    return 1
+  fi
+
+  (
+    umask 077
+    printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n' \
+      "$token" >"$api_headers"
+    printf 'Authorization: Bearer %s\nAccept: application/octet-stream\nX-GitHub-Api-Version: 2022-11-28\n' \
+      "$token" >"$asset_headers"
+  )
+
+  if ! curl "${curl_common_args[@]}" --max-redirs 0 \
+    -H @"$api_headers" \
+    -o "$release_json" \
+    "https://api.github.com/repos/jdx/mise/releases/tags/${MISE_BOOTSTRAP_VERSION}"; then
+    rm -f "$api_headers" "$asset_headers"
+    return 1
+  fi
+
+  asset_api_url=$(extract_release_asset_api_url "$release_json" "$asset")
+  if [[ ! $asset_api_url =~ ^https://api\.github\.com/repos/jdx/mise/releases/assets/[0-9]+$ ]]; then
+    rm -f "$api_headers" "$asset_headers"
+    return 1
+  fi
+
+  if ! redirect_meta=$(curl "${curl_common_args[@]}" --max-redirs 0 \
+    -H @"$asset_headers" \
+    -o /dev/null \
+    -w '%{http_code}\n%{redirect_url}\n' \
+    "$asset_api_url"); then
+    rm -f "$api_headers" "$asset_headers"
+    return 1
+  fi
+  rm -f "$api_headers" "$asset_headers"
+
+  if [[ $redirect_meta != *$'\n'* ]]; then
+    return 1
+  fi
+  http_code=${redirect_meta%%$'\n'*}
+  rest=${redirect_meta#*$'\n'}
+  cdn_url=${rest%%$'\n'*}
+  if [[ $http_code != 302 || ! $cdn_url =~ ^https://[^[:space:]]+$ ]]; then
+    return 1
+  fi
+
+  # 预签名 CDN 请求绝不携带 Authorization 头，避免跨主机 token 泄露或对象存储冲突。
+  curl "${curl_common_args[@]}" -L -o "$dest" "$cdn_url"
+}
+
+download_mise_binary() {
+  local work_dir=$1 asset=$2 dest=$3
+  if [[ -n ${GITHUB_TOKEN:-} ]]; then
+    if download_mise_via_github_api "$work_dir" "$asset" "$dest"; then
+      return 0
+    fi
+    rm -f "$dest" "$work_dir/github-api.headers" "$work_dir/github-asset.headers"
+    printf 'ci-setup-mise: authenticated GitHub API download failed; falling back to direct release download\n' >&2
+  fi
+
+  curl "${curl_common_args[@]}" -L \
+    -o "$dest" \
+    "https://github.com/jdx/mise/releases/download/${MISE_BOOTSTRAP_VERSION}/${asset}"
+}
+
+if ((!in_ci)) && existing_mise=$(command -v mise 2>/dev/null) && [[ $existing_mise != "$mise_bin" ]]; then
+  mise_bin=$existing_mise
   printf 'mise already available at %s; skipping bootstrap\n' "$mise_bin"
 else
   mise_release_env=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/mise-release.env
@@ -38,26 +234,35 @@ else
     ;;
   esac
 
-  install_dir=${HOME}/.local/bin
-  mise_bin=${install_dir}/mise
+  need_download=1
+  if [[ -f $mise_bin && ! -L $mise_bin && -x $mise_bin ]]; then
+    if printf '%s  %s\n' "$mise_sha256" "$mise_bin" | sha256sum --check --strict - >/dev/null 2>&1; then
+      need_download=0
+      printf 'mise already verified at %s; skipping bootstrap download\n' "$mise_bin"
+    else
+      printf 'ci-setup-mise: cached binary at %s failed sha256 check; re-downloading\n' "$mise_bin" >&2
+    fi
+  elif [[ -e $mise_bin || -L $mise_bin ]]; then
+    printf 'ci-setup-mise: existing %s is not a regular executable file; re-downloading\n' "$mise_bin" >&2
+  fi
 
-  mkdir -p "$install_dir"
-  work=$(mktemp -d)
-  trap 'rm -rf "$work"' EXIT
-  curl --proto '=https' --tlsv1.2 -fsSL \
-    --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 --max-time 120 \
-    -o "$work/$mise_asset" \
-    "https://github.com/jdx/mise/releases/download/${MISE_BOOTSTRAP_VERSION}/${mise_asset}"
-  printf '%s  %s\n' "$mise_sha256" "$work/$mise_asset" | sha256sum --check --strict -
-  install -m 0755 "$work/$mise_asset" "$mise_bin"
-  rm -rf "$work"
-  trap - EXIT
+  if ((need_download)); then
+    mkdir -p "$install_dir"
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    download_mise_binary "$work" "$mise_asset" "$work/$mise_asset"
+    printf '%s  %s\n' "$mise_sha256" "$work/$mise_asset" | sha256sum --check --strict -
+    install -m 0755 "$work/$mise_asset" "$mise_bin"
+    rm -rf "$work"
+    trap - EXIT
+  fi
 
-  if [[ -z ${GITHUB_PATH:-} ]]; then
+  if [[ -n ${GITHUB_PATH:-} ]]; then
+    printf '%s\n' "$install_dir" >>"$GITHUB_PATH"
+  elif ((in_ci || need_download)); then
     printf 'GITHUB_PATH is not set; this setup script must run inside GitHub Actions\n' >&2
     exit 1
   fi
-  printf '%s\n' "$install_dir" >>"$GITHUB_PATH"
 fi
 
 "$mise_bin" trust "$PWD/mise.toml"

@@ -52,6 +52,14 @@ jobs:
             echo 'SDK release tag commit is not reachable from origin/main' >&2
             exit 1
           }
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -83,6 +91,14 @@ jobs:
             echo 'SDK release tag commit is not reachable from origin/main' >&2
             exit 1
           }
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -121,6 +137,14 @@ jobs:
             echo 'SDK release tag commit is not reachable from origin/main' >&2
             exit 1
           }
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       # 与 ci.yml 的 sdk-python job 同一套引导：uv 由 mise 提供，不用 setup-python 与 pip，
       # 构建依赖受 sdk/python/pyproject.toml 的 [tool.uv] exclude-newer（7 天最小发布年龄）约束。
       - name: Install mise toolchain

@@ -41,8 +41,8 @@ if [[ ! -x $trivy ]]; then
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
   archive=$work/trivy.tar.gz
-  curl --proto '=https' --tlsv1.2 -fsSL \
-    --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 --max-time 120 \
+  curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
+    --retry 5 --retry-all-errors --retry-max-time 90 --connect-timeout 20 --max-time 120 \
     -o "$archive" \
     "https://github.com/aquasecurity/trivy/releases/download/v${trivy_version}/trivy_${trivy_version}_${asset}.tar.gz"
   printf '%s  %s\n' "$sha256" "$archive" | sha256sum --check --strict - >&2

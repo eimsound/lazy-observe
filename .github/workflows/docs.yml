@@ -36,6 +36,11 @@ jobs:
       - name: Calculate cache keys
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

@@ -71,6 +71,7 @@ if [[ -z $mise_tools ]]; then
   exit 1
 fi
 mise_hash=$(printf '%s\n' "$mise_tools" | sha256sum | awk '{print $1}')
+mise_bin_hash=$(hash_files mise-bin scripts/mise-release.env)
 go_hash=$(hash_files go "${go_manifests[@]}")
 
 # 从已去注释的 [tools] 条目里提取工具版本，兼容单/双引号、等号两侧空白和内联表（{ version = "..." }）。
@@ -159,6 +160,7 @@ playwright_sdk_browser=${playwright_versions[0]}
 output=${GITHUB_OUTPUT:-/dev/stdout}
 {
   printf 'mise=%s\n' "$mise_hash"
+  printf 'mise-bin=%s\n' "$mise_bin_hash"
   printf 'go=%s\n' "$go_hash"
   printf 'go-toolchain=%s\n' "$go_toolchain"
   printf 'pnpm-toolchain=%s\n' "$pnpm_toolchain"

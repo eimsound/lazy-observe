@@ -160,6 +160,11 @@ jobs:
         run: bash scripts/ci-cache-keys.sh
       # tag 触发时 ref 是 refs/tags/*，写进去的缓存别的 tag 和 main 都读不到，所以这个 workflow 只在 main 上保存
       # （手动 snapshot 选 main 时）；其余情况只读 ci.yml 在 main 上保存的缓存。缓存规矩见 ci.yml 顶部注释。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -235,6 +240,11 @@ jobs:
       # release 工具集（goreleaser、go-licenses）只有这个 job 用，自己一份 mise 缓存；tag 触发时只读，
       # 手动 snapshot 选 main 时才保存（原因见上面 performance-gates 的注释）。gomod、gobuild、pnpm、storage
       # 与 performance-gates 共用同一批 key，只读。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore release mise cache
         id: mise-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -340,6 +350,14 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Calculate cache keys
+        id: cache-keys
+        run: bash scripts/ci-cache-keys.sh
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Install container publish toolchain
         run: bash scripts/ci-setup-mise.sh
         env:

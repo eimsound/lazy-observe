@@ -67,28 +67,47 @@ cat >"$fakebin/curl" <<'CURL'
 set -eu
 out=
 url=
+if [ -n "${CURL_CALL_LOG:-}" ]; then
+  printf '%s\n' '---' >>"$CURL_CALL_LOG"
+  for arg in "$@"; do
+    printf '%s\n' "$arg" >>"$CURL_CALL_LOG"
+  done
+fi
 while [ $# -gt 0 ]; do
   case $1 in
-  -o)
-    out=$2
+  -o | --output | --proto | --proto-redir | --connect-timeout | --max-time | --retry | --retry-delay | --retry-max-time | --max-redirs | -H | --header | -w | --write-out)
+    if [ "$1" = -o ] || [ "$1" = --output ]; then
+      out=$2
+    fi
     shift 2
+    ;;
+  --)
+    shift
+    break
     ;;
   -*)
     shift
     ;;
   *)
+    if [ -n "$url" ]; then
+      printf 'fake curl: unexpected extra positional arg: %s\n' "$1" >&2
+      exit 2
+    fi
     url=$1
     shift
     ;;
   esac
 done
+if [ -z "$url" ] && [ $# -gt 0 ]; then
+  url=$1
+fi
 asset=${url##*/}
 cp "${FAKE_STORAGE_PAYLOADS:?}/$asset" "$out"
 CURL
 chmod 0755 "$fakebin/curl"
 
 run_downloader() {
-  local bin_dir=$1 stdout_file=$2 stderr_file=$3
+  local bin_dir=$1 stdout_file=$2 stderr_file=$3 curl_log=${4:-}
   local rc=0
   env -i \
     PATH="$fakebin:/usr/bin:/bin" \
@@ -96,11 +115,12 @@ run_downloader() {
     GOARCH=amd64 \
     LO_STORAGE_BIN_DIR="$bin_dir" \
     FAKE_STORAGE_PAYLOADS="$payloads" \
+    CURL_CALL_LOG="$curl_log" \
     "$bash_bin" "$test_script" >"$stdout_file" 2>"$stderr_file" || rc=$?
   return "$rc"
 }
 
-# 1. 部分缓存命中 + 同平台旧归档与符号链接清理 + 保护其它平台目录。
+# 1. 部分缓存命中 + 同平台旧归档与符号链接清理 + 保护其它平台目录 + curl TLS/超时/指数退避参数。
 bin_ok=$work/bin-ok
 arch_amd64=$bin_ok/.archives/linux-amd64
 arch_arm64=$bin_ok/.archives/linux-arm64
@@ -113,11 +133,21 @@ ln -s "victoria-logs-linux-amd64-v1.53.0.tar.gz" "$arch_amd64/stale-symlink.tar.
 printf 'arm64-metrics-bytes\n' >"$arch_arm64/victoria-metrics-linux-arm64-v1.156.0.tar.gz"
 printf 'arm64-logs-bytes\n' >"$arch_arm64/victoria-logs-linux-arm64-v1.54.0.tar.gz"
 
+ok_curl_log=$work/ok.curl.log
+: >"$ok_curl_log"
 rc=0
-run_downloader "$bin_ok" "$work/ok.out" "$work/ok.err" || rc=$?
+run_downloader "$bin_ok" "$work/ok.out" "$work/ok.err" "$ok_curl_log" || rc=$?
 if ((rc != 0)); then
   fail "case 1: expected exit 0, got $rc; stderr: $(cat "$work/ok.err")"
 fi
+
+if (($(grep -c '^---$' "$ok_curl_log") != 2)); then
+  fail "case 1: expected 2 curl calls for 2 uncached archives, got $(grep -c '^---$' "$ok_curl_log")"
+fi
+for flag in --proto =https --tlsv1.2 --proto-redir -fsSL --connect-timeout 20 --max-time 120 --retry 5 --retry-all-errors --retry-max-time 90; do
+  grep -Fxq -- "$flag" "$ok_curl_log" || fail "case 1: curl missing expected argument $flag"
+done
+! grep -Fxq -- '--retry-delay' "$ok_curl_log" || fail "case 1: curl must not set fixed --retry-delay"
 
 for asset in "${assets[@]}"; do
   [[ -f "$arch_amd64/$asset" ]] || fail "case 1: missing current archive $asset"
