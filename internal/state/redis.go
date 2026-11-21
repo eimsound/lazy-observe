@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -279,4 +281,87 @@ func (r *Redis) Locked(ctx context.Context, key string) (bool, error) {
 
 func (r *Redis) Clear(ctx context.Context, key string) error {
 	return r.client.Del(ctx, r.loginFailKey(key), r.loginLockKey(key)).Err()
+}
+
+const (
+	authSubscribeRetryMin = 100 * time.Millisecond
+	authSubscribeRetryMax = 2 * time.Second
+)
+
+func (r *Redis) authRevisionKey() string       { return r.prefix + ":auth:revision" }
+func (r *Redis) authInvalidateChannel() string { return r.prefix + ":auth:invalidate" }
+
+// Publish bumps the shared authentication revision in Redis and broadcasts an
+// invalidation message so other replicas clear cached tokens within milliseconds.
+func (r *Redis) Publish(ctx context.Context) error {
+	rev, err := r.client.Incr(ctx, r.authRevisionKey()).Result()
+	if err != nil {
+		return fmt.Errorf("increment auth revision: %w", err)
+	}
+	if err := r.client.Publish(ctx, r.authInvalidateChannel(), strconv.FormatInt(rev, 10)).Err(); err != nil {
+		return fmt.Errorf("publish auth invalidation: %w", err)
+	}
+	return nil
+}
+
+// Subscribe listens to the Redis auth invalidation channel until ctx is canceled.
+// When a subscription drops and reconnects, onInvalidate is called immediately to
+// flush any invalidations that may have occurred while disconnected.
+func (r *Redis) Subscribe(ctx context.Context, onReady func(), onInvalidate func()) error {
+	var readyOnce sync.Once
+	notifyReady := func() {
+		if onReady != nil {
+			readyOnce.Do(onReady)
+		}
+	}
+	backoff := authSubscribeRetryMin
+	reconnecting := false
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		pubsub := r.client.Subscribe(ctx, r.authInvalidateChannel())
+		if _, err := pubsub.Receive(ctx); err != nil {
+			_ = pubsub.Close()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			backoff = min(backoff*2, authSubscribeRetryMax)
+			reconnecting = true
+			continue
+		}
+		backoff = authSubscribeRetryMin
+		notifyReady()
+		if reconnecting && onInvalidate != nil {
+			// Flush local caches after a dropped connection in case an
+			// invalidation occurred while disconnected.
+			onInvalidate()
+		}
+		reconnecting = true
+
+		ch := pubsub.Channel()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = pubsub.Close()
+				return ctx.Err()
+			case _, ok := <-ch:
+				if !ok {
+					_ = pubsub.Close()
+					goto reconnect
+				}
+				if onInvalidate != nil {
+					onInvalidate()
+				}
+			}
+		}
+	reconnect:
+	}
 }

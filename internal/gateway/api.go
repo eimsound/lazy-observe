@@ -419,6 +419,7 @@ func (g *Gateway) updateProject(c fiber.Ctx) error {
 	if err != nil {
 		return managementAPIError(c, err)
 	}
+	g.notifyAuthInvalidation(c.Context())
 	return c.JSON(projectJSON(p))
 }
 
@@ -441,6 +442,7 @@ func (g *Gateway) deleteProject(c fiber.Ctx) error {
 	if err != nil {
 		return managementAPIError(c, err)
 	}
+	g.notifyAuthInvalidation(c.Context())
 	if g.blobs != nil && facts.ProjectSlug != "" {
 		allCleaned := true
 		for _, prefix := range []string{
@@ -559,6 +561,7 @@ func (g *Gateway) revokeProjectAPIToken(c fiber.Ctx) error {
 	if err != nil {
 		return managementAPIError(c, err)
 	}
+	g.notifyAuthInvalidation(c.Context())
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -633,6 +636,7 @@ func (g *Gateway) revokeSourceMapUploadToken(c fiber.Ctx) error {
 	if err != nil {
 		return managementAPIError(c, err)
 	}
+	g.notifyAuthInvalidation(c.Context())
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -770,6 +774,9 @@ func managementAPIError(c fiber.Ctx, err error) error {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
 	case management.IsErrorKind(err, management.ErrorProtected):
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	case management.IsErrorKind(err, management.ErrorUnavailable):
+		return c.Status(fiber.StatusServiceUnavailable).
+			JSON(fiber.Map{"code": "service_unavailable", "error": "management service unavailable"})
 	default:
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
 	}

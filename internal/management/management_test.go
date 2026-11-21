@@ -287,3 +287,44 @@ func TestUserManagementRevokesSessionsAndProtectsLastAdmin(t *testing.T) {
 	}
 	_ = store
 }
+
+type failingSessionRevoker struct{ err error }
+
+func (f failingSessionRevoker) RevokeOthers(context.Context, int, string) error { return f.err }
+
+func TestUpdateAndDeleteUserReportSessionRevocationFailure(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	manager.WithSessions(failingSessionRevoker{err: errors.New("redis down")})
+
+	if _, _, err := manager.CreateUser(ctx, CreateUserInput{
+		Username: "admin-rev", Password: "password-123", Role: "admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	member, _, err := manager.CreateUser(ctx, CreateUserInput{
+		Username: "member-rev", Password: "password-123", Role: "member",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, facts, err := manager.UpdateUser(
+		ctx,
+		UpdateUserInput{ID: member.ID, Password: "new-password-456"},
+	); !IsErrorKind(err, ErrorUnavailable) || facts.FailureReason != "session_revoke_failed" {
+		t.Fatalf("password reset revoke failure: err=%v facts=%#v", err, facts)
+	}
+
+	if _, facts, err := manager.UpdateUser(
+		ctx,
+		UpdateUserInput{ID: member.ID, Role: "viewer"},
+	); !IsErrorKind(err, ErrorUnavailable) || facts.FailureReason != "session_revoke_failed" {
+		t.Fatalf("role downgrade revoke failure: err=%v facts=%#v", err, facts)
+	}
+
+	if facts, err := manager.DeleteUser(ctx, member.ID); !IsErrorKind(err, ErrorUnavailable) ||
+		facts.FailureReason != "session_revoke_failed" {
+		t.Fatalf("delete user revoke failure: err=%v facts=%#v", err, facts)
+	}
+}

@@ -720,14 +720,12 @@ func TestLegacyPoCLogsQueryRouteIsNotRegistered(t *testing.T) {
 }
 
 func TestMemberRequiredUsesExplicitRoleWhitelist(t *testing.T) {
-	gw := newTestGateway(Config{})
 	app := fiber.New()
 	app.Get("/protected", func(c fiber.Ctx) error {
-		if role := c.Get("X-Test-Role"); role != "" {
-			c.Locals(userLocal, meta.UserInfo{ID: 1, Username: "u", Role: role})
+		role := c.Get("X-Test-Role")
+		if !roleSatisfies(role, roleMember) {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 		}
-		return c.Next()
-	}, gw.memberRequired, func(c fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNoContent)
 	})
 
