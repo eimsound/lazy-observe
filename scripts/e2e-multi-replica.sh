@@ -986,9 +986,10 @@ PY
     exit 1
     ;;
   esac
-  # The sink is supporting test infrastructure, not a replica under test. Give
-  # it two schedulable cores and prove >=2x headroom with direct controls.
-  GOMAXPROCS=2 "$WORK/e2e-otlp-sink" -listen=127.0.0.1:31480 -expected-batch="$PERF_BATCH_SIZE" >"$WORK/perf-sink.log" 2>&1 &
+  # The sink is supporting test infrastructure, not a replica under test. Let
+  # it use all available host CPUs while the two measured gateways stay pinned
+  # to GATEWAY_GOMAXPROCS, and still prove >=2x headroom with direct controls.
+  env -u GOMAXPROCS "$WORK/e2e-otlp-sink" -listen=127.0.0.1:31480 -expected-batch="$PERF_BATCH_SIZE" >"$WORK/perf-sink.log" 2>&1 &
   PERF_SINK_PID=$!
   PIDS="$PIDS $PERF_SINK_PID"
   wait_http "$PERF_SINK_URL/health"

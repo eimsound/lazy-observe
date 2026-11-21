@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -664,17 +666,31 @@ func TestCapacityReferenceUsesFastestIndividualReplicaPerSignal(t *testing.T) {
 	}
 }
 
-func TestConservativeUpstreamHeadroomUsesWorstControlAndBestScaledRound(t *testing.T) {
-	evidence := conservativeUpstreamHeadroom(
-		[]scalePhaseResult{{SamplesPerSecond: 310, LogsPerSecond: 400}, {SamplesPerSecond: 100, LogsPerSecond: 200}},
-		[]scalePhaseResult{{SamplesPerSecond: 50, LogsPerSecond: 80}, {SamplesPerSecond: 80, LogsPerSecond: 100}},
+func TestEvaluateUpstreamHeadroomComputesMedianConservativeAndMajorityMetrics(t *testing.T) {
+	evidence := evaluateUpstreamHeadroom(
+		[]scalePhaseResult{
+			{SamplesPerSecond: 310, LogsPerSecond: 400},
+			{SamplesPerSecond: 100, LogsPerSecond: 200},
+			{SamplesPerSecond: 280, LogsPerSecond: 360},
+		},
+		[]scalePhaseResult{
+			{SamplesPerSecond: 50, LogsPerSecond: 80},
+			{SamplesPerSecond: 80, LogsPerSecond: 100},
+			{SamplesPerSecond: 60, LogsPerSecond: 90},
+			{SamplesPerSecond: 70, LogsPerSecond: 100},
+		},
 		2,
 	)
-	if evidence.MinimumControlSamplesPerSecond != 100 || evidence.MaximumScaledSamplesPerSecond != 80 ||
-		evidence.SampleRatio != 1.25 ||
-		evidence.MinimumControlLogsPerSecond != 200 ||
-		evidence.MaximumScaledLogsPerSecond != 100 ||
-		evidence.LogRatio != 2 {
+	if evidence.MedianControlSamplesPerSecond != 280 || evidence.MedianScaledSamplesPerSecond != 65 ||
+		evidence.SampleRatio != 280.0/65.0 ||
+		evidence.MedianControlLogsPerSecond != 360 || evidence.MedianScaledLogsPerSecond != 95 ||
+		evidence.LogRatio != 360.0/95.0 ||
+		evidence.MinimumControlSamplesPerSecond != 100 || evidence.MaximumScaledSamplesPerSecond != 80 ||
+		evidence.ConservativeSampleRatio != 1.25 ||
+		evidence.MinimumControlLogsPerSecond != 200 || evidence.MaximumScaledLogsPerSecond != 100 ||
+		evidence.ConservativeLogRatio != 2 ||
+		evidence.PassingControlRounds != 2 || evidence.RequiredPassingControlRounds != 2 ||
+		evidence.MinimumRequiredRatio != 2 || evidence.MinimumConservativeRatio != 1.5 {
 		t.Fatalf("upstream headroom evidence = %#v", evidence)
 	}
 }
@@ -881,5 +897,421 @@ func TestRunScaleGateRequiresSeparateReadCredential(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), testReadAuth.token) {
 		t.Fatalf("credential error leaked token: %v", err)
+	}
+}
+
+func TestUpstreamHeadroomInterleavedControlSchedule(t *testing.T) {
+	wantFour := []string{"", "after-round-2", "", ""}
+	for round, want := range wantFour {
+		got, ok := upstreamControlPositionAfterRound(round, 4)
+		if ok != (want != "") || got != want {
+			t.Fatalf("4-round schedule round %d = (%q, %v), want (%q, %v)", round, got, ok, want, want != "")
+		}
+	}
+	wantEight := []string{"", "after-round-2", "", "after-round-4", "", "after-round-6", "", ""}
+	for round, want := range wantEight {
+		got, ok := upstreamControlPositionAfterRound(round, 8)
+		if ok != (want != "") || got != want {
+			t.Fatalf("8-round schedule round %d = (%q, %v), want (%q, %v)", round, got, ok, want, want != "")
+		}
+	}
+}
+
+func TestUpstreamHeadroomToleratesSingleRoundJitter(t *testing.T) {
+	tests := []struct {
+		name          string
+		controlRounds []scalePhaseResult
+		scaledRounds  []scalePhaseResult
+	}{
+		{
+			name: "single control dip",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 290000, LogsPerSecond: 290000},
+				{SamplesPerSecond: 220000, LogsPerSecond: 220000},
+				{SamplesPerSecond: 295000, LogsPerSecond: 295000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 125000, LogsPerSecond: 125000},
+				{SamplesPerSecond: 128000, LogsPerSecond: 128000},
+				{SamplesPerSecond: 127000, LogsPerSecond: 127000},
+				{SamplesPerSecond: 135000, LogsPerSecond: 135000},
+			},
+		},
+		{
+			name: "issue 302 combined dip and fast scaled round",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 258000, LogsPerSecond: 258000},
+				{SamplesPerSecond: 285000, LogsPerSecond: 285000},
+				{SamplesPerSecond: 288000, LogsPerSecond: 288000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 126000, LogsPerSecond: 126000},
+				{SamplesPerSecond: 129000, LogsPerSecond: 129000},
+				{SamplesPerSecond: 128000, LogsPerSecond: 128000},
+				{SamplesPerSecond: 135000, LogsPerSecond: 135000},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence := evaluateUpstreamHeadroom(tc.controlRounds, tc.scaledRounds, 2.0)
+			if evidence.ConservativeSampleRatio >= 2.0 || evidence.ConservativeLogRatio >= 2.0 {
+				t.Fatalf("expected legacy conservative min/max ratio < 2.0 to exercise jitter, got %#v", evidence)
+			}
+			if evidence.SampleRatio < 2.0 || evidence.LogRatio < 2.0 ||
+				evidence.PassingControlRounds < evidence.RequiredPassingControlRounds {
+				t.Fatalf("expected median and majority metrics to pass, got %#v", evidence)
+			}
+			result := scaleGateResult{
+				UpstreamControlRounds: tc.controlRounds,
+				ScaledRounds:          tc.scaledRounds,
+				UpstreamHeadroom:      evidence,
+				GatePassed:            true,
+			}
+			applyUpstreamHeadroomGate(&result)
+			if !result.GatePassed || len(result.GateFailures) != 0 {
+				t.Fatalf("expected gate pass under single-round jitter, got failures=%v", result.GateFailures)
+			}
+		})
+	}
+}
+
+func TestUpstreamHeadroomFailsClosedOnBottleneckAndDegradation(t *testing.T) {
+	tests := []struct {
+		name          string
+		controlRounds []scalePhaseResult
+		scaledRounds  []scalePhaseResult
+		wantSubstr    string
+	}{
+		{
+			name: "real upstream bottleneck",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 230000, LogsPerSecond: 230000},
+				{SamplesPerSecond: 235000, LogsPerSecond: 235000},
+				{SamplesPerSecond: 228000, LogsPerSecond: 228000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 128000, LogsPerSecond: 128000},
+				{SamplesPerSecond: 130000, LogsPerSecond: 130000},
+				{SamplesPerSecond: 129000, LogsPerSecond: 129000},
+				{SamplesPerSecond: 131000, LogsPerSecond: 131000},
+			},
+			wantSubstr: "median ratio",
+		},
+		{
+			name: "sustained degradation in majority of rounds",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 290000, LogsPerSecond: 290000},
+				{SamplesPerSecond: 225000, LogsPerSecond: 225000},
+				{SamplesPerSecond: 228000, LogsPerSecond: 228000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 125000, LogsPerSecond: 125000},
+				{SamplesPerSecond: 126000, LogsPerSecond: 126000},
+				{SamplesPerSecond: 127000, LogsPerSecond: 127000},
+				{SamplesPerSecond: 128000, LogsPerSecond: 128000},
+			},
+			wantSubstr: "only 1 of 3 upstream control rounds",
+		},
+		{
+			name: "half of even rounds anomalous fails strict majority",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 340000, LogsPerSecond: 340000},
+				{SamplesPerSecond: 340000, LogsPerSecond: 340000},
+				{SamplesPerSecond: 200000, LogsPerSecond: 200000},
+				{SamplesPerSecond: 200000, LogsPerSecond: 200000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 120000, LogsPerSecond: 120000},
+				{SamplesPerSecond: 120000, LogsPerSecond: 120000},
+				{SamplesPerSecond: 120000, LogsPerSecond: 120000},
+				{SamplesPerSecond: 120000, LogsPerSecond: 120000},
+			},
+			wantSubstr: "only 2 of 4 upstream control rounds",
+		},
+		{
+			name: "misaligned metric and log headroom across rounds",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 260000, LogsPerSecond: 190000},
+				{SamplesPerSecond: 190000, LogsPerSecond: 260000},
+				{SamplesPerSecond: 260000, LogsPerSecond: 260000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 100000, LogsPerSecond: 100000},
+				{SamplesPerSecond: 100000, LogsPerSecond: 100000},
+				{SamplesPerSecond: 100000, LogsPerSecond: 100000},
+				{SamplesPerSecond: 100000, LogsPerSecond: 100000},
+			},
+			wantSubstr: "only 1 of 3 upstream control rounds",
+		},
+		{
+			name: "severe single round collapse below conservative floor",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 300000, LogsPerSecond: 300000},
+				{SamplesPerSecond: 140000, LogsPerSecond: 140000},
+				{SamplesPerSecond: 305000, LogsPerSecond: 305000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 125000, LogsPerSecond: 125000},
+				{SamplesPerSecond: 128000, LogsPerSecond: 128000},
+				{SamplesPerSecond: 127000, LogsPerSecond: 127000},
+				{SamplesPerSecond: 130000, LogsPerSecond: 130000},
+			},
+			wantSubstr: "conservative min/max ratio",
+		},
+		{
+			name:          "empty control rounds",
+			controlRounds: nil,
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 100000, LogsPerSecond: 100000},
+			},
+			wantSubstr: "median ratio",
+		},
+		{
+			name: "zero scaled throughput",
+			controlRounds: []scalePhaseResult{
+				{SamplesPerSecond: 200000, LogsPerSecond: 200000},
+			},
+			scaledRounds: []scalePhaseResult{
+				{SamplesPerSecond: 0, LogsPerSecond: 0},
+			},
+			wantSubstr: "median ratio",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence := evaluateUpstreamHeadroom(tc.controlRounds, tc.scaledRounds, 2.0)
+			result := scaleGateResult{
+				UpstreamControlRounds: tc.controlRounds,
+				ScaledRounds:          tc.scaledRounds,
+				UpstreamHeadroom:      evidence,
+				GatePassed:            true,
+			}
+			applyUpstreamHeadroomGate(&result)
+			if result.GatePassed || len(result.GateFailures) == 0 {
+				t.Fatalf("expected fail-closed failure, got result=%#v", result)
+			}
+			joined := strings.Join(result.GateFailures, "; ")
+			if !strings.Contains(joined, tc.wantSubstr) {
+				t.Fatalf("failures = %q, want substring %q", joined, tc.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestFormatScaleFailureDiagnosticsIncludesPerRoundDetails(t *testing.T) {
+	controlRounds := []scalePhaseResult{
+		{SamplesPerSecond: 250000, LogsPerSecond: 255000},
+		{SamplesPerSecond: 180000, LogsPerSecond: 185000},
+		{SamplesPerSecond: 245000, LogsPerSecond: 248000},
+	}
+	scaledRounds := []scalePhaseResult{
+		{SamplesPerSecond: 130000, LogsPerSecond: 131000},
+		{SamplesPerSecond: 132000, LogsPerSecond: 133000},
+		{SamplesPerSecond: 129000, LogsPerSecond: 130000},
+		{SamplesPerSecond: 135000, LogsPerSecond: 136000},
+	}
+	result := scaleGateResult{
+		Targets: []string{"target-1", "target-2"},
+		SingleCapacityReference: scaleThroughputReference{
+			SamplesPerSecond: 80000,
+			SampleSource:     "target-1_nominal",
+			LogsPerSecond:    80000,
+			LogSource:        "target-2_high_control",
+		},
+		Scaled: scalePhaseResult{
+			SamplesPerSecond: 131000,
+			LogsPerSecond:    132000,
+		},
+		SampleReplicaEfficiency:     0.819,
+		LogReplicaEfficiency:        0.825,
+		MinReplicaEfficiency:        0.68,
+		PassingScaledRounds:         4,
+		RequiredPassingScaledRounds: 3,
+		ScaledRounds:                scaledRounds,
+		ScaledRoundEfficiencies: []scaleRoundEfficiency{
+			{Round: 1, SampleReplicaEfficiency: 0.812, LogReplicaEfficiency: 0.819, PairedGatePassed: true},
+			{Round: 2, SampleReplicaEfficiency: 0.825, LogReplicaEfficiency: 0.831, PairedGatePassed: true},
+			{Round: 3, SampleReplicaEfficiency: 0.806, LogReplicaEfficiency: 0.813, PairedGatePassed: true},
+			{Round: 4, SampleReplicaEfficiency: 0.844, LogReplicaEfficiency: 0.850, PairedGatePassed: true},
+		},
+		UpstreamControlRounds: controlRounds,
+		UpstreamControlLabels: []string{"leading", "after-round-2", "trailing"},
+		UpstreamHeadroom:      evaluateUpstreamHeadroom(controlRounds, scaledRounds, 2.0),
+	}
+	applyUpstreamHeadroomGate(&result)
+	if result.GatePassed {
+		t.Fatal("expected gate failure in diagnostic test")
+	}
+	diag := formatScaleFailureDiagnostics(result)
+	for _, want := range []string{
+		"median ratio",
+		"upstream_headroom:",
+		"median_ratio=samples:",
+		"conservative_min_max_ratio=samples:",
+		"passing_control_rounds=0/3 (required>=2)",
+		"upstream_control_rounds:",
+		"1(leading: samples=250000.0/s, logs=255000.0/s",
+		"2(after-round-2: samples=180000.0/s, logs=185000.0/s",
+		"3(trailing: samples=245000.0/s, logs=248000.0/s",
+		"scaled_rounds:",
+		"1(samples=130000.0/s, logs=131000.0/s, eff=0.812/0.819)",
+		"4(samples=135000.0/s, logs=136000.0/s, eff=0.844/0.850)",
+		"scaling_summary:",
+	} {
+		if !strings.Contains(diag, want) {
+			t.Fatalf("diagnostics missing %q:\n%s", want, diag)
+		}
+	}
+}
+
+func TestRunScaleGateEmitsThreeControlRoundsAndDiagnosticsOnBottleneck(t *testing.T) {
+	const sinkIdentity = "losink_0123456789abcdef"
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "gates.json")
+	outputPath := filepath.Join(tmpDir, "scale.json")
+	configJSON := `{
+  "version": 1,
+  "release": { "max_binary_bytes": 150000000, "max_idle_rss_bytes": 524288000 },
+  "query": {
+    "warmup_requests": 0,
+    "measured_requests": 1,
+    "medium_fixture": { "issues": 1000, "logs": 1000, "traces": 1000 },
+    "max_p95_ms": { "issues": 1000, "logs": 1000, "trace": 1000 },
+    "max_p99_ms": { "issues": 1500, "logs": 1500, "trace": 1500 }
+  },
+  "ha_scaling": {
+    "settle_seconds": 0,
+    "warmup_seconds": 0.01,
+    "recovery_seconds": 0,
+    "duration_seconds": 0.06,
+    "scaled_concurrency_per_replica": 2,
+    "gomaxprocs_per_replica": 1,
+    "batch_size": 2,
+    "min_replica_efficiency": 0.68,
+    "min_passing_round_ratio": 0.75,
+    "min_target_balance_ratio": 0.7,
+    "min_baseline_ratio": 0.8,
+    "min_upstream_headroom_ratio": 2.0,
+    "max_failed_requests": 0
+  }
+}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	controlledSink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			w.Header().Set(scaleSinkIdentityHeader, sinkIdentity)
+			_, _ = w.Write([]byte("OK\n"))
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+		writeScaleSinkSuccess(t, w, r, sinkIdentity)
+	}))
+	defer controlledSink.Close()
+
+	newMeasureTarget := func(instanceID string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == scaleInstanceIdentityPath {
+				assertReadCredential(t, r)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"instance_id":"` + instanceID + `","gomaxprocs":1}`))
+				return
+			}
+			writeScaleSinkSuccess(t, w, r, sinkIdentity)
+		}))
+	}
+	measureA := newMeasureTarget("measure-a")
+	defer measureA.Close()
+	measureB := newMeasureTarget("measure-b")
+	defer measureB.Close()
+
+	newReadbackTarget := func(instanceID string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case scaleInstanceIdentityPath:
+				assertReadCredential(t, r)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"instance_id":"` + instanceID + `","gomaxprocs":1}`))
+			case "/v1/metrics", "/v1/logs":
+				if r.Header.Get("Authorization") != "Bearer "+testIngestToken {
+					t.Errorf("readback ingest auth = %q", r.Header.Get("Authorization"))
+				}
+				w.Header().Set("Content-Type", "application/x-protobuf")
+				w.WriteHeader(http.StatusOK)
+			case "/api/v1/query":
+				assertReadCredential(t, r)
+				_, _ = w.Write(
+					[]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"2"]}]}}`),
+				)
+			case "/api/v1/logs/query":
+				assertReadCredential(t, r)
+				q := r.URL.Query().Get("query")
+				msg := strings.TrimSuffix(strings.TrimPrefix(q, `_msg:="`), `"`)
+				_, _ = w.Write(
+					[]byte(
+						`{"_msg":"` + msg + `","_time":"2026-07-18T00:00:00Z","sequence":"0"}` + "\n" +
+							`{"_msg":"` + msg + `","_time":"2026-07-18T00:00:00Z","sequence":"1"}` + "\n",
+					),
+				)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+	readbackA := newReadbackTarget("readback-a")
+	defer readbackA.Close()
+	readbackB := newReadbackTarget("readback-b")
+	defer readbackB.Close()
+
+	t.Setenv("LO_PERF_TOKEN", testIngestToken)
+	t.Setenv("LO_PERF_QUERY_TOKEN", testReadAuth.token)
+
+	err := runScaleGate([]string{
+		"--config", configPath,
+		"--project", testReadAuth.project,
+		"--targets", measureA.URL + "," + measureB.URL,
+		"--readback-targets", readbackA.URL + "," + readbackB.URL,
+		"--controlled-upstream", controlledSink.URL,
+		"--output", outputPath,
+	})
+	if err == nil {
+		t.Fatal("expected runScaleGate to fail closed when controlled upstream is bottlenecked")
+	}
+	errMsg := err.Error()
+	for _, want := range []string{
+		"gate failed:",
+		"upstream_headroom:",
+		"upstream_control_rounds:",
+		"1(leading:",
+		"2(after-round-2:",
+		"3(trailing:",
+		"scaled_rounds:",
+	} {
+		if !strings.Contains(errMsg, want) {
+			t.Fatalf("error missing %q:\n%s", want, errMsg)
+		}
+	}
+
+	raw, readErr := os.ReadFile(outputPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var saved scaleGateResult
+	if unmarshalErr := json.Unmarshal(raw, &saved); unmarshalErr != nil {
+		t.Fatal(unmarshalErr)
+	}
+	if saved.Version != 7 || saved.GatePassed || saved.GeneratedAt == "" {
+		t.Fatalf("saved scale.json metadata/gate = %#v", saved)
+	}
+	if len(saved.UpstreamControlRounds) != 3 {
+		t.Fatalf("upstream_control_rounds len = %d, want 3", len(saved.UpstreamControlRounds))
+	}
+	if !slices.Equal(saved.UpstreamControlLabels, []string{"leading", "after-round-2", "trailing"}) {
+		t.Fatalf("upstream_control_labels = %v", saved.UpstreamControlLabels)
+	}
+	if saved.UpstreamHeadroom.SampleRatio >= 2.0 || saved.UpstreamHeadroom.LogRatio >= 2.0 {
+		t.Fatalf("expected headroom ratios < 2.0 under throttled sink, got %#v", saved.UpstreamHeadroom)
 	}
 }
