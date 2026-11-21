@@ -1,82 +1,78 @@
-# 运维手册：备份、恢复、升级、回滚与应急操作
+# Operations: backup, restore, upgrade, rollback, and emergency procedures
 
-本手册面向 lazy-observe 的部署者与运维人员，覆盖 **All-in-One（单机嵌入式）** 与 **HA（高可用多副本）** 两种运行形态的备份、恢复、只读自检、升级回滚及凭据/密钥应急处置。
+This runbook covers All-in-one (single-node embedded) and HA (multi-replica) deployments of lazy-observe. It describes backup, restore, read-only preflight checks, upgrades, rollbacks, and emergency key or password recovery.
 
-> **v0.x 公开预览期兼容性约束（[ADR 0003](../.agents/docs/adr/0003-pre-release-single-database-baseline.md)）**
+> **v0.x public preview compatibility constraint ([ADR 0003](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0003-pre-release-single-database-baseline.md))**
 >
-> 当前处于首个受支持版本之前的预览阶段：SQLite 与 PostgreSQL 各自仅维护一份可变的 `001_baseline.sql` 元数据基线，**不提供跨不兼容 schema 变更的原地升级或降级迁移链**。
+> Before the first supported release, SQLite and PostgreSQL each maintain one mutable `001_baseline.sql` metadata baseline. In-place upgrade and downgrade migration chains across incompatible schema changes are not supported.
 >
-> - 同一元数据基线版本内：正常与异常重启均保持已提交数据持久化，可原地替换二进制或滚动更新镜像。
-> - 跨元数据基线版本：旧库启动时会因基线校验和不匹配直接失败退出（`metadata migration 1 checksum mismatch`），需重建元数据数据库。升级前请先确认目标版本的 [CHANGELOG.md](../CHANGELOG.md) 与 [docs/version-matrix.md](version-matrix.md)。
+> - Within the same metadata baseline version, normal and crash restarts preserve committed data, and you can replace the binary or roll container images in place.
+> - Across metadata baseline versions, an older database fails at startup with `metadata migration 1 checksum mismatch` and requires recreating the metadata database. Check [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) and [version-matrix.md](version-matrix.md) before upgrading.
 
----
+## 1. Persistent state and backup inventory
 
-## 1. 持久化状态与备份资产清单
+Before backing up a deployment, separate authoritative persistent state from artifacts that startup rebuilds automatically.
 
-备份前必须分清哪些状态属于权威持久化数据、哪些可由启动流程自动重建。
-
-| 资产 | All-in-One 模式 | HA 模式（`topology: ha`） | 必须备份 | 说明 |
+| Asset | All-in-one mode | HA mode (`topology: ha`) | Must back up | Notes |
 | --- | --- | --- | --- | --- |
-| 元数据数据库 | `<data_dir>/meta/lazy-observe.db`（SQLite WAL） | 外部 PostgreSQL（`meta.db_url`） | 是 | 存用户、项目、Token、告警规则/状态/租约/Outbox、Issue、错误 Inbox、Replay/Source Map/Profile 索引、`platform_key_fingerprints`、`schema_version` |
-| 对象 / Blob 存储 | `<data_dir>/blobs/` | S3 或兼容对象存储（`blob.backend: s3`） | 是 | 存会话回放分段、Source Map 制品、gzip pprof 剖析文件 |
-| 信号存储 | `<data_dir>/storage/{metrics,logs,traces}`（及 `storage/scrape`） | 外部 VictoriaMetrics / VictoriaLogs / VictoriaTraces 集群 | 视保留需求 | 指标、日志（含原始错误事件）、链路数据 |
-| 平台加密密钥 | `<data_dir>/secret.key`（或 `security.secret_key_file`） | 共享只读密钥文件（`security.secret_key_file`） | **极高** | 256-bit AES-256-GCM 密钥（32 字节标准 base64），加密 AI Provider API Key 并派生自监控 Token；丢失后旧密文不可恢复 |
-| 配置文件与初始密码文件 | `config.yaml` / `security.admin_password_file` | ConfigMap / Secret / `config.yaml` / `security.admin_password_file` | 是 | 不含 `<data_dir>/initial-admin-password`（随机生成的首次密码在管理员首次改密后由网关自动删除） |
-| 共享会话与限流 | 进程内内存 / SQLite | Redis / Valkey（`redis.enabled: true`） | 否（易失） | 仅存登录会话、限流与登录锁定计数；丢失后用户重新登录即可 |
-| 解压的嵌入存储二进制 | `<data_dir>/bin/` | `<data_dir>/bin/`（仅启用 `vmagent` 时解压） | 否 | 启动时从 `lazy-observe` 二进制校验并原子重建 |
+| Metadata database | `<data_dir>/meta/lazy-observe.db` (SQLite WAL) | External PostgreSQL (`meta.db_url`) | Yes | Stores users, projects, tokens, alert rules/state/leases/Outbox, Issues, Error Inbox, Replay/Source Map/Profile indexes, `platform_key_fingerprints`, and `schema_version` |
+| Object and blob storage | `<data_dir>/blobs/` | S3 or S3-compatible object storage (`blob.backend: s3`) | Yes | Stores Session Replay segments, Source Map artifacts, and gzipped pprof profiles |
+| Signal storage | `<data_dir>/storage/{metrics,logs,traces}` (and `storage/scrape`) | External VictoriaMetrics, VictoriaLogs, and VictoriaTraces clusters | Based on retention needs | Metrics, logs (including raw error events), and trace data |
+| Platform encryption key | `<data_dir>/secret.key` (or `security.secret_key_file`) | Shared read-only key file (`security.secret_key_file`) | Critical | 256-bit AES-256-GCM key (32 bytes as standard base64); seals AI provider API keys and derives the self-monitoring token. Old ciphertext cannot be recovered if lost |
+| Configuration and initial password files | `config.yaml` and `security.admin_password_file` | ConfigMap, Secret, `config.yaml`, and `security.admin_password_file` | Yes | Excludes `<data_dir>/initial-admin-password`, which the gateway deletes after the admin replaces the generated first password |
+| Shared sessions and rate limits | In-process memory or SQLite | Redis or Valkey (`redis.enabled: true`) | No (volatile) | Stores login sessions, rate limits, and login lockout counters; users sign in again if lost |
+| Extracted embedded storage binaries | `<data_dir>/bin/` | `<data_dir>/bin/` (only when `vmagent` is enabled) | No | Verified and atomically rebuilt from the `lazy-observe` binary at startup |
 
----
+## 2. Backup procedures
 
-## 2. 备份流程
+### 2.1 All-in-one mode
 
-### 2.1 All-in-One 模式
+#### Option A: cold backup (recommended for full-stack consistency)
 
-#### 方案 A：冷备份（推荐，全栈强一致）
+A cold backup captures SQLite, local blobs, embedded VictoriaMetrics, VictoriaLogs, VictoriaTraces, and the platform key at one consistent point in time.
 
-冷备份可确保 SQLite、本地 Blob、嵌入式 VictoriaMetrics/Logs/Traces 与平台密钥处于同一一致时间点。
-
-1. **优雅停止服务**，等待网关摘流（`process.drain_timeout` 默认 `20s`）及托管子进程顺序退出（`process.shutdown_timeout` 默认 `15s`，内置 Supervisor 会先停 `vmagent`，再优雅关闭存储引擎；嵌入式存储的落盘间隔为 `1s`）：
+1. Stop the service cleanly and wait for the gateway drain (`process.drain_timeout`, default `20s`) and supervised child shutdown (`process.shutdown_timeout`, default `15s`). The supervisor stops `vmagent` first and then closes the embedded storage engines, which flush every `1s`:
 
    ```sh
-   # systemd 部署
+   # systemd deployment
    sudo systemctl stop lazy-observe
 
-   # Docker Compose 部署
+   # Docker Compose deployment
    docker compose -f deploy/compose/docker-compose.yml stop lazy-observe
    ```
 
-2. **打包备份 `<data_dir>` 与配置文件**（排除自动重建的 `bin/` 目录）：
+2. Archive `<data_dir>` and configuration files, excluding the auto-rebuilt `bin/` directory:
 
    ```sh
    BACKUP_TS=$(date -u +%Y%m%dT%H%M%SZ)
    BACKUP_DIR="/var/backups/lazy-observe/${BACKUP_TS}"
    install -d -m 0700 "${BACKUP_DIR}"
 
-   # 记录创建该备份的二进制版本（预览期回滚必须与二进制成对保留）
+   # Record the binary version that created this backup (preview rollbacks must pair backup and binary)
    lazy-observe --version > "${BACKUP_DIR}/binary-version.txt"
 
-   # 打包数据目录（含 meta/、blobs/、storage/、secret.key）
+   # Archive data directory (meta/, blobs/, storage/, secret.key)
    tar --exclude='./bin' -czf "${BACKUP_DIR}/data.tar.gz" -C /var/lib/lazy-observe .
 
-   # 若配置文件或外部 secret_key_file 在 data_dir 之外，一并备份并限制权限
+   # Back up external config or secret_key_file if stored outside data_dir, and restrict permissions
    tar -czf "${BACKUP_DIR}/etc.tar.gz" -C /etc/lazy-observe .
    chmod 0600 "${BACKUP_DIR}"/*.tar.gz
    ```
 
-3. **重新启动服务并校验探针**：
+3. Restart the service and check readiness:
 
    ```sh
    sudo systemctl start lazy-observe
    curl -fsS http://127.0.0.1:3100/readyz
    ```
 
-> **禁止**在服务运行时直接 `cp` 或 `tar` 活的 SQLite 文件（`lazy-observe.db` 启用了 WAL 模式，直接拷贝可能遗漏 `-wal`/`-shm` 导致数据库损坏）或活的嵌入式 Victoria 数据目录。
+> Never run `cp` or `tar` on a live SQLite file or live embedded Victoria directories while the service is running. `lazy-observe.db` uses WAL mode, so raw copies can miss `-wal` or `-shm` files and corrupt the database.
 
-#### 方案 B：热备份（不停机备份元数据、Blob 与密钥）
+#### Option B: hot backup (metadata, blobs, and key without downtime)
 
-当业务不允许停机时，可分层热备份：
+When downtime is not acceptable, back up each layer online:
 
-1. **SQLite 元数据热备份**（使用 SQLite Online Backup API，安全处理 WAL）：
+1. Back up SQLite metadata through the SQLite Online Backup API so WAL state stays intact:
 
    ```sh
    BACKUP_TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -88,28 +84,27 @@
    sqlite3 "${BACKUP_DIR}/lazy-observe.db" "PRAGMA integrity_check;"
    ```
 
-2. **本地 Blob 同步**（Replay / Source Map / Profile 文件为写入即不可变对象）：
+2. Sync local blobs. Replay, Source Map, and Profile files are immutable once written:
 
    ```sh
    rsync -a /var/lib/lazy-observe/blobs/ "${BACKUP_DIR}/blobs/"
    ```
 
-3. **平台加密密钥与指纹归档**：
+3. Archive the platform encryption key and record its fingerprint:
 
-   - 将 `secret.key`（默认 `<data_dir>/secret.key`，或 `security.secret_key_file` 指向的路径）加密存储到独立密钥库或离线介质，文件权限保持 `0600`。
-   - 可从启动日志记录 128-bit 平台密钥指纹（例如 `platform encryption key matches the recorded fingerprint ... fingerprint=<hex>`）；该指纹为单向截断摘要，不包含密钥明文，可安全写入备份清单与工单。
+   - Store `secret.key` (default `<data_dir>/secret.key`, or the path in `security.secret_key_file`) encrypted in an external vault or offline medium with mode `0600`.
+   - Record the 128-bit key fingerprint from startup logs (for example, `platform encryption key matches the recorded fingerprint ... fingerprint=<hex>`). The fingerprint is a one-way truncated digest with no key material, so it is safe to store in backup manifests and tickets.
 
-4. **嵌入式信号存储热备份**：
-   - 嵌入式 VictoriaMetrics（`127.0.0.1:18428`）、VictoriaLogs（`127.0.0.1:19428`）、VictoriaTraces（`127.0.0.1:20428`）仅监听本机回环地址，不可对外暴露。
-   - 若需不停机备份指标，可在本机使用 VictoriaMetrics 官方快照接口（`POST http://127.0.0.1:18428/snapshot/create`）配合 `vmbackup` 或底层文件系统快照（LVM/ZFS）；否则建议在维护窗口执行 2.1 方案 A 的全栈冷备份。
+4. Back up embedded signal storage online:
 
----
+   - Embedded VictoriaMetrics (`127.0.0.1:18428`), VictoriaLogs (`127.0.0.1:19428`), VictoriaTraces (`127.0.0.1:20428`), and `vmagent` (`127.0.0.1:22428`) bind only to loopback and must never be exposed externally.
+   - To back up metrics without downtime, invoke VictoriaMetrics' local snapshot endpoint (`POST http://127.0.0.1:18428/snapshot/create`) together with `vmbackup`, or take an underlying filesystem snapshot (LVM or ZFS). Otherwise schedule a maintenance window for Option A.
 
-### 2.2 HA 模式（PostgreSQL + S3 + 外部 Victoria 集群 + Redis）
+### 2.2 HA mode (PostgreSQL, S3, external Victoria clusters, and Redis)
 
-HA 模式下每个应用副本的 `<data_dir>` 均为临时工作目录（用于解压可选的 `vmagent` 与生成 `scrape.yml`），**不要把副本 `<data_dir>` 当作备份来源**。所有持久化状态按外部组件分别热备：
+In HA mode, each replica's `<data_dir>` is an ephemeral scratch directory used to extract the optional `vmagent` binary and write `scrape.yml`. Do not treat a replica's `<data_dir>` as a backup source. Back up each external dependency online:
 
-1. **PostgreSQL 元数据备份**：
+1. Back up PostgreSQL metadata:
 
    ```sh
    BACKUP_TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -121,36 +116,38 @@ HA 模式下每个应用副本的 `<data_dir>` 均为临时工作目录（用于
      "${LO_META_DB_URL}"
    ```
 
-   生产环境建议结合 PostgreSQL WAL 归档与定时基础备份（如 `pg_basebackup` / pgBackRest）以支持时间点恢复（PITR）。
+   Pair logical dumps with PostgreSQL WAL archiving and scheduled base backups (`pg_basebackup` or pgBackRest) in production to support point-in-time recovery (PITR).
 
-2. **S3 / 兼容对象存储备份**：
-   - 开启目标 Bucket（`blob.s3.bucket`）的对象版本控制与生命周期策略；
-   - 或定期增量同步至异地灾备 Bucket：
+2. Back up S3 or compatible object storage:
+
+   - Enable object versioning and lifecycle rules on `blob.s3.bucket`.
+   - Or sync incrementally to a disaster-recovery bucket:
 
    ```sh
    aws s3 sync "s3://${LO_BLOB_S3_BUCKET}" "s3://${DR_S3_BUCKET}/lazy-observe/${BACKUP_TS}" \
      --endpoint-url "${LO_BLOB_S3_ENDPOINT}"
    ```
 
-3. **外部 Victoria 集群备份**：
-   - VictoriaMetrics：使用 `vmbackup` 对 `vmstorage`（集群）或单节点创建增量快照；
-   - VictoriaLogs / VictoriaTraces：按 Victoria 官方备份工具与快照文档独立备份。
+3. Back up external Victoria clusters:
 
-4. **平台密钥与部署配置备份**：
-   - 加密备份 `security.secret_key_file`（Kubernetes 中为 `encryptionKey.existingSecret` 或 `<fullname>-encryption-key` Secret）；
-   - 备份 `config.yaml` / Helm values 与当前部署的容器镜像 **不可变 digest**（如 `ghcr.io/eimsound/lazy-observe:0.1.0@sha256:...`）。
+   - **VictoriaMetrics.** Create incremental snapshots of `vmstorage` (cluster) or single-node instances with `vmbackup`.
+   - **VictoriaLogs and VictoriaTraces.** Follow the upstream Victoria snapshot and backup tools for each engine.
 
-5. **Redis / Valkey**：
-   - 仅存储登录会话、限流窗口、登录失败锁定和跨副本认证缓存失效通知，属于可重建易失状态，无需纳入强一致备份。
+4. Back up the platform encryption key and deployment configuration:
 
----
+   - Back up `security.secret_key_file` encrypted (in Kubernetes, `encryptionKey.existingSecret` or `<fullname>-encryption-key`).
+   - Save `config.yaml`, Helm values, and the deployed container image's immutable digest (such as `ghcr.io/eimsound/lazy-observe:0.1.0@sha256:...`).
 
-## 3. 恢复与自检校验
+5. Skip Redis or Valkey for consistent backups:
 
-### 3.1 All-in-One 恢复
+   - Redis stores only login sessions, rate-limit windows, failed-login lockouts, and cross-replica auth cache invalidation messages. That state is volatile and rebuilds on demand.
 
-1. 停止当前运行实例，避免双写同一个 `<data_dir>`。
-2. 清空或移走损坏的 `<data_dir>`，解压备份并修正属主与权限：
+## 3. Restore and verification
+
+### 3.1 All-in-one restore
+
+1. Stop the running instance so two processes cannot write to the same `<data_dir>`.
+2. Move or clear the damaged `<data_dir>`, extract the archive, and restore ownership and permissions:
 
    ```sh
    sudo systemctl stop lazy-observe
@@ -161,15 +158,15 @@ HA 模式下每个应用副本的 `<data_dir>` 均为临时工作目录（用于
    sudo chmod 0600 /var/lib/lazy-observe/secret.key
    ```
 
-   > 若使用容器部署（`deploy/compose`），容器内进程以 `65532:65532`（distroless `nonroot`）运行，宿主机目录或卷属主须为 `65532:65532`。
+   > In container deployments (`deploy/compose`), the process runs as `65532:65532` (distroless `nonroot`). Set the host directory or volume owner to `65532:65532`.
 
-3. 确认当前二进制与备份时的元数据基线匹配后启动服务。
-4. 执行恢复后校验（见 3.3 节）。
+3. Confirm that the installed binary matches the metadata baseline of the backup, then start the service.
+4. Run the post-startup verification checks in Section 3.3.
 
-### 3.2 HA 恢复与 `lazy-observe doctor --ha` 只读预检
+### 3.2 HA restore and read-only preflight with `lazy-observe doctor --ha`
 
-1. **停止全部应用副本**（Kubernetes 执行 `kubectl scale deployment/<name> --replicas=0`），防止旧副本在恢复期间写入元数据或续约告警租约。
-2. **恢复 PostgreSQL 到新建的空数据库**：
+1. Stop all application replicas, for example with `kubectl scale deployment/<name> --replicas=0` in Kubernetes, so old replicas cannot write metadata or renew alert leases during restore.
+2. Restore PostgreSQL into a fresh empty database:
 
    ```sh
    createdb -h <pg-host> -U <pg-user> lazy_observe_restored
@@ -180,38 +177,38 @@ HA 模式下每个应用副本的 `<data_dir>` 均为临时工作目录（用于
      /var/backups/lazy-observe/meta-<TS>.dump
    ```
 
-3. **恢复 S3 对象与外部信号存储**，并确保共享 `security.secret_key_file` 已挂载原密钥文件。
-4. **启动副本前，先运行只读自检 `lazy-observe doctor --ha`**：
+3. Restore S3 objects and external signal storage, and mount the original `security.secret_key_file`.
+4. Before starting replicas, run the read-only preflight check:
 
    ```sh
    lazy-observe doctor --ha --config /etc/lazy-observe/config.yaml
    ```
 
-   `lazy-observe doctor --ha`（源码见 `cmd/lazy-observe/doctor.go`）全程**只读**，不会修改数据库、不生成密钥文件、不写入测试对象，按顺序逐项校验以下检查项：
+   `lazy-observe doctor --ha` (implemented in `cmd/lazy-observe/doctor.go`) is strictly read-only. It makes no database writes, creates no key files, and uploads no test objects. It runs these checks in order:
 
-   | 检查项 | 校验内容 |
+   | Check | Verification |
    | --- | --- |
-   | `standalone` | 已启用 `standalone: true` 或 `topology: ha` |
-   | `redis` | `redis.enabled: true` 且 `PING` 成功 |
-   | `metadata-postgres` | 只读连接 PostgreSQL，验证表结构与当前二进制元数据基线校验和一致 |
-   | `secret-key` | 读取 `security.secret_key_file`，校验格式合法且指纹与库中 `platform_key_fingerprints` 一致 |
-   | `admin-password` | 若库中尚无 `admin` 账号，要求 `security.admin_password_file` 已配置且合法（≥ 8 字符）；已有 `admin` 时允许省略 |
-   | `blob-s3` | `blob.backend: s3`、`blob.s3.bucket` 非空且对 `doctor/` 前缀执行只读 `List` 成功 |
-   | `storage-metrics` / `storage-metrics-ingest` | 探测指标查询端与写入端健康检查 |
-   | `storage-logs`（及分拆的 `storage-logs-ingest`） | 探测日志查询端与写入端健康检查 |
-   | `storage-traces`（及分拆的 `storage-traces-ingest`） | 探测链路查询端与写入端健康检查 |
+   | `standalone` | `standalone: true` or `topology: ha` is enabled |
+   | `redis` | `redis.enabled: true` and `PING` succeeds |
+   | `metadata-postgres` | Read-only PostgreSQL connection confirms tables and checksum match the binary's metadata baseline |
+   | `secret-key` | Reads `security.secret_key_file`, checks key format, and confirms its fingerprint matches `platform_key_fingerprints` |
+   | `admin-password` | When no `admin` account exists in metadata, requires a valid `security.admin_password_file` (at least 8 characters); optional once `admin` exists |
+   | `blob-s3` | Confirms `blob.backend: s3`, non-empty `blob.s3.bucket`, and a read-only `List` on the `doctor/` prefix |
+   | `storage-metrics` / `storage-metrics-ingest` | Probes metrics query and ingest health endpoints |
+   | `storage-logs` (and split `storage-logs-ingest`) | Probes logs query and ingest health endpoints |
+   | `storage-traces` (and split `storage-traces-ingest`) | Probes traces query and ingest health endpoints |
 
-   全部输出 `PASS` 且末行打印 `HA ready: replicas can use shared PostgreSQL, Redis, S3, and signal storage` 后，再拉起应用副本。
+   Start the application replicas only after every check prints `PASS` and the final line prints `HA ready: replicas can use shared PostgreSQL, Redis, S3, and signal storage`.
 
-### 3.3 启动后功能校验
+### 3.3 Post-startup verification
 
 ```sh
-# 1. 存活、就绪与组件聚合健康检查（均应返回 HTTP 200）
+# 1. Liveness, readiness, and aggregate component health (each should return HTTP 200)
 curl -fsS http://127.0.0.1:3100/livez
 curl -fsS http://127.0.0.1:3100/readyz
 curl -fsS http://127.0.0.1:3100/healthz
 
-# 2. 使用用户 API Token (lou_...) 校验系统信息与三类信号读链路
+# 2. Verify system info and all three signal query paths with a user API token (lou_...)
 curl -fsS http://127.0.0.1:3100/api/system/info \
   -H 'Authorization: Bearer lou_<your-token>' \
   -H 'X-LO-Project: default'
@@ -232,77 +229,75 @@ curl -fsS http://127.0.0.1:3100/api/traces/services \
   -H 'X-LO-Project: default'
 ```
 
-如使用管理员账号，可额外检查 `GET /api/system/error-inbox` 确认错误 Inbox 无异常积压，并在 Web UI 中抽查历史 Issue、Replay 会话与 Source Map 列表。
+With an administrator account, also check `GET /api/system/error-inbox` to confirm there is no unexpected backlog, and spot-check historical Issues, Replay sessions, and Source Map lists in the web UI.
 
----
+## 4. Upgrades and rollbacks
 
-## 4. 版本升级与回滚
+### 4.1 Pre-upgrade checklist
 
-### 4.1 升级前检查清单
+1. Read [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) and [version-matrix.md](version-matrix.md) for the target version:
+   - Check whether `001_baseline.sql` changed. During the `v0.x` preview phase, baseline changes require recreating the metadata database and do not support in-place upgrades.
+   - Check whether protocol changes require upgrading client SDKs together with the server.
+2. Complete the Section 2 backup and record the current binary version or container image `tag@sha256:<digest>`.
+3. For container and Helm deployments, use the `helm-values-lazy-observe-<version>.yaml` file attached to the GitHub Release to pin the immutable image digest.
 
-1. 阅读目标版本的 [CHANGELOG.md](../CHANGELOG.md) 与 [docs/version-matrix.md](version-matrix.md)：
-   - 确认 `001_baseline.sql` 是否发生变化（v0.x 预览期基线变更需重建元数据数据库，无法原地升级）；
-   - 确认协议面与四端 SDK 兼容矩阵是否要求同步升级客户端 SDK。
-2. 完成第 2 节的对应备份，并记录当前二进制版本或镜像 `tag@sha256:<digest>`。
-3. 若使用容器/Helm，优先采用 GitHub Release 附带的 `helm-values-lazy-observe-<version>.yaml` 固定镜像不可变 digest。
+### 4.2 All-in-one upgrade
 
-### 4.2 All-in-One 升级步骤
+1. Stop the service cleanly with `SIGTERM`.
+2. Run Option A cold backup from Section 2.1.
+3. Replace the single `lazy-observe` binary (or update the Docker Compose image tag and digest). Release archives embed the web UI, checksum manifest, and four matched Victoria binaries. Never mix versions inside `storage_bin_dir`; if you use that development or offline override, replace all four binaries together.
+4. If the new release changed the metadata baseline, keep the old `<data_dir>` backup and initialize a fresh database. If the baseline did not change, start the new binary directly; startup verifies and atomically refreshes `<data_dir>/bin`.
+5. Run the probes and query checks in Section 3.3 before removing the old backup.
 
-1. 优雅停止服务（`SIGTERM`）。
-2. 执行 2.1 方案 A 冷备份。
-3. 替换单一 `lazy-observe` 二进制（或更新 Docker Compose 镜像 tag+digest）：
-   - 发布包已内嵌 Web UI、校验清单与四套匹配的 Victoria 二进制，**切勿混用不同版本的 `storage_bin_dir`**（除非明确处于开发/离线覆写模式，此时须整组同步替换四套二进制）。
-4. 若新版本变更了元数据基线：保留旧 `<data_dir>` 备份并初始化新库；若基线未变：直接启动。启动时会自动校验并原子刷新 `<data_dir>/bin`。
-5. 执行 3.3 节探针与查询验收，确认无误后再清理旧备份。
+### 4.3 HA upgrade
 
-### 4.3 HA 升级步骤
-
-1. 完成 2.2 节备份（PostgreSQL dump + 确认 S3 备份与 `secret.key` 备份完好）。
-2. **使用新版本二进制/镜像先跑一次只读预检**：
+1. Complete the Section 2.2 backup, including a PostgreSQL dump, S3 backup confirmation, and a verified `secret.key` backup.
+2. Run the read-only preflight check using the new binary or image before touching live replicas:
 
    ```sh
    lazy-observe doctor --ha --config /etc/lazy-observe/config.yaml
    ```
 
-   若新版本与现有 PostgreSQL 基线不兼容，`metadata-postgres` 会立刻在只读预检阶段报 `FAIL`（不会中断正在运行的线上副本）。
-3. 预检全部 `PASS` 后滚动更新副本：
-   - Kubernetes / Helm：默认使用 `RollingUpdate` 与 `PodDisruptionBudget`，配合 `pre-stop` 钩子先发 `SIGUSR1` 使 `/readyz` 立即返回 `503`，等待端点摘流窗口后再发 `SIGTERM` 优雅关闭；
-   - 非 K8s 多副本：逐台先发 `SIGUSR1`（等待前置负载均衡摘流）→ 发 `SIGTERM` → 替换二进制/镜像 → 启动并等 `/readyz` 返回 `200` → 再升级下一台。
-4. 全部副本就绪后，校验告警规则评估、通知投递与 vmagent leader 切换（可在日志及 `/healthz` 中确认）。
+   If the new release is incompatible with the existing PostgreSQL baseline, `metadata-postgres` prints `FAIL` right away without disrupting running replicas.
 
-### 4.4 回滚步骤
+3. After every preflight check prints `PASS`, roll the replicas:
+   - **Kubernetes and Helm.** The chart uses `RollingUpdate` and `PodDisruptionBudget`. The `pre-stop` hook sends `SIGUSR1` so `/readyz` returns `503`, waits through the endpoint-removal window, and then sends `SIGTERM` for graceful shutdown.
+   - **Non-Kubernetes multi-replica hosts.** Upgrade one host at a time. Send `SIGUSR1` and wait for the front-end load balancer to drain traffic, send `SIGTERM`, replace the binary or image, start the instance, wait until `/readyz` returns `200`, and then proceed to the next host.
+4. Once all replicas are ready, confirm alert rule evaluation, notification delivery, and `vmagent` leader handover in logs and `/healthz`.
 
-- **同元数据基线回滚**：
-  1. 停止当前版本（或滚动切回旧版镜像 digest / 二进制）；
-  2. 若新版本未引入不兼容数据变更，直接以旧版二进制启动即可；若怀疑有脏数据写入，同步按第 3 节恢复升级前备份；
-  3. 重新执行 `/readyz`、`/healthz` 及查询校验。
-- **跨元数据基线回滚**：
-  - 严禁把新基线生成的元数据数据库交给旧版二进制启动；
-  - 必须将**升级前的数据库/数据目录备份**与**升级前的精确二进制/镜像 digest**成对恢复，并运行 `lazy-observe doctor --ha`（HA 模式）确认基线与密钥指纹一致后再恢复流量。
+### 4.4 Rollback
 
----
+#### Same metadata baseline
 
-## 5. 应急运维流程
+1. Stop the new release (or roll back to the previous image digest or binary).
+2. If the new release wrote no incompatible data, start the previous binary directly. If you suspect dirty writes, restore the pre-upgrade backup from Section 3 first.
+3. Rerun `/readyz`, `/healthz`, and the signal query checks.
 
-### 5.1 平台加密密钥失配与主动轮换（`admin reset-key-fingerprint`）
+#### Across metadata baselines
 
-lazy-observe 启动时会将 `security.secret_key_file`（默认 `<data_dir>/secret.key`）计算出的 128-bit 指纹与元数据表 `platform_key_fingerprints` 比对。若指纹不一致，服务会在初始化网关与存储前**直接拒绝启动**，并在错误日志中打印文件路径、库中指纹与当前文件指纹。
+- Never start an older binary against a metadata database created by a newer baseline.
+- Restore the pre-upgrade database or data directory backup together with the exact pre-upgrade binary or image digest. In HA mode, run `lazy-observe doctor --ha` to confirm baseline and key fingerprint parity before restoring traffic.
 
-#### 场景 A：误重建 Secret 或某副本挂载了错误的密钥文件（可无损恢复）
+## 5. Emergency procedures
 
-**不要运行 `reset-key-fingerprint`！**
+### 5.1 Platform encryption key mismatch and rotation (`admin reset-key-fingerprint`)
 
-1. 停止报错副本；
-2. 从备份或密钥库恢复原始 `secret.key` 文件（确保与其余健康副本字节完全一致，权限 `0600` 或容器只读挂载 `0444`）；
-3. 重启副本，确认日志出现 `platform encryption key matches the recorded fingerprint`。所有既有加密数据（AI Provider API Key 等）保持可读。
+At startup, lazy-observe computes the 128-bit fingerprint of `security.secret_key_file` (default `<data_dir>/secret.key`) and compares it with the `platform_key_fingerprints` table. On mismatch, the server refuses to start before initializing the gateway or storage, and logs the file path, the recorded fingerprint, and the loaded file fingerprint.
 
-#### 场景 B：旧密钥已永久丢失或确认执行主动轮换
+#### Case A: accidental Secret recreation or wrong key file mounted (lossless recovery)
 
-> **注意**：`admin reset-key-fingerprint` 不会对历史密文重加密。确认轮换即表示接受放弃旧密钥加密的数据。
+**Do not run `reset-key-fingerprint`.**
 
-1. **停止全部 lazy-observe 应用副本**（Kubernetes 将 Deployment 缩容至 `0`；systemd / Compose 全部停止）。
-   > 必须先停完所有副本：运行中的旧副本会在内存中继续使用旧密钥加密写入，导致新副本无法解密。
-2. 生成或挂载新的 256-bit 随机密钥文件（32 字节标准 base64，禁止使用人工口令）：
+1. Stop the failing replica.
+2. Restore the original `secret.key` file from backup or your secret manager so its bytes match the healthy replicas, with mode `0600` (or read-only container mount `0444`).
+3. Restart the replica and verify that startup logs print `platform encryption key matches the recorded fingerprint`. All existing encrypted values, including AI provider API keys, remain readable.
+
+#### Case B: old key permanently lost or intentional key rotation
+
+> `admin reset-key-fingerprint` does not re-encrypt historical ciphertext. Confirming rotation means accepting the loss of data sealed with the old key.
+
+1. Stop every lazy-observe replica. Scale the Deployment to `0` in Kubernetes, or stop all systemd and Compose instances. Every replica must stop first because any running replica keeps sealing writes with the old key in memory, which produces ciphertext that rotated replicas cannot decrypt.
+2. Generate or mount a new 256-bit random key file containing 32 random bytes encoded as standard base64. Never use a human passphrase:
 
    ```sh
    openssl rand -base64 32 > /etc/lazy-observe/secret.key
@@ -310,29 +305,28 @@ lazy-observe 启动时会将 `security.secret_key_file`（默认 `<data_dir>/sec
    chown lazy-observe:lazy-observe /etc/lazy-observe/secret.key
    ```
 
-3. 使用与服务端相同的配置与新密钥文件，执行指纹重置（该命令只读密钥文件，文件不存在时会报错退出，绝不会自动创建或改写密钥）：
+3. Run the fingerprint reset with the same server configuration and the new key file. The command only reads the key file and exits with an error if the file is missing; it never creates or rewrites a key file:
 
    ```sh
    lazy-observe admin reset-key-fingerprint --config /etc/lazy-observe/config.yaml
    ```
 
-   成功后会输出新旧指纹，并向审计日志写入 `security.key_fingerprint_reset`（`actor=cli`）。重复对同一密钥执行会打印 `already recorded` 并保持幂等。
-4. 重新启动所有应用副本（HA 模式建议先跑一次 `lazy-observe doctor --ha`）。
-5. **轮换后必须完成的收尾操作**：
-   - 登录 Web UI 进入 **Settings > AI** 重新输入并保存 AI Provider API Key（以新密钥重新加密入库）；
-   - 新密钥会在下次启动时派生新的自监控项目 Token，但**旧派生 Token 不会自动吊销**，仍可向自监控项目上报遥测；若旧密钥已泄露，请进入自监控项目的令牌管理页手动吊销旧 Token。
+   On success, the command prints the old and new fingerprints and records a `security.key_fingerprint_reset` audit event with `actor=cli`. Running it again with the same key prints `already recorded` and changes nothing.
 
----
+4. Restart all replicas. In HA mode, run `lazy-observe doctor --ha` first.
+5. Complete the post-rotation cleanup:
+   - Sign in to the web UI, open **Settings > AI**, and re-enter and save the AI provider API key so it seals under the new key.
+   - The next startup derives a new self-monitoring project token from the new key, but the previous derived token is not revoked automatically and still accepts telemetry for the self-monitoring project. If the old key leaked, open the self-monitoring project's token list and revoke the old token manually.
 
-### 5.2 密码应急重置与登录锁定解除（`admin reset-password`）
+### 5.2 Emergency password reset and lockout clearing (`admin reset-password`)
 
-当管理员忘记密码、账号被锁或需离线重置任意用户密码时，直接通过 CLI 操作元数据数据库（不经 HTTP API）：
+When an administrator forgets a password, gets locked out, or needs an offline password reset for any user, run the CLI directly against the metadata database without going through the HTTP API:
 
 ```sh
-# 1. All-in-One 且未配置 security.admin_password_file 时重置 admin（自动生成随机密码）
+# 1. Reset admin on All-in-one without security.admin_password_file (generates a random password)
 lazy-observe admin reset-password --config /etc/lazy-observe/config.yaml
 
-# 2. 指定新密码文件（重置非 admin 账号、或配置了 security.admin_password_file / HA 部署时必填）
+# 2. Provide a password file (required for non-admin accounts, or when security.admin_password_file / HA is used)
 install -m 0600 /dev/null /run/lazy-observe-new-password
 printf '%s\n' '<at-least-8-chars-strong-password>' > /run/lazy-observe-new-password
 lazy-observe admin reset-password \
@@ -342,34 +336,27 @@ lazy-observe admin reset-password \
 rm -f /run/lazy-observe-new-password
 ```
 
-关键行为契约（源码见 `cmd/lazy-observe/admin.go`）：
+`cmd/lazy-observe/admin.go` implements these reset behaviors:
 
-- **随机生成模式**（省略 `--password-file`）：仅允许目标为 `admin` 且未配置 `security.admin_password_file`。新密码写入 `<data_dir>/initial-admin-password`（权限 `0600`），终端仅打印路径而不打印明文，并强制下次登录修改密码（改密后网关自动删除该文件）。
-- **密码文件模式**（传入 `--password-file`）：忽略首尾空白，长度须 `>= 8` 字符；不强制下次登录改密，且不会删除或覆盖部署方的 `security.admin_password_file`。
-- **会话吊销与登录锁定清理**：
-  - 命令会吊销目标账号的全部现有会话，并写入 `auth.password_reset`（`actor=cli`）审计事件；
-  - 启用 Redis 时（HA 部署），命令必须能读到相同的 `redis.*` 配置，以便同步吊销 Redis 会话并**清除 Redis 登录失败锁定计数**（连续 5 次失败默认锁 15 分钟）；
-  - 未启用 Redis 的单进程部署中，登录锁定计数保存在网关进程内存里，CLI 无法清除；若账号正处于锁定窗口，请重启网关。
+- **Generated password mode.** Omit `--password-file` only for `admin` when `security.admin_password_file` is unset. The CLI writes the new password to `<data_dir>/initial-admin-password` with mode `0600`, prints only the path, and forces a password change on the next sign-in. The gateway deletes that file after the password changes.
+- **Password file mode.** Pass `--password-file` to supply a file. The CLI strips surrounding whitespace, requires at least 8 characters, does not force a password change on next sign-in, and never deletes or overwrites `security.admin_password_file`.
+- **Session revocation and lockout clearing.** The command revokes all active sessions for the target account and records an `auth.password_reset` audit event with `actor=cli`. When Redis is enabled (HA deployments), pass the same `redis.*` configuration so the CLI revokes Redis sessions and clears the Redis failed-login lockout counter. By default, 5 consecutive failures trigger a 15-minute lockout. In a single-process deployment without Redis, the lockout counter lives in gateway memory, which the CLI cannot reach; restart the gateway if the account is locked out.
 
----
+### 5.3 Graceful shutdown and signal handling
 
-### 5.3 优雅关停与信号控制
+`lazy-observe server` (implemented in `cmd/lazy-observe/server.go` and `cmd/lazy-observe/server_gateway.go`) supports two-phase graceful shutdown:
 
-`lazy-observe server`（源码见 `cmd/lazy-observe/server.go`、`cmd/lazy-observe/server_gateway.go`）支持两阶段优雅退出：
-
-| 信号 | 行为 |
+| Signal | Behavior |
 | --- | --- |
-| `SIGUSR1` | 立即将 `/readyz` 置为 `503`（`not_ready`）并中断长连接流（如 Live Tail），但监听器继续服务在途与尚未摘流的请求。适用于前置负载均衡摘流窗口。 |
-| `SIGTERM` / `SIGINT` | 触发完整关停流程：若此前未收到 `SIGUSR1`，短暂保留监听 `250ms` 以便探针观测 `503` → 刷出自监控 SDK → 在 `process.drain_timeout`（默认 `20s`）内完成在途请求与错误 Inbox 关闭 → 在 `process.shutdown_timeout`（默认 `15s`）内由 Supervisor 先停 `vmagent`、再优雅停止三个嵌入式 Victoria 存储进程。 |
+| `SIGUSR1` | Sets `/readyz` to `503` (`not_ready`) and closes long-lived streams such as Live Tail while keeping the listener open for in-flight requests. Use this signal during load-balancer drain windows. |
+| `SIGTERM` / `SIGINT` | Starts full shutdown. If `SIGUSR1` was not received earlier, the gateway keeps listening for `250ms` so probes observe `503`. It then flushes the self-monitoring SDK, finishes in-flight requests and closes the Error Inbox within `process.drain_timeout` (default `20s`), and instructs the supervisor to stop `vmagent` first and then shut down the three embedded Victoria storage processes within `process.shutdown_timeout` (default `15s`). |
 
-容器编排（Docker Compose `stop_grace_period` / Kubernetes `terminationGracePeriodSeconds` / systemd `TimeoutStopSec`）应至少设为 **`45s`**，以完整覆盖 `pre-stop` 摘流窗口 + `drain_timeout` + `shutdown_timeout`。
+Set orchestrator stop grace periods (`stop_grace_period` in Docker Compose, `terminationGracePeriodSeconds` in Kubernetes, and `TimeoutStopSec` in systemd) to at least `45s` to cover the pre-stop drain window, `drain_timeout`, and `shutdown_timeout`.
 
----
+## Related documentation
 
-## 相关文档
-
-- [部署总览（配置字段、Standalone 与 Helm）](deployment.md)
-- [Grafana 与 Perses 对接指南](grafana-perses.md)
-- [Docker Compose 部署](../deploy/compose/README.md)
-- [systemd 服务部署](../deploy/systemd/README.md)
-- [服务端与 SDK 版本兼容矩阵](version-matrix.md)
+- [Deployment guide (configuration, Standalone, and Helm)](deployment.md)
+- [Grafana and Perses integration guide](grafana-perses.md)
+- [Docker Compose deployment](https://github.com/eimsound/lazy-observe/blob/main/deploy/compose/README.md)
+- [systemd service deployment](https://github.com/eimsound/lazy-observe/blob/main/deploy/systemd/README.md)
+- [Server and SDK version matrix](version-matrix.md)
