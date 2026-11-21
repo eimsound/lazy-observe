@@ -63,7 +63,9 @@ changelog:
       - '^test:'
 
 release:
-  draft: false
+  # 先建 draft Release，待不可变容器镜像推送、Cosign 签名、Provenance/SBOM Attestation
+  # 与 helm-values 资产全部成功后再由 release.yml 的 publish-release job 公开（draft: false）。
+  draft: true
   prerelease: auto
   # v0.x 是公开预览：Release 页面顶部写明预览声明（与 CHANGELOG、README、deployment 同一句）。
   # 正文其余部分由 git log 生成，看不到 CHANGELOG；v1 起不再渲染。

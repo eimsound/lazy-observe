@@ -2,6 +2,10 @@ name: Release
 
 # 服务端发版：v* tag 发布 GitHub Release 与 ghcr.io 镜像；workflow_dispatch 只出 snapshot
 # 归档（不发布任何东西）。全部跑在 GitHub 托管 runner 上，凭据只用 job 的 GITHUB_TOKEN。
+# 不可变容器发布流：build-meta 锁定单一构建元信息 → container-check（仅 contents: read）单次构建
+# OCI 归档、对同一字节做 Trivy 扫描与容器冒烟 → archive（GoReleaser 先建 draft Release 并签发归档
+# provenance）→ docker（无 Dockerfile 构建，推送已扫描 OCI 字节并组装多架构 index、Cosign keyless
+# 签名、Provenance/SBOM Attestation）→ helm-values（回填同一 digest）→ publish-release（公开 Release）。
 # SDK 由 sdk-release.yml 按 sdk/go/v*、sdk-*-v* tag 单独发布。
 on:
   push:
@@ -21,9 +25,32 @@ env:
   MISE_GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
+  # 同一 release 锁定单一 VERSION / COMMIT / DATE，避免 amd64/arm64 矩阵或下游阶段因时间戳漂移导致重建。
+  build-meta:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      date: ${{ steps.meta.outputs.date }}
+    steps:
+      - name: Set build metadata
+        id: meta
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          version=dev
+          if [[ "$RELEASE_EVENT" == push ]]; then version=${RELEASE_REF_NAME#v}; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
   container-check:
-    name: Container smoke (linux/${{ matrix.arch }})
-    # 原生 runner 构建与冒烟，不走 QEMU 仿真。
+    name: Container build, scan, and smoke (linux/${{ matrix.arch }})
+    needs: build-meta
+    # 原生 runner 构建与冒烟，不走 QEMU 仿真；仅继承顶层 contents: read，绝不向 BuildKit 暴露写权限。
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
@@ -37,43 +64,66 @@ jobs:
         with:
           # 不用默认的 moby/buildkit:buildx-stable-1：按具体版本 + 多架构 index digest 固定。
           driver-opts: image=moby/buildkit:v0.35.0@sha256:aa632b921ef07411d2cb77292cd34213d4f7b384001d6fceef1e1f25bf9752bb
-      - name: Set build metadata
-        id: build-meta
-        env:
-          RELEASE_EVENT: ${{ github.event_name }}
-          RELEASE_REF_NAME: ${{ github.ref_name }}
-          RELEASE_SHA: ${{ github.sha }}
-        run: |
-          version=dev
-          if [[ "$RELEASE_EVENT" == push ]]; then version=${RELEASE_REF_NAME#v}; fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "commit=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-      - name: Build loadable container
+      - name: Generate OCI image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/eimsound/lazy-observe
+          labels: |
+            org.opencontainers.image.created=${{ needs.build-meta.outputs.date }}
+            org.opencontainers.image.version=${{ needs.build-meta.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.build-meta.outputs.commit }}
+      - name: Build immutable OCI container archive
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
-          load: true
+          load: false
           push: false
           tags: lazy-observe:preflight-${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=oci,dest=${{ runner.temp }}/lazy-observe-linux-${{ matrix.arch }}.oci.tar
           provenance: false
           sbom: false
           build-args: |
-            VERSION=${{ steps.build-meta.outputs.version }}
-            COMMIT=${{ steps.build-meta.outputs.commit }}
-            DATE=${{ steps.build-meta.outputs.date }}
+            VERSION=${{ needs.build-meta.outputs.version }}
+            COMMIT=${{ needs.build-meta.outputs.commit }}
+            DATE=${{ needs.build-meta.outputs.date }}
           secrets: |
             github_token=${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha,scope=container-${{ matrix.arch }}
           # mode=max 的层缓存动辄 GB 级；tag 触发时写在 refs/tags/* 下，别的 tag 和 main 都读不到，只在 main 上写。
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=container-{0}', matrix.arch) || '' }}
+      - name: Load and verify immutable OCI archive
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          oci_tar="${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.oci.tar"
+          digest=$(bash scripts/merge-oci-layouts.sh inspect \
+            --archive "$oci_tar" \
+            --arch "$ARCH" \
+            --digest-out "${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.digest" \
+            --sha256-out "${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.oci.tar.sha256")
+          docker load -i "$oci_tar"
+          printf 'Verified and loaded linux/%s immutable manifest %s\n' "$ARCH" "$digest"
       # 发版前挡住：CRITICAL/HIGH 且已有修复版本的漏洞让 container-check 失败，archive 与 docker 都不会运行。
       # 扫描器按版本 + sha256 固定，例外写进 .trivyignore.yaml（见 scripts/check-image-vulns.sh）。
       - name: Scan container for fixable CRITICAL/HIGH vulnerabilities
         run: bash scripts/check-image-vulns.sh lazy-observe:preflight-${{ matrix.arch }}
       - name: Smoke container
         run: bash scripts/check-container-smoke.sh lazy-observe:preflight-${{ matrix.arch }} linux/${{ matrix.arch }}
+      - name: Upload verified OCI container archive
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oci-image-linux-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/lazy-observe-linux-${{ matrix.arch }}.oci.tar
+            ${{ runner.temp }}/lazy-observe-linux-${{ matrix.arch }}.oci.tar.sha256
+            ${{ runner.temp }}/lazy-observe-linux-${{ matrix.arch }}.digest
+          if-no-files-found: error
+          retention-days: 1
 
   # 嵌入的 Victoria 二进制在 lazy-observe 里是 gzip 后 go:embed 的 payload，镜像与归档里没有独立的可执行文件，
   # 上面的镜像扫描读不到它们的 Go buildinfo。这里对下载并校验过 sha256 的原始上游二进制（amd64 + arm64，
@@ -161,12 +211,15 @@ jobs:
           key: ${{ steps.storage-cache.outputs.cache-primary-key }}
 
   archive:
-    name: ${{ github.event_name == 'workflow_dispatch' && 'Snapshot archives' || 'Publish archives' }}
+    name: ${{ github.event_name == 'workflow_dispatch' && 'Snapshot archives' || 'Publish draft archives' }}
     needs: [container-check, storage-bin-scan, performance-gates]
     runs-on: ubuntu-24.04
     permissions:
-      # GoReleaser creates the GitHub Release and uploads archives.
+      # GoReleaser creates the draft GitHub Release and uploads archives;
+      # attest-build-provenance signs SLSA provenance for the release archives.
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -241,11 +294,18 @@ jobs:
             exit 1
           }
           mise run release-publish-check
-      - name: Publish GoReleaser archives
+      - name: Publish draft GoReleaser archives
         if: github.event_name == 'push'
         run: mise run release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest release archive build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt
       - name: Prune stale mise tools
         if: github.ref == 'refs/heads/main' && steps.mise-cache.outputs.cache-hit != 'true'
         run: mise prune --tools --yes
@@ -257,27 +317,41 @@ jobs:
           key: ${{ steps.mise-cache.outputs.cache-primary-key }}
 
   docker:
-    name: Publish multi-platform container
+    name: Publish, sign, and attest multi-platform container
     if: github.event_name == 'push'
-    needs: archive
+    needs: [build-meta, archive]
     runs-on: ubuntu-24.04
     permissions:
-      # 只读：这个 job 把 GITHUB_TOKEN 当作 BuildKit secret 挂进构建，构建期代码不应该拿到
-      # 写仓库的权限。回填 Release 资产交给下面的 helm-values job。
+      # 无构建发布：本 job 不运行 Dockerfile/BuildKit，只校验并推送 container-check 产出的
+      # 不可变 OCI 镜像层，随后对最终多架构 index digest 执行 Cosign keyless 签名与
+      # GitHub Provenance/SBOM Attestation。回填 Release 资产交给 helm-values job。
       contents: read
       packages: write
-    # digest 只有推完镜像才存在；helm-values job 通过 outputs 拿到它和版本号。
+      id-token: write
+      attestations: write
+    # digest 只有推完多架构 index 才存在；helm-values job 通过 outputs 拿到同一 digest 与版本号。
     outputs:
-      version: ${{ steps.build-meta.outputs.version }}
-      digest: ${{ steps.build.outputs.digest }}
+      version: ${{ needs.build-meta.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The builder stage runs on $BUILDPLATFORM and cross-compiles; the final
-      # distroless stage only copies files, so arm64 needs no QEMU emulation.
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Install container publish toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MISE_CI_PROFILE: docker-publish
+      - name: Download verified OCI container archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          # 不用默认的 moby/buildkit:buildx-stable-1：按具体版本 + 多架构 index digest 固定。
-          driver-opts: image=moby/buildkit:v0.35.0@sha256:aa632b921ef07411d2cb77292cd34213d4f7b384001d6fceef1e1f25bf9752bb
+          pattern: oci-image-linux-*
+          path: ${{ runner.temp }}/oci-artifacts
+          merge-multiple: true
+      - name: Verify checksums and assemble multi-platform OCI layout
+        run: |
+          mise exec -- bash scripts/merge-oci-layouts.sh merge \
+            --input-dir "${RUNNER_TEMP}/oci-artifacts" \
+            --output-dir "${RUNNER_TEMP}/merged-oci" \
+            --sbom-dir "${RUNNER_TEMP}/sbom-amd64"
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
@@ -291,45 +365,74 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-      - name: Set build metadata
-        id: build-meta
+      - name: Push verified multi-platform OCI index and verify digests
+        id: push
         env:
-          RELEASE_REF_NAME: ${{ github.ref_name }}
-          RELEASE_SHA: ${{ github.sha }}
+          IMAGE_REPO: ghcr.io/eimsound/lazy-observe
+          IMAGE_VERSION: ${{ needs.build-meta.outputs.version }}
+          META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          echo "version=${RELEASE_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          echo "commit=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-      - name: Build and push container
-        id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.build-meta.outputs.version }}
-            COMMIT=${{ steps.build-meta.outputs.commit }}
-            DATE=${{ steps.build-meta.outputs.date }}
-          secrets: |
-            github_token=${{ secrets.GITHUB_TOKEN }}
-          # docker job 只在 tag push 时跑，refs/tags/* 写出的层缓存别的 tag 和 main 都读不到，所以只读不写。
-          cache-from: |
-            type=gha,scope=container-amd64
-            type=gha,scope=container-arm64
-      - name: Verify pushed manifest
+          pushed_ref=$(mise exec -- crane push --index "${RUNNER_TEMP}/merged-oci" "${IMAGE_REPO}:${IMAGE_VERSION}")
+          digest=${pushed_ref##*@}
+          if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf 'unexpected pushed index digest: %s\n' "$pushed_ref" >&2
+            exit 1
+          fi
+          while IFS= read -r full_tag; do
+            [[ -n $full_tag ]] || continue
+            tag_name=${full_tag#"${IMAGE_REPO}:"}
+            [[ $tag_name == "$IMAGE_VERSION" ]] && continue
+            mise exec -- crane tag "${IMAGE_REPO}@${digest}" "$tag_name"
+          done <<<"$META_TAGS"
+          remote_index=$(mise exec -- crane manifest "${IMAGE_REPO}@${digest}")
+          for arch in amd64 arm64; do
+            want=$(tr -d '[:space:]' <"${RUNNER_TEMP}/oci-artifacts/lazy-observe-linux-${arch}.digest")
+            got=$(mise exec -- jq -er --arg arch "$arch" \
+              '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' \
+              <<<"$remote_index")
+            if [[ $got != "$want" ]]; then
+              printf 'remote index digest mismatch for linux/%s: got %s, want %s\n' "$arch" "$got" "$want" >&2
+              exit 1
+            fi
+          done
+          printf 'Verified pushed multi-arch index %s@%s\n' "$IMAGE_REPO" "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Generate SPDX SBOM from verified OCI image
+        run: |
+          trivy=$(bash scripts/install-trivy.sh)
+          mkdir -p dist
+          "$trivy" image \
+            --input "${RUNNER_TEMP}/sbom-amd64" \
+            --format spdx-json \
+            --output dist/lazy-observe-sbom.spdx.json \
+            --skip-version-check \
+            --no-progress
+          [[ -s dist/lazy-observe-sbom.spdx.json ]] || { echo 'SBOM generation produced an empty file' >&2; exit 1; }
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Sign multi-platform image with Cosign (keyless)
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: docker buildx imagetools inspect "ghcr.io/eimsound/lazy-observe@$DIGEST"
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes --recursive "ghcr.io/eimsound/lazy-observe@${IMAGE_DIGEST}"
+      - name: Attest container build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/eimsound/lazy-observe
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Attest container SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/eimsound/lazy-observe
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: dist/lazy-observe-sbom.spdx.json
+          push-to-registry: true
 
-  # chart 本身不打包也不发布（仍在 deploy/helm/lazy-observe）；digest 只有推完镜像才存在，
-  # 且 GoReleaser 已在 archive job 建好 Release，所以回填的做法是把 digest 写成 values
-  # 片段挂到本次 Release 上，而不是把 digest 提交回 main（AFK 契约禁止直推 main，
+  # chart 本身不打包也不发布（仍在 deploy/helm/lazy-observe）；digest 只有推完多架构镜像才存在，
+  # 且 GoReleaser 已在 archive job 建好 draft Release，所以回填的做法是把 digest 写成 values
+  # 片段挂到本次 draft Release 上，而不是把 digest 提交回 main（AFK 契约禁止直推 main，
   # 提交回 main 也只会让 chart 永远指向上一个版本的镜像）。
-  # 单独开一个 job 而不是塞进 docker：那个 job 会把 GITHUB_TOKEN 当 BuildKit secret 挂进
-  # 构建，写权限只应该出现在这里。
+  # 单独开一个 job 而不是塞进 docker：写仓库 Release 资产的权限只出现在这里与 publish-release。
   helm-values:
     name: Attach digest-pinned Helm values
     if: github.event_name == 'push'
@@ -350,9 +453,25 @@ jobs:
             --tag "$IMAGE_TAG" \
             --digest "$IMAGE_DIGEST" \
             --output "dist/helm-values-lazy-observe-$IMAGE_TAG.yaml"
-      - name: Attach digest-pinned Helm values to the release
+      - name: Attach digest-pinned Helm values to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
           HELM_VALUES_FILE: dist/helm-values-lazy-observe-${{ needs.docker.outputs.version }}.yaml
         run: gh release upload "$RELEASE_TAG" "$HELM_VALUES_FILE" --repo "$GITHUB_REPOSITORY" --clobber
+
+  # 仅在 GoReleaser 归档、多架构不可变容器推送、Cosign 签名、Provenance/SBOM Attestation
+  # 与 digest 固定 helm-values 资产全部成功后，才将 draft Release 公开，避免中途失败留下半残公开 Release。
+  publish-release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs: helm-values
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Mark draft release as published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

@@ -19,6 +19,8 @@ uv = { version = "0.13.8", lazy = true }
 golangci-lint = { version = "2.15.0", lazy = true }
 helm = { version = "4.3.2", lazy = true }
 goreleaser = { version = "2.20.2", lazy = true }
+# crane：release.yml 推送已扫描的不可变多架构 OCI 布局，不重新执行 Dockerfile（Apache-2.0）。
+crane = { version = "0.22.1", lazy = true }
 "go:github.com/google/go-licenses/v2" = { version = "2.0.1", lazy = true, lazy_bins = ["go-licenses"] }
 # 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
 "go:golang.org/x/vuln/cmd/govulncheck" = { version = "1.10.0", lazy = true, lazy_bins = ["govulncheck"] }
@@ -253,6 +255,7 @@ run = [
   "bash scripts/check-github-workflows.sh",
   "bash scripts/check-pipefail-pipelines.sh",
   "bash scripts/ci-setup-mise-test.sh",
+  "bash scripts/merge-oci-layouts-test.sh",
   "bash scripts/check-e2e-contract.sh",
   "bash scripts/ci-changes-test.sh",
 ]
