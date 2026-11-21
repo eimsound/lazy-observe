@@ -92,13 +92,22 @@ type scaleThroughputReference struct {
 }
 
 type scaleUpstreamHeadroomEvidence struct {
+	MedianControlSamplesPerSecond  float64 `json:"median_control_samples_per_second"`
+	MedianScaledSamplesPerSecond   float64 `json:"median_scaled_samples_per_second"`
+	SampleRatio                    float64 `json:"sample_ratio"`
+	MedianControlLogsPerSecond     float64 `json:"median_control_logs_per_second"`
+	MedianScaledLogsPerSecond      float64 `json:"median_scaled_logs_per_second"`
+	LogRatio                       float64 `json:"log_ratio"`
 	MinimumControlSamplesPerSecond float64 `json:"minimum_control_samples_per_second"`
 	MaximumScaledSamplesPerSecond  float64 `json:"maximum_scaled_samples_per_second"`
-	SampleRatio                    float64 `json:"sample_ratio"`
+	ConservativeSampleRatio        float64 `json:"conservative_sample_ratio"`
 	MinimumControlLogsPerSecond    float64 `json:"minimum_control_logs_per_second"`
 	MaximumScaledLogsPerSecond     float64 `json:"maximum_scaled_logs_per_second"`
-	LogRatio                       float64 `json:"log_ratio"`
+	ConservativeLogRatio           float64 `json:"conservative_log_ratio"`
+	PassingControlRounds           int     `json:"passing_control_rounds"`
+	RequiredPassingControlRounds   int     `json:"required_passing_control_rounds"`
 	MinimumRequiredRatio           float64 `json:"minimum_required_ratio"`
+	MinimumConservativeRatio       float64 `json:"minimum_conservative_ratio"`
 }
 
 type scaleRoundEfficiency struct {
@@ -136,6 +145,7 @@ type scaleGateResult struct {
 	SingleCapacityReference       scaleThroughputReference      `json:"single_capacity_reference"`
 	Scaled                        scalePhaseResult              `json:"scaled_replicas"`
 	UpstreamControlRounds         []scalePhaseResult            `json:"upstream_control_rounds"`
+	UpstreamControlLabels         []string                      `json:"upstream_control_labels,omitempty"`
 	UpstreamHeadroom              scaleUpstreamHeadroomEvidence `json:"upstream_headroom"`
 	SampleScaleFactor             float64                       `json:"sample_scale_factor"`
 	LogScaleFactor                float64                       `json:"log_scale_factor"`
@@ -419,7 +429,8 @@ func runScaleGate(args []string) error {
 	}
 	waitScaleRecovery(recovery)
 
-	upstreamControlRounds := make([]scalePhaseResult, 0, 2)
+	upstreamControlRounds := make([]scalePhaseResult, 0, *rounds/2+1)
+	upstreamControlLabels := make([]string, 0, *rounds/2+1)
 	measureUpstreamControl := func(position string) error {
 		if !controlledUpstream {
 			return nil
@@ -452,6 +463,7 @@ func runScaleGate(args []string) error {
 			)
 		}
 		upstreamControlRounds = append(upstreamControlRounds, phase)
+		upstreamControlLabels = append(upstreamControlLabels, position)
 		waitScaleRecovery(recovery)
 		return nil
 	}
@@ -580,6 +592,11 @@ func runScaleGate(args []string) error {
 			waitScaleRecovery(recovery)
 		}
 		roundOrders = append(roundOrders, orderNames)
+		if position, ok := upstreamControlPositionAfterRound(round, *rounds); ok {
+			if err := measureUpstreamControl(position); err != nil {
+				return err
+			}
+		}
 	}
 	if err := measureUpstreamControl("trailing"); err != nil {
 		return err
@@ -612,7 +629,7 @@ func runScaleGate(args []string) error {
 		concurrencyPerReplica,
 		cfg.HAScaling.MinReplicaEfficiency,
 	)
-	result.Version = 6
+	result.Version = 7
 	result.GitCommit, result.GeneratedAt = resultMetadata()
 	result.Scope = "stateless_platform_gateway"
 	result.ScalingModel = "weak_scaling_with_single_high_concurrency_control"
@@ -640,7 +657,8 @@ func runScaleGate(args []string) error {
 	result.ReadbackVerified = true
 	result.PayloadProofVerified = true
 	result.UpstreamControlRounds = upstreamControlRounds
-	result.UpstreamHeadroom = conservativeUpstreamHeadroom(
+	result.UpstreamControlLabels = upstreamControlLabels
+	result.UpstreamHeadroom = evaluateUpstreamHeadroom(
 		upstreamControlRounds,
 		scaledRounds,
 		cfg.HAScaling.MinUpstreamHeadroomRatio,
@@ -750,35 +768,16 @@ func runScaleGate(args []string) error {
 			appendScaleFailure(&result, fmt.Sprintf("scaled round %d: %s", roundIndex+1, failure))
 		}
 	}
-	if result.UpstreamHeadroom.SampleRatio < result.UpstreamHeadroom.MinimumRequiredRatio {
-		appendScaleFailure(
-			&result,
-			fmt.Sprintf(
-				"metric upstream headroom %.3f is below %.3f",
-				result.UpstreamHeadroom.SampleRatio,
-				result.UpstreamHeadroom.MinimumRequiredRatio,
-			),
-		)
-	}
-	if result.UpstreamHeadroom.LogRatio < result.UpstreamHeadroom.MinimumRequiredRatio {
-		appendScaleFailure(
-			&result,
-			fmt.Sprintf(
-				"log upstream headroom %.3f is below %.3f",
-				result.UpstreamHeadroom.LogRatio,
-				result.UpstreamHeadroom.MinimumRequiredRatio,
-			),
-		)
-	}
+	applyUpstreamHeadroomGate(&result)
 	result.GatePassed = len(result.GateFailures) == 0
 	if err := writeResult(*output, result); err != nil {
 		return err
 	}
 	if !result.GatePassed {
-		return failResult(strings.Join(result.GateFailures, "; "))
+		return failResult(formatScaleFailureDiagnostics(result))
 	}
 	fmt.Printf(
-		"PASS: %d equivalent platform replicas achieved aggregate median metric/log capacity efficiency %.3f/%.3f; %d/%d paired rounds met >= %.3f for both signals (required %d at ratio %.3f), with baseline ratios %.3f/%.3f (>= %.3f), concurrency %d per replica, and batch %d; %.0f -> %.0f records/s through %s; upstream headroom %.2fx/%.2fx and real-storage mirrored payload readback verified\n",
+		"PASS: %d equivalent platform replicas achieved aggregate median metric/log capacity efficiency %.3f/%.3f; %d/%d paired rounds met >= %.3f for both signals (required %d at ratio %.3f), with baseline ratios %.3f/%.3f (>= %.3f), concurrency %d per replica, and batch %d; %.0f -> %.0f records/s through %s; upstream headroom median %.2fx/%.2fx (conservative min/max %.2fx/%.2fx, %d/%d control rounds >= %.2fx) and real-storage mirrored payload readback verified\n",
 		len(targets),
 		result.SampleReplicaEfficiency,
 		result.LogReplicaEfficiency,
@@ -797,6 +796,11 @@ func runScaleGate(args []string) error {
 		result.MeasurementUpstream,
 		result.UpstreamHeadroom.SampleRatio,
 		result.UpstreamHeadroom.LogRatio,
+		result.UpstreamHeadroom.ConservativeSampleRatio,
+		result.UpstreamHeadroom.ConservativeLogRatio,
+		result.UpstreamHeadroom.PassingControlRounds,
+		len(result.UpstreamControlRounds),
+		result.UpstreamHeadroom.MinimumRequiredRatio,
 	)
 	return nil
 }
@@ -1691,14 +1695,31 @@ func scaleCapacityReference(nominal, highControl []scaleTargetBaseline) scaleThr
 	return result
 }
 
-func conservativeUpstreamHeadroom(
+func upstreamControlPositionAfterRound(round, totalRounds int) (string, bool) {
+	completed := round + 1
+	if completed < totalRounds && completed%2 == 0 {
+		return fmt.Sprintf("after-round-%d", completed), true
+	}
+	return "", false
+}
+
+func minimumConservativeHeadroomRatio(minimumRequired float64) float64 {
+	if minimumRequired <= 1 {
+		return minimumRequired
+	}
+	return 1 + (minimumRequired-1)/2
+}
+
+func evaluateUpstreamHeadroom(
 	controlRounds, scaledRounds []scalePhaseResult,
 	minimumRequired float64,
 ) scaleUpstreamHeadroomEvidence {
 	result := scaleUpstreamHeadroomEvidence{
 		MinimumControlSamplesPerSecond: math.MaxFloat64,
 		MinimumControlLogsPerSecond:    math.MaxFloat64,
+		RequiredPassingControlRounds:   len(controlRounds)/2 + 1,
 		MinimumRequiredRatio:           minimumRequired,
+		MinimumConservativeRatio:       minimumConservativeHeadroomRatio(minimumRequired),
 	}
 	for _, phase := range controlRounds {
 		result.MinimumControlSamplesPerSecond = min(result.MinimumControlSamplesPerSecond, phase.SamplesPerSecond)
@@ -1712,13 +1733,217 @@ func conservativeUpstreamHeadroom(
 		result.MinimumControlSamplesPerSecond = 0
 		result.MinimumControlLogsPerSecond = 0
 	}
+	result.MedianControlSamplesPerSecond = medianScaleFloat(
+		controlRounds,
+		func(phase scalePhaseResult) float64 { return phase.SamplesPerSecond },
+	)
+	result.MedianControlLogsPerSecond = medianScaleFloat(
+		controlRounds,
+		func(phase scalePhaseResult) float64 { return phase.LogsPerSecond },
+	)
+	result.MedianScaledSamplesPerSecond = medianScaleFloat(
+		scaledRounds,
+		func(phase scalePhaseResult) float64 { return phase.SamplesPerSecond },
+	)
+	result.MedianScaledLogsPerSecond = medianScaleFloat(
+		scaledRounds,
+		func(phase scalePhaseResult) float64 { return phase.LogsPerSecond },
+	)
+	if result.MedianScaledSamplesPerSecond > 0 {
+		result.SampleRatio = result.MedianControlSamplesPerSecond / result.MedianScaledSamplesPerSecond
+	}
+	if result.MedianScaledLogsPerSecond > 0 {
+		result.LogRatio = result.MedianControlLogsPerSecond / result.MedianScaledLogsPerSecond
+	}
 	if result.MaximumScaledSamplesPerSecond > 0 {
-		result.SampleRatio = result.MinimumControlSamplesPerSecond / result.MaximumScaledSamplesPerSecond
+		result.ConservativeSampleRatio = result.MinimumControlSamplesPerSecond / result.MaximumScaledSamplesPerSecond
 	}
 	if result.MaximumScaledLogsPerSecond > 0 {
-		result.LogRatio = result.MinimumControlLogsPerSecond / result.MaximumScaledLogsPerSecond
+		result.ConservativeLogRatio = result.MinimumControlLogsPerSecond / result.MaximumScaledLogsPerSecond
+	}
+	if result.MedianScaledSamplesPerSecond > 0 && result.MedianScaledLogsPerSecond > 0 {
+		for _, phase := range controlRounds {
+			sampleRatio := phase.SamplesPerSecond / result.MedianScaledSamplesPerSecond
+			logRatio := phase.LogsPerSecond / result.MedianScaledLogsPerSecond
+			if sampleRatio >= minimumRequired && logRatio >= minimumRequired {
+				result.PassingControlRounds++
+			}
+		}
 	}
 	return result
+}
+
+func applyUpstreamHeadroomGate(result *scaleGateResult) {
+	headroom := result.UpstreamHeadroom
+	if headroom.SampleRatio < headroom.MinimumRequiredRatio {
+		appendScaleFailure(
+			result,
+			fmt.Sprintf(
+				"metric upstream headroom median ratio %.3f (median_control=%.1f / median_scaled=%.1f) is below %.3f",
+				headroom.SampleRatio,
+				headroom.MedianControlSamplesPerSecond,
+				headroom.MedianScaledSamplesPerSecond,
+				headroom.MinimumRequiredRatio,
+			),
+		)
+	}
+	if headroom.LogRatio < headroom.MinimumRequiredRatio {
+		appendScaleFailure(
+			result,
+			fmt.Sprintf(
+				"log upstream headroom median ratio %.3f (median_control=%.1f / median_scaled=%.1f) is below %.3f",
+				headroom.LogRatio,
+				headroom.MedianControlLogsPerSecond,
+				headroom.MedianScaledLogsPerSecond,
+				headroom.MinimumRequiredRatio,
+			),
+		)
+	}
+	if headroom.PassingControlRounds < headroom.RequiredPassingControlRounds {
+		appendScaleFailure(
+			result,
+			fmt.Sprintf(
+				"only %d of %d upstream control rounds met paired metric/log headroom %.3f against median scaled throughput (require %d)",
+				headroom.PassingControlRounds,
+				len(result.UpstreamControlRounds),
+				headroom.MinimumRequiredRatio,
+				headroom.RequiredPassingControlRounds,
+			),
+		)
+	}
+	if headroom.ConservativeSampleRatio < headroom.MinimumConservativeRatio {
+		appendScaleFailure(
+			result,
+			fmt.Sprintf(
+				"metric upstream headroom conservative min/max ratio %.3f (min_control=%.1f / max_scaled=%.1f) is below floor %.3f",
+				headroom.ConservativeSampleRatio,
+				headroom.MinimumControlSamplesPerSecond,
+				headroom.MaximumScaledSamplesPerSecond,
+				headroom.MinimumConservativeRatio,
+			),
+		)
+	}
+	if headroom.ConservativeLogRatio < headroom.MinimumConservativeRatio {
+		appendScaleFailure(
+			result,
+			fmt.Sprintf(
+				"log upstream headroom conservative min/max ratio %.3f (min_control=%.1f / max_scaled=%.1f) is below floor %.3f",
+				headroom.ConservativeLogRatio,
+				headroom.MinimumControlLogsPerSecond,
+				headroom.MaximumScaledLogsPerSecond,
+				headroom.MinimumConservativeRatio,
+			),
+		)
+	}
+	result.GatePassed = len(result.GateFailures) == 0
+}
+
+func formatScaleFailureDiagnostics(result scaleGateResult) string {
+	headroom := result.UpstreamHeadroom
+	lines := []string{
+		strings.Join(result.GateFailures, "; "),
+		fmt.Sprintf(
+			"upstream_headroom: median_ratio=samples:%.3f(%.1f/%.1f),logs:%.3f(%.1f/%.1f) (required>=%.3f); conservative_min_max_ratio=samples:%.3f(%.1f/%.1f),logs:%.3f(%.1f/%.1f) (floor>=%.3f); passing_control_rounds=%d/%d (required>=%d)",
+			headroom.SampleRatio,
+			headroom.MedianControlSamplesPerSecond,
+			headroom.MedianScaledSamplesPerSecond,
+			headroom.LogRatio,
+			headroom.MedianControlLogsPerSecond,
+			headroom.MedianScaledLogsPerSecond,
+			headroom.MinimumRequiredRatio,
+			headroom.ConservativeSampleRatio,
+			headroom.MinimumControlSamplesPerSecond,
+			headroom.MaximumScaledSamplesPerSecond,
+			headroom.ConservativeLogRatio,
+			headroom.MinimumControlLogsPerSecond,
+			headroom.MaximumScaledLogsPerSecond,
+			headroom.MinimumConservativeRatio,
+			headroom.PassingControlRounds,
+			len(result.UpstreamControlRounds),
+			headroom.RequiredPassingControlRounds,
+		),
+	}
+	if len(result.UpstreamControlRounds) == 0 {
+		lines = append(lines, "upstream_control_rounds: none")
+	} else {
+		entries := make([]string, 0, len(result.UpstreamControlRounds))
+		for index, phase := range result.UpstreamControlRounds {
+			sampleRatio, logRatio := 0.0, 0.0
+			if headroom.MedianScaledSamplesPerSecond > 0 {
+				sampleRatio = phase.SamplesPerSecond / headroom.MedianScaledSamplesPerSecond
+			}
+			if headroom.MedianScaledLogsPerSecond > 0 {
+				logRatio = phase.LogsPerSecond / headroom.MedianScaledLogsPerSecond
+			}
+			label := ""
+			if index < len(result.UpstreamControlLabels) {
+				label = strings.TrimSpace(result.UpstreamControlLabels[index])
+			}
+			if label != "" {
+				entries = append(entries, fmt.Sprintf(
+					"%d(%s: samples=%.1f/s, logs=%.1f/s, ratio=%.3fx/%.3fx)",
+					index+1,
+					label,
+					phase.SamplesPerSecond,
+					phase.LogsPerSecond,
+					sampleRatio,
+					logRatio,
+				))
+			} else {
+				entries = append(entries, fmt.Sprintf(
+					"%d(samples=%.1f/s, logs=%.1f/s, ratio=%.3fx/%.3fx)",
+					index+1,
+					phase.SamplesPerSecond,
+					phase.LogsPerSecond,
+					sampleRatio,
+					logRatio,
+				))
+			}
+		}
+		lines = append(lines, "upstream_control_rounds: "+strings.Join(entries, ", "))
+	}
+	if len(result.ScaledRounds) == 0 {
+		lines = append(lines, "scaled_rounds: none")
+	} else {
+		entries := make([]string, 0, len(result.ScaledRounds))
+		for index, phase := range result.ScaledRounds {
+			if index < len(result.ScaledRoundEfficiencies) {
+				efficiency := result.ScaledRoundEfficiencies[index]
+				entries = append(entries, fmt.Sprintf(
+					"%d(samples=%.1f/s, logs=%.1f/s, eff=%.3f/%.3f)",
+					index+1,
+					phase.SamplesPerSecond,
+					phase.LogsPerSecond,
+					efficiency.SampleReplicaEfficiency,
+					efficiency.LogReplicaEfficiency,
+				))
+			} else {
+				entries = append(entries, fmt.Sprintf(
+					"%d(samples=%.1f/s, logs=%.1f/s)",
+					index+1,
+					phase.SamplesPerSecond,
+					phase.LogsPerSecond,
+				))
+			}
+		}
+		lines = append(lines, "scaled_rounds: "+strings.Join(entries, ", "))
+	}
+	lines = append(lines, fmt.Sprintf(
+		"scaling_summary: single_ref=samples:%.1f/s(%s),logs:%.1f/s(%s); scaled_median=samples:%.1f/s,logs:%.1f/s; efficiency=%.3f/%.3f (min>=%.3f); paired_rounds=%d/%d (required>=%d)",
+		result.SingleCapacityReference.SamplesPerSecond,
+		result.SingleCapacityReference.SampleSource,
+		result.SingleCapacityReference.LogsPerSecond,
+		result.SingleCapacityReference.LogSource,
+		result.Scaled.SamplesPerSecond,
+		result.Scaled.LogsPerSecond,
+		result.SampleReplicaEfficiency,
+		result.LogReplicaEfficiency,
+		result.MinReplicaEfficiency,
+		result.PassingScaledRounds,
+		len(result.ScaledRoundEfficiencies),
+		result.RequiredPassingScaledRounds,
+	))
+	return strings.Join(lines, "\n")
 }
 
 func evaluateScaleRoundEfficiencies(
