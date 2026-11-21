@@ -1,4 +1,5 @@
 import type { LogRow } from "@/lib/api/logs";
+import { hashString } from "@/lib/hash";
 
 /** Pure model for the logs explorer views: settings, defaults, and field access. */
 
@@ -93,6 +94,26 @@ export function safeJsonStringify(value: unknown, pretty = false): string {
   } catch {
     return String(value);
   }
+}
+
+/**
+ * Builds position-independent, collision-resistant stable keys for log rows
+ * so prepending new rows on refresh never shifts expanded state or measured
+ * virtual heights onto neighboring rows, while duplicate payloads in the same
+ * response stay uniquely keyed via their occurrence counter.
+ */
+export function buildStableLogRowKeys(rows: ReadonlyArray<LogRow>): string[] {
+  const seen = new Map<string, number>();
+  return rows.map((row) => {
+    const serialized = safeJsonStringify(row.raw);
+    const payload = `${row.timeRaw}\0${row.stream}\0${serialized}`;
+    const h1 = hashString(payload).toString(36);
+    const h2 = hashString(`${serialized.length}\0${payload}`).toString(36);
+    const fingerprint = `${h1}-${h2}-${serialized.length}`;
+    const occurrence = seen.get(fingerprint) ?? 0;
+    seen.set(fingerprint, occurrence + 1);
+    return `${fingerprint}#${occurrence}`;
+  });
 }
 
 export function stringifyFieldValue(value: unknown): string {
