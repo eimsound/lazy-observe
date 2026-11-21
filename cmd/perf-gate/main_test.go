@@ -39,7 +39,7 @@ func TestRepositoryGateConfig(t *testing.T) {
 		cfg.HAScaling.MinTargetBalanceRatio != 0.7 ||
 		cfg.HAScaling.MinBaselineRatio != 0.8 ||
 		cfg.HAScaling.GOMAXPROCSPerReplica != 1 ||
-		cfg.HAScaling.BatchSize != 20 ||
+		cfg.HAScaling.BatchSize != 100 ||
 		cfg.HAScaling.ScaledConcurrencyPerReplica != 64 ||
 		cfg.HAScaling.MinUpstreamHeadroomRatio != 2 ||
 		cfg.HAScaling.SettleSeconds != 10 ||
@@ -145,10 +145,30 @@ func TestEvaluateCapacityScaling(t *testing.T) {
 	if !passing.GatePassed || passing.SampleReplicaEfficiency < 0.714 || passing.LogReplicaEfficiency < 0.714 {
 		t.Fatalf("passing result = %#v", passing)
 	}
-	scaled.RequestsPerTarget[1] = 0
-	failing := evaluateCapacityScaling([]string{"a", "b"}, nominal, highControl, reference, scaled, 4, 0.8)
-	if failing.GatePassed || len(failing.GateFailures) != 1 {
-		t.Fatalf("failing result = %#v", failing)
+
+	lowMedian := evaluateCapacityScaling([]string{"a", "b"}, nominal, highControl, reference, scaled, 4, 0.8)
+	if lowMedian.GatePassed || len(lowMedian.GateFailures) != 2 {
+		t.Fatalf("low median efficiency result = %#v", lowMedian)
+	}
+
+	missingTarget := scaled
+	missingTarget.RequestsPerTarget = []uint64{10, 0}
+	failingMissing := evaluateCapacityScaling(
+		[]string{"a", "b"},
+		nominal,
+		highControl,
+		reference,
+		missingTarget,
+		4,
+		0.7,
+	)
+	if failingMissing.GatePassed || len(failingMissing.GateFailures) != 1 {
+		t.Fatalf("missing target result = %#v", failingMissing)
+	}
+
+	failingBoth := evaluateCapacityScaling([]string{"a", "b"}, nominal, highControl, reference, missingTarget, 4, 0.8)
+	if failingBoth.GatePassed || len(failingBoth.GateFailures) != 3 {
+		t.Fatalf("missing target and low median result = %#v", failingBoth)
 	}
 }
 

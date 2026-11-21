@@ -98,6 +98,7 @@ DOCKER_NAMES="$PG_NAME $REDIS_NAME $S3_NAME $VMSTORAGE_1 $VMSTORAGE_2 $VMSTORAGE
 PIDS=""
 
 cleanup() {
+  exit_code=$?
   set +e
   for pid in $PIDS; do kill -TERM "$pid" 2>/dev/null; done
   sleep 1
@@ -107,6 +108,15 @@ cleanup() {
   done
   docker rm -f $DOCKER_NAMES >/dev/null 2>&1
   docker network rm "$NETWORK" >/dev/null 2>&1
+  if [ "$exit_code" -ne 0 ]; then
+    for log_name in perf-sink.log perf-a.log perf-b.log; do
+      log_file="$WORK/$log_name"
+      if [ -s "$log_file" ]; then
+        printf '=== %s (tail -n 200) ===\n' "$log_name" >&2
+        tail -n 200 "$log_file" >&2 || true
+      fi
+    done
+  fi
   rm -rf "$WORK"
   if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
     rm -rf "$LOCK_DIR"
@@ -433,6 +443,8 @@ blob:
     endpoint: "http://$S3_HOST:8333"
     access_key: "$S3_ACCESS_KEY"
     secret_key: "$S3_SECRET_KEY"
+scrape:
+  mode: disabled
 process:
   startup_timeout: 20s
   shutdown_timeout: 10s

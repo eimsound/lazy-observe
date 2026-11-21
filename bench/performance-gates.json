@@ -30,7 +30,7 @@
     "duration_seconds": 15,
     "scaled_concurrency_per_replica": 64,
     "gomaxprocs_per_replica": 1,
-    "batch_size": 20,
+    "batch_size": 100,
     "min_replica_efficiency": 0.68,
     "min_passing_round_ratio": 0.75,
     "min_target_balance_ratio": 0.7,
