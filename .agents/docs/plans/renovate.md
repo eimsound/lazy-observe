@@ -95,14 +95,14 @@ Renovate 的 mise manager 只改 `mise.toml`，所以工具版本只在 `mise.to
   **Docker Hub 不放进 `timestamp-optional`（统一走全局默认 `timestamp-required`，fail-closed）**：托管 Renovate 上 seaweedfs、postgres、debian（标签均超过 1000 个）正常情况下能拿到时间戳并等满 7 天。
   早先因本地 `--platform=local` 的 44.253.4 抓 Hub 标签请求 `page_size=1000`、Hub 每页只给 100 条且第 11 页起返回 403 导致整次回退成无时间戳（2026-11-20 的标签数：debian 3090、seaweedfs 4345、postgres 1469、Victoria 集群镜像约 1900），曾把三者留在 `timestamp-optional` 作兜底；
   但 2026-11-21 PR #283（`chrislusf/seaweedfs:4.54` 仅发布 5 天即被提前开 PR）实测表明，托管环境偶发抓不到 Hub 分页时间戳时，`timestamp-optional` 会直接绕过 7 天门禁提前开 PR。
-  将 `chrislusf/seaweedfs`、`postgres`、`debian` 移出豁免后，偶发抓取失败只会在 Dependency Dashboard #135 维持 `Pending Status Checks`，待下一轮正常抓取并满 7 天后自动开 PR。
+  将 `chrislusf/seaweedfs`、`postgres`、`debian` 移出豁免后，偶发抓取失败只会在后台维持 pending 状态（可在 Mend Web Portal `https://developer.mend.io/github/eimsound/lazy-observe` 查看），待下一轮正常抓取并满 7 天后自动开 PR。
   Victoria 集群镜像在 Docker Hub 有同 tag、同 index digest 的发布（逐个比对一致），所以如果想让 e2e 也受 7 天限制，可以改到 Docker Hub；这是单独的决定，本切片不做。
   `renovate/stability-days` 是 Mend 托管 App 自己加的 commit status，不影响 ruleset（required check 只有 `ci-ok`）。
 - postgres、valkey 是 e2e 夹具，规则里关掉 major，只升 minor/patch。
 
 ### 其它写法
 
-- Renovate 44 用 `managerFilePatterns`（旧名 `fileMatch`），值是 `/regex/` 字符串；`dependencyDashboard` 必须写成对象 `{"enabled": true}`，布尔写法 `--strict` 会报需要迁移。
+- Renovate 44 用 `managerFilePatterns`（旧名 `fileMatch`），值是 `/regex/` 字符串；`dependencyDashboard` 必须写成对象（默认 `{"enabled": false}` 以避免未满 7 天最小发布年龄或未到周一排期的依赖长期挂在 GitHub Issues 列表造成噪音，pending/告警状态改在 Mend Web Portal `https://developer.mend.io/github/eimsound/lazy-observe` 查看；如需启用改回 `{"enabled": true}` 即可），布尔写法 `--strict` 会报需要迁移。
 - 提交信息 `chore: update dependency x to v1.2.3`：`semanticCommits: enabled`、`semanticCommitType: chore`、`semanticCommitScope: null`，并去掉 `:semanticPrefixFixDepsChoreOthers`。
 - 排期 `timezone: Asia/Shanghai`、`schedule: ["after 3am on monday"]`；Mend 免费托管每 4 小时跑一轮。`prConcurrentLimit: 10`，`prHourlyLimit: 0`。
 - `enabledManagers` 显式列出（github-actions、gomod、npm、pep621、dockerfile、mise、custom.regex），避免托管 App 的默认集合打开 `helm-values` 等不需要的 manager。
@@ -114,11 +114,11 @@ Renovate 的 mise manager 只改 `mise.toml`，所以工具版本只在 `mise.to
 1. **ruleset**：进 `main` 必须 PR 且 `ci-ok` 绿。`ci.yml` 的 `pull_request` 触发不得加 `paths` 过滤（现在是裸 `pull_request:`，增量靠 `ci-changes.sh` 的 job 级 `if`），否则 Renovate 的 PR 缺 `ci-ok` 永远合不进。
 2. **Renovate 的 PR 是同仓库分支**，`pull_request` workflow 对它有仓库 secrets 访问权。现在 `ci.yml`/`bench.yml` 没有 `secrets.` 引用且 `permissions: contents: read`；以后给 `ci.yml` 加 secret 时要想到「依赖升级 PR 的安装脚本会在带 secret 的环境里跑」。
 3. **PR 年龄闸只管 Renovate 自己开的 PR**：人手改的固定点不再有年龄检查，也没有 `gh release verify`。
-4. **「是否落后上游」不再有脚本判断**（ADR 0016）：发版前看 Dependency Dashboard，没有待合并的固定点升级。
+4. **「是否落后上游」不再有脚本判断**（ADR 0016）：发版前在 Mend Web Portal（`https://developer.mend.io/github/eimsound/lazy-observe`）查看 pending/运行状态并确认仓库没有待合并的固定点升级（如临时启用了 Dependency Dashboard 也可在 Issue 中查看）。
 5. **go.sum 与 entc.sum**（结论来自 `.agents/docs/research/ent-renovate.md`）：`internal/db/ent` 入库后，根模块的 `go get -t ./...` 加 `go mod tidy` 可以全自动完成（pgx、miniredis 升级实测过），gomod 照常周更、不设 Dashboard 批准。`entc.mod` 不行：Renovate 的 `go get` 只改根 `go.mod`/`go.sum`，去掉 `tools/entgen` 的 build ignore 也无法让 `entc.sum` 自动更新，所以 ent 的升级 PR（`renovate/ent`）很可能带 artifact 失败（缺 sum），需要 agent 按下面审查清单里的命令补 sum。`sdk/go` 没有生成物依赖，`gomodTidy` 正常。
    「全自动」只指 `go.mod`/`go.sum`：改了进二进制的模块版本时，`license-check` 会因 `third_party/go/THIRD_PARTY_NOTICES.txt`（带模块版本）过期变红，合并前要补一次生成（见审查清单）。
 6. **AGPL**：不要在仓库 CI 里运行 `renovate` 或 `renovate-config-validator`；配置校验靠 Mend App 对 `renovate/reconfigure` 分支的检查和本地一次性运行。
-7. 改 `renovate.json` 后要等下一轮（最长 4 小时）或在 Dashboard 勾「trigger a request for Renovate to run again」。
+7. 改 `renovate.json` 后要等下一轮（最长 4 小时），运行状态与错误日志在 Mend Web Portal（`https://developer.mend.io/github/eimsound/lazy-observe`）查看（如需在 GitHub Issue 手动触发重跑，可临时改回 `dependencyDashboard: {"enabled": true}`）。
 
 ## 负责人操作
 
@@ -127,8 +127,8 @@ Renovate 的 mise manager 只改 `mise.toml`，所以工具版本只在 `mise.to
 3. **授权时确认 App 拥有 Dependabot alerts: Read**（App 的「Configure」→「Permissions」里应能看到 `read` 访问）。没有这项权限时 `vulnerabilityAlerts` 不工作且不报错。Mend 更新权限时 GitHub 会给仓库管理员发「接受新权限」的提示，需要点接受。
 4. 仓库设置复核：Dependency graph 开、Dependabot alerts 开、**Dependabot security updates 关**（避免与 Renovate 的 `[SECURITY]` PR 重复）、Grouped security updates 关。
 5. Ruleset 保持「进 `main` 必须 PR + `ci-ok` 绿」，不给 Renovate 加 bypass；若开了「Require signed commits」，在首个 Renovate PR 上确认提交显示 Verified。
-6. 安装后检查：Dependency Dashboard issue 出现；列出 Pending / Awaiting Schedule；Onboarding PR 不出现。
-7. 紧急放行安全修复（发布不满 7 天时 Renovate 不会开 PR，pnpm 也会拒装）：npm 工程在对应 `pnpm-workspace.yaml` 加 `minimumReleaseAgeExclude`；Renovate 侧在 Dashboard 勾选该条目，或临时在 `renovate.json` 给该包加 `minimumReleaseAge: null` 的 `packageRules`；
+6. 安装后检查：Onboarding PR 不出现；`dependencyDashboard` 默认关闭（`{"enabled": false}`）以减少 GitHub Issues 噪音，改为在 Mend Web Portal（`https://developer.mend.io/github/eimsound/lazy-observe`）查看 Pending / Awaiting Schedule 与运行日志（如需在 Issue 查看，改回 `{"enabled": true}` 即可）。
+7. 紧急放行安全修复（发布不满 7 天时 Renovate 不会开 PR，pnpm 也会拒装）：npm 工程在对应 `pnpm-workspace.yaml` 加 `minimumReleaseAgeExclude`；Renovate 侧临时在 `renovate.json` 给该包加 `minimumReleaseAge: null` 的 `packageRules`（或临时改回 `dependencyDashboard: {"enabled": true}` 后在 Dashboard 勾选该条目）；
    Python 把 `[tool.uv] exclude-newer` 临时改成具体时间戳；固定点直接人工改版本与 sha（Victoria、mise：版本、sha、`# <tag>` 一起改；Trivy：`trivy_version` 与两个 sha，没有 `# <tag>`）。放行记录写在 PR 描述里。
 8. 是否向 Mend 申请 OSS 白名单（Discussions → Mend Hosted Request）：本方案不依赖它。
 
@@ -193,7 +193,7 @@ mise run ent-generate-check
 
 ## 没验证的
 
-托管 Renovate 44.249.1 已在跑，Dashboard 是 issue #135；`platform=local` 验证不了的部分按下表跟踪：
+托管 Renovate 44.249.1 已在跑（原 Dependency Dashboard 为 issue #135，现已默认关闭以减少 Issues 噪音，pending/告警状态改在 Mend Web Portal `https://developer.mend.io/github/eimsound/lazy-observe` 查看）；`platform=local` 验证不了的部分按下表跟踪：
 
 | 项 | 状态 |
 | --- | --- |
