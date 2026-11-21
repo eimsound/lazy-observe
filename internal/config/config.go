@@ -41,10 +41,20 @@ func (d *Duration) Set(value string) error {
 }
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error { return d.Set(node.Value) }
 
+const (
+	TopologyAllInOne   = "all-in-one"
+	TopologyStandalone = "standalone"
+	TopologyHA         = "ha"
+
+	ScrapeModeAuto     = "auto"
+	ScrapeModeDisabled = "disabled"
+)
+
 type Config struct {
 	Listen         string         `yaml:"listen"`
 	DataDir        string         `yaml:"data_dir"`
 	ServeWebUI     bool           `yaml:"serve_web_ui"`
+	Topology       string         `yaml:"topology"`
 	Standalone     bool           `yaml:"standalone"`
 	StorageBinDir  string         `yaml:"storage_bin_dir"`
 	Storage        Storage        `yaml:"storage"`
@@ -54,6 +64,7 @@ type Config struct {
 	Replay         Replay         `yaml:"replay"`
 	Blob           Blob           `yaml:"blob"`
 	Alert          Alert          `yaml:"alert"`
+	Scrape         Scrape         `yaml:"scrape"`
 	AI             AI             `yaml:"ai"`
 	ErrorInbox     ErrorInbox     `yaml:"error_inbox"`
 	Process        Process        `yaml:"process"`
@@ -180,6 +191,14 @@ type Alert struct {
 	RepeatInterval Duration `yaml:"repeat_interval"`
 }
 
+// Scrape controls embedded vmagent target scraping behavior.
+type Scrape struct {
+	// Mode is "auto" (run embedded vmagent, using PostgreSQL advisory-lock
+	// leader election in clustered/HA deployments) or "disabled" (never extract
+	// or run vmagent; external scrapers own target collection).
+	Mode string `yaml:"mode"`
+}
+
 // AI groups static LLM observability configuration. BYO AI provider credentials
 // remain managed exclusively through the admin UI.
 type AI struct {
@@ -224,6 +243,7 @@ func Defaults() Config {
 			GroupWait:      Duration(30 * time.Second),
 			RepeatInterval: Duration(4 * time.Hour),
 		},
+		Scrape: Scrape{Mode: ScrapeModeAuto},
 		ErrorInbox: ErrorInbox{
 			MaxItems: 100_000, MaxBytes: 1 << 30, ReadinessItems: 80_000, ReadinessBytes: 800 << 20,
 		},
@@ -314,6 +334,12 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "root data directory")
 	fs.BoolVar(&cfg.ServeWebUI, "serve-web-ui", cfg.ServeWebUI, "serve the embedded web UI from the gateway")
 	fs.StringVar(
+		&cfg.Topology,
+		"topology",
+		cfg.Topology,
+		"explicit deployment topology: all-in-one, standalone, or ha (empty derives from standalone/shared backends)",
+	)
+	fs.StringVar(
 		&cfg.Meta.DBURL,
 		"meta-db-url",
 		cfg.Meta.DBURL,
@@ -341,6 +367,12 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 	fs.Var(&cfg.Retention.Replay, "retention-replay", "replay retention period")
 	fs.Var(&cfg.Replay.CleanupInterval, "replay-cleanup-interval", "replay cleanup interval")
 	fs.IntVar(&cfg.Alert.StormThreshold, "alert-storm-threshold", cfg.Alert.StormThreshold, "alert storm threshold")
+	fs.StringVar(
+		&cfg.Scrape.Mode,
+		"scrape-mode",
+		cfg.Scrape.Mode,
+		"embedded vmagent scrape mode: auto or disabled",
+	)
 	fs.StringVar(
 		&cfg.AI.PricingFile,
 		"ai-pricing-file",
@@ -527,11 +559,13 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 	stringsMap := map[string]*string{
 		"LO_LISTEN":           &c.Listen,
 		"LO_DATA_DIR":         &c.DataDir,
+		"LO_TOPOLOGY":         &c.Topology,
 		"LO_STORAGE_BIN_DIR":  &c.StorageBinDir,
 		"LO_META_DB_URL":      &c.Meta.DBURL,
 		"LO_REDIS_ADDR":       &c.Redis.Addr,
 		"LO_REDIS_PASSWORD":   &c.Redis.Password,
 		"LO_REDIS_KEY_PREFIX": &c.Redis.KeyPrefix,
+		"LO_SCRAPE_MODE":      &c.Scrape.Mode,
 		"LO_AI_PRICING_FILE":  &c.AI.PricingFile,
 		// Paths, not the secrets: the key material itself never travels via env.
 		"LO_SECURITY_SECRET_KEY_FILE":     &c.Security.SecretKeyFile,
@@ -707,14 +741,110 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 	return nil
 }
 
+// CheckResult represents one named topology/HA configuration validation check.
+type CheckResult struct {
+	Name string
+	Err  error
+}
+
+// IsPostgresURL reports whether dbURL uses a PostgreSQL scheme.
+func IsPostgresURL(dbURL string) bool {
+	return strings.HasPrefix(dbURL, "postgres://") || strings.HasPrefix(dbURL, "postgresql://")
+}
+
+// EffectiveTopology returns the resolved deployment topology. When Topology is
+// omitted, it derives "all-in-one", "standalone", or "ha" for backward
+// compatibility.
+func (c Config) EffectiveTopology() string {
+	switch c.Topology {
+	case TopologyAllInOne, TopologyStandalone, TopologyHA:
+		return c.Topology
+	}
+	if !c.Standalone {
+		return TopologyAllInOne
+	}
+	if IsPostgresURL(c.Meta.DBURL) && c.Redis.Enabled && c.Blob.Backend == "s3" {
+		return TopologyHA
+	}
+	return TopologyStandalone
+}
+
+// IsStandalone reports whether signal storage is external rather than managed
+// as embedded VictoriaMetrics/VictoriaLogs/VictoriaTraces child processes.
+func (c Config) IsStandalone() bool {
+	return c.Standalone || c.Topology == TopologyStandalone || c.Topology == TopologyHA
+}
+
+// HAConfigChecks evaluates static configuration prerequisites required by
+// multi-replica HA deployments. Both Config.Validate (when topology=ha) and
+// `lazy-observe doctor --ha` reuse this kernel so startup and preflight checks
+// stay aligned.
+func (c Config) HAConfigChecks() []CheckResult {
+	results := make([]CheckResult, 0, 6)
+	add := func(name string, err error) {
+		results = append(results, CheckResult{Name: name, Err: err})
+	}
+	if !c.IsStandalone() {
+		add("standalone", errors.New("standalone must be true (or topology must be ha) for HA replicas"))
+	} else {
+		add("standalone", nil)
+	}
+	if !c.Redis.Enabled {
+		add("redis", errors.New("redis.enabled must be true for shared sessions and rate limits"))
+	} else {
+		add("redis", nil)
+	}
+	if !IsPostgresURL(c.Meta.DBURL) {
+		add("metadata-postgres", errors.New("meta.db_url must be a PostgreSQL URL"))
+	} else {
+		add("metadata-postgres", nil)
+	}
+	if strings.TrimSpace(c.Security.SecretKeyFile) == "" {
+		add("secret-key", errors.New("security.secret_key_file must be configured and shared across HA replicas"))
+	} else {
+		add("secret-key", nil)
+	}
+	if c.Blob.Backend != "s3" {
+		add("blob-s3", errors.New("blob.backend must be s3 for replay and profile blobs"))
+	} else if strings.TrimSpace(c.Blob.S3.Bucket) == "" {
+		add("blob-s3", errors.New("blob.s3.bucket is required when blob.backend is s3"))
+	} else {
+		add("blob-s3", nil)
+	}
+	if strings.TrimSpace(c.Storage.Metrics.IngestURL) == "" {
+		add("storage-metrics-ingest", errors.New("storage.metrics.ingest_url is not configured"))
+	} else {
+		add("storage-metrics-ingest", nil)
+	}
+	return results
+}
+
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Listen) == "" || strings.TrimSpace(c.DataDir) == "" {
 		return errors.New("listen and data-dir are required")
 	}
+	switch c.Topology {
+	case "", TopologyAllInOne, TopologyStandalone, TopologyHA:
+	default:
+		return fmt.Errorf(
+			"topology must be %q, %q, or %q, got %q",
+			TopologyAllInOne,
+			TopologyStandalone,
+			TopologyHA,
+			c.Topology,
+		)
+	}
+	if c.Topology == TopologyAllInOne && c.Standalone {
+		return errors.New("topology all-in-one conflicts with standalone=true")
+	}
+	if c.Scrape.Mode != ScrapeModeAuto && c.Scrape.Mode != ScrapeModeDisabled {
+		return fmt.Errorf("scrape.mode must be %q or %q, got %q", ScrapeModeAuto, ScrapeModeDisabled, c.Scrape.Mode)
+	}
 	if c.Storage.Metrics.Kind != "vm" && c.Storage.Metrics.Kind != "prometheus" {
 		return fmt.Errorf("metrics kind must be vm or prometheus, got %q", c.Storage.Metrics.Kind)
 	}
-	if c.Storage.Metrics.Cluster && (!c.Standalone || c.Storage.Metrics.Kind != "vm") {
+	standalone := c.IsStandalone()
+	if c.Storage.Metrics.Cluster && (!standalone || c.Storage.Metrics.Kind != "vm") {
 		return errors.New("metrics.cluster requires standalone mode with metrics.kind vm")
 	}
 	if c.Storage.Metrics.Cluster {
@@ -725,7 +855,7 @@ func (c Config) Validate() error {
 			return errors.New("metrics.ingest_url is required in cluster mode")
 		}
 	}
-	if c.Standalone {
+	if standalone {
 		logsQuery := c.Storage.Logs.EffectiveQueryURL()
 		logsIngest := c.Storage.Logs.EffectiveIngestURL()
 		tracesQuery := c.Storage.Traces.EffectiveQueryURL()
@@ -746,6 +876,8 @@ func (c Config) Validate() error {
 		name string
 		raw  string
 	}{
+		{"storage.metrics.query_url", c.Storage.Metrics.QueryURL},
+		{"storage.metrics.ingest_url", c.Storage.Metrics.IngestURL},
 		{"storage.logs.url", c.Storage.Logs.URL},
 		{"storage.logs.query_url", c.Storage.Logs.QueryURL},
 		{"storage.logs.ingest_url", c.Storage.Logs.IngestURL},
@@ -788,9 +920,7 @@ func (c Config) Validate() error {
 	if c.Blob.Backend != "local" && c.Blob.Backend != "s3" {
 		return fmt.Errorf("unsupported blob store %q", c.Blob.Backend)
 	}
-	if c.Meta.DBURL != "" && !strings.HasPrefix(c.Meta.DBURL, "sqlite://") &&
-		!strings.HasPrefix(c.Meta.DBURL, "postgres://") &&
-		!strings.HasPrefix(c.Meta.DBURL, "postgresql://") {
+	if c.Meta.DBURL != "" && !strings.HasPrefix(c.Meta.DBURL, "sqlite://") && !IsPostgresURL(c.Meta.DBURL) {
 		return fmt.Errorf("meta.db_url must use sqlite://, postgres://, or postgresql://")
 	}
 	if c.Redis.Enabled && (strings.TrimSpace(c.Redis.Addr) == "" || strings.TrimSpace(c.Redis.KeyPrefix) == "") {
@@ -811,6 +941,17 @@ func (c Config) Validate() error {
 			if _, addrErr := netip.ParseAddr(entry); addrErr != nil {
 				return fmt.Errorf("security.trusted_proxies entry %q must be a valid IP or CIDR", raw)
 			}
+		}
+	}
+	if c.Topology == TopologyHA {
+		var haErrs []error
+		for _, check := range c.HAConfigChecks() {
+			if check.Err != nil {
+				haErrs = append(haErrs, fmt.Errorf("%s: %w", check.Name, check.Err))
+			}
+		}
+		if len(haErrs) > 0 {
+			return fmt.Errorf("ha topology validation failed: %w", errors.Join(haErrs...))
 		}
 	}
 	return nil

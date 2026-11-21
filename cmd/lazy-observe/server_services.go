@@ -76,6 +76,11 @@ type serverServices struct {
 	alerts                  *alert.Service
 	scrapes                 *scrape.Service
 	scrapeUnavailableReason string
+	bgCancel                context.CancelFunc
+	bgWG                    sync.WaitGroup
+	shutdownTimeout         time.Duration
+	logger                  *slog.Logger
+	closeOnce               sync.Once
 }
 
 func startServerServices(
@@ -88,7 +93,16 @@ func startServerServices(
 	loopback *internalLoopback,
 	limits sharedstate.Limiter,
 ) *serverServices {
-	alerts := alert.NewService(
+	if logger == nil {
+		logger = slog.Default()
+	}
+	bgCtx, bgCancel := context.WithCancel(ctx)
+	services := &serverServices{
+		bgCancel:        bgCancel,
+		shutdownTimeout: cfg.Process.ShutdownTimeout.Value(),
+		logger:          logger,
+	}
+	services.alerts = alert.NewService(
 		alert.Config{
 			Store:          metadata.store,
 			OutboundPolicy: essentials.outboundPolicy,
@@ -99,13 +113,32 @@ func startServerServices(
 			SharedLimiter:  sharedAlertLimiter(cfg, limits),
 		},
 	)
-	scrapes, unavailableReason := startScrapeService(ctx, cfg, logger, essentials, metadata.store, signals, loopback)
-	startRetentionJanitor(ctx, cfg, logger, metadata)
-	return &serverServices{
-		alerts:                  alerts,
-		scrapes:                 scrapes,
-		scrapeUnavailableReason: unavailableReason,
+	scrapes, unavailableReason := startScrapeService(
+		bgCtx,
+		&services.bgWG,
+		cfg,
+		logger,
+		essentials,
+		metadata.store,
+		signals,
+		loopback,
+	)
+	services.scrapes = scrapes
+	services.scrapeUnavailableReason = unavailableReason
+	retentionJanitor := buildRetentionJanitor(cfg, logger, metadata)
+	services.startBackground(bgCtx, retentionJanitor.Run)
+	return services
+}
+
+func (services *serverServices) startBackground(ctx context.Context, fn func(context.Context)) {
+	if fn == nil {
+		return
 	}
+	services.bgWG.Add(1)
+	go func() {
+		defer services.bgWG.Done()
+		fn(ctx)
+	}()
 }
 
 func sharedAlertLimiter(cfg appconfig.Config, limits sharedstate.Limiter) sharedstate.Limiter {
@@ -117,6 +150,7 @@ func sharedAlertLimiter(cfg appconfig.Config, limits sharedstate.Limiter) shared
 
 func startScrapeService(
 	ctx context.Context,
+	wg *sync.WaitGroup,
 	cfg appconfig.Config,
 	logger *slog.Logger,
 	essentials serverEssentials,
@@ -124,6 +158,11 @@ func startScrapeService(
 	signals *serverSignalStorage,
 	loopback *internalLoopback,
 ) (*scrape.Service, string) {
+	if cfg.Scrape.Mode == appconfig.ScrapeModeDisabled {
+		const unavailableReason = "scrape management is disabled: scrape.mode is disabled"
+		logger.Info("embedded vmagent and scrape management disabled by configuration")
+		return nil, unavailableReason
+	}
 	if signals.ingestURL != "" {
 		platformPorts, blockedHostPorts := collectPlatformEndpoints(cfg, loopback, signals)
 		service := scrape.NewService(
@@ -137,7 +176,11 @@ func startScrapeService(
 				Logger:           logger,
 			},
 		)
-		go service.RunReconciler(ctx, logger, scrape.DefaultLeaderSyncInterval)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			service.RunReconciler(ctx, logger, scrape.DefaultLeaderSyncInterval)
+		}()
 		return service, ""
 	}
 	const unavailableReason = "scrape management is disabled: storage.metrics.ingest_url is not configured"
@@ -149,12 +192,11 @@ func startScrapeService(
 	return nil, unavailableReason
 }
 
-func startRetentionJanitor(
-	ctx context.Context,
+func buildRetentionJanitor(
 	cfg appconfig.Config,
 	logger *slog.Logger,
 	metadata *serverMetadata,
-) {
+) *janitor.Janitor {
 	retentionJanitor := janitor.New(logger, janitor.DefaultInterval)
 	retentionJanitor.SetCoordinator(metadata.store)
 	retentionJanitor.RegisterWithInterval(
@@ -215,9 +257,34 @@ func startRetentionJanitor(
 		cfg.Security.AuditRetention.Value(),
 		janitor.AuditEvents{Metadata: metadata.store},
 	)
-	go retentionJanitor.Run(ctx)
+	return retentionJanitor
 }
 
 func (services *serverServices) Close() {
-	services.alerts.Close()
+	services.closeOnce.Do(func() {
+		if services.bgCancel != nil {
+			services.bgCancel()
+		}
+		done := make(chan struct{})
+		go func() {
+			services.bgWG.Wait()
+			close(done)
+		}()
+		timeout := services.shutdownTimeout
+		if timeout <= 0 {
+			timeout = 15 * time.Second
+		}
+		timer := time.NewTimer(timeout)
+		select {
+		case <-done:
+			timer.Stop()
+		case <-timer.C:
+			if services.logger != nil {
+				services.logger.Warn("background services shutdown timed out", "timeout", timeout)
+			}
+		}
+		if services.alerts != nil {
+			services.alerts.Close()
+		}
+	})
 }

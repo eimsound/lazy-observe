@@ -3,6 +3,7 @@ package janitor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -137,7 +138,7 @@ func (j *Janitor) run(ctx context.Context, forceAll bool) []Result {
 		if j.taskTimeout > 0 {
 			taskCtx, cancel = context.WithTimeout(ctx, j.taskTimeout)
 		}
-		deleted, err := registered.task.Clean(taskCtx, now.Add(-registered.retention))
+		deleted, err := runTaskSafely(taskCtx, registered.task, now.Add(-registered.retention))
 		if cancel != nil {
 			cancel()
 		}
@@ -169,6 +170,15 @@ func (j *Janitor) run(ctx context.Context, forceAll bool) []Result {
 		)
 	}
 	return results
+}
+
+func runTaskSafely(ctx context.Context, task Task, cutoff time.Time) (deleted int, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("janitor task panic: %v", recovered)
+		}
+	}()
+	return task.Clean(ctx, cutoff)
 }
 
 func (j *Janitor) tickInterval() time.Duration {

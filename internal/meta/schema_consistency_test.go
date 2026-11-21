@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -13,6 +14,63 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/db/ent/profilemeta"
 )
+
+var (
+	sqlCreateTableRe = regexp.MustCompile(`(?i)^\s*CREATE\s+TABLE\s+([a-z0-9_]+)\s*\(`)
+	sqlCreateIndexRe = regexp.MustCompile(
+		`(?i)^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+([a-z0-9_]+)\s+ON\s+([a-z0-9_]+)\s*\(([^)]+)\)`,
+	)
+)
+
+func TestBaselineSQLDeclarationsMatchAcrossDialects(t *testing.T) {
+	extract := func(path string) (tables []string, indexes []string) {
+		raw, err := migrationFiles.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		// Collapse multiline CREATE INDEX definitions into one logical statement.
+		for _, stmt := range strings.Split(string(raw), ";") {
+			normalized := strings.Join(strings.Fields(strings.TrimSpace(stmt)), " ")
+			if normalized == "" {
+				continue
+			}
+			if m := sqlCreateTableRe.FindStringSubmatch(normalized); m != nil {
+				tables = append(tables, strings.ToLower(m[1]))
+				continue
+			}
+			if m := sqlCreateIndexRe.FindStringSubmatch(normalized); m != nil {
+				unique := strings.TrimSpace(m[1]) != ""
+				cols := strings.ReplaceAll(strings.ToLower(m[4]), `"`, "")
+				cols = strings.Join(strings.Fields(cols), " ")
+				indexes = append(
+					indexes,
+					fmt.Sprintf("%s.%s:unique=%t(%s)", strings.ToLower(m[3]), strings.ToLower(m[2]), unique, cols),
+				)
+			}
+		}
+		sort.Strings(tables)
+		sort.Strings(indexes)
+		return tables, indexes
+	}
+
+	sqliteTables, sqliteIndexes := extract("migrations/001_baseline.sql")
+	pgTables, pgIndexes := extract("migrations/postgres/001_baseline.sql")
+	if !reflect.DeepEqual(sqliteTables, pgTables) {
+		t.Fatalf("baseline tables differ:\nsqlite: %v\npostgres: %v", sqliteTables, pgTables)
+	}
+	if !reflect.DeepEqual(sqliteIndexes, pgIndexes) {
+		t.Fatalf("baseline explicit indexes differ:\nsqlite: %v\npostgres: %v", sqliteIndexes, pgIndexes)
+	}
+	tableSet := make(map[string]bool, len(sqliteTables))
+	for _, tbl := range sqliteTables {
+		tableSet[tbl] = true
+	}
+	for _, required := range []string{"replay_segments", "deleted_project_slugs", "notification_outbox"} {
+		if !tableSet[required] {
+			t.Fatalf("baseline missing required table %q", required)
+		}
+	}
+}
 
 func TestSingleBaselineSetsMatch(t *testing.T) {
 	versions := func(directory string) []string {
@@ -132,7 +190,17 @@ func TestMigratedSchemaEquivalent(t *testing.T) {
 	want := schemaColumns(t, sqlite)
 	got := schemaColumns(t, postgres)
 	if !reflect.DeepEqual(want, got) {
-		t.Fatalf("migrated table/column/nullability shape differs:\nsqlite: %v\npostgres: %v", want, got)
+		t.Fatalf("migrated table/column/type/nullability/default shape differs:\nsqlite: %v\npostgres: %v", want, got)
+	}
+	wantPKs := schemaPrimaryKeys(t, sqlite)
+	gotPKs := schemaPrimaryKeys(t, postgres)
+	if !reflect.DeepEqual(wantPKs, gotPKs) {
+		t.Fatalf("migrated primary keys differ:\nsqlite: %v\npostgres: %v", wantPKs, gotPKs)
+	}
+	wantUniques := schemaUniqueConstraints(t, sqlite)
+	gotUniques := schemaUniqueConstraints(t, postgres)
+	if !reflect.DeepEqual(wantUniques, gotUniques) {
+		t.Fatalf("migrated unique constraints differ:\nsqlite: %v\npostgres: %v", wantUniques, gotUniques)
 	}
 	wantIndexes := schemaIndexes(t, sqlite)
 	gotIndexes := schemaIndexes(t, postgres)
@@ -146,6 +214,195 @@ func TestMigratedSchemaEquivalent(t *testing.T) {
 	}
 	assertSchemaCRUD(t, sqlite)
 	assertSchemaCRUD(t, postgres)
+}
+
+func schemaPrimaryKeys(t *testing.T, store *Store) []string {
+	t.Helper()
+	ctx := context.Background()
+	var result []string
+	if store.dialect == "postgres" {
+		rows, err := store.db.QueryContext(ctx, `
+			SELECT t.relname,
+				array_to_string(array(
+					SELECT a.attname
+					FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+					JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+					ORDER BY k.ord
+				), ',')
+			FROM pg_index ix
+			JOIN pg_class t ON t.oid = ix.indrelid
+			JOIN pg_namespace n ON n.oid = t.relnamespace
+			WHERE n.nspname = 'public'
+			  AND t.relname <> 'schema_version'
+			  AND ix.indisprimary
+			ORDER BY t.relname`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var table, cols string
+			if err := rows.Scan(&table, &cols); err != nil {
+				t.Fatal(err)
+			}
+			result = append(result, fmt.Sprintf("%s:(%s)", table, cols))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		sort.Strings(result)
+		return result
+	}
+	tables, err := store.db.QueryContext(
+		ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	_ = tables.Close()
+	for _, table := range names {
+		rows, err := store.db.QueryContext(ctx, `PRAGMA table_info("`+table+`")`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type pkCol struct {
+			pos  int
+			name string
+		}
+		var pkCols []pkCol
+		for rows.Next() {
+			var cid, notNull, pk int
+			var name, typ string
+			var defaultValue any
+			if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+				t.Fatal(err)
+			}
+			if pk > 0 {
+				pkCols = append(pkCols, pkCol{pos: pk, name: name})
+			}
+		}
+		_ = rows.Close()
+		if len(pkCols) > 0 {
+			sort.Slice(pkCols, func(i, j int) bool { return pkCols[i].pos < pkCols[j].pos })
+			cols := make([]string, len(pkCols))
+			for i, c := range pkCols {
+				cols[i] = c.name
+			}
+			result = append(result, fmt.Sprintf("%s:(%s)", table, strings.Join(cols, ",")))
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func schemaUniqueConstraints(t *testing.T, store *Store) []string {
+	t.Helper()
+	ctx := context.Background()
+	var result []string
+	if store.dialect == "postgres" {
+		rows, err := store.db.QueryContext(ctx, `
+			SELECT t.relname,
+				array_to_string(array(
+					SELECT a.attname || CASE WHEN (ix.indoption[k.ord - 1] & 1) = 1 THEN ' DESC' ELSE '' END
+					FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+					JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+					ORDER BY k.ord
+				), ',')
+			FROM pg_index ix
+			JOIN pg_class t ON t.oid = ix.indrelid
+			JOIN pg_namespace n ON n.oid = t.relnamespace
+			WHERE n.nspname = 'public'
+			  AND t.relname <> 'schema_version'
+			  AND ix.indisunique
+			  AND NOT ix.indisprimary
+			ORDER BY t.relname`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var table, cols string
+			if err := rows.Scan(&table, &cols); err != nil {
+				t.Fatal(err)
+			}
+			result = append(result, fmt.Sprintf("%s:(%s)", table, cols))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		sort.Strings(result)
+		return result
+	}
+	tables, err := store.db.QueryContext(
+		ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	_ = tables.Close()
+	for _, table := range names {
+		idxRows, err := store.db.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var uniqueIdxNames []string
+		for idxRows.Next() {
+			var seq, unique, partial int
+			var name, origin string
+			if err := idxRows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+				t.Fatal(err)
+			}
+			if unique == 1 && (origin == "c" || origin == "u") {
+				uniqueIdxNames = append(uniqueIdxNames, name)
+			}
+		}
+		_ = idxRows.Close()
+		for _, idxName := range uniqueIdxNames {
+			infoRows, err := store.db.QueryContext(ctx, `PRAGMA index_xinfo("`+idxName+`")`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cols []string
+			for infoRows.Next() {
+				var seqno, cid, desc, key int
+				var colName sql.NullString
+				var coll string
+				if err := infoRows.Scan(&seqno, &cid, &colName, &desc, &coll, &key); err != nil {
+					t.Fatal(err)
+				}
+				if key == 0 || !colName.Valid {
+					continue
+				}
+				if desc == 1 {
+					cols = append(cols, colName.String+" DESC")
+				} else {
+					cols = append(cols, colName.String)
+				}
+			}
+			_ = infoRows.Close()
+			result = append(result, fmt.Sprintf("%s:(%s)", table, strings.Join(cols, ",")))
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func schemaIndexes(t *testing.T, store *Store) []string {
@@ -343,13 +600,73 @@ func schemaForeignKeys(t *testing.T, store *Store) []string {
 	return result
 }
 
+func canonicalColumnType(dialectName, raw string) string {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	if dialectName == "postgres" {
+		switch normalized {
+		case "integer", "bigint", "smallint":
+			return "int"
+		case "text", "character varying":
+			return "text"
+		case "boolean":
+			return "bool"
+		case "timestamp with time zone", "timestamp without time zone":
+			return "timestamp"
+		case "jsonb", "json":
+			return "json"
+		case "bytea":
+			return "bytes"
+		case "double precision", "real":
+			return "float"
+		default:
+			return normalized
+		}
+	}
+	switch normalized {
+	case "integer", "int", "bigint":
+		return "int"
+	case "text":
+		return "text"
+	case "boolean", "bool":
+		return "bool"
+	case "timestamp", "datetime":
+		return "timestamp"
+	case "json":
+		return "json"
+	case "blob":
+		return "bytes"
+	case "real", "double":
+		return "float"
+	default:
+		return normalized
+	}
+}
+
+func normalizeColumnDefault(raw sql.NullString) string {
+	if !raw.Valid {
+		return ""
+	}
+	val := strings.TrimSpace(raw.String)
+	if idx := strings.Index(val, "::"); idx != -1 {
+		val = strings.TrimSpace(val[:idx])
+	}
+	switch strings.ToLower(val) {
+	case "true":
+		return "true"
+	case "false":
+		return "false"
+	default:
+		return val
+	}
+}
+
 func schemaColumns(t *testing.T, store *Store) []string {
 	t.Helper()
 	ctx := context.Background()
 	var result []string
 	if store.dialect == "postgres" {
 		rows, err := store.db.QueryContext(ctx, `
-			SELECT table_name, column_name, is_nullable
+			SELECT table_name, column_name, data_type, is_nullable, column_default
 			FROM information_schema.columns
 			WHERE table_schema = 'public' AND table_name <> 'schema_version'
 			ORDER BY table_name, ordinal_position`)
@@ -358,11 +675,22 @@ func schemaColumns(t *testing.T, store *Store) []string {
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var table, column, nullable string
-			if err := rows.Scan(&table, &column, &nullable); err != nil {
+			var table, column, dataType, nullable string
+			var colDefault sql.NullString
+			if err := rows.Scan(&table, &column, &dataType, &nullable, &colDefault); err != nil {
 				t.Fatal(err)
 			}
-			result = append(result, fmt.Sprintf("%s.%s:%t", table, column, nullable == "YES"))
+			result = append(
+				result,
+				fmt.Sprintf(
+					"%s.%s:%s:null=%t:def=%s",
+					table,
+					column,
+					canonicalColumnType("postgres", dataType),
+					nullable == "YES",
+					normalizeColumnDefault(colDefault),
+				),
+			)
 		}
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
@@ -394,11 +722,21 @@ func schemaColumns(t *testing.T, store *Store) []string {
 		for rows.Next() {
 			var cid, notNull, pk int
 			var name, typ string
-			var defaultValue any
+			var defaultValue sql.NullString
 			if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
 				t.Fatal(err)
 			}
-			result = append(result, fmt.Sprintf("%s.%s:%t", table, name, notNull == 0 && pk == 0))
+			result = append(
+				result,
+				fmt.Sprintf(
+					"%s.%s:%s:null=%t:def=%s",
+					table,
+					name,
+					canonicalColumnType("sqlite", typ),
+					notNull == 0 && pk == 0,
+					normalizeColumnDefault(defaultValue),
+				),
+			)
 		}
 		_ = rows.Close()
 	}

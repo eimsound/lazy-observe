@@ -250,12 +250,122 @@ func TestDeletedProjectSlugCannotBeReusedAndTracksBlobCleanup(t *testing.T) {
 		if _, err := store.CreateProject(ctx, "Reincarnated", "reused-slug"); err != ErrProjectSlugReserved {
 			t.Fatalf("CreateProject with deleted slug err=%v want ErrProjectSlugReserved", err)
 		}
+		// Another project must not be able to mutate its slug (including onto a tombstoned slug).
+		other, err := store.CreateProject(ctx, "Other", "other-slug")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpdateProject(ctx, other.ID, "Other", "reused-slug"); err != ErrProjectSlugImmutable {
+			t.Fatalf("UpdateProject slug mutation err=%v want ErrProjectSlugImmutable", err)
+		}
+		if _, err := store.UpdateProject(ctx, other.ID, "Other", "brand-new-slug"); err != ErrProjectSlugImmutable {
+			t.Fatalf("UpdateProject slug rename err=%v want ErrProjectSlugImmutable", err)
+		}
+		renamed, err := store.UpdateProject(ctx, other.ID, "Other Renamed", "other-slug")
+		if err != nil || renamed.Name != "Other Renamed" || renamed.Slug != "other-slug" {
+			t.Fatalf("UpdateProject same-slug rename=%+v err=%v", renamed, err)
+		}
 		if err := store.MarkDeletedProjectBlobsCleaned(ctx, "reused-slug", time.Now().UTC()); err != nil {
 			t.Fatal(err)
 		}
 		pending, err = store.ListPendingDeletedProjectBlobs(ctx, 10)
 		if err != nil || len(pending) != 0 {
 			t.Fatalf("pending after mark cleaned=%v err=%v", pending, err)
+		}
+	})
+}
+
+func TestDeleteProjectCleansAlertLeasesStatesOutboxAndReplays(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+		p, err := store.CreateProject(ctx, "Doomed", "doomed-full")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := store.CreateNotificationChannel(ctx, NotificationChannelCreate{
+			Type: "webhook", Name: "doomed-hook", Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		enabled := true
+		rule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug: p.Slug,
+			Name:        "doomed-rule",
+			Signal:      "metrics",
+			Expression:  "up == 0",
+			For:         "0s",
+			Severity:    "warning",
+			Labels:      map[string]string{},
+			Annotations: map[string]string{},
+			Enabled:     &enabled,
+			ChannelIDs:  []int{ch.ID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.HeartbeatAlertEngine(ctx, "member-1", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.AcquireAlertRuleLease(ctx, rule.ID, "member-1", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(
+			ctx,
+			bind(
+				store.dialect,
+				`INSERT INTO notification_outbox(idempotency_key, project_id, rule_id, channel_id, payload, status, available_at, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, '{}', 'pending', ?, ?, ?)`,
+			),
+			"doomed-outbox-key",
+			p.ID,
+			rule.ID,
+			ch.ID,
+			now,
+			now,
+			now,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpsertReplaySegment(ctx, ReplaySegmentInput{
+			ProjectID:     p.ID,
+			SessionID:     "doomed-sess",
+			Seq:           0,
+			StartedAt:     now,
+			LastSeenAt:    now,
+			EventCount:    1,
+			SizeBytes:     32,
+			PayloadSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			MarkersJSON:   "[]",
+			MaxSegments:   10,
+			MaxBytes:      1024,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := store.DeleteProject(ctx, p.ID); err != nil {
+			t.Fatalf("DeleteProject: %v", err)
+		}
+		for _, check := range []struct {
+			table string
+			query string
+			arg   int
+		}{
+			{"alert_rule_leases", `SELECT COUNT(*) FROM alert_rule_leases WHERE rule_id = ?`, rule.ID},
+			{"alert_rule_states", `SELECT COUNT(*) FROM alert_rule_states WHERE rule_id = ?`, rule.ID},
+			{"notification_outbox", `SELECT COUNT(*) FROM notification_outbox WHERE project_id = ?`, p.ID},
+			{"replay_segments", `SELECT COUNT(*) FROM replay_segments WHERE project_id = ?`, p.ID},
+			{"replay_sessions", `SELECT COUNT(*) FROM replay_sessions WHERE project_id = ?`, p.ID},
+		} {
+			var count int
+			if err := store.db.QueryRowContext(ctx, bind(store.dialect, check.query), check.arg).
+				Scan(&count); err != nil {
+				t.Fatalf("query %s: %v", check.table, err)
+			}
+			if count != 0 {
+				t.Fatalf("%s retained %d rows after DeleteProject", check.table, count)
+			}
 		}
 	})
 }

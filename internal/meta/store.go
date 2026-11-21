@@ -52,6 +52,7 @@ type Store struct {
 	aiSettingsMu       sync.Mutex
 	sourceMapMu        sync.Mutex
 	replayMu           sync.Mutex
+	projectMu          sync.Mutex
 	revision           atomic.Uint64
 	secretBox          atomic.Pointer[secret.Box]
 }
@@ -169,6 +170,13 @@ var ErrInvalidUserAPIToken = errors.New("invalid user API token")
 // belonged to a previously deleted project. Reusing a slug would expose the
 // prior project's retained metrics or uncollected blobs under the same key.
 var ErrProjectSlugReserved = errors.New("project slug was previously used and cannot be reused")
+
+// ErrProjectSlugImmutable is returned when an update attempts to change an
+// existing project's slug. Slugs serve as non-reusable tenant keys across
+// metrics, logs, traces, and blobs.
+var ErrProjectSlugImmutable = errors.New("project slug is immutable")
+
+const projectSlugAdvisoryLockNamespace = 7303
 
 const projectAPITokenPrefixLength = 11
 
@@ -547,9 +555,34 @@ func (s *Store) AuthenticateUserAPIToken(ctx context.Context, token string) (Use
 	return userInfo(u), nil
 }
 
+func hashProjectSlugLock(slug string) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(slug))
+	return int32(h.Sum32())
+}
+
 func (s *Store) CreateProject(ctx context.Context, name, slug string) (*Project, error) {
+	if s.dialect != dialect.Postgres {
+		s.projectMu.Lock()
+		defer s.projectMu.Unlock()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin create project: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if s.dialect == dialect.Postgres {
+		if _, err := tx.ExecContext(
+			ctx,
+			`SELECT pg_advisory_xact_lock($1, $2)`,
+			projectSlugAdvisoryLockNamespace,
+			hashProjectSlugLock(slug),
+		); err != nil {
+			return nil, fmt.Errorf("lock project slug: %w", err)
+		}
+	}
 	var reserved int
-	if err := s.db.QueryRowContext(
+	if err := tx.QueryRowContext(
 		ctx,
 		bind(s.dialect, `SELECT COUNT(*) FROM deleted_project_slugs WHERE slug = ?`),
 		slug,
@@ -559,19 +592,53 @@ func (s *Store) CreateProject(ctx context.Context, name, slug string) (*Project,
 	if reserved > 0 {
 		return nil, ErrProjectSlugReserved
 	}
-	p, err := s.client.Project.Create().SetName(name).SetSlug(slug).Save(ctx)
-	if err == nil {
-		s.revision.Add(1)
+	var existing int
+	if err := tx.QueryRowContext(
+		ctx,
+		bind(s.dialect, `SELECT COUNT(*) FROM projects WHERE slug = ?`),
+		slug,
+	).Scan(&existing); err != nil {
+		return nil, fmt.Errorf("check existing project slug: %w", err)
 	}
-	return p, err
+	if existing > 0 {
+		return nil, fmt.Errorf("project slug %q already exists: %w", slug, errConstraint)
+	}
+	createdAt := time.Now().UTC().Round(0)
+	var id int
+	if err := tx.QueryRowContext(
+		ctx,
+		bind(s.dialect, `INSERT INTO projects(name, slug, created_at) VALUES (?, ?, ?) RETURNING id`),
+		name,
+		slug,
+		createdAt,
+	).Scan(&id); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.revision.Add(1)
+	return &Project{ID: id, Name: name, Slug: slug, CreatedAt: createdAt}, nil
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]*Project, error) {
-	return s.client.Project.Query().Order(orderAsc(project.FieldID)).All(ctx)
+	rows, err := s.client.Project.Query().Order(orderAsc(project.FieldID)).All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*Project, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, projectFromEnt(row))
+	}
+	return result, nil
 }
 
 func (s *Store) GetProject(ctx context.Context, id int) (*Project, error) {
-	return s.client.Project.Get(ctx, id)
+	row, err := s.client.Project.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return projectFromEnt(row), nil
 }
 
 func (s *Store) ProjectBySlug(ctx context.Context, slug string) (ProjectInfo, error) {
@@ -583,25 +650,33 @@ func (s *Store) ProjectBySlug(ctx context.Context, slug string) (ProjectInfo, er
 }
 
 func (s *Store) UpdateProject(ctx context.Context, id int, name, slug string) (*Project, error) {
+	existing, err := s.client.Project.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if slug != "" && slug != existing.Slug {
+		return nil, ErrProjectSlugImmutable
+	}
 	b := s.client.Project.UpdateOneID(id)
 	if name != "" {
 		b.SetName(name)
 	}
-	if slug != "" {
-		b.SetSlug(slug)
-	}
 	p, err := b.Save(ctx)
-	if err == nil {
-		s.revision.Add(1)
+	if err != nil {
+		return nil, err
 	}
-	return p, err
+	s.revision.Add(1)
+	return projectFromEnt(p), nil
 }
 
 // DeleteProject removes a project and all metadata rows scoped to it in one
-// transaction. Blob retention is handled independently by the storage layer;
-// deleting a project must not leave relational rows that prevent the CRUD
-// operation from completing.
+// transaction and tombstones its slug so it can never be reused. Blob cleanup
+// is triggered immediately by the gateway and retried durably by the janitor.
 func (s *Store) DeleteProject(ctx context.Context, id int) error {
+	if s.dialect != dialect.Postgres {
+		s.projectMu.Lock()
+		defer s.projectMu.Unlock()
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -614,6 +689,16 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 			return &NotFoundError{project.Label}
 		}
 		return err
+	}
+	if s.dialect == dialect.Postgres {
+		if _, err := tx.ExecContext(
+			ctx,
+			`SELECT pg_advisory_xact_lock($1, $2)`,
+			projectSlugAdvisoryLockNamespace,
+			hashProjectSlugLock(projectSlug),
+		); err != nil {
+			return fmt.Errorf("lock project slug: %w", err)
+		}
 	}
 	state, err := s.lockErrorInboxStateTx(ctx, tx)
 	if err != nil {
@@ -637,7 +722,10 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 	}
 
 	statements := []string{
+		`DELETE FROM notification_outbox WHERE project_id = ?`,
 		`DELETE FROM notification_deliveries WHERE rule_id IN (SELECT id FROM alert_rules WHERE project_id = ?)`,
+		`DELETE FROM alert_rule_leases WHERE rule_id IN (SELECT id FROM alert_rules WHERE project_id = ?)`,
+		`DELETE FROM alert_rule_states WHERE rule_id IN (SELECT id FROM alert_rules WHERE project_id = ?)`,
 		`DELETE FROM alert_rule_channels WHERE alert_rule_id IN (SELECT id FROM alert_rules WHERE project_id = ?)`,
 		`DELETE FROM alert_events WHERE rule_id IN (SELECT id FROM alert_rules WHERE project_id = ?)`,
 		`DELETE FROM alert_rules WHERE project_id = ?`,
@@ -823,7 +911,7 @@ func (s *Store) ListProjectAPITokens(ctx context.Context, projectID int) ([]Proj
 	return result, nil
 }
 
-func tokenInfo(token *ProjectAPIToken) ProjectAPITokenInfo {
+func tokenInfo(token *dbent.ProjectAPIToken) ProjectAPITokenInfo {
 	return ProjectAPITokenInfo{
 		ID:         token.ID,
 		Name:       token.Name,
@@ -905,7 +993,7 @@ func (s *Store) RevokeUserAPITokenByID(ctx context.Context, userID, tokenID int)
 	return nil
 }
 
-func userAPITokenInfo(token *UserAPIToken) UserAPITokenInfo {
+func userAPITokenInfo(token *dbent.UserAPIToken) UserAPITokenInfo {
 	return UserAPITokenInfo{
 		ID:         token.ID,
 		Name:       token.Name,
@@ -1359,7 +1447,7 @@ func (s *Store) DeleteAuditBefore(ctx context.Context, cutoff time.Time) (int, e
 	)
 }
 
-func auditRecord(event *AuditEvent) AuditRecord {
+func auditRecord(event *dbent.AuditEvent) AuditRecord {
 	record := AuditRecord{
 		ID:            event.ID,
 		Action:        event.Action,
@@ -1483,9 +1571,9 @@ func (s *Store) Bootstrap(
 	if err := s.ensureBootstrapAdmin(ctx, logger, admin); err != nil {
 		return "", err
 	}
-	p, err := s.client.Project.Query().Where(project.SlugEQ("default")).Only(ctx)
+	_, err = s.ProjectBySlug(ctx, "default")
 	if IsNotFound(err) {
-		p, err = s.CreateProject(ctx, "Default", "default")
+		p, err := s.CreateProject(ctx, "Default", "default")
 		if err != nil {
 			return "", fmt.Errorf("create default project: %w", err)
 		}
@@ -1519,20 +1607,22 @@ func (s *Store) BootstrapSelfMonitoring(
 		return ProjectInfo{}, "", err
 	}
 	defer func() { err = errors.Join(err, release()) }()
-	p, err := s.client.Project.Query().Where(project.SlugEQ(SelfMonitoringProjectSlug)).Only(ctx)
+	info, err = s.ProjectBySlug(ctx, SelfMonitoringProjectSlug)
 	if IsNotFound(err) {
-		p, err = s.CreateProject(ctx, "lazy-observe", SelfMonitoringProjectSlug)
-	}
-	if err != nil {
+		created, createErr := s.CreateProject(ctx, "lazy-observe", SelfMonitoringProjectSlug)
+		if createErr != nil {
+			return ProjectInfo{}, "", fmt.Errorf("ensure self-monitoring project: %w", createErr)
+		}
+		info = ProjectInfo{ID: created.ID, Name: created.Name, Slug: created.Slug}
+	} else if err != nil {
 		return ProjectInfo{}, "", fmt.Errorf("ensure self-monitoring project: %w", err)
 	}
-	info = ProjectInfo{ID: p.ID, Name: p.Name, Slug: p.Slug}
 	existing, err := s.client.ProjectAPIToken.Query().
 		Where(projectapitoken.TokenEQ(storedCredential(derived))).
 		Only(ctx)
 	switch {
 	case err == nil:
-		if existing.ProjectID != p.ID {
+		if existing.ProjectID != info.ID {
 			return ProjectInfo{}, "", errors.New("self-monitoring token belongs to another project")
 		}
 		if existing.Revoked {
@@ -1545,7 +1635,7 @@ func (s *Store) BootstrapSelfMonitoring(
 	case !IsNotFound(err):
 		return ProjectInfo{}, "", fmt.Errorf("find self-monitoring project API token: %w", err)
 	}
-	if _, err := s.createProjectAPITokenValue(ctx, p.ID, "self-monitoring", derived); err != nil {
+	if _, err := s.createProjectAPITokenValue(ctx, info.ID, "self-monitoring", derived); err != nil {
 		return ProjectInfo{}, "", fmt.Errorf("create self-monitoring project API token: %w", err)
 	}
 	return info, derived, nil
@@ -1641,7 +1731,7 @@ func randomPassword() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func userInfo(u *User) UserInfo {
+func userInfo(u *dbent.User) UserInfo {
 	info := UserInfo{
 		ID: u.ID, Username: u.Username, Role: string(u.Role), CreatedAt: u.CreatedAt,
 		MustChangePassword: u.MustChangePassword,

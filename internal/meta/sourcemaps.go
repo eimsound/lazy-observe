@@ -146,9 +146,17 @@ func (s *Store) UpsertSourceMapArtifacts(
 }
 
 func (s *Store) SourceMapArtifacts(ctx context.Context, projectID int, release string) ([]*SourceMapArtifact, error) {
-	return s.client.SourceMapArtifact.Query().Where(
+	rows, err := s.client.SourceMapArtifact.Query().Where(
 		sourcemapartifact.ProjectIDEQ(projectID), sourcemapartifact.ReleaseEQ(release),
 	).Order(orderAsc(sourcemapartifact.FieldFilename)).All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*SourceMapArtifact, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, sourceMapArtifactFromEnt(row))
+	}
+	return result, nil
 }
 
 func (s *Store) ListSourceMapReleases(ctx context.Context, projectID, limit int) ([]SourceMapRelease, error) {

@@ -226,13 +226,17 @@ func (s *Store) GetReplaySegment(
 	sessionID string,
 	seq int,
 ) (*ReplaySegment, error) {
-	return s.client.ReplaySegment.Query().
+	row, err := s.client.ReplaySegment.Query().
 		Where(
 			replaysegment.ProjectIDEQ(projectID),
 			replaysegment.SessionIDEQ(sessionID),
 			replaysegment.SeqEQ(seq),
 		).
 		Only(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return replaySegmentFromEnt(row), nil
 }
 
 func (s *Store) ListReplaySegments(
@@ -250,7 +254,15 @@ func (s *Store) ListReplaySegments(
 	if limit > 0 {
 		q = q.Limit(limit)
 	}
-	return q.All(ctx)
+	rows, err := q.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*ReplaySegment, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, replaySegmentFromEnt(row))
+	}
+	return result, nil
 }
 
 // ListReplaySessionIDs returns the active replay session IDs for a project so
@@ -355,10 +367,18 @@ func (s *Store) ListReplaySessions(
 	if offset < 0 || offset > math.MaxInt32 {
 		return []*ReplaySession{}, nil
 	}
-	return q.Order(orderDesc(replaysession.FieldLastSeenAt), orderDesc(replaysession.FieldID)).
+	rows, err := q.Order(orderDesc(replaysession.FieldLastSeenAt), orderDesc(replaysession.FieldID)).
 		Offset(offset).
 		Limit(limit).
 		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*ReplaySession, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, replaySessionFromEnt(row))
+	}
+	return result, nil
 }
 
 func (s *Store) CountReplaySessions(ctx context.Context, projectID int, opts ReplayListOptions) (int, error) {
@@ -380,9 +400,13 @@ func (s *Store) replaySessionsQuery(projectID int, opts ReplayListOptions) *dben
 }
 
 func (s *Store) GetReplaySession(ctx context.Context, projectID int, sessionID string) (*ReplaySession, error) {
-	return s.client.ReplaySession.Query().
+	row, err := s.client.ReplaySession.Query().
 		Where(replaysession.ProjectIDEQ(projectID), replaysession.SessionIDEQ(sessionID)).
 		Only(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return replaySessionFromEnt(row), nil
 }
 
 // IssueIDsForErrorEvents resolves issue IDs for completed error events in bulk

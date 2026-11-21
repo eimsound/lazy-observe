@@ -49,25 +49,24 @@ func startSignalStorage(
 
 	var scrapeConfigPath string
 	var binarySource embed.BinarySource
-	needsManagedComponents := !cfg.Standalone || ingestURL != ""
-	if needsManagedComponents {
-		if store.IsClustered() {
-			// HA replicas start vmagent with an empty scrape config until the
-			// PostgreSQL advisory-lock leader loop elects the single active
-			// scraper, preventing duplicate target scrapes across replicas.
-			scrapeConfigPath = filepath.Join(cfg.DataDir, "scrape", "scrape.yml")
-			if err := scrape.WriteEmptyConfig(scrapeConfigPath); err != nil {
-				return nil, fmt.Errorf("write initial standby scrape config: %w", err)
+	disableVMAgent := cfg.Scrape.Mode == appconfig.ScrapeModeDisabled
+	requiredBins := requiredEmbeddedBinaries(cfg, ingestURL)
+	if len(requiredBins) > 0 {
+		if !disableVMAgent && (!cfg.IsStandalone() || ingestURL != "") {
+			if store.IsClustered() {
+				// HA replicas start vmagent with an empty scrape config until the
+				// PostgreSQL advisory-lock leader loop elects the single active
+				// scraper, preventing duplicate target scrapes across replicas.
+				scrapeConfigPath = filepath.Join(cfg.DataDir, "scrape", "scrape.yml")
+				if err := scrape.WriteEmptyConfig(scrapeConfigPath); err != nil {
+					return nil, fmt.Errorf("write initial standby scrape config: %w", err)
+				}
+			} else {
+				scrapeConfigPath, err = writeInitialScrapeConfig(ctx, store, cfg.DataDir)
+				if err != nil {
+					return nil, fmt.Errorf("write initial scrape config: %w", err)
+				}
 			}
-		} else {
-			scrapeConfigPath, err = writeInitialScrapeConfig(ctx, store, cfg.DataDir)
-			if err != nil {
-				return nil, fmt.Errorf("write initial scrape config: %w", err)
-			}
-		}
-		var requiredBins []string
-		if cfg.Standalone {
-			requiredBins = []string{"vmagent-prod"}
 		}
 		binarySource, err = storageBinarySource(cfg, logger, requiredBins...)
 		if err != nil {
@@ -83,7 +82,8 @@ func startSignalStorage(
 		RestartInitial:   cfg.Process.RestartInitial.Value(),
 		RestartMax:       cfg.Process.RestartMax.Value(),
 		Output:           os.Stderr,
-		Standalone:       cfg.Standalone,
+		Standalone:       cfg.IsStandalone(),
+		DisableVMAgent:   disableVMAgent,
 		MetricsIngestURL: backend.PrometheusRemoteWriteBase(),
 		MetricsRetention: cfg.Retention.Metrics.Value(),
 		LogsRetention:    cfg.Retention.Logs.Value(),
@@ -99,6 +99,20 @@ func startSignalStorage(
 		ingestURL:        ingestURL,
 		scrapeConfigPath: scrapeConfigPath,
 	}, nil
+}
+
+// requiredEmbeddedBinaries returns the exact subset of embedded storage
+// binaries required for the current topology and scrape configuration so
+// unused executables are never extracted to disk.
+func requiredEmbeddedBinaries(cfg appconfig.Config, ingestURL string) []string {
+	var bins []string
+	if !cfg.IsStandalone() {
+		bins = append(bins, "victoria-metrics-prod", "victoria-logs-prod", "victoria-traces-prod")
+	}
+	if cfg.Scrape.Mode != appconfig.ScrapeModeDisabled && (!cfg.IsStandalone() || ingestURL != "") {
+		bins = append(bins, "vmagent-prod")
+	}
+	return bins
 }
 
 func writeInitialScrapeConfig(ctx context.Context, store *meta.Store, dataDir string) (string, error) {
@@ -117,7 +131,7 @@ func signalStorageEndpoints(
 	ingestURL := embeddedURL(embed.MetricsAddr, cfg.Process.ComponentPortOffset)
 	logsEndpoint := storage.SignalEndpoint{URL: embeddedURL(embed.LogsAddr, cfg.Process.ComponentPortOffset)}
 	tracesEndpoint := storage.SignalEndpoint{URL: embeddedURL(embed.TracesAddr, cfg.Process.ComponentPortOffset)}
-	if cfg.Standalone {
+	if cfg.IsStandalone() {
 		queryURL = cfg.Storage.Metrics.QueryURL
 		ingestURL = cfg.Storage.Metrics.IngestURL
 		logsEndpoint = storage.SignalEndpoint{
