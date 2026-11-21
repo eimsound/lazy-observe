@@ -23,6 +23,11 @@ redis:
   db: 0
   key_prefix: "lazy-observe"
 
+# Explicit deployment topology: "", "all-in-one", "standalone", or "ha".
+# Empty derives from standalone and external shared backends. Setting "ha"
+# fails closed on startup unless PostgreSQL, Redis, S3, a shared secret key
+# file, and external signal endpoints are all configured.
+topology: ""
 # All-in-one is the default. Set standalone: true (or pass --standalone) to use external storage.
 standalone: false
 # Development/offline override containing victoria-metrics-prod, victoria-logs-prod,
@@ -91,6 +96,11 @@ alert:
   group_wait: 30s
   repeat_interval: 4h
 
+# Embedded vmagent scraping: "auto" (active in single-node, PostgreSQL leader-
+# elected in clustered/HA mode) or "disabled" (never extract or run vmagent).
+scrape:
+  mode: auto
+
 # Durable error work is rejected with 503 + Retry-After when either capacity
 # limit is reached. Readiness degrades at the lower thresholds; accepted work
 # is never evicted. Processing always uses the fixed 20-attempt, 1s-to-5m policy.
@@ -150,7 +160,7 @@ ai:
 
 # Environment names use LO_ and upper-case field paths. Common examples:
 # LO_LISTEN, LO_DATA_DIR, LO_META_DB_URL, LO_META_MIGRATION_LOCK_TIMEOUT,
-# LO_STANDALONE, LO_STORAGE_BIN_DIR, LO_AI_PRICING_FILE,
+# LO_STANDALONE, LO_TOPOLOGY, LO_SCRAPE_MODE, LO_STORAGE_BIN_DIR, LO_AI_PRICING_FILE,
 # LO_REDIS_ENABLED, LO_REDIS_ADDR, LO_REDIS_PASSWORD, LO_REDIS_DB, LO_REDIS_KEY_PREFIX,
 # LO_STORAGE_METRICS_KIND, LO_STORAGE_METRICS_QUERY_URL, LO_STORAGE_METRICS_INGEST_URL,
 # LO_STORAGE_METRICS_CLUSTER, LO_STORAGE_METRICS_TENANT_ACCOUNT_ID,

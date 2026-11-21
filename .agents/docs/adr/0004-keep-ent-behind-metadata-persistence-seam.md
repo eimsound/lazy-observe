@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: closed
 ---
 
 # 将 Ent 隔离在元数据持久化接缝（persistence seam）之后
@@ -18,3 +18,10 @@ status: accepted
 - 告警规则相关的多步持久化结果必须原子提交，但不得把告警引擎的领域决策移动到元数据模块。
 - 简单行为仍可由小方法实现，但不得重新暴露查询构造器（query builder）、生成的客户端，或要求调用方掌握写入顺序。
 - 本决定不改变 ADR 0001 的告警引擎（Alert engine）语义，也不改变 ADR 0003 的 Ent 生成和元数据基线（Metadata baseline）策略。
+
+## 闭合记录
+
+- 已彻底移除 `internal/meta/entities.go` 中的全部 Ent 实体类型别名与 `profilemeta.Type` 别名，替换为纯值 DTO（`Project`、`ProfileMeta`、`ProfileType`、`ReplaySegment`、`ReplaySession`、`SourceMapArtifact`），并在 `internal/meta` 内部完成 `ent -> DTO` 转换。
+- 由自动化测试 `internal/meta/adr0004_boundary_test.go` 持续守护两条不变量：
+  1. `internal/meta` 的任何导出符号（类型、字段、函数、方法、变量、常量）签名不得引用 `internal/db/ent` 及其子包类型；
+  2. 仓库内除 `internal/db/...` 与 `internal/meta/...` 外的任何 Go 包（含测试文件）不得导入 `internal/db/ent`。

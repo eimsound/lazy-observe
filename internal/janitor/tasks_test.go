@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
-	"github.com/eimsound/lazy-observe/internal/db/ent/issue"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
 )
@@ -295,13 +294,13 @@ func TestClosedIssuesDeleteOnlyExpiredResolvedOrIgnored(t *testing.T) {
 	retained := make(map[string]int)
 	for _, item := range []struct {
 		fingerprint string
-		status      issue.Status
+		status      string
 		seen        time.Time
 	}{
-		{"expired-resolved", issue.StatusResolved, now.Add(-91 * 24 * time.Hour)},
-		{"expired-ignored", issue.StatusIgnored, now.Add(-91 * 24 * time.Hour)},
-		{"old-open", issue.StatusOpen, now.Add(-91 * 24 * time.Hour)},
-		{"active-resolved", issue.StatusResolved, now.Add(-89 * 24 * time.Hour)},
+		{"expired-resolved", "resolved", now.Add(-91 * 24 * time.Hour)},
+		{"expired-ignored", "ignored", now.Add(-91 * 24 * time.Hour)},
+		{"old-open", "open", now.Add(-91 * 24 * time.Hour)},
+		{"active-resolved", "resolved", now.Add(-89 * 24 * time.Hour)},
 	} {
 		changes, err := store.ApplyIssueDeltas(ctx, []errortrack.IssueDelta{{
 			ProjectID: project.ID, Fingerprint: item.fingerprint, Title: item.fingerprint, Level: "error",
@@ -314,7 +313,7 @@ func TestClosedIssuesDeleteOnlyExpiredResolvedOrIgnored(t *testing.T) {
 		if len(changes) != 1 {
 			t.Fatalf("issue changes=%+v", changes)
 		}
-		if _, err := store.SetIssueStatus(ctx, project.ID, changes[0].IssueID, string(item.status), now); err != nil {
+		if _, err := store.SetIssueStatus(ctx, project.ID, changes[0].IssueID, item.status, now); err != nil {
 			t.Fatal(err)
 		}
 		retained[item.fingerprint] = changes[0].IssueID

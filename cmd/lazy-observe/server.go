@@ -31,49 +31,63 @@ func newServerCommand() *cobra.Command {
 }
 
 func runServer(cfg appconfig.Config) error {
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid server configuration: %w", err)
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	cleanups := newCleanupStack(logger)
+	defer func() { _ = cleanups.Close() }()
+
+	// Fail fast on listen-address conflicts or broken TLS certificates before
+	// touching data_dir, opening metadata databases, or spawning storage.
+	publicListener, err := openPublicListener(cfg, logger)
+	if err != nil {
+		return err
+	}
+	cleanups.Push("public-listener", publicListener.Close)
+
+	loopback, err := openInternalLoopback(cfg)
+	if err != nil {
+		return err
+	}
+	cleanups.PushFunc("internal-loopback", loopback.Close)
+
 	essentials, err := loadServerEssentials(cfg)
 	if err != nil {
 		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	cleanups.PushFunc("signal-context", stop)
 	drainSig := make(chan os.Signal, 1)
 	signal.Notify(drainSig, syscall.SIGUSR1)
-	defer signal.Stop(drainSig)
+	cleanups.PushFunc("drain-signal", func() { signal.Stop(drainSig) })
 
 	shared, err := openServerSharedState(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	defer shared.Close()
+	cleanups.PushFunc("shared-state", shared.Close)
 
 	metadata, err := openServerMetadata(ctx, cfg, logger, essentials.secretBox)
 	if err != nil {
 		return err
 	}
-	defer metadata.Close()
+	cleanups.PushFunc("metadata", metadata.Close)
 
 	signals, err := startSignalStorage(ctx, cfg, metadata.store, logger)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = signals.supervisor.Shutdown() }()
-
-	loopback, err := openInternalLoopback(cfg)
-	if err != nil {
-		return err
-	}
-	defer loopback.Close()
+	cleanups.Push("signal-storage", signals.supervisor.Shutdown)
 
 	enrichServerOutboundPolicy(&essentials.outboundPolicy, cfg, loopback, signals)
 
 	monitoring := startSelfMonitoring(cfg, loopback.baseURL, metadata.selfProject, metadata.selfToken, logger)
-	defer monitoring.Shutdown()
+	cleanups.PushFunc("self-monitoring", monitoring.Shutdown)
 
 	services := startServerServices(ctx, cfg, monitoring.logger, essentials, metadata, signals, loopback, shared.limits)
-	defer services.Close()
+	cleanups.PushFunc("server-services", services.Close)
 
 	runningGateway, err := startGateway(
 		cfg,
@@ -85,6 +99,7 @@ func runServer(cfg appconfig.Config) error {
 		monitoring,
 		services,
 		loopback,
+		publicListener,
 	)
 	if err != nil {
 		return err

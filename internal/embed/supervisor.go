@@ -59,6 +59,7 @@ type Config struct {
 	Output           io.Writer
 	ScrapeConfigPath string
 	Standalone       bool
+	DisableVMAgent   bool
 	MetricsIngestURL string
 	MetricsRetention time.Duration
 	LogsRetention    time.Duration
@@ -203,24 +204,33 @@ func Start(ctx context.Context, cfg Config) (*Supervisor, error) {
 		cancelLifecycle()
 		return nil, errors.New("binary source is required")
 	}
-	if cfg.ScrapeConfigPath == "" {
-		cfg.ScrapeConfigPath = filepath.Join(dataDir, "scrape", "scrape.yml")
-	}
-	if err := os.MkdirAll(filepath.Dir(cfg.ScrapeConfigPath), 0o755); err != nil {
-		cancelLifecycle()
-		return nil, fmt.Errorf("create scrape config directory: %w", err)
-	}
-	if _, err := os.Stat(cfg.ScrapeConfigPath); errors.Is(err, os.ErrNotExist) {
-		if err := os.WriteFile(cfg.ScrapeConfigPath, []byte("scrape_configs: []\n"), 0o644); err != nil {
-			cancelLifecycle()
-			return nil, fmt.Errorf("create initial scrape config: %w", err)
+	hasVMAgent := false
+	for i := range defs {
+		if defs[i].name == "vmagent" {
+			hasVMAgent = true
+			break
 		}
-	} else if err != nil {
-		cancelLifecycle()
-		return nil, fmt.Errorf("inspect scrape config: %w", err)
 	}
-	// Recompute defs if ScrapeConfigPath defaulted above.
-	defs = componentDefinitions(cfg, dataDir)
+	if hasVMAgent {
+		if cfg.ScrapeConfigPath == "" {
+			cfg.ScrapeConfigPath = filepath.Join(dataDir, "scrape", "scrape.yml")
+		}
+		if err := os.MkdirAll(filepath.Dir(cfg.ScrapeConfigPath), 0o755); err != nil {
+			cancelLifecycle()
+			return nil, fmt.Errorf("create scrape config directory: %w", err)
+		}
+		if _, err := os.Stat(cfg.ScrapeConfigPath); errors.Is(err, os.ErrNotExist) {
+			if err := os.WriteFile(cfg.ScrapeConfigPath, []byte("scrape_configs: []\n"), 0o644); err != nil {
+				cancelLifecycle()
+				return nil, fmt.Errorf("create initial scrape config: %w", err)
+			}
+		} else if err != nil {
+			cancelLifecycle()
+			return nil, fmt.Errorf("inspect scrape config: %w", err)
+		}
+		// Recompute defs if ScrapeConfigPath defaulted above.
+		defs = componentDefinitions(cfg, dataDir)
+	}
 	for i := range defs {
 		path, err := cfg.Source.Path(defs[i].binary)
 		if err != nil {
@@ -285,7 +295,7 @@ func componentDefinitions(cfg Config, dataDir string) []component {
 	} else {
 		ingestURL = strings.TrimRight(cfg.MetricsIngestURL, "/")
 	}
-	if ingestURL != "" {
+	if ingestURL != "" && !cfg.DisableVMAgent {
 		defs = append(defs, component{
 			name: "vmagent", binary: "vmagent-prod", addr: agentAddr,
 			args: []string{

@@ -222,7 +222,7 @@ func createOutboxFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return project, rule, channel
+	return projectFromEnt(project), rule, channel
 }
 
 func expireOutboxClaim(t *testing.T, store *Store, id int64) {

@@ -32,12 +32,15 @@ func newDoctorCommand() *cobra.Command {
 		Short: "Check whether an HA deployment is ready",
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if !ha {
-				return errors.New("--ha is required")
-			}
 			cfg, _, err := appconfig.LoadFlagSet(configFlags, os.LookupEnv)
 			if err != nil {
+				if !ha {
+					return errors.New("--ha is required")
+				}
 				return fmt.Errorf("load HA configuration: %w", err)
+			}
+			if !ha && cfg.Topology != appconfig.TopologyHA {
+				return errors.New("--ha is required")
 			}
 			return runDoctor(cfg)
 		},
@@ -67,13 +70,14 @@ func runDoctor(cfg appconfig.Config) error {
 		}
 		fmt.Fprintf(os.Stdout, "PASS %s\n", name)
 	}
-	if !cfg.Standalone {
-		check("standalone", errors.New("standalone must be true for HA replicas"))
-	} else {
-		check("standalone", nil)
+	staticChecks := make(map[string]error)
+	for _, res := range cfg.HAConfigChecks() {
+		staticChecks[res.Name] = res.Err
 	}
-	if !cfg.Redis.Enabled {
-		check("redis", errors.New("redis.enabled must be true for shared sessions and rate limits"))
+
+	check("standalone", staticChecks["standalone"])
+	if err := staticChecks["redis"]; err != nil {
+		check("redis", err)
 	} else {
 		redisCtx, cancelRedis := context.WithTimeout(ctx, doctorProbeTimeout)
 		client := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
@@ -84,8 +88,8 @@ func runDoctor(cfg appconfig.Config) error {
 
 	var pgDiag meta.PostgresDiagnostics
 	var pgOK bool
-	if !strings.HasPrefix(cfg.Meta.DBURL, "postgres://") && !strings.HasPrefix(cfg.Meta.DBURL, "postgresql://") {
-		check("metadata-postgres", errors.New("meta.db_url must be a PostgreSQL URL"))
+	if err := staticChecks["metadata-postgres"]; err != nil {
+		check("metadata-postgres", err)
 	} else {
 		diag, diagErr := meta.DiagnosePostgresReadOnly(ctx, cfg.Meta.DBURL, meta.OpenOptions{
 			MigrationLockTimeout: cfg.Meta.MigrationLockTimeout.Value(),
@@ -98,8 +102,8 @@ func runDoctor(cfg appconfig.Config) error {
 		}
 	}
 
-	if strings.TrimSpace(cfg.Security.SecretKeyFile) == "" {
-		check("secret-key", errors.New("security.secret_key_file must be configured and shared across HA replicas"))
+	if err := staticChecks["secret-key"]; err != nil {
+		check("secret-key", err)
 	} else {
 		box, loadErr := secret.Load(cfg.Security.SecretKeyFile)
 		if loadErr == nil && pgOK && pgDiag.PlatformKeyFingerprint != "" &&
@@ -125,8 +129,8 @@ func runDoctor(cfg appconfig.Config) error {
 		check("admin-password", nil)
 	}
 
-	if cfg.Blob.Backend != "s3" {
-		check("blob-s3", errors.New("blob.backend must be s3 for replay and profile blobs"))
+	if err := staticChecks["blob-s3"]; err != nil {
+		check("blob-s3", err)
 	} else {
 		s3Ctx, cancelS3 := context.WithTimeout(ctx, doctorProbeTimeout)
 		blobs, openErr := blob.NewS3(
@@ -145,9 +149,9 @@ func runDoctor(cfg appconfig.Config) error {
 		check("blob-s3", openErr)
 	}
 
-	metricsIngestConfigured := strings.TrimSpace(cfg.Storage.Metrics.IngestURL) != ""
+	metricsIngestConfigured := staticChecks["storage-metrics-ingest"] == nil
 	if !metricsIngestConfigured {
-		check("storage-metrics-ingest", errors.New("storage.metrics.ingest_url is not configured"))
+		check("storage-metrics-ingest", staticChecks["storage-metrics-ingest"])
 	}
 	probeClient := &http.Client{Timeout: doctorProbeTimeout}
 	backend, backendErr := storage.NewWithOptions(

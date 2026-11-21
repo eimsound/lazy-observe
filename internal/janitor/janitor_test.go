@@ -157,3 +157,51 @@ func TestJanitorCoordinatorLeadershipSequentialExecutionAndPerTaskInterval(t *te
 		t.Fatalf("per-task interval calls: fast=%d slow=%d want 2,1", fast.calls(), slow.calls())
 	}
 }
+
+type blockingTask struct {
+	observedErr error
+}
+
+func (b *blockingTask) Clean(ctx context.Context, _ time.Time) (int, error) {
+	<-ctx.Done()
+	b.observedErr = ctx.Err()
+	return 0, ctx.Err()
+}
+
+type panickingTask struct{}
+
+func (panickingTask) Clean(context.Context, time.Time) (int, error) {
+	panic("simulated janitor panic")
+}
+
+func TestJanitorPerTaskTimeoutAndPanicRecovery(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	coord := &fakeCoordinator{acquired: true}
+	j := New(logger, time.Hour)
+	j.SetCoordinator(coord)
+	j.SetTaskTimeout(30 * time.Millisecond)
+
+	slow := &blockingTask{}
+	after := &recordingTask{deleted: 4}
+	j.Register("slow", time.Hour, slow)
+	j.Register("panicky", time.Hour, panickingTask{})
+	j.Register("after", time.Hour, after)
+
+	results := j.RunOnce(context.Background())
+	if len(results) != 3 {
+		t.Fatalf("results=%d want 3: %+v", len(results), results)
+	}
+	if !errors.Is(results[0].Err, context.DeadlineExceeded) || !errors.Is(slow.observedErr, context.DeadlineExceeded) {
+		t.Fatalf("slow task timeout err=%v observed=%v want DeadlineExceeded", results[0].Err, slow.observedErr)
+	}
+	if results[1].Err == nil || !errors.Is(results[1].Err, results[1].Err) ||
+		results[1].Err.Error() != "janitor task panic: simulated janitor panic" {
+		t.Fatalf("panicking task err=%v", results[1].Err)
+	}
+	if results[2].Err != nil || results[2].Deleted != 4 {
+		t.Fatalf("subsequent task did not complete cleanly: %+v", results[2])
+	}
+	if coord.releases.Load() != 1 {
+		t.Fatalf("coordinator lock releases=%d want 1", coord.releases.Load())
+	}
+}

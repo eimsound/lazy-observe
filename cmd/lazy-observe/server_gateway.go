@@ -37,6 +37,36 @@ type managedComponentSupervisor interface {
 	Shutdown() error
 }
 
+type managedPublicListener struct {
+	listener net.Listener
+}
+
+func openPublicListener(cfg appconfig.Config, logger *slog.Logger) (*managedPublicListener, error) {
+	listener, err := gatewayListener(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	return &managedPublicListener{listener: listener}, nil
+}
+
+func (m *managedPublicListener) take() net.Listener {
+	if m == nil {
+		return nil
+	}
+	listener := m.listener
+	m.listener = nil
+	return listener
+}
+
+func (m *managedPublicListener) Close() error {
+	if m == nil || m.listener == nil {
+		return nil
+	}
+	listener := m.listener
+	m.listener = nil
+	return listener.Close()
+}
+
 func startGateway(
 	cfg appconfig.Config,
 	logger *slog.Logger,
@@ -47,6 +77,7 @@ func startGateway(
 	monitoring *selfMonitoring,
 	services *serverServices,
 	loopback *internalLoopback,
+	publicListener *managedPublicListener,
 ) (*runningServerGateway, error) {
 	readiness := serverReadiness(cfg, shared, metadata, signals)
 	var sessionAdapter account.Sessions
@@ -125,10 +156,13 @@ func startGateway(
 		return nil, err
 	}
 
-	listener, err := gatewayListener(cfg, logger)
-	if err != nil {
-		_ = errorTracker.Close(context.Background())
-		return nil, err
+	listener := publicListener.take()
+	if listener == nil {
+		listener, err = gatewayListener(cfg, logger)
+		if err != nil {
+			_ = errorTracker.Close(context.Background())
+			return nil, err
+		}
 	}
 	serverErr := make(chan error, 2)
 	go func() { serverErr <- gw.Serve(listener) }()
@@ -194,8 +228,10 @@ func logGatewayReady(cfg appconfig.Config, logger *slog.Logger) {
 		"gateway listening",
 		"address",
 		cfg.Listen,
+		"topology",
+		cfg.EffectiveTopology(),
 		"standalone",
-		cfg.Standalone,
+		cfg.IsStandalone(),
 		"metrics_kind",
 		cfg.Storage.Metrics.Kind,
 	)

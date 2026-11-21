@@ -376,7 +376,7 @@ func (s *Store) SaveIssueAnalysis(
 	return issueView(row), nil
 }
 
-func issueView(row *Issue) IssueView {
+func issueView(row *dbent.Issue) IssueView {
 	return IssueView{
 		ID:              row.ID,
 		Fingerprint:     row.Fingerprint,
