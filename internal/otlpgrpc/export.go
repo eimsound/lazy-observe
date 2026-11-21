@@ -180,7 +180,8 @@ func (s *Server) forwardProtobuf(
 		)
 		return status.Error(code, msg)
 	}
-	defer drainAndCloseBody(httpResp.Body)
+	defer httpResp.Body.Close()
+	defer drainBody(httpResp.Body)
 
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		errSnippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorLogBodyBytes))
@@ -221,12 +222,11 @@ func buildTargetURL(base, upstreamPath string, query url.Values) string {
 	return target
 }
 
-func drainAndCloseBody(body io.ReadCloser) {
+func drainBody(body io.ReadCloser) {
 	if body == nil {
 		return
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, drainBodyLimitBytes))
-	_ = body.Close()
 }
 
 func throttledStatusError(msg string, delay time.Duration) error {

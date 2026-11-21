@@ -37,36 +37,54 @@ func (s *Store) existingInboxDigests(
 	for projectID, eventIDs := range byProject {
 		for start := 0; start < len(eventIDs); start += inboxLookupChunkSize {
 			end := min(start+inboxLookupChunkSize, len(eventIDs))
-			chunk := eventIDs[start:end]
-			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-			args := make([]any, 0, len(chunk)+1)
-			args = append(args, projectID)
-			for _, eventID := range chunk {
-				args = append(args, eventID)
-			}
-			query := bind(
-				s.dialect,
-				`SELECT event_id, canonical_digest FROM telemetry_inbox WHERE project_id = ? AND event_id IN (`+
-					placeholders+`)`,
-			)
-			rows, err := querier.QueryContext(ctx, query, args...)
-			if err != nil {
-				return nil, fmt.Errorf("read accepted error events for project %d: %w", projectID, err)
-			}
-			for rows.Next() {
-				var eventID, digest string
-				if err := rows.Scan(&eventID, &digest); err != nil {
-					_ = rows.Close()
-					return nil, fmt.Errorf("scan accepted error event for project %d: %w", projectID, err)
-				}
-				existing[inboxEventKey{projectID: projectID, eventID: eventID}] = digest
-			}
-			if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-				return nil, fmt.Errorf("iterate accepted error events for project %d: %w", projectID, err)
+			if err := s.readExistingInboxDigestsChunk(
+				ctx,
+				querier,
+				projectID,
+				eventIDs[start:end],
+				existing,
+			); err != nil {
+				return nil, err
 			}
 		}
 	}
 	return existing, nil
+}
+
+func (s *Store) readExistingInboxDigestsChunk(
+	ctx context.Context,
+	querier inboxQuerier,
+	projectID int,
+	chunk []string,
+	existing map[inboxEventKey]string,
+) error {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+	args := make([]any, 0, len(chunk)+1)
+	args = append(args, projectID)
+	for _, eventID := range chunk {
+		args = append(args, eventID)
+	}
+	query := bind(
+		s.dialect,
+		`SELECT event_id, canonical_digest FROM telemetry_inbox WHERE project_id = ? AND event_id IN (`+
+			placeholders+`)`,
+	)
+	rows, err := querier.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("read accepted error events for project %d: %w", projectID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var eventID, digest string
+		if err := rows.Scan(&eventID, &digest); err != nil {
+			return fmt.Errorf("scan accepted error event for project %d: %w", projectID, err)
+		}
+		existing[inboxEventKey{projectID: projectID, eventID: eventID}] = digest
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate accepted error events for project %d: %w", projectID, err)
+	}
+	return nil
 }
 
 func filterPendingInboxEntries(
@@ -378,24 +396,9 @@ func (s *Store) claimSQLiteErrorEvents(
 		return nil, fmt.Errorf("begin SQLite error Inbox claim: %w", err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM telemetry_inbox
-		WHERE (status = 'pending' AND available_at <= ?)
-		   OR (status = 'processing' AND claim_until <= ?)
-		ORDER BY available_at, id LIMIT ?`, now, now, limit)
+	ids, err := selectClaimableSQLiteErrorEventIDsTx(ctx, tx, now, limit)
 	if err != nil {
-		return nil, fmt.Errorf("select SQLite error Inbox: %w", err)
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("scan SQLite error Inbox ID: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close SQLite error Inbox IDs: %w", err)
+		return nil, err
 	}
 	items := make([]errortrack.InboxItem, 0, len(ids))
 	for _, id := range ids {
@@ -582,13 +585,21 @@ func (s *Store) IssueIDForErrorEvent(ctx context.Context, projectID int, eventID
 	if err != nil {
 		return 0, false, err
 	}
+	issueID, ok := parseCompletedReceiptIssueID(outcome)
+	return issueID, ok, nil
+}
+
+func parseCompletedReceiptIssueID(outcome string) (int, bool) {
+	if outcome == "" {
+		return 0, false
+	}
 	var receipt struct {
 		IssueID int `json:"issue_id"`
 	}
 	if json.Unmarshal([]byte(outcome), &receipt) != nil || receipt.IssueID <= 0 {
-		return 0, false, nil
+		return 0, false
 	}
-	return receipt.IssueID, true, nil
+	return receipt.IssueID, true
 }
 
 func (s *Store) RetryErrorEvent(
@@ -880,23 +891,8 @@ func (s *Store) ClaimIssueLifecycleEvents(
 		return nil, fmt.Errorf("begin SQLite issue lifecycle claim: %w", err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM issue_lifecycle_events
-		WHERE (status = 'pending' AND available_at <= ?)
-		   OR (status = 'processing' AND claim_until <= ?)
-		ORDER BY available_at, id LIMIT ?`, now, now, limit)
+	ids, err := selectClaimableSQLiteLifecycleEventIDsTx(ctx, tx, now, limit)
 	if err != nil {
-		return nil, fmt.Errorf("select SQLite issue lifecycle events: %w", err)
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	events := make([]errortrack.LifecycleEvent, 0, len(ids))
@@ -1075,13 +1071,63 @@ func (s *Store) DeleteCompletedErrorReceipts(ctx context.Context, cutoff time.Ti
 	return deleted, nil
 }
 
-type errorInboxRows interface {
-	Next() bool
-	Scan(...any) error
-	Err() error
+func selectClaimableSQLiteErrorEventIDsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	now time.Time,
+	limit int,
+) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM telemetry_inbox
+		WHERE (status = 'pending' AND available_at <= ?)
+		   OR (status = 'processing' AND claim_until <= ?)
+		ORDER BY available_at, id LIMIT ?`, now, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select SQLite error Inbox: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan SQLite error Inbox ID: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate SQLite error Inbox IDs: %w", err)
+	}
+	return ids, nil
 }
 
-func scanErrorInboxRows(rows errorInboxRows) ([]errortrack.InboxItem, error) {
+func selectClaimableSQLiteLifecycleEventIDsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	now time.Time,
+	limit int,
+) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM issue_lifecycle_events
+		WHERE (status = 'pending' AND available_at <= ?)
+		   OR (status = 'processing' AND claim_until <= ?)
+		ORDER BY available_at, id LIMIT ?`, now, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select SQLite issue lifecycle events: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func scanErrorInboxRows(rows *sql.Rows) ([]errortrack.InboxItem, error) {
 	var items []errortrack.InboxItem
 	for rows.Next() {
 		var item errortrack.InboxItem
@@ -1110,7 +1156,7 @@ func scanErrorInboxRows(rows errorInboxRows) ([]errortrack.InboxItem, error) {
 	return items, nil
 }
 
-func scanLifecycleEventRows(rows errorInboxRows) ([]errortrack.LifecycleEvent, error) {
+func scanLifecycleEventRows(rows *sql.Rows) ([]errortrack.LifecycleEvent, error) {
 	var events []errortrack.LifecycleEvent
 	for rows.Next() {
 		var evt errortrack.LifecycleEvent

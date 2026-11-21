@@ -261,10 +261,6 @@ func (t *errorTransport) close(ctx context.Context) error {
 	return t.delivery.close(ctx)
 }
 
-func (t *errorTransport) dropped() uint64 {
-	return t.delivery.dropped()
-}
-
 func (t *errorTransport) send(parent context.Context, events []errorEvent) error {
 	if len(events) == 0 {
 		return nil
@@ -340,12 +336,6 @@ func (t *errorTransport) postBatch(parent context.Context, events []errorEvent) 
 		Timeout:       errorSendTimeout,
 		Op:            "send error events",
 	})
-}
-
-func boundErrorEvent(event errorEvent, limit int) (errorEvent, bool) {
-	budget := defaultErrorEventBudget
-	budget.MaxEventBytes = limit
-	return boundErrorEventWithBudget(event, budget)
 }
 
 func boundErrorEventWithBudget(event errorEvent, budget errorEventBudget) (errorEvent, bool) {

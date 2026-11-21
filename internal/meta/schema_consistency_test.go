@@ -121,42 +121,45 @@ func TestBaselineMetadataAndChecksumEnforcement(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rows, err := store.db.Query(
-			`SELECT version, name, checksum, app_version, duration_ms FROM schema_version ORDER BY version`,
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
 		seen := 0
-		for rows.Next() {
-			var version int
-			var durationMillis int64
-			var name, checksum, appVersion string
-			if err := rows.Scan(&version, &name, &checksum, &appVersion, &durationMillis); err != nil {
+		func() {
+			rows, err := store.db.Query(
+				`SELECT version, name, checksum, app_version, duration_ms FROM schema_version ORDER BY version`,
+			)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if seen >= len(definitions) {
-				t.Fatalf("unexpected extra migration history row version=%d", version)
+			defer rows.Close()
+			for rows.Next() {
+				var version int
+				var durationMillis int64
+				var name, checksum, appVersion string
+				if err := rows.Scan(&version, &name, &checksum, &appVersion, &durationMillis); err != nil {
+					t.Fatal(err)
+				}
+				if seen >= len(definitions) {
+					t.Fatalf("unexpected extra migration history row version=%d", version)
+				}
+				definition := definitions[seen]
+				if version != definition.version || name != definition.name || checksum != definition.checksum ||
+					appVersion == "" ||
+					durationMillis < 0 {
+					t.Fatalf(
+						"history row=(%d,%q,%q,%q,%d) definition=%#v",
+						version,
+						name,
+						checksum,
+						appVersion,
+						durationMillis,
+						definition,
+					)
+				}
+				seen++
 			}
-			definition := definitions[seen]
-			if version != definition.version || name != definition.name || checksum != definition.checksum ||
-				appVersion == "" ||
-				durationMillis < 0 {
-				t.Fatalf(
-					"history row=(%d,%q,%q,%q,%d) definition=%#v",
-					version,
-					name,
-					checksum,
-					appVersion,
-					durationMillis,
-					definition,
-				)
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
 			}
-			seen++
-		}
-		if err := rows.Close(); err != nil {
-			t.Fatal(err)
-		}
+		}()
 		if seen != len(definitions) {
 			t.Fatalf("history rows=%d want=%d", seen, len(definitions))
 		}
@@ -253,44 +256,34 @@ func schemaPrimaryKeys(t *testing.T, store *Store) []string {
 		sort.Strings(result)
 		return result
 	}
-	tables, err := store.db.QueryContext(
-		ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for tables.Next() {
-		var name string
-		if err := tables.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
-		names = append(names, name)
-	}
-	_ = tables.Close()
+	names := sqliteTableNames(t, ctx, store.db)
 	for _, table := range names {
-		rows, err := store.db.QueryContext(ctx, `PRAGMA table_info("`+table+`")`)
-		if err != nil {
-			t.Fatal(err)
-		}
 		type pkCol struct {
 			pos  int
 			name string
 		}
 		var pkCols []pkCol
-		for rows.Next() {
-			var cid, notNull, pk int
-			var name, typ string
-			var defaultValue any
-			if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+		func() {
+			rows, err := store.db.QueryContext(ctx, `PRAGMA table_info("`+table+`")`)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if pk > 0 {
-				pkCols = append(pkCols, pkCol{pos: pk, name: name})
+			defer rows.Close()
+			for rows.Next() {
+				var cid, notNull, pk int
+				var name, typ string
+				var defaultValue any
+				if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+					t.Fatal(err)
+				}
+				if pk > 0 {
+					pkCols = append(pkCols, pkCol{pos: pk, name: name})
+				}
 			}
-		}
-		_ = rows.Close()
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 		if len(pkCols) > 0 {
 			sort.Slice(pkCols, func(i, j int) bool { return pkCols[i].pos < pkCols[j].pos })
 			cols := make([]string, len(pkCols))
@@ -302,6 +295,30 @@ func schemaPrimaryKeys(t *testing.T, store *Store) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func sqliteTableNames(t *testing.T, ctx context.Context, db *sql.DB) []string {
+	t.Helper()
+	tables, err := db.QueryContext(
+		ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tables.Close()
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	if err := tables.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return names
 }
 
 func schemaUniqueConstraints(t *testing.T, store *Store) []string {
@@ -342,67 +359,66 @@ func schemaUniqueConstraints(t *testing.T, store *Store) []string {
 		sort.Strings(result)
 		return result
 	}
-	tables, err := store.db.QueryContext(
-		ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for tables.Next() {
-		var name string
-		if err := tables.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
-		names = append(names, name)
-	}
-	_ = tables.Close()
+	names := sqliteTableNames(t, ctx, store.db)
 	for _, table := range names {
-		idxRows, err := store.db.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
-		if err != nil {
-			t.Fatal(err)
-		}
 		var uniqueIdxNames []string
-		for idxRows.Next() {
-			var seq, unique, partial int
-			var name, origin string
-			if err := idxRows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
-				t.Fatal(err)
-			}
-			if unique == 1 && (origin == "c" || origin == "u") {
-				uniqueIdxNames = append(uniqueIdxNames, name)
-			}
-		}
-		_ = idxRows.Close()
-		for _, idxName := range uniqueIdxNames {
-			infoRows, err := store.db.QueryContext(ctx, `PRAGMA index_xinfo("`+idxName+`")`)
+		func() {
+			idxRows, err := store.db.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var cols []string
-			for infoRows.Next() {
-				var seqno, cid, desc, key int
-				var colName sql.NullString
-				var coll string
-				if err := infoRows.Scan(&seqno, &cid, &colName, &desc, &coll, &key); err != nil {
+			defer idxRows.Close()
+			for idxRows.Next() {
+				var seq, unique, partial int
+				var name, origin string
+				if err := idxRows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
 					t.Fatal(err)
 				}
-				if key == 0 || !colName.Valid {
-					continue
-				}
-				if desc == 1 {
-					cols = append(cols, colName.String+" DESC")
-				} else {
-					cols = append(cols, colName.String)
+				if unique == 1 && (origin == "c" || origin == "u") {
+					uniqueIdxNames = append(uniqueIdxNames, name)
 				}
 			}
-			_ = infoRows.Close()
+			if err := idxRows.Err(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		for _, idxName := range uniqueIdxNames {
+			cols := sqliteIndexColumns(t, ctx, store.db, idxName)
 			result = append(result, fmt.Sprintf("%s:(%s)", table, strings.Join(cols, ",")))
 		}
 	}
 	sort.Strings(result)
 	return result
+}
+
+func sqliteIndexColumns(t *testing.T, ctx context.Context, db *sql.DB, idxName string) []string {
+	t.Helper()
+	infoRows, err := db.QueryContext(ctx, `PRAGMA index_xinfo("`+idxName+`")`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer infoRows.Close()
+	var cols []string
+	for infoRows.Next() {
+		var seqno, cid, desc, key int
+		var colName sql.NullString
+		var coll string
+		if err := infoRows.Scan(&seqno, &cid, &colName, &desc, &coll, &key); err != nil {
+			t.Fatal(err)
+		}
+		if key == 0 || !colName.Valid {
+			continue
+		}
+		if desc == 1 {
+			cols = append(cols, colName.String+" DESC")
+		} else {
+			cols = append(cols, colName.String)
+		}
+	}
+	if err := infoRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return cols
 }
 
 func schemaIndexes(t *testing.T, store *Store) []string {
@@ -446,67 +462,36 @@ func schemaIndexes(t *testing.T, store *Store) []string {
 		sort.Strings(result)
 		return result
 	}
-	tables, err := store.db.QueryContext(
-		ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for tables.Next() {
-		var name string
-		if err := tables.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
-		names = append(names, name)
-	}
-	_ = tables.Close()
+	names := sqliteTableNames(t, ctx, store.db)
 	for _, table := range names {
-		idxRows, err := store.db.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
-		if err != nil {
-			t.Fatal(err)
-		}
 		type sqliteIndex struct {
 			name   string
 			unique bool
 		}
 		var indexes []sqliteIndex
-		for idxRows.Next() {
-			var seq, unique, partial int
-			var name, origin string
-			if err := idxRows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
-				t.Fatal(err)
-			}
-			if origin != "c" {
-				continue
-			}
-			indexes = append(indexes, sqliteIndex{name: name, unique: unique == 1})
-		}
-		_ = idxRows.Close()
-		for _, idx := range indexes {
-			infoRows, err := store.db.QueryContext(ctx, `PRAGMA index_xinfo("`+idx.name+`")`)
+		func() {
+			idxRows, err := store.db.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var cols []string
-			for infoRows.Next() {
-				var seqno, cid, desc, key int
-				var colName sql.NullString
-				var coll string
-				if err := infoRows.Scan(&seqno, &cid, &colName, &desc, &coll, &key); err != nil {
+			defer idxRows.Close()
+			for idxRows.Next() {
+				var seq, unique, partial int
+				var name, origin string
+				if err := idxRows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
 					t.Fatal(err)
 				}
-				if key == 0 || !colName.Valid {
+				if origin != "c" {
 					continue
 				}
-				if desc == 1 {
-					cols = append(cols, colName.String+" DESC")
-				} else {
-					cols = append(cols, colName.String)
-				}
+				indexes = append(indexes, sqliteIndex{name: name, unique: unique == 1})
 			}
-			_ = infoRows.Close()
+			if err := idxRows.Err(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		for _, idx := range indexes {
+			cols := sqliteIndexColumns(t, ctx, store.db, idx.name)
 			result = append(
 				result,
 				fmt.Sprintf("%s.%s:unique=%t(%s)", table, idx.name, idx.unique, strings.Join(cols, ",")),
@@ -562,39 +547,38 @@ func schemaForeignKeys(t *testing.T, store *Store) []string {
 		sort.Strings(result)
 		return result
 	}
-	tables, err := store.db.QueryContext(
-		ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for tables.Next() {
-		var name string
-		if err := tables.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
-		names = append(names, name)
-	}
-	_ = tables.Close()
+	names := sqliteTableNames(t, ctx, store.db)
 	for _, table := range names {
-		fkRows, err := store.db.QueryContext(ctx, `PRAGMA foreign_key_list("`+table+`")`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for fkRows.Next() {
-			var id, seq int
-			var refTable, fromCol, toCol, onUpdate, onDelete, match string
-			if err := fkRows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
+		func() {
+			fkRows, err := store.db.QueryContext(ctx, `PRAGMA foreign_key_list("`+table+`")`)
+			if err != nil {
 				t.Fatal(err)
 			}
-			result = append(
-				result,
-				fmt.Sprintf("%s.%s->%s.%s:%s", table, fromCol, refTable, toCol, strings.ToUpper(onDelete)),
-			)
-		}
-		_ = fkRows.Close()
+			defer fkRows.Close()
+			for fkRows.Next() {
+				var id, seq int
+				var refTable, fromCol, toCol, onUpdate, onDelete, match string
+				if err := fkRows.Scan(
+					&id,
+					&seq,
+					&refTable,
+					&fromCol,
+					&toCol,
+					&onUpdate,
+					&onDelete,
+					&match,
+				); err != nil {
+					t.Fatal(err)
+				}
+				result = append(
+					result,
+					fmt.Sprintf("%s.%s->%s.%s:%s", table, fromCol, refTable, toCol, strings.ToUpper(onDelete)),
+				)
+			}
+			if err := fkRows.Err(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 	}
 	sort.Strings(result)
 	return result
@@ -698,47 +682,37 @@ func schemaColumns(t *testing.T, store *Store) []string {
 		sort.Strings(result)
 		return result
 	}
-	tables, err := store.db.QueryContext(
-		ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_version' ORDER BY name`,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for tables.Next() {
-		var name string
-		if err := tables.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
-		names = append(names, name)
-	}
-	_ = tables.Close()
+	names := sqliteTableNames(t, ctx, store.db)
 	for _, table := range names {
-		rows, err := store.db.QueryContext(ctx, `PRAGMA table_info("`+table+`")`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for rows.Next() {
-			var cid, notNull, pk int
-			var name, typ string
-			var defaultValue sql.NullString
-			if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+		func() {
+			rows, err := store.db.QueryContext(ctx, `PRAGMA table_info("`+table+`")`)
+			if err != nil {
 				t.Fatal(err)
 			}
-			result = append(
-				result,
-				fmt.Sprintf(
-					"%s.%s:%s:null=%t:def=%s",
-					table,
-					name,
-					canonicalColumnType("sqlite", typ),
-					notNull == 0 && pk == 0,
-					normalizeColumnDefault(defaultValue),
-				),
-			)
-		}
-		_ = rows.Close()
+			defer rows.Close()
+			for rows.Next() {
+				var cid, notNull, pk int
+				var name, typ string
+				var defaultValue sql.NullString
+				if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+					t.Fatal(err)
+				}
+				result = append(
+					result,
+					fmt.Sprintf(
+						"%s.%s:%s:null=%t:def=%s",
+						table,
+						name,
+						canonicalColumnType("sqlite", typ),
+						notNull == 0 && pk == 0,
+						normalizeColumnDefault(defaultValue),
+					),
+				)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 	}
 	sort.Strings(result)
 	return result

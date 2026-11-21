@@ -129,6 +129,29 @@ func (s *Store) claimPostgresNotifications(
 	return scanNotificationOutboxRows(rows)
 }
 
+func selectClaimableSQLiteNotificationIDsTx(ctx context.Context, tx *sql.Tx, limit int) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM notification_outbox
+		WHERE (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
+		   OR (status = 'processing' AND claim_until <= CURRENT_TIMESTAMP)
+		ORDER BY priority DESC, available_at, id LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select SQLite notification outbox: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan SQLite notification outbox ID: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate SQLite notification outbox IDs: %w", err)
+	}
+	return ids, nil
+}
+
 func (s *Store) claimSQLiteNotifications(
 	ctx context.Context,
 	owner string,
@@ -140,24 +163,9 @@ func (s *Store) claimSQLiteNotifications(
 		return nil, fmt.Errorf("begin SQLite notification outbox claim: %w", err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM notification_outbox
-		WHERE (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
-		   OR (status = 'processing' AND claim_until <= CURRENT_TIMESTAMP)
-		ORDER BY priority DESC, available_at, id LIMIT ?`, limit)
+	ids, err := selectClaimableSQLiteNotificationIDsTx(ctx, tx, limit)
 	if err != nil {
-		return nil, fmt.Errorf("select SQLite notification outbox: %w", err)
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("scan SQLite notification outbox ID: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close SQLite notification outbox IDs: %w", err)
+		return nil, err
 	}
 	var items []NotificationOutboxItem
 	for _, id := range ids {

@@ -254,21 +254,15 @@ func (s *Store) RecordPlatformErrorRate(
 	return result, nil
 }
 
-// CheckPlatformErrorRateRecoveries inspects all projects with a firing
-// error_rate_spike state and transitions any whose sliding-window error count
-// has fallen at or below threshold (or whose threshold was disabled) to
-// resolved.
-func (s *Store) CheckPlatformErrorRateRecoveries(
-	ctx context.Context,
-	now time.Time,
-	window time.Duration,
-) ([]PlatformErrorSpikeRecovery, error) {
-	if window <= 0 {
-		return nil, errors.New("platform error rate recovery check requires positive window")
-	}
-	now = now.UTC()
-	cutoffBucket := alignPlatformErrorBucket(now.Add(-window))
+type platformErrorSpikeCandidate struct {
+	projectID   int
+	projectSlug string
+	cycle       int64
+	startsAt    time.Time
+	threshold   int
+}
 
+func (s *Store) listFiringErrorSpikeCandidates(ctx context.Context) ([]platformErrorSpikeCandidate, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		bind(
@@ -285,19 +279,12 @@ func (s *Store) CheckPlatformErrorRateRecoveries(
 	if err != nil {
 		return nil, fmt.Errorf("list firing platform alert states: %w", err)
 	}
-	type candidate struct {
-		projectID   int
-		projectSlug string
-		cycle       int64
-		startsAt    time.Time
-		threshold   int
-	}
-	var candidates []candidate
+	defer rows.Close()
+	var candidates []platformErrorSpikeCandidate
 	for rows.Next() {
-		var c candidate
+		var c platformErrorSpikeCandidate
 		var startsAt sql.NullTime
 		if scanErr := rows.Scan(&c.projectID, &c.projectSlug, &c.cycle, &startsAt, &c.threshold); scanErr != nil {
-			_ = rows.Close()
 			return nil, fmt.Errorf("scan firing platform alert state: %w", scanErr)
 		}
 		if startsAt.Valid {
@@ -305,11 +292,30 @@ func (s *Store) CheckPlatformErrorRateRecoveries(
 		}
 		candidates = append(candidates, c)
 	}
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close firing platform alert states: %w", err)
-	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate firing platform alert states: %w", err)
+	}
+	return candidates, nil
+}
+
+// CheckPlatformErrorRateRecoveries inspects all projects with a firing
+// error_rate_spike state and transitions any whose sliding-window error count
+// has fallen at or below threshold (or whose threshold was disabled) to
+// resolved.
+func (s *Store) CheckPlatformErrorRateRecoveries(
+	ctx context.Context,
+	now time.Time,
+	window time.Duration,
+) ([]PlatformErrorSpikeRecovery, error) {
+	if window <= 0 {
+		return nil, errors.New("platform error rate recovery check requires positive window")
+	}
+	now = now.UTC()
+	cutoffBucket := alignPlatformErrorBucket(now.Add(-window))
+
+	candidates, err := s.listFiringErrorSpikeCandidates(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	var recoveries []PlatformErrorSpikeRecovery

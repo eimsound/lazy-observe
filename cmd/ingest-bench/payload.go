@@ -485,7 +485,7 @@ func (p *payloadPool) materializeTrace(dst []byte, workerID int, seq uint64, now
 		}
 		copy(buf[tpl.spanIDOffsets[i]:tpl.spanIDOffsets[i]+8], spanID[:])
 		start := nowNano + uint64(i)*10_000
-		end := start + 250_000 + uint64((seq+uint64(i))%500)*1000
+		end := start + 250_000 + ((seq+uint64(i))%500)*1000
 		binary.LittleEndian.PutUint64(buf[tpl.startOffsets[i]:tpl.startOffsets[i]+8], start)
 		binary.LittleEndian.PutUint64(buf[tpl.endOffsets[i]:tpl.endOffsets[i]+8], end)
 	}

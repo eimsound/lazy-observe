@@ -3,6 +3,7 @@ package blob
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func TestStoreContract(t *testing.T) {
 			if err := store.Delete(ctx, "replay/project/session/1.json.gz"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.Get(ctx, "replay/project/session/1.json.gz"); err != ErrNotFound {
+			if _, err := store.Get(ctx, "replay/project/session/1.json.gz"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Get deleted error = %v", err)
 			}
 			if err := store.DeletePrefix(ctx, "replay/project/session/"); err != nil {
@@ -105,7 +106,7 @@ func TestPrefixOperationsMatchDirectoryBoundariesAcrossBackends(t *testing.T) {
 			if err := store.DeletePrefix(ctx, "replay/a"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.Get(ctx, "replay/a/1.json.gz"); err != ErrNotFound {
+			if _, err := store.Get(ctx, "replay/a/1.json.gz"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("replay/a/1.json.gz should be deleted, err=%v", err)
 			}
 			if r, err := store.Get(ctx, "replay/ab/1.json.gz"); err != nil {
@@ -151,7 +152,7 @@ func TestStoresRejectPathTraversal(t *testing.T) {
 	for name, store := range stores {
 		for _, key := range []string{"../escape", "replay/../escape", "/absolute", "replay/a b/x", "replay//x"} {
 			t.Run(name+"/"+key, func(t *testing.T) {
-				if err := store.Put(context.Background(), key, strings.NewReader("x")); err != ErrInvalidKey {
+				if err := store.Put(context.Background(), key, strings.NewReader("x")); !errors.Is(err, ErrInvalidKey) {
 					t.Fatalf("error = %v", err)
 				}
 			})

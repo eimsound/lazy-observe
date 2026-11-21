@@ -369,7 +369,7 @@ func (i *Inbox) Accept(ctx context.Context, project Project, events []AcceptedEv
 		}
 		payload, err := canonicalJSON(input.Raw)
 		if err != nil {
-			return fmt.Errorf("%w: canonicalize event %q: %v", ErrInvalid, input.Event.EventID, err)
+			return fmt.Errorf("%w: canonicalize event %q: %w", ErrInvalid, input.Event.EventID, err)
 		}
 		digest := sha256.Sum256(payload)
 		entries = append(entries, InboxEntry{
@@ -383,7 +383,7 @@ func (i *Inbox) Accept(ctx context.Context, project Project, events []AcceptedEv
 			errors.Is(err, ErrUnavailable) {
 			return err
 		}
-		return fmt.Errorf("%w: durably accept error events: %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: durably accept error events: %w", ErrUnavailable, err)
 	}
 	i.notify()
 	return nil

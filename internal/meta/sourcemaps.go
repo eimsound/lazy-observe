@@ -91,28 +91,16 @@ func (s *Store) UpsertSourceMapArtifacts(
 		incoming[item.Filename] = item
 		incomingBytes += item.Size
 	}
-	rows, err := tx.QueryContext(ctx, bind(s.dialect, `SELECT filename, size FROM source_map_artifacts
-		WHERE project_id = ? AND release = ?`), projectID, release)
+	existingCount, existingBytes, err := readExistingSourceMapReleaseQuotaTx(
+		ctx,
+		tx,
+		s.dialect,
+		projectID,
+		release,
+		incoming,
+	)
 	if err != nil {
-		return fmt.Errorf("read existing source map release quota: %w", err)
-	}
-	existingCount := 0
-	var existingBytes int64
-	for rows.Next() {
-		var filename string
-		var size int64
-		if err := rows.Scan(&filename, &size); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("scan source map release quota: %w", err)
-		}
-		if _, replaced := incoming[filename]; replaced {
-			continue
-		}
-		existingCount++
-		existingBytes += size
-	}
-	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return fmt.Errorf("iterate source map release quota: %w", err)
+		return err
 	}
 	if (maxFiles > 0 && existingCount+len(incoming) > maxFiles) ||
 		(maxBytes > 0 && existingBytes+incomingBytes > maxBytes) {
@@ -260,23 +248,67 @@ func (s *Store) ReferencedSourceMapDigests(ctx context.Context, projectID int) (
 	if err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, bind(s.dialect, `SELECT DISTINCT sha256 FROM source_map_artifacts
-		WHERE project_id = ?`), projectID)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var digest string
-		if err := rows.Scan(&digest); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		referenced[digest] = true
-	}
-	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+	if err := readReferencedSourceMapDigestsTx(ctx, tx, s.dialect, projectID, referenced); err != nil {
 		return nil, err
 	}
 	return referenced, tx.Commit()
+}
+
+func readExistingSourceMapReleaseQuotaTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	dbDialect string,
+	projectID int,
+	release string,
+	incoming map[string]SourceMapArtifactInput,
+) (int, int64, error) {
+	rows, err := tx.QueryContext(ctx, bind(dbDialect, `SELECT filename, size FROM source_map_artifacts
+		WHERE project_id = ? AND release = ?`), projectID, release)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read existing source map release quota: %w", err)
+	}
+	defer rows.Close()
+	existingCount := 0
+	var existingBytes int64
+	for rows.Next() {
+		var filename string
+		var size int64
+		if err := rows.Scan(&filename, &size); err != nil {
+			return 0, 0, fmt.Errorf("scan source map release quota: %w", err)
+		}
+		if _, replaced := incoming[filename]; replaced {
+			continue
+		}
+		existingCount++
+		existingBytes += size
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, fmt.Errorf("iterate source map release quota: %w", err)
+	}
+	return existingCount, existingBytes, nil
+}
+
+func readReferencedSourceMapDigestsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	dbDialect string,
+	projectID int,
+	referenced map[string]bool,
+) error {
+	rows, err := tx.QueryContext(ctx, bind(dbDialect, `SELECT DISTINCT sha256 FROM source_map_artifacts
+		WHERE project_id = ?`), projectID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			return err
+		}
+		referenced[digest] = true
+	}
+	return rows.Err()
 }
 
 // pendingSnapshotDigestsTx collects revision digests captured by Inbox items

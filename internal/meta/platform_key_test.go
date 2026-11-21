@@ -51,16 +51,9 @@ func TestPlatformKeyFingerprintRecordsFirstValueAndKeepsIt(t *testing.T) {
 			t.Fatalf("recorded fingerprint = %q after a mismatch, want %q", other.Fingerprint, "fingerprint-a")
 		}
 
-		count, err := store.db.QueryContext(ctx, `SELECT COUNT(*) FROM platform_key_fingerprints`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer count.Close()
-		if !count.Next() {
-			t.Fatal("count platform_key_fingerprints returned no row")
-		}
 		var rows int
-		if err := count.Scan(&rows); err != nil {
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM platform_key_fingerprints`).
+			Scan(&rows); err != nil {
 			t.Fatal(err)
 		}
 		if rows != 1 {

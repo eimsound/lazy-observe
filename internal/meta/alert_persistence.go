@@ -374,54 +374,14 @@ func (s *Store) UpdateAlertRule(
 			return AlertRuleView{}, fmt.Errorf("fence alert rule lease on update: %w", err)
 		}
 		if input.BuildResolveNotifications != nil {
-			firingRows, err := tx.QueryContext(
-				ctx,
-				bind(
-					s.dialect,
-					`SELECT rule_id, fingerprint, status, pending_since, firing_since, last_evaluated_at,
-						labels, annotations, value, last_notified_at, lease_epoch
-					 FROM alert_rule_states
-					 WHERE rule_id = ? AND status = 'firing'
-					 ORDER BY fingerprint`,
-				),
-				id,
-			)
+			firingStates, err := loadFiringAlertStatesTx(ctx, tx, s.dialect, id)
 			if err != nil {
-				return AlertRuleView{}, fmt.Errorf("load firing alert states for resolve notification: %w", err)
-			}
-			firingStates, scanErr := scanAlertRuleStates(firingRows)
-			_ = firingRows.Close()
-			if scanErr != nil {
-				return AlertRuleView{}, fmt.Errorf("scan firing alert states for resolve notification: %w", scanErr)
+				return AlertRuleView{}, err
 			}
 			if len(firingStates) != 0 {
-				channelRows, chErr := tx.QueryContext(
-					ctx,
-					bind(
-						s.dialect,
-						`SELECT c.id FROM alert_rule_channels AS rc
-						 JOIN notification_channels AS c ON c.id = rc.notification_channel_id
-						 WHERE rc.alert_rule_id = ? AND c.enabled = TRUE
-						 ORDER BY c.id`,
-					),
-					id,
-				)
-				if chErr != nil {
-					return AlertRuleView{}, fmt.Errorf("load rule notification channels for resolve: %w", chErr)
-				}
-				var enabledChannels []int
-				for channelRows.Next() {
-					var channelID int
-					if scanChErr := channelRows.Scan(&channelID); scanChErr != nil {
-						_ = channelRows.Close()
-						return AlertRuleView{}, fmt.Errorf("scan rule notification channel for resolve: %w", scanChErr)
-					}
-					enabledChannels = append(enabledChannels, channelID)
-				}
-				rowsErr := channelRows.Err()
-				_ = channelRows.Close()
-				if rowsErr != nil {
-					return AlertRuleView{}, fmt.Errorf("iterate rule notification channels for resolve: %w", rowsErr)
+				enabledChannels, err := loadEnabledAlertRuleChannelsTx(ctx, tx, s.dialect, id)
+				if err != nil {
+					return AlertRuleView{}, err
 				}
 				if len(enabledChannels) != 0 {
 					notifications, buildErr := input.BuildResolveNotifications(
@@ -518,6 +478,70 @@ func (s *Store) DeleteAlertRule(ctx context.Context, projectSlug string, id int)
 		return fmt.Errorf("commit alert rule delete: %w", err)
 	}
 	return nil
+}
+
+func loadFiringAlertStatesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	dbDialect string,
+	ruleID int,
+) ([]AlertRuleState, error) {
+	rows, err := tx.QueryContext(
+		ctx,
+		bind(
+			dbDialect,
+			`SELECT rule_id, fingerprint, status, pending_since, firing_since, last_evaluated_at,
+				labels, annotations, value, last_notified_at, lease_epoch
+			 FROM alert_rule_states
+			 WHERE rule_id = ? AND status = 'firing'
+			 ORDER BY fingerprint`,
+		),
+		ruleID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load firing alert states for resolve notification: %w", err)
+	}
+	defer rows.Close()
+	states, err := scanAlertRuleStates(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan firing alert states for resolve notification: %w", err)
+	}
+	return states, nil
+}
+
+func loadEnabledAlertRuleChannelsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	dbDialect string,
+	ruleID int,
+) ([]int, error) {
+	rows, err := tx.QueryContext(
+		ctx,
+		bind(
+			dbDialect,
+			`SELECT c.id FROM alert_rule_channels AS rc
+			 JOIN notification_channels AS c ON c.id = rc.notification_channel_id
+			 WHERE rc.alert_rule_id = ? AND c.enabled = TRUE
+			 ORDER BY c.id`,
+		),
+		ruleID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load rule notification channels for resolve: %w", err)
+	}
+	defer rows.Close()
+	var enabledChannels []int
+	for rows.Next() {
+		var channelID int
+		if err := rows.Scan(&channelID); err != nil {
+			return nil, fmt.Errorf("scan rule notification channel for resolve: %w", err)
+		}
+		enabledChannels = append(enabledChannels, channelID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rule notification channels for resolve: %w", err)
+	}
+	return enabledChannels, nil
 }
 
 func alertRuleView(row *dbent.AlertRule) (AlertRuleView, error) {

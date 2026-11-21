@@ -188,9 +188,10 @@ func (s *Server) Serve(ln net.Listener) error {
 // and idempotent to call multiple times.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.stopOnce.Do(func() {
-		if ctx == nil {
+		shutdownCtx := ctx
+		if shutdownCtx == nil {
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(context.Background(), s.drainTimeout)
+			shutdownCtx, cancel = context.WithTimeout(context.Background(), s.drainTimeout)
 			defer cancel()
 		}
 		done := make(chan struct{})
@@ -202,12 +203,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-done:
 			s.shutdownCancel()
 			s.stopErr = nil
-		case <-ctx.Done():
-			s.logger.Warn("otlp grpc graceful stop timed out; forcing immediate stop", "error", ctx.Err())
+		case <-shutdownCtx.Done():
+			s.logger.Warn("otlp grpc graceful stop timed out; forcing immediate stop", "error", shutdownCtx.Err())
 			s.shutdownCancel()
 			s.grpcServer.Stop()
 			<-done
-			s.stopErr = ctx.Err()
+			s.stopErr = shutdownCtx.Err()
 		}
 	})
 	return s.stopErr

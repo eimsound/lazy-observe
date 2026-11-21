@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -247,7 +248,7 @@ func TestDeletedProjectSlugCannotBeReusedAndTracksBlobCleanup(t *testing.T) {
 		if len(pending) != 1 || pending[0] != "reused-slug" {
 			t.Fatalf("pending deleted project blobs=%v want [reused-slug]", pending)
 		}
-		if _, err := store.CreateProject(ctx, "Reincarnated", "reused-slug"); err != ErrProjectSlugReserved {
+		if _, err := store.CreateProject(ctx, "Reincarnated", "reused-slug"); !errors.Is(err, ErrProjectSlugReserved) {
 			t.Fatalf("CreateProject with deleted slug err=%v want ErrProjectSlugReserved", err)
 		}
 		// Another project must not be able to mutate its slug (including onto a tombstoned slug).
@@ -255,10 +256,16 @@ func TestDeletedProjectSlugCannotBeReusedAndTracksBlobCleanup(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.UpdateProject(ctx, other.ID, "Other", "reused-slug"); err != ErrProjectSlugImmutable {
+		if _, err := store.UpdateProject(ctx, other.ID, "Other", "reused-slug"); !errors.Is(
+			err,
+			ErrProjectSlugImmutable,
+		) {
 			t.Fatalf("UpdateProject slug mutation err=%v want ErrProjectSlugImmutable", err)
 		}
-		if _, err := store.UpdateProject(ctx, other.ID, "Other", "brand-new-slug"); err != ErrProjectSlugImmutable {
+		if _, err := store.UpdateProject(ctx, other.ID, "Other", "brand-new-slug"); !errors.Is(
+			err,
+			ErrProjectSlugImmutable,
+		) {
 			t.Fatalf("UpdateProject slug rename err=%v want ErrProjectSlugImmutable", err)
 		}
 		renamed, err := store.UpdateProject(ctx, other.ID, "Other Renamed", "other-slug")
