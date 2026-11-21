@@ -476,19 +476,6 @@
       "allowedVersions": "<27.0.0"
     },
     {
-      "description": "unplugin 3 只发 ESM：bundler-plugin 的 dist/index.cjs 会 require(\"unplugin\")，Node <22.12 报 ERR_REQUIRE_ESM；其可选 peer 会把 vite→lightningcss(MPL-2.0) 链进 --prod 许可证检查。迁移切片定下 engines、CJS 取舍与许可证门禁口径后撤掉",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchFileNames": [
-        "sdk/browser/**"
-      ],
-      "matchPackageNames": [
-        "unplugin"
-      ],
-      "allowedVersions": "<3.0.0"
-    },
-    {
       "description": "Python SDK 是库：pyproject.toml 里的 >= 下限是对使用方的兼容承诺，不因为有新版就抬高",
       "matchManagers": [
         "pep621"
