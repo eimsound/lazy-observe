@@ -254,6 +254,160 @@ test("链路：检索 trace 并进入瀑布详情", async ({ page }) => {
   await expect(page).toHaveURL(/\/traces\/[a-f0-9]{32}$/);
   await expect(page.locator("main")).toContainText(/Trace ID:[a-f0-9]{32}/);
   await expect(page.getByText("悬停查看时长与占比")).toBeVisible();
+
+  // 验证瀑布图折叠/展开与点击选中 Span 详情抽屉联动正常
+  const waterfallRows = page.locator('[data-virtualized] [role="button"][tabindex="0"]');
+  const initialCount = await waterfallRows.count();
+  expect(initialCount).toBeGreaterThan(1);
+
+  const rootToggle = page.locator('[data-virtualized] button[aria-expanded]').first();
+  await expect(rootToggle).toHaveAttribute("aria-expanded", "true");
+  await rootToggle.click();
+  await expect(rootToggle).toHaveAttribute("aria-expanded", "false");
+  expect(await waterfallRows.count()).toBeLessThan(initialCount);
+
+  await rootToggle.click();
+  await expect(rootToggle).toHaveAttribute("aria-expanded", "true");
+  await expect(waterfallRows).toHaveCount(initialCount);
+
+  await waterfallRows.first().click();
+  await expect(page.getByRole("button", { name: "查看 Trace 精确日志" })).toBeVisible();
+});
+
+test("日志 JSON 视图：支持虚拟滚动、单行展开/收起与复制", async ({ page }) => {
+  await openFeature(page, "/logs?q=*&run=1&view=json&limit=200");
+
+  const list = page.locator('section[aria-label="JSON Lines"] [role="list"]');
+  await expect(list).toBeVisible();
+  await expect(list).toHaveAttribute("data-virtualized", "true");
+
+  // 200 行仅挂载可见窗口 + overscan，远少于总行数
+  const initialMounted = await list.getByRole("listitem").count();
+  expect(initialMounted).toBeGreaterThan(0);
+  expect(initialMounted).toBeLessThan(80);
+
+  // 展开与收起第一条 JSON 日志（多行 pretty-print 切换）
+  const firstExpand = list.getByRole("button", { name: "展开日志行" }).first();
+  await firstExpand.click();
+  const firstCollapse = list.getByRole("button", { name: "收起日志行" }).first();
+  await expect(firstCollapse).toHaveAttribute("aria-expanded", "true");
+  await expect(list.locator("pre").first()).toBeVisible();
+  await firstCollapse.click();
+  await expect(list.getByRole("button", { name: "展开日志行" }).first()).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+
+  // 滚动到底部后挂载后续日志行，DOM 节点仍维持有界窗口
+  await list.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+    el.dispatchEvent(new Event("scroll"));
+  });
+  await expect.poll(async () => {
+    const indices = await list
+      .getByRole("listitem")
+      .evaluateAll((els) => els.map((el) => Number(el.getAttribute("data-virtual-index"))));
+    return Math.max(...indices);
+  }).toBeGreaterThanOrEqual(150);
+  const scrolledMounted = await list.getByRole("listitem").count();
+  expect(scrolledMounted).toBeLessThan(80);
+
+  // 清空结果（卸载滚动容器）后重新拉取大结果集，滚动位置应复位到顶部且不出现白屏
+  const editor = page.getByLabel("LogsQL 表达式");
+  await editor.click();
+  await editor.press("Control+A");
+  await editor.pressSequentially("__empty");
+  await page.getByRole("button", { name: "查询", exact: true }).click();
+  await expect(page.getByText("无匹配日志")).toBeVisible();
+
+  await editor.click();
+  await editor.press("Control+A");
+  await editor.pressSequentially("*");
+  await page.getByRole("button", { name: "查询", exact: true }).click();
+  await expect(list).toBeVisible();
+  await expect(list.getByRole("listitem").first()).toHaveAttribute("data-virtual-index", "0");
+});
+
+test("日志 JSON 视图：展开高行后滚回行顶收起不出现视口白屏", async ({ page }) => {
+  await openFeature(page, "/logs?q=*&run=1&view=json&limit=500");
+
+  const list = page.locator('section[aria-label="JSON Lines"] [role="list"]');
+  await expect(list).toBeVisible();
+  await expect(list).toHaveAttribute("data-virtualized", "true");
+
+  // 滚到中间第 150 行附近并展开该行
+  const targetIndex = 150;
+  await list.evaluate((el, idx) => {
+    el.scrollTop = idx * 24;
+    el.dispatchEvent(new Event("scroll"));
+  }, targetIndex);
+
+  const targetRow = list.locator(`[role="listitem"][data-virtual-index="${targetIndex}"]`);
+  await expect(targetRow).toBeVisible();
+  await targetRow.getByRole("button", { name: "展开日志行" }).click();
+  await expect(targetRow.getByRole("button", { name: "收起日志行" })).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+
+  // 模拟超大 JSON 载荷（~2,246px 高）触发 ResizeObserver 更新行高
+  await targetRow.locator("pre").evaluate((pre) => {
+    pre.style.minHeight = "2246px";
+  });
+  await expect
+    .poll(() => targetRow.evaluate((el) => el.getBoundingClientRect().height))
+    .toBeGreaterThan(2_200);
+
+  // 在高行内部向下滚动至行底，再滚回该行顶部
+  const rowTop = await list.evaluate((container, idx) => {
+    const row = container.querySelector(`[role="listitem"][data-virtual-index="${idx}"]`);
+    if (!row) return -1;
+    const top =
+      row.getBoundingClientRect().top -
+      container.getBoundingClientRect().top +
+      container.scrollTop;
+    container.scrollTop = top + 1_600;
+    container.dispatchEvent(new Event("scroll"));
+    return top;
+  }, targetIndex);
+  expect(rowTop).toBeGreaterThan(0);
+
+  await page.waitForTimeout(80);
+
+  await list.evaluate((container, top) => {
+    container.scrollTop = top;
+    container.dispatchEvent(new Event("scroll"));
+  }, rowTop);
+  await page.waitForTimeout(80);
+
+  // 点击收起高行：视口内必须保留可见日志行且当前行仍在视口内（绝不白屏）
+  await targetRow.getByRole("button", { name: "收起日志行" }).click();
+  await expect(targetRow.getByRole("button", { name: "展开日志行" })).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+
+  await expect
+    .poll(() =>
+      list.evaluate((container) => {
+        const cRect = container.getBoundingClientRect();
+        const items = Array.from(container.querySelectorAll('[role="listitem"]'));
+        return items.filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.bottom > cRect.top && r.top < cRect.bottom;
+        }).length;
+      }),
+    )
+    .toBeGreaterThan(0);
+
+  const targetInViewport = await list.evaluate((container, idx) => {
+    const cRect = container.getBoundingClientRect();
+    const row = container.querySelector(`[role="listitem"][data-virtual-index="${idx}"]`);
+    if (!row) return false;
+    const r = row.getBoundingClientRect();
+    return r.bottom > cRect.top && r.top < cRect.bottom;
+  }, targetIndex);
+  expect(targetInViewport).toBe(true);
 });
 
 test("问题：打开 Issue 并检查堆栈与关联入口", async ({ page }) => {
