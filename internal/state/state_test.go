@@ -330,3 +330,56 @@ func TestMemoryLoginGateBoundsCapacityPreservesLocksAndReclaimsExpired(t *testin
 		t.Fatalf("expired login gate entries were not reclaimed: size = %d, want 1", got)
 	}
 }
+
+func TestRedisAuthInvalidatorPublishSubscribeSubSecond(t *testing.T) {
+	server := miniredis.RunT(t)
+	clientA := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	clientB := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = clientA.Close(); _ = clientB.Close() })
+
+	replicaA := NewRedis(clientA, "auth-inv-test")
+	replicaB := NewRedis(clientB, "auth-inv-test")
+
+	subCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ready := make(chan struct{})
+	invalidated := make(chan struct{}, 4)
+	done := make(chan error, 1)
+	go func() {
+		done <- replicaB.Subscribe(
+			subCtx,
+			func() { close(ready) },
+			func() { invalidated <- struct{}{} },
+		)
+	}()
+
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Redis auth invalidator subscription")
+	}
+
+	started := time.Now()
+	if err := replicaA.Publish(context.Background()); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+	select {
+	case <-invalidated:
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("invalidation latency = %s, want sub-second", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cross-replica auth invalidation")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Subscribe exit err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Subscribe did not exit after cancellation")
+	}
+}

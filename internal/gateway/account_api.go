@@ -2,10 +2,8 @@ package gateway
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"errors"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -51,30 +49,6 @@ func newCSRFToken() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(value), nil
-}
-
-// csrfRequired enforces the double-submit cookie check for mutating
-// session-authenticated requests. Bearer-token requests and read-only
-// methods are exempt; the token never leaves the browser except through the
-// X-CSRF-Token header.
-func (g *Gateway) csrfRequired(c fiber.Ctx) error {
-	if !g.requireCSRF {
-		return c.Next()
-	}
-	switch c.Method() {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
-		return c.Next()
-	}
-	if c.Cookies("lo_session") == "" {
-		return c.Next()
-	}
-	expected := c.Cookies(csrfCookieName)
-	actual := strings.TrimSpace(c.Get(csrfHeaderName))
-	if expected == "" || subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
-		return c.Status(fiber.StatusForbidden).
-			JSON(fiber.Map{"code": "csrf_failed", "error": "CSRF token missing or invalid"})
-	}
-	return c.Next()
 }
 
 func (g *Gateway) changePassword(c fiber.Ctx) error {

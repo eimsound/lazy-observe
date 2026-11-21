@@ -235,10 +235,11 @@ func ensurePlatformKeyFingerprint(
 }
 
 type serverSharedState struct {
-	sessions    sharedstate.SessionStore
-	limits      sharedstate.Limiter
-	loginGate   sharedstate.LoginGate
-	redisClient *redis.Client
+	sessions        sharedstate.SessionStore
+	limits          sharedstate.Limiter
+	loginGate       sharedstate.LoginGate
+	authInvalidator sharedstate.AuthInvalidator
+	redisClient     *redis.Client
 }
 
 func openServerSharedState(ctx context.Context, cfg appconfig.Config) (*serverSharedState, error) {
@@ -265,6 +266,7 @@ func openServerSharedState(ctx context.Context, cfg appconfig.Config) (*serverSh
 	state.sessions = redisState
 	state.limits = redisState
 	state.loginGate = redisState
+	state.authInvalidator = redisState
 	state.redisClient = client
 	return state, nil
 }

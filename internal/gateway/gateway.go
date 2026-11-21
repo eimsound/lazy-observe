@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/account"
@@ -44,7 +43,6 @@ import (
 
 const projectLocal = "lazy-observe.project"
 const userLocal = "lazy-observe.user"
-const tokenCacheTTL = 30 * time.Second
 
 // maxDecodedRequestBody bounds every request body after Content-Encoding is
 // removed. It equals the compressed BodyLimit so compression never raises the
@@ -132,6 +130,7 @@ type Config struct {
 	InstanceID              string
 	Tokens                  TokenStore
 	UploadTokens            UploadTokenStore
+	AuthInvalidator         state.AuthInvalidator
 	Store                   ManagementStore
 	Account                 account.Behavior
 	Limits                  state.Limiter
@@ -219,62 +218,84 @@ type Config struct {
 	InitialAdminPasswordFile string
 }
 
-type Gateway struct {
-	app                      *fiber.App
-	instanceID               string
+type gatewaySecurity struct {
 	auth                     *Authenticator
 	uploadAuth               *Authenticator
-	store                    ManagementStore
+	authInvalidator          state.AuthInvalidator
+	invalidatorWG            sync.WaitGroup
+	invalidatorReady         chan struct{}
 	account                  account.Behavior
 	limits                   state.Limiter
-	management               *management.Manager
-	health                   HealthChecker
-	readiness                HealthChecker
-	ready                    bool
-	readyMu                  sync.RWMutex
-	drainOnce                sync.Once
-	shutdownCtx              context.Context
-	shutdownCancel           context.CancelFunc
-	client                   *http.Client
-	tailClient               *http.Client
-	proxyTimeout             time.Duration
-	liveTail                 *liveTailLimiter
-	liveTailMaxDuration      time.Duration
-	liveTailHeartbeat        time.Duration
-	proxyStreamErrors        atomic.Int64
-	proxyStreamErrCounter    metric.Int64Counter
-	now                      func() time.Time
-	alerts                   *alert.Service
-	issues                   IssueStore
-	errorTracker             ErrorIntake
-	notifications            NotificationStore
-	replays                  ReplayStore
-	blobs                    blob.Store
-	sourceMaps               SourceMapStore
-	profiles                 ProfileStore
-	scrapes                  *scrape.Service
-	storage                  storagepkg.SignalBackend
-	metrics                  *storagepkg.MetricsClient
-	scrapeUnavailableReason  string
-	mcpBaseURL               string
-	querier                  *query.StorageQuerier
-	ai                       *aiManager
-	aiAssistant              *assistantService
-	issueAI                  *issueAIService
-	llmPricing               *llmcost.Table
-	webUI                    fs.FS
-	instrumentation          fiber.Handler
-	selfMonitoringToken      string
-	logger                   *slog.Logger
-	meterProvider            metric.MeterProvider
 	requireCSRF              bool
 	secureSessionCookie      bool
 	initialAdminPasswordFile string
-	remoteWriteSem           chan struct{}
-	remoteWriteRateLimit     int
+	selfMonitoringToken      string
 }
 
-func newFiberApp(readTimeout, idleTimeout time.Duration, trustedProxies []string) *fiber.App {
+type gatewayLifecycle struct {
+	health         HealthChecker
+	readiness      HealthChecker
+	ready          bool
+	readyMu        sync.RWMutex
+	drainOnce      sync.Once
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+}
+
+type domainStores struct {
+	store                   ManagementStore
+	management              *management.Manager
+	alerts                  *alert.Service
+	issues                  IssueStore
+	errorTracker            ErrorIntake
+	notifications           NotificationStore
+	replays                 ReplayStore
+	blobs                   blob.Store
+	sourceMaps              SourceMapStore
+	profiles                ProfileStore
+	scrapes                 *scrape.Service
+	scrapeUnavailableReason string
+}
+
+type gatewayAI struct {
+	ai          *aiManager
+	aiAssistant *assistantService
+	issueAI     *issueAIService
+	llmPricing  *llmcost.Table
+}
+
+type Gateway struct {
+	app        *fiber.App
+	instanceID string
+	now        func() time.Time
+	logger     *slog.Logger
+
+	gatewaySecurity
+	gatewayLifecycle
+	domainStores
+	gatewayAI
+
+	proxy                *storageProxy
+	client               *http.Client
+	storage              storagepkg.SignalBackend
+	metrics              *storagepkg.MetricsClient
+	querier              *query.StorageQuerier
+	mcpBaseURL           string
+	webUI                fs.FS
+	instrumentation      fiber.Handler
+	meterProvider        metric.MeterProvider
+	remoteWriteSem       chan struct{}
+	remoteWriteRateLimit int
+
+	registeredRoutes []registeredRoute
+	registeredIndex  map[string]routePolicy
+}
+
+func newFiberApp(
+	readTimeout, idleTimeout time.Duration,
+	trustedProxies []string,
+	logger *slog.Logger,
+) *fiber.App {
 	cfg := fiber.Config{
 		// Immutable makes Ctx.Get, Params, Query, Cookies, FormValue, Path,
 		// Method, Bind().Body fields and friends return owned copies instead of
@@ -293,6 +314,7 @@ func newFiberApp(readTimeout, idleTimeout time.Duration, trustedProxies []string
 		BodyLimit:               maxDecodedRequestBody,
 		ReadTimeout:             readTimeout,
 		IdleTimeout:             idleTimeout,
+		ErrorHandler:            apiErrorHandler(logger),
 	}
 	if len(trustedProxies) > 0 {
 		cfg.TrustProxy = true
@@ -394,24 +416,16 @@ func New(cfg Config) *Gateway {
 		cfg.LiveTailHeartbeat = defaultLiveTailHeartbeat
 	}
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
-	g := &Gateway{
-		app:        newFiberApp(cfg.ReadTimeout, cfg.IdleTimeout, cfg.TrustedProxies),
-		instanceID: cfg.InstanceID,
-		auth: NewAuthenticator(
-			cfg.Tokens,
-		),
-		uploadAuth:     newUploadAuthenticator(cfg.UploadTokens),
-		store:          cfg.Store,
-		account:        cfg.Account,
-		limits:         cfg.Limits,
-		management:     cfg.Management,
-		health:         cfg.Health,
-		readiness:      cfg.Readiness,
-		shutdownCtx:    shutdownCtx,
-		shutdownCancel: shutdownCancel,
-		client:         cfg.Client,
-		tailClient:     newLiveTailClient(cfg.Client),
-		proxyTimeout:   cfg.ProxyTimeout,
+	auth := NewAuthenticator(cfg.Tokens)
+	auth.now = cfg.Now
+	uploadAuth := newUploadAuthenticator(cfg.UploadTokens)
+	uploadAuth.now = cfg.Now
+
+	proxy := newStorageProxy(storageProxyConfig{
+		storage:      cfg.Storage,
+		client:       cfg.Client,
+		tailClient:   newLiveTailClient(cfg.Client),
+		proxyTimeout: cfg.ProxyTimeout,
 		liveTail: newLiveTailLimiter(
 			cfg.LiveTailMaxGlobal,
 			cfg.LiveTailMaxPerUser,
@@ -419,15 +433,53 @@ func New(cfg Config) *Gateway {
 		),
 		liveTailMaxDuration: cfg.LiveTailMaxDuration,
 		liveTailHeartbeat:   cfg.LiveTailHeartbeat,
-		now:                 cfg.Now,
-		alerts:              cfg.Alerts,
-		issues:              cfg.Issues,
-		replays:             cfg.Replays,
-		blobs:               cfg.Blobs,
-		sourceMaps:          cfg.SourceMaps,
-		profiles:            cfg.Profiles,
-		scrapes:             cfg.Scrapes,
-		storage:             cfg.Storage,
+		shutdownCtx:         shutdownCtx,
+		logger:              cfg.Logger,
+		meterProvider:       cfg.MeterProvider,
+	})
+
+	g := &Gateway{
+		app:        newFiberApp(cfg.ReadTimeout, cfg.IdleTimeout, cfg.TrustedProxies, cfg.Logger),
+		instanceID: cfg.InstanceID,
+		now:        cfg.Now,
+		logger:     cfg.Logger,
+		gatewaySecurity: gatewaySecurity{
+			auth:                     auth,
+			uploadAuth:               uploadAuth,
+			authInvalidator:          cfg.AuthInvalidator,
+			account:                  cfg.Account,
+			limits:                   cfg.Limits,
+			requireCSRF:              cfg.RequireCSRF,
+			secureSessionCookie:      cfg.SecureSessionCookie,
+			initialAdminPasswordFile: cfg.InitialAdminPasswordFile,
+			selfMonitoringToken:      cfg.SelfMonitoringToken,
+		},
+		gatewayLifecycle: gatewayLifecycle{
+			health:         cfg.Health,
+			readiness:      cfg.Readiness,
+			shutdownCtx:    shutdownCtx,
+			shutdownCancel: shutdownCancel,
+		},
+		domainStores: domainStores{
+			store:                   cfg.Store,
+			management:              cfg.Management,
+			alerts:                  cfg.Alerts,
+			issues:                  cfg.Issues,
+			errorTracker:            cfg.ErrorTracker,
+			notifications:           cfg.Notifications,
+			replays:                 cfg.Replays,
+			blobs:                   cfg.Blobs,
+			sourceMaps:              cfg.SourceMaps,
+			profiles:                cfg.Profiles,
+			scrapes:                 cfg.Scrapes,
+			scrapeUnavailableReason: cfg.ScrapeUnavailableReason,
+		},
+		gatewayAI: gatewayAI{
+			llmPricing: cfg.LLMPricing,
+		},
+		proxy:   proxy,
+		client:  cfg.Client,
+		storage: cfg.Storage,
 		metrics: storagepkg.NewMetricsClient(storagepkg.MetricsClientConfig{
 			Backend:        cfg.Storage,
 			HTTPClient:     cfg.Client,
@@ -435,19 +487,12 @@ func New(cfg Config) *Gateway {
 			MaxBytes:       metricsInstantQueryMaxBytes,
 			BodyDrainLimit: metricsBodyDrainLimit,
 		}),
-		scrapeUnavailableReason:  cfg.ScrapeUnavailableReason,
-		mcpBaseURL:               cfg.MCPBaseURL,
-		llmPricing:               cfg.LLMPricing,
-		webUI:                    cfg.WebUI,
-		instrumentation:          cfg.Instrumentation,
-		selfMonitoringToken:      cfg.SelfMonitoringToken,
-		logger:                   cfg.Logger,
-		meterProvider:            cfg.MeterProvider,
-		requireCSRF:              cfg.RequireCSRF,
-		secureSessionCookie:      cfg.SecureSessionCookie,
-		initialAdminPasswordFile: cfg.InitialAdminPasswordFile,
-		remoteWriteSem:           make(chan struct{}, defaultRemoteWriteConcurrency),
-		remoteWriteRateLimit:     defaultRemoteWriteRateLimit,
+		mcpBaseURL:           cfg.MCPBaseURL,
+		webUI:                cfg.WebUI,
+		instrumentation:      cfg.Instrumentation,
+		meterProvider:        cfg.MeterProvider,
+		remoteWriteSem:       make(chan struct{}, defaultRemoteWriteConcurrency),
+		remoteWriteRateLimit: defaultRemoteWriteRateLimit,
 	}
 	g.querier = query.NewStorageQuerier(query.StorageQuerierConfig{
 		Backend:        g.storage,
@@ -493,14 +538,61 @@ func New(cfg Config) *Gateway {
 	}
 	g.aiAssistant = newAssistantService(g)
 	g.issueAI = newIssueAIService(g, cfg.IssueAIAutoDailyBudget)
-	g.errorTracker = cfg.ErrorTracker
-	g.notifications = cfg.Notifications
-	if g.meterProvider != nil {
-		meter := g.meterProvider.Meter("github.com/eimsound/lazy-observe/internal/gateway")
-		g.proxyStreamErrCounter, _ = meter.Int64Counter("gateway.proxy.stream_errors")
-	}
+	g.startAuthInvalidation()
 	g.routes()
 	return g
+}
+
+func (g *Gateway) startAuthInvalidation() {
+	if g.authInvalidator == nil {
+		return
+	}
+	ready := make(chan struct{})
+	g.invalidatorReady = ready
+	var readyOnce sync.Once
+	markReady := func() { readyOnce.Do(func() { close(ready) }) }
+	g.invalidatorWG.Add(1)
+	go func() {
+		defer g.invalidatorWG.Done()
+		defer markReady()
+		err := g.authInvalidator.Subscribe(g.shutdownCtx, markReady, g.invalidateAuthCaches)
+		if err != nil && !errors.Is(err, context.Canceled) && g.shutdownCtx.Err() == nil {
+			g.logger.Warn("auth invalidation subscriber exited", "error", err)
+		}
+	}()
+}
+
+func (g *Gateway) invalidateAuthCaches() {
+	if g.auth != nil {
+		g.auth.Invalidate()
+	}
+	if g.uploadAuth != nil {
+		g.uploadAuth.Invalidate()
+	}
+}
+
+func (g *Gateway) notifyAuthInvalidation(ctx context.Context) {
+	g.invalidateAuthCaches()
+	if g.authInvalidator == nil {
+		return
+	}
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	if err := g.authInvalidator.Publish(pubCtx); err != nil {
+		g.logger.Warn("publish auth invalidation failed", "error", err)
+	}
+}
+
+func (g *Gateway) waitAuthInvalidationReady(ctx context.Context) error {
+	if g.invalidatorReady == nil {
+		return nil
+	}
+	select {
+	case <-g.invalidatorReady:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (g *Gateway) App() *fiber.App { return g.app }
@@ -557,6 +649,7 @@ func (g *Gateway) BeginDrain() {
 func (g *Gateway) Drain(ctx context.Context) error {
 	g.BeginDrain()
 	shutdownErr := g.app.ShutdownWithContext(ctx)
+	g.invalidatorWG.Wait()
 	var errorTrackErr error
 	if g.errorTracker != nil {
 		errorTrackErr = g.errorTracker.Close(ctx)
@@ -610,8 +703,8 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 	g.app.Use(boundedRequestDecoding)
 	// Register kubelet probes before optional instrumentation. In particular,
 	// /livez must not depend on telemetry middleware or any external service.
-	g.app.Get("/livez", g.livez)
-	g.app.Get("/readyz", g.readyz)
+	g.route(fiber.MethodGet, "/livez", routePolicy{auth: authPublic}, g.livez)
+	g.route(fiber.MethodGet, "/readyz", routePolicy{auth: authPublic}, g.readyz)
 	if g.instrumentation != nil {
 		g.app.Use(func(c fiber.Ctx) error {
 			// OTLP exports are never observed, and the private token is a second
@@ -628,194 +721,487 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 
 // registerPlatformRoutes serves health, system diagnostics, and MCP.
 func (g *Gateway) registerPlatformRoutes() {
-	g.app.Get("/healthz", g.healthz)
-	g.app.Get("/api/system/info", g.queryRequired, g.systemInfo)
-	g.app.Get("/api/system/error-inbox", g.userRequired, g.adminRequired, g.errorInboxDiagnostics)
+	g.route(fiber.MethodGet, "/healthz", routePolicy{auth: authPublic}, g.healthz)
+	g.route(fiber.MethodGet, "/api/system/info", routePolicy{auth: authUser, projectScope: true}, g.systemInfo)
+	g.route(
+		fiber.MethodGet,
+		"/api/system/error-inbox",
+		routePolicy{auth: authUser, role: roleAdmin},
+		g.errorInboxDiagnostics,
+	)
 	baseURL := g.mcpBaseURL
 	if baseURL == "" {
 		baseURL = "http://127.0.0.1:3100"
 	}
 	mcpHandler := fasthttpadaptor.NewFastHTTPHandler(observemcp.NewHTTPHandler(baseURL, nil))
-	g.app.All("/mcp", g.mcpRequired, func(c fiber.Ctx) error {
-		mcpHandler(c.RequestCtx())
-		return nil
-	})
+	g.routeAll(
+		"/mcp",
+		routePolicy{auth: authUserTokenOnly, projectScope: true},
+		func(c fiber.Ctx) error {
+			mcpHandler(c.RequestCtx())
+			return nil
+		},
+	)
 }
 
 // registerAuthRoutes serves login and the current user's own account.
 func (g *Gateway) registerAuthRoutes() {
-	g.app.Post("/api/auth/login", g.login)
-	g.app.Get("/api/auth/me", g.userRequired, g.me)
+	g.route(fiber.MethodPost, "/api/auth/login", routePolicy{auth: authPublic}, g.login)
+	g.route(fiber.MethodGet, "/api/auth/me", routePolicy{auth: authUser, allowWhenMustChange: true}, g.me)
 	// Login is the only cookie-less mutation here; every other /api/auth
 	// mutation rides on the session cookie and needs the CSRF double-submit.
-	g.app.Post("/api/auth/logout", g.sessionRequired, g.csrfRequired, g.logout)
-	g.app.Get("/api/auth/tokens", g.sessionRequired, g.listCurrentUserTokens)
-	g.app.Post("/api/auth/tokens", g.sessionRequired, g.csrfRequired, g.createCurrentUserToken)
-	g.app.Delete("/api/auth/tokens/:tokenID", g.sessionRequired, g.csrfRequired, g.revokeCurrentUserToken)
-	g.app.Post("/api/auth/password", g.sessionRequired, g.csrfRequired, g.changePassword)
-	g.app.Put("/api/auth/me", g.sessionRequired, g.csrfRequired, g.updateMe)
-	g.app.Get("/api/auth/sessions", g.sessionRequired, g.listMySessions)
-	g.app.Delete("/api/auth/sessions/:id", g.sessionRequired, g.csrfRequired, g.deleteMySession)
-	g.app.Get("/api/audit", g.userRequired, g.adminRequired, g.listAudit)
+	g.route(
+		fiber.MethodPost,
+		"/api/auth/logout",
+		routePolicy{auth: authSessionOnly, csrf: true, allowWhenMustChange: true},
+		g.logout,
+	)
+	g.route(fiber.MethodGet, "/api/auth/tokens", routePolicy{auth: authSessionOnly}, g.listCurrentUserTokens)
+	g.route(
+		fiber.MethodPost,
+		"/api/auth/tokens",
+		routePolicy{auth: authSessionOnly, csrf: true},
+		g.createCurrentUserToken,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/auth/tokens/:tokenID",
+		routePolicy{auth: authSessionOnly, csrf: true},
+		g.revokeCurrentUserToken,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/auth/password",
+		routePolicy{auth: authSessionOnly, csrf: true, allowWhenMustChange: true},
+		g.changePassword,
+	)
+	g.route(fiber.MethodPut, "/api/auth/me", routePolicy{auth: authSessionOnly, csrf: true}, g.updateMe)
+	g.route(fiber.MethodGet, "/api/auth/sessions", routePolicy{auth: authSessionOnly}, g.listMySessions)
+	g.route(
+		fiber.MethodDelete,
+		"/api/auth/sessions/:id",
+		routePolicy{auth: authSessionOnly, csrf: true},
+		g.deleteMySession,
+	)
+	g.route(fiber.MethodGet, "/api/audit", routePolicy{auth: authUser, role: roleAdmin}, g.listAudit)
 }
 
 // registerTelemetryRoutes serves ingest (project tokens) and the project-scoped
-// read API (sessions or user tokens via queryRequired).
+// read API (sessions or user tokens).
 func (g *Gateway) registerTelemetryRoutes() {
-	g.app.Post("/v1/metrics", g.auth.Middleware, g.metricsIngest)
-	g.app.Post("/api/v1/write", g.auth.Middleware, g.metricsRemoteWrite)
-	g.app.Post(
+	projectQuery := routePolicy{auth: authUser, projectScope: true}
+	browserIngest := routePolicy{auth: authProjectToken, browserIngestCORS: true}
+
+	g.route(fiber.MethodPost, "/v1/metrics", routePolicy{auth: authProjectToken}, g.metricsIngest)
+	g.route(fiber.MethodPost, "/api/v1/write", routePolicy{auth: authProjectToken}, g.metricsRemoteWrite)
+	g.route(
+		fiber.MethodPost,
 		"/v1/logs",
-		g.auth.Middleware,
-		g.tenantProxy(g.storage.LogsIngestBase(), "/insert/opentelemetry/v1/logs"),
+		routePolicy{auth: authProjectToken},
+		g.proxy.tenantHandler(g.storage.LogsIngestBase(), "/insert/opentelemetry/v1/logs"),
 	)
-	g.browserIngestRoute(
+	g.route(
+		fiber.MethodPost,
 		"/v1/traces",
-		g.tenantProxy(g.storage.TracesIngestBase(), "/insert/opentelemetry/v1/traces"),
+		browserIngest,
+		g.proxy.tenantHandler(g.storage.TracesIngestBase(), "/insert/opentelemetry/v1/traces"),
 	)
-	g.browserIngestRoute("/api/events/errors", g.errorsIngest)
-	g.browserIngestRoute("/api/events/vitals", g.vitalsIngest)
-	g.browserIngestRoute("/api/events/diagnostics", g.sdkDiagnosticsIngest)
-	g.app.Post("/api/releases/:release/sourcemaps", g.uploadAuth.UploadMiddleware, g.uploadSourceMaps)
-	g.app.Get("/api/releases", g.queryRequired, g.listSourceMapReleases)
-	g.browserIngestRoute("/api/replay/segments", g.publicIngestAdmission(replayIngestPolicy), g.replayIngest)
-	g.app.Post("/api/profiles", g.auth.Middleware, g.publicIngestAdmission(profileIngestPolicy), g.profileIngest)
-	g.app.Get("/api/profiles/services", g.queryRequired, g.listProfileServices)
-	g.app.Get("/api/profiles/flamegraph", g.queryRequired, g.profileFlamegraph)
-	g.app.Get("/api/profiles/:id/raw", g.queryRequired, g.rawProfile)
-	g.app.Get("/api/profiles", g.queryRequired, g.listProfiles)
-	g.app.Get("/api/replay/sessions", g.queryRequired, g.listReplaySessions)
-	g.app.Get("/api/replay/sessions/:session_id", g.queryRequired, g.getReplaySession)
-	g.app.Get("/api/replay/sessions/:session_id/segments/:seq", g.queryRequired, g.getReplaySegment)
-	for _, path := range []string{
+	g.route(fiber.MethodPost, "/api/events/errors", browserIngest, g.errorsIngest)
+	g.route(fiber.MethodPost, "/api/events/vitals", browserIngest, g.vitalsIngest)
+	g.route(fiber.MethodPost, "/api/events/diagnostics", browserIngest, g.sdkDiagnosticsIngest)
+	g.route(
+		fiber.MethodPost,
+		"/api/releases/:release/sourcemaps",
+		routePolicy{auth: authUploadToken},
+		g.uploadSourceMaps,
+	)
+	g.route(fiber.MethodGet, "/api/releases", projectQuery, g.listSourceMapReleases)
+	g.route(
+		fiber.MethodPost,
+		"/api/replay/segments",
+		browserIngest,
+		g.publicIngestAdmission(replayIngestPolicy),
+		g.replayIngest,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/profiles",
+		routePolicy{auth: authProjectToken},
+		g.publicIngestAdmission(profileIngestPolicy),
+		g.profileIngest,
+	)
+	g.route(fiber.MethodGet, "/api/profiles/services", projectQuery, g.listProfileServices)
+	g.route(fiber.MethodGet, "/api/profiles/flamegraph", projectQuery, g.profileFlamegraph)
+	g.route(fiber.MethodGet, "/api/profiles/:id/raw", projectQuery, g.rawProfile)
+	g.route(fiber.MethodGet, "/api/profiles", projectQuery, g.listProfiles)
+	g.route(fiber.MethodGet, "/api/replay/sessions", projectQuery, g.listReplaySessions)
+	g.route(fiber.MethodGet, "/api/replay/sessions/:session_id", projectQuery, g.getReplaySession)
+	g.route(fiber.MethodGet, "/api/replay/sessions/:session_id/segments/:seq", projectQuery, g.getReplaySegment)
+	for _, metricPath := range []string{
 		"/api/v1/query", "/api/v1/query_range", "/api/v1/series", "/api/v1/labels",
 		"/api/v1/label/:name/values",
 	} {
-		g.app.All(path, g.queryRequired, g.metricsQuery)
+		g.routeAll(metricPath, projectQuery, g.metricsQuery)
 	}
-	g.app.Get("/api/v1/prettify-query", g.queryRequired, g.metricsPrettify)
+	g.route(fiber.MethodGet, "/api/v1/prettify-query", projectQuery, g.proxy.metricsPrettify)
 	for _, route := range logsProxyRoutes {
-		handler := g.logsProxyHandler(route)
-		g.app.Get(route.apiPath, g.queryRequired, handler)
-		g.app.Post(route.apiPath, g.queryRequired, handler)
+		handler := g.proxy.logsHandler(route)
+		g.route(fiber.MethodGet, route.apiPath, projectQuery, handler)
+		g.route(fiber.MethodPost, route.apiPath, projectQuery, handler)
 	}
-	g.app.Get(
+	g.route(
+		fiber.MethodGet,
 		"/api/traces/services",
-		g.queryRequired,
-		g.tenantProxy(g.storage.TracesQueryBase(), "/select/jaeger/api/services"),
+		projectQuery,
+		g.proxy.tenantHandler(g.storage.TracesQueryBase(), "/select/jaeger/api/services"),
 	)
-	g.app.Get("/api/traces/services/:svc/operations", g.queryRequired, g.traceOperations)
-	g.app.Get("/api/traces/search", g.queryRequired, g.traceSearch)
-	g.app.Get("/api/traces/:traceID", g.queryRequired, g.traceByID)
-	g.app.Get("/api/llm/summary", g.queryRequired, g.llmSummary)
-	g.app.Get("/api/llm/calls", g.queryRequired, g.llmCalls)
-	g.app.Get("/api/llm/timeseries", g.queryRequired, g.llmTimeseries)
-	g.app.Get("/api/v1/performance/endpoints", g.queryRequired, g.performanceEndpoints)
+	g.route(fiber.MethodGet, "/api/traces/services/:svc/operations", projectQuery, g.traceOperations)
+	g.route(fiber.MethodGet, "/api/traces/search", projectQuery, g.traceSearch)
+	g.route(fiber.MethodGet, "/api/traces/:traceID", projectQuery, g.traceByID)
+	g.route(fiber.MethodGet, "/api/llm/summary", projectQuery, g.llmSummary)
+	g.route(fiber.MethodGet, "/api/llm/calls", projectQuery, g.llmCalls)
+	g.route(fiber.MethodGet, "/api/llm/timeseries", projectQuery, g.llmTimeseries)
+	g.route(fiber.MethodGet, "/api/v1/performance/endpoints", projectQuery, g.performanceEndpoints)
 	// Token-authenticated, read-only query aliases used by MCP. They deliberately
 	// reuse the same handlers as the UI and therefore retain project isolation.
-	g.app.Get("/api/v1/issues", g.queryRequired, g.listIssues)
-	g.app.Get("/api/v1/issues/:id", g.queryRequired, g.getIssue)
-	g.app.Get("/api/v1/issues/:id/events/:event_id", g.queryRequired, g.getIssueEvent)
-	g.app.Get("/api/v1/alerts", g.queryRequired, g.listAlerts)
-	g.app.Get("/api/v1/hosts", g.queryRequired, g.hosts)
+	g.route(fiber.MethodGet, "/api/v1/issues", projectQuery, g.listIssues)
+	g.route(fiber.MethodGet, "/api/v1/issues/:id", projectQuery, g.getIssue)
+	g.route(fiber.MethodGet, "/api/v1/issues/:id/events/:event_id", projectQuery, g.getIssueEvent)
+	g.route(fiber.MethodGet, "/api/v1/alerts", projectQuery, g.listAlerts)
+	g.route(fiber.MethodGet, "/api/v1/hosts", projectQuery, g.hosts)
 }
 
-// registerSessionAPI serves the web UI's management API under /api, behind a
-// user credential and the CSRF check.
+// registerSessionAPI serves the web UI's management API under /api with
+// explicit per-route authentication, CSRF, role, and project-scope policies.
 func (g *Gateway) registerSessionAPI() {
-	api := g.app.Group("/api", g.userRequired, g.csrfRequired)
-	api.Get("/ai/status", g.aiStatus)
-	api.Post("/ai/test", g.adminRequired, g.aiTest)
-	api.Get("/ai/settings", g.adminRequired, g.aiSettingsGet)
-	api.Put("/ai/settings", g.adminRequired, g.aiSettingsPut)
-	api.Post("/ai/assistant/query", g.loadSessionProject, g.aiAssistantQuery)
-	api.Post("/ai/assistant/explain", g.aiAssistantExplain)
-	api.Get("/projects", g.listProjects)
-	api.Get("/projects/:id", g.getProject)
-	api.Get("/projects/:id/alert-config", g.getProjectAlertConfig)
-	api.Put("/projects/:id/alert-config", g.memberRequired, g.putProjectAlertConfig)
-	api.Get("/projects/:id/ai-config", g.getProjectAIConfig)
-	api.Put("/projects/:id/ai-config", g.memberRequired, g.putProjectAIConfig)
-	api.Post("/projects", g.adminRequired, g.createProject)
-	api.Patch("/projects/:id", g.adminRequired, g.updateProject)
-	api.Put("/projects/:id", g.adminRequired, g.updateProject)
-	api.Delete("/projects/:id", g.adminRequired, g.deleteProject)
-	api.Get("/projects/:id/tokens", g.listProjectAPITokens)
-	api.Post("/projects/:id/tokens", g.adminRequired, g.createProjectAPIToken)
-	api.Delete("/projects/:id/tokens/:tokenID", g.adminRequired, g.revokeProjectAPIToken)
-	api.Get("/projects/:id/source-map-upload-tokens", g.adminRequired, g.listSourceMapUploadTokens)
-	api.Post("/projects/:id/source-map-upload-tokens", g.adminRequired, g.createSourceMapUploadToken)
-	api.Delete(
-		"/projects/:id/source-map-upload-tokens/:tokenID",
-		g.adminRequired,
+	g.route(fiber.MethodGet, "/api/ai/status", routePolicy{auth: authUser}, g.aiStatus)
+	g.route(fiber.MethodPost, "/api/ai/test", routePolicy{auth: authUser, role: roleAdmin, csrf: true}, g.aiTest)
+	g.route(fiber.MethodGet, "/api/ai/settings", routePolicy{auth: authUser, role: roleAdmin}, g.aiSettingsGet)
+	g.route(
+		fiber.MethodPut,
+		"/api/ai/settings",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.aiSettingsPut,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/ai/assistant/query",
+		routePolicy{auth: authUser, csrf: true, projectScope: true},
+		g.aiAssistantQuery,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/ai/assistant/explain",
+		routePolicy{auth: authUser, csrf: true},
+		g.aiAssistantExplain,
+	)
+
+	g.route(fiber.MethodGet, "/api/projects", routePolicy{auth: authUser}, g.listProjects)
+	g.route(fiber.MethodGet, "/api/projects/:id", routePolicy{auth: authUser}, g.getProject)
+	g.route(fiber.MethodGet, "/api/projects/:id/alert-config", routePolicy{auth: authUser}, g.getProjectAlertConfig)
+	g.route(
+		fiber.MethodPut,
+		"/api/projects/:id/alert-config",
+		routePolicy{auth: authUser, role: roleMember, csrf: true},
+		g.putProjectAlertConfig,
+	)
+	g.route(fiber.MethodGet, "/api/projects/:id/ai-config", routePolicy{auth: authUser}, g.getProjectAIConfig)
+	g.route(
+		fiber.MethodPut,
+		"/api/projects/:id/ai-config",
+		routePolicy{auth: authUser, role: roleMember, csrf: true},
+		g.putProjectAIConfig,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/projects",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.createProject,
+	)
+	g.route(
+		fiber.MethodPatch,
+		"/api/projects/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.updateProject,
+	)
+	g.route(
+		fiber.MethodPut,
+		"/api/projects/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.updateProject,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/projects/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.deleteProject,
+	)
+	g.route(fiber.MethodGet, "/api/projects/:id/tokens", routePolicy{auth: authUser}, g.listProjectAPITokens)
+	g.route(
+		fiber.MethodPost,
+		"/api/projects/:id/tokens",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.createProjectAPIToken,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/projects/:id/tokens/:tokenID",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.revokeProjectAPIToken,
+	)
+	g.route(
+		fiber.MethodGet,
+		"/api/projects/:id/source-map-upload-tokens",
+		routePolicy{auth: authUser, role: roleAdmin},
+		g.listSourceMapUploadTokens,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/projects/:id/source-map-upload-tokens",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.createSourceMapUploadToken,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/projects/:id/source-map-upload-tokens/:tokenID",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
 		g.revokeSourceMapUploadToken,
 	)
-	api.Get("/users", g.adminRequired, g.listUsers)
-	api.Get("/users/:id", g.adminRequired, g.getUser)
-	api.Post("/users", g.adminRequired, g.createUser)
-	api.Patch("/users/:id", g.adminRequired, g.updateUser)
-	api.Put("/users/:id", g.adminRequired, g.updateUser)
-	api.Delete("/users/:id", g.adminRequired, g.deleteUser)
-	api.Get("/alert-rules", g.memberRequired, g.loadSessionProject, g.listAlertRules)
-	api.Post("/alert-rules", g.memberRequired, g.loadSessionProject, g.createAlertRule)
-	api.Patch("/alert-rules/:id", g.memberRequired, g.loadSessionProject, g.updateAlertRule)
-	api.Put("/alert-rules/:id", g.memberRequired, g.loadSessionProject, g.updateAlertRule)
-	api.Delete("/alert-rules/:id", g.memberRequired, g.loadSessionProject, g.deleteAlertRule)
-	api.Get("/notifications", g.loadSessionProject, g.memberRequired, g.listNotifications)
-	api.Post("/notifications/:id/retry", g.loadSessionProject, g.memberRequired, g.requeueNotification)
-	api.Get("/channels", g.memberRequired, g.listChannels)
-	api.Post("/channels", g.adminRequired, g.createChannel)
-	api.Patch("/channels/:id", g.adminRequired, g.updateChannel)
-	api.Put("/channels/:id", g.adminRequired, g.updateChannel)
-	api.Delete("/channels/:id", g.adminRequired, g.deleteChannel)
-	api.Post("/channels/:id/test", g.adminRequired, g.testChannel)
-	api.Get("/silences", g.memberRequired, g.loadSessionProject, g.listSilences)
-	api.Post("/silences", g.memberRequired, g.loadSessionProject, g.createSilence)
-	api.Patch("/silences/:id", g.memberRequired, g.loadSessionProject, g.updateSilence)
-	api.Put("/silences/:id", g.memberRequired, g.loadSessionProject, g.updateSilence)
-	api.Delete("/silences/:id", g.memberRequired, g.loadSessionProject, g.deleteSilence)
-	api.Get("/inhibition-rules", g.memberRequired, g.loadSessionProject, g.listInhibitionRules)
-	api.Post("/inhibition-rules", g.memberRequired, g.loadSessionProject, g.createInhibitionRule)
-	api.Patch("/inhibition-rules/:id", g.memberRequired, g.loadSessionProject, g.updateInhibitionRule)
-	api.Put("/inhibition-rules/:id", g.memberRequired, g.loadSessionProject, g.updateInhibitionRule)
-	api.Delete("/inhibition-rules/:id", g.memberRequired, g.loadSessionProject, g.deleteInhibitionRule)
-	api.Get("/alerts", g.loadSessionProject, g.listAlerts)
-	api.Get("/scrape-targets", g.loadSessionProject, g.listScrapeTargets)
-	api.Post("/scrape-targets", g.loadSessionProject, g.memberRequired, g.createScrapeTarget)
-	api.Get("/scrape-targets/:id", g.loadSessionProject, g.getScrapeTarget)
-	api.Patch("/scrape-targets/:id", g.loadSessionProject, g.memberRequired, g.updateScrapeTarget)
-	api.Put("/scrape-targets/:id", g.loadSessionProject, g.memberRequired, g.updateScrapeTarget)
-	api.Delete("/scrape-targets/:id", g.loadSessionProject, g.memberRequired, g.deleteScrapeTarget)
-	api.Get("/scrape-targets/:id/health", g.loadSessionProject, g.scrapeTargetHealth)
-	api.Get("/hosts", g.loadSessionProject, g.hosts)
-	api.Get("/issues", g.loadSessionProject, g.listIssues)
-	api.Get("/issues/:id", g.loadSessionProject, g.getIssue)
-	api.Get("/issues/:id/ai-analysis", g.loadSessionProject, g.getIssueAIAnalysis)
-	api.Post(
-		"/issues/:id/ai-analysis",
-		g.loadSessionProject,
-		g.memberRequired,
+
+	g.route(fiber.MethodGet, "/api/users", routePolicy{auth: authUser, role: roleAdmin}, g.listUsers)
+	g.route(fiber.MethodGet, "/api/users/:id", routePolicy{auth: authUser, role: roleAdmin}, g.getUser)
+	g.route(fiber.MethodPost, "/api/users", routePolicy{auth: authUser, role: roleAdmin, csrf: true}, g.createUser)
+	g.route(
+		fiber.MethodPatch,
+		"/api/users/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.updateUser,
+	)
+	g.route(fiber.MethodPut, "/api/users/:id", routePolicy{auth: authUser, role: roleAdmin, csrf: true}, g.updateUser)
+	g.route(
+		fiber.MethodDelete,
+		"/api/users/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.deleteUser,
+	)
+
+	g.route(
+		fiber.MethodGet,
+		"/api/alert-rules",
+		routePolicy{auth: authUser, role: roleMember, projectScope: true},
+		g.listAlertRules,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/alert-rules",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.createAlertRule,
+	)
+	g.route(
+		fiber.MethodPatch,
+		"/api/alert-rules/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateAlertRule,
+	)
+	g.route(
+		fiber.MethodPut,
+		"/api/alert-rules/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateAlertRule,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/alert-rules/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.deleteAlertRule,
+	)
+	g.route(
+		fiber.MethodGet,
+		"/api/notifications",
+		routePolicy{auth: authUser, role: roleMember, projectScope: true},
+		g.listNotifications,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/notifications/:id/retry",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.requeueNotification,
+	)
+	g.route(fiber.MethodGet, "/api/channels", routePolicy{auth: authUser, role: roleMember}, g.listChannels)
+	g.route(
+		fiber.MethodPost,
+		"/api/channels",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.createChannel,
+	)
+	g.route(
+		fiber.MethodPatch,
+		"/api/channels/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.updateChannel,
+	)
+	g.route(
+		fiber.MethodPut,
+		"/api/channels/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.updateChannel,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/channels/:id",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.deleteChannel,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/channels/:id/test",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true},
+		g.testChannel,
+	)
+	g.route(
+		fiber.MethodGet,
+		"/api/silences",
+		routePolicy{auth: authUser, role: roleMember, projectScope: true},
+		g.listSilences,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/silences",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.createSilence,
+	)
+	g.route(
+		fiber.MethodPatch,
+		"/api/silences/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateSilence,
+	)
+	g.route(
+		fiber.MethodPut,
+		"/api/silences/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateSilence,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/silences/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.deleteSilence,
+	)
+	g.route(
+		fiber.MethodGet,
+		"/api/inhibition-rules",
+		routePolicy{auth: authUser, role: roleMember, projectScope: true},
+		g.listInhibitionRules,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/inhibition-rules",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.createInhibitionRule,
+	)
+	g.route(
+		fiber.MethodPatch,
+		"/api/inhibition-rules/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateInhibitionRule,
+	)
+	g.route(
+		fiber.MethodPut,
+		"/api/inhibition-rules/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateInhibitionRule,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/inhibition-rules/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.deleteInhibitionRule,
+	)
+	g.route(fiber.MethodGet, "/api/alerts", routePolicy{auth: authUser, projectScope: true}, g.listAlerts)
+
+	g.route(
+		fiber.MethodGet,
+		"/api/scrape-targets",
+		routePolicy{auth: authUser, projectScope: true},
+		g.listScrapeTargets,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/scrape-targets",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.createScrapeTarget,
+	)
+	g.route(
+		fiber.MethodGet,
+		"/api/scrape-targets/:id",
+		routePolicy{auth: authUser, projectScope: true},
+		g.getScrapeTarget,
+	)
+	g.route(
+		fiber.MethodPatch,
+		"/api/scrape-targets/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateScrapeTarget,
+	)
+	g.route(
+		fiber.MethodPut,
+		"/api/scrape-targets/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.updateScrapeTarget,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/scrape-targets/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.deleteScrapeTarget,
+	)
+	g.route(
+		fiber.MethodGet,
+		"/api/scrape-targets/:id/health",
+		routePolicy{auth: authUser, projectScope: true},
+		g.scrapeTargetHealth,
+	)
+	g.route(fiber.MethodGet, "/api/hosts", routePolicy{auth: authUser, projectScope: true}, g.hosts)
+
+	g.route(fiber.MethodGet, "/api/issues", routePolicy{auth: authUser, projectScope: true}, g.listIssues)
+	g.route(fiber.MethodGet, "/api/issues/:id", routePolicy{auth: authUser, projectScope: true}, g.getIssue)
+	g.route(
+		fiber.MethodGet,
+		"/api/issues/:id/ai-analysis",
+		routePolicy{auth: authUser, projectScope: true},
+		g.getIssueAIAnalysis,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/issues/:id/ai-analysis",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
 		g.postIssueAIAnalysis,
 	)
-	api.Patch("/issues/:id", g.loadSessionProject, g.memberRequired, g.patchIssue)
-	api.Post("/issues/batch", g.loadSessionProject, g.memberRequired, g.batchUpdateIssues)
-	api.Get("/issues/:id/events/:event_id", g.loadSessionProject, g.getIssueEvent)
-	api.Delete(
-		"/releases/:release/sourcemaps",
-		g.loadSessionProject,
-		g.adminRequired,
+	g.route(
+		fiber.MethodPatch,
+		"/api/issues/:id",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.patchIssue,
+	)
+	g.route(
+		fiber.MethodPost,
+		"/api/issues/batch",
+		routePolicy{auth: authUser, role: roleMember, csrf: true, projectScope: true},
+		g.batchUpdateIssues,
+	)
+	g.route(
+		fiber.MethodGet,
+		"/api/issues/:id/events/:event_id",
+		routePolicy{auth: authUser, projectScope: true},
+		g.getIssueEvent,
+	)
+	g.route(
+		fiber.MethodDelete,
+		"/api/releases/:release/sourcemaps",
+		routePolicy{auth: authUser, role: roleAdmin, csrf: true, projectScope: true},
 		g.deleteSourceMaps,
 	)
-}
-
-func (g *Gateway) browserIngestRoute(path string, handlers ...fiber.Handler) {
-	g.app.Options(path, browserIngestCORS)
-	rest := make([]any, 0, len(handlers)+1)
-	rest = append(rest, g.auth.Middleware)
-	for _, h := range handlers {
-		rest = append(rest, h)
-	}
-	g.app.Post(path, browserIngestCORS, rest...)
 }
 
 func (g *Gateway) serveWebUI(c fiber.Ctx) error {
@@ -854,98 +1240,6 @@ func (g *Gateway) serveWebUI(c fiber.Ctx) error {
 	return c.Send(data)
 }
 
-// mcpRequired authenticates MCP with a user API token and the project selected
-// by X-LO-Project. MCP only exposes reads, so project (ingest) tokens are
-// refused like on every other query route.
-func (g *Gateway) mcpRequired(c fiber.Ctx) error {
-	token := bearerCredential(c)
-	if token == "" {
-		return unauthorizedResponse(c)
-	}
-	if !strings.HasPrefix(token, "lou_") {
-		return nonQueryToken(c, token)
-	}
-	return g.queryRequired(c)
-}
-
-// ingestOnlyToken rejects a project API token on a read route. Project tokens
-// are embedded in browser pages and SDK configuration, so they are ingest-only.
-func ingestOnlyToken(c fiber.Ctx) error {
-	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-		"code":  "ingest_only_token",
-		"error": "project API tokens can only ingest telemetry; use a session or a user API token to query",
-	})
-}
-
-// uploadOnlyToken rejects a source map upload token anywhere but the upload route
-// (ADR 0018). It is confidential but narrowly scoped: it can neither ingest nor read.
-func uploadOnlyToken(c fiber.Ctx) error {
-	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-		"code":  "upload_only_token",
-		"error": "source map upload tokens can only upload source maps to their project",
-	})
-}
-
-// sourceMapUploadTokenRequired rejects a credential that is not an upload token on
-// the upload route: the project API token is public (ADR 0010) and must not be
-// able to overwrite a release's source maps (ADR 0018).
-func sourceMapUploadTokenRequired(c fiber.Ctx) error {
-	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-		"code":  "source_map_upload_token_required",
-		"error": "source map upload requires a source map upload token (los_...); create one in the project settings",
-	})
-}
-
-// nonQueryToken answers a bearer credential that cannot query: an upload token or a
-// project API token.
-func nonQueryToken(c fiber.Ctx, token string) error {
-	if strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) {
-		return uploadOnlyToken(c)
-	}
-	return ingestOnlyToken(c)
-}
-
-func unauthorizedResponse(c fiber.Ctx) error {
-	_ = unauthorized(c)
-	return nil
-}
-
-func (g *Gateway) loadSessionProject(c fiber.Ctx) error {
-	return g.resolveRequestProject(c)
-}
-
-func requestedProjectSlug(c fiber.Ctx) string {
-	slug := strings.TrimSpace(c.Get("X-LO-Project"))
-	if slug == "" {
-		slug = "default"
-	}
-	return slug
-}
-
-func (g *Gateway) resolveRequestProject(c fiber.Ctx) error {
-	if g.store == nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "project store unavailable"})
-	}
-	slug := requestedProjectSlug(c)
-	p, err := g.store.ProjectBySlug(c.Context(), slug)
-	if err != nil {
-		if meta.IsNotFound(err) {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-				"code":  "project_not_found",
-				"error": "project not found",
-			})
-		}
-		g.logger.Warn("project lookup failed", "project_slug", slug, "error", err)
-		return c.Status(fiber.StatusServiceUnavailable).
-			JSON(fiber.Map{"error": "project lookup temporarily unavailable"})
-	}
-	if p.ID <= 0 {
-		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
-	}
-	c.Locals(projectLocal, p)
-	return c.Next()
-}
-
 func probeComponentStatus(err error) string {
 	if err == nil {
 		return "ok"
@@ -955,6 +1249,7 @@ func probeComponentStatus(err error) string {
 	}
 	return "unavailable"
 }
+
 func (g *Gateway) healthz(c fiber.Ctx) error {
 	probeCtx, cancel := context.WithTimeout(c.Context(), defaultProbeTimeout)
 	defer cancel()
@@ -1037,7 +1332,7 @@ func (g *Gateway) readyz(c fiber.Ctx) error {
 }
 
 func (g *Gateway) metricsIngest(c fiber.Ctx) error {
-	return g.metricsWrite(c, "/opentelemetry/v1/metrics", true)
+	return g.proxy.metricsWrite(c, "/opentelemetry/v1/metrics", true)
 }
 
 func (g *Gateway) metricsRemoteWrite(c fiber.Ctx) error {
@@ -1107,153 +1402,7 @@ func (g *Gateway) metricsRemoteWrite(c fiber.Ctx) error {
 	c.Request().Header.SetContentType("application/x-protobuf")
 	c.Request().Header.Set("Content-Encoding", "snappy")
 	c.Request().Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
-	return g.metricsWriteWithBody(c, "/prometheus/api/v1/write", false, body)
-}
-
-func (g *Gateway) queryRequired(c fiber.Ctx) error {
-	if token := bearerCredential(c); strings.HasPrefix(token, "lou_") {
-		u, err := g.loadUserAPIToken(c, token)
-		if err != nil {
-			if errors.Is(err, errResponseWritten) {
-				return nil
-			}
-			return err
-		}
-		c.Locals(userLocal, u)
-		return g.loadQueryProject(c)
-	}
-	if token := bearerCredential(c); token != "" {
-		return nonQueryToken(c, token)
-	}
-	if err := g.loadSession(c); err != nil {
-		if errors.Is(err, errResponseWritten) {
-			return nil
-		}
-		if account.Code(err) == account.CodeUnavailable {
-			_ = c.Status(fiber.StatusServiceUnavailable).
-				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
-			return nil
-		}
-		_ = unauthorized(c)
-		return nil
-	}
-	return g.loadQueryProject(c)
-}
-
-func (g *Gateway) loadQueryProject(c fiber.Ctx) error {
-	return g.resolveRequestProject(c)
-}
-
-func bearerCredential(c fiber.Ctx) string {
-	authorization := strings.TrimSpace(c.Get("Authorization"))
-	scheme, token, ok := strings.Cut(authorization, " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
-		return ""
-	}
-	token = strings.TrimSpace(token)
-	if token == "" || strings.ContainsAny(token, " \t") {
-		return ""
-	}
-	return token
-}
-
-func (g *Gateway) sessionRequired(c fiber.Ctx) error {
-	if strings.TrimSpace(c.Cookies("lo_session")) == "" {
-		_ = unauthorized(c)
-		return nil
-	}
-	if err := g.loadSession(c); err != nil {
-		if errors.Is(err, errResponseWritten) {
-			return nil
-		}
-		if account.Code(err) == account.CodeUnavailable {
-			_ = c.Status(fiber.StatusServiceUnavailable).
-				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
-			return nil
-		}
-		_ = unauthorized(c)
-		return nil
-	}
-	return c.Next()
-}
-
-func (g *Gateway) userRequired(c fiber.Ctx) error {
-	if token := bearerCredential(c); token != "" {
-		if !strings.HasPrefix(token, "lou_") {
-			// ADR 0010: project API tokens are ingest-only; refuse them on the
-			// session API exactly like on the telemetry query routes.
-			return nonQueryToken(c, token)
-		}
-		u, err := g.loadUserAPIToken(c, token)
-		if err != nil {
-			if errors.Is(err, errResponseWritten) {
-				return nil
-			}
-			return err
-		}
-		c.Locals(userLocal, u)
-		return c.Next()
-	}
-	return g.sessionRequired(c)
-}
-
-func (g *Gateway) loadUserAPIToken(c fiber.Ctx, token string) (meta.UserInfo, error) {
-	u, err := g.account.AuthenticateUserToken(c.Context(), token)
-	if err != nil {
-		if account.Code(err) == account.CodeInvalidCredentials {
-			return meta.UserInfo{}, unauthorized(c)
-		}
-		_ = c.Status(fiber.StatusServiceUnavailable).
-			JSON(fiber.Map{"error": "authentication temporarily unavailable"})
-		return meta.UserInfo{}, errResponseWritten
-	}
-	if passwordChangeBlocks(c, u) {
-		return meta.UserInfo{}, errResponseWritten
-	}
-	return accountUserInfo(u), nil
-}
-
-func (g *Gateway) loadSession(c fiber.Ctx) error {
-	token := strings.TrimSpace(c.Cookies("lo_session"))
-	if token == "" {
-		return &account.Error{Code: account.CodeInvalidCredentials}
-	}
-	u, err := g.account.AuthenticateSession(c.Context(), token)
-	if err != nil {
-		return err
-	}
-	if passwordChangeBlocks(c, u) {
-		return errResponseWritten
-	}
-	c.Locals(userLocal, accountUserInfo(u))
-	return nil
-}
-
-// passwordChangeRoutes are the only routes a user flagged with
-// must_change_password may reach, whether through a session or a user API
-// token: read the current user, change the own password, and log out.
-var passwordChangeRoutes = map[string]struct{}{
-	fiber.MethodGet + " /api/auth/me":        {},
-	fiber.MethodPost + " /api/auth/password": {},
-	fiber.MethodPost + " /api/auth/logout":   {},
-}
-
-// passwordChangeBlocks writes 403 password_change_required and reports true
-// when a flagged user calls anything outside passwordChangeRoutes. The flag is
-// read from metadata on every request (ADR 0006), so a password change takes
-// effect immediately for every session adapter and replica.
-func passwordChangeBlocks(c fiber.Ctx, user account.User) bool {
-	if !user.MustChangePassword {
-		return false
-	}
-	if _, allowed := passwordChangeRoutes[c.Method()+" "+c.Route().Path]; allowed {
-		return false
-	}
-	_ = c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-		"code":  string(account.CodePasswordChangeRequired),
-		"error": "change the initial password before using the API",
-	})
-	return true
+	return g.proxy.metricsWriteWithBody(c, "/prometheus/api/v1/write", false, body)
 }
 
 func accountUserInfo(user account.User) meta.UserInfo {
@@ -1270,22 +1419,6 @@ func accountUser(user meta.UserInfo) account.User {
 	}
 }
 
-func (g *Gateway) adminRequired(c fiber.Ctx) error {
-	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	if u.Role != "admin" {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
-	}
-	return c.Next()
-}
-
-func (g *Gateway) memberRequired(c fiber.Ctx) error {
-	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	if u.Role != "admin" && u.Role != "member" {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
-	}
-	return c.Next()
-}
-
 // errResponseWritten marks auth failures whose HTTP response has already been
 // written. Callers stop the handler chain without returning the error to
 // Fiber's error handler (which would rewrite the status to 500).
@@ -1299,222 +1432,4 @@ func unauthorized(c fiber.Ctx) error {
 func currentProject(c fiber.Ctx) meta.ProjectInfo {
 	p, _ := c.Locals(projectLocal).(meta.ProjectInfo)
 	return p
-}
-
-type cachedProject struct {
-	project   meta.ProjectInfo
-	expiresAt time.Time
-}
-
-var errAuthenticationRevisionChanged = errors.New("authentication store revision changed")
-
-const defaultAuthLookupTimeout = 5 * time.Second
-
-type authenticationCall struct {
-	done     chan struct{}
-	revision uint64
-	project  meta.ProjectInfo
-	err      error
-	panicked bool
-	panicVal any
-}
-
-// Authenticator resolves a bearer credential to a project through one lookup. Two
-// instances exist: ingest (project API tokens) and source map upload (ADR 0018);
-// each only ever consults its own token table.
-type Authenticator struct {
-	revisionFn    func() uint64
-	lookup        func(context.Context, string) (meta.ProjectInfo, error)
-	invalid       error
-	configured    bool
-	lookupTimeout time.Duration
-	mu            sync.RWMutex
-	cache         map[string]cachedProject
-	inflight      map[string]*authenticationCall
-	revision      uint64
-}
-
-func NewAuthenticator(store TokenStore) *Authenticator {
-	a := newAuthenticator()
-	if store != nil {
-		a.revisionFn = store.Revision
-		a.lookup = store.AuthenticateProjectAPIToken
-		a.invalid = meta.ErrInvalidProjectAPIToken
-		a.configured = true
-	}
-	return a
-}
-
-func newUploadAuthenticator(store UploadTokenStore) *Authenticator {
-	a := newAuthenticator()
-	if store != nil {
-		a.revisionFn = store.Revision
-		a.lookup = store.AuthenticateSourceMapUploadToken
-		a.invalid = meta.ErrInvalidSourceMapUploadToken
-		a.configured = true
-	}
-	return a
-}
-
-func newAuthenticator() *Authenticator {
-	return &Authenticator{
-		lookupTimeout: defaultAuthLookupTimeout,
-		cache:         make(map[string]cachedProject),
-		inflight:      make(map[string]*authenticationCall),
-	}
-}
-
-// Middleware authenticates ingest routes with a project API token. A source map
-// upload token is refused explicitly: it is a different credential kind.
-func (a *Authenticator) Middleware(c fiber.Ctx) error {
-	token := bearerCredential(c)
-	if strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) {
-		return uploadOnlyToken(c)
-	}
-	return a.authenticateRequest(c, token)
-}
-
-// UploadMiddleware authenticates the source map upload route. Only a source map
-// upload token is accepted; project API tokens and user tokens get 403 with
-// source_map_upload_token_required, anything else 401.
-func (a *Authenticator) UploadMiddleware(c fiber.Ctx) error {
-	token := bearerCredential(c)
-	if token != "" && !strings.HasPrefix(token, meta.SourceMapUploadTokenPrefix) &&
-		(strings.HasPrefix(token, "lo_") || strings.HasPrefix(token, "lou_")) {
-		return sourceMapUploadTokenRequired(c)
-	}
-	return a.authenticateRequest(c, token)
-}
-
-func (a *Authenticator) authenticateRequest(c fiber.Ctx, token string) error {
-	if token == "" || !a.configured {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
-	}
-	p, err := a.authenticate(c.Context(), token)
-	if err != nil {
-		if !errors.Is(err, a.invalid) && !meta.IsNotFound(err) {
-			return c.Status(fiber.StatusServiceUnavailable).
-				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
-		}
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
-	}
-	c.Locals(projectLocal, p)
-	return c.Next()
-}
-
-func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.ProjectInfo, error) {
-	for {
-		a.mu.Lock()
-		revision := a.revisionFn()
-		if revision != a.revision {
-			clear(a.cache)
-			a.revision = revision
-		}
-		if cached, ok := a.cache[token]; ok && time.Now().Before(cached.expiresAt) {
-			a.mu.Unlock()
-			return cached.project, nil
-		}
-		delete(a.cache, token)
-		if call, ok := a.inflight[token]; ok {
-			done := call.done
-			a.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return meta.ProjectInfo{}, ctx.Err()
-			case <-done:
-			}
-			if errors.Is(call.err, errAuthenticationRevisionChanged) {
-				continue
-			}
-			return call.project, call.err
-		}
-
-		// The caller's token may borrow Fiber's reusable request buffer, which
-		// the next request on the same context overwrites. A borrowed map key
-		// would then silently become another request's token: a different
-		// project's token, or one that was never issued, would match this
-		// entry and authenticate as this project. Store only an owned copy.
-		// Lookups above may use the borrowed value; only stored keys must own
-		// their bytes.
-		key := strings.Clone(token)
-		call := &authenticationCall{done: make(chan struct{}), revision: revision}
-		a.inflight[key] = call
-		a.mu.Unlock()
-
-		// Decouple upstream lookup from the leader's cancellation so a single
-		// client disconnect cannot fail concurrent waiters sharing this call,
-		// while bounding the lookup with an independent timeout.
-		timeout := a.lookupTimeout
-		if timeout <= 0 {
-			timeout = defaultAuthLookupTimeout
-		}
-		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-		go a.runLookup(lookupCtx, cancel, key, call)
-
-		select {
-		case <-ctx.Done():
-			return meta.ProjectInfo{}, ctx.Err()
-		case <-call.done:
-		}
-		if call.panicked {
-			panic(call.panicVal)
-		}
-		if errors.Is(call.err, errAuthenticationRevisionChanged) {
-			continue
-		}
-		return call.project, call.err
-	}
-}
-
-func (a *Authenticator) runLookup(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	key string,
-	call *authenticationCall,
-) {
-	defer cancel()
-	completed := false
-	defer func() {
-		r := recover()
-		if !completed {
-			a.mu.Lock()
-			if r != nil {
-				call.panicked = true
-				call.panicVal = r
-				call.err = fmt.Errorf("authentication lookup panic: %v", r)
-			} else {
-				call.err = errors.New("authentication lookup aborted")
-			}
-			if a.inflight[key] == call {
-				delete(a.inflight, key)
-			}
-			close(call.done)
-			a.mu.Unlock()
-		}
-	}()
-
-	project, authErr := a.lookup(ctx, key)
-	a.mu.Lock()
-	latestRevision := a.revisionFn()
-	if latestRevision != a.revision {
-		clear(a.cache)
-		a.revision = latestRevision
-	}
-	if latestRevision != call.revision {
-		call.err = errAuthenticationRevisionChanged
-	} else {
-		call.project, call.err = project, authErr
-		if authErr == nil {
-			a.cache[key] = cachedProject{
-				project:   project,
-				expiresAt: time.Now().Add(tokenCacheTTL),
-			}
-		}
-	}
-	if a.inflight[key] == call {
-		delete(a.inflight, key)
-	}
-	completed = true
-	close(call.done)
-	a.mu.Unlock()
 }

@@ -200,9 +200,12 @@ func (m *Manager) UpdateUser(ctx context.Context, input UpdateUserInput) (meta.U
 
 	revokeSessions := input.Password != ""
 	if !revokeSessions && input.Role != "" && m.sessions != nil {
-		if existing, getErr := m.store.GetUser(ctx, input.ID); getErr == nil {
-			revokeSessions = roleRank(input.Role) < roleRank(existing.Role)
+		existing, getErr := m.store.GetUser(ctx, input.ID)
+		if getErr != nil {
+			facts, managementErr := failedFromMetadata(facts, getErr)
+			return meta.UserInfo{}, facts, managementErr
 		}
+		revokeSessions = roleRank(input.Role) < roleRank(existing.Role)
 	}
 
 	updated, err := m.store.UpdateManagedUser(ctx, meta.ManagedUserUpdate{

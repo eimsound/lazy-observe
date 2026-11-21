@@ -13,12 +13,14 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/gofiber/fiber/v3"
 	"github.com/valyala/fasthttp"
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -40,6 +42,54 @@ const (
 	proxyConcurrencyNone     proxyConcurrencyGroup = ""
 	proxyConcurrencyLiveTail proxyConcurrencyGroup = "live_tail"
 )
+
+type storageProxyConfig struct {
+	storage             storagepkg.SignalBackend
+	client              *http.Client
+	tailClient          *http.Client
+	proxyTimeout        time.Duration
+	liveTail            *liveTailLimiter
+	liveTailMaxDuration time.Duration
+	liveTailHeartbeat   time.Duration
+	shutdownCtx         context.Context
+	logger              *slog.Logger
+	meterProvider       metric.MeterProvider
+}
+
+// storageProxy isolates all unary and streaming reverse-proxy state and logic
+// for metrics, logs, and traces from the Gateway composition root.
+type storageProxy struct {
+	storage             storagepkg.SignalBackend
+	client              *http.Client
+	tailClient          *http.Client
+	proxyTimeout        time.Duration
+	liveTail            *liveTailLimiter
+	liveTailMaxDuration time.Duration
+	liveTailHeartbeat   time.Duration
+	shutdownCtx         context.Context
+	logger              *slog.Logger
+	streamErrors        atomic.Int64
+	streamErrCounter    metric.Int64Counter
+}
+
+func newStorageProxy(cfg storageProxyConfig) *storageProxy {
+	p := &storageProxy{
+		storage:             cfg.storage,
+		client:              cfg.client,
+		tailClient:          cfg.tailClient,
+		proxyTimeout:        cfg.proxyTimeout,
+		liveTail:            cfg.liveTail,
+		liveTailMaxDuration: cfg.liveTailMaxDuration,
+		liveTailHeartbeat:   cfg.liveTailHeartbeat,
+		shutdownCtx:         cfg.shutdownCtx,
+		logger:              cfg.logger,
+	}
+	if cfg.meterProvider != nil {
+		meter := cfg.meterProvider.Meter("github.com/eimsound/lazy-observe/internal/gateway")
+		p.streamErrCounter, _ = meter.Int64Counter("gateway.proxy.stream_errors")
+	}
+	return p
+}
 
 // proxySpec declaratively describes one proxied upstream request so bounded
 // unary requests and long-lived streaming connections follow explicit contracts
@@ -131,50 +181,55 @@ var defaultProxyResponseHeaders = map[string]bool{
 	"x-lazy-observe-perf-request":                  true,
 }
 
-func (g *Gateway) logsProxyHandler(route logsProxyRoute) fiber.Handler {
+func (p *storageProxy) logsHandler(route logsProxyRoute) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		p := currentProject(c)
+		project := currentProject(c)
 		spec := proxySpec{
 			kind:             route.kind,
-			base:             g.storage.LogsQueryBase(),
+			base:             p.storage.LogsQueryBase(),
 			upstreamPath:     route.upstreamPath,
 			concurrencyGroup: route.concurrencyGroup,
 			requireTenant:    true,
-			projectID:        p.ID,
+			projectID:        project.ID,
 		}
 		if route.kind == proxyKindStream {
-			spec.maxDuration = g.liveTailMaxDuration
-			spec.heartbeat = g.liveTailHeartbeat
+			spec.maxDuration = p.liveTailMaxDuration
+			spec.heartbeat = p.liveTailHeartbeat
 		}
-		return g.executeProxy(c, spec)
+		return p.execute(c, spec)
 	}
 }
 
-func (g *Gateway) tenantProxy(base, upstreamPath string) fiber.Handler {
+func (p *storageProxy) tenantHandler(base, upstreamPath string) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		p := currentProject(c)
-		return g.executeProxy(c, proxySpec{
+		project := currentProject(c)
+		return p.execute(c, proxySpec{
 			kind:          proxyKindUnary,
 			base:          base,
 			upstreamPath:  upstreamPath,
 			requireTenant: true,
-			projectID:     p.ID,
+			projectID:     project.ID,
 		})
 	}
 }
 
-func (g *Gateway) metricsWrite(c fiber.Ctx, upstreamPath string, addProjectQuery bool) error {
-	return g.metricsWriteWithBody(c, upstreamPath, addProjectQuery, nil)
+func (p *storageProxy) metricsWrite(c fiber.Ctx, upstreamPath string, addProjectQuery bool) error {
+	return p.metricsWriteWithBody(c, upstreamPath, addProjectQuery, nil)
 }
 
-func (g *Gateway) metricsWriteWithBody(c fiber.Ctx, upstreamPath string, addProjectQuery bool, body []byte) error {
-	if !g.storage.MetricsIngestEnabled() {
+func (p *storageProxy) metricsWriteWithBody(
+	c fiber.Ctx,
+	upstreamPath string,
+	addProjectQuery bool,
+	body []byte,
+) error {
+	if !p.storage.MetricsIngestEnabled() {
 		return c.Status(fiber.StatusNotImplemented).
 			JSON(fiber.Map{"error": "metrics ingest is disabled: storage.metrics.ingest_url is not configured"})
 	}
-	p := currentProject(c)
-	base := g.storage.MetricsIngestBase()
-	if !g.storage.MetricsClustered() {
+	project := currentProject(c)
+	base := p.storage.MetricsIngestBase()
+	if !p.storage.MetricsClustered() {
 		upstreamPath = strings.TrimPrefix(upstreamPath, "/prometheus")
 	}
 	spec := proxySpec{
@@ -185,19 +240,19 @@ func (g *Gateway) metricsWriteWithBody(c fiber.Ctx, upstreamPath string, addProj
 		body:           body,
 	}
 	if addProjectQuery {
-		extraLabel, err := g.storage.MetricsIngestExtraLabel(p.Slug)
+		extraLabel, err := p.storage.MetricsIngestExtraLabel(project.Slug)
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
 		}
 		spec.addQuery = url.Values{"extra_label": []string{extraLabel}}
 	}
-	return g.executeProxy(c, spec)
+	return p.execute(c, spec)
 }
 
-func (g *Gateway) metricsQuery(c fiber.Ctx) error {
-	p := currentProject(c)
+func (p *storageProxy) metricsQuery(c fiber.Ctx) error {
+	project := currentProject(c)
 	// proxy only isolates when metricsProject is non-empty; fail closed instead of forwarding an unfiltered query.
-	if p.Slug == "" {
+	if project.Slug == "" {
 		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
 	}
 	upstreamPath := c.Path()
@@ -208,11 +263,11 @@ func (g *Gateway) metricsQuery(c fiber.Ctx) error {
 		}
 		upstreamPath = "/api/v1/label/" + url.PathEscape(labelName) + "/values"
 	}
-	return g.executeProxy(c, proxySpec{
+	return p.execute(c, proxySpec{
 		kind:           proxyKindUnary,
-		base:           g.storage.MetricsQueryBase(),
+		base:           p.storage.MetricsQueryBase(),
 		upstreamPath:   upstreamPath,
-		metricsProject: p.Slug,
+		metricsProject: project.Slug,
 		reservedParams: true,
 	})
 }
@@ -221,30 +276,30 @@ func (g *Gateway) metricsQuery(c fiber.Ctx) error {
 // opening a data-read path. It is still project-authenticated, but only the
 // query parameter is forwarded; storage isolation parameters and arbitrary
 // client-supplied options are deliberately discarded.
-func (g *Gateway) metricsPrettify(c fiber.Ctx) error {
-	return g.executeProxy(c, proxySpec{
+func (p *storageProxy) metricsPrettify(c fiber.Ctx) error {
+	return p.execute(c, proxySpec{
 		kind:          proxyKindUnary,
-		base:          g.storage.MetricsQueryBase(),
+		base:          p.storage.MetricsQueryBase(),
 		upstreamPath:  "/prettify-query",
 		allowedParams: map[string]bool{"query": true},
 	})
 }
 
-func (g *Gateway) executeProxy(c fiber.Ctx, spec proxySpec) error {
+func (p *storageProxy) execute(c fiber.Ctx, spec proxySpec) error {
 	if (spec.requireTenant && spec.projectID <= 0) || spec.projectID < 0 {
 		return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
 	}
 	switch spec.kind {
 	case proxyKindUnary:
-		return g.unaryProxy(c, spec)
+		return p.unary(c, spec)
 	case proxyKindStream:
-		return g.streamProxy(c, spec)
+		return p.stream(c, spec)
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, "unsupported proxy kind")
 	}
 }
 
-func (g *Gateway) unaryProxy(c fiber.Ctx, spec proxySpec) error {
+func (p *storageProxy) unary(c fiber.Ctx, spec proxySpec) error {
 	query, err := url.ParseQuery(string(c.RequestCtx().QueryArgs().QueryString()))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid query parameters")
@@ -262,7 +317,7 @@ func (g *Gateway) unaryProxy(c fiber.Ctx, spec proxySpec) error {
 			return fiber.NewError(fiber.StatusBadRequest, "invalid form body")
 		}
 		storagepkg.StripReservedMetricsParams(form)
-		if spec.metricsProject != "" && g.storage.MetricsMode() == storagepkg.MetricsPrometheus {
+		if spec.metricsProject != "" && p.storage.MetricsMode() == storagepkg.MetricsPrometheus {
 			if injectErr := storagepkg.InjectPromValues(form, spec.metricsProject); injectErr != nil {
 				return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+injectErr.Error())
 			}
@@ -282,7 +337,7 @@ func (g *Gateway) unaryProxy(c fiber.Ctx, spec proxySpec) error {
 		defaultMatcher := spec.upstreamPath != "/api/v1/query" &&
 			spec.upstreamPath != "/api/v1/query_range" &&
 			!hasFormMatch
-		if err := g.applyMetricsIsolation(query, spec.metricsProject, defaultMatcher); err != nil {
+		if err := p.applyMetricsIsolation(query, spec.metricsProject, defaultMatcher); err != nil {
 			return fiber.NewError(fiber.StatusBadRequest, "invalid PromQL: "+err.Error())
 		}
 	}
@@ -291,7 +346,7 @@ func (g *Gateway) unaryProxy(c fiber.Ctx, spec proxySpec) error {
 
 	timeout := spec.timeout
 	if timeout <= 0 {
-		timeout = g.proxyTimeout
+		timeout = p.proxyTimeout
 	}
 	if timeout <= 0 {
 		timeout = defaultUnaryProxyTimeout
@@ -301,7 +356,7 @@ func (g *Gateway) unaryProxy(c fiber.Ctx, spec proxySpec) error {
 	req, err := http.NewRequestWithContext(reqCtx, c.Method(), target, requestBodyReader(body))
 	if err != nil {
 		cancel()
-		g.proxyLogger().Error("build upstream proxy request failed", "path", spec.upstreamPath, "error", err)
+		p.log().Error("build upstream proxy request failed", "path", spec.upstreamPath, "error", err)
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to construct upstream request")
 	}
 	reqAllowlist := spec.requestHeaders
@@ -310,16 +365,16 @@ func (g *Gateway) unaryProxy(c fiber.Ctx, spec proxySpec) error {
 	}
 	copyAllowlistedRequestHeaders(req.Header, &c.Request().Header, reqAllowlist)
 	if spec.projectID > 0 {
-		if err := g.storage.ApplyTenantHeaders(req.Header, spec.projectID); err != nil {
+		if err := p.storage.ApplyTenantHeaders(req.Header, spec.projectID); err != nil {
 			cancel()
 			return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
 		}
 	}
 
-	resp, err := g.client.Do(req)
+	resp, err := p.client.Do(req)
 	if err != nil {
 		cancel()
-		return g.writeProxyUpstreamError(c, parentCtx, reqCtx, spec.upstreamPath, err)
+		return p.writeUpstreamError(c, parentCtx, reqCtx, spec.upstreamPath, err)
 	}
 	respAllowlist := spec.responseHeaders
 	if respAllowlist == nil {
@@ -340,14 +395,14 @@ func (g *Gateway) unaryProxy(c fiber.Ctx, spec proxySpec) error {
 		defer cancel()
 		defer resp.Body.Close()
 		if _, copyErr := io.Copy(w, resp.Body); copyErr != nil {
-			g.recordProxyStreamError(upstreamPath, statusCode, copyErr)
+			p.recordStreamError(upstreamPath, statusCode, copyErr)
 		}
 	})
 	return nil
 }
 
-func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
-	shutdownCtx := g.shutdownCtx
+func (p *storageProxy) stream(c fiber.Ctx, spec proxySpec) error {
+	shutdownCtx := p.shutdownCtx
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
@@ -356,9 +411,9 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 	}
 
 	u, _ := c.Locals(userLocal).(meta.UserInfo)
-	releaseSlot, ok := g.acquireProxyConcurrency(spec.concurrencyGroup, u.ID, spec.projectID)
+	releaseSlot, ok := p.acquireConcurrency(spec.concurrencyGroup, u.ID, spec.projectID)
 	if !ok {
-		g.proxyLogger().Warn(
+		p.log().Warn(
 			"stream proxy concurrency limit exceeded",
 			"group", string(spec.concurrencyGroup),
 			"path", spec.upstreamPath,
@@ -381,14 +436,14 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 
 	maxDuration := spec.maxDuration
 	if maxDuration <= 0 {
-		maxDuration = g.liveTailMaxDuration
+		maxDuration = p.liveTailMaxDuration
 	}
 	if maxDuration <= 0 {
 		maxDuration = defaultLiveTailMaxDuration
 	}
 	heartbeatInterval := spec.heartbeat
 	if heartbeatInterval <= 0 {
-		heartbeatInterval = g.liveTailHeartbeat
+		heartbeatInterval = p.liveTailHeartbeat
 	}
 
 	parentCtx := c.Context()
@@ -407,16 +462,16 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 	copyAllowlistedRequestHeaders(req.Header, &c.Request().Header, reqAllowlist)
 	req.Header.Del("Accept-Encoding")
 	if spec.projectID > 0 {
-		if err := g.storage.ApplyTenantHeaders(req.Header, spec.projectID); err != nil {
+		if err := p.storage.ApplyTenantHeaders(req.Header, spec.projectID); err != nil {
 			streamCancel()
 			releaseSlot()
 			return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
 		}
 	}
 
-	client := g.tailClient
+	client := p.tailClient
 	if client == nil {
-		client = g.client
+		client = p.client
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -425,7 +480,7 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 		if shutdownCtx.Err() != nil {
 			return writeGatewayDraining(c)
 		}
-		return g.writeProxyUpstreamError(c, parentCtx, streamCtx, spec.upstreamPath, err)
+		return p.writeUpstreamError(c, parentCtx, streamCtx, spec.upstreamPath, err)
 	}
 
 	respAllowlist := spec.responseHeaders
@@ -529,7 +584,7 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 				return
 			case <-heartbeatCh:
 				if _, writeErr := fw.Write([]byte("\n")); writeErr != nil {
-					g.recordProxyStreamError(upstreamPath, statusCode, writeErr)
+					p.recordStreamError(upstreamPath, statusCode, writeErr)
 					return
 				}
 			case chunk, ok := <-chunks:
@@ -538,7 +593,7 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 				}
 				if len(chunk.data) > 0 {
 					if _, writeErr := fw.Write(chunk.data); writeErr != nil {
-						g.recordProxyStreamError(upstreamPath, statusCode, writeErr)
+						p.recordStreamError(upstreamPath, statusCode, writeErr)
 						return
 					}
 					if ticker != nil {
@@ -547,7 +602,7 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 				}
 				if chunk.err != nil {
 					if !errors.Is(chunk.err, io.EOF) && streamCtx.Err() == nil {
-						g.proxyLogger().Warn(
+						p.log().Warn(
 							"stream proxy upstream interrupted",
 							"path", upstreamPath,
 							"project_id", projectID,
@@ -555,7 +610,7 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 							"status", statusCode,
 							"error", chunk.err,
 						)
-						g.recordProxyStreamError(upstreamPath, statusCode, chunk.err)
+						p.recordStreamError(upstreamPath, statusCode, chunk.err)
 					}
 					return
 				}
@@ -565,15 +620,15 @@ func (g *Gateway) streamProxy(c fiber.Ctx, spec proxySpec) error {
 	return nil
 }
 
-func (g *Gateway) acquireProxyConcurrency(group proxyConcurrencyGroup, userID, projectID int) (func(), bool) {
+func (p *storageProxy) acquireConcurrency(group proxyConcurrencyGroup, userID, projectID int) (func(), bool) {
 	switch group {
 	case proxyConcurrencyNone:
 		return func() {}, true
 	case proxyConcurrencyLiveTail:
-		if g.liveTail == nil {
+		if p.liveTail == nil {
 			return func() {}, true
 		}
-		return g.liveTail.acquire(userID, projectID)
+		return p.liveTail.acquire(userID, projectID)
 	default:
 		return func() {}, true
 	}
@@ -586,7 +641,7 @@ func writeGatewayDraining(c fiber.Ctx) error {
 	})
 }
 
-func (g *Gateway) writeProxyUpstreamError(
+func (p *storageProxy) writeUpstreamError(
 	c fiber.Ctx,
 	parentCtx context.Context,
 	reqCtx context.Context,
@@ -594,7 +649,7 @@ func (g *Gateway) writeProxyUpstreamError(
 	err error,
 ) error {
 	status, code, msg := classifyProxyError(parentCtx, reqCtx, err)
-	g.proxyLogger().Warn(
+	p.log().Warn(
 		"gateway upstream proxy failed",
 		"path", upstreamPath,
 		"status", status,
@@ -646,9 +701,13 @@ func ownedProxyRequestBody(c fiber.Ctx, override []byte) []byte {
 	if len(raw) == 0 {
 		return nil
 	}
-	// When Immutable is enabled (production gateway), requestBody already
-	// returns an owned copy via App.GetBytes; avoid a redundant full copy.
+	// When Immutable is enabled (production gateway) or boundedRequestDecoding
+	// already produced an owned slice, requestBody returns an owned buffer;
+	// avoid a redundant full-body copy.
 	if c.App().Config().Immutable {
+		return raw
+	}
+	if _, owned := c.Locals(decodedBodyLocal).([]byte); owned {
 		return raw
 	}
 	return append([]byte(nil), raw...)
@@ -685,19 +744,19 @@ func buildProxyTarget(base, upstreamPath string, query url.Values) string {
 	return target
 }
 
-func (g *Gateway) proxyLogger() *slog.Logger {
-	if g.logger != nil {
-		return g.logger
+func (p *storageProxy) log() *slog.Logger {
+	if p.logger != nil {
+		return p.logger
 	}
 	return slog.Default()
 }
 
-func (g *Gateway) recordProxyStreamError(targetPath string, statusCode int, err error) {
-	g.proxyStreamErrors.Add(1)
-	if g.proxyStreamErrCounter != nil {
-		g.proxyStreamErrCounter.Add(context.Background(), 1)
+func (p *storageProxy) recordStreamError(targetPath string, statusCode int, err error) {
+	p.streamErrors.Add(1)
+	if p.streamErrCounter != nil {
+		p.streamErrCounter.Add(context.Background(), 1)
 	}
-	g.proxyLogger().Warn("gateway proxy stream interrupted", "path", targetPath, "status", statusCode, "error", err)
+	p.log().Warn("gateway proxy stream interrupted", "path", targetPath, "status", statusCode, "error", err)
 }
 
 func drainAndCloseBody(body io.ReadCloser) {
@@ -712,11 +771,29 @@ func noFollowRedirects(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
+func (p *storageProxy) applyMetricsIsolation(
+	values url.Values,
+	project string,
+	defaultMatcher bool,
+) error {
+	return p.storage.ApplyMetricsQueryIsolation(values, project, defaultMatcher)
+}
+
+func (g *Gateway) metricsQuery(c fiber.Ctx) error {
+	if g.proxy != nil {
+		return g.proxy.metricsQuery(c)
+	}
+	return (&storageProxy{storage: g.storage, client: g.client, logger: g.logger}).metricsQuery(c)
+}
+
 func (g *Gateway) applyMetricsIsolation(
 	values url.Values,
 	project string,
 	defaultMatcher bool,
 ) error {
+	if g.proxy != nil {
+		return g.proxy.applyMetricsIsolation(values, project, defaultMatcher)
+	}
 	return g.storage.ApplyMetricsQueryIsolation(values, project, defaultMatcher)
 }
 

@@ -91,7 +91,8 @@ func (g *Gateway) errorsIngest(c fiber.Ctx) error {
 		case errors.Is(err, errortrack.ErrUnavailable):
 			return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "error tracking unavailable"})
 		default:
-			return fiber.NewError(http.StatusInternalServerError, "accept error events: "+err.Error())
+			g.logger.Warn("accept error events failed", "project", project.Slug, "error", err)
+			return fiber.NewError(http.StatusInternalServerError, "accept error events failed")
 		}
 	}
 	return c.JSON(fiber.Map{"accepted": len(events)})
@@ -695,7 +696,8 @@ func (g *Gateway) getIssue(c fiber.Ctx) error {
 	}
 	events, err := g.queryIssueEvents(c, row.Fingerprint, "", 20)
 	if err != nil {
-		return fiber.NewError(http.StatusBadGateway, err.Error())
+		g.logger.Warn("query issue events failed", "project_id", currentProject(c).ID, "issue_id", row.ID, "error", err)
+		return fiber.NewError(http.StatusBadGateway, "upstream storage unavailable")
 	}
 	trends, err := g.queryIssueTrends(c.Context(), currentProject(c).ID, []meta.IssueView{row})
 	if err != nil {
@@ -792,7 +794,14 @@ func (g *Gateway) getIssueEvent(c fiber.Ctx) error {
 	}
 	events, err := g.queryIssueEvents(c, row.Fingerprint, eventID, 1)
 	if err != nil {
-		return fiber.NewError(http.StatusBadGateway, err.Error())
+		g.logger.Warn(
+			"query issue event failed",
+			"project_id", currentProject(c).ID,
+			"issue_id", row.ID,
+			"event_id", eventID,
+			"error", err,
+		)
+		return fiber.NewError(http.StatusBadGateway, "upstream storage unavailable")
 	}
 	if len(events) == 0 {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not found"})

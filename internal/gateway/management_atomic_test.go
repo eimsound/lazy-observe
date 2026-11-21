@@ -2,13 +2,18 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/eimsound/lazy-observe/internal/account"
 	"github.com/eimsound/lazy-observe/internal/management"
+	"github.com/eimsound/lazy-observe/internal/state"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestAdminCreateUserRollsBackOnProfileConflict(t *testing.T) {
@@ -151,5 +156,153 @@ func TestAdminCreateUserPersistsDisplayName(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("created user alice-ops not found in store")
+	}
+}
+
+func TestAdminUserMutationsRevokeRedisSessionsAndProtectLastAdminViaHTTP(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	redisState := state.NewRedis(client, "mgmt-session-revoke")
+	sessions := account.NewStateSessions(redisState)
+	accounts := account.New(store, sessions, account.Options{
+		Limits: redisState, LoginGate: redisState, LoginFailureDelay: noLoginFailureDelay,
+	})
+	mgr := management.New(store).WithSessions(sessions)
+
+	admin, _, err := mgr.CreateUser(ctx, management.CreateUserInput{
+		Username: "sole-http-admin", Password: "password-123", Role: "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _, err := mgr.CreateUser(ctx, management.CreateUserInput{
+		Username: "target-member", Password: "password-123", Role: "member",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw := newMetadataTestGateway(store, Config{
+		Store:      store,
+		Tokens:     store,
+		Account:    accounts,
+		Management: mgr,
+		Limits:     redisState,
+	})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+	app := gw.App()
+
+	login := func(username, password string) *http.Cookie {
+		t.Helper()
+		payload, _ := json.Marshal(map[string]string{"username": username, "password": password})
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(string(payload)))
+		req.Header.Set("Content-Type", "application/json")
+		resp, reqErr := app.Test(req)
+		if reqErr != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("login %s status=%d err=%v", username, resp.StatusCode, reqErr)
+		}
+		defer resp.Body.Close()
+		for _, c := range resp.Cookies() {
+			if c.Name == "lo_session" {
+				return c
+			}
+		}
+		t.Fatalf("login %s did not return session cookie", username)
+		return nil
+	}
+
+	meStatus := func(cookie *http.Cookie) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+		req.AddCookie(cookie)
+		resp, reqErr := app.Test(req)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	adminCookie := login("sole-http-admin", "password-123")
+
+	// 1. Sole admin cannot be demoted or deleted via HTTP, and session stays active.
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/users/"+strconvI(admin.ID),
+		strings.NewReader(`{"role":"member"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	resp, err := app.Test(req)
+	if err != nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("demote sole admin status=%d want=403 err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/users/"+strconvI(admin.ID), nil)
+	req.AddCookie(adminCookie)
+	resp, err = app.Test(req)
+	if err != nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("delete sole admin status=%d want=403 err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+	if status := meStatus(adminCookie); status != http.StatusOK {
+		t.Fatalf("protected sole admin session lost: status=%d", status)
+	}
+
+	// 2. Password reset via HTTP revokes target's Redis session.
+	targetCookie := login("target-member", "password-123")
+	if status := meStatus(targetCookie); status != http.StatusOK {
+		t.Fatalf("target initial session status=%d want=200", status)
+	}
+	req = httptest.NewRequest(
+		http.MethodPatch,
+		"/api/users/"+strconvI(target.ID),
+		strings.NewReader(`{"password":"new-password-456"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	resp, err = app.Test(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("password reset status=%d want=200 err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+	if status := meStatus(targetCookie); status != http.StatusUnauthorized {
+		t.Fatalf("target Redis session survived password reset: status=%d want=401", status)
+	}
+
+	// 3. Role downgrade via HTTP revokes target's Redis session.
+	targetCookie = login("target-member", "new-password-456")
+	req = httptest.NewRequest(
+		http.MethodPut,
+		"/api/users/"+strconvI(target.ID),
+		strings.NewReader(`{"role":"viewer"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	resp, err = app.Test(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("role downgrade status=%d want=200 err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+	if status := meStatus(targetCookie); status != http.StatusUnauthorized {
+		t.Fatalf("target Redis session survived role downgrade: status=%d want=401", status)
+	}
+
+	// 4. User deletion via HTTP revokes target's Redis session.
+	targetCookie = login("target-member", "new-password-456")
+	req = httptest.NewRequest(http.MethodDelete, "/api/users/"+strconvI(target.ID), nil)
+	req.AddCookie(adminCookie)
+	resp, err = app.Test(req)
+	if err != nil || resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete user status=%d want=204 err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+	if status := meStatus(targetCookie); status != http.StatusUnauthorized {
+		t.Fatalf("target Redis session survived user deletion: status=%d want=401", status)
 	}
 }

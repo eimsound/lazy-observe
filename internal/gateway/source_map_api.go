@@ -57,7 +57,8 @@ func (g *Gateway) uploadSourceMaps(c fiber.Ctx) error {
 		seen[filename] = true
 		f, openErr := headers[0].Open()
 		if openErr != nil {
-			return fiber.NewError(http.StatusInternalServerError, openErr.Error())
+			g.logger.Warn("open uploaded source map failed", "filename", filename, "error", openErr)
+			return fiber.NewError(http.StatusInternalServerError, "open uploaded source map failed")
 		}
 		raw, readErr := io.ReadAll(io.LimitReader(f, maxSourceMapBytes+1))
 		closeErr := f.Close()
@@ -89,7 +90,8 @@ func (g *Gateway) uploadSourceMaps(c fiber.Ctx) error {
 	for _, upload := range uploads {
 		key := sourceMapRevisionKey(p.Slug, upload.digest)
 		if err := g.blobs.Put(c.Context(), key, bytes.NewReader(upload.data)); err != nil {
-			return fiber.NewError(http.StatusInternalServerError, err.Error())
+			g.logger.Warn("store source map blob failed", "project", p.Slug, "release", release, "error", err)
+			return fiber.NewError(http.StatusInternalServerError, "store source map failed")
 		}
 		items = append(items, meta.SourceMapArtifactInput{
 			Filename: upload.filename,
@@ -109,7 +111,8 @@ func (g *Gateway) uploadSourceMaps(c fiber.Ctx) error {
 		if errors.Is(err, meta.ErrSourceMapQuotaExceeded) {
 			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "release archive limit exceeded"})
 		}
-		return fiber.NewError(http.StatusInternalServerError, err.Error())
+		g.logger.Warn("persist source map metadata failed", "project", p.Slug, "release", release, "error", err)
+		return fiber.NewError(http.StatusInternalServerError, "persist source map metadata failed")
 	}
 	return c.Status(http.StatusCreated).
 		JSON(fiber.Map{"release": release, "uploaded": len(uploads), "size": incomingBytes})

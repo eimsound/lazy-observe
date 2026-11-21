@@ -285,8 +285,8 @@ func TestProxyNoContentAndStreamErrorAccounting(t *testing.T) {
 			_, _ = io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 		}
-		if gw.proxyStreamErrors.Load() < 1 {
-			t.Fatalf("proxyStreamErrors=%d want >= 1", gw.proxyStreamErrors.Load())
+		if gw.proxy.streamErrors.Load() < 1 {
+			t.Fatalf("proxyStreamErrors=%d want >= 1", gw.proxy.streamErrors.Load())
 		}
 	})
 }

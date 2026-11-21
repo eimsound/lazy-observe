@@ -92,6 +92,7 @@ func startGateway(
 			Instrumentation:          monitoring.instrumentation,
 			SelfMonitoringToken:      metadata.selfToken,
 			Limits:                   shared.limits,
+			AuthInvalidator:          shared.authInvalidator,
 			RequireCSRF:              cfg.Security.CSRF,
 			SecureSessionCookie:      effectiveSecureSessionCookie(cfg),
 			TrustedProxies:           cfg.Security.TrustedProxies,
