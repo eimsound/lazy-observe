@@ -5,11 +5,11 @@
 ## 1. DSN 与凭据零泄漏（`#185`、`#187`、`#189`）
 
 - `parseDSN` 等解析失败路径只返回结构化脱敏错误，剥离原始 URL 与 token，避免通过 Go `*url.Error`、Node `cause.input` 或异常消息将明文项目 API Token 打印进宿主日志。
-- Python `DSN`/`Config` 的 `__repr__`/`__str__` 与四端示例代码统一隐藏或占位展示 token；Python 传输层使用独立 `OpenerDirector` 隔离全局 `urllib` opener 并禁止跨源重定向透传 `Authorization` 头；Go profiling 等子模块自建带超时 `http.Client`，不复用全局 `http.DefaultClient`。
+- Python `DSN`/`Config` 的 `__repr__`/`__str__` 与四端示例代码统一隐藏或占位展示 token；Python 传输层使用独立 `httpx.Client(follow_redirects=False)` 隔离全局 `urllib` 状态并拒绝 3xx 重定向（防降级 POST 或跨源泄露 `Authorization`）；Go profiling 等子模块自建带超时 `http.Client`，不复用全局 `http.DefaultClient`。
 
 ## 2. 4xx 丢弃契约、`Retry-After` 与单事件 200KB 预算（`#185`、`#187`、`#189`）
 
-- 除 `408`、`429` 外，其余 `4xx` 全部按 `server_rejected` 立即丢弃并记入自诊断计数，不进入退避重试；可重试错误遵守服务端 `Retry-After`（加合理上限）并叠加随机 jitter。
+- 除 `408`、`429` 外，其余 `4xx` 全部按 `server_rejected` 立即丢弃并记入自诊断计数，不进入退避重试；可重试错误采用带随机 jitter 的指数退避，并遵守服务端 `Retry-After`（默认上限 30s）。
 - 在入队或序列化前严格执行单事件 200KB 预算（防止异常文本与堆栈双份序列化膨胀），超限事件先裁剪字段或独立丢弃，杜绝单条 413 毒化整批正常事件。
 - Browser 侧约束 `fetch(..., { keepalive: true })` 载荷低于 64KB 浏览器上限；Node 侧使用异步压缩避免 `gzipSync` 阻塞事件循环。
 

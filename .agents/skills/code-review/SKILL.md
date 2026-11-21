@@ -33,7 +33,7 @@ Look for the originating spec, in this order:
 
 ### 3. Identify the standards sources
 
-Search the repo for every file that documents how code should be written. Always include `.agents/skills/pitfalls/SKILL.md` plus the surface reference file(s) matching the diff's touched paths, and include `CODING_STANDARDS.md` or `CONTRIBUTING.md` when present.
+Search the repo for documented standards: always include `AGENTS.md`, `.agents/skills/pitfalls/SKILL.md`, and the `pitfalls/` surface file(s) matching touched paths (plus `CONTRIBUTING.md` if present).
 
 On top of whatever the repo documents, the Standards axis always carries the **smell baseline** below: a fixed set of Fowler code smells (_Refactoring_, ch.3) that applies even when a repo documents nothing. Two rules bind it:
 
@@ -63,7 +63,7 @@ Issue both sub-agent calls together, in the foreground, and aggregate the report
 
 - The full diff command and commit list.
 - The list of standards-source files you found in step 3, **plus the smell baseline from step 3** pasted in full (the sub-agent has no other access to it).
-- The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Under 400 words."
+- The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); (b) any baseline smell you spot: name it and quote the hunk; and (c) optional pitfall signals (≤ 3 lines) for any reusable bug class that linters/tests cannot catch missing from `.agents/skills/pitfalls/`, or any `pitfalls/` entry that is stale or now enforced by tooling (cite file + symbol). Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces under (a)/(b), while still flagging tool-enforced `pitfalls/` entries under (c) for graduation. Under 400 words."
 
 **Spec sub-agent prompt** should include:
 
@@ -76,6 +76,8 @@ If the spec is missing, skip the Spec sub-agent and note this in the final repor
 ### 5. Aggregate
 
 Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned. Do **not** merge or rerank findings, because the two axes are deliberately separate (see _Why two axes_).
+
+If Standards reported pitfall signals under (c), include them verbatim under `## Pitfall Signals` (≤ 3 lines; omit when empty). When reviewing a PR, include this section in the PR review comment so later `/skill:retro` runs can collect it.
 
 End with a one-line summary: total findings per axis, and the worst issue _within each axis_ (if any). Don't pick a single winner across axes: that's the reranking the separation exists to prevent.
 
