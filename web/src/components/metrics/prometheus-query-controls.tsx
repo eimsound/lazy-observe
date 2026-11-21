@@ -1,11 +1,13 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { ChevronLeft, ChevronRight, Minus, Plus, Settings2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   effectiveMetricsStep,
   formatPrometheusDuration,
+  metricsRangeKey,
   metricsRangeSeconds,
   parsePrometheusDuration,
+  resolveRangeKeyedDraft,
   setMetricsRangeSeconds,
   shiftMetricsRange,
   stepMetricsRange,
@@ -13,6 +15,7 @@ import {
   type MetricsRange,
   type MetricsResolution,
   type MetricsTableMode,
+  type RangeKeyedDraft,
 } from "@/lib/metrics-query";
 import { MetricsTimeRangePicker } from "@/components/metrics/metrics-time-range-picker";
 import { Button } from "@/components/ui/button";
@@ -50,18 +53,19 @@ export function PrometheusQueryControls({
   onLocalTimeChange,
 }: PrometheusQueryControlsProps) {
   const { t } = useTranslation();
+  const rangeKey = metricsRangeKey(range);
   const seconds = metricsRangeSeconds(range);
-  const [rangeInput, setRangeInput] = useState(formatPrometheusDuration(seconds));
+  const formattedRange = formatPrometheusDuration(seconds);
+  const [rangeDraft, setRangeDraft] = useState<RangeKeyedDraft | null>(null);
+  const rangeInput = resolveRangeKeyedDraft(rangeDraft, range, formattedRange);
   const [customStep, setCustomStep] = useState(
     formatPrometheusDuration(effectiveMetricsStep(resolution, seconds)),
   );
 
-  useEffect(() => setRangeInput(formatPrometheusDuration(metricsRangeSeconds(range))), [range]);
-
   function applyRangeInput() {
     const parsed = parsePrometheusDuration(rangeInput);
+    setRangeDraft(null);
     if (parsed === null) {
-      setRangeInput(formatPrometheusDuration(metricsRangeSeconds(range)));
       return;
     }
     onRangeChange(setMetricsRangeSeconds(range, parsed));
@@ -97,7 +101,7 @@ export function PrometheusQueryControls({
             aria-label={t("metrics.range")}
             className="h-full w-20 rounded-none border-y-0 px-2 text-center font-mono text-xs shadow-none focus-visible:ring-0"
             value={rangeInput}
-            onChange={(event) => setRangeInput(event.target.value)}
+            onChange={(event) => setRangeDraft({ rangeKey, value: event.target.value })}
             onBlur={applyRangeInput}
             onKeyDown={(event) => event.key === "Enter" && applyRangeInput()}
           />

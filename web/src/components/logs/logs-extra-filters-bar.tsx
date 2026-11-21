@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Check, Copy, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -59,21 +59,19 @@ export function ExtraFiltersBar({
   className,
 }: ExtraFiltersBarProps) {
   const { t } = useTranslation();
-  const [copied, setCopied] = useState(false);
+  const [copiedExpression, setCopiedExpression] = useState<string | null>(null);
   const expression = useMemo(() => compileFilters(filters), [filters]);
-
-  useEffect(() => {
-    setCopied(false);
-  }, [expression]);
+  const copied = copiedExpression !== null && copiedExpression === expression;
 
   if (!filters.length) return null;
 
   const copyExpression = async () => {
     if (!expression) return;
     try {
-      setCopied(await copyText(expression));
+      const ok = await copyText(expression);
+      setCopiedExpression(ok ? expression : null);
     } catch {
-      setCopied(false);
+      setCopiedExpression(null);
     }
   };
 

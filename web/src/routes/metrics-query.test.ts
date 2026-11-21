@@ -16,9 +16,11 @@ import {
   METRICSQL_FUNCTIONS,
   metricsAutocompleteRange,
   metricsLabelColumns,
+  metricsRangeKey,
   parseDateTime,
   parsePrometheusDuration,
   resolveMetricsRange,
+  resolveRangeKeyedDraft,
   shiftMetricsRange,
   stepMetricsRange,
   toggleMetricsSeriesSelection,
@@ -220,4 +222,26 @@ test("CodeMirror surrounds selected PromQL when an opening bracket is typed", ()
     [transaction.state.selection.main.from, transaction.state.selection.main.to],
     [6, 13],
   );
+});
+
+test("metricsRangeKey and resolveRangeKeyedDraft preserve drafts across value-equal cloned MetricsRange objects", () => {
+  const relA = { mode: "relative" as const, presetId: "1h", seconds: 3600 };
+  const relClone = { mode: "relative" as const, presetId: "1h", seconds: 3600 };
+  const relOther = { mode: "relative" as const, presetId: "6h", seconds: 21600 };
+  assert.notEqual(relA, relClone);
+  assert.equal(metricsRangeKey(relA), metricsRangeKey(relClone));
+  assert.notEqual(metricsRangeKey(relA), metricsRangeKey(relOther));
+
+  const absA = { mode: "absolute" as const, startMs: 1_700_000_000_000, endMs: 1_700_003_600_000 };
+  const absClone = { mode: "absolute" as const, startMs: 1_700_000_000_000, endMs: 1_700_003_600_000 };
+  const absNoEnd = { mode: "absolute" as const, startMs: 1_700_000_000_000 };
+  assert.equal(metricsRangeKey(absA), metricsRangeKey(absClone));
+  assert.notEqual(metricsRangeKey(absA), metricsRangeKey(absNoEnd));
+
+  // User types an incomplete duration draft while Live Tail / background refresh emits a cloned range object.
+  const draft = { rangeKey: metricsRangeKey(relA), value: "2h3" };
+  assert.equal(resolveRangeKeyedDraft(draft, relClone, "1h"), "2h3");
+  // When the range actually changes (e.g. clicking +/- or external nav), the stale draft is discarded.
+  assert.equal(resolveRangeKeyedDraft(draft, relOther, "6h"), "6h");
+  assert.equal(resolveRangeKeyedDraft(draft, absA, "1h"), "1h");
 });

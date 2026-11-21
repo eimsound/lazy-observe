@@ -498,6 +498,107 @@ export interface UseVirtualWindowResult extends VirtualRange {
 const useIsomorphicLayoutEffect =
   typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
+export interface MeasurableVirtualElement {
+  dataset: { virtualIndex?: string };
+  getBoundingClientRect(): { height: number };
+}
+
+/**
+ * Records one mounted row element's measured DOM height against the current
+ * `layout`, `getItemKey`, `resetKey`, and `scrollTop`. Returns `0` when the
+ * height is unchanged within `MEASURE_TOLERANCE_PX`, a signed px delta when an
+ * above-viewport row changed height and requires scrollTop correction, or
+ * `Number.EPSILON` when a height changed without scrollTop adjustment.
+ */
+export function recordVirtualElementHeight(params: {
+  el: MeasurableVirtualElement;
+  store: VirtualMeasureStore;
+  resetKey: string | number | undefined;
+  layout: VirtualWindowLayout;
+  scrollTop: number;
+  getItemKey?: (index: number) => string | number;
+}): number {
+  const { el, store, resetKey, layout, scrollTop, getItemKey } = params;
+  syncMeasureStoreForResetKey(store, resetKey);
+  const indexAttr = el.dataset.virtualIndex;
+  if (indexAttr === undefined) return 0;
+  const index = Number(indexAttr);
+  if (!Number.isInteger(index) || index < 0 || index >= layout.count) {
+    return 0;
+  }
+
+  const rawHeight = el.getBoundingClientRect().height;
+  if (!Number.isFinite(rawHeight) || rawHeight <= 0) return 0;
+  const height = Math.round(rawHeight * 2) / 2;
+
+  const sizes = store.sizes;
+  const key = getItemKey ? getItemKey(index) : index;
+  const prevSize = layout.getSize(index);
+  const cachedSize = sizes.get(key);
+  if (cachedSize !== undefined && Math.abs(cachedSize - height) <= MEASURE_TOLERANCE_PX) {
+    return 0;
+  }
+  if (cachedSize === undefined && Math.abs(prevSize - height) <= MEASURE_TOLERANCE_PX) {
+    // Preserve the O(1) fixed-height fast path while unexpanded rows match estimate within deadband.
+    if (!layout.isFixed) {
+      sizes.set(key, height);
+    }
+    return 0;
+  }
+
+  const delta = height - prevSize;
+  sizes.set(key, height);
+
+  const itemEnd = layout.getOffset(index) + prevSize;
+  if (itemEnd <= scrollTop && Math.abs(delta) >= 1) {
+    return delta;
+  }
+  return Number.EPSILON; // Signal a height change without scrollTop adjustment.
+}
+
+/**
+ * Drains elements queued by child `ref={measureElement}` callbacks during the
+ * commit phase, measuring them once parent layout-effect state (`layout`,
+ * `getItemKey`, `resetKey`, `scrollTop`) is synchronized.
+ */
+export function flushPendingVirtualMeasurements(params: {
+  pendingElements: Set<MeasurableVirtualElement>;
+  store: VirtualMeasureStore;
+  resetKey: string | number | undefined;
+  layout: VirtualWindowLayout;
+  scrollTop: number;
+  getItemKey?: (index: number) => string | number;
+}): { changed: boolean; scrollCorrection: number } {
+  const { pendingElements, store, resetKey, layout, scrollTop, getItemKey } = params;
+  if (pendingElements.size === 0) {
+    return { changed: false, scrollCorrection: 0 };
+  }
+  const elements = Array.from(pendingElements);
+  pendingElements.clear();
+
+  let changed = false;
+  let scrollCorrection = 0;
+  for (const el of elements) {
+    const result = recordVirtualElementHeight({
+      el,
+      store,
+      resetKey,
+      layout,
+      scrollTop,
+      getItemKey,
+    });
+    if (result !== 0) {
+      changed = true;
+      if (result !== Number.EPSILON) {
+        scrollCorrection += result;
+      }
+    }
+  }
+  return { changed, scrollCorrection };
+}
+
+const EMPTY_MEASURED_SIZES: ReadonlyMap<string | number, number> = new Map();
+
 export function useVirtualWindow({
   count,
   estimateSize,
@@ -515,41 +616,42 @@ export function useVirtualWindow({
   const [viewportHeight, setViewportHeight] = useState(() =>
     sanitizeSize(defaultViewportHeight),
   );
-  const [measureVersion, setMeasureVersion] = useState(0);
+  // Immutable snapshot of measured heights scoped by `resetKey` so render stays
+  // pure while layout effects and ResizeObserver record into `measureStoreRef`.
+  const [measuredState, setMeasuredState] = useState<{
+    resetKey: string | number | undefined;
+    sizes: ReadonlyMap<string | number, number>;
+  }>(() => ({ resetKey, sizes: EMPTY_MEASURED_SIZES }));
+  const [trackedResetKey, setTrackedResetKey] = useState(resetKey);
+  const resetChangedInRender = !Object.is(trackedResetKey, resetKey);
+  if (resetChangedInRender) {
+    setTrackedResetKey(resetKey);
+    if (scrollTop !== 0) {
+      setScrollTop(0);
+    }
+  }
+  const effectiveScrollTop = resetChangedInRender ? 0 : scrollTop;
+  const activeMeasuredSizes =
+    Object.is(measuredState.resetKey, resetKey) && measuredState.sizes.size > 0
+      ? measuredState.sizes
+      : undefined;
 
-  // Swap the measured-height Map synchronously during render when `resetKey` changes
-  // so child `measureElement` ref callbacks during this commit write into the fresh
-  // Map and are never wiped by a post-commit layout effect.
   const measureStoreRef = useRef<VirtualMeasureStore>({
     resetKey,
     sizes: new Map(),
   });
-  const resetChangedInRender = syncMeasureStoreForResetKey(
-    measureStoreRef.current,
-    resetKey,
-  );
-  if (resetChangedInRender) {
-    scrollTopRef.current = 0;
-  }
-  const activeMeasuredSizes = measureStoreRef.current.sizes;
-  const effectiveScrollTop = resetChangedInRender ? 0 : scrollTop;
-
-  const committedScrollTopRef = useRef(0);
-  committedScrollTopRef.current = effectiveScrollTop;
-
+  const committedScrollTopRef = useRef(effectiveScrollTop);
   const getItemKeyRef = useRef(getItemKey);
-  getItemKeyRef.current = getItemKey;
+  const resetKeyRef = useRef(resetKey);
+  const prevLayoutResetKeyRef = useRef(resetKey);
+  const mountedElementsRef = useRef<Set<HTMLElement>>(new Set());
+  const pendingElementsRef = useRef<Set<HTMLElement>>(new Set());
 
-  const layout = useMemo(() => {
-    const measured =
-      activeMeasuredSizes.size > 0 && measureVersion > 0
-        ? activeMeasuredSizes
-        : undefined;
-    return buildVirtualLayout(count, estimateSize, measured, getItemKey);
-  }, [count, estimateSize, getItemKey, activeMeasuredSizes, measureVersion]);
-
+  const layout = useMemo(
+    () => buildVirtualLayout(count, estimateSize, activeMeasuredSizes, getItemKey),
+    [count, estimateSize, getItemKey, activeMeasuredSizes],
+  );
   const layoutRef = useRef(layout);
-  layoutRef.current = layout;
 
   const range = useMemo(
     () =>
@@ -563,21 +665,64 @@ export function useVirtualWindow({
       }),
     [layout, effectiveScrollTop, viewportHeight, overscan, virtualizeThreshold, enabled],
   );
-
   const rangeRef = useRef(range);
-  rangeRef.current = range;
-
   const viewportHeightRef = useRef(viewportHeight);
-  viewportHeightRef.current = viewportHeight;
-
   const overscanRef = useRef(overscan);
-  overscanRef.current = overscan;
-
   const thresholdRef = useRef(virtualizeThreshold);
-  thresholdRef.current = virtualizeThreshold;
-
   const enabledRef = useRef(enabled);
-  enabledRef.current = enabled;
+
+  // Unified pre-paint commit sync:
+  // React runs child `ref={measureElement}` callbacks depth-first before this
+  // parent layout effect. Sync `resetKey`, `layoutRef`, `getItemKeyRef`, and
+  // `scrollTopRef` first, then flush all pending row elements in one batch so
+  // measurements always target the current render's keys and layout.
+  useIsomorphicLayoutEffect(() => {
+    const resetChanged = !Object.is(prevLayoutResetKeyRef.current, resetKey);
+    if (resetChanged) {
+      prevLayoutResetKeyRef.current = resetKey;
+      syncMeasureStoreForResetKey(measureStoreRef.current, resetKey);
+      scrollTopRef.current = 0;
+      if (scrollElementRef.current) {
+        scrollElementRef.current.scrollTop = 0;
+      }
+      setScrollTop((prev) => (prev === 0 ? prev : 0));
+      for (const el of mountedElementsRef.current) {
+        pendingElementsRef.current.add(el);
+      }
+    }
+
+    committedScrollTopRef.current = effectiveScrollTop;
+    getItemKeyRef.current = getItemKey;
+    layoutRef.current = layout;
+    rangeRef.current = range;
+    viewportHeightRef.current = viewportHeight;
+    overscanRef.current = overscan;
+    thresholdRef.current = virtualizeThreshold;
+    enabledRef.current = enabled;
+    resetKeyRef.current = resetKey;
+
+    if (pendingElementsRef.current.size > 0) {
+      const { changed, scrollCorrection } = flushPendingVirtualMeasurements({
+        pendingElements: pendingElementsRef.current,
+        store: measureStoreRef.current,
+        resetKey,
+        layout,
+        scrollTop: scrollTopRef.current,
+        getItemKey,
+      });
+      if (scrollCorrection !== 0 && scrollElementRef.current) {
+        const nextTop = Math.max(0, scrollElementRef.current.scrollTop + scrollCorrection);
+        scrollElementRef.current.scrollTop = nextTop;
+        scrollTopRef.current = nextTop;
+      }
+      if (changed) {
+        setMeasuredState({
+          resetKey,
+          sizes: new Map(measureStoreRef.current.sizes),
+        });
+      }
+    }
+  });
 
   const items = useMemo(
     () => computeVirtualItems(layout, range.startIndex, range.endIndex),
@@ -588,21 +733,6 @@ export function useVirtualWindow({
     scrollElementRef.current = node;
     setScrollElement(node);
   }, []);
-
-  // Reset DOM scroll position when viewing a distinct entity (`resetKey`).
-  // Measured heights were already isolated synchronously in render so child
-  // `measureElement` measurements from this commit stay intact.
-  const prevLayoutResetKeyRef = useRef(resetKey);
-  useIsomorphicLayoutEffect(() => {
-    if (Object.is(prevLayoutResetKeyRef.current, resetKey)) return;
-    prevLayoutResetKeyRef.current = resetKey;
-
-    scrollTopRef.current = 0;
-    if (scrollElementRef.current) {
-      scrollElementRef.current.scrollTop = 0;
-    }
-    setScrollTop((prev) => (prev === 0 ? prev : 0));
-  }, [resetKey]);
 
   // Track container scroll position and viewport height.
   useIsomorphicLayoutEffect(() => {
@@ -722,50 +852,27 @@ export function useVirtualWindow({
 
   // Keep cached measured sizes consistent when the underlying item set changes.
   useEffect(() => {
-    if (pruneMeasuredSizes(measureStoreRef.current.sizes, count, getItemKey)) {
-      setMeasureVersion((v) => v + 1);
+    syncMeasureStoreForResetKey(measureStoreRef.current, resetKey);
+    if (!pruneMeasuredSizes(measureStoreRef.current.sizes, count, getItemKey)) {
+      return;
     }
-  }, [count, getItemKey]);
+    let cancelled = false;
+    const snapshot = new Map(measureStoreRef.current.sizes);
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setMeasuredState((prev) =>
+        Object.is(prev.resetKey, resetKey)
+          ? { resetKey, sizes: snapshot }
+          : prev,
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [count, getItemKey, resetKey]);
 
   // Single shared ResizeObserver for variable-height rows.
   const itemObserverRef = useRef<ResizeObserver | null>(null);
-
-  const recordElementHeight = useCallback((el: HTMLElement): number => {
-    const indexAttr = el.dataset.virtualIndex;
-    if (indexAttr === undefined) return 0;
-    const index = Number(indexAttr);
-    if (!Number.isInteger(index) || index < 0 || index >= layoutRef.current.count) {
-      return 0;
-    }
-
-    const rawHeight = el.getBoundingClientRect().height;
-    if (!Number.isFinite(rawHeight) || rawHeight <= 0) return 0;
-    const height = Math.round(rawHeight * 2) / 2;
-
-    const sizes = measureStoreRef.current.sizes;
-    const key = getItemKeyRef.current ? getItemKeyRef.current(index) : index;
-    const prevSize = layoutRef.current.getSize(index);
-    const cachedSize = sizes.get(key);
-    if (cachedSize !== undefined && Math.abs(cachedSize - height) <= MEASURE_TOLERANCE_PX) {
-      return 0;
-    }
-    if (cachedSize === undefined && Math.abs(prevSize - height) <= MEASURE_TOLERANCE_PX) {
-      // Preserve the O(1) fixed-height fast path while unexpanded rows match estimate within deadband.
-      if (!layoutRef.current.isFixed) {
-        sizes.set(key, height);
-      }
-      return 0;
-    }
-
-    const delta = height - prevSize;
-    sizes.set(key, height);
-
-    const itemEnd = layoutRef.current.getOffset(index) + prevSize;
-    if (itemEnd <= scrollTopRef.current && Math.abs(delta) >= 1) {
-      return delta;
-    }
-    return Number.EPSILON; // Signal a height change without scrollTop adjustment.
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -782,7 +889,14 @@ export function useVirtualWindow({
         let scrollCorrection = 0;
         for (const entry of entries) {
           if (!(entry.target instanceof HTMLElement)) continue;
-          const result = recordElementHeight(entry.target);
+          const result = recordVirtualElementHeight({
+            el: entry.target,
+            store: measureStoreRef.current,
+            resetKey: resetKeyRef.current,
+            layout: layoutRef.current,
+            scrollTop: scrollTopRef.current,
+            getItemKey: getItemKeyRef.current,
+          });
           if (result !== 0) {
             changed = true;
             if (result !== Number.EPSILON) {
@@ -796,32 +910,33 @@ export function useVirtualWindow({
           scrollTopRef.current = nextTop;
         }
         if (changed) {
-          setMeasureVersion((v) => v + 1);
+          const activeResetKey = resetKeyRef.current;
+          setMeasuredState({
+            resetKey: activeResetKey,
+            sizes: new Map(measureStoreRef.current.sizes),
+          });
         }
       });
     }
     return itemObserverRef.current;
-  }, [recordElementHeight]);
+  }, []);
 
+  // Stable ref callback: queues newly attached elements for pre-paint batch
+  // measurement inside the parent layout effect once layout/key refs are fresh.
   const measureElement = useCallback<RefCallback<HTMLElement>>(
     (el) => {
       if (!el) return;
+      mountedElementsRef.current.add(el);
+      pendingElementsRef.current.add(el);
       const observer = ensureItemObserver();
       observer?.observe(el);
-      const result = recordElementHeight(el);
-      if (result !== 0) {
-        if (result !== Number.EPSILON && scrollElementRef.current) {
-          const nextTop = Math.max(0, scrollElementRef.current.scrollTop + result);
-          scrollElementRef.current.scrollTop = nextTop;
-          scrollTopRef.current = nextTop;
-        }
-        setMeasureVersion((v) => v + 1);
-      }
       return () => {
+        mountedElementsRef.current.delete(el);
+        pendingElementsRef.current.delete(el);
         itemObserverRef.current?.unobserve(el);
       };
     },
-    [ensureItemObserver, recordElementHeight],
+    [ensureItemObserver],
   );
 
   const scrollToIndex = useCallback(

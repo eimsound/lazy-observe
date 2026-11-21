@@ -61,9 +61,16 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   // Auto-select a valid project once the list loads (or if the stored one vanished).
   useEffect(() => {
     if (!projectsQuery.isSuccess || !selection.changed) return;
+    let cancelled = false;
     setProjectSlug(selection.resolvedSlug);
-    setCurrentSlug(selection.resolvedSlug);
-    void switchProjectQueries(queryClient);
+    void switchProjectQueries(queryClient).then(() => {
+      if (!cancelled) {
+        setCurrentSlug(selection.resolvedSlug);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [projectsQuery.isSuccess, selection.changed, selection.resolvedSlug, queryClient]);
 
   const value = useMemo<ProjectContextValue>(() => {

@@ -40,14 +40,21 @@ export function CommandPalette({
   const { projects, setCurrent } = useProject();
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
+  const [wasOpen, setWasOpen] = useState(open);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) {
       setQuery("");
       setIndex(0);
-      requestAnimationFrame(() => inputRef.current?.focus());
     }
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    const id = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(id);
   }, [open]);
 
   const staticCommands = useMemo<CommandItem[]>(() => {
@@ -105,7 +112,7 @@ export function CommandPalette({
     return base.slice(0, 12);
   }, [query, staticCommands, t, navigate, onOpenChange]);
 
-  useEffect(() => setIndex(0), [query]);
+  const activeIndex = Math.min(index, Math.max(0, commands.length - 1));
 
   function select(command: CommandItem | undefined) {
     if (!command) return;
@@ -124,7 +131,7 @@ export function CommandPalette({
         break;
       case "Enter":
         event.preventDefault();
-        select(commands[index]);
+        select(commands[activeIndex]);
         break;
       case "Escape":
         onOpenChange(false);
@@ -143,7 +150,10 @@ export function CommandPalette({
           <Input
             ref={inputRef}
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setIndex(0);
+            }}
             placeholder={t("palette.placeholder")}
             className="h-11 border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
           />
@@ -160,7 +170,7 @@ export function CommandPalette({
                 type="button"
                 className={cn(
                   "flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm",
-                  i === index && "bg-accent text-accent-foreground",
+                  i === activeIndex && "bg-accent text-accent-foreground",
                 )}
                 onMouseEnter={() => setIndex(i)}
                 onClick={() => select(command)}

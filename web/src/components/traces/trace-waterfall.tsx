@@ -51,17 +51,11 @@ export function TraceWaterfall({
   }>(() => ({ traceID: trace.traceID, ids: new Set() }));
 
   // Isolate collapsed state per trace.traceID even if the caller reuses one mounted instance.
-  const collapsed = useMemo(
-    () => (collapsedState.traceID === trace.traceID ? collapsedState.ids : EMPTY_COLLAPSED),
-    [collapsedState, trace.traceID],
-  );
-  useEffect(() => {
-    setCollapsedState((prev) =>
-      prev.traceID === trace.traceID
-        ? prev
-        : { traceID: trace.traceID, ids: EMPTY_COLLAPSED },
-    );
-  }, [trace.traceID]);
+  if (collapsedState.traceID !== trace.traceID) {
+    setCollapsedState({ traceID: trace.traceID, ids: EMPTY_COLLAPSED });
+  }
+  const collapsed =
+    collapsedState.traceID === trace.traceID ? collapsedState.ids : EMPTY_COLLAPSED;
 
   const roots = useMemo(() => buildTree(trace), [trace]);
   const colorIndex = useMemo(() => serviceColorIndex(trace), [trace]);
@@ -71,14 +65,21 @@ export function TraceWaterfall({
   );
   const total = useMemo(() => bounds(trace).total, [trace]);
 
-  const virtual = useVirtualWindow({
+  const {
+    scrollRef,
+    scrollToIndex,
+    isVirtualized,
+    startIndex,
+    endIndex,
+    paddingTop,
+    paddingBottom,
+  } = useVirtualWindow({
     count: rows.length,
     estimateSize: ROW_H,
     overscan: WATERFALL_OVERSCAN,
     defaultViewportHeight: WATERFALL_VIEWPORT_MAX_H,
     resetKey: trace.traceID,
   });
-  const { scrollToIndex } = virtual;
 
   const lastScrolledRef = useRef<{ traceID: string; spanID: string } | null>(null);
   useEffect(() => {
@@ -99,8 +100,8 @@ export function TraceWaterfall({
   }, [rows, selectedSpanId, scrollToIndex, trace.traceID]);
 
   const visibleRows = useMemo(
-    () => rows.slice(virtual.startIndex, virtual.endIndex),
-    [rows, virtual.startIndex, virtual.endIndex],
+    () => rows.slice(startIndex, endIndex),
+    [rows, startIndex, endIndex],
   );
 
   function toggle(spanID: string) {
@@ -161,12 +162,12 @@ export function TraceWaterfall({
 
       {/* Rows */}
       <div
-        ref={virtual.scrollRef}
-        data-virtualized={virtual.isVirtualized ? "true" : "false"}
-        className={cn(virtual.isVirtualized && "max-h-[640px] overflow-y-auto")}
+        ref={scrollRef}
+        data-virtualized={isVirtualized ? "true" : "false"}
+        className={cn(isVirtualized && "max-h-[640px] overflow-y-auto")}
       >
-        {virtual.paddingTop > 0 && (
-          <div aria-hidden="true" style={{ height: virtual.paddingTop }} />
+        {paddingTop > 0 && (
+          <div aria-hidden="true" style={{ height: paddingTop }} />
         )}
         {visibleRows.map((row) => {
           const colorIdx = colorIndex.get(row.service) ?? 1;
@@ -277,8 +278,8 @@ export function TraceWaterfall({
             </div>
           );
         })}
-        {virtual.paddingBottom > 0 && (
-          <div aria-hidden="true" style={{ height: virtual.paddingBottom }} />
+        {paddingBottom > 0 && (
+          <div aria-hidden="true" style={{ height: paddingBottom }} />
         )}
       </div>
     </div>

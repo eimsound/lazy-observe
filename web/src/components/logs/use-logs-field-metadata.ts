@@ -33,6 +33,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const EMPTY_FIELD_VALUES: Record<string, LogsFieldValue[]> = {};
+const EMPTY_FIELD_LOADING: Record<string, boolean> = {};
+const EMPTY_FIELD_ERRORS: Record<string, string | null> = {};
+
+interface FieldMetadataCache {
+  identity: string;
+  values: Record<string, LogsFieldValue[]>;
+  loading: Record<string, boolean>;
+  errors: Record<string, string | null>;
+}
+
 export function useLogsFieldMetadata({
   project,
   executedQuery,
@@ -44,9 +55,6 @@ export function useLogsFieldMetadata({
 }: UseLogsFieldMetadataOptions) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [fieldValues, setFieldValues] = useState<Record<string, LogsFieldValue[]>>({});
-  const [fieldValuesLoading, setFieldValuesLoading] = useState<Record<string, boolean>>({});
-  const [fieldValuesErrors, setFieldValuesErrors] = useState<Record<string, string | null>>({});
   const fieldValueRequestKeys = useRef<Record<string, string>>({});
 
   const metadataQuery = executedQuery || DEFAULT_LOGS_QUERY;
@@ -70,12 +78,21 @@ export function useLogsFieldMetadata({
     project,
   ]);
 
+  const [cache, setCache] = useState<FieldMetadataCache>({
+    identity: metadataIdentity,
+    values: EMPTY_FIELD_VALUES,
+    loading: EMPTY_FIELD_LOADING,
+    errors: EMPTY_FIELD_ERRORS,
+  });
+
   useEffect(() => {
     fieldValueRequestKeys.current = {};
-    setFieldValues({});
-    setFieldValuesLoading({});
-    setFieldValuesErrors({});
   }, [metadataIdentity]);
+
+  const activeCache = cache.identity === metadataIdentity ? cache : null;
+  const fieldValues = activeCache?.values ?? EMPTY_FIELD_VALUES;
+  const fieldValuesLoading = activeCache?.loading ?? EMPTY_FIELD_LOADING;
+  const fieldValuesErrors = activeCache?.errors ?? EMPTY_FIELD_ERRORS;
 
   const fieldNamesResult = useProjectQuery({
     queryKey: [
@@ -133,8 +150,24 @@ export function useLogsFieldMetadata({
     );
     const requestKey = JSON.stringify([metadataIdentity, field]);
     fieldValueRequestKeys.current[field] = requestKey;
-    setFieldValuesLoading((current) => ({ ...current, [field]: true }));
-    setFieldValuesErrors((current) => ({ ...current, [field]: null }));
+    const updateCache = (mutate: (base: FieldMetadataCache) => FieldMetadataCache) => {
+      setCache((current) => {
+        const base = current.identity === metadataIdentity
+          ? current
+          : {
+            identity: metadataIdentity,
+            values: EMPTY_FIELD_VALUES,
+            loading: EMPTY_FIELD_LOADING,
+            errors: EMPTY_FIELD_ERRORS,
+          };
+        return mutate(base);
+      });
+    };
+    updateCache((base) => ({
+      ...base,
+      loading: { ...base.loading, [field]: true },
+      errors: { ...base.errors, [field]: null },
+    }));
     void queryClient.fetchQuery({
       queryKey: [
         "logs-explorer",
@@ -157,16 +190,22 @@ export function useLogsFieldMetadata({
       }, signal),
     }).then((response) => {
       if (fieldValueRequestKeys.current[field] !== requestKey) return;
-      setFieldValues((current) => ({ ...current, [field]: response.values }));
+      updateCache((base) => ({
+        ...base,
+        values: { ...base.values, [field]: response.values },
+      }));
     }).catch((error: unknown) => {
       if (fieldValueRequestKeys.current[field] !== requestKey) return;
-      setFieldValuesErrors((current) => ({
-        ...current,
-        [field]: errorMessage(error),
+      updateCache((base) => ({
+        ...base,
+        errors: { ...base.errors, [field]: errorMessage(error) },
       }));
     }).finally(() => {
       if (fieldValueRequestKeys.current[field] !== requestKey) return;
-      setFieldValuesLoading((current) => ({ ...current, [field]: false }));
+      updateCache((base) => ({
+        ...base,
+        loading: { ...base.loading, [field]: false },
+      }));
     });
   }, [
     executedFilters,

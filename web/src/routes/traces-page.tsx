@@ -61,7 +61,7 @@ const ALL_OPERATIONS = "__all__";
 export function TracesPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { routeLocation, recordSelfAuthored, classifyLocationChange } = useRouterLocationSync();
+  const { recordSelfAuthored, subscribeExternalLocation } = useRouterLocationSync();
   const routeSearch = useSearch({ strict: false }) as TraceSearchURL;
   const {
     service: urlService, operation: urlOperation, start: urlStart, end: urlEnd,
@@ -77,7 +77,7 @@ export function TracesPage() {
   );
   const [initialSearch] = useState(urlSearch);
 
-  const [service, setService] = useState(initialSearch?.service ?? "");
+  const [selectedService, setSelectedService] = useState(initialSearch?.service ?? "");
   const [operation, setOperation] = useState(initialSearch?.operation ?? ALL_OPERATIONS);
   const [rangeId, setRangeId] = useState(DEFAULT_RANGE_ID);
   const [minDuration, setMinDuration] = useState(initialSearch?.minDuration ?? "");
@@ -86,7 +86,7 @@ export function TracesPage() {
   const [executed, setExecuted] = useState<TraceSearchParams | null>(initialSearch);
 
   useResetOnProjectChange(() => {
-    setService("");
+    setSelectedService("");
     setOperation(ALL_OPERATIONS);
     setMinDuration("");
     setTags("");
@@ -98,16 +98,19 @@ export function TracesPage() {
   // Only resync form drafts and executed state on genuine external navigations
   // (deep links, browser Back/Forward), never clobbering local drafts after a
   // self-authored search submission.
-  useEffect(() => {
-    if (classifyLocationChange(routeLocation) === "self") return;
-    setExecuted(urlSearch);
-    if (!urlSearch) return;
-    setService(urlSearch.service);
-    setOperation(urlSearch.operation ?? ALL_OPERATIONS);
-    setMinDuration(urlSearch.minDuration ?? "");
-    setLimit(urlSearch.limit);
-    setTags(urlSearch.tags ?? "");
-  }, [routeLocation, urlSearch, classifyLocationChange]);
+  useEffect(() => subscribeExternalLocation((nextLocation) => {
+    const params = new URL(nextLocation, "https://lazy-observe.invalid").searchParams;
+    const nextSearch = traceSearchFromURL(
+      parseTraceSearchURL(Object.fromEntries(params.entries())),
+    );
+    setExecuted(nextSearch);
+    if (!nextSearch) return;
+    setSelectedService(nextSearch.service);
+    setOperation(nextSearch.operation ?? ALL_OPERATIONS);
+    setMinDuration(nextSearch.minDuration ?? "");
+    setLimit(nextSearch.limit);
+    setTags(nextSearch.tags ?? "");
+  }), [subscribeExternalLocation]);
 
   const servicesQuery = useProjectQuery<string[], ApiError>({
     queryKey: ["trace-services"],
@@ -116,11 +119,7 @@ export function TracesPage() {
   });
 
   // Default to the first service once the list loads.
-  useEffect(() => {
-    if (!service && servicesQuery.data && servicesQuery.data.length > 0) {
-      setService(servicesQuery.data[0]);
-    }
-  }, [service, servicesQuery.data]);
+  const service = selectedService || servicesQuery.data?.[0] || "";
 
   const operationsQuery = useProjectQuery<string[], ApiError>({
     queryKey: ["trace-operations", service],
@@ -217,7 +216,7 @@ export function TracesPage() {
             <Select
               value={service}
               onValueChange={(v) => {
-                setService(v);
+                setSelectedService(v);
                 setOperation(ALL_OPERATIONS);
               }}
             >

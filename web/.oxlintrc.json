@@ -87,10 +87,22 @@
     "typescript/prefer-as-const": "error",
     "typescript/prefer-namespace-keyword": "error",
     "typescript/triple-slash-reference": "error",
-    // 只启用经典 hooks 规则。eslint-plugin-react-hooks v7 自带的 React Compiler 诊断
-    // （refs、set-state-in-effect、purity 等）面向 React Compiler 兼容性，本项目不用它，记在路线图里而不是压掉。
+    // 经典 hooks 规则 + eslint-plugin-react-hooks v7 的 React Compiler 诊断（Oxlint 1.93.0 原生支持）。
+    // 注：eslint-plugin-react-hooks v7 中的 component-hook-factories、config、gating 尚未合入 Oxlint 1.93.0。
     "react/rules-of-hooks": "error",
     "react/exhaustive-deps": "error",
+    "react/error-boundaries": "error",
+    "react/globals": "error",
+    "react/immutability": "error",
+    "react/incompatible-library": "error",
+    "react/preserve-manual-memoization": "error",
+    "react/purity": "error",
+    "react/refs": "error",
+    "react/set-state-in-effect": "error",
+    "react/set-state-in-render": "error",
+    "react/static-components": "error",
+    "react/unsupported-syntax": "error",
+    "react/use-memo": "error",
     // react-refresh 的 vite 预设。
     "react/only-export-components": ["error", { "allowConstantExport": true, "allowCompoundComponents": true }],
     // 类型感知规则（lint 脚本带 --type-aware，需要直接依赖 oxlint-tsgolint）。只开这一条，其它类型感知规则一律不开。

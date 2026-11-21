@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useState } from "react";
 import { useRouter, useRouterState } from "@tanstack/react-router";
 
 const DUMMY_ORIGIN = "https://lazy-observe.invalid";
@@ -82,29 +82,38 @@ export function useRouterLocationSync() {
   const routeLocation = useRouterState({
     select: (state) => canonicalRelativeLocation(state.location.href),
   });
-  const syncRef = useRef<RouterLocationSync | null>(null);
-  if (!syncRef.current) {
-    syncRef.current = createRouterLocationSync(routeLocation);
-  }
+  const [sync] = useState<RouterLocationSync>(() => createRouterLocationSync(routeLocation));
+  const [initialPathname] = useState(() => new URL(routeLocation, DUMMY_ORIGIN).pathname);
 
   const replaceLocation = useCallback(
     (href: string) => {
       const target = canonicalRelativeLocation(href);
       const current = canonicalRelativeLocation(router.history.location.href);
       if (target === current) return;
-      syncRef.current?.recordSelfAuthored(target);
+      sync.recordSelfAuthored(target);
       router.history.replace(target, router.history.location.state);
     },
-    [router],
+    [router, sync],
   );
 
   const recordSelfAuthored = useCallback((href: string) => {
-    syncRef.current?.recordSelfAuthored(href);
-  }, []);
+    sync.recordSelfAuthored(href);
+  }, [sync]);
 
   const classifyLocationChange = useCallback(
-    (href: string) => syncRef.current?.classifyLocationChange(href) ?? "external",
-    [],
+    (href: string) => sync.classifyLocationChange(href),
+    [sync],
+  );
+
+  const subscribeExternalLocation = useCallback(
+    (onExternal: (nextLocation: string) => void) =>
+      router.history.subscribe(({ location }) => {
+        const next = canonicalRelativeLocation(location.href);
+        if (new URL(next, DUMMY_ORIGIN).pathname !== initialPathname) return;
+        if (sync.classifyLocationChange(next) === "self") return;
+        onExternal(next);
+      }),
+    [initialPathname, router, sync],
   );
 
   const currentHistoryHref = useCallback(
@@ -119,5 +128,6 @@ export function useRouterLocationSync() {
     replaceLocation,
     recordSelfAuthored,
     classifyLocationChange,
+    subscribeExternalLocation,
   };
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type MouseEvent } from "react";
+import { useMemo, useState, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import uPlot from "uplot";
 import type { TimeSeries } from "@/lib/api/types";
@@ -72,6 +72,8 @@ function translucent(color: string): string {
   return `color-mix(in oklch, ${color} 22%, transparent)`;
 }
 
+const EMPTY_SELECTED_INDEXES: number[] = [];
+
 export function TimeSeriesChart({
   series,
   height = 420,
@@ -81,10 +83,16 @@ export function TimeSeriesChart({
   tableMode = "series",
   timeWindow,
 }: TimeSeriesChartProps) {
-  const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
   const { i18n } = useTranslation();
   const theme = useChartTheme();
   const seriesKey = series.map((item) => item.name).join("\u0000");
+  const [selectionState, setSelectionState] = useState<{ key: string; indexes: number[] }>({
+    key: seriesKey,
+    indexes: EMPTY_SELECTED_INDEXES,
+  });
+  const selectedIndexes = selectionState.key === seriesKey
+    ? selectionState.indexes
+    : EMPTY_SELECTED_INDEXES;
   // Depend on the window's values, not the caller's object identity.
   const windowStartMs = timeWindow?.startMs;
   const windowEndMs = timeWindow?.endMs;
@@ -96,10 +104,6 @@ export function TimeSeriesChart({
     ),
     [windowStartMs, windowEndMs],
   );
-
-  useEffect(() => {
-    setSelectedIndexes([]);
-  }, [seriesKey]);
 
   const rawData = useMemo(() => alignSeries(series), [series]);
   const visibleIndexes = useMemo(
@@ -208,14 +212,18 @@ export function TimeSeriesChart({
   ]);
 
   function toggleSeries(index: number, event: MouseEvent<HTMLElement>) {
-    setSelectedIndexes((current) =>
-      toggleMetricsSeriesSelection(
-        current,
-        index,
-        series.length,
-        event.ctrlKey || event.metaKey,
-      )
-    );
+    setSelectionState((current) => {
+      const base = current.key === seriesKey ? current.indexes : EMPTY_SELECTED_INDEXES;
+      return {
+        key: seriesKey,
+        indexes: toggleMetricsSeriesSelection(
+          base,
+          index,
+          series.length,
+          event.ctrlKey || event.metaKey,
+        ),
+      };
+    });
   }
 
   return (

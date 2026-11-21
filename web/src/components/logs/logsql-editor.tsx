@@ -144,14 +144,16 @@ export function LogsQLEditor({
   // effect below, so creation reads the latest value through a ref.
   const valueRef = useRef(value);
 
-  onChangeRef.current = onChange;
-  onRunRef.current = onRun;
-  onCompleteRef.current = onComplete;
-  onHistoryPreviousRef.current = onHistoryPrevious;
-  onHistoryNextRef.current = onHistoryNext;
-  autocompleteEnabledRef.current = autocompleteEnabled;
-  tRef.current = t;
-  valueRef.current = value;
+  useEffect(() => {
+    onChangeRef.current = onChange;
+    onRunRef.current = onRun;
+    onCompleteRef.current = onComplete;
+    onHistoryPreviousRef.current = onHistoryPrevious;
+    onHistoryNextRef.current = onHistoryNext;
+    autocompleteEnabledRef.current = autocompleteEnabled;
+    tRef.current = t;
+    valueRef.current = value;
+  });
 
   useEffect(() => {
     if (!containerRef.current) return;

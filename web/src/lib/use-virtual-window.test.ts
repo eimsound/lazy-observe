@@ -9,10 +9,12 @@ import {
   computeScrollToIndexOffset,
   computeVirtualItems,
   computeVirtualRange,
+  flushPendingVirtualMeasurements,
   pruneMeasuredSizes,
   reconcileScrollTopOnLayoutChange,
   shouldCommitScrollTop,
   syncMeasureStoreForResetKey,
+  type MeasurableVirtualElement,
   type VirtualMeasureStore,
 } from "./use-virtual-window.ts";
 
@@ -512,4 +514,124 @@ test("syncMeasureStoreForResetKey isolates measured heights synchronously in ren
 
   // Measurement deadband absorbs 0.5px subpixel differences (e.g. 24px vs 23.5px).
   assert.ok(MEASURE_TOLERANCE_PX >= 1);
+});
+
+function makeFakeRowElement(index: number, height: number): MeasurableVirtualElement {
+  return {
+    dataset: { virtualIndex: String(index) },
+    getBoundingClientRect: () => ({ height }),
+  };
+}
+
+test("flushPendingVirtualMeasurements binds expanded height to the updated getItemKey and never pollutes the collapsed key", () => {
+  const store: VirtualMeasureStore = { resetKey: undefined, sizes: new Map() };
+  const pending = new Set<MeasurableVirtualElement>();
+
+  // Row 5 expands: React unmounts key `row-5:0`, mounts `row-5:1` into `pending`,
+  // then parent layout effect flushes with the updated `getItemKey` and `layout`.
+  const expanded = new Set<number>([5]);
+  const getItemKey = (i: number) => `row-${i}:${expanded.has(i) ? 1 : 0}`;
+  const expandedEstimate = (i: number) => (expanded.has(i) ? 180 : 24);
+  const expandedLayout = buildVirtualLayout(200, expandedEstimate, undefined, getItemKey);
+
+  pending.add(makeFakeRowElement(5, 600));
+  const expandResult = flushPendingVirtualMeasurements({
+    pendingElements: pending,
+    store,
+    resetKey: undefined,
+    layout: expandedLayout,
+    scrollTop: 0,
+    getItemKey,
+  });
+
+  assert.equal(expandResult.changed, true);
+  assert.equal(expandResult.scrollCorrection, 0);
+  assert.equal(pending.size, 0);
+  assert.equal(store.sizes.get("row-5:1"), 600);
+  assert.equal(store.sizes.has("row-5:0"), false);
+
+  // Row 5 collapses: React unmounts `row-5:1`, mounts compact 24px `row-5:0`.
+  // `row-5:0` must remain unpolluted and match the 24px compact height cleanly.
+  expanded.delete(5);
+  const collapsedLayout = buildVirtualLayout(200, 24, store.sizes, getItemKey);
+  assert.equal(collapsedLayout.getSize(5), 24);
+
+  pending.add(makeFakeRowElement(5, 24));
+  const collapseResult = flushPendingVirtualMeasurements({
+    pendingElements: pending,
+    store,
+    resetKey: undefined,
+    layout: collapsedLayout,
+    scrollTop: 0,
+    getItemKey,
+  });
+
+  assert.equal(collapseResult.changed, false);
+  assert.equal(collapseResult.scrollCorrection, 0);
+  assert.equal(store.sizes.get("row-5:0"), 24);
+  assert.notEqual(store.sizes.get("row-5:0"), 600);
+});
+
+test("flushPendingVirtualMeasurements captures first-frame heights when count transitions 0 -> 200", () => {
+  const store: VirtualMeasureStore = { resetKey: undefined, sizes: new Map() };
+  const pending = new Set<MeasurableVirtualElement>();
+
+  // Child refs mount for rows 0..2 while previous render had count=0.
+  pending.add(makeFakeRowElement(0, 72));
+  pending.add(makeFakeRowElement(1, 96));
+  pending.add(makeFakeRowElement(2, 24));
+
+  // Parent layout effect syncs `layout` (count=200) before draining `pending`.
+  const nextLayout = buildVirtualLayout(200, 24);
+  const result = flushPendingVirtualMeasurements({
+    pendingElements: pending,
+    store,
+    resetKey: undefined,
+    layout: nextLayout,
+    scrollTop: 0,
+  });
+
+  assert.equal(result.changed, true);
+  assert.equal(pending.size, 0);
+  assert.equal(store.sizes.get(0), 72);
+  assert.equal(store.sizes.get(1), 96);
+  // Row 2 matched the 24px fixed estimate within deadband, keeping it out of the override map.
+  assert.equal(store.sizes.has(2), false);
+
+  const measuredLayout = buildVirtualLayout(200, 24, store.sizes);
+  assert.equal(measuredLayout.getSize(0), 72);
+  assert.equal(measuredLayout.getSize(1), 96);
+  assert.equal(measuredLayout.getSize(2), 24);
+});
+
+test("flushPendingVirtualMeasurements isolates heights and scroll correction across resetKey switches", () => {
+  const store: VirtualMeasureStore = {
+    resetKey: "trace-a",
+    sizes: new Map<string | number, number>([
+      [0, 320],
+      [1, 480],
+    ]),
+  };
+  const pending = new Set<MeasurableVirtualElement>([
+    makeFakeRowElement(0, 64),
+    makeFakeRowElement(1, 30),
+  ]);
+
+  // Parent layout effect swaps store and resets scrollTop=0 before flushing trace-b elements.
+  assert.equal(syncMeasureStoreForResetKey(store, "trace-b"), true);
+  const traceBLayout = buildVirtualLayout(150, 30);
+  const result = flushPendingVirtualMeasurements({
+    pendingElements: pending,
+    store,
+    resetKey: "trace-b",
+    layout: traceBLayout,
+    scrollTop: 0,
+  });
+
+  assert.equal(result.changed, true);
+  // scrollTop was reset to 0 before flush, so trace-a's prior scroll offset cannot trigger scrollCorrection.
+  assert.equal(result.scrollCorrection, 0);
+  assert.equal(store.resetKey, "trace-b");
+  assert.equal(store.sizes.get(0), 64);
+  assert.equal(store.sizes.has(1), false);
 });

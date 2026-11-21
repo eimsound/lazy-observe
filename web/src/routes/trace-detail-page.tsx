@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { AlertCircle, ArrowLeft, BarChart3, Flame, Loader2 } from "lucide-react";
@@ -30,24 +30,11 @@ export function TraceDetailPage() {
   const { traceID } = useParams({ strict: false }) as { traceID: string };
   const { currentSlug: project } = useProject();
 
-  const [selected, setSelected] = useState<JaegerSpan | null>(null);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-
-  useEffect(() => {
-    setSelected(null);
-    setDrawerOpen(false);
-  }, [project, traceID]);
-
   const traceQuery = useProjectQuery<JaegerTrace, ApiError>({
     queryKey: ["trace", traceID],
     queryFn: ({ signal, project: activeProject }) => getTrace(traceID, signal, activeProject),
     retry: false,
   });
-
-  function selectSpan(span: JaegerSpan) {
-    setSelected(span);
-    setDrawerOpen(true);
-  }
 
   function viewLogs(trace: JaegerTrace) {
     const link = buildTraceEvidenceLinks(trace).logs;
@@ -116,10 +103,6 @@ export function TraceDetailPage() {
         <TraceDetailBody
           key={`${project}:${traceID}`}
           trace={traceQuery.data}
-          selected={selected}
-          drawerOpen={drawerOpen}
-          onOpenChange={setDrawerOpen}
-          onSelectSpan={selectSpan}
           onViewLogs={viewLogs}
           onViewProfiling={viewProfiling}
           onViewMetrics={viewMetrics}
@@ -131,26 +114,25 @@ export function TraceDetailPage() {
 
 function TraceDetailBody({
   trace,
-  selected,
-  drawerOpen,
-  onOpenChange,
-  onSelectSpan,
   onViewLogs,
   onViewProfiling,
   onViewMetrics,
 }: {
   trace: JaegerTrace;
-  selected: JaegerSpan | null;
-  drawerOpen: boolean;
-  onOpenChange: (open: boolean) => void;
-  onSelectSpan: (span: JaegerSpan) => void;
   onViewLogs: (trace: JaegerTrace) => void;
   onViewProfiling: (trace: JaegerTrace) => void;
   onViewMetrics: (trace: JaegerTrace) => void;
 }) {
   const { t } = useTranslation();
+  const [selected, setSelected] = useState<JaegerSpan | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const summary = useMemo(() => summarizeTrace(trace), [trace]);
   const depth = useMemo(() => maxDepth(buildTree(trace)), [trace]);
+
+  function selectSpan(span: JaegerSpan) {
+    setSelected(span);
+    setDrawerOpen(true);
+  }
 
   return (
     <>
@@ -189,7 +171,7 @@ function TraceDetailBody({
       <TraceWaterfall
         trace={trace}
         selectedSpanId={selected?.spanID}
-        onSelectSpan={onSelectSpan}
+        onSelectSpan={selectSpan}
       />
 
       {drawerOpen && selected && (
@@ -198,7 +180,7 @@ function TraceDetailBody({
           span={selected}
           trace={trace}
           open={drawerOpen}
-          onOpenChange={onOpenChange}
+          onOpenChange={setDrawerOpen}
           onViewLogs={() => onViewLogs(trace)}
         />
       )}

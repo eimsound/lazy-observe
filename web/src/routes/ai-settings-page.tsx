@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -91,19 +91,23 @@ export function AiSettingsPage() {
   const [form, setForm] = useState<AiSettingsFormState>(INITIAL_AI_SETTINGS_FORM);
   const [testResult, setTestResult] = useState<AiTestResult | null>(null);
 
-  const { draft, apiKeyDraft, clearKey } = form;
+  // Derive the effective form state from server data unless the user has unsaved edits.
+  const effectiveForm = settingsQuery.data
+    ? syncServerAiSettings(form, settingsQuery.data)
+    : form;
+  const { draft, apiKeyDraft, clearKey } = effectiveForm;
 
-  // Seed the form from server data only when the user has no unsaved edits.
-  useEffect(() => {
-    if (settingsQuery.data) {
-      setForm((prev) => syncServerAiSettings(prev, settingsQuery.data));
-    }
-  }, [settingsQuery.data]);
+  function updateForm(updater: (current: AiSettingsFormState) => AiSettingsFormState) {
+    setForm((prev) => {
+      const base = settingsQuery.data ? syncServerAiSettings(prev, settingsQuery.data) : prev;
+      return updater(base);
+    });
+  }
 
   const save = useMutation({
     mutationFn: () => {
-      if (!form.draft) throw new ApiError("no settings", 400);
-      return updateAiSettings(buildAiSettingsUpdatePayload(form));
+      if (!effectiveForm.draft) throw new ApiError("no settings", 400);
+      return updateAiSettings(buildAiSettingsUpdatePayload(effectiveForm));
     },
     onSuccess: (saved) => {
       setForm(applySavedAiSettings(saved));
@@ -160,7 +164,7 @@ export function AiSettingsPage() {
       draft.base_url === "" || draft.base_url === previousDefault
         ? providerDefaultBaseUrl(provider)
         : draft.base_url;
-    setForm((prev) => patchAiDraft(prev, { provider, base_url }));
+    updateForm((prev) => patchAiDraft(prev, { provider, base_url }));
   }
 
   return (
@@ -297,7 +301,7 @@ export function AiSettingsPage() {
                 <Switch
                   id="ai-enabled"
                   checked={draft.enabled}
-                  onCheckedChange={(on) => setForm((prev) => patchAiDraft(prev, { enabled: on }))}
+                  onCheckedChange={(on) => updateForm((prev) => patchAiDraft(prev, { enabled: on }))}
                 />
               </div>
 
@@ -323,7 +327,7 @@ export function AiSettingsPage() {
                     id="ai-model"
                     value={draft.model}
                     placeholder={draft.provider === "deepseek" ? "deepseek-chat" : "gpt-4o-mini"}
-                    onChange={(e) => setForm((prev) => patchAiDraft(prev, { model: e.target.value }))}
+                    onChange={(e) => updateForm((prev) => patchAiDraft(prev, { model: e.target.value }))}
                   />
                 </div>
               </div>
@@ -334,7 +338,7 @@ export function AiSettingsPage() {
                   id="ai-base-url"
                   value={draft.base_url}
                   placeholder={providerDefaultBaseUrl(draft.provider) || "https://…"}
-                  onChange={(e) => setForm((prev) => patchAiDraft(prev, { base_url: e.target.value }))}
+                  onChange={(e) => updateForm((prev) => patchAiDraft(prev, { base_url: e.target.value }))}
                 />
                 <p className="text-xs text-muted-foreground">{t("aiSettings.baseUrlHint")}</p>
               </div>
@@ -352,7 +356,7 @@ export function AiSettingsPage() {
                         ? t("aiSettings.keyStoredPlaceholder")
                         : t("aiSettings.keyEmptyPlaceholder")
                     }
-                    onChange={(e) => setForm((prev) => setAiApiKeyDraft(prev, e.target.value))}
+                    onChange={(e) => updateForm((prev) => setAiApiKeyDraft(prev, e.target.value))}
                   />
                 </div>
                 <div className="space-y-1">
@@ -363,7 +367,7 @@ export function AiSettingsPage() {
                     min={1}
                     value={draft.max_tokens || 1024}
                     onChange={(e) =>
-                      setForm((prev) =>
+                      updateForm((prev) =>
                         patchAiDraft(prev, { max_tokens: Number(e.target.value) || 0 }),
                       )
                     }
@@ -388,7 +392,7 @@ export function AiSettingsPage() {
                   <Button
                     variant="outline"
                     disabled={save.isPending}
-                    onClick={() => setForm((prev) => requestClearAiApiKey(prev))}
+                    onClick={() => updateForm((prev) => requestClearAiApiKey(prev))}
                   >
                     {t("aiSettings.clearKey")}
                   </Button>

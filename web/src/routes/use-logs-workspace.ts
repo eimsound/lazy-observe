@@ -1,10 +1,10 @@
 import {
   useEffect,
   useLayoutEffect,
-  useRef,
+  useState,
   useSyncExternalStore,
 } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -109,6 +109,179 @@ async function executeFinitePlan(
   }
 }
 
+interface LogsWorkspaceRuntimeDeps {
+  replaceLocation: (location: string) => void;
+  chartErrorMessage: string;
+  liveStreamEndedMessage: string;
+  queryClient: QueryClient;
+}
+
+interface LogsWorkspaceRuntime {
+  workspace: LogsExplorationWorkspace;
+  syncDeps: (next: LogsWorkspaceRuntimeDeps) => void;
+  mount: () => () => void;
+}
+
+function createLogsWorkspaceRuntime(initial: {
+  project: string;
+  location: string;
+  auxiliaryConfig: LogsAuxiliaryQueryConfig;
+  deps: LogsWorkspaceRuntimeDeps;
+}): LogsWorkspaceRuntime {
+  let deps = initial.deps;
+  const lifecycle: {
+    mounted: boolean;
+    mountCount: number;
+    disposeTimer: number | null;
+  } = { mounted: false, mountCount: 0, disposeTimer: null };
+  const finiteControllers = new Map<string, {
+    executionId: number;
+    controller: AbortController;
+  }>();
+
+  let workspace: LogsExplorationWorkspace | null = null;
+  const sendToWorkspace = (event: Parameters<LogsExplorationWorkspace["send"]>[0]) => {
+    workspace?.send(event);
+  };
+
+  const runFinitePlanNow = (plan: LogsFiniteQueryPlan) => {
+    const controller = new AbortController();
+    finiteControllers.set(plan.identity, {
+      executionId: plan.executionId,
+      controller,
+    });
+    void deps.queryClient.fetchQuery({
+      queryKey: [
+        "logs-workspace",
+        plan.snapshot.project,
+        plan.slot,
+        plan.identity,
+      ],
+      retry: false,
+      queryFn: ({ signal }) => executeFinitePlan(
+        plan,
+        AbortSignal.any([signal, controller.signal]),
+        deps.chartErrorMessage,
+      ),
+    }).then((data) => {
+      sendToWorkspace({ type: "finiteSucceeded", identity: plan.identity, data });
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      sendToWorkspace({
+        type: "finiteFailed",
+        identity: plan.identity,
+        error: errorMessage(error),
+      });
+    }).finally(() => {
+      if (finiteControllers.get(plan.identity)?.controller === controller) {
+        finiteControllers.delete(plan.identity);
+      }
+    });
+  };
+
+  const runFinitePlan = (plan: LogsFiniteQueryPlan) => {
+    if (lifecycle.mounted) {
+      runFinitePlanNow(plan);
+      return;
+    }
+    queueMicrotask(() => {
+      if (lifecycle.mounted) runFinitePlanNow(plan);
+    });
+  };
+
+  workspace = createLogsExplorationWorkspace({
+    project: initial.project,
+    location: initial.location,
+    clock: logsWorkspaceClock,
+    history: {
+      load: getLogsExplorerHistory,
+      push: pushLogsExplorerHistory,
+      toggleFavorite: toggleLogsExplorerFavorite,
+      remove: removeLogsExplorerHistory,
+      clear: clearLogsExplorerHistory,
+    },
+    deferInitialExecution: true,
+    initialAuxiliaryConfig: initial.auxiliaryConfig,
+    onLocationReplace: (nextLocation) => {
+      if (lifecycle.mounted) {
+        deps.replaceLocation(nextLocation);
+        return;
+      }
+      queueMicrotask(() => {
+        if (lifecycle.mounted) deps.replaceLocation(nextLocation);
+      });
+    },
+    onFiniteQueryPlan: runFinitePlan,
+    onFiniteQueryCancel: (executionId) => {
+      for (const entry of finiteControllers.values()) {
+        if (entry.executionId === executionId) entry.controller.abort();
+      }
+    },
+    openLiveStream(request, observer: LogsLiveObserver) {
+      const controller = new AbortController();
+      const open = async () => {
+        let opened = false;
+        try {
+          for await (const nextRow of tailLogs({
+            query: request.query,
+            offset: request.offset,
+            refreshInterval: "1s",
+            project: request.project,
+            ...buildLogsExtraFilterParams(request.filters),
+          }, controller.signal)) {
+            if (!opened) {
+              opened = true;
+              observer.opened();
+            }
+            observer.row(nextRow);
+          }
+          if (!controller.signal.aborted) {
+            observer.failed({ message: deps.liveStreamEndedMessage, kind: "network" });
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) observer.failed(liveFailure(error));
+        }
+      };
+      if (lifecycle.mounted) void open();
+      else {
+        queueMicrotask(() => {
+          if (lifecycle.mounted && !controller.signal.aborted) void open();
+        });
+      }
+      return { close: () => controller.abort() };
+    },
+  });
+
+  const activeWorkspace = workspace;
+
+  return {
+    workspace: activeWorkspace,
+    syncDeps(next) {
+      deps = next;
+    },
+    mount() {
+      if (lifecycle.disposeTimer !== null) {
+        globalThis.clearTimeout(lifecycle.disposeTimer);
+        lifecycle.disposeTimer = null;
+      }
+      lifecycle.mountCount += 1;
+      lifecycle.mounted = true;
+      activeWorkspace.send({ type: "activated" });
+      return () => {
+        lifecycle.mountCount -= 1;
+        lifecycle.mounted = false;
+        lifecycle.disposeTimer = globalThis.setTimeout(() => {
+          lifecycle.disposeTimer = null;
+          if (lifecycle.mountCount > 0) return;
+          activeWorkspace.dispose();
+          for (const entry of finiteControllers.values()) entry.controller.abort();
+          finiteControllers.clear();
+        }, 0) as unknown as number;
+      };
+    },
+  };
+}
+
 export function useLogsWorkspace({
   project,
   location,
@@ -117,130 +290,21 @@ export function useLogsWorkspace({
 }: UseLogsWorkspaceOptions) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const workspaceRef = useRef<LogsExplorationWorkspace | null>(null);
-  const lifecycle = useRef<{
-    mounted: boolean;
-    mountCount: number;
-    disposeTimer: number | null;
-  }>({ mounted: false, mountCount: 0, disposeTimer: null });
-  const finiteControllers = useRef(new Map<string, {
-    executionId: number;
-    controller: AbortController;
-  }>());
+  const chartErrorMessage = t("logs.chartError");
+  const liveStreamEndedMessage = t("logs.liveStreamEnded");
+  const [runtime] = useState(() => createLogsWorkspaceRuntime({
+    project,
+    location,
+    auxiliaryConfig,
+    deps: {
+      replaceLocation,
+      chartErrorMessage,
+      liveStreamEndedMessage,
+      queryClient,
+    },
+  }));
+  const { workspace } = runtime;
 
-  if (!workspaceRef.current) {
-    const sendToWorkspace = (event: Parameters<LogsExplorationWorkspace["send"]>[0]) => {
-      workspaceRef.current?.send(event);
-    };
-    const runFinitePlanNow = (plan: LogsFiniteQueryPlan) => {
-      const controller = new AbortController();
-      finiteControllers.current.set(plan.identity, {
-        executionId: plan.executionId,
-        controller,
-      });
-      void queryClient.fetchQuery({
-        queryKey: [
-          "logs-workspace",
-          plan.snapshot.project,
-          plan.slot,
-          plan.identity,
-        ],
-        retry: false,
-        queryFn: ({ signal }) => executeFinitePlan(
-          plan,
-          AbortSignal.any([signal, controller.signal]),
-          t("logs.chartError"),
-        ),
-      }).then((data) => {
-        sendToWorkspace({ type: "finiteSucceeded", identity: plan.identity, data });
-      }).catch((error: unknown) => {
-        if (controller.signal.aborted) return;
-        sendToWorkspace({
-          type: "finiteFailed",
-          identity: plan.identity,
-          error: errorMessage(error),
-        });
-      }).finally(() => {
-        if (finiteControllers.current.get(plan.identity)?.controller === controller) {
-          finiteControllers.current.delete(plan.identity);
-        }
-      });
-    };
-    const runFinitePlan = (plan: LogsFiniteQueryPlan) => {
-      if (lifecycle.current.mounted) {
-        runFinitePlanNow(plan);
-        return;
-      }
-      queueMicrotask(() => {
-        if (lifecycle.current.mounted) runFinitePlanNow(plan);
-      });
-    };
-
-    workspaceRef.current = createLogsExplorationWorkspace({
-      project,
-      location,
-      clock: logsWorkspaceClock,
-      history: {
-        load: getLogsExplorerHistory,
-        push: pushLogsExplorerHistory,
-        toggleFavorite: toggleLogsExplorerFavorite,
-        remove: removeLogsExplorerHistory,
-        clear: clearLogsExplorerHistory,
-      },
-      deferInitialExecution: true,
-      initialAuxiliaryConfig: auxiliaryConfig,
-      onLocationReplace: (nextLocation) => {
-        if (lifecycle.current.mounted) {
-          replaceLocation(nextLocation);
-          return;
-        }
-        queueMicrotask(() => {
-          if (lifecycle.current.mounted) replaceLocation(nextLocation);
-        });
-      },
-      onFiniteQueryPlan: runFinitePlan,
-      onFiniteQueryCancel: (executionId) => {
-        for (const entry of finiteControllers.current.values()) {
-          if (entry.executionId === executionId) entry.controller.abort();
-        }
-      },
-      openLiveStream(request, observer: LogsLiveObserver) {
-        const controller = new AbortController();
-        const open = async () => {
-          let opened = false;
-          try {
-            for await (const nextRow of tailLogs({
-              query: request.query,
-              offset: request.offset,
-              refreshInterval: "1s",
-              project: request.project,
-              ...buildLogsExtraFilterParams(request.filters),
-            }, controller.signal)) {
-              if (!opened) {
-                opened = true;
-                observer.opened();
-              }
-              observer.row(nextRow);
-            }
-            if (!controller.signal.aborted) {
-              observer.failed({ message: t("logs.liveStreamEnded"), kind: "network" });
-            }
-          } catch (error) {
-            if (!controller.signal.aborted) observer.failed(liveFailure(error));
-          }
-        };
-        if (lifecycle.current.mounted) void open();
-        else {
-          queueMicrotask(() => {
-            if (lifecycle.current.mounted && !controller.signal.aborted) void open();
-          });
-        }
-        return { close: () => controller.abort() };
-      },
-    });
-  }
-
-  const workspace = workspaceRef.current;
   const snapshot = useSyncExternalStore(
     workspace.subscribe,
     workspace.getSnapshot,
@@ -248,29 +312,15 @@ export function useLogsWorkspace({
   );
 
   useLayoutEffect(() => {
-    // Both refs hold one mutable object for the hook's lifetime; capture them
-    // so the deferred cleanup provably works on the same objects.
-    const state = lifecycle.current;
-    const controllers = finiteControllers.current;
-    if (state.disposeTimer !== null) {
-      globalThis.clearTimeout(state.disposeTimer);
-      state.disposeTimer = null;
-    }
-    state.mountCount += 1;
-    state.mounted = true;
-    workspace.send({ type: "activated" });
-    return () => {
-      state.mountCount -= 1;
-      state.mounted = false;
-      state.disposeTimer = globalThis.setTimeout(() => {
-        state.disposeTimer = null;
-        if (state.mountCount > 0) return;
-        workspace.dispose();
-        for (const entry of controllers.values()) entry.controller.abort();
-        controllers.clear();
-      }, 0) as unknown as number;
-    };
-  }, [workspace]);
+    runtime.syncDeps({
+      replaceLocation,
+      chartErrorMessage,
+      liveStreamEndedMessage,
+      queryClient,
+    });
+  }, [runtime, replaceLocation, chartErrorMessage, liveStreamEndedMessage, queryClient]);
+
+  useLayoutEffect(() => runtime.mount(), [runtime]);
 
   useLayoutEffect(() => {
     workspace.send({ type: "projectChanged", project });

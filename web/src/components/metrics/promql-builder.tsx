@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   AlertTriangle,
   ChevronDown,
@@ -326,20 +326,18 @@ export function PromQLBuilderView({
     draft.histogramQuantile === ""
     || (PROMQL_QUANTILE_PRESETS as readonly string[]).includes(draft.histogramQuantile);
   const [customQuantileOpen, setCustomQuantileOpen] = useState(!isPresetQuantile);
+  const [prevQuantile, setPrevQuantile] = useState(draft.histogramQuantile);
+  if (prevQuantile !== draft.histogramQuantile) {
+    setPrevQuantile(draft.histogramQuantile);
+    if (!isPresetQuantile && !customQuantileOpen) {
+      setCustomQuantileOpen(true);
+    }
+  }
   const quantileSelectValue = draft.histogramQuantile === ""
     ? (customQuantileOpen ? "custom" : "none")
     : (PROMQL_QUANTILE_PRESETS as readonly string[]).includes(draft.histogramQuantile) && !customQuantileOpen
       ? draft.histogramQuantile
       : "custom";
-
-  useEffect(() => {
-    if (
-      draft.histogramQuantile !== ""
-      && !(PROMQL_QUANTILE_PRESETS as readonly string[]).includes(draft.histogramQuantile)
-    ) {
-      setCustomQuantileOpen(true);
-    }
-  }, [draft.histogramQuantile]);
 
   if (status !== "synced") {
     const isSyntax = status === "syntax";
@@ -775,21 +773,18 @@ export function PromQLBuilder({
 }: PromQLBuilderProps) {
   const [controller, setController] = useState(() => createBuilderController(query));
   const [viewEpoch, setViewEpoch] = useState(0);
-  const previousProject = useRef(project);
+  const [tracked, setTracked] = useState({ project, query });
 
-  // Sync incoming external query changes (CodeMirror typing, History, Explorer, URL)
-  // without clobbering in-progress blank filter rows.
-  useEffect(() => {
-    setController((current) => syncBuilderControllerFromQuery(current, query));
-  }, [query]);
-
-  // Reset local builder draft and transient UI controls immediately when the active project changes.
-  useEffect(() => {
-    if (previousProject.current === project) return;
-    previousProject.current = project;
+  // Reset local builder draft and transient UI controls immediately on project switch,
+  // or sync incoming external query changes without clobbering blank filter rows.
+  if (tracked.project !== project) {
+    setTracked({ project, query });
     setController(createBuilderController(""));
     setViewEpoch((current) => current + 1);
-  }, [project]);
+  } else if (tracked.query !== query) {
+    setTracked({ project, query });
+    setController((current) => syncBuilderControllerFromQuery(current, query));
+  }
 
   const bucketRange = useMemo(() => metricsAutocompleteRange(range), [range]);
   const matchSelector = useMemo(
