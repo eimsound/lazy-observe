@@ -1,12 +1,14 @@
 import { onCLS, onFCP, onINP, onLCP, onTTFB, type Metric } from "web-vitals";
-import type { Transport } from "./transport";
-import type { Dispose, ReplayVitalSample, VitalName, VitalRating } from "./types";
+import type { Transport, VitalPayload } from "./transport";
+import type { Dispose, ReplayVitalSample, VitalDimensions, VitalName, VitalRating } from "./types";
+import { collectVitalDimensions, normalizeCountryCode } from "./vitals-dimensions";
 
 export function startVitals(
   transport: Transport,
   page: () => string,
   onReplayVital?: (sample: ReplayVitalSample) => void,
   onDeliveryFailure?: (error: unknown) => void,
+  dimensions: () => VitalDimensions = () => collectVitalDimensions(),
 ): Dispose {
   // Hold references in a mutable container cleared on dispose() so long-lived web-vitals
   // observers neither report after close() nor retain the closed Client and Replay buffer.
@@ -15,7 +17,8 @@ export function startVitals(
     page: () => string;
     onReplayVital?: (sample: ReplayVitalSample) => void;
     onDeliveryFailure?: (error: unknown) => void;
-  } | undefined = { transport, page, onReplayVital, onDeliveryFailure };
+    dimensions: () => VitalDimensions;
+  } | undefined = { transport, page, onReplayVital, onDeliveryFailure, dimensions };
 
   const report = (metric: Metric) => {
     const current = active;
@@ -27,12 +30,18 @@ export function startVitals(
       value: metric.value,
       rating: metric.rating as VitalRating,
     });
-    void current.transport.vitals([{
+    const dims = safeReadDimensions(current.dimensions);
+    const payload: VitalPayload = {
       name: metric.name as VitalName,
       value: metric.value,
       page: current.page(),
-      timestamp: new Date(timestamp).toISOString()
-    }]).catch((error: unknown) => {
+      timestamp: new Date(timestamp).toISOString(),
+      ...(dims.device_type ? { device_type: dims.device_type } : {}),
+      ...(dims.browser_family ? { browser_family: dims.browser_family } : {}),
+      ...(dims.os_family ? { os_family: dims.os_family } : {}),
+      ...(dims.country ? { country: dims.country } : {}),
+    };
+    void current.transport.vitals([payload]).catch((error: unknown) => {
       // Vitals bypass the delivery queue and are sent once, so this is the only place a
       // failed POST is observable. The handler must never reach application code, and the
       // outer try/catch keeps a throwing reporter from becoming an unhandled rejection.
@@ -47,4 +56,20 @@ export function startVitals(
   };
   onLCP(report); onCLS(report); onINP(report); onTTFB(report); onFCP(report);
   return () => { active = undefined; };
+}
+
+function safeReadDimensions(reader: () => VitalDimensions): VitalDimensions {
+  try {
+    const dims = reader();
+    if (!dims || typeof dims !== "object") return {};
+    const country = normalizeCountryCode(dims.country);
+    return {
+      device_type: dims.device_type,
+      browser_family: dims.browser_family,
+      os_family: dims.os_family,
+      ...(country ? { country } : {}),
+    };
+  } catch {
+    return {};
+  }
 }

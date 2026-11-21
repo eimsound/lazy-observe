@@ -31,6 +31,7 @@ func TestProjectTokenCannotQuery(t *testing.T) {
 	for _, test := range []struct{ method, target string }{
 		{http.MethodGet, "/api/v1/logs/query?query=*"},
 		{http.MethodGet, "/api/v1/query?query=up"},
+		{http.MethodGet, "/api/v1/performance/vitals"},
 		{http.MethodGet, "/api/traces/services"},
 		{http.MethodGet, "/api/v1/issues"},
 		{http.MethodGet, "/api/replay/sessions"},

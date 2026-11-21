@@ -1,4 +1,10 @@
-import type { ErrorEventPayload, VitalName } from "./types";
+import type {
+  ErrorEventPayload,
+  VitalBrowserFamily,
+  VitalDeviceType,
+  VitalName,
+  VitalOSFamily,
+} from "./types";
 import type { ParsedDsn } from "./dsn";
 import type { RecordedSpan, SpanAttribute } from "./trace";
 import {
@@ -18,7 +24,16 @@ export {
   TransportError,
 };
 
-export interface VitalPayload { name: VitalName; value: number; page: string; timestamp: string }
+export interface VitalPayload {
+  name: VitalName;
+  value: number;
+  page: string;
+  timestamp: string;
+  device_type?: VitalDeviceType;
+  browser_family?: VitalBrowserFamily;
+  os_family?: VitalOSFamily;
+  country?: string;
+}
 export type DiagnosticSignal = "error" | "trace" | "vitals" | "replay" | "diagnostic";
 /**
  * Why a telemetry signal was dropped. The first three describe the SDK's own bounded
