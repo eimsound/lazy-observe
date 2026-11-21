@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronRight, AlertTriangle } from "lucide-react";
 import type { JaegerSpan, JaegerTrace } from "@/lib/api/traces";
@@ -10,6 +10,7 @@ import {
   serviceColorIndex,
 } from "@/lib/trace-tree";
 import { formatDurationMicros, formatPercent } from "@/lib/format";
+import { useVirtualWindow } from "@/lib/use-virtual-window";
 import { cn } from "@/lib/utils";
 import {
   Tooltip,
@@ -27,6 +28,8 @@ import {
  */
 
 const ROW_H = 30;
+const WATERFALL_VIEWPORT_MAX_H = 640;
+const WATERFALL_OVERSCAN = 12;
 const TICKS = [0, 0.25, 0.5, 0.75, 1];
 
 interface TraceWaterfallProps {
@@ -50,6 +53,32 @@ export function TraceWaterfall({
     [roots, trace, collapsed],
   );
   const total = useMemo(() => bounds(trace).total, [trace]);
+
+  const virtual = useVirtualWindow({
+    count: rows.length,
+    estimateSize: ROW_H,
+    overscan: WATERFALL_OVERSCAN,
+    defaultViewportHeight: WATERFALL_VIEWPORT_MAX_H,
+  });
+  const { scrollToIndex } = virtual;
+
+  const lastScrolledSpanRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!selectedSpanId) {
+      lastScrolledSpanRef.current = undefined;
+      return;
+    }
+    if (lastScrolledSpanRef.current === selectedSpanId) return;
+    const targetIndex = rows.findIndex((row) => row.span.spanID === selectedSpanId);
+    if (targetIndex < 0) return;
+    lastScrolledSpanRef.current = selectedSpanId;
+    scrollToIndex(targetIndex, { align: "auto", behavior: "smooth" });
+  }, [rows, selectedSpanId, scrollToIndex]);
+
+  const visibleRows = useMemo(
+    () => rows.slice(virtual.startIndex, virtual.endIndex),
+    [rows, virtual.startIndex, virtual.endIndex],
+  );
 
   function toggle(spanID: string) {
     setCollapsed((prev) => {
@@ -107,8 +136,15 @@ export function TraceWaterfall({
       </div>
 
       {/* Rows */}
-      <div>
-        {rows.map((row) => {
+      <div
+        ref={virtual.scrollRef}
+        data-virtualized={virtual.isVirtualized ? "true" : "false"}
+        className={cn(virtual.isVirtualized && "max-h-[640px] overflow-y-auto")}
+      >
+        {virtual.paddingTop > 0 && (
+          <div aria-hidden="true" style={{ height: virtual.paddingTop }} />
+        )}
+        {visibleRows.map((row) => {
           const colorIdx = colorIndex.get(row.service) ?? 1;
           const selected = row.span.spanID === selectedSpanId;
           const labelRight = row.offset + row.width > 0.82;
@@ -119,7 +155,11 @@ export function TraceWaterfall({
               tabIndex={0}
               onClick={() => onSelectSpan(row.span)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") onSelectSpan(row.span);
+                if (e.target !== e.currentTarget) return;
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onSelectSpan(row.span);
+                }
               }}
               className={cn(
                 "flex cursor-pointer border-b border-border/50 hover:bg-muted/50",
@@ -136,6 +176,7 @@ export function TraceWaterfall({
                   <button
                     type="button"
                     aria-label={row.span.operationName}
+                    aria-expanded={!row.collapsed}
                     className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
                     onClick={(e) => {
                       e.stopPropagation();
@@ -212,6 +253,9 @@ export function TraceWaterfall({
             </div>
           );
         })}
+        {virtual.paddingBottom > 0 && (
+          <div aria-hidden="true" style={{ height: virtual.paddingBottom }} />
+        )}
       </div>
     </div>
   );
