@@ -1,10 +1,11 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   calendarCells,
   dateParts,
   formatPrometheusDuration,
+  metricsRangeKey,
   metricsRangeSeconds,
   parseDateTime,
   type MetricsRange,
@@ -71,17 +72,37 @@ export function MetricsTimeRangePicker({
   const [dateTimeInput, setDateTimeInput] = useState(() =>
     formatDateTimeInput(selectedMs, localTime)
   );
+  const rangeKey = metricsRangeKey(value);
   const [viewMonth, setViewMonth] = useState<MonthRef>(() => monthRef(selectedMs, localTime));
+  const [prevProps, setPrevProps] = useState({ rangeKey, localTime });
 
-  useEffect(() => {
-    if (!open) return;
-    const endMs = value.mode === "absolute" && value.endMs !== undefined
-      ? value.endMs
-      : dayjs().valueOf();
-    setSelectedMs(endMs);
-    setDateTimeInput(formatDateTimeInput(endMs, localTime));
-    setViewMonth(monthRef(endMs, localTime));
-  }, [localTime, open, value]);
+  if (prevProps.rangeKey !== rangeKey || prevProps.localTime !== localTime) {
+    const rangeChanged = prevProps.rangeKey !== rangeKey;
+    setPrevProps({ rangeKey, localTime });
+    if (open) {
+      const nextMs =
+        rangeChanged && value.mode === "absolute" && value.endMs !== undefined
+          ? value.endMs
+          : selectedMs;
+      if (nextMs !== selectedMs) {
+        setSelectedMs(nextMs);
+      }
+      setDateTimeInput(formatDateTimeInput(nextMs, localTime));
+      setViewMonth(monthRef(nextMs, localTime));
+    }
+  }
+
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen);
+    if (nextOpen) {
+      const endMs = value.mode === "absolute" && value.endMs !== undefined
+        ? value.endMs
+        : dayjs().valueOf();
+      setSelectedMs(endMs);
+      setDateTimeInput(formatDateTimeInput(endMs, localTime));
+      setViewMonth(monthRef(endMs, localTime));
+    }
+  }
 
   const timezone = dayjs.tz.guess() || t("metrics.localTime");
   const dateTimeInvalid = parseDateTimeInput(dateTimeInput, localTime) === null;
@@ -124,7 +145,7 @@ export function MetricsTimeRangePicker({
   }
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <div className="relative">
         <PopoverTrigger asChild>
           <Button

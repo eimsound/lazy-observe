@@ -21,7 +21,10 @@ export function useResetOnProjectChange(
   const { currentSlug } = useProject();
   const prevRef = useRef(currentSlug);
   const callbackRef = useRef(onReset);
-  callbackRef.current = onReset;
+
+  useEffect(() => {
+    callbackRef.current = onReset;
+  });
 
   useEffect(() => {
     const previous = prevRef.current;

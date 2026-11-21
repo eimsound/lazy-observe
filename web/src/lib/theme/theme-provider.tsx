@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -70,6 +71,9 @@ function systemPrefersDark(): boolean {
   );
 }
 
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<ThemeMode>(
     () => read(STORAGE_KEYS.mode, DEFAULT_MODE) as ThemeMode,
@@ -89,7 +93,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // Track OS preference while in "system" mode.
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => setSystemDark(mq.matches);
+    const onChange = () => {
+      setSystemDark(mq.matches);
+      setVersion((v) => v + 1);
+    };
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
   }, []);
@@ -97,46 +104,46 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const resolvedMode: "light" | "dark" =
     mode === "system" ? (systemDark ? "dark" : "light") : mode;
 
-  // Apply mode -> .dark class.
-  useEffect(() => {
+  // Apply mode -> .dark class before paint / child chart effects read CSS vars.
+  useIsomorphicLayoutEffect(() => {
     document.documentElement.classList.toggle("dark", resolvedMode === "dark");
-    setVersion((v) => v + 1);
   }, [resolvedMode]);
 
   // Apply palette -> data-palette attribute.
-  useEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     const root = document.documentElement;
     if (palette) root.setAttribute("data-palette", palette);
     else root.removeAttribute("data-palette");
-    setVersion((v) => v + 1);
   }, [palette]);
 
   // Apply radius -> inline --radius.
-  useEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     document.documentElement.style.setProperty("--radius", radius);
-    setVersion((v) => v + 1);
   }, [radius]);
 
   // Apply font -> inline --font-scale (globals.css scales root font-size by it).
-  useEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     document.documentElement.style.setProperty("--font-scale", font);
-    setVersion((v) => v + 1);
   }, [font]);
 
   const setMode = useCallback((m: ThemeMode) => {
     setModeState(m);
+    setVersion((v) => v + 1);
     write(STORAGE_KEYS.mode, m);
   }, []);
   const setPalette = useCallback((p: string) => {
     setPaletteState(p);
+    setVersion((v) => v + 1);
     write(STORAGE_KEYS.palette, p, true);
   }, []);
   const setRadius = useCallback((r: string) => {
     setRadiusState(r);
+    setVersion((v) => v + 1);
     write(STORAGE_KEYS.radius, r);
   }, []);
   const setFont = useCallback((f: string) => {
     setFontState(f);
+    setVersion((v) => v + 1);
     write(STORAGE_KEYS.font, f);
   }, []);
   const reset = useCallback(() => {

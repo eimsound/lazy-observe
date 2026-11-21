@@ -1,6 +1,9 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import dayjs from "@/lib/dayjs";
 import { DEFAULT_RANGE_ID, rangeById, resolveRange } from "@/lib/api/ranges";
+
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 export interface ResolvedTimeWindow {
   /** Unix epoch seconds. */
@@ -92,13 +95,14 @@ export function useTimeWindow(
   );
 
   const windowRef = useRef<ResolvedTimeWindow>(window);
-  windowRef.current = window;
-
   const rangeIdRef = useRef(rangeId);
-  rangeIdRef.current = rangeId;
-
   const customWindowRef = useRef(customWindow);
-  customWindowRef.current = customWindow;
+
+  useIsomorphicLayoutEffect(() => {
+    windowRef.current = window;
+    rangeIdRef.current = rangeId;
+    customWindowRef.current = customWindow;
+  }, [window, rangeId, customWindow]);
 
   const getWindow = useCallback(() => windowRef.current, []);
 

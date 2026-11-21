@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type UseQueryResult } from "@tanstack/react-query";
 import { useSearch } from "@tanstack/react-router";
@@ -66,7 +66,7 @@ export function ProfilingPage() {
 
   // Prefill from the URL once (cross-page link from a trace passes service +
   // start/end; the metrics-style range prefill is also honored).
-  const [service, setService] = useState(search.service ?? "");
+  const [selectedService, setSelectedService] = useState(search.service ?? "");
   const [type, setType] = useState<ProfileType>(
     isProfileType(search.type) ? search.type : "cpu",
   );
@@ -83,7 +83,7 @@ export function ProfilingPage() {
   // Reset service selection, drawer, and search when switching projects so the
   // prior project's service name never leaks into the newly selected project.
   const currentSlug = useResetOnProjectChange(() => {
-    setService("");
+    setSelectedService("");
     setDrawerOpen(false);
     setQuery("");
   });
@@ -95,11 +95,7 @@ export function ProfilingPage() {
   });
 
   // Default to the first service once the list loads (unless prefilled).
-  useEffect(() => {
-    if (!service && servicesQuery.data && servicesQuery.data.length > 0) {
-      setService(servicesQuery.data[0]);
-    }
-  }, [service, servicesQuery.data]);
+  const service = selectedService || servicesQuery.data?.[0] || "";
 
   // The dropdown always includes the active service, even if the services API
   // doesn't list it (e.g. arriving from a trace for an unprofiled-looking svc).
@@ -171,7 +167,7 @@ export function ProfilingPage() {
         <CardContent className="grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 lg:grid-cols-12 lg:items-end">
           <div className="space-y-1.5 lg:col-span-3">
             <Label>{t("profiling.service")}</Label>
-            <Select value={service} onValueChange={setService}>
+            <Select value={service} onValueChange={setSelectedService}>
               <SelectTrigger>
                 <SelectValue placeholder={t("profiling.selectService")} />
               </SelectTrigger>

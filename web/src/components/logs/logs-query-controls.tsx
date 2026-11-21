@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   BarChart3,
   Check,
@@ -13,12 +13,15 @@ import {
 import { useTranslation } from "react-i18next";
 import {
   formatPrometheusDuration,
+  metricsRangeKey,
   metricsRangeSeconds,
   parsePrometheusDuration,
+  resolveRangeKeyedDraft,
   setMetricsRangeSeconds,
   shiftMetricsRange,
   stepMetricsRange,
   type MetricsRange,
+  type RangeKeyedDraft,
 } from "@/lib/metrics-query";
 import {
   LOGS_REFRESH_OPTIONS,
@@ -66,19 +69,16 @@ export function LogsTimeControls({
   onRefresh: () => void;
 }) {
   const { t } = useTranslation();
-  const [durationInput, setDurationInput] = useState(
-    formatPrometheusDuration(metricsRangeSeconds(range)),
-  );
-
-  useEffect(() => {
-    setDurationInput(formatPrometheusDuration(metricsRangeSeconds(range)));
-  }, [range]);
+  const rangeKey = metricsRangeKey(range);
+  const formattedDuration = formatPrometheusDuration(metricsRangeSeconds(range));
+  const [durationDraft, setDurationDraft] = useState<RangeKeyedDraft | null>(null);
+  const durationInput = resolveRangeKeyedDraft(durationDraft, range, formattedDuration);
 
   const parsedDuration = parsePrometheusDuration(durationInput);
 
   function commitDuration() {
+    setDurationDraft(null);
     if (parsedDuration === null) {
-      setDurationInput(formatPrometheusDuration(metricsRangeSeconds(range)));
       return;
     }
     onRangeChange(setMetricsRangeSeconds(range, parsedDuration));
@@ -139,7 +139,7 @@ export function LogsTimeControls({
           aria-label={t("logs.duration")}
           aria-invalid={parsedDuration === null}
           disabled={disabled}
-          onChange={(event) => setDurationInput(event.target.value)}
+          onChange={(event) => setDurationDraft({ rangeKey, value: event.target.value })}
           onBlur={commitDuration}
           onKeyDown={(event) => {
             if (event.key === "Enter") {

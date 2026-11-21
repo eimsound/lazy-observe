@@ -85,11 +85,13 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
     retry: false,
   });
 
-  const [draft, setDraft] = useState<AlertConfig | null>(null);
-  const [dirty, setDirty] = useState(false);
+  const [editedDraft, setEditedDraft] = useState<AlertConfig | null>(null);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Derive the effective form value from server data unless the user has unsaved edits.
+  const draft = editedDraft ?? config.data ?? null;
 
   useEffect(() => {
     return () => {
@@ -99,19 +101,11 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
     };
   }, []);
 
-  // Seed the editable draft from server data unless the user has unsaved edits.
-  useEffect(() => {
-    if (config.data && !dirty) {
-      setDraft(config.data);
-    }
-  }, [config.data, dirty]);
-
   const save = useMutation({
     mutationFn: (next: AlertConfig) => putAlertConfig(projectId, next),
     onSuccess: (next) => {
       queryClient.setQueryData(["alert-config", projectId], next);
-      setDraft(next);
-      setDirty(false);
+      setEditedDraft(null);
       setSaved(true);
       setError(null);
       if (savedTimerRef.current !== null) {
@@ -127,24 +121,26 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
 
   function patch(p: Partial<AlertConfig>) {
     if (!canManage) return;
-    setDraft((prev) => (prev ? { ...prev, ...p } : prev));
-    setDirty(true);
+    setEditedDraft((prev) => {
+      const base = prev ?? config.data ?? null;
+      return base ? { ...base, ...p } : null;
+    });
     setSaved(false);
   }
 
   function toggleChannel(id: string) {
     if (!canManage) return;
-    setDraft((prev) => {
-      if (!prev) return prev;
-      const has = prev.channel_ids.includes(id);
+    setEditedDraft((prev) => {
+      const base = prev ?? config.data ?? null;
+      if (!base) return null;
+      const has = base.channel_ids.includes(id);
       return {
-        ...prev,
+        ...base,
         channel_ids: has
-          ? prev.channel_ids.filter((c) => c !== id)
-          : [...prev.channel_ids, id],
+          ? base.channel_ids.filter((c) => c !== id)
+          : [...base.channel_ids, id],
       };
     });
-    setDirty(true);
     setSaved(false);
   }
 

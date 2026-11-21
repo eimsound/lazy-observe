@@ -47,10 +47,9 @@ export function useChartTheme(): ChartTheme {
   const { version, resolvedMode } = useTheme();
   const [theme, setTheme] = useState<ChartTheme>(() => readChartTheme(resolvedMode));
 
-  // Re-read whenever the ThemeProvider bumps `version` or the mode flips, and
-  // once more on the next frame so values settle after fonts/layout apply.
+  // Re-read on the next frame whenever ThemeProvider bumps `version` or the
+  // mode flips (ThemeProvider applies DOM attributes in useLayoutEffect).
   useEffect(() => {
-    setTheme(readChartTheme(resolvedMode));
     const id = requestAnimationFrame(() => setTheme(readChartTheme(resolvedMode)));
     return () => cancelAnimationFrame(id);
   }, [version, resolvedMode]);

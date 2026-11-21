@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import uPlot from "uplot";
 import { Eye, EyeOff, Filter } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -199,6 +199,8 @@ function createRangeSelectionPlugin(
   };
 }
 
+const EMPTY_HIDDEN_INDEXES: number[] = [];
+
 export function LogsHitsChart({
   series,
   height = 220,
@@ -209,7 +211,6 @@ export function LogsHitsChart({
 }: LogsHitsChartProps) {
   const { t } = useTranslation();
   const theme = useChartTheme();
-  const [hidden, setHidden] = useState<number[]>([]);
   const seriesIdentity = useMemo(
     () => series.map((item) => JSON.stringify([
       item.label,
@@ -218,7 +219,24 @@ export function LogsHitsChart({
     ])).join("\u0000"),
     [series],
   );
-  useEffect(() => setHidden([]), [seriesIdentity]);
+  const [hiddenState, setHiddenState] = useState<{ identity: string; indexes: number[] }>({
+    identity: seriesIdentity,
+    indexes: EMPTY_HIDDEN_INDEXES,
+  });
+  const hidden = hiddenState.identity === seriesIdentity
+    ? hiddenState.indexes
+    : EMPTY_HIDDEN_INDEXES;
+  const toggleHidden = (index: number) => {
+    setHiddenState((current) => {
+      const base = current.identity === seriesIdentity
+        ? current.indexes
+        : EMPTY_HIDDEN_INDEXES;
+      const next = base.includes(index)
+        ? base.filter((itemIndex) => itemIndex !== index)
+        : [...base, index];
+      return { identity: seriesIdentity, indexes: next };
+    });
+  };
   const seriesColors = useMemo(
     () => series.map((item, index) => (
       item.isOther
@@ -358,11 +376,7 @@ export function LogsHitsChart({
                   type="button"
                   className="min-w-0 flex-1 truncate text-left"
                   title={seriesLabel(item)}
-                  onClick={() => setHidden((current) => (
-                    current.includes(index)
-                      ? current.filter((itemIndex) => itemIndex !== index)
-                      : [...current, index]
-                  ))}
+                  onClick={() => toggleHidden(index)}
                 >
                   {seriesLabel(item)}
                 </button>
@@ -374,11 +388,7 @@ export function LogsHitsChart({
                   variant="ghost"
                   size="icon"
                   className="size-6"
-                  onClick={() => setHidden((current) => (
-                    current.includes(index)
-                      ? current.filter((itemIndex) => itemIndex !== index)
-                      : [...current, index]
-                  ))}
+                  onClick={() => toggleHidden(index)}
                   aria-label={isHidden ? t("logs.showSeries") : t("logs.hideSeries")}
                 >
                   {isHidden ? <EyeOff /> : <Eye />}

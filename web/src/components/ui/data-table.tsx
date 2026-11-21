@@ -16,7 +16,6 @@ import {
 } from "@tanstack/react-table";
 import { ArrowDown, ArrowUp, ChevronsUpDown } from "lucide-react";
 import {
-  useEffect,
   useMemo,
   useRef,
   useState,
@@ -113,6 +112,13 @@ export function DataTable<TData extends RowData>({
   tableClassName,
 }: DataTableProps<TData>) {
   const [sorting, setSorting] = useState<SortingState>([]);
+  const [prevResetSortingKey, setPrevResetSortingKey] = useState(resetSortingKey);
+  if (!Object.is(prevResetSortingKey, resetSortingKey)) {
+    setPrevResetSortingKey(resetSortingKey);
+    if (sorting.length > 0) {
+      setSorting([]);
+    }
+  }
   const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const tableColumns = useMemo(() => withV8SortDefaults(columns, data), [columns, data]);
   const table = useTable({
@@ -123,10 +129,6 @@ export function DataTable<TData extends RowData>({
     onSortingChange: setSorting,
     state: { sorting },
   });
-
-  useEffect(() => {
-    setSorting([]);
-  }, [resetSortingKey]);
 
   return (
     <div

@@ -26,6 +26,33 @@ export interface AbsoluteMetricsRange {
 
 export type MetricsRange = RelativeMetricsRange | AbsoluteMetricsRange;
 
+/**
+ * Stable value key for a `MetricsRange` so range inputs compare values instead
+ * of object identity and keep user drafts intact across background refreshes.
+ */
+export function metricsRangeKey(range: MetricsRange): string {
+  if (range.mode === "relative") {
+    return `relative:${range.presetId}:${range.seconds}`;
+  }
+  return `absolute:${range.startMs}:${range.endMs ?? ""}`;
+}
+
+export interface RangeKeyedDraft {
+  rangeKey: string;
+  value: string;
+}
+
+/** Resolve a range-scoped draft against the current range's value key. */
+export function resolveRangeKeyedDraft(
+  draft: RangeKeyedDraft | null,
+  range: MetricsRange,
+  fallbackValue: string,
+): string {
+  return draft !== null && draft.rangeKey === metricsRangeKey(range)
+    ? draft.value
+    : fallbackValue;
+}
+
 export interface ResolvedMetricsRange {
   start: number;
   end: number;

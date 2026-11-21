@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
@@ -52,7 +52,8 @@ export function IssueDetailPage() {
   const search = useSearch({ strict: false }) as { event?: string };
   const queryClient = useQueryClient();
 
-  const [selectedEventId, setSelectedEventId] = useState<string | undefined>(search.event);
+  const contextKey = `${project}:${issueId}:${search.event ?? ""}`;
+  const [pickedEvent, setPickedEvent] = useState<{ key: string; eventId: string } | null>(null);
   const [jsonOpen, setJsonOpen] = useState(false);
   const [statusError, setStatusError] = useState<string | null>(null);
 
@@ -63,16 +64,20 @@ export function IssueDetailPage() {
   });
 
   const events = useMemo(() => issueQuery.data?.events ?? [], [issueQuery.data?.events]);
+  const activePickedEventId = pickedEvent?.key === contextKey ? pickedEvent.eventId : undefined;
 
-  // Default the event switcher to the deep-linked event, else the newest.
-  useEffect(() => {
-    if (events.length === 0) return;
-    if (!selectedEventId || !events.some((e) => e.event_id === selectedEventId)) {
-      setSelectedEventId(search.event && events.some((e) => e.event_id === search.event)
-        ? search.event
-        : events[0].event_id);
+  // Default the event switcher to the user's pick within the active issue/deep-link
+  // scope, else the deep-linked event, else the newest.
+  const selectedEventId = useMemo(() => {
+    if (events.length === 0) return activePickedEventId ?? search.event;
+    if (activePickedEventId && events.some((e) => e.event_id === activePickedEventId)) {
+      return activePickedEventId;
     }
-  }, [events, selectedEventId, search.event]);
+    if (search.event && events.some((e) => e.event_id === search.event)) {
+      return search.event;
+    }
+    return events[0].event_id;
+  }, [events, activePickedEventId, search.event]);
 
   const eventQuery = useProjectQuery<ErrorEvent, ApiError>({
     queryKey: ["issue-event", issueId, selectedEventId],
@@ -167,7 +172,7 @@ export function IssueDetailPage() {
           selectedIndex={selectedIndex}
           canManage={canManage}
           statusError={statusError}
-          onSelectEvent={setSelectedEventId}
+          onSelectEvent={(eventId) => setPickedEvent({ key: contextKey, eventId })}
           onStatus={(s) => statusMutation.mutate(s)}
           statusBusy={statusMutation.isPending}
           onOpenJson={() => setJsonOpen(true)}
