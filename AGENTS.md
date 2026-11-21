@@ -16,11 +16,10 @@
 - `internal/db/ent` 是生成代码并纳入 git：改 `internal/db/schema` 后运行 `mise run ent-generate`，与 schema 一并提交，不手改。
 - fencing/租约被拒（如 `meta.ErrStaleRuleFence`）不得静默丢弃：放弃结果的调用方至少 `slog.Warn`，带规则、成员和纪元；
   `errors.Is` 命中后直接 `return`/`continue` 不留日志算缺陷。
-- `alert_engine_members`、`alert_rule_leases` 读数据库时间只走 `alertClockSQL`/`alertLeaseExpiry`（ADR 0011）。
+- `alert_engine_members`、`alert_rule_leases`、`source_map_upload_pins` 读数据库时间只走 `alertClockSQL`/`alertLeaseExpiry`（ADR 0011）。
 
 ## 工作流
 
-- 非平凡工作从 `.agents/skills/do/SKILL.md` 开始，`do` 覆盖的情境不要只凭 skill description 选；
-  负责人要主线程只对话、子线程干活时，在 `do` 之上再遵循 `.agents/skills/main/SKILL.md`。
+- 改代码、改配置、发版、写文档或排查代码问题前，先读 `.agents/skills/do/SKILL.md` 按情境选流程（单行改错字/纯闲聊除外），不要只凭 skill description 选。
 - issue tracker、triage labels、domain docs（`.agents/docs/GLOSSARY.md`、`.agents/docs/adr/`）的配置在 `.agents/docs/agents/`。
-- 修改或审查后端、Web、SDK 或部署/CI 链路时，按改动面查阅 `.agents/skills/pitfalls/SKILL.md` 规避已知共性坑。
+- 审查代码，或修改后端、Web、SDK、部署/CI 的逻辑与配置时，按改动面查阅 `.agents/skills/pitfalls/SKILL.md`（仅改错字/注释/纯文档可跳过）。

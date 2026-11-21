@@ -1,6 +1,6 @@
 ---
 name: do
-description: lazy-observe 的单一工作入口。在开始任何非平凡改动前使用：把一句目标路由到一条流程（feature / feature-multi / bug-fix / investigate / refactor / release / docs / afk-run），给出该流程要调用的 skill、产物路径、必跑门禁和提交纪律。用户提到"走流程""选 skill""AFK""无人值守""该跑哪些检查"时也用它。
+description: lazy-observe 的单一工作入口。改代码、改配置、发版、写文档或排查代码问题前使用（单行改错字/纯闲聊除外）：把一句目标路由到一条流程（feature / feature-multi / bug-fix / investigate / refactor / release / docs / afk-run），给出该流程要调用的 skill、产物路径、必跑门禁和提交纪律。用户提到"走流程""选 skill""AFK""无人值守""该跑哪些检查"时也用它。
 ---
 
 # do
@@ -37,40 +37,38 @@ description: lazy-observe 的单一工作入口。在开始任何非平凡改动
 | 多票、跨会话、可并行 | feature-multi | `/skill:to-spec` → `/skill:to-tickets` → `/skill:implement-spec` | GitHub issue + integration branch |
 | 报错、回归、flaky 测试 | bug-fix | `/skill:diagnosing-bugs` | 回归测试 + 证据 |
 | 只读问题（"这块怎么工作"） | investigate | 直接查代码，不改 | 回答 + 文件行号 |
-| 行为不变的整形 | refactor | `/skill:tdd` 保护接缝 | 全绿 diff |
-| 发布、tag、容器、门面 | release | `/skill:wizard` 处理凭据 | `CHANGELOG.md` + tag |
+| 不改外部行为的结构重构 | refactor | `/skill:tdd` 保护接缝 | 全绿 diff |
+| 发版、打 tag、容器镜像与 Release 资产 | release | `/skill:wizard` 处理凭据 | `CHANGELOG.md` + tag |
 | 文档、README、调研归档 | docs | 直接改 | 按读者选目录：用户文档放 `docs/`，AI/规划放 `.agents/docs/`（见 `AGENTS.md`） |
 | 长时间无人值守 | afk-run | `/skill:chief-of-staff` + `/skill:implement-spec` | `.agents/docs/afk/<goal>/` |
 | 方向没定、要拍板 | 先 `/skill:grill-with-docs`，再回本文件 | ADR | `.agents/docs/adr/` |
-| 巨大且看不清全貌 | `/skill:wayfinder`，清完雾再回本文件 | 决策票 | GitHub issue |
+| 范围过大、边界和依赖还不清楚 | `/skill:wayfinder`，厘清范围后再回本文件 | 决策票 | GitHub issue |
 
 `/skill:to-spec` 和 `/skill:to-tickets` 产出的票已经带 `ready-for-agent`，不要再 triage。
 外部来的 bug 报告或功能请求才走 `/skill:triage`。
 
 ## 流程步骤
 
-实现、修复或审查后端、Web、SDK 或部署/CI 改动面时，按需查阅 `.agents/skills/pitfalls/SKILL.md` 核对已知共性坑。
-
 ### feature
 
 1. 读 `.agents/docs/requirements.md` 对应小节、相关 ADR、`.agents/docs/GLOSSARY.md` 术语。
 2. `/skill:spec-to-plan` 产出计划，落到 `.agents/docs/plans/<topic>.md`；计划里必须有仓库证据、两条备选路线、Tracer Bullet 切片、每切片的 red/green 命令。
 3. `/skill:implement`：每个切片先写失败测试，再最小实现，跑门禁，在计划里勾选并贴证据（命令 + 结论）。
-4. 收尾：`/skill:code-review`（Standards 对照 `AGENTS.md`，Spec 对照计划）→ 更新 `CHANGELOG.md` → `/skill:retro`。
+4. 收尾：`/skill:code-review`（Spec 对照计划）→ 更新 `CHANGELOG.md` → 按「收尾」条件运行 `/skill:retro`。
 
 ### feature-multi
 
 1. 同一个上下文窗口里做完 `/skill:to-spec` 和 `/skill:to-tickets`，不要中途 compact 或 clear。
 2. 票落 GitHub Issues，blocking 边在票正文写 `Blocked by #<n>`（可用 sub-issue 挂到 spec 票下）；按 frontier 推进。
 3. `/skill:implement-spec` 跑整个 spec：integration branch + 每个 implementer 自己的 worktree，收尾在 integration branch 上跑一次 `/skill:code-review`。
-4. 结束后清理 worktree，再 `/skill:retro`。
+4. 结束后清理 worktree，按「收尾」条件运行 `/skill:retro`。
 
 ### bug-fix
 
 1. 先建一个**已经红**的反馈环：一条命令，跑出来就是这个 bug。
 2. 定位到最小接缝，写回归测试，再修。
 3. 修完跑同一命令转绿，附上修复前后输出。
-4. `/skill:retro` 问一句：什么环境改动能防止这类 bug 再发生。
+4. 满足「收尾」条件时运行 `/skill:retro`（重点确认：什么环境改动能防止这类 bug 再发生）。
 
 ### release
 
@@ -248,8 +246,8 @@ feature-multi：每个 implementer 的 PR base 是 integration branch，各自�
 
 ## 收尾
 
-- `/skill:code-review`：Standards 对照 `AGENTS.md`，Spec 对照计划或票。放在最后一条切片 PR 合并之前跑；发现问题就开一条修复分支走同一条流水线。
+- `/skill:code-review`：Standards 按 `code-review` 第 3 步，Spec 对照计划或票。放在最后一条切片 PR 合并之前跑；发现问题就开一条修复分支走同一条流水线。
 - 更新 `CHANGELOG.md` 作为独立的 `chore/changelog-<topic>` 分支，走同一条流水线。
-- `/skill:retro`：回看这次会话，给出环境改进（导航指针、自动检查、编码标准、工具）。机械性错误变成确定性检查，判断题变成编码标准。
+- `/skill:retro`：完成多票 spec、发版前，或自上次修订 `.agents/skills/pitfalls/` 以来出现新的 `## Pitfall Signals` 或 `main` 分支 CI 出现基线外失败时运行；能自动检查的错误沉淀为 linter/测试/CI，其余按信号批量修订 `.agents/skills/pitfalls/`（删旧/毕业优先于新增）。
 - 汇报时列出真实跑过的命令和结果，以及每个 PR 的链接和它对应 CI run 的结论。没跑的不要说通过。
 - 发现流程本身有缺口（比如某类改动没有对应门禁），在这里补一行，不要绕过去。
