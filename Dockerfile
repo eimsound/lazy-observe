@@ -6,9 +6,6 @@ ARG TARGETOS
 ARG TARGETARCH
 # builder 阶段固定在 $BUILDPLATFORM 上执行；BUILDARCH 决定要安装哪个架构的 mise。
 ARG BUILDARCH
-ARG VERSION=dev
-ARG COMMIT=none
-ARG DATE=unknown
 # Optional build args so `mise install` inside the build container can reach
 # GitHub release downloads and the GitHub API through a local proxy. Empty by
 # default (direct access); the release workflow does not set them.
@@ -242,6 +239,9 @@ RUN --mount=type=secret,id=github_token bash -euo pipefail -c ' \
   mise trust /src/mise.toml && mise install go node pnpm \
 '
 COPY . .
+ARG VERSION=dev
+ARG COMMIT=none
+ARG DATE=unknown
 # go.mod replaces github.com/eimsound/lazy-observe/sdk/go with the in-repo ./sdk/go
 # module, which `COPY . .` already brought into the build context.
 RUN --mount=type=cache,target=/root/go/pkg/mod \

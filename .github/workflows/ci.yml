@@ -23,12 +23,12 @@ name: CI
 #   PR 与只读消费者仍保留 `restore-keys` 回退加速。
 # - mise 缓存只按 mise.toml 的 `[tools]` 表哈希（scripts/ci-cache-keys.sh），改任务定义或注释不失效；
 #   base 工具集共用 `mise-base-*`（仅由 `go-cross` 保存 X64/ARM64，其余 base job 与 sdk-python/meta-pg/sdk-journeys 只读），
-#   `sdk-go` 只读 `mise-go-*` 并配 `--skip-tools`，`sdk-node` 与 `sdk-browser` 共用 `mise-sdk-node-<node>-pnpm-<pnpm>-*`
+#   `sdk-go` 只读 `mise-go-*` 并配 `--skip-tools`，`sdk-node` 与 `sdk-browser` 共用 `mise-sdk-node-v2-<node>-pnpm-<pnpm>-*`
 #   （仅由 `sdk-node` 保存，配 `--skip-tools`，不装 Go/air/golines 等无关工具、不跨版本回退）。保存 `mise-go`/`mise-base`
 #   前先 `mise prune --tools --yes`，避免升版后把旧版本工具一并打包进新缓存。
 # - 每个共享 key 在同一次 workflow 运行内严格只有一个 writer（`go` 写 `mise-go`/`gomod`/`gobuild-X64`，`go-cross` 写
 #   `mise-base`、`mise-bin` 与 ARM64 的 `gobuild`/`pnpm-web`，`web` 写 X64 的 `pnpm-web`，`e2e(storage)` 写 `storage-native`，
-#   `sdk-node` 写 `mise-sdk-node-*`），避免并发 save 冲突。`mise-bin-*`（`~/.local/bin/mise`）单独按 `scripts/mise-release.env` 键控，
+#   `sdk-node` 写 `mise-sdk-node-v2-*`），避免并发 save 冲突。`mise-bin-*`（`~/.local/bin/mise`）单独按 `scripts/mise-release.env` 键控，
 #   不设跨版本 `restore-keys`，只在 `main` 上由 `go-cross` 保存 X64/ARM64，其余全部 workflow/job 只读恢复。
 # - pnpm 的 key 不带 mise.toml 哈希，其它工具升版不会让它们整份换新；`sdk-journeys` 按工作区隔离目录只读复用
 #   `pnpm-web` / `pnpm-sdk-node` / `pnpm-sdk-browser` 三个独立 store，不额外保存三锁合一副本；`playwright-sdk-journeys-*`
@@ -654,8 +654,8 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # sdk-node 与 sdk-browser 只装 pnpm + 这一格的 node，任务走 --skip-tools 不装 Go/air/golines 等无关工具，
-      # 两边共用 mise-sdk-node-<node>-pnpm-<pnpm>-* 一份约 50 MB 的小缓存；不设跨版本 restore-keys 避免把旧版或旧的
-      # 260 MB 膨胀缓存拖回来。
+      # 两边共用 mise-sdk-node-v2-<node>-pnpm-<pnpm>-* 一份约 50 MB 的小缓存（v2 跳过 #299 修复前残留的膨胀旧键）；
+      # 不设跨版本 restore-keys 避免把旧版或旧的膨胀缓存拖回来。
       - name: Restore mise binary cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -666,7 +666,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
-          key: mise-sdk-node-${{ matrix.node }}-pnpm-${{ steps.cache-keys.outputs.pnpm-toolchain }}-${{ runner.os }}-${{ runner.arch }}
+          key: mise-sdk-node-v2-${{ matrix.node }}-pnpm-${{ steps.cache-keys.outputs.pnpm-toolchain }}-${{ runner.os }}-${{ runner.arch }}
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -730,7 +730,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
-          key: mise-sdk-node-${{ matrix.node }}-pnpm-${{ steps.cache-keys.outputs.pnpm-toolchain }}-${{ runner.os }}-${{ runner.arch }}
+          key: mise-sdk-node-v2-${{ matrix.node }}-pnpm-${{ steps.cache-keys.outputs.pnpm-toolchain }}-${{ runner.os }}-${{ runner.arch }}
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:

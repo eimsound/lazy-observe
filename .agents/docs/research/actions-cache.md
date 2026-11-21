@@ -1,7 +1,7 @@
 # GitHub Actions Cache 超限治理（10 GB 配额）
 
-> 状态：一期与二期治理调研与实施方案记录（切片 CQ；Issue #300），2026-11-21。
-> 数据来源：只读查询 `gh api repos/eimsound/lazy-observe/actions/cache/usage` 与 `actions/caches --paginate`（一期 2026-11-20 12:18 UTC，对应 `main` `714a21f`；二期 2026-11-21 17:54–19:00 UTC，对应 `main` `92610f3`）。
+> 状态：一期、二期与三期治理调研及实施方案记录（Issue #300、#310、#311），2026-11-21。
+> 数据来源：只读查询 `gh api repos/eimsound/lazy-observe/actions/cache/usage` 与 `actions/caches --paginate`（一期 2026-11-20 12:18 UTC，对应 `main` `714a21f`；二期 2026-11-21 17:54–19:00 UTC，对应 `main` `92610f3`；三期 2026-11-21 20:05 UTC 后对应 `f58eb5a`，以及 #310 合入 `2150509` 后 `mise-bin-*` 实测）。
 
 ## 1. 现状盘点
 
@@ -65,7 +65,7 @@ GitHub Actions 单仓缓存配额上限为 **10 GB**（超出后按 LRU 淘汰�
    - 全部改用已固定同一 40 位 SHA 的 `actions/cache/restore` 与 `actions/cache/save`（`55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0`），不引入新 action 属主。
    - 所有保存步骤统一加 `if: github.ref == 'refs/heads/main' && steps.<id>.outputs.cache-hit != 'true'`，确保 PR、integration、tag 只读不写，且精确命中时不重复上传。
    - 严格单一 writer：同一 workflow 运行内每个共享 key 只有一个 job/矩阵格保存，避免并发 `actions/cache/save` 竞争——`go` 保存 `mise-go`/`gomod`/`gobuild(X64)`，`go-cross` 保存 `mise-base(X64/ARM64)` 与 `gobuild`/`pnpm-web(ARM64)`，`web` 保存 `pnpm-web(X64)`，`e2e(storage)` 保存 `storage-native`，`sdk-node` 保存 `mise-sdk-node-*` 与 `pnpm-sdk-node(Node 26)`，`sdk-browser(Node 26)` 保存 `pnpm-sdk-browser`；`e2e-restart`、`e2e-ha`、`sdk-go` 全部只读，`sdk-browser` 对 `mise-sdk-node-*` 只读，`sdk-journeys` 对 `storage-native` 只读。
-   - `release.yml`：`container-check` 的 BuildKit `cache-to` 仅在 `refs/heads/main`（手动 snapshot 选 `main`）时写入；只在 tag push 运行的 `docker` job 移除 `cache-to`，只读 `container-amd64` / `container-arm64`。
+   - `release.yml`：（一期做法，已于三期 #311 彻底移除 BuildKit GHA 缓存，见 §7）`container-check` 的 BuildKit `cache-to` 仅在 `refs/heads/main`（手动 snapshot 选 `main`）时写入；只在 tag push 运行的 `docker` job 移除 `cache-to`，只读 `container-amd64` / `container-arm64`。
 2. **拆分 `GOMODCACHE` 与 `GOCACHE`，合并重复 Go key（`scripts/ci-cache-keys.sh` + 三个 workflow）**：
    - `gomod-${{ steps.cache-keys.outputs.go }}`（`~/go/pkg/mod`）：纯源码，**跨架构且跨 Go 版本共享**，仅由 `go` job 在 `main` 上保存一份，其余全部 job（含 ARM64、`bench.yml`、`release.yml`）只读复用。
    - `gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-${{ steps.cache-keys.outputs.go }}`（`~/.cache/go-build`）：按架构与精确 Go 版本隔离，**`restore-keys` 仅回退到同一 `go-toolchain`**，绝不跨 Go 版本恢复旧编译产物；仅由 `go` job（X64）与 `go-cross` 的 `arm64` 格保存，彻底取消 `go-sdk-journeys`、`go-sdk`、`go-meta-pg`、`go-bench`、`go-release`。
@@ -82,36 +82,39 @@ GitHub Actions 单仓缓存配额上限为 **10 GB**（超出后按 LRU 淘汰�
 - **不在 `sdk-node` / `sdk-browser` 里运行 `mise prune`**：矩阵中 `node@22.23.5` / `node@24.22.3` 不在 `mise.toml` 中，`mise prune` 会误删它们；改用精确版本 key 且不设跨版本 `restore-keys`，直接避免旧版本残留。
 - **不给 `e2e` / `e2e-ha` / `go-cross` / `sdk-journeys` 加 `--skip-tools`**：`scripts/check-e2e-contract.sh` 断言它们的原命令字面量，且它们共用同一份 `mise-base`，加与不加不影响总条目数。
 
-## 4. 预期总容量估算
+## 4. 预期总容量估算（按 #300 / #310 / #311 实测修正）
 
 ### 单代稳态（`main` 日常 CI）
 
-| 类别 | key 模式 | 条数 | 估算单条 | 估算小计 |
+| 类别 | key 模式 | 条数 | 实测/估算单条 | 估算小计 |
 | --- | --- | ---: | ---: | ---: |
-| Go 模块（X64/ARM64 共用） | `gomod-<go>` | 1 | ~200 MB | ~200 MB |
-| Go 编译缓存（X64） | `gobuild-Linux-X64-<go-ver>-<go>` | 1 | ~250 MB | ~250 MB |
-| Go 编译缓存（ARM64） | `gobuild-Linux-ARM64-<go-ver>-<go>` | 1 | ~180 MB | ~180 MB |
-| mise（go-ci，已 prune） | `mise-go-Linux-X64-<tools>` | 1 | ~240 MB | ~240 MB |
-| mise（base X64 + ARM64，已 prune） | `mise-base-Linux-{X64,ARM64}-<tools>` | 2 | ~165 / 155 MB | ~320 MB |
-| mise（sdk-node 22/24/26，`--skip-tools`） | `mise-sdk-node-<ver>-pnpm-<ver>-Linux-X64` | 3 | ~50 MB | ~150 MB |
-| storage 原生归档 | `storage-native-Linux-X64-<storage>` | 1 | 333 MB | 333 MB |
-| pnpm（web×2、node、browser、journeys） | `pnpm-*-Linux-*` | 5 | 33–85 MB | ~281 MB |
-| Playwright 浏览器 | `playwright-sdk-journeys-Linux-X64-<lock>` | 1 | 114 MB | 114 MB |
-| uv（5 个 Python 版本） | `uv-sdk-python-Linux-X64-<py>-<toml>` | 5 | ~10.5 MB | ~52 MB |
-| embedded-pg | `embedded-pg-Linux-X64-18.6.1-<mod>` | 1 | 37 MB | 37 MB |
-| **日常 CI 单代合计** | | **22** | | **~2.11 GiB（~2.26 GB）** |
+| Go 模块（X64/ARM64 共用） | `gomod-<go>` | 1 | ~412 MiB | ~412 MiB |
+| Go 编译缓存（X64） | `gobuild-Linux-X64-<go-ver>-<go>` | 1 | ~292 MiB | ~292 MiB |
+| Go 编译缓存（ARM64） | `gobuild-Linux-ARM64-<go-ver>-<go>` | 1 | ~176 MiB | ~176 MiB |
+| mise（go-ci，已 prune） | `mise-go-Linux-X64-<tools>` | 1 | ~206 MiB | ~206 MiB |
+| mise（base X64 + ARM64，已 prune） | `mise-base-Linux-{X64,ARM64}-<tools>` | 2 | ~170 / ~162 MiB | ~332 MiB |
+| mise 二进制本体（#310 新增，X64 + ARM64） | `mise-bin-Linux-{X64,ARM64}-<mise-release.env>` | 2 | 55.60 / 55.88 MiB | ~111.5 MiB |
+| mise（sdk-node 22/24/26，`--skip-tools`，#311 键升级） | `mise-sdk-node-v2-<ver>-pnpm-<ver>-Linux-X64` | 3 | ~45–60 MiB | ~150 MiB |
+| storage 原生归档（#300 清理历史归档） | `storage-native-Linux-X64-<storage>` | 1 | ~180 MiB | ~180 MiB |
+| pnpm（web×2、node、browser；已移除 `pnpm-sdk-journeys`） | `pnpm-*-Linux-*` | 4 | 45–60 MiB | ~214 MiB |
+| Playwright 浏览器（按 `playwright-core` 版本） | `playwright-sdk-journeys-Linux-X64-<playwright-core>` | 1 | ~113.4 MiB | ~113.4 MiB |
+| uv（5 个 Python 版本） | `uv-sdk-python-Linux-X64-<py>-<toml>` | 5 | ~13.4 MiB | ~66.8 MiB |
+| embedded-pg | `embedded-pg-Linux-X64-18.6.1-<mod>` | 1 | 36.9 MiB | 36.9 MiB |
+| uv（docs 文档站） | `uv-docs-Linux-X64-<toml>` | 1 | 16.4 MiB | 16.4 MiB |
+| **日常 CI 单代合计** | | **24** | | **~2.25 GiB（~2.42 GB）** |
 
 ### 7 天窗口峰值估算（含 Renovate 密集升级 + 手动发版演练）
 
 - **高频升级周**（7 天内合并 3 次 `go.mod` 升级 + 2 次 `mise.toml [tools]` 升级 + 2 次 `pnpm-lock.yaml` 升级，旧代尚未过 7 天 TTL）：
-  - Go 缓存（3 代 × ~630 MB）：~1.89 GB
-  - `mise-go` + `mise-base`（2 代 × ~560 MB）+ `mise-sdk-node`（1 代 ~150 MB）：~1.27 GB
-  - `pnpm-*`（2 代 × ~281 MB）：~0.56 GB
-  - 长期稳定资产（`storage-native` + `playwright` + `uv` + `embedded-pg`）：~0.54 GB
-  - **CI 峰值合计**：**~4.26 GB**（远低于 10 GB 配额）。
+  - Go 缓存（3 代 × ~880 MiB）：~2.64 GiB（~2.83 GB）
+  - `mise-go` + `mise-base`（2 代 × ~538 MiB）+ `mise-bin`（1 代 ~111.5 MiB）+ `mise-sdk-node-v2`（1 代 ~150 MiB）：~1.34 GiB（~1.44 GB）
+  - `pnpm-*`（2 代 × ~214 MiB）：~428 MiB（~0.45 GB）
+  - 长期稳定资产（`storage-native` + `playwright` + `uv` + `embedded-pg` + `uv-docs`）：~414 MiB（~0.43 GB）
+  - **CI 峰值合计**：**~5.15 GB**（稳定低于 10 GB 配额）。
 - **叠加手动在 `main` 上跑 `bench.yml` / `release.yml` snapshot**：
-  - 另加 `storage-all`（~660 MB）+ `mise-release`（~220 MB）+ BuildKit `container-amd64`/`container-arm64` `mode=max`（~1.5–2.5 GB）
-  - **极端峰值**：**~6.6–7.6 GB**，仍留有 >2.4 GB 余量，关键缓存（`embedded-pg`、`storage-native`、`mise-*`、`gomod`）不再被 LRU 挤出。
+  - `release.yml` BuildKit GHA 缓存预算：**0 GB**（#311 已移除 `cache-from`/`cache-to`，并由 `scripts/check-github-workflows.sh` 静态禁止；原估 ~1.5–2.5 GB 已被 §7 实证推翻——两次 snapshot 即达 `3.60 GiB` / 67 条并击穿配额）；
+  - 另加 `storage-all`（当前仍为 1 条旧键 `523.77 MiB`，待 #309 修复 `perf-ha` 后下次 `main` 成功运行刷新保存，预期收敛至 ~360 MiB）+ `mise-release`（~220 MiB）；
+  - **极端峰值**：**~5.7–6.0 GB**（留有 >4.0 GB 余量），关键缓存（`embedded-pg`、`storage-native`、`mise-*`、`gomod`）不再被 LRU 挤出。
 
 > 过渡期说明：本改动合入 `main` 后，旧 key（约 11.7 GB）将在 7 天内随无人访问自然过期，或在短时间内被新 key（~2.2 GB）挤出旧代，一周后回落至稳态区间。
 
@@ -168,24 +171,65 @@ GitHub Actions 单仓缓存配额上限为 **10 GB**（超出后按 LRU 淘汰�
    - 在 4 个当前归档全部完成下载与 SHA-256 校验后，删除 `$bin_dir/.archives/$platform` 顶层不属于 `$metrics_asset` / `$vmutils_asset` / `$logs_asset` / `$traces_asset` 的历史归档文件及符号链接（不触碰其它平台目录），并在二进制已就绪的快路径上同样执行清理；校验失败则 fail-closed 退出不误删。
    - 新增离线自测 `scripts/download-storage-bins-test.sh` 并接入 `mise.toml` `workflow-check`。
 
-### 6.3 修正后的单代稳态估算与新一轮复查清单
+### 6.3 修正后的单代稳态估算（含 #310 / #311 口径更新）
 
-- 修正 `gomod`（~412 MiB）、`gobuild` 冷基线（X64 ~292 MiB + ARM64 ~176 MiB）、`storage-native`（~180 MiB）及移除 `pnpm-sdk-journeys-*` 后，#300 治理覆盖的日常 CI 增量单代预期：
+- 修正 `gomod`（~412 MiB）、`gobuild` 冷基线（X64 ~292 MiB + ARM64 ~176 MiB）、`storage-native`（~180 MiB）及移除 `pnpm-sdk-journeys-*` 后，结合三期 #310 与 #311 更新后的日常 CI 增量单代预期（详表见 §4）：
   - Go 侧：`gomod`（412 MiB）+ `gobuild-X64`（292 MiB）+ `gobuild-ARM64`（176 MiB）≈ **880 MiB**；
   - `storage-native` ≈ **180 MiB**（较 345.5 MiB 减少 ~165 MiB，降幅 ~48%）；
   - `pnpm-*` 4 组（`pnpm-web` X64/ARM64、`pnpm-sdk-node`、`pnpm-sdk-browser`）≈ **214 MiB**（消除 `pnpm-sdk-journeys` ~86 MiB × 多代）；
-  - `playwright-sdk-journeys`（按 `playwright-core` 精确版本，1 代）≈ **114 MiB**；
-  - 配合 #299 将 `mise-sdk-node-*` 3 格收敛至单格 ~50 MiB 后，日常 CI 单代总计约 **~2.0 GiB**，7 天多代滚动峰值可稳态控制在 **4–5 GB**（含 `release.yml` BuildKit 缓存仍远低于 10 GB 配额）。
+  - `playwright-sdk-journeys`（按 `playwright-core` 精确版本，1 代）≈ **113.4 MiB**；
+  - `#310` 新增 `mise-bin-*`（X64 `55.60 MiB` + ARM64 `55.88 MiB`，仅由 `go-cross` on `main` 保存、不设 `restore-keys`）≈ **111.5 MiB**；
+  - `#311` 将 `mise-sdk-node-*` 升级为 `mise-sdk-node-v2-*`（3 格单条回落至 ~45–60 MiB，合计 **~150 MiB**，脱离旧 556.08 MiB 膨胀条目）；
+  - `#311` 将 `release.yml` BuildKit GHA 缓存预算更正为 **0 GB**（移除 `cache-from`/`cache-to`，修正原“含 BuildKit 缓存仍远低于 10 GB”的误判）；`storage-all-*` 当前仍为 1 条旧键 `523.77 MiB`（因 Run `44944072291` `performance-gates` 的 `perf-ha` 门禁失败跳过保存，待 #309 后下次 `main` 成功运行刷新）。
+  - 修正后日常 CI 单代总计约 **~2.25 GiB（~2.42 GB，24 条）**，7 天多代滚动峰值约 **~4.9–5.2 GB**，叠加手动 `bench.yml` / `release.yml` snapshot 极端峰值约 **~5.7–6.0 GB**（远低于 10 GB 配额）。
+- 原二期复查清单已合并升级至 §7.3，统一按三期完成后的最终清单复核。
 
-#### 新一轮合入 7 天后复查清单
+## 7. 三期治理：移除 `release.yml` BuildKit GHA 缓存与 `mise-sdk-node-v2` 键升级（2026-11-21 / Issue #311）
 
-- [ ] 合入 `main` 满 7 天（并确认旧 `gobuild`/`pnpm-sdk-journeys`/`playwright-sdk-journeys`/`storage-native` 过期）后执行：
+### 7.1 实时水位与 LRU 淘汰实证（2026-11-21 20:05 UTC 后）
+
+二期（#300）合入后，连续两次在 `main` 上手动执行 `.github/workflows/release.yml`（`workflow_dispatch` snapshot）导致仓库缓存再次突破 10 GB 配额并触发实际 LRU 淘汰：
+
+- **总体水位**：`gh api repos/eimsound/lazy-observe/actions/cache/usage` 返回 `active_caches_size_in_bytes` = **`12,354,548,018` B（`12.35 GB` / `11.51 GiB`）**，超出 10 GB 配额 **+2.35 GB（+23.5%）**；`active_caches_count` = `125`（`actions/caches --paginate` 列出 **126** 条，100% 位于 `refs/heads/main`，1 条计数差为 GitHub API 最终一致性）。
+- **BuildKit 缓存（`buildkit-blob-*` + `index-container-*`）单次双架构演练净增 `+1.77 GiB`（`+1.90 GB`）**：
+  - 基线（§6.1，19:00 UTC，对应第 1 次 snapshot Run `44931530120` @ `5705f4e`）：**43 条**（41 个 blob + 2 个 index `#1`），**`1,960,926,532` B（`1,870.09 MiB` / `1.83 GiB`）**；
+  - 第 2 次 snapshot Run `44944072291`（2026-11-21 20:01:51Z，on `main` `f58eb5a`）净增：**+24 条**（+22 个 blob + 2 个 index `#2`），**`+1,899,316,480` B（`+1,811.33 MiB` / `+1.77 GiB` / `+1.90 GB`）**；
+  - 两次合计：**67 条**（63 `buildkit-blob-*` `3,860,195,881` B + 4 `index-container-*` `47,131` B）= **`3,860,243,012` B（`3,681.42 MiB` / `3.60 GiB` / `3.86 GB`）**，仅两次发版演练即占总用量的 **31.2%**、占整仓 10 GB 配额的 **38.6%**。
+- **与 19:00 UTC 快照精确守恒校验（实际发生 LRU 淘汰）**：
+  - 基线快照：`97` 条、`10,638,926,276` B；
+  - 新增（`+31` 条、`+2,277,215,788` B）：BuildKit Run 2（`+24` / `+1,899,316,480` B）、`uv-sdk-python`（`+5` / `+70,059,892` B）、`storage-native` 新干净键（`+1` / `+188,910,534` B，180.16 MiB）、`playwright-sdk-journeys` 精确版本键 `1.65.1`（`+1` / `+118,928,882` B，113.42 MiB）；
+  - 已被 LRU 淘汰（`-2` 条、`-561,594,046` B / `-535.58 MiB`）：`mise-base-Linux-ARM64` `4 → 3` 条（`-169,689,203` B / `-161.83 MiB`）、`gobuild-Linux-X64` `3 → 2` 条（`-391,904,843` B / `-373.75 MiB`）；
+  - 校验：`97 + 31 - 2 = 126` 条，`10,638,926,276 + 2,277,215,788 - 561,594,046 = 12,354,548,018` B。
+- **其余前缀现状补充确认**：
+  - `pnpm-sdk-journeys-*`：仍为 5 条 / `430.25 MiB`（`451,149,964` B），#300 合入后已停止新增，等待自然过期/淘汰；
+  - `storage-all-*`：仍为 1 条旧键（`523.77 MiB` / `549,214,645` B），原因是 Run `44944072291` 中 `performance-gates`（Job `136967388205`）的 `perf-ha` 门禁在弱扩展效率上失败（`2/4` 轮通过 `0.680`），导致末尾 `Save cross-platform storage archives` 步骤被跳过，非缓存机制故障（#309 修复后待下次成功运行刷新）；
+  - `mise-sdk-node-*`（共 6 条 / `1,111.19 MiB` / `1.09 GiB`）：#299 合入修复了裸 `mise exec --` 触发无关工具安装的问题，但未升级 key，导致 3 条 `pnpm-12.21.0` 膨胀旧缓存（`556.08 MiB`：199.64 / 200.82 / 155.62 MiB）在 Run `44943060889` 及后续 PR 中持续精确命中并刷新 `last_accessed_at`，无法自动淘汰（虚占 ~406 MiB）；
+  - `mise-bin-*`（#310 新增，Run `2150509` 合入后实测）：`mise-bin-Linux-X64`（`58,300,925` B / `55.60 MiB`）+ `mise-bin-Linux-ARM64`（`58,593,871` B / `55.88 MiB`），合计 `116,894,796` B（**~111.5 MiB**），由 `go-cross` on `main` 唯一写入。
+
+### 7.2 根因与治理改动（Issue #311）
+
+1. **三层叠加根因**：
+   - `Dockerfile` 将易变 `ARG VERSION / COMMIT / DATE` 声明在 `builder` 阶段顶部（`release.yml` 每次传入秒级 `DATE` 与 `COMMIT`），每次运行 100% 击穿 `apt-get`、`curl mise`、`mise install` 等前置层；
+   - BuildKit `type=gha,mode=max` 按内容寻址追加写入 `buildkit-blob-*` 从不覆盖旧条目，且不缓存 `RUN --mount=type=cache`（`/root/go/pkg/mod`、`/root/.cache/go-build`）；
+   - 实测耗时倒挂：开启 `mode=max` 时 `#26 exporting to GitHub Actions Cache` 耗 **78.1s（amd64）/ 93.6s（arm64）**（构建步合计 209s / 189s），而关闭 GHA 缓存的 `ci.yml` `artifact-smoke` 原生冷构仅 **90s**（Job 总耗时 1m49s / 1m47s），且 `container-check` 与约 15 分钟的 `performance-gates` 并行，不在关键路径。
+2. **落地改动**：
+   - `.github/workflows/release.yml`：`container-check` 移除 `cache-from` 与 `cache-to`，与 `ci.yml` `artifact-smoke` 对齐（BuildKit GHA 缓存增量归 **0 B**）；
+   - `Dockerfile`：将 `ARG VERSION=dev`、`ARG COMMIT=none`、`ARG DATE=unknown` 下移至 `COPY . .` 之后、`RUN ... mise run --skip-tools dist` 之前，保留本地重复构建的前置层缓存；
+   - `.github/workflows/ci.yml`：`sdk-node` 与 `sdk-browser` 同步将缓存键升级为 `mise-sdk-node-v2-${{ matrix.node }}-pnpm-${{ steps.cache-keys.outputs.pnpm-toolchain }}-${{ runner.os }}-${{ runner.arch }}`，在 `main` 触发干净冷重建（~150 MiB）并停止刷新旧 `mise-sdk-node-*` 膨胀条目；
+   - `scripts/check-github-workflows.sh`：新增 `buildkit_gha_cache_to` 静态校验与自测夹具，禁止 `.github/workflows/*.yml` 中出现 BuildKit `cache-to` 指向 `type=gha`（覆盖 `cache-to:` YAML 输入与 `--cache-to` CLI 参数）。
+
+### 7.3 更新后的 7 天复查清单
+
+- [ ] 合入 `main` 满 7 天（并确认旧 `buildkit-blob-*`/`index-container-*`、`mise-sdk-node-*`、`gobuild-*`、`pnpm-sdk-journeys-*` 过期）后执行：
   ```bash
   gh api repos/eimsound/lazy-observe/actions/cache/usage
   gh api repos/eimsound/lazy-observe/actions/caches --paginate --jq '.actions_caches[] | "\(.ref)\t\(.size_in_bytes)\t\(.key)"' | sort
   ```
 - [ ] 核查要点：
-  1. `gobuild-Linux-X64-*` 单条稳定在 **~290–310 MiB**（ARM64 **~176–190 MiB**），`go.mod` 升级后新条不再在旧条体积上单调叠加。
-  2. `pnpm-sdk-journeys-*` 彻底归零；`playwright-sdk-journeys-Linux-X64-<ver>` 仅按 `playwright-core` 版本存在单条（~114 MiB）。
-  3. `storage-native-Linux-X64-*` 单条回落至 **~180 MiB**；如运行过 `bench.yml` / `release.yml` 升级，旧归档也同步从 `storage-all-*` 清理。
-  4. 仓库 `active_caches_size_in_bytes` 稳定低于 10 GB 且无意外 LRU 淘汰 `embedded-pg-*`、`storage-native-*`。
+  1. `buildkit-blob-*` 与 `index-container-*` 彻底归零；合入后在 `main` 执行 `release.yml` `workflow_dispatch` snapshot 演练时，`container-check` 不新增任何 BuildKit Actions 缓存条目，单格构建耗时维持在 ~2 分钟内。
+  2. `mise-sdk-node-v2-*-pnpm-*-Linux-X64` 共 3 条（Node 22/24/26），单条回落至 **~45–60 MiB**（合计 ~150 MiB），旧膨胀 `mise-sdk-node-*` 过期归零。
+  3. `mise-bin-Linux-{X64,ARM64}-*` 共 2 条（合计 **~111.5 MiB**）。
+  4. `gobuild-Linux-X64-*` 单条稳定在 **~290–310 MiB**（ARM64 **~176–190 MiB**），`go.mod` 升级后新条不再在旧条体积上单调叠加。
+  5. `pnpm-sdk-journeys-*` 彻底归零；`playwright-sdk-journeys-Linux-X64-<ver>` 仅按 `playwright-core` 版本存在单条（~113.4 MiB）。
+  6. `storage-native-Linux-X64-*` 单条回落至 **~180 MiB**；`storage-all-*` 在 `performance-gates`（`bench.yml` / `release.yml`）下次于 `main` 成功运行后刷新，同步清理历史归档。
+  7. 仓库 `active_caches_size_in_bytes` 稳定低于 **10 GB**（预期日常峰值 ~5.15 GB，含发版演练 ~5.7–6.0 GB），且无意外 LRU 淘汰 `embedded-pg-*`、`storage-native-*`、`mise-base-*`、`gobuild-*`。

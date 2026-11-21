@@ -529,6 +529,465 @@ if [[ -n $unpinned_buildkit ]]; then
   fail 'docker/setup-buildx-action must set driver-opts: image=moby/buildkit:vX.Y.Z@sha256:<index digest>'
 fi
 
+# 禁止在 workflow 中使用 BuildKit cache-to 写入 GitHub Actions 缓存（type=gha）：
+# buildkit-blob-* 按内容寻址只增不减、不覆盖旧条目，且 type=gha 不缓存 RUN --mount=type=cache，
+# 两次 release snapshot 即可消耗近 4 GB（挤爆 10 GB 配额并触发 LRU 淘汰），反而因导出耗时拖慢构建。
+buildkit_gha_cache_to() {
+  awk '
+    function indent(s) { return match(s, /^ */) ? RLENGTH : 0 }
+    function ltrim(s) { sub(/^[[:space:]]+/, "", s); return s }
+    function rtrim(s) { sub(/[[:space:]]+$/, "", s); return s }
+    function has_type_gha(s) {
+      return (s ~ /(^|[^A-Za-z0-9_-])type=gha($|[^A-Za-z0-9_-])/)
+    }
+    function ends_with_backslash(s,    i, cnt) {
+      cnt = 0
+      for (i = length(s); i >= 1 && substr(s, i, 1) == "\\"; i--) cnt++
+      return (cnt % 2) == 1
+    }
+    function strip_yaml_comment(s,    i, n, c, q, out) {
+      q = ""
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (q != "") {
+          out = out c
+          if (q == "\"" && c == "\\" && i < n) {
+            i++
+            out = out substr(s, i, 1)
+          } else if (q == "'"'"'" && c == "'"'"'" && i < n && substr(s, i + 1, 1) == "'"'"'") {
+            i++
+            out = out "'"'"'"
+          } else if (c == q) {
+            q = ""
+          }
+        } else if (c == "\"" || c == "'"'"'") {
+          q = c
+          out = out c
+        } else if (c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[[:space:]]/)) {
+          break
+        } else {
+          out = out c
+        }
+      }
+      return rtrim(out)
+    }
+    function unquote_yaml(s,    body) {
+      s = ltrim(s)
+      if (substr(s, 1, 1) == "'"'"'" && match(s, /^'"'"'([^'"'"']|'"'"''"'"')*'"'"'([[:space:]]*(#.*)?)?$/)) {
+        body = substr(s, 2)
+        sub(/'"'"'([[:space:]]*(#.*)?)?$/, "", body)
+        gsub(/'"'"''"'"'/, "'"'"'", body)
+        return body
+      }
+      if (substr(s, 1, 1) == "\"" && match(s, /^"([^"\\]|\\.)*"([[:space:]]*(#.*)?)?$/)) {
+        body = substr(s, 2)
+        sub(/"([[:space:]]*(#.*)?)?$/, "", body)
+        gsub(/\\"/, "\"", body)
+        gsub(/\\\\/, "\\", body)
+        return body
+      }
+      return s
+    }
+    function push_tok(t) {
+      if (has_tok) {
+        toks[++ntoks] = t
+        word = ""
+        has_tok = 0
+      }
+    }
+    function push_sep() {
+      push_tok(word)
+      if (ntoks == 0 || toks[ntoks] != "\n") {
+        toks[++ntoks] = "\n"
+      }
+    }
+    function tokenize(line,    n, i, c, c2, sp, stk, st) {
+      ntoks = 0
+      word = ""
+      has_tok = 0
+      sp = 1
+      stk[1] = "CODE"
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        st = stk[sp]
+        if (st == "SQ") {
+          if (c == "'"'"'") {
+            sp--
+          } else {
+            word = word c
+          }
+          has_tok = 1
+          continue
+        }
+        if (st == "DQ") {
+          if (c == "\"") {
+            sp--
+            has_tok = 1
+          } else if (c == "\\") {
+            if (i + 1 <= n) {
+              c2 = substr(line, i + 1, 1)
+              if (c2 == "$" || c2 == "`" || c2 == "\"" || c2 == "\\") {
+                word = word c2
+                i++
+              } else {
+                word = word c
+              }
+            } else {
+              word = word c
+            }
+            has_tok = 1
+          } else if (c == "$" && i + 1 <= n && substr(line, i + 1, 1) == "(") {
+            push_sep()
+            stk[++sp] = "SUB"
+            i++
+          } else if (c == "`") {
+            push_sep()
+          } else {
+            word = word c
+            has_tok = 1
+          }
+          continue
+        }
+        if (c == " " || c == "\t" || c == "\r" || c == "\n") {
+          push_tok(word)
+        } else if (c == "#" && !has_tok) {
+          break
+        } else if (c == "'"'"'") {
+          stk[++sp] = "SQ"
+          has_tok = 1
+        } else if (c == "\"") {
+          stk[++sp] = "DQ"
+          has_tok = 1
+        } else if (c == "\\") {
+          if (i + 1 <= n) {
+            word = word substr(line, i + 1, 1)
+            i++
+          } else {
+            word = word c
+          }
+          has_tok = 1
+        } else if (c == "$" && i + 1 <= n && substr(line, i + 1, 1) == "(") {
+          push_sep()
+          stk[++sp] = "SUB"
+          i++
+        } else if (c == "`") {
+          push_sep()
+        } else if (c == "(") {
+          push_sep()
+          stk[++sp] = "PAREN"
+        } else if (c == ")") {
+          push_sep()
+          if (sp > 1 && (stk[sp] == "SUB" || stk[sp] == "PAREN")) sp--
+        } else if (c == ";" || c == "|" || c == "&") {
+          if (i + 1 <= n) {
+            c2 = substr(line, i + 1, 1)
+            if ((c == "&" && c2 == "&") || (c == "|" && (c2 == "|" || c2 == "&")) || (c == ";" && c2 == ";")) i++
+          }
+          push_sep()
+        } else {
+          word = word c
+          has_tok = 1
+        }
+      }
+      push_tok(word)
+    }
+    function extract_flow_cache_to(s,    clean, i, j, n, c, q, brace, expr, nested, val_start, val) {
+      clean = strip_yaml_comment(s)
+      n = length(clean)
+      q = ""
+      brace = 0
+      expr = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(clean, i, 1)
+        if (q != "") {
+          if (q == "\"" && c == "\\" && i < n) {
+            i++
+          } else if (q == "'"'"'" && c == "'"'"'" && i < n && substr(clean, i + 1, 1) == "'"'"'") {
+            i++
+          } else if (c == q) {
+            q = ""
+          }
+          continue
+        }
+        if (c == "\"" || c == "'"'"'") {
+          q = c
+          continue
+        }
+        if (c == "$" && i + 1 < n && substr(clean, i + 1, 2) == "{{") {
+          expr++
+          i += 2
+          continue
+        }
+        if (expr > 0) {
+          if (c == "}" && i < n && substr(clean, i + 1, 1) == "}") {
+            expr--
+            i++
+          }
+          continue
+        }
+        if (c == "{") {
+          brace++
+          continue
+        }
+        if (c == "}") {
+          if (brace > 0) brace--
+          continue
+        }
+        if (brace > 0 && substr(clean, i) ~ /^["'"'"']?cache-to["'"'"']?[[:space:]]*:/) {
+          if (i == 1 || substr(clean, i - 1, 1) ~ /[{,[:space:]]/) {
+            match(substr(clean, i), /^["'"'"']?cache-to["'"'"']?[[:space:]]*:/)
+            val_start = i + RLENGTH
+            val = ""
+            q = ""
+            expr = 0
+            nested = 0
+            for (j = val_start; j <= n; j++) {
+              c = substr(clean, j, 1)
+              if (q != "") {
+                val = val c
+                if (q == "\"" && c == "\\" && j < n) {
+                  j++
+                  val = val substr(clean, j, 1)
+                } else if (q == "'"'"'" && c == "'"'"'" && j < n && substr(clean, j + 1, 1) == "'"'"'") {
+                  j++
+                  val = val "'"'"'"
+                } else if (c == q) {
+                  q = ""
+                }
+                continue
+              }
+              if (c == "\"" || c == "'"'"'") {
+                q = c
+                val = val c
+                continue
+              }
+              if (c == "$" && j + 1 < n && substr(clean, j + 1, 2) == "{{") {
+                expr++
+                val = val "${{"
+                j += 2
+                continue
+              }
+              if (expr > 0) {
+                val = val c
+                if (c == "}" && j < n && substr(clean, j + 1, 1) == "}") {
+                  val = val "}"
+                  expr--
+                  j++
+                }
+                continue
+              }
+              if (c == "{") {
+                nested++
+              } else if (c == "}") {
+                if (nested == 0) break
+                nested--
+              } else if (c == "," && nested == 0) {
+                break
+              }
+              val = val c
+            }
+            if (has_type_gha(val)) return 1
+            i = j
+          }
+        }
+      }
+      return 0
+    }
+    function check_logical_cli(file, lineno, raw,    i, t) {
+      tokenize(raw)
+      for (i = 1; i <= ntoks; i++) {
+        t = toks[i]
+        if (t == "\n") continue
+        if (t ~ /^--cache-to=/) {
+          if (has_type_gha(substr(t, 12))) {
+            printf "%s:%d: %s\n", file, lineno, ltrim(raw)
+            return
+          }
+        } else if (t == "--cache-to" && i + 1 <= ntoks && toks[i + 1] != "\n") {
+          if (has_type_gha(toks[i + 1])) {
+            printf "%s:%d: %s\n", file, lineno, ltrim(raw)
+            return
+          }
+        }
+      }
+    }
+    function flush_logical() {
+      if (logical != "") {
+        check_logical_cli(start_file, start_nr, logical)
+        logical = ""
+      }
+    }
+    function feed_line(file, nr, line) {
+      if (logical == "") {
+        if (line ~ /^[[:space:]]*(#.*)?$/) return
+        start_file = file
+        start_nr = nr
+      }
+      if (ends_with_backslash(line)) {
+        sub(/\\$/, "", line)
+        logical = (logical == "" ? line : logical " " line)
+        return
+      }
+      logical = (logical == "" ? line : logical " " line)
+      flush_logical()
+    }
+    FNR == 1 && NR > 1 {
+      flush_logical()
+      in_run_block = 0
+      in_yaml_block = 0
+      in_cache_to_cont = 0
+    }
+    in_run_block {
+      if ($0 ~ /^[[:space:]]*$/ || indent($0) > run_base) {
+        feed_line(FILENAME, FNR, $0)
+        next
+      }
+      flush_logical()
+      in_run_block = 0
+    }
+    in_yaml_block {
+      if ($0 ~ /^[[:space:]]*$/ || indent($0) > yaml_base) {
+        if ($0 !~ /^[[:space:]]*#/) {
+          val = strip_yaml_comment($0)
+          if (has_type_gha(val)) {
+            printf "%s:%d: %s\n", FILENAME, FNR, ltrim($0)
+          }
+        }
+        next
+      }
+      in_yaml_block = 0
+    }
+    in_cache_to_cont {
+      if ($0 ~ /^[[:space:]]*$/ || indent($0) > cont_base || (indent($0) == cont_base && $0 ~ /^[[:space:]]*-[[:space:]]/)) {
+        if ($0 !~ /^[[:space:]]*#/) {
+          val = strip_yaml_comment($0)
+          if (has_type_gha(val)) {
+            printf "%s:%d: %s\n", FILENAME, FNR, ltrim($0)
+          }
+        }
+        next
+      }
+      in_cache_to_cont = 0
+    }
+    /^[[:space:]]*#/ { next }
+    match($0, /^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*/) {
+      rest = substr($0, RSTART + RLENGTH)
+      if (rest ~ /^[|>][-+]?[0-9]*([[:space:]]+#.*)?[[:space:]]*$/) {
+        in_run_block = 1
+        match($0, /run:/)
+        run_base = RSTART - 1
+        next
+      }
+      if (rest != "" && rest !~ /^[[:space:]]*#/) {
+        feed_line(FILENAME, FNR, unquote_yaml(rest))
+        flush_logical()
+      }
+      next
+    }
+    match($0, /^[[:space:]]*(-[[:space:]]+)?["'"'"']?cache-to["'"'"']?[[:space:]]*:/) {
+      rest = strip_yaml_comment(substr($0, RSTART + RLENGTH))
+      sub(/^[[:space:]]+/, "", rest)
+      match($0, /["'"'"']?cache-to["'"'"']?[[:space:]]*:/)
+      key_indent = RSTART - 1
+      if (rest ~ /^[|>][-+]?[0-9]*$/) {
+        in_yaml_block = 1
+        yaml_base = key_indent
+        next
+      }
+      if (rest == "") {
+        in_cache_to_cont = 1
+        cont_base = key_indent
+        next
+      }
+      if (has_type_gha(rest)) {
+        printf "%s:%d: %s\n", FILENAME, FNR, ltrim($0)
+      }
+      next
+    }
+    /^[[:space:]]*(-[[:space:]]+)?(["'"'"']?[A-Za-z0-9_-]+["'"'"']?[[:space:]]*:[[:space:]]*)?\{/ {
+      if (extract_flow_cache_to($0)) {
+        printf "%s:%d: %s\n", FILENAME, FNR, ltrim($0)
+      }
+    }
+    END { flush_logical() }
+  ' "$@"
+}
+
+buildkit_gha_fixture=$(mktemp -d)
+cat >"$buildkit_gha_fixture/bad.yml" <<'EOF'
+jobs:
+  x:
+    steps:
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          cache-to: type=gha,mode=max,scope=container-amd64
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=container-{0}', matrix.arch) || '' }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          cache-to: |
+            type=local,dest=/tmp/cache
+            type=gha,mode=min
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          cache-to:
+            - type=gha,mode=max
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with: { cache-to: "type=gha,mode=max", load: false }
+      - run: docker buildx build --cache-to=type=gha,mode=max .
+      - run: docker buildx build --cache-to "type=gha,mode=max" .
+      - run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --cache-to \
+              type=gha,mode=max \
+            .
+EOF
+cat >"$buildkit_gha_fixture/good.yml" <<'EOF'
+jobs:
+  x:
+    steps:
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          cache-from: type=gha,scope=container-amd64
+          cache-to: type=registry,ref=ghcr.io/eimsound/lazy-observe:buildcache,mode=max
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          cache-to: |
+            type=local,dest=/tmp/cache
+            # type=gha
+      # cache-to: type=gha,mode=max
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          cache-to: type=local,dest=/tmp/cache # not type=gha
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with: { cache-to: type=local, cache-from: type=gha }
+      - run: docker buildx build --cache-to type=local,dest=/tmp/cache --cache-from type=gha .
+      # - run: docker buildx build --cache-to type=gha,mode=max .
+      - run: |
+          # docker buildx build --cache-to type=gha,mode=max .
+          echo ok # --cache-to type=gha
+      - name: Reject cache-to: type=gha and --cache-to type=gha in step name
+        run: echo ok
+EOF
+buildkit_gha_bad=$(buildkit_gha_cache_to "$buildkit_gha_fixture/bad.yml")
+buildkit_gha_good=$(buildkit_gha_cache_to "$buildkit_gha_fixture/good.yml")
+rm -rf "$buildkit_gha_fixture"
+buildkit_gha_bad_count=$(grep -c . <<<"$buildkit_gha_bad" || true)
+[[ $buildkit_gha_bad_count -eq 8 ]] ||
+  fail "buildkit GHA cache-to self-test: expected 8 rejected entries, got $buildkit_gha_bad_count: $buildkit_gha_bad"
+[[ -z $buildkit_gha_good ]] ||
+  fail "buildkit GHA cache-to self-test: valid entries were rejected: $buildkit_gha_good"
+buildkit_gha=$(buildkit_gha_cache_to "${workflows[@]}")
+if [[ -n $buildkit_gha ]]; then
+  printf '%s\n' "$buildkit_gha" >&2
+  fail 'workflows must not export BuildKit cache-to with type=gha (blows past the 10 GB Actions cache quota)'
+fi
+
 # 按 job 名截取 workflow 里的 job 块（$1 文件，$2 job 名）。下面的断言必须按 job 定位：
 # 否则「docker job 里写了 contents: write」这种检查会因为别的 job 满足而误判通过。
 release_job() {
