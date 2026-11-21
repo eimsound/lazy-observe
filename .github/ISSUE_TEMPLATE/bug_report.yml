@@ -1,18 +1,19 @@
 name: Bug report
-about: Report reproducible incorrect behavior
+description: Report reproducible incorrect behavior
 title: "[Bug]: "
 labels:
   - bug
+  - needs-triage
 body:
   - type: markdown
     attributes:
-      value: Thanks for reporting a bug. Remove secrets, ingest tokens, passwords, and private telemetry from all output.
+      value: Thanks for reporting a bug. Do not report unpatched security vulnerabilities in public issues (use GitHub Private Vulnerability Reporting; see SECURITY.md). Remove secrets, API tokens, passwords, secret.key, and private telemetry from all output.
   - type: input
     id: version
     attributes:
       label: Version
-      description: Milestone tag, commit SHA, or build identifier.
-      placeholder: m5 / b1c891e / dev
+      description: Release tag, commit SHA, container digest, or build identifier (`lazy-observe --version`).
+      placeholder: v0.1.0 / 514ce5c / dev
     validations:
       required: true
   - type: dropdown
@@ -22,6 +23,8 @@ body:
       options:
         - Zero-config release binary (All-in-One)
         - All-in-One with custom configuration
+        - Docker Compose (All-in-One / Standalone)
+        - Linux systemd service
         - Standalone with external services
         - Kubernetes/Helm all-in-one
         - Kubernetes/Helm standalone-ha
@@ -33,8 +36,8 @@ body:
     id: platform
     attributes:
       label: Platform
-      description: OS, architecture, Go/Node version when relevant.
-      placeholder: Linux arm64, Go 1.26.5
+      description: OS, architecture, and Go/Node/Python version when relevant.
+      placeholder: Linux arm64, Go 1.27.4 / Node 26.13.1 / Python 3.13
     validations:
       required: true
   - type: textarea
