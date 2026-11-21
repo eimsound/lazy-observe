@@ -38,6 +38,7 @@ test("parseMetricsSearch preserves both evidence deep-link fields and indexed gN
 test("multi-panel metrics state round-trips through TanStack Router URLs without window.location.search", () => {
   const nowMs = Date.UTC(2026, 10, 21, 10, 0, 0);
   const p0 = newMetricsPanel("query-1", 'rate(http_requests_total{job="api"}[5m])');
+  p0.editorMode = "builder";
   p0.activeTab = "graph";
   p0.range = { mode: "relative", presetId: "6h", seconds: 6 * 3600 };
   p0.resolution = { type: "fixed", step: 30 };
@@ -59,6 +60,7 @@ test("multi-panel metrics state round-trips through TanStack Router URLs without
 
   assert.equal(hydrated.panels.length, 2);
   assert.equal(hydrated.panels[0].query, p0.query);
+  assert.equal(hydrated.panels[0].editorMode, "builder");
   assert.equal(hydrated.panels[0].activeTab, "graph");
   assert.deepEqual(hydrated.panels[0].range, { mode: "relative", presetId: "6h", seconds: 21600 });
   assert.deepEqual(hydrated.panels[0].resolution, { type: "fixed", step: 30 });

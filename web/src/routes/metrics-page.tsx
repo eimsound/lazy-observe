@@ -3,6 +3,7 @@ import { useSearch } from "@tanstack/react-router";
 import {
   AlertCircle,
   BarChart3,
+  Code2,
   Copy,
   Database,
   History,
@@ -13,6 +14,7 @@ import {
   Plus,
   Search,
   Settings2,
+  SlidersHorizontal,
   Table2,
   Trash2,
   WandSparkles,
@@ -55,6 +57,7 @@ import { TimeSeriesChart } from "@/components/charts/time-series-chart";
 import { MetricsExplorer } from "@/components/metrics/metrics-explorer";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { PrometheusQueryControls } from "@/components/metrics/prometheus-query-controls";
+import { PromQLBuilder } from "@/components/metrics/promql-builder";
 import { PromQLEditor, type PromQLEditorHandle } from "@/components/metrics/promql-editor";
 import { MetricsTimeRangePicker } from "@/components/metrics/metrics-time-range-picker";
 import { Badge } from "@/components/ui/badge";
@@ -131,8 +134,13 @@ export function MetricsPage() {
     setHistory(getMetricsHistory(project));
     if (previousProject.current !== project) {
       previousProject.current = project;
+      setPanels([newMetricsPanel("query-1")]);
+      setExecuted({});
       setPrettifying({});
       setEditorErrors({});
+      nextPanelId.current = 2;
+      nextRunId.current = 1;
+      lastDeepLinkKey.current = null;
     }
   }, [project]);
 
@@ -398,6 +406,52 @@ function QueryCard({
   return (
     <Card className="overflow-visible">
       <CardContent className="flex flex-col gap-4 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div
+            className="inline-flex h-8 rounded-md border border-input bg-background p-0.5"
+            role="group"
+            aria-label={t("metrics.queryLabel")}
+          >
+            <Button
+              type="button"
+              variant={panel.editorMode === "builder" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-full gap-1.5 px-2.5 text-xs"
+              aria-pressed={panel.editorMode === "builder"}
+              onClick={() => onChange({ editorMode: "builder" })}
+            >
+              <SlidersHorizontal className="size-3.5" />
+              {t("metrics.modeBuilder")}
+            </Button>
+            <Button
+              type="button"
+              variant={panel.editorMode === "code" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-full gap-1.5 px-2.5 text-xs"
+              aria-pressed={panel.editorMode === "code"}
+              onClick={() => onChange({ editorMode: "code" })}
+            >
+              <Code2 className="size-3.5" />
+              {t("metrics.modeCode")}
+            </Button>
+          </div>
+          {panel.editorMode === "builder" && (
+            <span className="text-xs text-muted-foreground">
+              {t("metrics.builder.liveSyncHint")}
+            </span>
+          )}
+        </div>
+
+        {panel.editorMode === "builder" && (
+          <PromQLBuilder
+            project={project}
+            query={panel.query}
+            range={autocompleteRange}
+            onQueryChange={(query) => onChange({ query })}
+            onSwitchToCode={() => onChange({ editorMode: "code" })}
+          />
+        )}
+
         <div className="flex items-start gap-2">
           <PromQLEditor
             ref={editorRef}

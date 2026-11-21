@@ -324,8 +324,12 @@ export interface PromQLContext {
   matchers: string[];
 }
 
+const EXPRESSION_TAIL_BOUNDARY =
+  /(?<![\w.:/-])(?:fill|group_left|group_right)\s*\([^)]*\)\s*|\s(?:or|and|unless|default|ifnot|if|group_left|group_right|fill)\s|}|\+|-|\*|\/|\^/i;
+const TRAILING_MODIFIER_CALL = /(?<![\w.:/-])(?:fill|group_left|group_right)\s*\([^)]*\)\s+$/i;
+
 function expressionTail(beforeCursor: string): string {
-  const parts = beforeCursor.split(/\s(?:or|and|unless|default|ifnot|if|group_left|group_right)\s|}|\+|-|\*|\/|\^/i);
+  const parts = beforeCursor.split(EXPRESSION_TAIL_BOUNDARY);
   return parts.at(-1)?.trim() ?? "";
 }
 
@@ -359,7 +363,7 @@ export function analyzePromQLContext(query: string, cursor: number): PromQLConte
       matchers: labelMatches.map((match) => match[0]),
     };
   }
-  const closed = /[})"'`]\s*$/.test(before);
+  const closed = /[})"'`]\s*$/.test(before) && !TRAILING_MODIFIER_CALL.test(before);
   return {
     kind: closed ? "none" : "metric",
     token,
@@ -390,7 +394,7 @@ export function insertPromQLSuggestion(
   return { query: next, cursor: context.tokenStart + insert.length + suffix.length };
 }
 
-// Generated from the h4 headings in vmui v1.147.0's bundled MetricsQL.md.
+// Generated from the h4 headings in vmui v1.156.0's bundled MetricsQL.md.
 export const METRICSQL_FUNCTIONS = `
 abs absent absent_over_time acos acosh aggr_over_time alias any ascent_over_time asin asinh atan atanh avg avg_over_time
 bitmap_and bitmap_or bitmap_xor bottomk bottomk_avg bottomk_last bottomk_max bottomk_median bottomk_min buckets_limit

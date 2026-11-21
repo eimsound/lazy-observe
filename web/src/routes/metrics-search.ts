@@ -23,9 +23,12 @@ const DUMMY_ORIGIN = "https://lazy-observe.invalid";
 export const DEFAULT_METRICS_RANGE =
   METRICS_RANGE_PRESETS.find((item) => item.presetId === "1h") ?? METRICS_RANGE_PRESETS[0];
 
+export type MetricsEditorMode = "code" | "builder";
+
 export interface MetricsPanelState {
   id: string;
   query: string;
+  editorMode: MetricsEditorMode;
   activeTab: MetricsQueryTab;
   range: MetricsRange;
   resolution: MetricsResolution;
@@ -54,12 +57,13 @@ export interface InitialMetricsState {
  */
 export type MetricsRouteSearch = MetricsEvidenceSearch & Record<string, unknown>;
 
-const PANEL_KEY_PATTERN = /^g(\d+)\.(expr|tab|range_input|end_input|res_type|res_density|res_step|display_mode|table_mode|time_format|y_axis_min)$/;
+const PANEL_KEY_PATTERN = /^g(\d+)\.(expr|mode|tab|range_input|end_input|res_type|res_density|res_step|display_mode|table_mode|time_format|y_axis_min)$/;
 
 export function newMetricsPanel(id: string, query = ""): MetricsPanelState {
   return {
     id,
     query,
+    editorMode: "code",
     activeTab: "table",
     range: DEFAULT_METRICS_RANGE,
     resolution: { type: "auto", density: "medium" },
@@ -103,6 +107,8 @@ export function parseMetricsStateFromLocation(
   const executed: Record<string, ExecutedMetricsQuery> = {};
   for (const index of indices) {
     const panel = newMetricsPanel(`query-${panels.length + 1}`, params.get(`g${index}.expr`) ?? "");
+    const mode = params.get(`g${index}.mode`);
+    if (mode === "builder" || mode === "code") panel.editorMode = mode;
     const tab = params.get(`g${index}.tab`);
     if (tab === "graph" || tab === "table") panel.activeTab = tab;
     const rangeSeconds = parsePrometheusDuration(params.get(`g${index}.range_input`) ?? "");
@@ -178,6 +184,7 @@ export function buildMetricsPanelsURL(
     const rangeSeconds = metricsRangeSeconds(panel.range);
     const defaultRange = panel.range.mode === "relative" && rangeSeconds === DEFAULT_METRICS_RANGE.seconds;
     setOptional(prefix + "expr", panel.query.trim() ? panel.query : undefined);
+    setOptional(prefix + "mode", panel.editorMode === "code" ? undefined : panel.editorMode);
     setOptional(prefix + "tab", panel.activeTab === "table" ? undefined : panel.activeTab);
     setOptional(
       prefix + "range_input",
