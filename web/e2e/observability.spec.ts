@@ -27,6 +27,38 @@ test("指标：执行 PromQL 并在图表与表格间切换", async ({ page }) =
   await expect(page.getByRole("columnheader", { name: "值" })).toBeVisible();
 });
 
+test("指标：可视化构建器与 CodeMirror 双向同步并保护复杂表达式", async ({ page }) => {
+  await openFeature(page, "/metrics");
+
+  await page.getByRole("button", { name: "构建器" }).click();
+  await page.getByRole("button", { name: "展开指标候选" }).click();
+  await page.getByRole("option", { name: "http.server.request.duration_count" }).click();
+
+  const editor = page.getByLabel("PromQL 表达式");
+  await expect(editor).toContainText("http.server.request.duration_count");
+
+  await page.getByRole("button", { name: "添加筛选" }).click();
+  await page.getByRole("button", { name: "展开标签名…候选" }).click();
+  await page.getByRole("option", { name: "http.request.method" }).click();
+  await page.getByRole("button", { name: "展开标签值…候选" }).click();
+  await page.getByRole("option", { name: "GET" }).click();
+  await expect(editor).toContainText(
+    'http.server.request.duration_count{http.request.method="GET"}',
+  );
+
+  await page.getByRole("button", { name: "执行查询" }).click();
+  await expect(page.getByText(/加载耗时：\d+ ms\u3000结果序列：\d+/)).toBeVisible();
+
+  await editor.click();
+  await editor.press("Control+A");
+  await editor.pressSequentially("rate(a[5m]) / rate(b[5m])");
+  await expect(page.getByText("复杂表达式请使用代码模式编辑")).toBeVisible();
+  await expect(editor).toContainText("rate(a[5m]) / rate(b[5m])");
+
+  await page.getByRole("button", { name: "切换到代码模式" }).click();
+  await expect(editor).toContainText("rate(a[5m]) / rate(b[5m])");
+});
+
 test("日志：执行 LogsQL、展示结果并打开详情", async ({ page }) => {
   await openFeature(page, "/logs?q=*&run=1&view=table");
 
