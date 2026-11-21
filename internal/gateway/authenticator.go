@@ -132,6 +132,16 @@ func (a *Authenticator) UploadMiddleware(c fiber.Ctx) error {
 	return a.authenticateRequest(c, cred.token)
 }
 
+// AuthenticateProjectToken resolves a project API token through the shared
+// cache and singleflight lookup. Callers must enforce credential-kind rules
+// before invoking it.
+func (a *Authenticator) AuthenticateProjectToken(ctx context.Context, token string) (meta.ProjectInfo, error) {
+	if token == "" || !a.configured {
+		return meta.ProjectInfo{}, meta.ErrInvalidProjectAPIToken
+	}
+	return a.authenticate(ctx, token)
+}
+
 func (a *Authenticator) authenticateRequest(c fiber.Ctx, token string) error {
 	if token == "" || !a.configured {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})

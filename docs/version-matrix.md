@@ -35,9 +35,12 @@
 
 | 协议面 | 端点 | 说明 |
 | --- | --- | --- |
-| OTLP / metrics | `POST /v1/metrics` | OpenTelemetry 协议，标准 OTLP/HTTP 载荷 |
-| OTLP / logs | `POST /v1/logs` | 由网关转发至 VictoriaLogs `insert/opentelemetry/v1/logs` |
-| OTLP / traces | `POST /v1/traces` | 由网关转发至 VictoriaTraces `insert/opentelemetry/v1/traces` |
+| OTLP / metrics (HTTP) | `POST /v1/metrics` | OpenTelemetry 协议，标准 OTLP/HTTP 载荷 |
+| OTLP / logs (HTTP) | `POST /v1/logs` | 由网关转发至 VictoriaLogs `insert/opentelemetry/v1/logs` |
+| OTLP / traces (HTTP) | `POST /v1/traces` | 由网关转发至 VictoriaTraces `insert/opentelemetry/v1/traces` |
+| OTLP / traces (gRPC) | `opentelemetry.proto.collector.trace.v1.TraceService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`，通过 `otlp_grpc.enabled` 启用，支持 gzip 与原生 TLS），转发至 VictoriaTraces `insert/opentelemetry/v1/traces` |
+| OTLP / metrics (gRPC) | `opentelemetry.proto.collector.metrics.v1.MetricsService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`），转发至 VictoriaMetrics `opentelemetry/v1/metrics` 并注入受信任 `extra_label=project_id=<slug>` |
+| OTLP / logs (gRPC) | `opentelemetry.proto.collector.logs.v1.LogsService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`），转发至 VictoriaLogs `insert/opentelemetry/v1/logs` |
 | 私有 ingest | `POST /api/events/errors` | 错误事件上报 |
 | 私有 ingest | `POST /api/events/vitals` | Web Vitals 上报；未知指标名跳过并计数（§5），响应含 `rejected` |
 | 私有 ingest | `POST /api/events/diagnostics` | SDK 诊断信息上报；未知 `signal` / `reason` 跳过并计数（§5），响应含 `rejected` |
@@ -62,7 +65,11 @@ http(s)://<host>/p/<project-slug>@<token>
 
 其中 `<token>` 是 `lo_...` 前缀的项目 API Token，SDK 将其解析为项目标识与鉴权
 凭据，但**只通过 `Authorization: Bearer <token>` 请求头发送**，不得把完整 DSN 作为
-请求明文。
+请求明文。使用原生 OTLP/gRPC（默认 `:4317`）时，同样通过 gRPC incoming metadata
+`authorization: Bearer <token>`（scheme 大小写无关）携带项目 API Token：缺失、格式
+错误或无效/已吊销 Token 返回 `Unauthenticated`；用户 API Token（`lou_...`）与 Source
+Map 上传 Token（`los_...`）返回 `PermissionDenied`；认证存储或上游存储故障返回
+`Unavailable`（错误信息脱敏）。
 
 项目 API Token 只能摄取（ADR 0010）：SDK DSN 里的 Token 只用于 §2.1 列出的摄取
 端点。所有读路由（含 `/mcp`、`/api/system/info`）收到项目 Token 时返回 `403`，
