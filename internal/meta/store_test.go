@@ -351,6 +351,15 @@ func TestDeleteProjectCleansAlertLeasesStatesOutboxAndReplays(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		if _, err := store.PinSourceMapUploads(
+			ctx,
+			p.ID,
+			[]string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+			15*time.Minute,
+		); err != nil {
+			t.Fatal(err)
+		}
+
 		if err := store.DeleteProject(ctx, p.ID); err != nil {
 			t.Fatalf("DeleteProject: %v", err)
 		}
@@ -364,6 +373,7 @@ func TestDeleteProjectCleansAlertLeasesStatesOutboxAndReplays(t *testing.T) {
 			{"notification_outbox", `SELECT COUNT(*) FROM notification_outbox WHERE project_id = ?`, p.ID},
 			{"replay_segments", `SELECT COUNT(*) FROM replay_segments WHERE project_id = ?`, p.ID},
 			{"replay_sessions", `SELECT COUNT(*) FROM replay_sessions WHERE project_id = ?`, p.ID},
+			{"source_map_upload_pins", `SELECT COUNT(*) FROM source_map_upload_pins WHERE project_id = ?`, p.ID},
 		} {
 			var count int
 			if err := store.db.QueryRowContext(ctx, bind(store.dialect, check.query), check.arg).

@@ -2,7 +2,9 @@ package janitor
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -15,10 +17,11 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 )
 
-func openTestStore(t *testing.T) (*meta.Store, meta.ProjectInfo) {
+func openTestStoreWithPath(t *testing.T) (*meta.Store, meta.ProjectInfo, string) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	dbPath := filepath.Join(t.TempDir(), "meta.db")
+	store, err := meta.OpenStore(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +37,12 @@ func openTestStore(t *testing.T) (*meta.Store, meta.ProjectInfo) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return store, project, dbPath
+}
+
+func openTestStore(t *testing.T) (*meta.Store, meta.ProjectInfo) {
+	t.Helper()
+	store, project, _ := openTestStoreWithPath(t)
 	return store, project
 }
 
@@ -247,6 +256,77 @@ func TestSourceMapsSweepRespectsGracePeriod(t *testing.T) {
 	}
 	if _, err := blobs.Get(ctx, revisionKey(inFlight)); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("orphan blob past grace period was not deleted: err=%v", err)
+	}
+}
+
+func TestSourceMapsSweepPreservesActivePinsAndReclaimsMultiBatchOrphans(t *testing.T) {
+	ctx := context.Background()
+	store, project, dbPath := openTestStoreWithPath(t)
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(DefaultSourceMapGracePeriod + time.Hour)
+	pinnedDigest := digestOf('7')
+	expiredPinDigest := digestOf('8')
+	if err := blobs.Put(ctx, revisionKey(pinnedDigest), strings.NewReader("pinned")); err != nil {
+		t.Fatal(err)
+	}
+	if err := blobs.Put(ctx, revisionKey(expiredPinDigest), strings.NewReader("expired-pin")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PinSourceMapUploads(ctx, project.ID, []string{pinnedDigest}, 15*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PinSourceMapUploads(
+		ctx,
+		project.ID,
+		[]string{expiredPinDigest},
+		15*time.Minute,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rawDB.Close() }()
+	if _, err := rawDB.ExecContext(
+		ctx,
+		`UPDATE source_map_upload_pins
+		 SET expires_at = strftime('%Y-%m-%d %H:%M:%f', 'now', '-1 minute')
+		 WHERE project_id = ? AND sha256 = ?`,
+		project.ID,
+		expiredPinDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Seed more orphan blobs than one sweep lock batch to cover multi-batch reclamation.
+	orphans := make([]string, 0, sourceMapSweepDeleteBatchSize+5)
+	for i := range sourceMapSweepDeleteBatchSize + 5 {
+		digest := fmt.Sprintf("%064x", i+1)
+		orphans = append(orphans, digest)
+		if err := blobs.Put(ctx, revisionKey(digest), strings.NewReader("orphan")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := (&SourceMaps{
+		Metadata: store,
+		Blobs:    blobs,
+		Now:      func() time.Time { return now },
+	}).Clean(ctx, now.Add(-90*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blobs.Get(ctx, revisionKey(pinnedDigest)); err != nil {
+		t.Fatalf("active pinned revision blob was deleted: %v", err)
+	}
+	if _, err := blobs.Get(ctx, revisionKey(expiredPinDigest)); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("expired pinned blob was not deleted: err=%v", err)
+	}
+	for _, digest := range orphans {
+		if _, err := blobs.Get(ctx, revisionKey(digest)); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("orphan blob %s was not deleted: err=%v", digest, err)
+		}
 	}
 }
 

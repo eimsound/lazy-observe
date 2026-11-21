@@ -61,6 +61,15 @@ func TestCheckFile(t *testing.T) {
 				"db.Exec(bind(d, query))",
 			want: []string{"used without alertClockSQL"},
 		},
+		{
+			name: "source_map_upload_pins wrapped by clock helper",
+			body: "db.Exec(s.alertClockSQL(`DELETE FROM source_map_upload_pins WHERE expires_at <= CURRENT_TIMESTAMP`))",
+		},
+		{
+			name: "source_map_upload_pins without clock helper",
+			body: "db.Exec(bind(d, `SELECT sha256 FROM source_map_upload_pins WHERE expires_at > CURRENT_TIMESTAMP`))",
+			want: []string{"reads CURRENT_TIMESTAMP without alertClockSQL"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

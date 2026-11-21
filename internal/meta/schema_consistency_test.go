@@ -65,7 +65,12 @@ func TestBaselineSQLDeclarationsMatchAcrossDialects(t *testing.T) {
 	for _, tbl := range sqliteTables {
 		tableSet[tbl] = true
 	}
-	for _, required := range []string{"replay_segments", "deleted_project_slugs", "notification_outbox"} {
+	for _, required := range []string{
+		"replay_segments",
+		"deleted_project_slugs",
+		"notification_outbox",
+		"source_map_upload_pins",
+	} {
 		if !tableSet[required] {
 			t.Fatalf("baseline missing required table %q", required)
 		}
