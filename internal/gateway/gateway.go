@@ -24,6 +24,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/embed"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
+	"github.com/eimsound/lazy-observe/internal/ingestlimit"
 	"github.com/eimsound/lazy-observe/internal/llmcost"
 	"github.com/eimsound/lazy-observe/internal/management"
 	observemcp "github.com/eimsound/lazy-observe/internal/mcp"
@@ -32,6 +33,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/query"
 	"github.com/eimsound/lazy-observe/internal/scrape"
 	"github.com/eimsound/lazy-observe/internal/secret"
+	"github.com/eimsound/lazy-observe/internal/selfmetrics"
 	"github.com/eimsound/lazy-observe/internal/state"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 	"github.com/eimsound/lazy-observe/internal/webui"
@@ -186,6 +188,14 @@ type Config struct {
 	// MeterProvider receives the gateway's own operational metrics. Nil uses a
 	// no-op provider.
 	MeterProvider metric.MeterProvider
+	// IngestLimiter enforces unified per-project token-bucket rate limiting
+	// across all HTTP project-token ingest routes. Nil disables limiting.
+	IngestLimiter *ingestlimit.Limiter
+	// SelfMetrics collects low-cardinality Prometheus self-observability metrics
+	// served by GET /metrics when MetricsEndpoint.Enabled is true.
+	SelfMetrics *selfmetrics.Registry
+	// MetricsEndpoint configures GET /metrics exposition and authentication.
+	MetricsEndpoint MetricsEndpointConfig
 	// RequireCSRF enables the double-submit CSRF token check for
 	// session-authenticated mutating requests. Production wiring enables it.
 	RequireCSRF bool
@@ -284,6 +294,9 @@ type Gateway struct {
 	webUI                fs.FS
 	instrumentation      fiber.Handler
 	meterProvider        metric.MeterProvider
+	ingestLimiter        *ingestlimit.Limiter
+	selfMetrics          *selfmetrics.Registry
+	metricsEndpoint      metricsEndpointState
 	remoteWriteSem       chan struct{}
 	remoteWriteRateLimit int
 
@@ -358,6 +371,9 @@ func New(cfg Config) *Gateway {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.SelfMetrics == nil {
+		cfg.SelfMetrics = selfmetrics.New(selfmetrics.Config{Now: cfg.Now})
 	}
 	if cfg.Limits == nil {
 		cfg.Limits = state.NewMemoryLimiterWithClock(cfg.Now)
@@ -491,6 +507,9 @@ func New(cfg Config) *Gateway {
 		webUI:                cfg.WebUI,
 		instrumentation:      cfg.Instrumentation,
 		meterProvider:        cfg.MeterProvider,
+		ingestLimiter:        cfg.IngestLimiter,
+		selfMetrics:          cfg.SelfMetrics,
+		metricsEndpoint:      newMetricsEndpointState(cfg.MetricsEndpoint),
 		remoteWriteSem:       make(chan struct{}, defaultRemoteWriteConcurrency),
 		remoteWriteRateLimit: defaultRemoteWriteRateLimit,
 	}
@@ -687,9 +706,13 @@ func (g *Gateway) routes() {
 	g.app.Use(g.serveWebUI)
 }
 
-// registerMiddlewareAndProbes installs panic recovery, bounded request
-// decoding, the kubelet probes, and optional self-instrumentation.
+// registerMiddlewareAndProbes installs HTTP self-metrics observation, panic
+// recovery, bounded request decoding, the kubelet probes, and optional
+// self-instrumentation.
 func (g *Gateway) registerMiddlewareAndProbes() {
+	// Observe HTTP requests with lock-free in-memory counters before recover so
+	// recovered panics are also counted as 5xx responses.
+	g.app.Use(g.httpMetricsMiddleware)
 	// A handler panic answers 500 for that request instead of killing the
 	// process (and every in-flight request with it).
 	g.app.Use(fiberrecover.New(fiberrecover.Config{
@@ -724,9 +747,13 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 	}
 }
 
-// registerPlatformRoutes serves health, system diagnostics, and MCP.
+// registerPlatformRoutes serves health, optional Prometheus self-metrics,
+// system diagnostics, and MCP.
 func (g *Gateway) registerPlatformRoutes() {
 	g.route(fiber.MethodGet, "/healthz", routePolicy{auth: authPublic}, g.healthz)
+	if g.metricsEndpoint.enabled {
+		g.route(fiber.MethodGet, "/metrics", g.metricsEndpoint.routePolicy(), g.prometheusMetrics)
+	}
 	g.route(fiber.MethodGet, "/api/system/info", routePolicy{auth: authUser, projectScope: true}, g.systemInfo)
 	g.route(
 		fiber.MethodGet,
@@ -795,25 +822,29 @@ func (g *Gateway) registerAuthRoutes() {
 // read API (sessions or user tokens).
 func (g *Gateway) registerTelemetryRoutes() {
 	projectQuery := routePolicy{auth: authUser, projectScope: true}
-	browserIngest := routePolicy{auth: authProjectToken, browserIngestCORS: true}
 
-	g.route(fiber.MethodPost, "/v1/metrics", routePolicy{auth: authProjectToken}, g.metricsIngest)
-	g.route(fiber.MethodPost, "/api/v1/write", routePolicy{auth: authProjectToken}, g.metricsRemoteWrite)
+	g.route(fiber.MethodPost, "/v1/metrics", projectIngestPolicy(selfmetrics.SignalMetrics), g.metricsIngest)
+	g.route(fiber.MethodPost, "/api/v1/write", projectIngestPolicy(selfmetrics.SignalMetrics), g.metricsRemoteWrite)
 	g.route(
 		fiber.MethodPost,
 		"/v1/logs",
-		routePolicy{auth: authProjectToken},
+		projectIngestPolicy(selfmetrics.SignalLogs),
 		g.proxy.tenantHandler(g.storage.LogsIngestBase(), "/insert/opentelemetry/v1/logs"),
 	)
 	g.route(
 		fiber.MethodPost,
 		"/v1/traces",
-		browserIngest,
+		browserIngestPolicy(selfmetrics.SignalTraces),
 		g.proxy.tenantHandler(g.storage.TracesIngestBase(), "/insert/opentelemetry/v1/traces"),
 	)
-	g.route(fiber.MethodPost, "/api/events/errors", browserIngest, g.errorsIngest)
-	g.route(fiber.MethodPost, "/api/events/vitals", browserIngest, g.vitalsIngest)
-	g.route(fiber.MethodPost, "/api/events/diagnostics", browserIngest, g.sdkDiagnosticsIngest)
+	g.route(fiber.MethodPost, "/api/events/errors", browserIngestPolicy(selfmetrics.SignalErrors), g.errorsIngest)
+	g.route(fiber.MethodPost, "/api/events/vitals", browserIngestPolicy(selfmetrics.SignalVitals), g.vitalsIngest)
+	g.route(
+		fiber.MethodPost,
+		"/api/events/diagnostics",
+		browserIngestPolicy(selfmetrics.SignalDiagnostics),
+		g.sdkDiagnosticsIngest,
+	)
 	g.route(
 		fiber.MethodPost,
 		"/api/releases/:release/sourcemaps",
@@ -824,14 +855,14 @@ func (g *Gateway) registerTelemetryRoutes() {
 	g.route(
 		fiber.MethodPost,
 		"/api/replay/segments",
-		browserIngest,
+		browserIngestPolicy(selfmetrics.SignalReplay),
 		g.publicIngestAdmission(replayIngestPolicy),
 		g.replayIngest,
 	)
 	g.route(
 		fiber.MethodPost,
 		"/api/profiles",
-		routePolicy{auth: authProjectToken},
+		projectIngestPolicy(selfmetrics.SignalProfiles),
 		g.publicIngestAdmission(profileIngestPolicy),
 		g.profileIngest,
 	)
@@ -1214,7 +1245,7 @@ func (g *Gateway) serveWebUI(c fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
 	requestPath := c.Path()
-	for _, prefix := range []string{"/api", "/v1", "/mcp", "/healthz", "/livez", "/readyz", "/select"} {
+	for _, prefix := range []string{"/api", "/v1", "/mcp", "/healthz", "/livez", "/readyz", "/select", "/metrics"} {
 		if requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/") {
 			return c.SendStatus(fiber.StatusNotFound)
 		}

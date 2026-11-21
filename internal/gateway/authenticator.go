@@ -114,11 +114,20 @@ func (a *Authenticator) Invalidate() {
 // Middleware authenticates ingest routes with a project API token. A source map
 // upload token is refused explicitly: it is a different credential kind.
 func (a *Authenticator) Middleware(c fiber.Ctx) error {
+	p, ok, err := a.authenticateIngest(c)
+	if !ok {
+		return err
+	}
+	c.Locals(projectLocal, p)
+	return c.Next()
+}
+
+func (a *Authenticator) authenticateIngest(c fiber.Ctx) (meta.ProjectInfo, bool, error) {
 	cred := classifyBearer(c)
 	if cred.kind == bearerUploadToken {
-		return uploadOnlyToken(c)
+		return meta.ProjectInfo{}, false, uploadOnlyToken(c)
 	}
-	return a.authenticateRequest(c, cred.token)
+	return a.resolveRequestProject(c, cred.token)
 }
 
 // UploadMiddleware authenticates the source map upload route. Only a source map
@@ -129,7 +138,12 @@ func (a *Authenticator) UploadMiddleware(c fiber.Ctx) error {
 	if cred.kind == bearerProjectToken || cred.kind == bearerUserToken {
 		return sourceMapUploadTokenRequired(c)
 	}
-	return a.authenticateRequest(c, cred.token)
+	p, ok, err := a.resolveRequestProject(c, cred.token)
+	if !ok {
+		return err
+	}
+	c.Locals(projectLocal, p)
+	return c.Next()
 }
 
 // AuthenticateProjectToken resolves a project API token through the shared
@@ -142,20 +156,19 @@ func (a *Authenticator) AuthenticateProjectToken(ctx context.Context, token stri
 	return a.authenticate(ctx, token)
 }
 
-func (a *Authenticator) authenticateRequest(c fiber.Ctx, token string) error {
+func (a *Authenticator) resolveRequestProject(c fiber.Ctx, token string) (meta.ProjectInfo, bool, error) {
 	if token == "" || !a.configured {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+		return meta.ProjectInfo{}, false, c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 	p, err := a.authenticate(c.Context(), token)
 	if err != nil {
 		if !errors.Is(err, a.invalid) && !meta.IsNotFound(err) {
-			return c.Status(fiber.StatusServiceUnavailable).
+			return meta.ProjectInfo{}, false, c.Status(fiber.StatusServiceUnavailable).
 				JSON(fiber.Map{"error": "authentication temporarily unavailable"})
 		}
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+		return meta.ProjectInfo{}, false, c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
-	c.Locals(projectLocal, p)
-	return c.Next()
+	return p, true, nil
 }
 
 func (a *Authenticator) authenticate(ctx context.Context, token string) (meta.ProjectInfo, error) {

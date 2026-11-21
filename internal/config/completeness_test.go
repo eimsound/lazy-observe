@@ -187,6 +187,8 @@ func TestConfigReflectionCompleteness(t *testing.T) {
 						yVal, eVal, fVal = "false", "true", "false"
 					case reflect.Int, reflect.Int64:
 						yVal, eVal, fVal = "11", "12", "13"
+					case reflect.Float64:
+						yVal, eVal, fVal = "11.5", "12.5", "13.5"
 					default:
 						t.Fatalf("unsupported Config field type %s for %s", sf.Type, path)
 					}

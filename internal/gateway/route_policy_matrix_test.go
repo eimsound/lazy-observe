@@ -97,6 +97,24 @@ func TestRoutePolicyValidationPanicsOnInvalidCombinations(t *testing.T) {
 			path:   "/bad",
 			policy: routePolicy{auth: authUser, browserIngestCORS: true},
 		},
+		{
+			name:   "project token route missing ingestSignal",
+			method: fiber.MethodPost,
+			path:   "/bad",
+			policy: routePolicy{auth: authProjectToken},
+		},
+		{
+			name:   "metrics scrape token route with role",
+			method: fiber.MethodGet,
+			path:   "/bad",
+			policy: routePolicy{auth: authMetricsScrapeToken, role: roleAdmin},
+		},
+		{
+			name:   "metrics scrape token route with projectScope",
+			method: fiber.MethodGet,
+			path:   "/bad",
+			policy: routePolicy{auth: authMetricsScrapeToken, projectScope: true},
+		},
 	}
 
 	for _, tc := range cases {
