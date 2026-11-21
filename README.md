@@ -219,6 +219,7 @@ Server and SDK compatibility rules are tracked in [docs/version-matrix.md](docs/
 | [deploy/compose/README.md](deploy/compose/README.md) | Hardened Docker Compose reference (All-in-One and `--profile standalone` external stack) |
 | [deploy/systemd/README.md](deploy/systemd/README.md) | Hardened Linux systemd unit, graceful draining, and offline CLI maintenance |
 | [docs/sdk/go.md](docs/sdk/go.md) · [node.md](docs/sdk/node.md) · [browser.md](docs/sdk/browser.md) · [python.md](docs/sdk/python.md) | Per-language SDK installation, configuration, and integration guides |
+| [SECURITY.md](SECURITY.md) | Security policy, supported preview scope, and private vulnerability reporting |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contributor setup, `mise` tasks, test layers (`e2e`, `e2e-ha`, `web-e2e-real`, `sdk-journeys`), and PR rules |
 | [CHANGELOG.md](CHANGELOG.md) | Full record of unreleased changes and pre-release history |
 | [.agents/docs/architecture.md](.agents/docs/architecture.md) · [.agents/docs/adr/](.agents/docs/adr/) | Deep architecture notes and Architecture Decision Records (ADRs) |
@@ -230,7 +231,7 @@ Server and SDK compatibility rules are tracked in [docs/version-matrix.md](docs/
 - **Victoria-only signal storage ([ADR 0013](.agents/docs/adr/0013-signal-storage-is-victoria-only.md)):** Metrics, logs, and traces storage is fixed to VictoriaMetrics, VictoriaLogs, and VictoriaTraces. Loki/LogQL and Tempo/TraceQL backends are intentionally out of scope.
 - **No built-in drag-and-drop dashboards ([ADR 0017](.agents/docs/adr/0017-no-built-in-dashboards.md)):** lazy-observe keeps focused built-in diagnostic screens (Overview, Performance, Hosts, LLM, Metrics/Logs/Traces explorers, Profiling) and delegates custom dashboards to Grafana or Perses ([docs/grafana-perses.md](docs/grafana-perses.md)).
 - **Public preview (v0.x, [ADR 0003](.agents/docs/adr/0003-pre-release-single-database-baseline.md)):** Until the first supported release introduces append-only migrations, schema baseline changes require recreating the metadata database. Review [docs/comparison.md](docs/comparison.md) for explicit product boundaries before adopting in production.
-- **Security disclosures:** Please report suspected vulnerabilities privately via GitHub Security Advisories on `eimsound/lazy-observe` rather than opening a public issue.
+- **Security disclosures:** Please report suspected vulnerabilities privately via GitHub Security Advisories on `eimsound/lazy-observe` rather than opening a public issue (see [SECURITY.md](SECURITY.md)).
 
 ---
 
