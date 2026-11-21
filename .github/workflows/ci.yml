@@ -705,6 +705,8 @@ jobs:
   # 3.9、3.13、3.15（GIL 构建）、3.15t（free-threaded）阻塞；3.16 预发布只为提前暴露 CPython 接口变化，
   # 红了不挡合并。持续剖析（ADR 0014）的真实采样只在 3.15t 上跑，其余格验证「开关打开只打 warning、不采集」，
   # 各格由测试按解释器能力自行 skip。
+  # 3.9（最低支持 Python）与 3.13（默认基准 Python）额外在独立临时虚拟环境里用 `--resolution lowest-direct`
+  # 回归最低直接依赖版本并校验生产依赖许可证白名单，不拖慢 3.15 / 3.15t / 3.16 变体。
   # continue-on-error 只许出现在这里，且只对 experimental 的 3.16 格为 true（check-github-workflows.sh 钉住）：
   # 带 continue-on-error 的失败格在 needs 里算 success，所以 ci-ok 不会因它变红。
   sdk-python:
@@ -720,14 +722,19 @@ jobs:
         include:
           - python: "3.9"
             experimental: false
+            lowest_direct: true
           - python: "3.13"
             experimental: false
+            lowest_direct: true
           - python: "3.15"
             experimental: false
+            lowest_direct: false
           - python: "3.15t"
             experimental: false
+            lowest_direct: false
           - python: "3.16"
             experimental: true
+            lowest_direct: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Calculate cache keys
@@ -759,6 +766,23 @@ jobs:
       - run: mise run --skip-tools sdk-python
         env:
           LO_SDK_PYTHON_VERSION: ${{ matrix.python }}
+      # 最低直接依赖回归：在独立临时 venv 中按 pyproject.toml 的 [tool.uv] exclude-newer（7 天）与
+      # `--resolution lowest-direct` 解析直接依赖下界，避免污染 sdk/python/.venv。
+      - name: Test Python SDK with lowest-direct dependencies
+        if: matrix.lowest_direct
+        shell: bash
+        working-directory: sdk/python
+        env:
+          LO_SDK_PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          set -euo pipefail
+          venv_dir=$(mktemp -d)
+          trap 'rm -rf "$venv_dir"' EXIT
+          mise x uv -- uv venv --managed-python --python "$LO_SDK_PYTHON_VERSION" --clear "$venv_dir"
+          mise x uv -- uv pip install --python "$venv_dir/bin/python" --resolution lowest-direct -e ".[test]"
+          "$venv_dir/bin/python" -VV
+          "$venv_dir/bin/python" -m pytest -q tests
+          bash ../../scripts/check-python-licenses.sh "$venv_dir/bin/python"
       - name: Save uv cache
         if: github.ref == 'refs/heads/main' && steps.uv-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
