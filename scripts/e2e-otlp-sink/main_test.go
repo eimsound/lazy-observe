@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -418,4 +419,176 @@ func marshal(t *testing.T, message proto.Message) []byte {
 func bodyDigest(body []byte) string {
 	digest := sha256.Sum256(body)
 	return fmt.Sprintf("%x", digest)
+}
+
+func TestReadBoundedBodyHandlesKnownChunkedAndMismatchedContentLength(t *testing.T) {
+	largePayload := bytes.Repeat([]byte("a"), 24<<10)
+	exactPayload := []byte("0123456789abcdef")
+
+	tests := []struct {
+		name          string
+		payload       []byte
+		contentLength int64
+		limit         int64
+		wantTooLarge  bool
+	}{
+		{
+			name:          "known content length above pool initial cap",
+			payload:       largePayload,
+			contentLength: int64(len(largePayload)),
+			limit:         int64(len(largePayload)),
+		},
+		{
+			name:          "known content length exact limit",
+			payload:       exactPayload,
+			contentLength: int64(len(exactPayload)),
+			limit:         int64(len(exactPayload)),
+		},
+		{
+			name:          "unknown chunked length within limit",
+			payload:       largePayload,
+			contentLength: -1,
+			limit:         int64(len(largePayload)) + 1024,
+		},
+		{
+			name:          "unknown chunked length exceeds limit",
+			payload:       largePayload,
+			contentLength: -1,
+			limit:         int64(len(largePayload)) - 1,
+			wantTooLarge:  true,
+		},
+		{
+			name:          "understated content length within limit",
+			payload:       bytes.Repeat([]byte("u"), 200),
+			contentLength: 10,
+			limit:         256,
+		},
+		{
+			name:          "understated content length exceeds limit",
+			payload:       bytes.Repeat([]byte("v"), 100),
+			contentLength: 10,
+			limit:         64,
+			wantTooLarge:  true,
+		},
+		{
+			name:          "overstated huge content length within limit",
+			payload:       []byte("small-body"),
+			contentLength: maxPreallocBodyBytes * 4,
+			limit:         maxPreallocBodyBytes * 8,
+		},
+		{
+			name:          "overstated content length exceeds limit",
+			payload:       bytes.Repeat([]byte("z"), 65),
+			contentLength: 1024,
+			limit:         64,
+			wantTooLarge:  true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, pooled := range []bool{false, true} {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(
+					http.MethodPost,
+					"/v1/metrics",
+					io.NopCloser(bytes.NewReader(test.payload)),
+				)
+				request.ContentLength = test.contentLength
+
+				var (
+					got     []byte
+					release = func() {}
+					err     error
+				)
+				if pooled {
+					got, release, err = readBoundedBodyPooled(recorder, request, test.limit)
+				} else {
+					got, err = readBoundedBody(recorder, request, test.limit)
+				}
+				if test.wantTooLarge {
+					release()
+					var tooLarge *http.MaxBytesError
+					if !errors.As(err, &tooLarge) {
+						t.Fatalf("pooled=%v err = %v, want *http.MaxBytesError", pooled, err)
+					}
+					continue
+				}
+				if err != nil {
+					release()
+					t.Fatalf("pooled=%v unexpected err = %v", pooled, err)
+				}
+				if !bytes.Equal(got, test.payload) {
+					release()
+					t.Fatalf("pooled=%v len(got)=%d want=%d", pooled, len(got), len(test.payload))
+				}
+				release()
+			}
+		})
+	}
+}
+
+func TestHandlerPooledBodyBuffersConcurrentReceipts(t *testing.T) {
+	const batchSize = 100
+	cache := newValidationCache(32)
+	handler := newHandler(batchSize, testNonce, maxRequestBodyBytes, cache)
+
+	sequences := make([]int, batchSize)
+	for i := range sequences {
+		sequences[i] = i
+	}
+
+	type sampleCase struct {
+		path    string
+		payload []byte
+		digest  string
+	}
+	cases := make([]sampleCase, 0, 16)
+	for i := 0; i < 8; i++ {
+		marker := fmt.Sprintf("pool-run-%d", i)
+		markers := make([]string, batchSize)
+		for j := range markers {
+			markers[j] = marker
+		}
+		mBody := metricsPayload(t, sequences, markers)
+		lBody := logsPayload(t, sequences, markers)
+		cases = append(
+			cases,
+			sampleCase{path: "/v1/metrics", payload: mBody, digest: bodyDigest(mBody)},
+			sampleCase{path: "/v1/logs", payload: lBody, digest: bodyDigest(lBody)},
+		)
+	}
+
+	var wg sync.WaitGroup
+	var seq atomic.Uint64
+	errCh := make(chan error, len(cases)*8)
+	for _, tc := range cases {
+		for round := 0; round < 8; round++ {
+			wg.Add(1)
+			go func(tc sampleCase) {
+				defer wg.Done()
+				requestID := fmt.Sprintf("loreq_0123456789abcdef01234567_%d", seq.Add(1))
+				resp := postWithRequestID(t, handler, tc.path, tc.payload, requestID)
+				if resp.Code != http.StatusOK {
+					errCh <- fmt.Errorf("%s status=%d body=%q", tc.path, resp.Code, resp.Body.String())
+					return
+				}
+				if got := resp.Header().Get(receiptHeader); got != tc.digest {
+					errCh <- fmt.Errorf("%s receipt=%q want=%q", tc.path, got, tc.digest)
+					return
+				}
+				if got := resp.Header().Get(requestHeader); got != requestID {
+					errCh <- fmt.Errorf("%s request proof=%q want=%q", tc.path, got, requestID)
+				}
+			}(tc)
+		}
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	if got := cache.len(); got != len(cases) {
+		t.Fatalf("cache entries=%d want=%d", got, len(cases))
+	}
 }

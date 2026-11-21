@@ -773,11 +773,14 @@ func TestScaleRoundEfficiencyGatePassesCurrentEvidenceAndRoundsRequirementUp(t *
 		{SamplesPerSecond: 141.64, LogsPerSecond: 141.86},
 		{SamplesPerSecond: 130.36, LogsPerSecond: 130.62},
 	}
+	aggregate := medianScalePhase(rounds)
 	result := scaleGateResult{
 		Targets:                 []string{"target-1", "target-2"},
 		SingleCapacityReference: scaleThroughputReference{SamplesPerSecond: 100, LogsPerSecond: 100},
 		MinReplicaEfficiency:    0.68,
 		MinPassingRoundRatio:    0.75,
+		SampleReplicaEfficiency: aggregate.SamplesPerSecond / 200,
+		LogReplicaEfficiency:    aggregate.LogsPerSecond / 200,
 		GatePassed:              true,
 	}
 	applyScaleRoundEfficiencyGate(&result, rounds)
@@ -795,6 +798,118 @@ func TestScaleRoundEfficiencyGatePassesCurrentEvidenceAndRoundsRequirementUp(t *
 	)
 	if required != 4 {
 		t.Fatalf("required passing rounds = %d, want ceil(5*0.75)=4", required)
+	}
+}
+
+func TestScaleEfficiencyGateRejectsLowAggregateMedianWithLowPassingRoundRatio(t *testing.T) {
+	nominal := scalePhaseResult{Concurrency: 4, SamplesPerSecond: 100, LogsPerSecond: 100}
+	highControl := scalePhaseResult{Concurrency: 8, SamplesPerSecond: 100, LogsPerSecond: 100}
+	reference := capacityReferenceForTest(nominal, highControl)
+	rounds := []scalePhaseResult{
+		{Concurrency: 8, SamplesPerSecond: 140, LogsPerSecond: 140, RequestsPerTarget: []uint64{10, 10}},
+		{Concurrency: 8, SamplesPerSecond: 140, LogsPerSecond: 140, RequestsPerTarget: []uint64{10, 10}},
+		{Concurrency: 8, SamplesPerSecond: 124, LogsPerSecond: 124, RequestsPerTarget: []uint64{10, 10}},
+		{Concurrency: 8, SamplesPerSecond: 120, LogsPerSecond: 120, RequestsPerTarget: []uint64{10, 10}},
+	}
+	scaled := medianScalePhase(rounds)
+	result := evaluateCapacityScaling(
+		[]string{"target-1", "target-2"},
+		nominal,
+		highControl,
+		reference,
+		scaled,
+		4,
+		0.68,
+	)
+	result.MinPassingRoundRatio = 0.5
+	applyScaleRoundEfficiencyGate(&result, rounds)
+	if result.GatePassed || result.PassingScaledRounds != 2 || result.RequiredPassingScaledRounds != 2 {
+		t.Fatalf("low median with 0.5 passing round ratio unexpectedly passed: %#v", result)
+	}
+	if len(result.GateFailures) != 2 ||
+		!strings.Contains(result.GateFailures[0], "aggregate median metric replica efficiency 0.660 is below 0.680") ||
+		!strings.Contains(result.GateFailures[1], "aggregate median log replica efficiency 0.660 is below 0.680") {
+		t.Fatalf("unexpected aggregate median failures: %v", result.GateFailures)
+	}
+
+	singleSignalRounds := []scalePhaseResult{
+		{Concurrency: 8, SamplesPerSecond: 140, LogsPerSecond: 140, RequestsPerTarget: []uint64{10, 10}},
+		{Concurrency: 8, SamplesPerSecond: 140, LogsPerSecond: 140, RequestsPerTarget: []uint64{10, 10}},
+		{Concurrency: 8, SamplesPerSecond: 136, LogsPerSecond: 124, RequestsPerTarget: []uint64{10, 10}},
+		{Concurrency: 8, SamplesPerSecond: 130, LogsPerSecond: 120, RequestsPerTarget: []uint64{10, 10}},
+	}
+	singleSignalResult := scaleGateResult{
+		Targets:                 []string{"target-1", "target-2"},
+		SingleCapacityReference: reference,
+		MinReplicaEfficiency:    0.68,
+		MinPassingRoundRatio:    0.5,
+		SampleReplicaEfficiency: medianScalePhase(singleSignalRounds).SamplesPerSecond / 200,
+		LogReplicaEfficiency:    medianScalePhase(singleSignalRounds).LogsPerSecond / 200,
+		GatePassed:              true,
+	}
+	applyScaleRoundEfficiencyGate(&singleSignalResult, singleSignalRounds)
+	if singleSignalResult.GatePassed || len(singleSignalResult.GateFailures) != 1 ||
+		!strings.Contains(
+			singleSignalResult.GateFailures[0],
+			"aggregate median log replica efficiency 0.660 is below 0.680",
+		) {
+		t.Fatalf("single-signal low median failures = %#v", singleSignalResult.GateFailures)
+	}
+}
+
+func TestMergeWorkerLatenciesPreservesAllSamplesAndPercentiles(t *testing.T) {
+	if got := mergeWorkerLatencies([][]time.Duration{nil, {}, nil}); got != nil {
+		t.Fatalf("empty merge = %v, want nil", got)
+	}
+	shards := [][]time.Duration{
+		{50 * time.Millisecond, 10 * time.Millisecond},
+		{},
+		{99 * time.Millisecond, 25 * time.Millisecond, 95 * time.Millisecond},
+	}
+	merged := mergeWorkerLatencies(shards)
+	flat := []time.Duration{
+		50 * time.Millisecond,
+		10 * time.Millisecond,
+		99 * time.Millisecond,
+		25 * time.Millisecond,
+		95 * time.Millisecond,
+	}
+	if len(merged) != len(flat) {
+		t.Fatalf("len(merged)=%d want=%d", len(merged), len(flat))
+	}
+	if got, want := summarizeLatencies(merged), summarizeLatencies(flat); got != want {
+		t.Fatalf("merged summary=%#v want=%#v", got, want)
+	}
+}
+
+func TestMeasureScalePhaseRecordsLatenciesAcrossAllWorkers(t *testing.T) {
+	const sinkIdentity = "losink_testfixture"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeScaleSinkSuccess(t, w, r, sinkIdentity)
+	}))
+	defer server.Close()
+	phase, err := measureScalePhase(
+		context.Background(),
+		server.Client(),
+		[]string{server.URL, server.URL},
+		"secret",
+		sinkIdentity,
+		nil,
+		nil,
+		1,
+		4,
+		scalePhaseTestDuration,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase.RequestsFailed != 0 || len(phase.RequestsPerTarget) != 2 ||
+		phase.RequestsPerTarget[0] == 0 || phase.RequestsPerTarget[1] == 0 {
+		t.Fatalf("phase counts = %#v", phase)
+	}
+	if phase.RequestLatency.P50MS <= 0 || phase.RequestLatency.P95MS < phase.RequestLatency.P50MS ||
+		phase.RequestLatency.P99MS < phase.RequestLatency.P95MS {
+		t.Fatalf("unexpected latency summary = %#v", phase.RequestLatency)
 	}
 }
 
@@ -1101,18 +1216,132 @@ func TestUpstreamHeadroomFailsClosedOnBottleneckAndDegradation(t *testing.T) {
 
 func TestFormatScaleFailureDiagnosticsIncludesPerRoundDetails(t *testing.T) {
 	controlRounds := []scalePhaseResult{
-		{SamplesPerSecond: 250000, LogsPerSecond: 255000},
-		{SamplesPerSecond: 180000, LogsPerSecond: 185000},
-		{SamplesPerSecond: 245000, LogsPerSecond: 248000},
+		{
+			SamplesPerSecond: 250000,
+			LogsPerSecond:    255000,
+			RequestLatency:   latencySummary{P50MS: 0.40, P95MS: 0.90, P99MS: 1.50},
+		},
+		{
+			SamplesPerSecond: 180000,
+			LogsPerSecond:    185000,
+			RequestLatency:   latencySummary{P50MS: 0.55, P95MS: 1.20, P99MS: 2.10},
+		},
+		{
+			SamplesPerSecond: 245000,
+			LogsPerSecond:    248000,
+			RequestLatency:   latencySummary{P50MS: 0.42, P95MS: 0.95, P99MS: 1.60},
+		},
+	}
+	nominalBaselines := []scaleTargetBaseline{
+		{
+			Target: "target-1",
+			Rounds: []scalePhaseResult{
+				{
+					SamplesPerSecond:          79000,
+					LogsPerSecond:             78000,
+					RequestLatency:            latencySummary{P50MS: 0.70, P95MS: 1.40, P99MS: 2.20},
+					RequestsPerTarget:         []uint64{11850},
+					RecordsPerSecondPerTarget: []float64{157000},
+				},
+			},
+			Median: scalePhaseResult{
+				SamplesPerSecond: 79000,
+				LogsPerSecond:    78000,
+				RequestLatency:   latencySummary{P50MS: 0.70, P95MS: 1.40, P99MS: 2.20},
+			},
+		},
+		{
+			Target: "target-2",
+			Rounds: []scalePhaseResult{
+				{
+					SamplesPerSecond:          80000,
+					LogsPerSecond:             79000,
+					RequestLatency:            latencySummary{P50MS: 0.68, P95MS: 1.35, P99MS: 2.10},
+					RequestsPerTarget:         []uint64{11925},
+					RecordsPerSecondPerTarget: []float64{159000},
+				},
+			},
+			Median: scalePhaseResult{
+				SamplesPerSecond: 80000,
+				LogsPerSecond:    79000,
+				RequestLatency:   latencySummary{P50MS: 0.68, P95MS: 1.35, P99MS: 2.10},
+			},
+		},
+	}
+	highControlBaselines := []scaleTargetBaseline{
+		{
+			Target: "target-1",
+			Rounds: []scalePhaseResult{
+				{
+					SamplesPerSecond:          80000,
+					LogsPerSecond:             79500,
+					RequestLatency:            latencySummary{P50MS: 1.45, P95MS: 2.80, P99MS: 4.10},
+					RequestsPerTarget:         []uint64{11960},
+					RecordsPerSecondPerTarget: []float64{159500},
+				},
+			},
+			Median: scalePhaseResult{
+				SamplesPerSecond: 80000,
+				LogsPerSecond:    79500,
+				RequestLatency:   latencySummary{P50MS: 1.45, P95MS: 2.80, P99MS: 4.10},
+			},
+		},
+		{
+			Target: "target-2",
+			Rounds: []scalePhaseResult{
+				{
+					SamplesPerSecond:          79500,
+					LogsPerSecond:             80000,
+					RequestLatency:            latencySummary{P50MS: 1.48, P95MS: 2.90, P99MS: 4.30},
+					RequestsPerTarget:         []uint64{11962},
+					RecordsPerSecondPerTarget: []float64{159500},
+				},
+			},
+			Median: scalePhaseResult{
+				SamplesPerSecond: 79500,
+				LogsPerSecond:    80000,
+				RequestLatency:   latencySummary{P50MS: 1.48, P95MS: 2.90, P99MS: 4.30},
+			},
+		},
 	}
 	scaledRounds := []scalePhaseResult{
-		{SamplesPerSecond: 130000, LogsPerSecond: 131000},
-		{SamplesPerSecond: 132000, LogsPerSecond: 133000},
-		{SamplesPerSecond: 129000, LogsPerSecond: 130000},
-		{SamplesPerSecond: 135000, LogsPerSecond: 136000},
+		{
+			SamplesPerSecond:          130000,
+			LogsPerSecond:             131000,
+			RequestLatency:            latencySummary{P50MS: 0.85, P95MS: 1.75, P99MS: 2.95},
+			RequestsPerTarget:         []uint64{19500, 19650},
+			RecordsPerSecondPerTarget: []float64{130000, 131000},
+		},
+		{
+			SamplesPerSecond:          132000,
+			LogsPerSecond:             133000,
+			RequestLatency:            latencySummary{P50MS: 0.83, P95MS: 1.70, P99MS: 2.85},
+			RequestsPerTarget:         []uint64{19800, 19950},
+			RecordsPerSecondPerTarget: []float64{132000, 133000},
+		},
+		{
+			SamplesPerSecond:          129000,
+			LogsPerSecond:             130000,
+			RequestLatency:            latencySummary{P50MS: 0.88, P95MS: 1.80, P99MS: 3.10},
+			RequestsPerTarget:         []uint64{19350, 19500},
+			RecordsPerSecondPerTarget: []float64{129000, 130000},
+		},
+		{
+			SamplesPerSecond:          135000,
+			LogsPerSecond:             136000,
+			RequestLatency:            latencySummary{P50MS: 0.80, P95MS: 1.65, P99MS: 2.75},
+			RequestsPerTarget:         []uint64{20250, 20400},
+			RecordsPerSecondPerTarget: []float64{135000, 136000},
+		},
 	}
 	result := scaleGateResult{
-		Targets: []string{"target-1", "target-2"},
+		Targets:              []string{"target-1", "target-2"},
+		NominalBaselines:     nominalBaselines,
+		HighControlBaselines: highControlBaselines,
+		RoundOrders: [][]string{
+			{"target-1-nominal", "target-2-nominal", "scaled", "target-1-high-control"},
+			{"target-2-nominal", "target-2-high-control", "target-1-nominal", "scaled"},
+		},
 		SingleCapacityReference: scaleThroughputReference{
 			SamplesPerSecond: 80000,
 			SampleSource:     "target-1_nominal",
@@ -1122,12 +1351,19 @@ func TestFormatScaleFailureDiagnosticsIncludesPerRoundDetails(t *testing.T) {
 		Scaled: scalePhaseResult{
 			SamplesPerSecond: 131000,
 			LogsPerSecond:    132000,
+			RequestLatency:   latencySummary{P50MS: 0.84, P95MS: 1.72, P99MS: 2.90},
 		},
 		SampleReplicaEfficiency:     0.819,
 		LogReplicaEfficiency:        0.825,
 		MinReplicaEfficiency:        0.68,
 		PassingScaledRounds:         4,
 		RequiredPassingScaledRounds: 3,
+		BaselineSampleRatio:         0.988,
+		BaselineLogRatio:            0.987,
+		HighControlSampleRatio:      0.994,
+		HighControlLogRatio:         0.994,
+		MinBaselineRatio:            0.800,
+		TargetBalanceLowerBound:     0.700,
 		ScaledRounds:                scaledRounds,
 		ScaledRoundEfficiencies: []scaleRoundEfficiency{
 			{Round: 1, SampleReplicaEfficiency: 0.812, LogReplicaEfficiency: 0.819, PairedGatePassed: true},
@@ -1152,12 +1388,20 @@ func TestFormatScaleFailureDiagnosticsIncludesPerRoundDetails(t *testing.T) {
 		"passing_control_rounds=0/3 (required>=2)",
 		"upstream_control_rounds:",
 		"1(leading: samples=250000.0/s, logs=255000.0/s",
+		"latency_ms=p50:0.40/p95:0.90/p99:1.50)",
 		"2(after-round-2: samples=180000.0/s, logs=185000.0/s",
 		"3(trailing: samples=245000.0/s, logs=248000.0/s",
+		"nominal_baselines:",
+		"target-1(median: samples=79000.0/s, logs=78000.0/s, latency_ms=p50:0.70/p95:1.40/p99:2.20;",
+		"high_control_baselines:",
+		"target-2(median: samples=79500.0/s, logs=80000.0/s, latency_ms=p50:1.48/p95:2.90/p99:4.30;",
+		"baseline_ratios: nominal=samples:0.988,logs:0.987; high_control=samples:0.994,logs:0.994 (min>=0.800); target_balance_lower_bound=0.700",
 		"scaled_rounds:",
-		"1(samples=130000.0/s, logs=131000.0/s, eff=0.812/0.819)",
-		"4(samples=135000.0/s, logs=136000.0/s, eff=0.844/0.850)",
+		"1(samples=130000.0/s, logs=131000.0/s, eff=0.812/0.819, latency_ms=p50:0.85/p95:1.75/p99:2.95, reqs_per_target=[19500,19650], records_per_s_per_target=[130000.0,131000.0])",
+		"4(samples=135000.0/s, logs=136000.0/s, eff=0.844/0.850, latency_ms=p50:0.80/p95:1.65/p99:2.75, reqs_per_target=[20250,20400], records_per_s_per_target=[135000.0,136000.0])",
+		"round_orders: 1(target-1-nominal -> target-2-nominal -> scaled -> target-1-high-control), 2(target-2-nominal -> target-2-high-control -> target-1-nominal -> scaled)",
 		"scaling_summary:",
+		"scaled_latency_ms=p50:0.84/p95:1.72/p99:2.90",
 	} {
 		if !strings.Contains(diag, want) {
 			t.Fatalf("diagnostics missing %q:\n%s", want, diag)

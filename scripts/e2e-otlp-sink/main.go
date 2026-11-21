@@ -15,11 +15,21 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const maxRequestBodyBytes int64 = 64 << 20
+const maxPreallocBodyBytes int64 = 1 << 20
 const validationCacheEntries = 256
+
+var bodyBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 16<<10)
+		return &buf
+	},
+}
+
 const sinkHeader = "X-Lazy-Observe-Perf-Sink"
 const receiptHeader = "X-Lazy-Observe-Perf-Receipt"
 const requestHeader = "X-Lazy-Observe-Perf-Request"
@@ -87,7 +97,7 @@ func newHandler(expectedBatch int, nonce string, bodyLimit int64, cache *validat
 			http.Error(w, "missing or invalid performance request proof", http.StatusBadRequest)
 			return
 		}
-		body, err := readBoundedBody(w, r, bodyLimit)
+		body, releaseBody, err := readBoundedBodyPooled(w, r, bodyLimit)
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
@@ -97,6 +107,7 @@ func newHandler(expectedBatch int, nonce string, bodyLimit int64, cache *validat
 			http.Error(w, "cannot read request body", http.StatusBadRequest)
 			return
 		}
+		defer releaseBody()
 
 		key := validationKey{kind: kind, digest: sha256.Sum256(body)}
 		if err := cache.validate(key, func() error {
@@ -147,8 +158,59 @@ func performanceRequestID(header http.Header) (string, bool) {
 }
 
 func readBoundedBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	return readBoundedBodyInto(w, r, limit, nil)
+}
+
+func readBoundedBodyPooled(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, func(), error) {
+	bufPtr := bodyBufferPool.Get().(*[]byte)
+	initial := (*bufPtr)[:0]
+	body, err := readBoundedBodyInto(w, r, limit, initial)
+	release := func() {
+		target := body
+		if err != nil || int64(cap(target)) > maxPreallocBodyBytes {
+			target = initial
+		}
+		if int64(cap(target)) <= maxPreallocBodyBytes {
+			*bufPtr = target[:0]
+			bodyBufferPool.Put(bufPtr)
+		}
+	}
+	if err != nil {
+		release()
+		return nil, func() {}, err
+	}
+	return body, release, nil
+}
+
+func readBoundedBodyInto(w http.ResponseWriter, r *http.Request, limit int64, buf []byte) ([]byte, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
-	return io.ReadAll(r.Body)
+	buf = buf[:0]
+	if r.ContentLength > 0 && limit > 0 {
+		prealloc := min(r.ContentLength, limit, maxPreallocBodyBytes)
+		capacity := int(prealloc)
+		if r.ContentLength <= limit && r.ContentLength <= maxPreallocBodyBytes {
+			// Reserve one extra byte so the final Read reaches io.EOF without reallocating.
+			capacity++
+		}
+		if cap(buf) < capacity {
+			buf = make([]byte, 0, capacity)
+		}
+	} else if cap(buf) == 0 {
+		buf = make([]byte, 0, 512)
+	}
+	for {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)]
+		}
+		n, err := r.Body.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return buf, nil
+			}
+			return nil, err
+		}
+	}
 }
 
 func signalForPath(path string) (signalKind, bool) {

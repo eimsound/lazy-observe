@@ -1109,18 +1109,23 @@ func measureScalePhase(
 	var requestSequence atomic.Uint64
 	var counters phaseCounters
 	perTarget := make([]phaseTargetCounters, len(targets))
-	latencies := make([]time.Duration, 0, 1<<16)
-	var latencyMu sync.Mutex
+	totalWorkers := len(targets) * concurrencyPerReplica
+	workerLatencies := make([][]time.Duration, totalWorkers)
 	var workers sync.WaitGroup
 	var ready sync.WaitGroup
-	ready.Add(len(targets) * concurrencyPerReplica)
+	ready.Add(totalWorkers)
 	startWorkers := make(chan struct{})
 	for targetIndex, target := range targets {
 		for localWorker := 0; localWorker < concurrencyPerReplica; localWorker++ {
+			workerIndex := targetIndex*concurrencyPerReplica + localWorker
 			isMetrics := localWorker%2 == 0
 			workers.Add(1)
-			go func(targetIndex int, target string, isMetrics bool) {
+			go func(workerIndex, targetIndex int, target string, isMetrics bool) {
 				defer workers.Done()
+				localLatencies := make([]time.Duration, 0, 1024)
+				defer func() {
+					workerLatencies[workerIndex] = localLatencies
+				}()
 				ready.Done()
 				select {
 				case <-startWorkers:
@@ -1159,9 +1164,7 @@ func measureScalePhase(
 					if ctx.Err() != nil {
 						return
 					}
-					latencyMu.Lock()
-					latencies = append(latencies, time.Since(requestStarted))
-					latencyMu.Unlock()
+					localLatencies = append(localLatencies, time.Since(requestStarted))
 					if requestErr != nil || status/100 != 2 {
 						kind := scaleFailureKind(status, requestErr)
 						counters.fails.Add(1)
@@ -1178,7 +1181,7 @@ func measureScalePhase(
 						perTarget[targetIndex].logRequests.Add(1)
 					}
 				}
-			}(targetIndex, target, isMetrics)
+			}(workerIndex, targetIndex, target, isMetrics)
 		}
 	}
 	ready.Wait()
@@ -1196,6 +1199,7 @@ func measureScalePhase(
 	if elapsed <= 0 {
 		return scalePhaseResult{}, fmt.Errorf("phase duration was not positive")
 	}
+	latencies := mergeWorkerLatencies(workerLatencies)
 	requestsPerTarget := make([]uint64, len(targets))
 	metricRequestsPerTarget := make([]uint64, len(targets))
 	logRequestsPerTarget := make([]uint64, len(targets))
@@ -1226,6 +1230,21 @@ func measureScalePhase(
 		LogRequestsPerTarget: logRequestsPerTarget, FailedRequestsPerTarget: failedRequestsPerTarget,
 		RequestsPerSecondPerTarget: requestsPerSecondPerTarget, RecordsPerSecondPerTarget: recordsPerSecondPerTarget,
 	}, nil
+}
+
+func mergeWorkerLatencies(shards [][]time.Duration) []time.Duration {
+	total := 0
+	for _, shard := range shards {
+		total += len(shard)
+	}
+	if total == 0 {
+		return nil
+	}
+	merged := make([]time.Duration, 0, total)
+	for _, shard := range shards {
+		merged = append(merged, shard...)
+	}
+	return merged
 }
 
 func scaleFailureKind(status int, err error) string {
@@ -1881,27 +1900,43 @@ func formatScaleFailureDiagnostics(result scaleGateResult) string {
 			}
 			if label != "" {
 				entries = append(entries, fmt.Sprintf(
-					"%d(%s: samples=%.1f/s, logs=%.1f/s, ratio=%.3fx/%.3fx)",
+					"%d(%s: samples=%.1f/s, logs=%.1f/s, ratio=%.3fx/%.3fx, latency_ms=%s)",
 					index+1,
 					label,
 					phase.SamplesPerSecond,
 					phase.LogsPerSecond,
 					sampleRatio,
 					logRatio,
+					formatLatencySummary(phase.RequestLatency),
 				))
 			} else {
 				entries = append(entries, fmt.Sprintf(
-					"%d(samples=%.1f/s, logs=%.1f/s, ratio=%.3fx/%.3fx)",
+					"%d(samples=%.1f/s, logs=%.1f/s, ratio=%.3fx/%.3fx, latency_ms=%s)",
 					index+1,
 					phase.SamplesPerSecond,
 					phase.LogsPerSecond,
 					sampleRatio,
 					logRatio,
+					formatLatencySummary(phase.RequestLatency),
 				))
 			}
 		}
 		lines = append(lines, "upstream_control_rounds: "+strings.Join(entries, ", "))
 	}
+	lines = append(
+		lines,
+		"nominal_baselines: "+formatScaleTargetBaselines(result.NominalBaselines),
+		"high_control_baselines: "+formatScaleTargetBaselines(result.HighControlBaselines),
+		fmt.Sprintf(
+			"baseline_ratios: nominal=samples:%.3f,logs:%.3f; high_control=samples:%.3f,logs:%.3f (min>=%.3f); target_balance_lower_bound=%.3f",
+			result.BaselineSampleRatio,
+			result.BaselineLogRatio,
+			result.HighControlSampleRatio,
+			result.HighControlLogRatio,
+			result.MinBaselineRatio,
+			result.TargetBalanceLowerBound,
+		),
+	)
 	if len(result.ScaledRounds) == 0 {
 		lines = append(lines, "scaled_rounds: none")
 	} else {
@@ -1910,26 +1945,41 @@ func formatScaleFailureDiagnostics(result scaleGateResult) string {
 			if index < len(result.ScaledRoundEfficiencies) {
 				efficiency := result.ScaledRoundEfficiencies[index]
 				entries = append(entries, fmt.Sprintf(
-					"%d(samples=%.1f/s, logs=%.1f/s, eff=%.3f/%.3f)",
+					"%d(samples=%.1f/s, logs=%.1f/s, eff=%.3f/%.3f, latency_ms=%s, reqs_per_target=%s, records_per_s_per_target=%s)",
 					index+1,
 					phase.SamplesPerSecond,
 					phase.LogsPerSecond,
 					efficiency.SampleReplicaEfficiency,
 					efficiency.LogReplicaEfficiency,
+					formatLatencySummary(phase.RequestLatency),
+					formatUintSlice(phase.RequestsPerTarget),
+					formatFloatSlice(phase.RecordsPerSecondPerTarget),
 				))
 			} else {
 				entries = append(entries, fmt.Sprintf(
-					"%d(samples=%.1f/s, logs=%.1f/s)",
+					"%d(samples=%.1f/s, logs=%.1f/s, latency_ms=%s, reqs_per_target=%s, records_per_s_per_target=%s)",
 					index+1,
 					phase.SamplesPerSecond,
 					phase.LogsPerSecond,
+					formatLatencySummary(phase.RequestLatency),
+					formatUintSlice(phase.RequestsPerTarget),
+					formatFloatSlice(phase.RecordsPerSecondPerTarget),
 				))
 			}
 		}
 		lines = append(lines, "scaled_rounds: "+strings.Join(entries, ", "))
 	}
+	if len(result.RoundOrders) == 0 {
+		lines = append(lines, "round_orders: none")
+	} else {
+		orderEntries := make([]string, 0, len(result.RoundOrders))
+		for index, order := range result.RoundOrders {
+			orderEntries = append(orderEntries, fmt.Sprintf("%d(%s)", index+1, strings.Join(order, " -> ")))
+		}
+		lines = append(lines, "round_orders: "+strings.Join(orderEntries, ", "))
+	}
 	lines = append(lines, fmt.Sprintf(
-		"scaling_summary: single_ref=samples:%.1f/s(%s),logs:%.1f/s(%s); scaled_median=samples:%.1f/s,logs:%.1f/s; efficiency=%.3f/%.3f (min>=%.3f); paired_rounds=%d/%d (required>=%d)",
+		"scaling_summary: single_ref=samples:%.1f/s(%s),logs:%.1f/s(%s); scaled_median=samples:%.1f/s,logs:%.1f/s; efficiency=%.3f/%.3f (min>=%.3f); paired_rounds=%d/%d (required>=%d); scaled_latency_ms=%s",
 		result.SingleCapacityReference.SamplesPerSecond,
 		result.SingleCapacityReference.SampleSource,
 		result.SingleCapacityReference.LogsPerSecond,
@@ -1942,8 +1992,65 @@ func formatScaleFailureDiagnostics(result scaleGateResult) string {
 		result.PassingScaledRounds,
 		len(result.ScaledRoundEfficiencies),
 		result.RequiredPassingScaledRounds,
+		formatLatencySummary(result.Scaled.RequestLatency),
 	))
 	return strings.Join(lines, "\n")
+}
+
+func formatLatencySummary(summary latencySummary) string {
+	return fmt.Sprintf("p50:%.2f/p95:%.2f/p99:%.2f", summary.P50MS, summary.P95MS, summary.P99MS)
+}
+
+func formatUintSlice(values []uint64) string {
+	if len(values) == 0 {
+		return "[]"
+	}
+	parts := make([]string, len(values))
+	for index, value := range values {
+		parts[index] = strconv.FormatUint(value, 10)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+func formatFloatSlice(values []float64) string {
+	if len(values) == 0 {
+		return "[]"
+	}
+	parts := make([]string, len(values))
+	for index, value := range values {
+		parts[index] = fmt.Sprintf("%.1f", value)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+func formatScaleTargetBaselines(baselines []scaleTargetBaseline) string {
+	if len(baselines) == 0 {
+		return "none"
+	}
+	entries := make([]string, 0, len(baselines))
+	for _, baseline := range baselines {
+		roundEntries := make([]string, 0, len(baseline.Rounds))
+		for roundIndex, phase := range baseline.Rounds {
+			roundEntries = append(roundEntries, fmt.Sprintf(
+				"%d(samples=%.1f/s, logs=%.1f/s, latency_ms=%s, reqs=%s, rps=%s)",
+				roundIndex+1,
+				phase.SamplesPerSecond,
+				phase.LogsPerSecond,
+				formatLatencySummary(phase.RequestLatency),
+				formatUintSlice(phase.RequestsPerTarget),
+				formatFloatSlice(phase.RecordsPerSecondPerTarget),
+			))
+		}
+		entries = append(entries, fmt.Sprintf(
+			"%s(median: samples=%.1f/s, logs=%.1f/s, latency_ms=%s; rounds=[%s])",
+			baseline.Target,
+			baseline.Median.SamplesPerSecond,
+			baseline.Median.LogsPerSecond,
+			formatLatencySummary(baseline.Median.RequestLatency),
+			strings.Join(roundEntries, ", "),
+		))
+	}
+	return strings.Join(entries, "; ")
 }
 
 func evaluateScaleRoundEfficiencies(
@@ -1991,6 +2098,30 @@ func applyScaleRoundEfficiencyGate(result *scaleGateResult, rounds []scalePhaseR
 			result.MinPassingRoundRatio,
 			formatFailingScaleRounds(result.ScaledRoundEfficiencies),
 		))
+	}
+	applyAggregateMedianEfficiencyGate(result)
+}
+
+func applyAggregateMedianEfficiencyGate(result *scaleGateResult) {
+	if result.SampleReplicaEfficiency < result.MinReplicaEfficiency {
+		appendScaleFailure(
+			result,
+			fmt.Sprintf(
+				"aggregate median metric replica efficiency %.3f is below %.3f",
+				result.SampleReplicaEfficiency,
+				result.MinReplicaEfficiency,
+			),
+		)
+	}
+	if result.LogReplicaEfficiency < result.MinReplicaEfficiency {
+		appendScaleFailure(
+			result,
+			fmt.Sprintf(
+				"aggregate median log replica efficiency %.3f is below %.3f",
+				result.LogReplicaEfficiency,
+				result.MinReplicaEfficiency,
+			),
+		)
 	}
 	result.GatePassed = len(result.GateFailures) == 0
 }
@@ -2145,6 +2276,6 @@ func evaluateCapacityScaling(
 			)
 		}
 	}
-	result.GatePassed = len(result.GateFailures) == 0
+	applyAggregateMedianEfficiencyGate(&result)
 	return result
 }
