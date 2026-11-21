@@ -742,6 +742,7 @@ func (s *Store) DeleteProject(ctx context.Context, id int) error {
 		`DELETE FROM issues WHERE project_id = ?`,
 		`DELETE FROM replay_segments WHERE project_id = ?`,
 		`DELETE FROM replay_sessions WHERE project_id = ?`,
+		`DELETE FROM source_map_upload_pins WHERE project_id = ?`,
 		`DELETE FROM source_map_artifacts WHERE project_id = ?`,
 		`DELETE FROM scrape_targets WHERE project_id = ?`,
 		`DELETE FROM profile_metas WHERE project_id = ?`,
@@ -1851,6 +1852,28 @@ func releasePostgresAdvisoryLock(conn *sql.Conn, lockKey int64, operation string
 	defer cancel()
 	var released bool
 	err := conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock($1)`, lockKey).Scan(&released)
+	if err == nil && released {
+		return nil
+	}
+	// A failed unlock must never return a session-scoped lock to database/sql's
+	// pool. pgx stdlib exposes the underlying connection only for this discard.
+	_ = conn.Raw(func(driverConn any) error {
+		if pgxConn, ok := driverConn.(*pgxstdlib.Conn); ok {
+			_ = pgxConn.Conn().Close(context.Background())
+		}
+		return driver.ErrBadConn
+	})
+	if err != nil {
+		return fmt.Errorf("release %s lock: %w", operation, err)
+	}
+	return fmt.Errorf("release %s lock: lock was not held by the reserved connection", operation)
+}
+
+func releasePostgresAdvisoryLock2(conn *sql.Conn, namespace, key int, operation string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), migrationUnlockTimeout)
+	defer cancel()
+	var released bool
+	err := conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock($1, $2)`, namespace, key).Scan(&released)
 	if err == nil && released {
 		return nil
 	}

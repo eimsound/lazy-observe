@@ -192,3 +192,170 @@ func TestListSourceMapReleasesSQLPushdownAggregationAndLimit(t *testing.T) {
 		}
 	})
 }
+
+func TestSourceMapUploadPinsLifecycleAndSweepSerialization(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "PinnedMaps", "pinned-maps")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+		d1, d2 := strings.Repeat("1", 64), strings.Repeat("2", 64)
+
+		// 1. Active pin appears in ReferencedSourceMapDigestsAt and hands off
+		// atomically to source_map_artifacts on commit.
+		token, err := store.PinSourceMapUploads(ctx, project.ID, []string{d1, d1}, now.Add(15*time.Minute))
+		if err != nil || token == "" {
+			t.Fatalf("PinSourceMapUploads token=%q err=%v", token, err)
+		}
+		refs, err := store.ReferencedSourceMapDigestsAt(ctx, project.ID, now)
+		if err != nil || !refs[d1] {
+			t.Fatalf("active pin missing from references: refs=%v err=%v", refs, err)
+		}
+		if err := store.CommitPinnedSourceMapArtifacts(
+			ctx,
+			project.ID,
+			"r1",
+			token,
+			[]SourceMapArtifactInput{{Filename: "a.js", Size: 10, SHA256: d1}},
+			10,
+			1000,
+			now,
+		); err != nil {
+			t.Fatalf("CommitPinnedSourceMapArtifacts: %v", err)
+		}
+		// Reusing an already consumed pin must fail cleanly.
+		if err := store.CommitPinnedSourceMapArtifacts(
+			ctx,
+			project.ID,
+			"r1",
+			token,
+			[]SourceMapArtifactInput{{Filename: "a.js", Size: 10, SHA256: d1}},
+			10,
+			1000,
+			now,
+		); !errors.Is(err, ErrSourceMapUploadPinExpired) {
+			t.Fatalf("reused pin err=%v want ErrSourceMapUploadPinExpired", err)
+		}
+
+		// 2. Expired pin is purged by WithSourceMapSweepLock and subsequent late
+		// commit is rejected with ErrSourceMapUploadPinExpired.
+		expiredToken, err := store.PinSourceMapUploads(ctx, project.ID, []string{d2}, now.Add(5*time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		later := now.Add(6 * time.Minute)
+		var sawD2 bool
+		if err := store.WithSourceMapSweepLock(ctx, project.ID, later, func(locked map[string]bool) error {
+			sawD2 = locked[d2]
+			return nil
+		}); err != nil {
+			t.Fatalf("WithSourceMapSweepLock: %v", err)
+		}
+		if sawD2 {
+			t.Fatalf("expired pin %s should not remain referenced after sweep purge", d2)
+		}
+		if err := store.CommitPinnedSourceMapArtifacts(
+			ctx,
+			project.ID,
+			"r2",
+			expiredToken,
+			[]SourceMapArtifactInput{{Filename: "b.js", Size: 10, SHA256: d2}},
+			10,
+			1000,
+			later,
+		); !errors.Is(err, ErrSourceMapUploadPinExpired) {
+			t.Fatalf("late commit after expiry err=%v want ErrSourceMapUploadPinExpired", err)
+		}
+
+		// 3. WithSourceMapSweepLock blocks concurrent PinSourceMapUploads until released.
+		lockHeld := make(chan struct{})
+		releaseLock := make(chan struct{})
+		sweepDone := make(chan error, 1)
+		go func() {
+			sweepDone <- store.WithSourceMapSweepLock(ctx, project.ID, later, func(map[string]bool) error {
+				close(lockHeld)
+				<-releaseLock
+				return nil
+			})
+		}()
+		select {
+		case <-lockHeld:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for sweep lock")
+		}
+		pinDone := make(chan error, 1)
+		go func() {
+			pinTok, pinErr := store.PinSourceMapUploads(ctx, project.ID, []string{d2}, later.Add(15*time.Minute))
+			if pinErr == nil {
+				pinErr = store.ReleaseSourceMapUploadPins(ctx, project.ID, pinTok)
+			}
+			pinDone <- pinErr
+		}()
+		select {
+		case err := <-pinDone:
+			t.Fatalf("PinSourceMapUploads bypassed sweep lock (err=%v)", err)
+		default:
+		}
+		close(releaseLock)
+		if err := <-sweepDone; err != nil {
+			t.Fatalf("WithSourceMapSweepLock failed: %v", err)
+		}
+		select {
+		case err := <-pinDone:
+			if err != nil {
+				t.Fatalf("PinSourceMapUploads after unlock failed: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for PinSourceMapUploads after unlock")
+		}
+
+		// 4. PruneExpiredSourceMapUploadPins removes leftover expired pins in batches.
+		if _, err := store.PinSourceMapUploads(ctx, project.ID, []string{d2}, now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		pruned, err := store.PruneExpiredSourceMapUploadPins(ctx, later)
+		if err != nil || pruned != 1 {
+			t.Fatalf("PruneExpiredSourceMapUploadPins pruned=%d err=%v want 1", pruned, err)
+		}
+	})
+}
+
+func TestDeleteExpiredSourceMapReleaseRespectsConcurrentRefresh(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "ExpireMaps", "expire-maps")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+		cutoff := now.Add(-90 * 24 * time.Hour)
+		old := cutoff.Add(-time.Hour)
+		d1 := strings.Repeat("a", 64)
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-old", "a.js", 10, d1, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-refreshed", "a.js", 10, d1, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-refreshed", "b.js", 10, d1, now); err != nil {
+			t.Fatal(err)
+		}
+
+		removed, err := store.DeleteExpiredSourceMapRelease(ctx, project.ID, "r-refreshed", cutoff)
+		if err != nil || removed {
+			t.Fatalf("DeleteExpiredSourceMapRelease(r-refreshed) removed=%v err=%v want false", removed, err)
+		}
+		if rows, err := store.SourceMapArtifacts(ctx, project.ID, "r-refreshed"); err != nil || len(rows) != 2 {
+			t.Fatalf("r-refreshed rows=%d err=%v want 2", len(rows), err)
+		}
+		removed, err = store.DeleteExpiredSourceMapRelease(ctx, project.ID, "r-old", cutoff)
+		if err != nil || !removed {
+			t.Fatalf("DeleteExpiredSourceMapRelease(r-old) removed=%v err=%v want true", removed, err)
+		}
+		if rows, err := store.SourceMapArtifacts(ctx, project.ID, "r-old"); err != nil || len(rows) != 0 {
+			t.Fatalf("r-old rows=%d err=%v want 0", len(rows), err)
+		}
+	})
+}

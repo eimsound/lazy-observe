@@ -20,7 +20,23 @@ type SourceMapStore interface {
 	ReferencedSourceMapDigests(context.Context, int) (map[string]bool, error)
 }
 
-const DefaultSourceMapGracePeriod = 15 * time.Minute
+type conditionalSourceMapReleaseDeleter interface {
+	DeleteExpiredSourceMapRelease(context.Context, int, string, time.Time) (bool, error)
+}
+
+type sourceMapSweepStore interface {
+	ReferencedSourceMapDigestsAt(context.Context, int, time.Time) (map[string]bool, error)
+	WithSourceMapSweepLock(context.Context, int, time.Time, func(map[string]bool) error) error
+}
+
+type sourceMapPinPruner interface {
+	PruneExpiredSourceMapUploadPins(context.Context, time.Time) (int, error)
+}
+
+const (
+	DefaultSourceMapGracePeriod   = 15 * time.Minute
+	sourceMapSweepDeleteBatchSize = 16
+)
 
 type SourceMaps struct {
 	Metadata    SourceMapStore
@@ -38,19 +54,44 @@ func (c *SourceMaps) Clean(ctx context.Context, cutoff time.Time) (int, error) {
 	if c.Metadata == nil || c.Blobs == nil {
 		return 0, nil
 	}
+	cutoff = cutoff.UTC().Round(0)
 	deleted := 0
+	skipped := make(map[meta.ExpiredSourceMapRelease]struct{})
+	conditionalDeleter, hasConditionalDelete := c.Metadata.(conditionalSourceMapReleaseDeleter)
 	for {
 		releases, err := c.Metadata.ListExpiredSourceMapReleases(ctx, cutoff, 100)
 		if err != nil {
 			return deleted, fmt.Errorf("list expired source map releases: %w", err)
 		}
+		if len(releases) == 0 {
+			break
+		}
+		progressed := false
 		for _, release := range releases {
-			if err := c.Metadata.DeleteSourceMapArtifacts(ctx, release.ProjectID, release.Release); err != nil {
+			if _, skip := skipped[release]; skip {
+				continue
+			}
+			if hasConditionalDelete {
+				removed, err := conditionalDeleter.DeleteExpiredSourceMapRelease(
+					ctx,
+					release.ProjectID,
+					release.Release,
+					cutoff,
+				)
+				if err != nil {
+					return deleted, fmt.Errorf("delete source map metadata for %s: %w", release.Release, err)
+				}
+				if !removed {
+					skipped[release] = struct{}{}
+					continue
+				}
+			} else if err := c.Metadata.DeleteSourceMapArtifacts(ctx, release.ProjectID, release.Release); err != nil {
 				return deleted, fmt.Errorf("delete source map metadata for %s: %w", release.Release, err)
 			}
 			deleted++
+			progressed = true
 		}
-		if len(releases) < 100 {
+		if !progressed || len(releases) < 100 {
 			break
 		}
 	}
@@ -66,7 +107,7 @@ func (c *SourceMaps) sweepRevisions(ctx context.Context) error {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
-	now := nowFn().UTC()
+	now := nowFn().UTC().Round(0)
 	grace := c.GracePeriod
 	if grace == 0 {
 		grace = DefaultSourceMapGracePeriod
@@ -77,15 +118,15 @@ func (c *SourceMaps) sweepRevisions(ctx context.Context) error {
 		if len(parts) != 4 || parts[2] != "revisions" || !strings.HasSuffix(parts[3], ".map") {
 			continue
 		}
-		// Skip recently written blobs so an in-flight upload between blob Put
+		// Skip recently written blobs so an unpinned upload between blob Put
 		// and metadata Upsert commit is never reclaimed as an orphan.
 		if grace > 0 && !object.ModTime.IsZero() && now.Sub(object.ModTime.UTC()) < grace {
 			continue
 		}
 		byProject[parts[1]] = append(byProject[parts[1]], strings.TrimSuffix(parts[3], ".map"))
 	}
+	sweepStore, hasSweepLock := c.Metadata.(sourceMapSweepStore)
 	for slug, digests := range byProject {
-		var referenced map[string]bool
 		project, err := c.Metadata.ProjectBySlug(ctx, slug)
 		if err != nil {
 			if !meta.IsNotFound(err) {
@@ -93,20 +134,66 @@ func (c *SourceMaps) sweepRevisions(ctx context.Context) error {
 			}
 			// Project no longer exists; every past-grace revision under this
 			// slug is orphaned and must be reclaimed.
-		} else {
-			referenced, err = c.Metadata.ReferencedSourceMapDigests(ctx, project.ID)
+			for _, digest := range digests {
+				key := symbolicate.RevisionKey(slug, digest)
+				if err := c.Blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+					return fmt.Errorf("delete source map revision %s: %w", key, err)
+				}
+			}
+			continue
+		}
+		if !hasSweepLock {
+			referenced, err := c.Metadata.ReferencedSourceMapDigests(ctx, project.ID)
 			if err != nil {
 				return fmt.Errorf("list referenced source map revisions for %s: %w", slug, err)
 			}
+			for _, digest := range digests {
+				if referenced[digest] {
+					continue
+				}
+				key := symbolicate.RevisionKey(slug, digest)
+				if err := c.Blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+					return fmt.Errorf("delete source map revision %s: %w", key, err)
+				}
+			}
+			continue
 		}
+		referenced, err := sweepStore.ReferencedSourceMapDigestsAt(ctx, project.ID, now)
+		if err != nil {
+			return fmt.Errorf("list referenced source map revisions for %s: %w", slug, err)
+		}
+		candidates := make([]string, 0)
 		for _, digest := range digests {
-			if referenced[digest] {
-				continue
+			if !referenced[digest] {
+				candidates = append(candidates, digest)
 			}
-			key := symbolicate.RevisionKey(slug, digest)
-			if err := c.Blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
-				return fmt.Errorf("delete source map revision %s: %w", key, err)
+		}
+		for start := 0; start < len(candidates); start += sourceMapSweepDeleteBatchSize {
+			batch := candidates[start:min(start+sourceMapSweepDeleteBatchSize, len(candidates))]
+			if err := sweepStore.WithSourceMapSweepLock(
+				ctx,
+				project.ID,
+				now,
+				func(lockedReferenced map[string]bool) error {
+					for _, digest := range batch {
+						if lockedReferenced[digest] {
+							continue
+						}
+						key := symbolicate.RevisionKey(slug, digest)
+						if err := c.Blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+							return fmt.Errorf("delete source map revision %s: %w", key, err)
+						}
+					}
+					return nil
+				},
+			); err != nil {
+				return fmt.Errorf("sweep source map revisions for %s: %w", slug, err)
 			}
+		}
+	}
+	if pruner, ok := c.Metadata.(sourceMapPinPruner); ok {
+		if _, err := pruner.PruneExpiredSourceMapUploadPins(ctx, now); err != nil {
+			return fmt.Errorf("prune expired source map upload pins: %w", err)
 		}
 	}
 	return nil

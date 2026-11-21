@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/symbolicate"
@@ -18,10 +20,27 @@ import (
 )
 
 const (
-	maxSourceMapFiles        = 200
-	maxSourceMapBytes        = 50 << 20
-	maxSourceMapFilenameSize = 512
+	maxSourceMapFiles            = 200
+	maxSourceMapBytes            = 50 << 20
+	maxSourceMapFilenameSize     = 512
+	defaultSourceMapUploadPinTTL = 15 * time.Minute
+	sourceMapPinReleaseTimeout   = 5 * time.Second
 )
+
+type sourceMapPinnedUploadStore interface {
+	PinSourceMapUploads(context.Context, int, []string, time.Time) (string, error)
+	ReleaseSourceMapUploadPins(context.Context, int, string) error
+	CommitPinnedSourceMapArtifacts(
+		context.Context,
+		int,
+		string,
+		string,
+		[]meta.SourceMapArtifactInput,
+		int,
+		int64,
+		time.Time,
+	) error
+}
 
 var sourceMapComponent = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
@@ -87,33 +106,107 @@ func (g *Gateway) uploadSourceMaps(c fiber.Ctx) error {
 	}
 	p := currentProject(c)
 	items := make([]meta.SourceMapArtifactInput, 0, len(uploads))
+	uniqueUploads := make([]sourceMapUpload, 0, len(uploads))
+	uniqueDigests := make([]string, 0, len(uploads))
+	seenDigests := make(map[string]struct{}, len(uploads))
 	for _, upload := range uploads {
-		key := sourceMapRevisionKey(p.Slug, upload.digest)
-		if err := g.blobs.Put(c.Context(), key, bytes.NewReader(upload.data)); err != nil {
-			g.logger.Warn("store source map blob failed", "project", p.Slug, "release", release, "error", err)
-			return fiber.NewError(http.StatusInternalServerError, "store source map failed")
-		}
 		items = append(items, meta.SourceMapArtifactInput{
 			Filename: upload.filename,
 			Size:     int64(len(upload.data)),
 			SHA256:   upload.digest,
 		})
+		if _, dup := seenDigests[upload.digest]; dup {
+			continue
+		}
+		seenDigests[upload.digest] = struct{}{}
+		uniqueUploads = append(uniqueUploads, upload)
+		uniqueDigests = append(uniqueDigests, upload.digest)
 	}
-	if err := g.sourceMaps.UpsertSourceMapArtifacts(
-		c.Context(),
-		p.ID,
-		release,
-		items,
-		maxSourceMapFiles,
-		maxSourceMapBytes,
-		g.now().UTC(),
-	); err != nil {
-		if errors.Is(err, meta.ErrSourceMapQuotaExceeded) {
+	pinStore, hasPinStore := g.sourceMaps.(sourceMapPinnedUploadStore)
+	var pinToken string
+	committed := false
+	if hasPinStore {
+		pinTTL := g.sourceMapUploadPinTTL
+		if pinTTL <= 0 {
+			pinTTL = defaultSourceMapUploadPinTTL
+		}
+		var pinErr error
+		pinToken, pinErr = pinStore.PinSourceMapUploads(
+			c.Context(),
+			p.ID,
+			uniqueDigests,
+			g.now().UTC().Add(pinTTL),
+		)
+		if pinErr != nil {
+			g.logger.Warn("pin source map upload failed", "project", p.Slug, "release", release, "error", pinErr)
+			return fiber.NewError(http.StatusInternalServerError, "persist source map metadata failed")
+		}
+		defer func() {
+			if committed || pinToken == "" {
+				return
+			}
+			releaseCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(c.Context()),
+				sourceMapPinReleaseTimeout,
+			)
+			defer cancel()
+			if releaseErr := pinStore.ReleaseSourceMapUploadPins(releaseCtx, p.ID, pinToken); releaseErr != nil {
+				g.logger.Warn(
+					"release source map upload pins failed",
+					"project", p.Slug,
+					"release", release,
+					"error", releaseErr,
+				)
+			}
+		}()
+	}
+	for _, upload := range uniqueUploads {
+		key := sourceMapRevisionKey(p.Slug, upload.digest)
+		if err := g.blobs.Put(c.Context(), key, bytes.NewReader(upload.data)); err != nil {
+			g.logger.Warn("store source map blob failed", "project", p.Slug, "release", release, "error", err)
+			return fiber.NewError(http.StatusInternalServerError, "store source map failed")
+		}
+	}
+	var persistErr error
+	if hasPinStore {
+		persistErr = pinStore.CommitPinnedSourceMapArtifacts(
+			c.Context(),
+			p.ID,
+			release,
+			pinToken,
+			items,
+			maxSourceMapFiles,
+			maxSourceMapBytes,
+			g.now().UTC(),
+		)
+	} else {
+		persistErr = g.sourceMaps.UpsertSourceMapArtifacts(
+			c.Context(),
+			p.ID,
+			release,
+			items,
+			maxSourceMapFiles,
+			maxSourceMapBytes,
+			g.now().UTC(),
+		)
+	}
+	if persistErr != nil {
+		if errors.Is(persistErr, meta.ErrSourceMapQuotaExceeded) {
 			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "release archive limit exceeded"})
 		}
-		g.logger.Warn("persist source map metadata failed", "project", p.Slug, "release", release, "error", err)
+		if errors.Is(persistErr, meta.ErrSourceMapUploadPinExpired) {
+			g.logger.Warn(
+				"source map upload pin expired before commit",
+				"project", p.Slug,
+				"release", release,
+			)
+			return c.Status(http.StatusServiceUnavailable).
+				JSON(fiber.Map{"error": "source map upload expired; retry upload"})
+		}
+		g.logger.Warn("persist source map metadata failed", "project", p.Slug, "release", release, "error", persistErr)
 		return fiber.NewError(http.StatusInternalServerError, "persist source map metadata failed")
 	}
+	committed = true
 	return c.Status(http.StatusCreated).
 		JSON(fiber.Map{"release": release, "uploaded": len(uploads), "size": incomingBytes})
 }

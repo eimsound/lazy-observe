@@ -262,6 +262,7 @@ type domainStores struct {
 	replays                 ReplayStore
 	blobs                   blob.Store
 	sourceMaps              SourceMapStore
+	sourceMapUploadPinTTL   time.Duration
 	profiles                ProfileStore
 	scrapes                 *scrape.Service
 	scrapeUnavailableReason string
