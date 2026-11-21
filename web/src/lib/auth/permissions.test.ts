@@ -141,28 +141,24 @@ function parseGatewayRoutes(source: string): Map<string, Role> {
     throw new Error(`unclosed function body for ${fnName}`);
   };
 
-  const scan = (body: string, receiver: "g.app" | "api", prefix: string) => {
-    const escaped = receiver.replace(".", "\\.");
-    const pattern = new RegExp(
-      `${escaped}\\.(Get|Post|Put|Patch|Delete)\\(\\s*"([^"]+)"([^)]*)\\)`,
-      "gs",
-    );
+  const scan = (body: string) => {
+    const pattern = /g\.route\(\s*fiber\.Method(Get|Post|Put|Patch|Delete),\s*"([^"]+)",\s*routePolicy\{([^}]*)\}/gs;
     for (const match of body.matchAll(pattern)) {
       const method = match[1].toUpperCase();
-      const fullPath = `${prefix}${match[2]}`;
-      const args = match[3];
-      const role: Role = args.includes("g.adminRequired")
+      const fullPath = match[2];
+      const policy = match[3];
+      const role: Role = /role:\s*roleAdmin\b/.test(policy)
         ? "admin"
-        : args.includes("g.memberRequired")
+        : /role:\s*roleMember\b/.test(policy)
           ? "member"
           : "viewer";
       routes.set(`${method} ${fullPath}`, role);
     }
   };
 
-  scan(registerBody("registerPlatformRoutes"), "g.app", "");
-  scan(registerBody("registerAuthRoutes"), "g.app", "");
-  scan(registerBody("registerSessionAPI"), "api", "/api");
+  scan(registerBody("registerPlatformRoutes"));
+  scan(registerBody("registerAuthRoutes"));
+  scan(registerBody("registerSessionAPI"));
   return routes;
 }
 

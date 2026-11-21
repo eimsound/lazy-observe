@@ -59,6 +59,19 @@ type Limiter interface {
 	Allow(context.Context, string, int, time.Duration) (bool, error)
 }
 
+// AuthInvalidator propagates authentication and token-cache invalidations
+// across gateway replicas (for example via Redis Pub/Sub).
+type AuthInvalidator interface {
+	// Publish notifies all subscribed replicas that cached authentication state
+	// changed and must be invalidated.
+	Publish(ctx context.Context) error
+	// Subscribe listens for invalidation events until ctx is canceled.
+	// onReady, when non-nil, is called once after the initial subscription is
+	// established; onInvalidate is called for each remote invalidation and on
+	// reconnect after a dropped subscription.
+	Subscribe(ctx context.Context, onReady func(), onInvalidate func()) error
+}
+
 type memorySessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]Session

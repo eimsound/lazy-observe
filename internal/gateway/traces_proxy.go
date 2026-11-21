@@ -23,7 +23,7 @@ func (g *Gateway) traceOperations(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return g.tenantProxy(
+	return g.proxy.tenantHandler(
 		g.storage.TracesQueryBase(),
 		"/select/jaeger/api/services/"+url.PathEscape(svc)+"/operations",
 	)(c)
@@ -34,7 +34,7 @@ func (g *Gateway) traceByID(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return g.tenantProxy(
+	return g.proxy.tenantHandler(
 		g.storage.TracesQueryBase(),
 		"/select/jaeger/api/traces/"+url.PathEscape(traceID),
 	)(c)
@@ -42,7 +42,7 @@ func (g *Gateway) traceByID(c fiber.Ctx) error {
 
 func (g *Gateway) traceSearch(c fiber.Ctx) error {
 	p := currentProject(c)
-	return g.executeProxy(c, proxySpec{
+	return g.proxy.execute(c, proxySpec{
 		kind:          proxyKindUnary,
 		base:          g.storage.TracesQueryBase(),
 		upstreamPath:  "/select/jaeger/api/traces",

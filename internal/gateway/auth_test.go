@@ -267,7 +267,7 @@ func TestRBACViewerForbiddenAdminAllowed(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/projects", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(viewer)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("viewer create: status=%d err=%v", resp.StatusCode, err)
 	}
@@ -275,7 +275,7 @@ func TestRBACViewerForbiddenAdminAllowed(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/projects", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(admin)
-	resp, err = app.Test(req)
+	resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin create: status=%d err=%v", resp.StatusCode, err)
 	}
@@ -288,7 +288,7 @@ func TestAlertWriteRBAC(t *testing.T) {
 	body := bytes.NewReader([]byte(`{"name":"Always","expr":"vector(1)"}`))
 	req := httptest.NewRequest(http.MethodPost, "/api/alert-rules", body)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("anonymous rule write: status=%d err=%v", resp.StatusCode, err)
 	}
@@ -299,7 +299,7 @@ func TestAlertWriteRBAC(t *testing.T) {
 	)
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(viewer)
-	resp, err = app.Test(req)
+	resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("viewer rule write: status=%d err=%v", resp.StatusCode, err)
 	}
@@ -327,20 +327,20 @@ func TestQueryAuthenticationBothChannels(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/logs/query?query=*", nil)
 	req.Header.Set("Authorization", "Bearer "+userQueryToken(t, store, "token-reader"))
 	req.Header.Set("X-LO-Project", "alpha")
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusNoContent || <-projects != strconvI(project.ID) {
 		t.Fatalf("user token channel: status=%d err=%v", resp.StatusCode, err)
 	}
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/logs/query?query=*", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err = app.Test(req)
+	resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("project token channel: status=%d err=%v", resp.StatusCode, err)
 	}
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/logs/query?query=*", nil)
 	req.Header.Set("X-LO-Project", "alpha")
 	req.AddCookie(cookie)
-	resp, err = app.Test(req)
+	resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusNoContent || <-projects != strconvI(project.ID) {
 		t.Fatalf("session channel: status=%d err=%v", resp.StatusCode, err)
 	}
@@ -355,7 +355,7 @@ func TestLoginRateLimit(t *testing.T) {
 	for i := 1; i <= 11; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader([]byte(`{}`)))
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -381,7 +381,7 @@ func TestLoginAccountRateLimitAcrossSourceIPs(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
 		req.RemoteAddr = fmt.Sprintf("10.0.0.%d:1234", i)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -420,7 +420,7 @@ func TestLoginFailureResponseAndDelayDoNotRevealUsername(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
 		started := time.Now()
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -452,7 +452,7 @@ func TestLoginReportsAuthenticationServiceFailure(t *testing.T) {
 		bytes.NewReader([]byte(`{"username":"admin","password":"secret"}`)),
 	)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,7 +478,7 @@ func TestSharedSessionLoginFailureDoesNotLeaveSession(t *testing.T) {
 	payload, _ := json.Marshal(map[string]string{"username": "partial", "password": "secret"})
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,9 +518,12 @@ func TestSharedSessionUsesCurrentUserRole(t *testing.T) {
 	payload, _ := json.Marshal(map[string]string{"username": "changing-role", "password": "secret"})
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("login status=%d err=%v", resp.StatusCode, err)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
+	if err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login status=%d", resp.StatusCode)
 	}
 	cookie := resp.Cookies()[0]
 
@@ -534,7 +537,7 @@ func TestSharedSessionUsesCurrentUserRole(t *testing.T) {
 	)
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
-	resp, err = app.Test(req)
+	resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("stale member role status=%d err=%v", resp.StatusCode, err)
 	}
@@ -544,7 +547,7 @@ func TestSharedSessionUsesCurrentUserRole(t *testing.T) {
 	}
 	req = httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
 	req.AddCookie(cookie)
-	resp, err = app.Test(req)
+	resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("deleted user session status=%d err=%v", resp.StatusCode, err)
 	}
@@ -559,7 +562,7 @@ func TestLoginCookieAndMe(t *testing.T) {
 	payload, _ := json.Marshal(map[string]string{"username": "admin", "password": "secret"})
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusOK || len(resp.Cookies()) != 1 {
 		t.Fatalf("login: status=%d cookies=%v err=%v", resp.StatusCode, resp.Cookies(), err)
 	}
@@ -569,7 +572,7 @@ func TestLoginCookieAndMe(t *testing.T) {
 	}
 	req = httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
 	req.AddCookie(cookie)
-	resp, err = app.Test(req)
+	resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("me: status=%d err=%v", resp.StatusCode, err)
 	}
@@ -620,7 +623,7 @@ func TestRedisSessionAndLoginLimitSharedAcrossGatewayReplicas(t *testing.T) {
 		}
 		req = httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader([]byte(`{}`)))
 		req.Header.Set("Content-Type", "application/json")
-		resp, err = app.Test(req)
+		resp, err = app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}

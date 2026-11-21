@@ -22,6 +22,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/profiling"
+	"github.com/gofiber/fiber/v3"
 	pprofprofile "github.com/google/pprof/profile"
 )
 
@@ -371,7 +372,7 @@ func uploadProfileFixtureWithID(
 	req := httptest.NewRequest(http.MethodPost, "/api/profiles", &body)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +388,7 @@ func profileGET(t *testing.T, app httpTestApp, reader, project, target string) *
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	req.Header.Set("Authorization", "Bearer "+reader)
 	req.Header.Set("X-LO-Project", project)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +622,7 @@ func TestProfileIngestFutureClampMetadataBoundsAndRateLimit(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/profiles", &body)
 		req.Header.Set("Content-Type", w.FormDataContentType())
 		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -836,7 +837,7 @@ func TestDeleteProjectCleansProfileAndReplayBlobs(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/projects/"+strconvI(p.ID), nil)
 	req.Header.Set("Authorization", "Bearer "+adminToken)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
 	if err != nil {
 		t.Fatal(err)
 	}

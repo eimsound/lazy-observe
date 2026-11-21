@@ -240,10 +240,10 @@ func TestLiveTailEnforcesConcurrencyLimitsAndReleasesSlots(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
-	for gw.liveTail.activeCount() != 0 && time.Now().Before(deadline) {
+	for gw.proxy.liveTail.activeCount() != 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if active := gw.liveTail.activeCount(); active != 0 {
+	if active := gw.proxy.liveTail.activeCount(); active != 0 {
 		t.Fatalf("active live tail slots=%d want=0", active)
 	}
 

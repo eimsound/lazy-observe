@@ -568,7 +568,7 @@ func (g *Gateway) streamLLMTracesQuery(
 	query url.Values,
 	onRow func(map[string]json.RawMessage) error,
 ) error {
-	return newLLMTracesQuerier(g.storage, g.client, llmMaxResponseBody, g.proxyTimeout).
+	return newLLMTracesQuerier(g.storage, g.client, llmMaxResponseBody, g.requestProxyTimeout()).
 		StreamLogsQL(ctx, project, query, onRow)
 }
 

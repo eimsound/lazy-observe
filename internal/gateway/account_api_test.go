@@ -64,7 +64,7 @@ func TestChangePasswordEndpoint(t *testing.T) {
 			req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrf})
 			req.Header.Set(csrfHeaderName, csrf)
 		}
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,7 +188,7 @@ func TestUpdateMeProfile(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPut, "/api/auth/me", bytes.NewReader([]byte(body)))
 		req.Header.Set("Content-Type", "application/json")
 		req.AddCookie(cookie)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -251,7 +251,7 @@ func TestSessionManagementEndpoints(t *testing.T) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodGet, "/api/auth/sessions", nil)
 		req.AddCookie(cookie)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -322,7 +322,7 @@ func TestAuditEndpointAdminOnlyWithFilters(t *testing.T) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodGet, "/api/audit"+query, nil)
 		req.AddCookie(cookie)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -391,7 +391,7 @@ func TestCSRFEnforcementAndCookies(t *testing.T) {
 			req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrfValue})
 			req.Header.Set(csrfHeaderName, csrfValue)
 		}
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -458,7 +458,7 @@ func TestLoginLockoutLiftsAfterWindow(t *testing.T) {
 		payload, _ := json.Marshal(map[string]string{"username": "locker", "password": password})
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatal(err)
 		}

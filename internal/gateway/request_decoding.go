@@ -14,6 +14,11 @@ import (
 // boundedRequestDecoding removed, for handlers whose contract depends on it.
 const decodedContentEncodingLocal = "lazy-observe.decoded-content-encoding"
 
+// decodedBodyLocal stores the already-owned byte slice produced by
+// boundedRequestDecoding so requestBody avoids copying a decoded payload a
+// second time under Immutable mode.
+const decodedBodyLocal = "lazy-observe.decoded-body"
+
 // maxContentEncodingLayers bounds stacked HTTP Content-Encoding transformations
 // so crafted multi-layer headers cannot amplify CPU work before auth.
 const maxContentEncodingLayers = 4
@@ -82,6 +87,7 @@ func boundedRequestDecoding(c fiber.Ctx) error {
 	c.Request().SetBodyRaw(body)
 	c.Request().Header.Del(fiber.HeaderContentEncoding)
 	c.Locals(decodedContentEncodingLocal, strings.Join(codings, ", "))
+	c.Locals(decodedBodyLocal, body)
 	return c.Next()
 }
 
@@ -152,9 +158,13 @@ var _ io.Writer = (*limitedBuffer)(nil)
 // it. Handlers must not use Ctx.Body: Fiber v3's Body decodes Content-Encoding
 // a second time, and for a coding it cannot undo (snappy on Prometheus
 // remote-write) it answers 415 or 501 and returns the error text in place of
-// the bytes. Reading fasthttp's raw body keeps the v2 contract. GetBytes
-// detaches the slice when the app is Immutable, as Ctx.Body did, because
-// fasthttp reuses the buffer for the next request.
+// the bytes. Reading fasthttp's raw body keeps the v2 contract. When
+// boundedRequestDecoding already decoded into an owned slice, return it directly
+// to avoid a second full-body copy; otherwise GetBytes detaches the slice when
+// the app is Immutable because fasthttp reuses the buffer for the next request.
 func requestBody(c fiber.Ctx) []byte {
+	if owned, ok := c.Locals(decodedBodyLocal).([]byte); ok {
+		return owned
+	}
 	return c.App().GetBytes(c.Request().Body())
 }
