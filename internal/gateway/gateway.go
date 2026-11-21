@@ -597,6 +597,11 @@ func (g *Gateway) waitAuthInvalidationReady(ctx context.Context) error {
 
 func (g *Gateway) App() *fiber.App { return g.app }
 
+// IngestAuthenticator returns the gateway's shared project-token authenticator
+// so auxiliary ingest listeners (such as OTLP/gRPC) share the same cache and
+// cross-replica invalidation stream.
+func (g *Gateway) IngestAuthenticator() *Authenticator { return g.auth }
+
 // AttachErrorTracker completes composition before the listener starts. The
 // Gateway owns only the HTTP acceptance seam; the composition root owns the
 // durable module and its metadata, VLogs, and symbolication adapters.

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +18,15 @@ import (
 	"time"
 
 	appconfig "github.com/eimsound/lazy-observe/internal/config"
+	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/otlpgrpc"
+	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
+	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logsdata "go.opentelemetry.io/proto/otlp/logs/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 type fatalSupervisor struct {
@@ -334,5 +346,163 @@ func TestWaitForServerExitGatewayErrorDrainsWithDeadlineAndStopsSupervisor(t *te
 			gw.drainHasDL.Load(),
 			supervisor.shutdowns.Load(),
 		)
+	}
+}
+
+func TestCollectPlatformEndpointsIncludesOTLPGRPCPortWhenEnabled(t *testing.T) {
+	cfg := appconfig.Defaults()
+	cfg.OTLPGRPC.Enabled = true
+	cfg.OTLPGRPC.Listen = "0.0.0.0:4317"
+
+	ports, _ := collectPlatformEndpoints(cfg, nil, nil)
+	if !slices.Contains(ports, 4317) {
+		t.Fatalf("platform ports=%v missing enabled OTLP/gRPC port 4317", ports)
+	}
+
+	policy, err := serverOutboundPolicy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := policy.BlockedPorts[4317]; !ok {
+		t.Fatalf("outbound policy BlockedPorts=%v missing 4317", policy.BlockedPorts)
+	}
+}
+
+type stubGRPCAuth struct{}
+
+func (stubGRPCAuth) AuthenticateProjectToken(context.Context, string) (meta.ProjectInfo, error) {
+	return meta.ProjectInfo{ID: 1, Slug: "default"}, nil
+}
+
+type signalingGatewayLifecycle struct {
+	recordingGatewayLifecycle
+	drained chan struct{}
+}
+
+func (g *signalingGatewayLifecycle) Drain(ctx context.Context) error {
+	err := g.recordingGatewayLifecycle.Drain(ctx)
+	close(g.drained)
+	return err
+}
+
+func TestCompositeGatewayLifecycleDrainsOTLPGRPCAndHTTPConcurrently(t *testing.T) {
+	upstreamStarted := make(chan struct{}, 1)
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamStarted <- struct{}{}
+		select {
+		case <-releaseUpstream:
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	backend, err := storagepkg.New(
+		storagepkg.MetricsVM,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcSrv, err := otlpgrpc.NewServer(otlpgrpc.Config{
+		Auth:       stubGRPCAuth{},
+		Storage:    backend,
+		HTTPClient: upstream.Client(),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- grpcSrv.Serve(ln) }()
+
+	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Start an in-flight OTLP/gRPC RPC that blocks on upstream so GracefulStop stalls.
+	rpcDone := make(chan error, 1)
+	go func() {
+		ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Bearer lo_test"))
+		_, callErr := logspb.NewLogsServiceClient(conn).Export(ctx, &logspb.ExportLogsServiceRequest{
+			ResourceLogs: []*logsdata.ResourceLogs{{
+				ScopeLogs: []*logsdata.ScopeLogs{{
+					LogRecords: []*logsdata.LogRecord{{
+						Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "in-flight"}},
+					}},
+				}},
+			}},
+		})
+		rpcDone <- callErr
+	}()
+	select {
+	case <-upstreamStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight gRPC export did not reach upstream")
+	}
+
+	httpGW := &signalingGatewayLifecycle{drained: make(chan struct{})}
+	composite := &compositeGatewayLifecycle{
+		httpGateway: httpGW,
+		otlpGRPC:    grpcSrv,
+		drainLimit:  2 * time.Second,
+	}
+	composite.BeginDrain()
+	if httpGW.beginDrains.Load() != 1 {
+		t.Fatalf("beginDrains=%d want=1", httpGW.beginDrains.Load())
+	}
+
+	drainDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		drainDone <- composite.Drain(ctx)
+	}()
+
+	// HTTP Drain must start and complete concurrently without waiting for the slow gRPC RPC.
+	select {
+	case <-httpGW.drained:
+	case <-time.After(500 * time.Millisecond):
+		close(releaseUpstream)
+		t.Fatal("httpGateway.Drain was blocked by slow OTLP/gRPC Shutdown")
+	}
+
+	close(releaseUpstream)
+	if err := <-rpcDone; err != nil {
+		t.Fatalf("in-flight gRPC RPC failed during concurrent drain: %v", err)
+	}
+	if err := <-drainDone; err != nil {
+		t.Fatalf("composite Drain err=%v", err)
+	}
+	if err := <-serveDone; err != nil {
+		t.Fatalf("grpcSrv.Serve err=%v", err)
+	}
+	if httpGW.drains.Load() != 1 {
+		t.Fatalf("http drains=%d want=1", httpGW.drains.Load())
+	}
+}
+
+func TestOpenOTLPGRPCListenerTrimsWhitespace(t *testing.T) {
+	cfg := appconfig.Defaults()
+	cfg.OTLPGRPC.Enabled = true
+	cfg.OTLPGRPC.Listen = "  127.0.0.1:0  "
+	managed, err := openOTLPGRPCListener(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("openOTLPGRPCListener with surrounding spaces failed: %v", err)
+	}
+	defer managed.Close()
+	if managed.Port() <= 0 {
+		t.Fatalf("managed.Port()=%d want > 0", managed.Port())
 	}
 }

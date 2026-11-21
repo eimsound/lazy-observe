@@ -11204,7 +11204,7 @@ google.golang.org/genproto/googleapis/api/httpbody v0.0.0-20261019180522-ce908d2
    limitations under the License.
 
 ------------------------------------------------------------------------
-google.golang.org/genproto/googleapis/rpc/status v0.0.0-20261012220534-4341edf3f941 (Apache-2.0)
+google.golang.org/genproto/googleapis/rpc v0.0.0-20261012220534-4341edf3f941 (Apache-2.0)
 
 
                                  Apache License
