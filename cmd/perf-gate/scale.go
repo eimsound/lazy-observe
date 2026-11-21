@@ -472,10 +472,17 @@ func runScaleGate(args []string) error {
 			scaledTotalConcurrency,
 			warmup,
 		)
-		if warmErr != nil || warmResult.RequestsFailed > cfg.HAScaling.MaxFailedRequests {
+		if warmErr != nil {
 			return fmt.Errorf(
-				"controlled upstream warmup failed: err=%v failures=%d (%s)",
+				"controlled upstream warmup failed: err=%w failures=%d (%s)",
 				warmErr,
+				warmResult.RequestsFailed,
+				formatFailureKinds(warmResult.FailureKinds),
+			)
+		}
+		if warmResult.RequestsFailed > cfg.HAScaling.MaxFailedRequests {
+			return fmt.Errorf(
+				"controlled upstream warmup failed: err=<nil> failures=%d (%s)",
 				warmResult.RequestsFailed,
 				formatFailureKinds(warmResult.FailureKinds),
 			)

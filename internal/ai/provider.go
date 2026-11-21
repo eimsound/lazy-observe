@@ -64,7 +64,7 @@ func (p *providerClient) ChatStream(ctx context.Context, request ChatRequest) (S
 	if httpClient == nil {
 		httpClient = p.client
 	}
-	resp, err := p.do(ctx, httpClient, body)
+	resp, err := p.do(ctx, httpClient, body) //nolint:bodyclose // ownership transfers to returned Stream
 	if err != nil {
 		return nil, err
 	}

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/aiassistant"
@@ -165,35 +164,6 @@ func (g *Gateway) executeAssistantQuery(
 		}, nil
 	}
 	return result, nil
-}
-
-var errQueryResponseTooLarge = query.ErrResponseTooLarge
-
-func (g *Gateway) isolatedQuery(
-	ctx context.Context,
-	project meta.ProjectInfo,
-	signal, path string,
-	params url.Values,
-) ([]byte, error) {
-	return g.querier.Query(ctx, project, query.Signal(signal), path, params)
-}
-
-func (g *Gateway) isolatedQueryWithLimit(
-	ctx context.Context,
-	project meta.ProjectInfo,
-	signal, path string,
-	params url.Values,
-	maxBytes int64,
-) ([]byte, error) {
-	return g.querier.QueryWithLimit(ctx, project, query.Signal(signal), path, params, maxBytes)
-}
-
-func disableTracesLatencyOffset(path string, params url.Values) {
-	query.DisableTracesLatencyOffset(path, params)
-}
-
-func cloneQueryValues(source url.Values) url.Values {
-	return query.CloneValues(source)
 }
 
 func (g *Gateway) aiAssistantExplain(c fiber.Ctx) error {

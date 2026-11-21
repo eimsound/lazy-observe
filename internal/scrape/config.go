@@ -325,7 +325,7 @@ func (s *Service) validateAndNormalize(ctx context.Context, in Input, partial bo
 	if out.URL != "" {
 		u, port, err := parseTargetURL(out.URL)
 		if err != nil {
-			return Input{}, fmt.Errorf("%w: %v", ErrInvalidTarget, err)
+			return Input{}, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
 		}
 		if _, forbidden := s.platformPorts[port]; forbidden {
 			return Input{}, fmt.Errorf("%w: platform port %d is not allowed", ErrInvalidTarget, port)
@@ -341,7 +341,7 @@ func (s *Service) validateAndNormalize(ctx context.Context, in Input, partial bo
 	if strings.TrimSpace(in.Interval) != "" {
 		canonical, _, err := normalizeInterval(in.Interval)
 		if err != nil {
-			return Input{}, fmt.Errorf("%w: %v", ErrInvalidTarget, err)
+			return Input{}, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
 		}
 		out.Interval = canonical
 	}
@@ -360,7 +360,7 @@ func (s *Service) validateTargetDestination(ctx context.Context, u *url.URL, por
 		return fmt.Errorf("%w: target host %q is blocked by outbound policy", ErrInvalidTarget, host)
 	}
 	if _, err := outbound.ValidateURL(u.String(), s.outboundPolicy); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidTarget, err)
+		return fmt.Errorf("%w: %w", ErrInvalidTarget, err)
 	}
 	// If host is already an IP literal, outbound.ValidateURL checked it via Policy.CheckIP.
 	if _, err := netip.ParseAddr(host); err == nil {
@@ -379,7 +379,7 @@ func (s *Service) validateTargetDestination(ctx context.Context, u *url.URL, por
 	addrs, err := resolver.LookupNetIP(lookupCtx, "ip", host)
 	if err != nil {
 		if explicitResolver {
-			return fmt.Errorf("%w: failed to resolve target host: %v", ErrInvalidTarget, err)
+			return fmt.Errorf("%w: failed to resolve target host: %w", ErrInvalidTarget, err)
 		}
 		// Allow unresolved hostnames (e.g. offline tests or not-yet-created cluster
 		// services) while still blocking any resolvable internal/metadata target.

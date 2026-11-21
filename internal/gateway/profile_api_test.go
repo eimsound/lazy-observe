@@ -167,9 +167,8 @@ func mustJSON(value any) string {
 func TestProfileAPIEndToEndAndProjectIsolation(t *testing.T) {
 	app, defaultToken, p2Token, store := profileTestApp(t)
 	reader := userQueryToken(t, store, "profile-reader")
-	data := writeProfile(t, syntheticProfile(11, "main.busyLoop", "main.main"))
 	for _, value := range []int64{11, 13} {
-		data = writeProfile(t, syntheticProfile(value, "main.busyLoop", "main.main"))
+		data := writeProfile(t, syntheticProfile(value, "main.busyLoop", "main.main"))
 		resp := uploadProfileFixture(t, app, defaultToken, "example", "cpu", data, http.StatusCreated)
 		resp.Body.Close()
 	}

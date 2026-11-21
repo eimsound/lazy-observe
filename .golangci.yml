@@ -3,11 +3,24 @@ version: "2"
 linters:
   default: none
   enable:
+    - bidichk
+    - bodyclose
+    - copyloopvar
     - depguard
+    - durationcheck
     - errcheck
+    - errorlint
+    - fatcontext
     - forbidigo
     - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - rowserrcheck
+    - sqlclosecheck
     - staticcheck
+    - unconvert
+    - unused
   settings:
     # Fiber v3 calls that compile but changed meaning (patterns match the
     # type-qualified name, so fasthttp's c.Request().Body() is not caught).
@@ -37,6 +50,10 @@ linters:
             - pkg: github.com/eimsound/lazy-observe/internal/db/ent
               desc: use internal/meta behavior; Ent stays behind the metadata seam (ADR 0004)
   exclusions:
+    paths:
+      # Generated Ent client code and gitignored throwaway PoC spikes.
+      - ^internal/db/ent/
+      - ^poc/
     rules:
       # The Body ban guards gateway handlers only; tests and other packages may
       # read the decoded body.
@@ -48,13 +65,12 @@ linters:
         text: requestBody\(c\)
         linters:
           - forbidigo
-      # Existing tests intentionally use best-effort cleanup after assertions.
+      # Existing tests intentionally use best-effort cleanup after assertions;
+      # Fiber app.Test returns in-memory NopCloser bodies and test helpers that
+      # return *http.Response own body cleanup via t.Cleanup/io.ReadAll.
       - path: _test\.go
         linters:
-          - errcheck
-      # PoC shutdown paths are not production code.
-      - path: ^poc/
-        linters:
+          - bodyclose
           - errcheck
       # Production cleanup and diagnostic writes are also best effort; primary
       # operation errors remain covered by errcheck.
@@ -63,14 +79,5 @@ linters:
           - errcheck
       # QF is a style-only staticcheck category.
       - text: QF1001
-        linters:
-          - staticcheck
-      # Known pre-CI unused assignments; keep all other SA checks enabled.
-      - path: ^internal/gateway/profile_api_test\.go
-        text: SA4006
-        linters:
-          - staticcheck
-      - path: ^internal/meta/store\.go
-        text: SA4006
         linters:
           - staticcheck

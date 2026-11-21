@@ -371,7 +371,7 @@ func (p *storageProxy) unary(c fiber.Ctx, spec proxySpec) error {
 		}
 	}
 
-	resp, err := p.client.Do(req)
+	resp, err := p.client.Do(req) //nolint:bodyclose // closed inline for empty responses or by SetBodyStreamWriter
 	if err != nil {
 		cancel()
 		return p.writeUpstreamError(c, parentCtx, reqCtx, spec.upstreamPath, err)
@@ -473,7 +473,7 @@ func (p *storageProxy) stream(c fiber.Ctx, spec proxySpec) error {
 	if client == nil {
 		client = p.client
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:bodyclose // closed inline for empty/error responses or by SetBodyStreamWriter
 	if err != nil {
 		streamCancel()
 		releaseSlot()

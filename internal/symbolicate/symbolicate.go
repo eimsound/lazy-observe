@@ -83,6 +83,20 @@ func isSourceMapPlatform(platform string) bool {
 	return strings.EqualFold(platform, "javascript") || strings.EqualFold(platform, "node")
 }
 
+func parseSourceMapSnapshot(raw json.RawMessage, release string) (map[string]string, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var snapshot map[string]string
+	if json.Unmarshal(raw, &snapshot) != nil {
+		return nil, false
+	}
+	if snapshot["kind"] != "content-addressed-v1" || snapshot["release"] != release {
+		return nil, false
+	}
+	return snapshot, true
+}
+
 func (e *Engine) Symbolicate(
 	ctx context.Context,
 	projectSlug string,
@@ -92,9 +106,8 @@ func (e *Engine) Symbolicate(
 	if e == nil || e.blobs == nil || !isSourceMapPlatform(event.Platform) || event.Release == "" {
 		return event, nil
 	}
-	var snapshot map[string]string
-	if json.Unmarshal(snapshotJSON, &snapshot) != nil || snapshot["kind"] != "content-addressed-v1" ||
-		snapshot["release"] != event.Release {
+	snapshot, ok := parseSourceMapSnapshot(snapshotJSON, event.Release)
+	if !ok {
 		return event, nil
 	}
 	event.Exception.Stacktrace.Frames = append([]errortrack.Frame(nil), event.Exception.Stacktrace.Frames...)
@@ -285,7 +298,7 @@ func (e *Engine) loadConsumer(ctx context.Context, project, digest string) (*gos
 	}
 	consumer, err := safeParseSourceMap(key, normalized)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: %v", ErrInvalidSourceMap, err)
+		return nil, 0, fmt.Errorf("%w: %w", ErrInvalidSourceMap, err)
 	}
 	entrySize := int64(len(normalized)) + int64(segments)*estimatedMappingBytes
 	if entrySize <= 0 {

@@ -58,7 +58,7 @@ func ValidateAndNormalize(data []byte) ([]byte, int, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	var parsed rawSourceMap
 	if err := decoder.Decode(&parsed); err != nil {
-		return nil, 0, fmt.Errorf("%w: %v", ErrInvalidSourceMap, err)
+		return nil, 0, fmt.Errorf("%w: %w", ErrInvalidSourceMap, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
@@ -93,7 +93,7 @@ func ValidateAndNormalize(data []byte) ([]byte, int, error) {
 			}
 			segs, err := validateMappings(sec.Map.Mappings, len(sec.Map.Sources), len(sec.Map.Names))
 			if err != nil {
-				return nil, 0, fmt.Errorf("%w: section %d: %v", ErrInvalidSourceMap, i, err)
+				return nil, 0, fmt.Errorf("%w: section %d: %w", ErrInvalidSourceMap, i, err)
 			}
 			totalSegments += segs
 			if totalSegments > MaxMappingSegments {
@@ -107,13 +107,13 @@ func ValidateAndNormalize(data []byte) ([]byte, int, error) {
 	} else {
 		segs, err := validateMappings(parsed.Mappings, len(parsed.Sources), len(parsed.Names))
 		if err != nil {
-			return nil, 0, fmt.Errorf("%w: %v", ErrInvalidSourceMap, err)
+			return nil, 0, fmt.Errorf("%w: %w", ErrInvalidSourceMap, err)
 		}
 		totalSegments = segs
 	}
 	normalized, err := json.Marshal(parsed)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: marshal normalized map: %v", ErrInvalidSourceMap, err)
+		return nil, 0, fmt.Errorf("%w: marshal normalized map: %w", ErrInvalidSourceMap, err)
 	}
 	return normalized, totalSegments, nil
 }

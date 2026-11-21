@@ -3,7 +3,6 @@ package meta
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -434,43 +433,44 @@ func (s *Store) IssueIDsForErrorEvents(
 	}
 	for start := 0; start < len(unique); start += replayIssueLookupBatchSize {
 		end := min(start+replayIssueLookupBatchSize, len(unique))
-		batch := unique[start:end]
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
-		args := make([]any, 0, len(batch)+1)
-		args = append(args, projectID)
-		for _, id := range batch {
-			args = append(args, id)
-		}
-		query := bind(
-			s.dialect,
-			`SELECT event_id, outcome FROM telemetry_inbox WHERE project_id = ? AND status = 'completed' AND event_id IN (`+placeholders+`)`,
-		)
-		rows, err := s.db.QueryContext(ctx, query, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var eventID, outcome string
-			if err := rows.Scan(&eventID, &outcome); err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			var receipt struct {
-				IssueID int `json:"issue_id"`
-			}
-			if json.Unmarshal([]byte(outcome), &receipt) == nil && receipt.IssueID > 0 {
-				result[eventID] = receipt.IssueID
-			}
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
+		if err := s.readCompletedReceiptIssueIDsBatch(ctx, projectID, unique[start:end], result); err != nil {
 			return nil, err
 		}
 	}
 	return result, nil
+}
+
+func (s *Store) readCompletedReceiptIssueIDsBatch(
+	ctx context.Context,
+	projectID int,
+	batch []string,
+	result map[string]int,
+) error {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+	args := make([]any, 0, len(batch)+1)
+	args = append(args, projectID)
+	for _, id := range batch {
+		args = append(args, id)
+	}
+	query := bind(
+		s.dialect,
+		`SELECT event_id, outcome FROM telemetry_inbox WHERE project_id = ? AND status = 'completed' AND event_id IN (`+placeholders+`)`,
+	)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var eventID, outcome string
+		if err := rows.Scan(&eventID, &outcome); err != nil {
+			return err
+		}
+		if issueID, ok := parseCompletedReceiptIssueID(outcome); ok {
+			result[eventID] = issueID
+		}
+	}
+	return rows.Err()
 }
 
 func (s *Store) ListExpiredReplaySessions(
