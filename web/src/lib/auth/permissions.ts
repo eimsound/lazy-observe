@@ -90,6 +90,12 @@ export const ROUTE_ACCESS_RULES: readonly RouteAccessRule[] = [
     forbiddenDescKey: "alerts.silencesForbiddenDesc",
   },
   {
+    path: "/alerts/inhibitions",
+    capability: "alerts:read",
+    forbiddenTitleKey: "common.forbiddenTitle",
+    forbiddenDescKey: "alerts.inhibitionsForbiddenDesc",
+  },
+  {
     path: "/alerts/channels",
     capability: "channels:write",
     forbiddenTitleKey: "common.forbiddenTitle",

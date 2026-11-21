@@ -21,6 +21,7 @@ test("project-scoped business pages remount cleanly when switching projects", ()
     "/alerts",
     "/alerts/rules",
     "/alerts/silences",
+    "/alerts/inhibitions",
     "/alerts/notifications",
     "/traces/0123456789abcdef",
   ];

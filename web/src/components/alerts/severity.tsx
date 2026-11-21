@@ -69,6 +69,15 @@ export function StatusBadge({ status }: { status: AlertStatus }) {
   );
 }
 
+export function InhibitedBadge() {
+  const { t } = useTranslation();
+  return (
+    <span className="inline-flex items-center rounded-md border border-level-warn/30 bg-level-warn/10 px-2 py-0.5 text-xs font-medium text-level-warn">
+      {t("alerts.statusInhibited")}
+    </span>
+  );
+}
+
 /** Small key=value chips used to render label sets. */
 export function LabelChips({
   labels,

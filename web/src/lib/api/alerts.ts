@@ -9,6 +9,8 @@ import {
   normalizeChannel,
   normalizeChannelList,
   normalizeChannelTestResult,
+  normalizeInhibitionRule,
+  normalizeInhibitionRuleList,
   normalizeSilence,
   normalizeSilenceList,
   type AlertEvent,
@@ -19,6 +21,9 @@ import {
   type ChannelInput,
   type ChannelTestResult,
   type ChannelType,
+  type InhibitionRule,
+  type InhibitionRuleInput,
+  type InhibitionRulePatch,
   type Matcher,
   type NotificationChannel,
   type Severity,
@@ -39,6 +44,9 @@ export type {
   ChannelInput,
   ChannelTestResult,
   ChannelType,
+  InhibitionRule,
+  InhibitionRuleInput,
+  InhibitionRulePatch,
   Matcher,
   NotificationChannel,
   Severity,
@@ -48,9 +56,10 @@ export type {
 
 /**
  * Alerting API (A1). Fixed contract, endpoints under /api:
- *   /api/alert-rules  CRUD (project-scoped, member+)
- *   /api/channels     GET (member+ summary / admin redacted), write+test (admin)
- *   /api/silences     CRUD (project-scoped, member+)
+ *   /api/alert-rules       CRUD (project-scoped, member+)
+ *   /api/channels          GET (member+ summary / admin redacted), write+test (admin)
+ *   /api/silences          CRUD (project-scoped, member+)
+ *   /api/inhibition-rules  CRUD (project-scoped, member+)
  *   GET /api/alerts?status=firing|resolved  -> event list (project-scoped, viewer+)
  * In VITE_MOCK mode an in-memory store backs every operation so the whole
  * alerting surface is interactive offline.
@@ -181,6 +190,46 @@ export async function deleteSilence(id: string, project?: string): Promise<void>
     return delay(undefined);
   }
   await apiSend<void>("DELETE", `/silences/${id}`, undefined, { base: API_ROOT, project });
+}
+
+// ── inhibition rules ─────────────────────────────────────────────────────────
+
+export async function listInhibitionRules(
+  signal?: AbortSignal,
+  project?: string,
+): Promise<InhibitionRule[]> {
+  if (IS_MOCK) return delay([...(await loadMockAlerts()).mockInhibitionRules]);
+  const values = await apiGet<unknown>("/inhibition-rules", { base: API_ROOT, signal, project });
+  return normalizeInhibitionRuleList(values);
+}
+
+export async function createInhibitionRule(
+  input: InhibitionRuleInput,
+  project?: string,
+): Promise<InhibitionRule> {
+  if (IS_MOCK) return delay((await loadMockAlerts()).createMockInhibitionRule(input), 250);
+  return normalizeInhibitionRule(
+    await apiSend<unknown>("POST", "/inhibition-rules", input, { base: API_ROOT, project }),
+  );
+}
+
+export async function updateInhibitionRule(
+  id: string,
+  input: InhibitionRulePatch,
+  project?: string,
+): Promise<InhibitionRule> {
+  if (IS_MOCK) return delay((await loadMockAlerts()).updateMockInhibitionRule(id, input), 250);
+  return normalizeInhibitionRule(
+    await apiSend<unknown>("PATCH", `/inhibition-rules/${id}`, input, { base: API_ROOT, project }),
+  );
+}
+
+export async function deleteInhibitionRule(id: string, project?: string): Promise<void> {
+  if (IS_MOCK) {
+    (await loadMockAlerts()).deleteMockInhibitionRule(id);
+    return delay(undefined);
+  }
+  await apiSend<void>("DELETE", `/inhibition-rules/${id}`, undefined, { base: API_ROOT, project });
 }
 
 // ── events ───────────────────────────────────────────────────────────────────

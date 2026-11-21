@@ -89,6 +89,25 @@ export interface Silence {
 
 export type SilenceInput = Pick<Silence, "matchers" | "starts_at" | "ends_at" | "comment">;
 
+export interface InhibitionRule {
+  id: string;
+  project_id?: string;
+  source_matchers: Matcher[];
+  target_matchers: Matcher[];
+  equal_labels: string[];
+  enabled: boolean;
+  comment: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type InhibitionRuleInput = Pick<
+  InhibitionRule,
+  "source_matchers" | "target_matchers" | "equal_labels" | "enabled" | "comment"
+>;
+
+export type InhibitionRulePatch = Partial<InhibitionRuleInput>;
+
 export type AlertStatus = "firing" | "resolved";
 
 export interface AlertEvent {
@@ -246,6 +265,32 @@ export function normalizeAlertRuleList(value: unknown): AlertRule[] {
   return value.map(normalizeAlertRule);
 }
 
+function normalizeMatcherList(value: unknown, label: string): Matcher[] {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  return value.map((entry, idx) => {
+    const matcher = assertRecord(entry, `${label}[${idx}]`);
+    const op = matcher.op;
+    if (op !== "=" && op !== "=~") {
+      throw new TypeError(`${label}[${idx}].op must be "=" or "=~"`);
+    }
+    return {
+      name: assertString(matcher.name, `${label}[${idx}].name`),
+      op,
+      value: assertString(matcher.value, `${label}[${idx}].value`, true),
+    };
+  });
+}
+
+function normalizeOptionalStringArray(value: unknown, label: string): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  return value.map((item, idx) => assertString(item, `${label}[${idx}]`));
+}
+
 /**
  * Validates `GET`/`POST`/`PATCH /api/silences` (`silenceResponse`).
  * Explicitly permits empty `comment: ""` (and omitted `comment` -> `""`),
@@ -253,21 +298,7 @@ export function normalizeAlertRuleList(value: unknown): AlertRule[] {
  */
 export function normalizeSilence(value: unknown): Silence {
   const raw = assertRecord(value, "silence");
-  if (!Array.isArray(raw.matchers)) {
-    throw new TypeError("silence.matchers must be an array");
-  }
-  const matchers: Matcher[] = raw.matchers.map((entry, idx) => {
-    const matcher = assertRecord(entry, `silence.matchers[${idx}]`);
-    const op = matcher.op;
-    if (op !== "=" && op !== "=~") {
-      throw new TypeError(`silence.matchers[${idx}].op must be "=" or "=~"`);
-    }
-    return {
-      name: assertString(matcher.name, `silence.matchers[${idx}].name`),
-      op,
-      value: assertString(matcher.value, `silence.matchers[${idx}].value`, true),
-    };
-  });
+  const matchers = normalizeMatcherList(raw.matchers, "silence.matchers");
 
   const creator = raw.creator !== undefined
     ? optionalString(raw.creator, "silence.creator")
@@ -290,6 +321,44 @@ export function normalizeSilenceList(value: unknown): Silence[] {
     throw new TypeError("silences response must be an array");
   }
   return value.map(normalizeSilence);
+}
+
+/**
+ * Validates `GET`/`POST`/`PATCH /api/inhibition-rules` (`meta.InhibitionRuleView`).
+ *
+ * Go serializes `meta.InhibitionRuleView` with `omitempty` on `enabled`,
+ * `equal_labels`, `comment`, `created_at`, and `updated_at`, so a disabled
+ * rule omits `"enabled"` (`undefined` -> `false`) and a rule with no equal
+ * labels omits `"equal_labels"` (`undefined` -> `[]`).
+ */
+export function normalizeInhibitionRule(value: unknown): InhibitionRule {
+  const raw = assertRecord(value, "inhibition rule");
+  const enabled = raw.enabled === undefined
+    ? false
+    : assertBoolean(raw.enabled, "inhibition rule.enabled");
+  const projectId = raw.project_id !== undefined && raw.project_id !== null
+    ? normalizeId(raw.project_id, "inhibition rule.project_id")
+    : undefined;
+
+  return {
+    id: normalizeId(raw.id, "inhibition rule.id"),
+    ...(projectId !== undefined ? { project_id: projectId } : {}),
+    source_matchers: normalizeMatcherList(raw.source_matchers, "inhibition rule.source_matchers"),
+    target_matchers: normalizeMatcherList(raw.target_matchers, "inhibition rule.target_matchers"),
+    equal_labels: normalizeOptionalStringArray(raw.equal_labels, "inhibition rule.equal_labels"),
+    enabled,
+    comment: optionalString(raw.comment, "inhibition rule.comment"),
+    created_at: optionalString(raw.created_at, "inhibition rule.created_at"),
+    updated_at: optionalString(raw.updated_at, "inhibition rule.updated_at"),
+  };
+}
+
+export function normalizeInhibitionRuleList(value: unknown): InhibitionRule[] {
+  if (value === null || value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new TypeError("inhibition rules response must be an array");
+  }
+  return value.map(normalizeInhibitionRule);
 }
 
 /** Validates `GET /api/alerts` (`alertEventResponse`). */
