@@ -17,7 +17,8 @@ used in this repo's issue tracker.
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label
 string from this table.
 
-The tracker currently has no labels created. Create the ones you need with
-`gh label create <label> --color <hex>` before running `/skill:triage`.
-
-Edit the "Label in our tracker" column to match whatever vocabulary you actually use.
+All 7 canonical labels above (`bug`, `enhancement`, `needs-triage`, `needs-info`,
+`ready-for-agent`, `ready-for-human`, `wontfix`) are created and maintained on
+`eimsound/lazy-observe` (and `.github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml`
+automatically apply `needs-triage` alongside the category label). If a future skill introduces a new
+role, create the label with `gh label create <label> --color <hex>` and add it to the table above.
