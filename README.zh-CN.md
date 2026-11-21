@@ -219,6 +219,7 @@ mise exec -- go run . load --url http://127.0.0.1:3320 --duration 30s --concurre
 | [deploy/compose/README.md](deploy/compose/README.md) | 加固的 Docker Compose 参考部署（All-in-One 与 `--profile standalone` 外置存储栈） |
 | [deploy/systemd/README.md](deploy/systemd/README.md) | 加固的 Linux systemd 服务单元、两阶段优雅摘流与离线 CLI 维护 |
 | [docs/sdk/go.md](docs/sdk/go.md) · [node.md](docs/sdk/node.md) · [browser.md](docs/sdk/browser.md) · [python.md](docs/sdk/python.md) | 四端客户端 SDK 安装、配置与框架集成指南 |
+| [SECURITY.md](SECURITY.md) | 安全策略、预览期支持范围与私下漏洞上报流程 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献者指南：`mise` 任务、测试分层（`e2e`、`e2e-ha`、`web-e2e-real`、`sdk-journeys`）与 PR 规则 |
 | [CHANGELOG.md](CHANGELOG.md) | 未发布变更清单与历史演进记录 |
 | [.agents/docs/architecture.md](.agents/docs/architecture.md) · [.agents/docs/adr/](.agents/docs/adr/) | 深入架构说明与架构决策记录（ADR） |
@@ -230,7 +231,7 @@ mise exec -- go run . load --url http://127.0.0.1:3320 --duration 30s --concurre
 - **Victoria 专精存储（[ADR 0013](.agents/docs/adr/0013-signal-storage-is-victoria-only.md)）**：指标、日志与链路存储固定采用 VictoriaMetrics、VictoriaLogs 与 VictoriaTraces，按设计不支持 Loki/LogQL 或 Tempo/TraceQL 后端。
 - **不内置拖拽大屏，原生对接 Grafana / Perses（[ADR 0017](.agents/docs/adr/0017-no-built-in-dashboards.md)）**：内置页面聚焦核心诊断工作流（Overview、Performance、Hosts、LLM、Metrics/Logs/Traces 查询工作区、Profiling），自定义大盘与社区看板直接交由 Grafana 或 Perses（见 [docs/grafana-perses.md](docs/grafana-perses.md)）。
 - **v0.x 公开预览期（[ADR 0003](.agents/docs/adr/0003-pre-release-single-database-baseline.md)）**：在首个受支持版本引入只增不改的迁移链之前，元数据基线仍保持可变，升级时可能需要重建元数据数据库。生产选型前建议完整阅读 [docs/comparison.md](docs/comparison.md) 中的产品边界说明。
-- **安全漏洞上报**：如发现疑似安全漏洞，请通过 `eimsound/lazy-observe` 仓库的 GitHub Security Advisories 私下提交，切勿在公开 Issue 中披露细节。
+- **安全漏洞上报**：如发现疑似安全漏洞，请通过 `eimsound/lazy-observe` 仓库的 GitHub Security Advisories 私下提交，切勿在公开 Issue 中披露细节（详见 [SECURITY.md](SECURITY.md)）。
 
 ---
 
