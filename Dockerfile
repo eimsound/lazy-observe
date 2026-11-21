@@ -47,7 +47,9 @@ RUN set -eu; \
     exit 1 \
     ;; \
     esac; \
-    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /tmp/mise \
+    curl --proto '=https' --tlsv1.2 -fsSL \
+    --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 --max-time 120 \
+    -o /tmp/mise \
     "https://github.com/jdx/mise/releases/download/${MISE_BOOTSTRAP_VERSION}/${mise_asset}"; \
     printf '%s  %s\n' "$mise_sha256" /tmp/mise | sha256sum --check --strict -; \
     install -m 0755 /tmp/mise /usr/local/bin/mise; \

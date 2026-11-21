@@ -1,13 +1,20 @@
 name: Performance gates
 
-# 只留手动入口。性能门禁不跟 PR 跑；发版前由 release.yml 的 performance-gates job 挡住，
-# 两处的步骤由 scripts/check-e2e-contract.sh 保证一致。
+# 性能门禁不跟 PR 跑；除手动触发外，每周在 main 上定时运行一次以持续守护回读/总 RSS/p99 回归，
+# 发版前另由 release.yml 的 performance-gates job 挡住，两处步骤由 scripts/check-e2e-contract.sh 保证一致。
 # GitHub 托管 runner 是共享机器，噪声比自建 runner 大；结果只作参考时注意这一点。
 on:
   workflow_dispatch:
+  schedule:
+    # 每周日 UTC 17:00（北京时间周一 01:00），避开工作高峰与 Renovate（北京时间周一 03:00 起）高峰。
+    - cron: "0 17 * * 0"
 
 permissions:
   contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
 
 # mise 在 job 中途按需安装 task 工具时也要带 token，否则 GitHub API 匿名限流会让安装 403。
 env:

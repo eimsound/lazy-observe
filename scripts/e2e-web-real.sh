@@ -156,15 +156,28 @@ platform_url=http://127.0.0.1:$gateway_port
 admin_password_file=$work/data/initial-admin-password
 
 printf 'preparing web Playwright dependencies...\n'
-playwright_args="--only-shell chromium"
-if [[ $(id -u) == 0 ]] || sudo -n true >/dev/null 2>&1; then
-  playwright_args="--with-deps $playwright_args"
-fi
 (
   cd "$root/web"
   CI=true pnpm install --frozen-lockfile
-  # shellcheck disable=SC2086 # 有意按空白拆分参数
-  pnpm exec playwright install $playwright_args
+  if [[ $(id -u) == 0 ]] || sudo -n true >/dev/null 2>&1; then
+    apt_cmd=(apt-get)
+    if [[ $(id -u) != 0 ]]; then
+      apt_cmd=(sudo -n apt-get)
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+      "${apt_cmd[@]}" update -qq >/dev/null 2>&1 || true
+    fi
+    if ! pnpm exec playwright install --with-deps --only-shell chromium; then
+      printf 'warning: playwright install --with-deps failed; retrying after apt-get update and falling back to browser-only install\n' >&2
+      if command -v apt-get >/dev/null 2>&1; then
+        "${apt_cmd[@]}" update -qq >/dev/null 2>&1 || true
+      fi
+      pnpm exec playwright install --with-deps --only-shell chromium ||
+        pnpm exec playwright install --only-shell chromium
+    fi
+  else
+    pnpm exec playwright install --only-shell chromium
+  fi
 )
 
 printf 'starting lazy-observe at %s (component port offset %s)...\n' "$platform_url" "$port_offset"

@@ -52,6 +52,9 @@ run_case() { # name sha expected_rc [config_source]
   cat >"$dir/fakebin/curl" <<'CURL'
 #!/bin/sh
 out=
+for arg in "$@"; do
+  printf '%s\n' "$arg" >>"${CURL_CALL_LOG:?}"
+done
 while [ $# -gt 0 ]; do
   case $1 in
   -o) out=$2; shift 2 ;;
@@ -62,6 +65,7 @@ cp "$FAKE_MISE_PAYLOAD" "$out"
 CURL
   chmod 0755 "$dir/fakebin/uname" "$dir/fakebin/curl"
   : >"$dir/mise.log"
+  : >"$dir/curl.log"
   : >"$dir/github_path"
 
   env -i \
@@ -70,6 +74,7 @@ CURL
     GITHUB_PATH="$dir/github_path" \
     MISE_CI_TOOLS=go \
     MISE_CALL_LOG="$dir/mise.log" \
+    CURL_CALL_LOG="$dir/curl.log" \
     FAKE_MISE_PAYLOAD="$payload" \
     FAKE_MISE_SOURCE="$source" \
     "$bash_bin" "$dir/ci-setup-mise.sh" >"$dir/stdout" 2>"$dir/stderr" || rc=$?
@@ -77,6 +82,11 @@ CURL
   if [[ $rc -ne $expected_rc ]]; then
     fail "$name: exit $rc, want $expected_rc; stderr: $(cat "$dir/stderr")"
     return
+  fi
+  if [[ $name == matching-sha ]]; then
+    for flag in --retry --retry-delay --retry-all-errors --connect-timeout --max-time; do
+      grep -Fxq -- "$flag" "$dir/curl.log" || fail "$name: curl missing transient retry flag $flag"
+    done
   fi
   if [[ $expected_rc -ne 0 ]]; then
     ! grep -q '^mise install' "$dir/mise.log" || fail "$name: mise install ran despite the failing check"

@@ -10,7 +10,8 @@ go = "1.27.4"
 node = "26.13.1"
 pnpm = "12.21.0"
 jq = "1.8.2"
-actionlint = "1.7.12"
+# 显式使用 aqua:rhysd/actionlint 后端，消除 mise 短名注册表对 actionlint 的 deprecated 警告并保持上游 MIT 仓库不变。
+"aqua:rhysd/actionlint" = "1.7.12"
 rg = "15.2.0"
 air = "1.67.4"
 "go:github.com/golangci/golines" = "0.16.1"
@@ -464,7 +465,25 @@ pnpm install --frozen-lockfile
 pnpm lint
 pnpm test
 pnpm build
-pnpm exec playwright install --with-deps --only-shell chromium
+if [[ $(id -u) == 0 ]] || sudo -n true >/dev/null 2>&1; then
+  apt_cmd=(apt-get)
+  if [[ $(id -u) != 0 ]]; then
+    apt_cmd=(sudo -n apt-get)
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    "${apt_cmd[@]}" update -qq >/dev/null 2>&1 || true
+  fi
+  if ! pnpm exec playwright install --with-deps --only-shell chromium; then
+    printf 'warning: playwright install --with-deps failed; retrying after apt-get update and falling back to browser-only install\n' >&2
+    if command -v apt-get >/dev/null 2>&1; then
+      "${apt_cmd[@]}" update -qq >/dev/null 2>&1 || true
+    fi
+    pnpm exec playwright install --with-deps --only-shell chromium ||
+      pnpm exec playwright install --only-shell chromium
+  fi
+else
+  pnpm exec playwright install --only-shell chromium
+fi
 pnpm test:e2e
 cd ..
 bash scripts/check-js-licenses.sh web
