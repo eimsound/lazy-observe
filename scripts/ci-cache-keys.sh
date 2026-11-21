@@ -129,6 +129,33 @@ storage_hash=$(hash_files storage \
   scripts/prepare-embedded-storage.sh)
 pnpm_web_hash=$(hash_files pnpm-web web/pnpm-lock.yaml)
 
+playwright_lock=sdk/browser/pnpm-lock.yaml
+if [[ ! -f $playwright_lock ]]; then
+  printf 'missing playwright cache key input: %s\n' "$playwright_lock" >&2
+  exit 1
+fi
+# pnpm 12 lockfile 含多文档 YAML，从 packages: 区块提取解析后的 playwright-core 精确版本；
+# 仅当匹配到唯一且合法的语义化版本时放行，否则 fail-closed 退出非零。
+mapfile -t playwright_versions < <(awk '
+  /^packages:[[:space:]]*$/ { in_packages = 1; next }
+  /^[^[:space:]#]/ { in_packages = 0 }
+  in_packages && /^  ["'\'']?playwright-core@[^[:space:]"'\'':]+["'\'']?:[[:space:]]*$/ {
+    ver = $1
+    gsub(/^["'\'']|["'\'']?:$/, "", ver)
+    sub(/^playwright-core@/, "", ver)
+    versions[ver] = 1
+  }
+  END {
+    for (v in versions) print v
+  }
+' "$playwright_lock" | sort)
+if ((${#playwright_versions[@]} != 1)) || [[ ! ${playwright_versions[0]} =~ ^[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.-]+)?$ ]]; then
+  printf 'cannot read a unique playwright-core version from %s (got: %s)\n' \
+    "$playwright_lock" "${playwright_versions[*]:-<none>}" >&2
+  exit 1
+fi
+playwright_sdk_browser=${playwright_versions[0]}
+
 output=${GITHUB_OUTPUT:-/dev/stdout}
 {
   printf 'mise=%s\n' "$mise_hash"
@@ -137,4 +164,5 @@ output=${GITHUB_OUTPUT:-/dev/stdout}
   printf 'pnpm-toolchain=%s\n' "$pnpm_toolchain"
   printf 'storage=%s\n' "$storage_hash"
   printf 'pnpm-web=%s\n' "$pnpm_web_hash"
+  printf 'playwright-sdk-browser=%s\n' "$playwright_sdk_browser"
 } >>"$output"

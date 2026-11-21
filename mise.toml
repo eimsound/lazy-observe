@@ -81,10 +81,16 @@ CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
 
 [tasks.web-assets]
 description = "Build and stage the embedded web UI"
-run = [
-  "cd web && CI=true pnpm install --frozen-lockfile && pnpm build",
-  "bash scripts/prepare-web-assets.sh",
-]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+install_args=(install --frozen-lockfile)
+if [[ -n ${LO_PNPM_STORE_WEB:-} ]]; then
+  install_args+=(--store-dir "$LO_PNPM_STORE_WEB")
+fi
+(cd web && CI=true pnpm "${install_args[@]}" && pnpm build)
+bash scripts/prepare-web-assets.sh
+'''
 
 [tasks.embedded-storage]
 description = "Prepare embedded storage binaries for the selected platform"
@@ -290,6 +296,7 @@ run = [
   "bash scripts/check-pipefail-pipelines.sh",
   "bash scripts/ci-setup-mise-test.sh",
   "bash scripts/merge-oci-layouts-test.sh",
+  "bash scripts/download-storage-bins-test.sh",
   "bash scripts/check-e2e-contract.sh",
   "bash scripts/ci-changes-test.sh",
 ]
