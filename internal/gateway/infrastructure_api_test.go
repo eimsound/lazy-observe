@@ -493,6 +493,7 @@ func TestProjectScopedAlertAndMetricsRoutesRequireResolvedProject(t *testing.T) 
 		{http.MethodGet, "/api/v1/alerts"},
 		{http.MethodGet, "/api/v1/hosts"},
 		{http.MethodGet, "/api/v1/performance/endpoints"},
+		{http.MethodGet, "/api/v1/performance/vitals"},
 	}
 	for _, rt := range routes {
 		req := httptest.NewRequest(rt.method, rt.path, nil)

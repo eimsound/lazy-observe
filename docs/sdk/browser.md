@@ -33,7 +33,8 @@ Call `await client.close()` when the owning application is torn down. A second `
 | --- | --- | --- |
 | `dsn` | required | `<origin>/p/<project>@<token>`. The token is a `lo_...` project API token that ships inside the public page, so any visitor can read it: it can only ingest, and read routes answer it with `403 ingest_only_token`. Querying needs a `lou_...` user API token plus the `X-LO-Project` header ([deployment guide](../deployment.md#query-api-mcp-and-grafana)) |
 | `errors` | true | Window error and unhandled rejection capture |
-| `vitals` | true | LCP, CLS, INP, TTFB, FCP |
+| `vitals` | true | LCP, CLS, INP, TTFB, FCP with low-cardinality `device_type`, `browser_family`, and `os_family` dimensions; object form `{ country: "US" }` attaches an explicit 2-letter ISO country code |
+| `country` | unset | Optional explicit 2-letter ISO 3166-1 alpha-2 country code attached to Web Vitals (never inferred from locale/timezone; update at runtime with `setCountry()`) |
 | `fetchTracing` | true | Patch fetch and XHR; object form controls patching/allowlist |
 | `replay` | enabled | Boolean or replay configuration |
 | `release`, `environment` | unset | Error event fields |
@@ -52,6 +53,10 @@ init({
   fetchTracing: { autoPatch: false }
 });
 ```
+
+### Web Vitals dimensions
+
+Web Vitals uploads attach privacy-friendly, low-cardinality dimensions (`device_type`, `browser_family`, and `os_family`) normalized into fixed enums — raw User-Agent strings and IP addresses are never sent as metric labels. The SDK never guesses geography from browser locale or timezone; omit `country` to let a gateway behind `security.trusted_proxies` derive it from edge headers (`CF-IPCountry`, `CloudFront-Viewer-Country`, `X-Vercel-IP-Country`, `X-Country-Code`), or pass an explicit 2-letter ISO 3166-1 alpha-2 code via `init({ country: "US" })`, `init({ vitals: { country: "US" } })`, or `client.setCountry("US")` / `setCountry("US")` (pass `undefined` to clear).
 
 ## Error reporting
 

@@ -6,6 +6,11 @@ import {
   type EndpointStatsResult,
 } from "./performance-contract";
 import { requestVitalPages } from "./performance-pages-contract";
+import {
+  normalizeVitalsBreakdownResponse,
+  type VitalFilters,
+  type VitalsBreakdownResult,
+} from "./performance-vitals-contract";
 
 // Mock data is only for VITE_MOCK builds; load it lazily so it never ships with real chunks.
 const loadMockPerformance = () => import("./mock-performance");
@@ -120,18 +125,102 @@ export function aggregateTrend(series: TimeSeries[] | undefined): number[] {
     .map(([, { sum, count }]) => (count > 0 ? sum / count : 0));
 }
 
-/** Trend series for a single vital, optionally scoped to one page. */
+/** Build a PromQL selector for a Web Vital metric scoped by low-cardinality filters. */
+export function buildVitalPromQL(metric: string, filters?: VitalFilters): string {
+  const matchers: string[] = [];
+  if (filters?.page) {
+    matchers.push(`page=${JSON.stringify(filters.page)}`);
+  }
+  if (filters?.device_type) {
+    matchers.push(
+      filters.device_type === "unknown"
+        ? `device_type=~"|unknown"`
+        : `device_type=${JSON.stringify(filters.device_type)}`,
+    );
+  }
+  if (filters?.browser_family) {
+    matchers.push(
+      filters.browser_family === "other"
+        ? `browser_family=~"|other"`
+        : `browser_family=${JSON.stringify(filters.browser_family)}`,
+    );
+  }
+  if (filters?.os_family) {
+    matchers.push(
+      filters.os_family === "other"
+        ? `os_family=~"|other"`
+        : `os_family=${JSON.stringify(filters.os_family)}`,
+    );
+  }
+  if (filters?.country) {
+    matchers.push(
+      filters.country === "unknown"
+        ? `country=~"|unknown"`
+        : `country=${JSON.stringify(filters.country)}`,
+    );
+  }
+  if (matchers.length === 0) return metric;
+  return `${metric}{${matchers.join(",")}}`;
+}
+
+/**
+ * Build a bounded, sample-weighted PromQL trend expression for a Web Vital metric.
+ * Aggregates across all matched multi-dimensional series in storage so the UI receives
+ * one weighted trend series instead of unbounded raw dimension combinations.
+ */
+export function buildVitalTrendPromQL(
+  metric: string,
+  window: PerfWindow,
+  filters?: VitalFilters,
+): string {
+  const selector = buildVitalPromQL(metric, filters);
+  const windowSpan = Math.max(1, Math.trunc(window.end - window.start));
+  const stepSeconds = Math.max(1, Math.min(Math.max(Math.trunc(window.step), 60), windowSpan));
+  const range = `${stepSeconds}s`;
+  return `sum(sum_over_time(${selector}[${range}])) / sum(count_over_time(${selector}[${range}]))`;
+}
+
+/** Trend series for a single vital, optionally scoped to page and dimension filters. */
 export async function queryVitalSeries(
   key: VitalKey,
   page: string | undefined,
   window: PerfWindow,
   signal?: AbortSignal,
   project?: string,
+  filters?: Omit<VitalFilters, "page">,
 ): Promise<TimeSeries[]> {
-  if (IS_MOCK) return (await loadMockPerformance()).mockVitalSeries(key, page, window);
+  const combined: VitalFilters = { ...filters, ...(page ? { page } : {}) };
+  if (IS_MOCK) return (await loadMockPerformance()).mockVitalSeries(key, page, window, combined);
   const m = vitalByKey(key);
-  const query = page ? `${m.metric}{page=${JSON.stringify(page)}}` : m.metric;
-  return queryRange({ query, start: window.start, end: window.end, step: window.step }, signal, project);
+  const query = buildVitalTrendPromQL(m.metric, window, combined);
+  const label = buildVitalPromQL(m.metric, combined);
+  const series = await queryRange({ query, start: window.start, end: window.end, step: window.step }, signal, project);
+  return series.map((s) => (s.name === "{}" ? { ...s, name: label } : s));
+}
+
+/** Aggregated Web Vitals breakdown across page, device, browser, OS and country dimensions. */
+export async function getVitalsBreakdown(
+  window: PerfWindow,
+  filters?: VitalFilters,
+  signal?: AbortSignal,
+  project?: string,
+): Promise<VitalsBreakdownResult> {
+  if (IS_MOCK) return (await loadMockPerformance()).mockVitalsBreakdown(window, filters, signal);
+  const response = await apiGet<unknown>("/performance/vitals", {
+    params: {
+      start: window.start,
+      end: window.end,
+      step: window.step,
+      page: filters?.page,
+      device_type: filters?.device_type,
+      browser_family: filters?.browser_family,
+      os_family: filters?.os_family,
+      country: filters?.country,
+    },
+    signal,
+    project,
+  });
+  return normalizeVitalsBreakdownResponse(response);
 }
 
 export interface PageVitals {
@@ -163,42 +252,33 @@ export async function getVitalPages(
   );
 }
 
-/** Per-page aggregate table (latest value of each vital, grouped by page). */
+/** Per-page aggregate table backed by the bounded, sample-weighted breakdown endpoint. */
 export async function getVitalsByPage(
   window: PerfWindow,
   signal?: AbortSignal,
   project?: string,
+  filters?: Omit<VitalFilters, "page">,
 ): Promise<PageVitals[]> {
-  if (IS_MOCK) return (await loadMockPerformance()).mockVitalsByPage(window);
-
-  // Real mode: one query per vital (series come back labelled by `page`); join.
-  const perVital = await Promise.all(
-    VITALS.map(async (m) => {
-      const series = await queryRange(
-        { query: m.metric, start: window.start, end: window.end, step: window.step },
-        signal,
-        project,
-      );
-      return { key: m.key, series };
-    }),
-  );
-  const byPage = new Map<string, Partial<Record<VitalKey, number>>>();
-  for (const { key, series } of perVital) {
-    for (const s of series) {
-      const page = s.labels.page;
-      const value = lastValue([s]);
-      if (!page || value == null) continue;
-      const row = byPage.get(page) ?? {};
-      row[key] = value;
-      byPage.set(page, row);
-    }
-  }
-  return [...byPage.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([page, values]) => ({ page, values }));
+  const breakdown = await getVitalsBreakdown(window, filters, signal, project);
+  return [...breakdown.by_page]
+    .sort((a, b) => a.value.localeCompare(b.value))
+    .map((row) => ({ page: row.value, values: row.values }));
 }
 
 export type { EndpointPoint, EndpointStat, EndpointStatsResult } from "./performance-contract";
+export {
+  VITAL_BROWSER_FAMILIES,
+  VITAL_DEVICE_TYPES,
+  VITAL_OS_FAMILIES,
+  type VitalBreakdownRow,
+  type VitalBrowserFamily,
+  type VitalDeviceType,
+  type VitalDimensionKey,
+  type VitalFilters,
+  type VitalOSFamily,
+  type VitalsBreakdownResult,
+  type VitalValuesDTO,
+} from "./performance-vitals-contract";
 
 export async function getEndpointStats(
   window: PerfWindow,

@@ -673,7 +673,10 @@ func TestErrorTrackingLifecycleRawEventsIsolationAndVitals(t *testing.T) {
 	storage.mu.Lock()
 	samples := storage.metricSamples
 	storage.mu.Unlock()
-	if !strings.Contains(samples, `web_vitals_lcp{project_id="default",page="/checkout"} 123.4`) {
+	if !strings.Contains(
+		samples,
+		`web_vitals_lcp{project_id="default",page="/checkout",device_type="unknown",browser_family="other",os_family="other",country="unknown"} 123.4`,
+	) {
 		t.Fatalf("samples=%q", samples)
 	}
 }
@@ -783,7 +786,7 @@ func TestVitalsIngestAcceptsKnownMetricsAndSkipsUnknownNames(t *testing.T) {
 	}
 
 	samples := setup.samples()
-	want := `web_vitals_lcp{project_id="vitals-partial",page="/checkout"} 123.4 1787488496789`
+	want := `web_vitals_lcp{project_id="vitals-partial",page="/checkout",device_type="unknown",browser_family="other",os_family="other",country="unknown"} 123.4 1787488496789`
 	if !strings.Contains(samples, want) {
 		t.Fatalf("samples=%q want substring=%q", samples, want)
 	}
@@ -1030,11 +1033,11 @@ func TestVitalsIngestBatchLimitPageNormalizationAndTimestampBounds(t *testing.T)
 		}
 		samples := setup.samples()
 		for _, want := range []string{
-			`web_vitals_lcp{project_id="vitals-page-norm",page="/checkout"} 100`,
-			`web_vitals_fcp{project_id="vitals-page-norm",page="/orders/:id"} 110`,
-			`web_vitals_inp{project_id="vitals-page-norm",page="/users/:id/profile"} 120`,
-			`web_vitals_cls{project_id="vitals-page-norm",page="/items/:id/detail"} 0.1`,
-			`web_vitals_ttfb{project_id="vitals-page-norm",page="/dashboard/overview"} 80`,
+			`web_vitals_lcp{project_id="vitals-page-norm",page="/checkout",device_type="unknown",browser_family="other",os_family="other",country="unknown"} 100`,
+			`web_vitals_fcp{project_id="vitals-page-norm",page="/orders/:id",device_type="unknown",browser_family="other",os_family="other",country="unknown"} 110`,
+			`web_vitals_inp{project_id="vitals-page-norm",page="/users/:id/profile",device_type="unknown",browser_family="other",os_family="other",country="unknown"} 120`,
+			`web_vitals_cls{project_id="vitals-page-norm",page="/items/:id/detail",device_type="unknown",browser_family="other",os_family="other",country="unknown"} 0.1`,
+			`web_vitals_ttfb{project_id="vitals-page-norm",page="/dashboard/overview",device_type="unknown",browser_family="other",os_family="other",country="unknown"} 80`,
 		} {
 			if !strings.Contains(samples, want) {
 				t.Fatalf("samples missing %q:\n%s", want, samples)

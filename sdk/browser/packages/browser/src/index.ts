@@ -25,6 +25,8 @@ export function startSpan<T>(options: StartSpanOptions, callback: (span: ActiveS
 
 export function setPage(page: string): void { current?.setPage(page); }
 
+export function setCountry(country: string | undefined): void { current?.setCountry(country); }
+
 export function wrapFetch(fetchImpl?: typeof fetch): typeof fetch {
   if (!current) throw new Error("Call init() before wrapFetch()");
   return current.wrapFetch(fetchImpl);
@@ -37,6 +39,14 @@ export { MinuteRateLimiter } from "./rate-limit";
 export { ReplayRingBuffer } from "./replay-buffer";
 export { createTraceContext, isTraceparent, parseTraceparent, traceparent } from "./trace";
 export type { TraceContext } from "./trace";
+export {
+  collectVitalDimensions,
+  detectBrowserFamily,
+  detectDeviceType,
+  detectOSFamily,
+  normalizeCountryCode,
+  type VitalDimensionEnv,
+} from "./vitals-dimensions";
 export type {
   ActiveSpan,
   BrowserClient,
@@ -50,5 +60,10 @@ export type {
   StackFrame,
   StartSpanOptions,
   TraceTarget,
+  VitalBrowserFamily,
+  VitalDeviceType,
+  VitalDimensions,
   VitalName,
+  VitalOSFamily,
+  VitalsConfig,
 } from "./types";

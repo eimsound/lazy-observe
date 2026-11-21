@@ -2,6 +2,21 @@ import type { TraceContext } from "./trace";
 
 export type VitalName = "LCP" | "CLS" | "INP" | "TTFB" | "FCP";
 export type VitalRating = "good" | "needs-improvement" | "poor";
+export type VitalDeviceType = "desktop" | "mobile" | "tablet" | "unknown";
+export type VitalBrowserFamily = "chrome" | "edge" | "safari" | "firefox" | "opera" | "other";
+export type VitalOSFamily = "windows" | "macos" | "ios" | "android" | "linux" | "chromeos" | "other";
+
+export interface VitalDimensions {
+  device_type?: VitalDeviceType;
+  browser_family?: VitalBrowserFamily;
+  os_family?: VitalOSFamily;
+  country?: string;
+}
+
+export interface VitalsConfig {
+  /** Optional explicit 2-letter ISO 3166-1 alpha-2 country code (e.g. "US", "CN"). */
+  country?: string;
+}
 
 /** Safe Web Vital fields mirrored into the rrweb custom-event stream. */
 export interface ReplayVitalSample {
@@ -73,7 +88,9 @@ export interface BrowserConfig {
   dsn: string;
   serviceName?: string;
   errors?: boolean;
-  vitals?: boolean;
+  vitals?: boolean | VitalsConfig;
+  /** Optional explicit 2-letter ISO 3166-1 alpha-2 country code attached to Web Vitals. */
+  country?: string;
   fetchTracing?: boolean | { autoPatch?: boolean; allowlist?: TraceTarget[] };
   replay?: boolean | ReplayConfig;
   beforeSend?: (event: ErrorEventPayload) => ErrorEventPayload | null | undefined;
@@ -108,6 +125,7 @@ export interface BrowserClient {
   captureException(error: unknown, options?: CaptureOptions): string | undefined;
   wrapFetch(fetchImpl?: typeof fetch): typeof fetch;
   setPage(page: string): void;
+  setCountry(country: string | undefined): void;
   diagnostics(): BrowserDiagnostics;
   flush(): Promise<void>;
   close(): Promise<void>;

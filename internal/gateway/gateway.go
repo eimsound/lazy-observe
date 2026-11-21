@@ -898,6 +898,7 @@ func (g *Gateway) registerTelemetryRoutes() {
 	g.route(fiber.MethodGet, "/api/llm/calls", projectQuery, g.llmCalls)
 	g.route(fiber.MethodGet, "/api/llm/timeseries", projectQuery, g.llmTimeseries)
 	g.route(fiber.MethodGet, "/api/v1/performance/endpoints", projectQuery, g.performanceEndpoints)
+	g.route(fiber.MethodGet, "/api/v1/performance/vitals", projectQuery, g.performanceVitals)
 	// Token-authenticated, read-only query aliases used by MCP. They deliberately
 	// reuse the same handlers as the UI and therefore retain project isolation.
 	g.route(fiber.MethodGet, "/api/v1/issues", projectQuery, g.listIssues)

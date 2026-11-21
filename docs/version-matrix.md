@@ -42,7 +42,8 @@
 | OTLP / metrics (gRPC) | `opentelemetry.proto.collector.metrics.v1.MetricsService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`），转发至 VictoriaMetrics `opentelemetry/v1/metrics` 并注入受信任 `extra_label=project_id=<slug>` |
 | OTLP / logs (gRPC) | `opentelemetry.proto.collector.logs.v1.LogsService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`），转发至 VictoriaLogs `insert/opentelemetry/v1/logs` |
 | 私有 ingest | `POST /api/events/errors` | 错误事件上报 |
-| 私有 ingest | `POST /api/events/vitals` | Web Vitals 上报；未知指标名跳过并计数（§5），响应含 `rejected` |
+| 私有 ingest | `POST /api/events/vitals` | Web Vitals 上报；未知指标名跳过并计数（§5），响应含 `rejected`；支持可选低基数设备与地理维度字段（见下方说明） |
+| 私有查询 | `GET /api/v1/performance/vitals` | 项目隔离的 Web Vitals 聚合与维度分解查询（`by_page`、`by_device`、`by_browser`、`by_os`、`by_country`），支持 `page`/`device_type`/`browser_family`/`os_family`/`country` 筛选 |
 | 私有 ingest | `POST /api/events/diagnostics` | SDK 诊断信息上报；未知 `signal` / `reason` 跳过并计数（§5），响应含 `rejected` |
 | 私有 ingest | `POST /api/replay/segments` | 会话回放分段上报 |
 | 私有 ingest | `POST /api/profiles` | 持续剖析（pprof）上报 |
@@ -53,6 +54,15 @@
 
 - `signal`：`error` / `trace` / `vitals` / `replay` / `diagnostic`；
 - `reason`：`queue_full` / `retry_exhausted` / `shutdown_budget` / `server_rejected`。
+
+`POST /api/events/vitals` 每条指标项可选携带以下低基数维度字段（缺省完全向后兼容，协议版本仍为 **v0**）：
+
+- `device_type`：仅限 `desktop` / `mobile` / `tablet` / `unknown`；客户端省略时服务端按 `User-Agent` 低基数回退归一，非白名单值一律归一为 `unknown`；
+- `browser_family`：仅限 `chrome` / `edge` / `safari` / `firefox` / `opera` / `other`；客户端省略时服务端按 `User-Agent` 回退归一，非白名单值一律归一为 `other`；
+- `os_family`：仅限 `windows` / `macos` / `ios` / `android` / `linux` / `chromeos` / `other`；客户端省略时服务端按 `User-Agent` 回退归一，非白名单值一律归一为 `other`；
+- `country`：2 位大写 ASCII ISO 3166-1 alpha-2 国家码（如 `US`/`CN`，排除 `XX`/`T1`/`ZZ`/`A1`/`A2`/`O1` 等未知占位码，非法值归一为 `unknown`）。仅当请求来自 `security.trusted_proxies` 信任的代理时，优先提取标准边缘头（`CF-IPCountry`、`CloudFront-Viewer-Country`、`X-Vercel-IP-Country`、`X-Country-Code`）；无受信任边缘头时才采纳 SDK 显式传入的合法 2 位国家码，否则一律记为 `unknown`。服务端绝不将客户端真实 IP、原始 `User-Agent` 或自由文本写入指标标签。
+
+`GET /api/v1/performance/vitals`（需会话 Cookie 或用户 API Token，拒绝项目 API Token 并强制项目隔离）返回 `{ start, end, step_seconds, filters, summary, total_samples, by_page, by_device, by_browser, by_os, by_country, truncated }`，历史无维度标签的序列在聚合与筛选时自动归入 `unknown` / `other`。
 
 服务端认识的值之外的新增枚举值不会导致整批拒绝：见 §2.3 与 §5。
 
