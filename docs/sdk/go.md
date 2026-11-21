@@ -1,13 +1,12 @@
 # Go SDK
 
-The Go SDK provides explicit Fiber v3, `slog`, `database/sql`, runtime metric, and pprof integrations. Importing it installs no hooks or global OpenTelemetry providers.
+The Go SDK provides explicit integrations for Fiber v3, `slog`, `database/sql`, runtime metrics, and pprof. Importing the package installs no hooks and sets no global OpenTelemetry providers.
 
-> **Breaking: Fiber v3 only.** `lo.Fiber()` returns a Fiber v3 handler (`github.com/gofiber/fiber/v3`, `func(fiber.Ctx) error`). Fiber v2 is not supported and there is no compatibility layer, so a Fiber v2 application cannot use `app.Use(lo.Fiber())`; migrate the application to v3 first (see the [Fiber v3 migration notes](../../sdk/go/README.md#fiber-v3-migration-notes)). The SDK has no tagged release yet, so no previously released version changes.
+> **Breaking change.** The Go SDK supports Fiber v3 only. `lo.Fiber()` returns a Fiber v3 handler (`github.com/gofiber/fiber/v3`, `func(fiber.Ctx) error`). The SDK does not support Fiber v2 and provides no compatibility layer, so a Fiber v2 application cannot pass `lo.Fiber()` to `app.Use`. Migrate the application to Fiber v3 first using the [Fiber v3 migration notes](https://github.com/eimsound/lazy-observe/blob/main/sdk/go/README.md#fiber-v3-migration-notes). Because the SDK has no tagged release yet, no previously released version changes.
 
 ## Install
 
-The Go SDK is the nested module `github.com/eimsound/lazy-observe/sdk/go`
-inside this repository, released with `sdk/go/vX.Y.Z` tags:
+The Go SDK is the nested module `github.com/eimsound/lazy-observe/sdk/go` inside this repository, released with `sdk/go/vX.Y.Z` tags:
 
 ```sh
 go get github.com/eimsound/lazy-observe/sdk/go@latest
@@ -20,9 +19,7 @@ go mod edit \
   -replace github.com/eimsound/lazy-observe/sdk/go=/absolute/path/to/lazy-observe/sdk/go
 ```
 
-For development inside this repository, run the Fiber example from its standalone
-module directory `sdk/go/examples/fiber`, whose `go.mod` isolates example-only
-dependencies such as `modernc.org/sqlite` from `sdk/go/go.mod`.
+For development inside this repository, run the Fiber example from its standalone module directory `sdk/go/examples/fiber`. Its `go.mod` isolates example-only dependencies, such as `modernc.org/sqlite`, from `sdk/go/go.mod`.
 
 ## Initialize and shut down
 
@@ -44,7 +41,7 @@ defer func() {
 }()
 ```
 
-`Init` returns a safe degraded client instead of panicking on invalid configuration. The DSN must be `http(s)://host[:port]/p/<project>@<token>` without query or fragment data.
+`Init` returns a safe degraded client instead of panicking on invalid configuration. The DSN must match `http(s)://host[:port]/p/<project>@<token>` with no query string or fragment.
 
 ## Fiber and logs
 
@@ -59,15 +56,9 @@ app.Get("/orders/:id", func(c fiber.Ctx) error {
 })
 ```
 
-`Fiber()` extracts W3C `traceparent`, creates server spans, records request
-duration and active-request metrics, and recovers panics as HTTP 500 with a
-correlated stack log. Panics and returned handler errors whose effective status
-is 5xx are asynchronously submitted as error events and aggregated into Issues.
-`url.scheme` reads Fiber v3 `Ctx.Scheme()`, honoring forwarded scheme headers
-only when the app explicitly trusts the peer via `fiber.Config{TrustProxy: true}`.
-Use context-aware slog methods to attach `trace_id` and `span_id`.
+`Fiber()` extracts W3C `traceparent`, creates server spans, records request duration and active-request metrics, and recovers panics as HTTP 500 with a correlated stack log. The middleware submits recovered panics and returned handler errors with a 5xx effective status asynchronously as error events, and the platform aggregates them into Issues. `url.scheme` reads Fiber v3 `Ctx.Scheme()`, honoring forwarded scheme headers only when the application trusts the peer through `fiber.Config{TrustProxy: true}`. Use context-aware `slog` methods to attach `trace_id` and `span_id`.
 
-For tighter host isolation, use `lo.FiberWithOptions(lazyobserve.FiberOptions{...})`:
+For tighter host isolation, call `lo.FiberWithOptions(lazyobserve.FiberOptions{...})`:
 
 ```go
 app.Use(lo.FiberWithOptions(lazyobserve.FiberOptions{
@@ -80,7 +71,7 @@ app.Use(lo.FiberWithOptions(lazyobserve.FiberOptions{
 }))
 ```
 
-The SDK does not call `slog.SetDefault`; the application chooses whether to do so.
+The SDK does not call `slog.SetDefault`. The application chooses whether to set the default logger.
 
 ## Database instrumentation
 
@@ -94,26 +85,26 @@ defer db.Close()
 row := db.QueryRowContext(c.Context(), "SELECT status FROM orders WHERE id = $1", id)
 ```
 
-`WrapDB` replaces `sql.Open`, creates client spans, and registers pool metrics without patching or registering drivers; its `metric.Registration` is automatically unregistered during `lo.Shutdown`. For short-lived or dynamically rotated database pools, use `lo.WrapDBContext(poolCtx, driverName, dsn)` so pool metric registration is unregistered immediately when `poolCtx` is cancelled (as well as on `Shutdown`) without leaking callbacks. Import the chosen database driver normally. SQL text is disabled by default; setting `CaptureDBStatement: true` captures query text but never bound parameter values.
+`WrapDB` replaces `sql.Open`, creates client spans, and registers pool metrics without patching or registering drivers. `lo.Shutdown` unregisters its `metric.Registration`. For short-lived or dynamically rotated database pools, call `lo.WrapDBContext(poolCtx, driverName, dsn)`. That call unregisters pool metrics when `poolCtx` is cancelled and on `Shutdown`, preventing callback leaks. Import your database driver as usual. SQL text capture is disabled by default. Setting `CaptureDBStatement: true` captures query text and never captures bound parameter values.
 
 ## Configuration and capability switches
 
 | Field | Default | Behavior |
 | --- | --- | --- |
-| `DSN` | required | Gateway, project, and project API token. The token is a `lo_...` project API token and can only ingest: read routes answer it with `403 ingest_only_token`, so querying needs a `lou_...` user API token plus the `X-LO-Project` header ([deployment guide](../deployment.md#query-api-mcp-and-grafana)) |
-| `ServiceName` | executable basename | OTel `service.name` and slog field |
-| `Metrics`, `Logs`, `Traces` | all enabled when all are false | Once any is true, the three booleans form an explicit enabled set |
-| `SampleRate` | `1` | Parent-based head sampling; zero means “unset” and resolves to `1`, while explicit effective values are `(0, 1]` |
-| `TeeToStderr` | enabled | Pointer to false disables local text output |
-| `CaptureDBStatement` | false | Include SQL statement text in DB spans |
-| `Release`, `Environment` | empty | Deployment metadata attached to error events |
-| `Tags` | empty | Application tags copied during initialization and attached to error events |
-| `ExportInterval` | 5 seconds | Periodic metrics/log export |
-| `Profiling` | enabled | Pointer to false disables CPU, heap, and goroutine profiling |
-| `ProfilingCPU` | enabled | Pointer to false disables CPU pprof sampling while continuing heap and goroutine snapshots (useful when another profiler owns `runtime/pprof.StartCPUProfile`) |
-| `ProfilingInterval` | 60 seconds | Base interval between profiling cycle starts (jittered on initial start and each cycle) |
+| `DSN` | required | Gateway, project, and project API token. This `lo_...` project API token can only ingest. Read routes reject it with `403 ingest_only_token`. Querying requires a `lou_...` user API token and the `X-LO-Project` header. See the [deployment guide](../deployment.md#query-api-mcp-and-grafana). |
+| `ServiceName` | executable basename | OpenTelemetry `service.name` and `slog` field. |
+| `Metrics`, `Logs`, `Traces` | all enabled when all are false | Once any flag is true, the three booleans form an explicit enabled set. |
+| `SampleRate` | `1` | Parent-based head sampling. Zero means "unset" and resolves to `1`. Explicit effective values are `(0, 1]`. |
+| `TeeToStderr` | enabled | Pointer to `false` disables local text output. |
+| `CaptureDBStatement` | `false` | Include SQL statement text in database spans. |
+| `Release`, `Environment` | empty | Deployment metadata attached to error events. |
+| `Tags` | empty | Application tags copied during initialization and attached to error events. |
+| `ExportInterval` | 5 seconds | Periodic metrics and log export interval. |
+| `Profiling` | enabled | Pointer to `false` disables CPU, heap, and goroutine profiling. |
+| `ProfilingCPU` | enabled | Pointer to `false` disables CPU pprof sampling while keeping heap and goroutine snapshots, for cases where another profiler owns `runtime/pprof.StartCPUProfile`. |
+| `ProfilingInterval` | 60 seconds | Base interval between profiling cycle starts, jittered on initial start and on each cycle. |
 
-Example: only metrics and traces:
+Enable only metrics and traces:
 
 ```go
 lo := lazyobserve.Init(lazyobserve.Config{
@@ -123,34 +114,21 @@ lo := lazyobserve.Init(lazyobserve.Config{
 })
 ```
 
-Because the zero-value matrix enables all three signals, disabling every signal means not initializing the SDK.
+Because the zero-value matrix enables all three signals, disable all signals by not initializing the SDK.
 
 ## Error reporting
 
-Fiber reports recovered panics and handler errors with an effective status of
-500 or greater. Returning a 4xx error does not create an Issue. Directly writing
-a 5xx response without returning an error remains visible in metrics and traces,
-but does not create a fabricated exception event.
+Fiber reports recovered panics and handler errors whose effective status is 500 or greater. Returning a 4xx error does not create an Issue. Writing a 5xx response directly without returning an error appears in metrics and traces, not as an exception event.
 
-Use the core API outside Fiber:
+Report errors outside Fiber with the core API:
 
 ```go
 eventID := lo.CaptureException(ctx, err)
 ```
 
-The event carries an outermost-first Go stack, configured
-release/environment/tags, `service.name`, and the active `trace_id` and
-`span_id`. Fiber adds method, route, status, and a query-free request URL.
-Request bodies, headers, cookies, authorization values, and URL queries are not
-captured.
+Each error event carries an outermost-first Go stack, configured release, environment, and tags, `service.name`, and the active `trace_id` and `span_id`. Fiber adds the HTTP method, route, status, and a query-free request URL. The SDK does not capture request bodies, headers, cookies, authorization values, or URL query strings.
 
-Error sending uses a bounded non-blocking queue and batches up to 20 events.
-Before enqueueing, each event is bounded against the gateway's 200 KiB single-event
-budget (capping message, exception type/value, release/environment, URL, tags, and
-stack frames in UTF-8-safe steps). Queue saturation drops the event, updates
-`Diagnostics().DroppedTelemetry` and the drop metric accurately, and emits a
-rate-limited local warning instead of delaying requests or flooding logs.
-`Shutdown` drains the queue and reports the latest export failure.
+Error delivery uses a bounded non-blocking queue and sends batches of up to 20 events. Before enqueueing an event, the SDK trims it to fit the gateway's 200 KiB single-event budget by capping the message, exception type and value, release, environment, URL, tags, and stack frames in UTF-8-safe steps. When the queue is full, the SDK drops the event, updates `Diagnostics().DroppedTelemetry` and the drop metric, and emits a rate-limited local warning without delaying requests or flooding logs. `Shutdown` drains the queue and reports the latest export failure.
 
 ## Continuous profiling
 
@@ -166,6 +144,8 @@ lo := lazyobserve.Init(lazyobserve.Config{
 })
 ```
 
-Each cycle records a 10-second CPU window (unless `ProfilingCPU` is set to `false`) followed by heap and goroutine snapshots, then uploads the gzip pprof payloads to `/api/profiles`. Both the initial start and subsequent cycle intervals include randomized jitter to prevent fleet-wide synchronized spikes. If another profiler already owns `pprof.StartCPUProfile`, the SDK logs a single warning and continues collecting heap and goroutine snapshots. Uploads share the SDK's dedicated ingest HTTP client and bounded `Delivery` retry budget (`MaxAttempts`, Full Jitter exponential backoff, and server `Retry-After` honoring, dropping immediately on permanent 4xx or payloads over 10 MiB) and never fail application requests. If `Shutdown` interrupts a CPU window, the window is uploaded only if it already ran at least 5 seconds; a shorter one is discarded (this is not counted as dropped telemetry). Heap and goroutine snapshots are instantaneous and are still collected; everything queued is uploaded within the `Shutdown` context deadline.
+Each cycle records a 10-second CPU window unless `ProfilingCPU` is `false`, collects heap and goroutine snapshots, and uploads gzip pprof payloads to `/api/profiles`. Both the initial start and subsequent cycle intervals include randomized jitter to prevent synchronized spikes across a fleet. If another profiler already owns `pprof.StartCPUProfile`, the SDK logs one warning and continues collecting heap and goroutine snapshots.
 
-See the runnable [Fiber example](../../sdk/go/examples/fiber/) for a nested order trace, database child spans, correlated logs, controlled fast/slow/error routes, and a concurrent load generator that populates the Performance page.
+Profile uploads share the SDK's dedicated ingest HTTP client and bounded `Delivery` retry budget. That budget enforces `MaxAttempts`, Full Jitter exponential backoff, and server `Retry-After` headers. The client drops permanent 4xx responses and payloads over 10 MiB immediately and never fails application requests. If `Shutdown` interrupts a CPU window, the SDK uploads that window only when it has run for at least 5 seconds. The SDK discards shorter windows and does not count them as dropped telemetry. Heap and goroutine snapshots run immediately, and the SDK uploads all queued payloads within the `Shutdown` context deadline.
+
+See the runnable [Fiber example](https://github.com/eimsound/lazy-observe/blob/main/sdk/go/examples/fiber/README.md) for a nested order trace, database child spans, correlated logs, controlled fast, slow, and error routes, and a concurrent load generator that populates the Performance page.
