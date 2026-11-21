@@ -27,8 +27,9 @@ name: CI
 #   （仅由 `sdk-node` 保存，配 `--skip-tools`，不装 Go/air/golines 等无关工具、不跨版本回退）。保存 `mise-go`/`mise-base`
 #   前先 `mise prune --tools --yes`，避免升版后把旧版本工具一并打包进新缓存。
 # - 每个共享 key 在同一次 workflow 运行内严格只有一个 writer（`go` 写 `mise-go`/`gomod`/`gobuild-X64`，`go-cross` 写
-#   `mise-base` 与 ARM64 的 `gobuild`/`pnpm-web`，`web` 写 X64 的 `pnpm-web`，`e2e(storage)` 写 `storage-native`，
-#   `sdk-node` 写 `mise-sdk-node-*`），避免并发 save 冲突。
+#   `mise-base`、`mise-bin` 与 ARM64 的 `gobuild`/`pnpm-web`，`web` 写 X64 的 `pnpm-web`，`e2e(storage)` 写 `storage-native`，
+#   `sdk-node` 写 `mise-sdk-node-*`），避免并发 save 冲突。`mise-bin-*`（`~/.local/bin/mise`）单独按 `scripts/mise-release.env` 键控，
+#   不设跨版本 `restore-keys`，只在 `main` 上由 `go-cross` 保存 X64/ARM64，其余全部 workflow/job 只读恢复。
 # - pnpm 的 key 不带 mise.toml 哈希，其它工具升版不会让它们整份换新；`sdk-journeys` 按工作区隔离目录只读复用
 #   `pnpm-web` / `pnpm-sdk-node` / `pnpm-sdk-browser` 三个独立 store，不额外保存三锁合一副本；`playwright-sdk-journeys-*`
 #   仅按 `playwright-core` 精确版本键控且不设跨版本 `restore-keys`。
@@ -102,6 +103,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # go-ci 工具集（含 golangci-lint、helm 等）由这个 job 保存，sdk-go 只读复用。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         id: mise-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -184,6 +190,12 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # mise-base 是所有 base 工具集 job 的共用 key，唯一 writer 是本 job（覆盖 X64 与 ARM64）。
+      - name: Restore mise binary cache
+        id: mise-bin-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         id: mise-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -229,6 +241,12 @@ jobs:
       - name: Prune stale mise tools
         if: github.ref == 'refs/heads/main' && steps.mise-cache.outputs.cache-hit != 'true'
         run: mise prune --tools --yes
+      - name: Save mise binary cache
+        if: github.ref == 'refs/heads/main' && steps.mise-bin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: ${{ steps.mise-bin-cache.outputs.cache-primary-key }}
       - name: Save mise cache
         if: github.ref == 'refs/heads/main' && steps.mise-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -305,6 +323,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # mise-base 由 go-cross 唯一保存，这里只读。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -358,6 +381,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # 与 e2e 使用完全相同的触发标志，mise-base 由 go-cross 保存、storage-native 由 e2e(storage) 保存，这里全部只读。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -405,6 +433,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # mise-base 由 go-cross 唯一保存、gomod/gobuild 由 go 保存、storage-native 由 e2e(storage) 保存，这里全部只读。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -447,6 +480,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # mise-base 由 go-cross 唯一保存，这里只读。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -485,6 +523,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # 只读 base 工具集的缓存（go 在里面）；保存由其它 base job 负责。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -556,6 +599,11 @@ jobs:
         run: bash scripts/ci-cache-keys.sh
       # 只读复用 go job 的 mise-go（已含 go 与 golangci-lint）以及 gomod/gobuild（go job 的 vulncheck 与
       # replace 依赖已覆盖 sdk/go 的绝大多数模块与编译产物），配 --skip-tools 避免装无关工具，不再单存一份。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -608,6 +656,11 @@ jobs:
       # sdk-node 与 sdk-browser 只装 pnpm + 这一格的 node，任务走 --skip-tools 不装 Go/air/golines 等无关工具，
       # 两边共用 mise-sdk-node-<node>-pnpm-<pnpm>-* 一份约 50 MB 的小缓存；不设跨版本 restore-keys 避免把旧版或旧的
       # 260 MB 膨胀缓存拖回来。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         id: mise-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -668,6 +721,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # 与 sdk-node 共用同一份 mise 缓存（由 sdk-node 唯一保存，这里只读，避免并发 save 同一 key）。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -735,6 +793,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # 只读 base 工具集的缓存（uv 在里面），配 --skip-tools 避免装 Go/Node 等无关工具；保存由 base job 负责。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -796,6 +859,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # mise-base 已包含 go/node/pnpm/jq/uv 及非 lazy 工具 rg，与 sdk-journeys 工具集一致，直接只读复用。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -931,6 +999,11 @@ jobs:
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
       # 只读复用 base 的 mise 缓存（uv 在里面），配 --skip-tools 避免安装无关工具。
+      - name: Restore mise binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/mise
+          key: mise-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise-bin }}
       - name: Restore mise cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

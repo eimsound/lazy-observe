@@ -78,7 +78,10 @@ fetch() {
   archive="$archive_dir/$asset"
   if [[ ! -f $archive ]]; then
     printf 'downloading %s\n' "$url"
-    curl -fL --retry 3 --retry-all-errors -o "$tmp_dir/$asset" "$url"
+    curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
+      --connect-timeout 20 --max-time 120 \
+      --retry 5 --retry-all-errors --retry-max-time 90 \
+      -o "$tmp_dir/$asset" "$url"
     mv "$tmp_dir/$asset" "$archive"
   else
     printf 'using cached %s\n' "$archive"
