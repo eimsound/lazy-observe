@@ -25,7 +25,7 @@ const (
 )
 
 var (
-	leaseTable     = regexp.MustCompile(`\balert_(engine_members|rule_leases)\b`)
+	leaseTable     = regexp.MustCompile(`\b(alert_(engine_members|rule_leases)|source_map_upload_pins)\b`)
 	secondOnlyTime = regexp.MustCompile(`(?i)\bdatetime\(\s*'now'`)
 )
 

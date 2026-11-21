@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"entgo.io/ent/dialect"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 )
 
@@ -189,6 +190,274 @@ func TestListSourceMapReleasesSQLPushdownAggregationAndLimit(t *testing.T) {
 		}
 		if len(limited) != 2 || limited[0].Release != "v2" || limited[1].Release != "v3" {
 			t.Fatalf("limited=%#v", limited)
+		}
+	})
+}
+
+func expireSourceMapPinsForTest(t *testing.T, store *Store, projectID int) {
+	t.Helper()
+	query := `UPDATE source_map_upload_pins SET expires_at = strftime('%Y-%m-%d %H:%M:%f', 'now', '-1 minute') WHERE project_id = ?`
+	if store.dialect == dialect.Postgres {
+		query = `UPDATE source_map_upload_pins SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 minute' WHERE project_id = $1`
+	}
+	if _, err := store.db.ExecContext(context.Background(), query, projectID); err != nil {
+		t.Fatalf("expire source map upload pins: %v", err)
+	}
+}
+
+func TestSourceMapUploadPinsLifecycleAndSweepSerialization(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "PinnedMaps", "pinned-maps")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+		d1, d2, d3 := strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64)
+
+		// 1. Active pin appears in ReferencedSourceMapDigests and hands off
+		// atomically to source_map_artifacts on commit.
+		token, err := store.PinSourceMapUploads(ctx, project.ID, []string{d1, d1}, 15*time.Minute)
+		if err != nil || token == "" {
+			t.Fatalf("PinSourceMapUploads token=%q err=%v", token, err)
+		}
+		refs, err := store.ReferencedSourceMapDigests(ctx, project.ID)
+		if err != nil || !refs[d1] {
+			t.Fatalf("active pin missing from references: refs=%v err=%v", refs, err)
+		}
+		if err := store.CommitPinnedSourceMapArtifacts(
+			ctx,
+			project.ID,
+			"r1",
+			token,
+			[]SourceMapArtifactInput{{Filename: "a.js", Size: 10, SHA256: d1}},
+			10,
+			1000,
+			now,
+		); err != nil {
+			t.Fatalf("CommitPinnedSourceMapArtifacts: %v", err)
+		}
+		// Reusing an already consumed pin must fail cleanly.
+		if err := store.CommitPinnedSourceMapArtifacts(
+			ctx,
+			project.ID,
+			"r1",
+			token,
+			[]SourceMapArtifactInput{{Filename: "a.js", Size: 10, SHA256: d1}},
+			10,
+			1000,
+			now,
+		); !errors.Is(err, ErrSourceMapUploadPinExpired) {
+			t.Fatalf("reused pin err=%v want ErrSourceMapUploadPinExpired", err)
+		}
+
+		// 2. Expired pin must be rejected by CommitPinnedSourceMapArtifacts on
+		// its own even before any janitor prune or sweep runs.
+		unprunedExpiredToken, err := store.PinSourceMapUploads(ctx, project.ID, []string{d3}, 15*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expireSourceMapPinsForTest(t, store, project.ID)
+		if err := store.CommitPinnedSourceMapArtifacts(
+			ctx,
+			project.ID,
+			"r-unpruned",
+			unprunedExpiredToken,
+			[]SourceMapArtifactInput{{Filename: "c.js", Size: 10, SHA256: d3}},
+			10,
+			1000,
+			now,
+		); !errors.Is(err, ErrSourceMapUploadPinExpired) {
+			t.Fatalf("unpruned expired pin commit err=%v want ErrSourceMapUploadPinExpired", err)
+		}
+		if rows, err := store.SourceMapArtifacts(ctx, project.ID, "r-unpruned"); err != nil || len(rows) != 0 {
+			t.Fatalf("unpruned expired pin persisted metadata: rows=%d err=%v", len(rows), err)
+		}
+
+		// 3. Expired pin is purged by WithSourceMapSweepLock and subsequent late
+		// commit is rejected with ErrSourceMapUploadPinExpired.
+		expiredToken, err := store.PinSourceMapUploads(ctx, project.ID, []string{d2}, 15*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expireSourceMapPinsForTest(t, store, project.ID)
+		var sawD2 bool
+		if err := store.WithSourceMapSweepLock(ctx, project.ID, func(locked map[string]bool) error {
+			sawD2 = locked[d2]
+			return nil
+		}); err != nil {
+			t.Fatalf("WithSourceMapSweepLock: %v", err)
+		}
+		if sawD2 {
+			t.Fatalf("expired pin %s should not remain referenced after sweep purge", d2)
+		}
+		if err := store.CommitPinnedSourceMapArtifacts(
+			ctx,
+			project.ID,
+			"r2",
+			expiredToken,
+			[]SourceMapArtifactInput{{Filename: "b.js", Size: 10, SHA256: d2}},
+			10,
+			1000,
+			now,
+		); !errors.Is(err, ErrSourceMapUploadPinExpired) {
+			t.Fatalf("late commit after expiry err=%v want ErrSourceMapUploadPinExpired", err)
+		}
+
+		// 4. WithSourceMapSweepLock blocks concurrent PinSourceMapUploads until released.
+		lockHeld := make(chan struct{})
+		releaseLock := make(chan struct{})
+		sweepDone := make(chan error, 1)
+		go func() {
+			sweepDone <- store.WithSourceMapSweepLock(ctx, project.ID, func(map[string]bool) error {
+				close(lockHeld)
+				<-releaseLock
+				return nil
+			})
+		}()
+		select {
+		case <-lockHeld:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for sweep lock")
+		}
+		pinDone := make(chan error, 1)
+		go func() {
+			pinTok, pinErr := store.PinSourceMapUploads(ctx, project.ID, []string{d2}, 15*time.Minute)
+			if pinErr == nil {
+				pinErr = store.ReleaseSourceMapUploadPins(ctx, project.ID, pinTok)
+			}
+			pinDone <- pinErr
+		}()
+		select {
+		case err := <-pinDone:
+			t.Fatalf("PinSourceMapUploads bypassed sweep lock (err=%v)", err)
+		default:
+		}
+		close(releaseLock)
+		if err := <-sweepDone; err != nil {
+			t.Fatalf("WithSourceMapSweepLock failed: %v", err)
+		}
+		select {
+		case err := <-pinDone:
+			if err != nil {
+				t.Fatalf("PinSourceMapUploads after unlock failed: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for PinSourceMapUploads after unlock")
+		}
+
+		// 5. PruneExpiredSourceMapUploadPins removes leftover expired pins in batches.
+		if _, err := store.PinSourceMapUploads(ctx, project.ID, []string{d2}, 15*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		expireSourceMapPinsForTest(t, store, project.ID)
+		pruned, err := store.PruneExpiredSourceMapUploadPins(ctx)
+		if err != nil || pruned != 1 {
+			t.Fatalf("PruneExpiredSourceMapUploadPins pruned=%d err=%v want 1", pruned, err)
+		}
+	})
+}
+
+func TestWithSourceMapSweepLockReleasesLockOnPanic(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "PanicSweep", "panic-sweep")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			_ = store.WithSourceMapSweepLock(ctx, project.ID, func(map[string]bool) error {
+				panic("simulated blob delete panic")
+			})
+		}()
+		if recovered == nil {
+			t.Fatal("expected panic from sweep callback")
+		}
+		// Lock and reserved DB connection must be released after panic.
+		lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		tok, err := store.PinSourceMapUploads(lockCtx, project.ID, []string{strings.Repeat("f", 64)}, 15*time.Minute)
+		if err != nil {
+			t.Fatalf("PinSourceMapUploads after sweep panic failed: %v", err)
+		}
+		if err := store.ReleaseSourceMapUploadPins(lockCtx, project.ID, tok); err != nil {
+			t.Fatalf("ReleaseSourceMapUploadPins after sweep panic failed: %v", err)
+		}
+		if err := store.WithSourceMapSweepLock(lockCtx, project.ID, func(map[string]bool) error {
+			return nil
+		}); err != nil {
+			t.Fatalf("subsequent WithSourceMapSweepLock after panic failed: %v", err)
+		}
+	})
+}
+
+func TestDeleteExpiredSourceMapReleaseRespectsConcurrentRefresh(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "ExpireMaps", "expire-maps")
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+		cutoff := now.Add(-90 * 24 * time.Hour)
+		old := cutoff.Add(-time.Hour)
+		d1, d2 := strings.Repeat("a", 64), strings.Repeat("b", 64)
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-old", "a.js", 10, d1, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-refreshed", "a.js", 10, d1, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-refreshed", "b.js", 10, d1, now); err != nil {
+			t.Fatal(err)
+		}
+		// Overwrite only the existing filename with a newer timestamp.
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-overwrite", "a.js", 10, d1, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertSourceMapArtifact(ctx, project.ID, "r-overwrite", "a.js", 20, d2, now); err != nil {
+			t.Fatal(err)
+		}
+
+		removed, err := store.DeleteExpiredSourceMapRelease(ctx, project.ID, "r-refreshed", cutoff)
+		if err != nil || removed {
+			t.Fatalf("DeleteExpiredSourceMapRelease(r-refreshed) removed=%v err=%v want false", removed, err)
+		}
+		if rows, err := store.SourceMapArtifacts(ctx, project.ID, "r-refreshed"); err != nil || len(rows) != 2 {
+			t.Fatalf("r-refreshed rows=%d err=%v want 2", len(rows), err)
+		}
+		removed, err = store.DeleteExpiredSourceMapRelease(ctx, project.ID, "r-overwrite", cutoff)
+		if err != nil || removed {
+			t.Fatalf("DeleteExpiredSourceMapRelease(r-overwrite) removed=%v err=%v want false", removed, err)
+		}
+		if rows, err := store.SourceMapArtifacts(ctx, project.ID, "r-overwrite"); err != nil || len(rows) != 1 ||
+			rows[0].Sha256 != d2 || !rows[0].CreatedAt.Equal(now) {
+			t.Fatalf("r-overwrite rows=%+v err=%v want 1 refreshed row", rows, err)
+		}
+		releases, err := store.ListSourceMapReleases(ctx, project.ID, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var foundOverwrite bool
+		for _, rel := range releases {
+			if rel.Release == "r-overwrite" {
+				foundOverwrite = true
+				if rel.Files != 1 || rel.Size != 20 || !rel.CreatedAt.Equal(now) {
+					t.Fatalf("r-overwrite release summary=%+v want created_at=%v", rel, now)
+				}
+			}
+		}
+		if !foundOverwrite {
+			t.Fatalf("r-overwrite missing from ListSourceMapReleases: %+v", releases)
+		}
+		removed, err = store.DeleteExpiredSourceMapRelease(ctx, project.ID, "r-old", cutoff)
+		if err != nil || !removed {
+			t.Fatalf("DeleteExpiredSourceMapRelease(r-old) removed=%v err=%v want true", removed, err)
+		}
+		if rows, err := store.SourceMapArtifacts(ctx, project.ID, "r-old"); err != nil || len(rows) != 0 {
+			t.Fatalf("r-old rows=%d err=%v want 0", len(rows), err)
 		}
 	})
 }

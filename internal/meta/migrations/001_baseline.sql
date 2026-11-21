@@ -515,3 +515,17 @@ CREATE TABLE deleted_project_slugs (
     blobs_cleaned_at TIMESTAMP NULL
 );
 CREATE INDEX deleted_project_slugs_blobs_cleaned ON deleted_project_slugs (blobs_cleaned_at);
+
+CREATE TABLE source_map_upload_pins (
+    token TEXT NOT NULL,
+    project_id INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (token, sha256),
+    CONSTRAINT source_map_upload_pins_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+CREATE INDEX source_map_upload_pins_project_expires_at
+    ON source_map_upload_pins (project_id, expires_at);
+CREATE INDEX source_map_upload_pins_expires_at
+    ON source_map_upload_pins (expires_at);

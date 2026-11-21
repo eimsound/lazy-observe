@@ -1,6 +1,6 @@
 # SQLite 下告警租约统一走毫秒时钟入口
 
-SQLite 的 `CURRENT_TIMESTAMP` 和 `datetime()` 只有整秒精度：`datetime('now', '+1.000000 seconds')` 在 `hh:mm:23.9` 求值得到 `hh:mm:24`，而不是 `hh:mm:24.9`。告警引擎的成员身份和规则租约（ADR 0001）用数据库时间判定过期，于是 SQLite 下每个 TTL 实际只有 `TTL - frac(获取时刻)`，短 TTL 的租约可能在一次评估中途就过期，提交被隔离纪元拒绝（`ErrStaleRuleFence`）。PostgreSQL 的 `CURRENT_TIMESTAMP` 是微秒精度，没有这个问题。我们决定：凡是读写 `alert_engine_members`、`alert_rule_leases` 且用到数据库当前时间的查询，都只通过 `internal/meta/alert_engine.go` 里的两个入口取时钟：
+SQLite 的 `CURRENT_TIMESTAMP` 和 `datetime()` 只有整秒精度：`datetime('now', '+1.000000 seconds')` 在 `hh:mm:23.9` 求值得到 `hh:mm:24`，而不是 `hh:mm:24.9`。告警引擎的成员身份和规则租约（ADR 0001）以及 Source Map 在途上传保护表 `source_map_upload_pins` 用数据库时间判定过期，于是 SQLite 下每个 TTL 实际只有 `TTL - frac(获取时刻)`，短 TTL 的租约可能在一次评估或上传中途就过期，提交被隔离纪元或过期检查拒绝（`ErrStaleRuleFence`、`ErrSourceMapUploadPinExpired`）。PostgreSQL 的 `CURRENT_TIMESTAMP` 是微秒精度，没有这个问题。我们决定：凡是读写 `alert_engine_members`、`alert_rule_leases`、`source_map_upload_pins` 且用到数据库当前时间的查询，都只通过 `internal/meta/alert_engine.go` 里的两个入口取时钟：
 
 - `(*Store).alertLeaseExpiry(ttl)`：生成到期时间表达式和参数。SQLite 用 `strftime('%Y-%m-%d %H:%M:%f', 'now', ?)`，PostgreSQL 用 `CURRENT_TIMESTAMP + (? * INTERVAL '1 millisecond')`。
 - `(*Store).alertClockSQL(query)`：代替 `bind(s.dialect, query)`。查询里照常写 `CURRENT_TIMESTAMP`，SQLite 下它被替换成 `sqliteAlertClock`（`strftime('%Y-%m-%d %H:%M:%f', 'now')`），PostgreSQL 下原样保留。
