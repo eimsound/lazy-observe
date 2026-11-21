@@ -8,7 +8,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 script="$root/scripts/ci-changes.sh"
-flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys trivy_pin)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys trivy_pin docs)
 failures=0
 
 changes_for() {
@@ -38,8 +38,28 @@ expect_flag() { # files flag [flag ...]
   done
 }
 
+expect_only_flags() { # files flag [flag ...]
+  local files=$1 got flag want
+  shift
+  got=$(changes_for "$files")
+  for flag in "${flags[@]}"; do
+    want=false
+    for expected in "$@"; do
+      if [[ $flag == "$expected" ]]; then
+        want=true
+        break
+      fi
+    done
+    grep -qx "${flag}=${want}" <<<"$got" || {
+      printf 'FAIL [%s] %s must be %s\n' "$files" "$flag" "$want" >&2
+      failures=$((failures + 1))
+    }
+  done
+}
+
 # --- 1. 全量兜底（CI 自身、工具链、未分类路径） ---
 expect_full '.github/workflows/ci.yml'
+expect_full '.github/workflows/docs.yml'
 expect_full '.github/workflows/release.yml'
 expect_full '.github/workflows/sdk-release.yml'
 expect_full 'mise.toml'
@@ -126,6 +146,14 @@ expect_flag 'sdk/browser/packages/browser/src/index.ts' sdk_browser sdk_journeys
 expect_flag 'sdk/python/src/lazyobserve/__init__.py' sdk_python sdk_journeys
 expect_flag 'sdk/scripts/sdk-publish.sh' go sdk_go sdk_node sdk_browser sdk_python sdk_journeys
 expect_flag 'scripts/sdk-journeys.sh' go sdk_journeys
+
+# --- 5.5 Zensical 文档站变更面（纯文档站不触发重型业务 job；tools/docs/pyproject.toml 同时触发 go 的 7 天发布年龄校验） ---
+expect_only_flags 'docs/index.md' docs
+expect_only_flags 'docs/zh/quickstart.md' docs
+expect_only_flags 'zensical.toml' docs
+expect_only_flags 'zensical.zh.toml' docs
+expect_only_flags 'tools/docs/pyproject.toml' go docs
+expect_only_flags 'README.md'
 
 # --- 6. --all 与无可用 base 事件兜底 ---
 got=$(GITHUB_OUTPUT='' bash "$script" --all 2>/dev/null)

@@ -250,6 +250,39 @@ run = '${HELM:-helm} lint deploy/helm/lazy-observe'
 description = "Check the Helm chart values schema, security guards, image.digest, and Go config.Load contract"
 run = "bash scripts/helm-template-test.sh"
 
+[tasks.docs-build]
+description = "Build the bilingual Zensical documentation site (English in site/, Simplified Chinese in site/zh/)"
+# 文档站构建工具由 uv 受管 Python + tools/docs/pyproject.toml 驱动，不依赖系统 python3 或 pip；
+# 先构建英文主站（--clean 清空 site/），再构建简体中文站到 site/zh/。
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+version=${LO_DOCS_PYTHON_VERSION:-3.13}
+venv="$PWD/tools/docs/.venv"
+uv python install --managed-python --no-bin "$version"
+uv venv --managed-python --python "$version" --clear "$venv"
+(cd tools/docs && uv pip install --quiet --python "$venv/bin/python" -r pyproject.toml)
+"$venv/bin/zensical" build -f zensical.toml --clean --strict
+"$venv/bin/zensical" build -f zensical.zh.toml --clean --strict
+'''
+
+[tasks.docs-serve]
+description = "Serve the Zensical documentation site locally (set LO_DOCS_LANG=zh for Simplified Chinese)"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+version=${LO_DOCS_PYTHON_VERSION:-3.13}
+venv="$PWD/tools/docs/.venv"
+config=zensical.toml
+if [[ ${LO_DOCS_LANG:-en} == zh ]]; then
+  config=zensical.zh.toml
+fi
+uv python install --managed-python --no-bin "$version"
+uv venv --managed-python --python "$version" --clear "$venv"
+(cd tools/docs && uv pip install --quiet --python "$venv/bin/python" -r pyproject.toml)
+exec "$venv/bin/zensical" serve -f "$config"
+'''
+
 [tasks.workflow-check]
 description = "Statically validate GitHub Actions workflows without a runner"
 run = [
