@@ -231,13 +231,13 @@ printf '\n'
 go_version=
 for tool in "${ci_tools[@]}"; do
   [[ $tool == go:* ]] || continue
-  [[ -n $go_version ]] || go_version=$("$mise_bin" exec -- go env GOVERSION)
+  [[ -n $go_version ]] || go_version=$("$mise_bin" exec go -- go env GOVERSION)
   tool_dir=$("$mise_bin" where "$tool")
   built=
   rebuild=0
   for bin in "$tool_dir"/bin/*; do
     [[ -f $bin ]] || continue
-    built=$("$mise_bin" exec -- go version "$bin" | awk '{print $NF}')
+    built=$("$mise_bin" exec go -- go version "$bin" | awk '{print $NF}')
     [[ $built == "$go_version" ]] || rebuild=1
   done
   if ((rebuild)); then
@@ -248,7 +248,7 @@ done
 
 for tool in "${ci_tools[@]}"; do
   if [[ $tool == pnpm || $tool == pnpm@* ]]; then
-    "$mise_bin" exec -- pnpm config set store-dir "${HOME}/.pnpm-store"
+    "$mise_bin" exec "$tool" -- pnpm config set store-dir "${HOME}/.pnpm-store"
     break
   fi
 done

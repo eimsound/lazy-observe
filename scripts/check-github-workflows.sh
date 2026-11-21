@@ -184,6 +184,326 @@ if [[ -n $unverified_mise ]]; then
   fail 'mise must be downloaded from the pinned GitHub release, not the mise.run installer'
 fi
 
+# 禁止在 workflow 中使用裸 `mise exec --` / `mise x --`（未在 `--` 或 `-c` 前显式指名工具）：
+# mise 会在自动安装开启时顺手装上 mise.toml [tools] 里的全部非 lazy 工具，导致缓存膨胀并扩大供应链暴露面。
+bare_mise_exec() {
+  awk '
+    function indent(s) { return match(s, /^ */) ? RLENGTH : 0 }
+    function ltrim(s) { sub(/^[[:space:]]+/, "", s); return s }
+    function rtrim(s) { sub(/[[:space:]]+$/, "", s); return s }
+    function ends_with_backslash(s,    i, cnt) {
+      cnt = 0
+      for (i = length(s); i >= 1 && substr(s, i, 1) == "\\"; i--) cnt++
+      return (cnt % 2) == 1
+    }
+    function unquote_yaml(s,    q, body) {
+      s = ltrim(s)
+      if (substr(s, 1, 1) == "'"'"'" && match(s, /^'"'"'([^'"'"']|'"'"''"'"')*'"'"'([[:space:]]*(#.*)?)?$/)) {
+        body = substr(s, 2)
+        sub(/'"'"'([[:space:]]*(#.*)?)?$/, "", body)
+        gsub(/'"'"''"'"'/, "'"'"'", body)
+        return body
+      }
+      if (substr(s, 1, 1) == "\"" && match(s, /^"([^"\\]|\\.)*"([[:space:]]*(#.*)?)?$/)) {
+        body = substr(s, 2)
+        sub(/"([[:space:]]*(#.*)?)?$/, "", body)
+        gsub(/\\"/, "\"", body)
+        gsub(/\\\\/, "\\", body)
+        return body
+      }
+      return s
+    }
+    function push_tok(t) {
+      if (has_tok) {
+        toks[++ntoks] = t
+        word = ""
+        has_tok = 0
+      }
+    }
+    function push_sep() {
+      push_tok(word)
+      if (ntoks == 0 || toks[ntoks] != "\n") {
+        toks[++ntoks] = "\n"
+      }
+    }
+    function tokenize(line,    n, i, c, c2, sp, stk, st, word_started) {
+      ntoks = 0
+      word = ""
+      has_tok = 0
+      sp = 1
+      stk[1] = "CODE"
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        st = stk[sp]
+        if (st == "SQ") {
+          if (c == "'"'"'") {
+            sp--
+          } else {
+            word = word c
+          }
+          has_tok = 1
+          continue
+        }
+        if (st == "DQ") {
+          if (c == "\"") {
+            sp--
+            has_tok = 1
+          } else if (c == "\\") {
+            if (i + 1 <= n) {
+              c2 = substr(line, i + 1, 1)
+              if (c2 == "$" || c2 == "`" || c2 == "\"" || c2 == "\\") {
+                word = word c2
+                i++
+              } else {
+                word = word c
+              }
+            } else {
+              word = word c
+            }
+            has_tok = 1
+          } else if (c == "$" && i + 1 <= n && substr(line, i + 1, 1) == "(") {
+            push_sep()
+            stk[++sp] = "SUB"
+            i++
+          } else if (c == "`") {
+            push_sep()
+          } else {
+            word = word c
+            has_tok = 1
+          }
+          continue
+        }
+        # CODE / SUB / PAREN
+        if (c == " " || c == "\t" || c == "\r" || c == "\n") {
+          push_tok(word)
+        } else if (c == "#" && !has_tok) {
+          break
+        } else if (c == "'"'"'") {
+          stk[++sp] = "SQ"
+          has_tok = 1
+        } else if (c == "\"") {
+          stk[++sp] = "DQ"
+          has_tok = 1
+        } else if (c == "\\") {
+          if (i + 1 <= n) {
+            word = word substr(line, i + 1, 1)
+            i++
+          } else {
+            word = word c
+          }
+          has_tok = 1
+        } else if (c == "$" && i + 1 <= n && substr(line, i + 1, 1) == "(") {
+          push_sep()
+          stk[++sp] = "SUB"
+          i++
+        } else if (c == "`") {
+          push_sep()
+        } else if (c == "(") {
+          push_sep()
+          stk[++sp] = "PAREN"
+        } else if (c == ")") {
+          push_sep()
+          if (sp > 1 && (stk[sp] == "SUB" || stk[sp] == "PAREN")) sp--
+        } else if (c == ";" || c == "|" || c == "&") {
+          if (i + 1 <= n) {
+            c2 = substr(line, i + 1, 1)
+            if ((c == "&" && c2 == "&") || (c == "|" && (c2 == "|" || c2 == "&")) || (c == ";" && c2 == ";")) i++
+          }
+          push_sep()
+        } else {
+          word = word c
+          has_tok = 1
+        }
+      }
+      push_tok(word)
+    }
+    function is_global_val_flag(t) {
+      return (t == "-C" || t == "--cd" || t == "-E" || t == "--env" || t == "--profile")
+    }
+    function is_global_bool_flag(t) {
+      return (t ~ /^-(q|y|h|V|v+)$/ || t ~ /^--(quiet|verbose|yes|locked|silent|no-config|help|version)$/ || t ~ /^--(cd|env|profile)=/)
+    }
+    function is_exec_val_flag(t) {
+      return (t == "-j" || t == "--jobs" || t == "-C" || t == "--cd" || t == "-E" || t == "--env" || t == "--profile" || \
+              t == "--allow-env" || t == "--allow-net" || t == "--allow-read" || t == "--allow-write" || t == "--secrets")
+    }
+    function check_logical(file, lineno, raw,    i, j, end, cmd, subcmd, is_help, has_target, has_tool, t) {
+      tokenize(raw)
+      i = 1
+      while (i <= ntoks) {
+        while (i <= ntoks && toks[i] == "\n") i++
+        if (i > ntoks) break
+        end = i
+        while (end <= ntoks && toks[end] != "\n") end++
+        j = i
+        while (j < end) {
+          t = toks[j]
+          if (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || t == "!" || t == "time" || t == "exec" || t == "command" || \
+              t == "builtin" || t == "nohup" || t == "if" || t == "then" || t == "elif" || t == "else" || t == "do") {
+            j++
+            continue
+          }
+          if (t == "env") {
+            j++
+            while (j < end) {
+              t = toks[j]
+              if (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { j++; continue }
+              if (t == "-u" || t == "--unset" || t == "-C" || t == "--chdir" || t == "-S" || t == "--split-string") { j += 2; continue }
+              if (t ~ /^-/) { j++; continue }
+              break
+            }
+            continue
+          }
+          break
+        }
+        if (j < end) {
+          cmd = toks[j]
+          sub(/^.*\//, "", cmd)
+          if (cmd == "mise") {
+            j++
+            while (j < end) {
+              t = toks[j]
+              if (is_global_val_flag(t)) {
+                j += 2
+              } else if (is_global_bool_flag(t)) {
+                j++
+              } else {
+                break
+              }
+            }
+            if (j < end && (toks[j] == "exec" || toks[j] == "x")) {
+              j++
+              is_help = 0
+              has_target = 0
+              has_tool = 0
+              while (j < end) {
+                t = toks[j]
+                if (t == "--") {
+                  has_target = 1
+                  break
+                } else if (t == "-h" || t == "--help") {
+                  is_help = 1
+                  break
+                } else if (t == "-c" || t == "--command") {
+                  has_target = 1
+                  j += 2
+                } else if (t ~ /^--command=/ || t ~ /^-c.+$/) {
+                  has_target = 1
+                  j++
+                } else if (is_exec_val_flag(t)) {
+                  j += 2
+                } else if (t ~ /^-/ && t != "-") {
+                  j++
+                } else {
+                  has_tool = 1
+                  j++
+                }
+              }
+              if (!is_help && has_target && !has_tool) {
+                printf "%s:%d: %s\n", file, lineno, ltrim(raw)
+              }
+            }
+          }
+        }
+        i = end + 1
+      }
+    }
+    function flush_logical() {
+      if (logical != "") {
+        check_logical(start_file, start_nr, logical)
+        logical = ""
+      }
+    }
+    function feed_line(file, nr, line) {
+      if (logical == "") {
+        if (line ~ /^[[:space:]]*(#.*)?$/) return
+        start_file = file
+        start_nr = nr
+      }
+      if (ends_with_backslash(line)) {
+        sub(/\\$/, "", line)
+        logical = (logical == "" ? line : logical " " line)
+        return
+      }
+      logical = (logical == "" ? line : logical " " line)
+      flush_logical()
+    }
+    FNR == 1 && NR > 1 {
+      flush_logical()
+      inblock = 0
+    }
+    inblock {
+      if ($0 ~ /^[[:space:]]*$/ || indent($0) > base) {
+        feed_line(FILENAME, FNR, $0)
+        next
+      }
+      flush_logical()
+      inblock = 0
+    }
+    match($0, /^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*/) {
+      rest = substr($0, RSTART + RLENGTH)
+      if (rest ~ /^[|>][-+]?[0-9]*([[:space:]]+#.*)?[[:space:]]*$/) {
+        inblock = 1
+        match($0, /run:/)
+        base = RSTART - 1
+        next
+      }
+      if (rest != "" && rest !~ /^[[:space:]]*#/) {
+        feed_line(FILENAME, FNR, unquote_yaml(rest))
+        flush_logical()
+      }
+    }
+    END { flush_logical() }
+  ' "$@"
+}
+
+bare_mise_fixture=$(mktemp -d)
+cat >"$bare_mise_fixture/bad.yml" <<'EOF'
+jobs:
+  x:
+    steps:
+      - run: mise exec -- bash sdk/scripts/sdk-publish.sh
+      - run: mise x -- jq -er .
+      - run: |
+          pushed_ref=$(mise exec -- crane push --index dir repo:tag)
+          mise exec \
+            -- jq .
+      - run: mise exec -q -C sub -- jq .
+      - run: mise -q x -- jq .
+      - run: mise exec -c "jq ."
+      - run: |
+          out="$(mise exec -- jq .)"
+EOF
+cat >"$bare_mise_fixture/good.yml" <<'EOF'
+jobs:
+  x:
+    steps:
+      - run: mise exec go -- go env GOVERSION
+      - run: mise exec go golangci-lint go:github.com/google/go-licenses/v2 -- bash sdk/scripts/sdk-publish.sh
+      - run: mise x go uv -- bash scripts/check-embedded-artifact.sh
+      - run: mise exec -C sub go -- go test ./...
+      - run: mise exec "node@$LO_SDK_NODE_VERSION" -- node -v
+      - run: mise run --skip-tools sdk-python-release
+      # - run: mise exec -- commented out
+      - run: echo ok # mise exec -- inline comment
+      - name: Reject bare mise exec -- in step name
+        run: echo ok
+EOF
+bare_mise_bad=$(bare_mise_exec "$bare_mise_fixture/bad.yml")
+bare_mise_good=$(bare_mise_exec "$bare_mise_fixture/good.yml")
+rm -rf "$bare_mise_fixture"
+bare_mise_bad_count=$(grep -c . <<<"$bare_mise_bad" || true)
+[[ $bare_mise_bad_count -eq 8 ]] ||
+  fail "bare mise exec self-test: expected 8 rejected commands, got $bare_mise_bad_count: $bare_mise_bad"
+[[ -z $bare_mise_good ]] ||
+  fail "bare mise exec self-test: valid commands were rejected: $bare_mise_good"
+bare_mise=$(bare_mise_exec "${workflows[@]}")
+if [[ -n $bare_mise ]]; then
+  printf '%s\n' "$bare_mise" >&2
+  fail 'workflows must explicitly name tool(s) before -- in mise exec / mise x (bare mise exec -- installs all non-lazy tools from mise.toml)'
+fi
+
 # setup-buildx-action 默认拉未固定的 moby/buildkit:buildx-stable-1；每处都要用 driver-opts 钉具体版本 + digest。
 buildkit_pin_re='^[[:space:]]+driver-opts:[[:space:]]*image=moby/buildkit:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}[[:space:]]*$'
 unpinned_buildkit=$(for file in "${workflows[@]}"; do
