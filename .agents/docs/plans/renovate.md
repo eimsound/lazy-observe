@@ -52,7 +52,7 @@ Trivy 的 sha 只在 `release.yml` 的扫描里用，PR CI 其它 job 不会校�
 | npm | `web`、`sdk/node`、`sdk/browser`（含各 examples，同一 lockfile） | 每个工程 minor+patch 一组、major 单独（`matchFileNames`）。`:ignoreModulesAndTests` 预设去掉，否则 examples 被忽略。`@types/node` 上界 `<27.0.0` 跟随 `mise.toml` 的 node 主版本，升 node 主版本时同步改；`sdk/browser` 的 `unplugin` 上界 `<3.0.0`。`pnpm` 在 `mise.toml` 与三个 `packageManager` 里同一 PR（组 `pnpm`，排在 npm 与 mise 的 minor-patch 规则之后，否则 `mise.toml` 里的 pnpm 被并进 mise tools 组）。 |
 | pep621 | `sdk/python/pyproject.toml` | `rangeStrategy: widen`：库里的 `>=` 下限是对使用方的兼容承诺，现有范围仍满足时不开 PR。代价是 Renovate 对 Python 基本空转（只有新版本让范围不再满足时才动），Dependabot 之前也是这样。minor/patch 一组、major 单独。运行时 7 天由 `[tool.uv] exclude-newer = "7 days"` 保证（#119）。 |
 | github-actions | 5 个 workflow | `helpers:pinGitHubActionDigestsToSemver`：保持 SHA 固定，行尾 `# vX.Y.Z` 注释与 SHA 一起改。`github-runner` depType 关掉（`ubuntu-24.04` 会被提 26.04）。minor/patch/digest 一组、major 单独。 |
-| dockerfile | `Dockerfile` | `FROM` 的 tag 与 digest 原生更新；minor/patch/digest 一组。浮动 tag（`debian:trixie-slim`）会提 digest 更新。gcr distroless 与 Docker Hub 的 debian 拿不到时间戳，见下。 |
+| dockerfile | `Dockerfile` | `FROM` 的 tag 与 digest 原生更新；minor/patch/digest 一组。浮动 tag（`debian:trixie-slim`）会提 digest 更新，走默认 `timestamp-required`（满 7 天才开 PR）；gcr distroless 拿不到时间戳，见下。 |
 | mise | `mise.toml` 的 `[tools]` | 原生识别，minor/patch 一组、major 单独；`go` 工具另有 `mise go` 组（`renovate/mise-go`，只限 minor/patch，排在 `mise tools minor-patch` 之后）：go 升 1.27 出问题时不拖住 air、uv 等同组工具；它只匹配 mise manager，与关掉 gomod `golang` depType（`go` 指令）的规则互不相干；go 后端（`go:…/golines`、`govulncheck`）与 `{ version = "…", lazy = true }` 的内联表写法也识别。工具版本只在 `[tools]` 写一次，没有别的重复固定点，合并 mise tools PR 不用再手工同步，见下节「mise 工具版本的单一来源」。 |
 | custom.regex | mise 引导、Victoria 三件套、Trivy、e2e 镜像、BuildKit | 见上。e2e 镜像用一条正则 + `docker` datasource，原生更新 tag 与 digest；BuildKit 的 `driver-opts: image=moby/buildkit:tag@digest` 同理。手工固定点不设周排期（`schedule: at any time`），满 7 天就开 PR。 |
 
@@ -91,11 +91,11 @@ Renovate 的 mise manager 只改 `mise.toml`，所以工具版本只在 `mise.to
 - `vulnerabilityAlerts` 开启并显式写 `minimumReleaseAge: "7 days"`（默认 `null`，安全更新不等，会开出 pnpm 装不上的 PR）；`osvVulnerabilityAlerts: false`。
   安全更新「插队」：无视 `prConcurrentLimit` 和 `schedule`。因为 `vulnerabilityAlerts.prCreation` 默认 `immediate`，年龄闸靠 `internalChecksFilter: strict` 在选版本阶段起作用。
 - `scripts/check-github-workflows.sh` 校验 `release-age.env`、`renovate.json`（顶层与 `vulnerabilityAlerts` 两处，且每个 `minimumReleaseAge` 都等于它）、各 pnpm 工程（分钟）、各 `pyproject.toml` 的 `exclude-newer` 一致；另校验 `renovate.json` 里的 `internalChecksFilter` 全是 `strict`（`flexible`/`none` 会在所有新版本都不满 7 天时照样开 PR）。
-- **没有时间戳的依赖**：`timestamp-optional` 只是兜底。真正缺时间戳、因此不受 7 天限制的只有 Quay 的 vm*（vmstorage/vminsert/vmselect）、GCR distroless、`govulncheck`（mise 的 go 后端）这类来源（GHCR 同样不提供）。
-  **Docker Hub 不属于这一类**：托管 Renovate 上 seaweedfs 和 postgres（标签都超过 1000 个）都拿到了时间戳，照样等满 7 天。
-  本地 `--platform=local` 的 44.253.4 抓 Hub 标签时请求 `page_size=1000`，Hub 每页只给 100 条、第 11 页起返回 403，整次回退成无时间戳（2026-11-20 的标签数：debian 3090、seaweedfs 4345、postgres 1469、Victoria 集群镜像约 1900），
-  这个现象在托管环境里没复现，以托管环境为准；早先「标签超过 1000 的 Hub 仓库不受 7 天限制」的说法已更正。
-  规则里的名单（Quay vm*、seaweedfs、postgres、`govulncheck`、gcr distroless、Dockerfile 的 debian）保留，拿不到时间戳时才生效，有新版就自动开 PR、不设 `dependencyDashboardApproval`，每个依赖单独成 PR；拿得到时间戳的（seaweedfs、postgres）仍受 7 天限制。
+- **没有时间戳的依赖**：`timestamp-optional` 豁免名单只保留真正不提供发布时间戳的 5 项——Quay 的 vm*（vmstorage/vminsert/vmselect）、GCR distroless、`govulncheck`（mise 的 go 后端）（GHCR 同样不提供）；它们有新版就自动单独成 PR（`groupName: null`）、不设 `dependencyDashboardApproval`。
+  **Docker Hub 不放进 `timestamp-optional`（统一走全局默认 `timestamp-required`，fail-closed）**：托管 Renovate 上 seaweedfs、postgres、debian（标签均超过 1000 个）正常情况下能拿到时间戳并等满 7 天。
+  早先因本地 `--platform=local` 的 44.253.4 抓 Hub 标签请求 `page_size=1000`、Hub 每页只给 100 条且第 11 页起返回 403 导致整次回退成无时间戳（2026-11-20 的标签数：debian 3090、seaweedfs 4345、postgres 1469、Victoria 集群镜像约 1900），曾把三者留在 `timestamp-optional` 作兜底；
+  但 2026-11-21 PR #283（`chrislusf/seaweedfs:4.54` 仅发布 5 天即被提前开 PR）实测表明，托管环境偶发抓不到 Hub 分页时间戳时，`timestamp-optional` 会直接绕过 7 天门禁提前开 PR。
+  将 `chrislusf/seaweedfs`、`postgres`、`debian` 移出豁免后，偶发抓取失败只会在 Dependency Dashboard #135 维持 `Pending Status Checks`，待下一轮正常抓取并满 7 天后自动开 PR。
   Victoria 集群镜像在 Docker Hub 有同 tag、同 index digest 的发布（逐个比对一致），所以如果想让 e2e 也受 7 天限制，可以改到 Docker Hub；这是单独的决定，本切片不做。
   `renovate/stability-days` 是 Mend 托管 App 自己加的 commit status，不影响 ruleset（required check 只有 `ci-ok`）。
 - postgres、valkey 是 e2e 夹具，规则里关掉 major，只升 minor/patch。
@@ -164,7 +164,7 @@ curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
 - **首个固定点 PR 人工看 diff**：抽查任一 sha 与上游 release 的 `*_checksums.txt` / `SHASUMS256.txt` 一致；
 - Renovate 不会做 `gh release verify`；Trivy 升级只有 7 天年龄和 sha 校验两道闸；Trivy 的 sha 来自 release 自己的 `*_checksums.txt`，信任模型与过去人工抄清单相同；
 - Victoria PR：`third_party/victoria/SOURCES.txt` 的版本与 LICENSE 链接改成新 tag（`license-check` 用 `scripts/third-party-notices.sh` 校验，不改就红），并对照上游该 tag 的 LICENSE 是否变化；
-- 无时间戳的依赖（Quay 的 vm*、`govulncheck`、distroless；Docker Hub 的 seaweedfs、postgres、debian 按托管环境实测拿得到时间戳，受 7 天限制）合并前看一眼上游 release 说明。
+- 无时间戳的依赖（Quay 的 vm*、`govulncheck`、distroless）合并前看一眼上游 release 说明（Docker Hub 的 seaweedfs、postgres、debian 走默认 `timestamp-required`，满 7 天才开 PR）。
 
 **Go major PR（fiber v3、embedded-postgres v2 等）**：第一个 Go major PR 上验证 `gomodUpdateImportPaths` 在托管 App 上是否生效：`.go` 文件的 import 路径应随 `go.mod` 的 `/v3`、`/v2` 一起改，`go build ./...` 通过。没生效就由 agent 手工改 import（或在计划里换方案）。
 
@@ -199,7 +199,7 @@ mise run ent-generate-check
 | --- | --- |
 | 分支名、Dashboard、PR 标题格式 | 已验证 |
 | tag 与 digest 同时改写（docker） | 已验证（#136、#137） |
-| Docker Hub 时间戳 | 已验证可取 |
+| Docker Hub 时间戳 | 已验证可取，但偶发分页失败会缺时间戳（2026-11-21 PR #283）；已移出 `timestamp-optional`，改走默认 `timestamp-required`（fail-closed） |
 | vulnerabilityAlerts 读取 | 间接验证（没有 "Cannot access" 警告） |
 | `[SECURITY]` PR 是否等 7 天 | 待验证（需要真实告警） |
 | 版本和 sha 同时改写（mise、Victoria） | 待验证 |
