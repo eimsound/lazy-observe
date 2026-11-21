@@ -15,9 +15,12 @@ name: CI
 #   tag 都只读 main 的缓存，不写。PR 改了 go.mod / mise.toml 时拿不到精确命中，走 restore-keys 回退到 main 最新一份。
 # - Go 缓存拆成两份：
 #   1) `gomod-<go-hash>`（~/go/pkg/mod）：纯源码，跨架构且跨 Go 版本共用，只由 `go` job 保存一份；
-#   2) `gobuild-<os>-<arch>-<go-toolchain>-<go-hash>`（~/.cache/go-build）：只按同架构同 Go 版本回退，
+#   2) `gobuild-<os>-<arch>-<go-toolchain>-<go-hash>`（~/.cache/go-build）：按架构与精确 Go 版本隔离，
 #      绝不跨 Go 版本 restore-keys（避免把旧 Go 的死对象文件拖进新版本缓存），由 `go` job（X64）与
 #      `go-cross` 的 arm64 格保存，其余 job（e2e、e2e-restart、e2e-ha、meta-pg、sdk-go、sdk-journeys）只读。
+#   为避免 `main` 上的 writer 恢复前代缓存后再叠写并整包保存导致单条体积跨代膨胀，
+#   `gomod` 与 `gobuild` 的 writer 在 `refs/heads/main` 上不设 `restore-keys`（精确未命中时冷编生成干净单代基线），
+#   PR 与只读消费者仍保留 `restore-keys` 回退加速。
 # - mise 缓存只按 mise.toml 的 `[tools]` 表哈希（scripts/ci-cache-keys.sh），改任务定义或注释不失效；
 #   base 工具集共用 `mise-base-*`（仅由 `go-cross` 保存 X64/ARM64，其余 base job 与 sdk-python/meta-pg/sdk-journeys 只读），
 #   `sdk-go` 只读 `mise-go-*` 并配 `--skip-tools`，`sdk-node` 与 `sdk-browser` 共用 `mise-sdk-node-<node>-pnpm-<pnpm>-*`
@@ -26,7 +29,9 @@ name: CI
 # - 每个共享 key 在同一次 workflow 运行内严格只有一个 writer（`go` 写 `mise-go`/`gomod`/`gobuild-X64`，`go-cross` 写
 #   `mise-base` 与 ARM64 的 `gobuild`/`pnpm-web`，`web` 写 X64 的 `pnpm-web`，`e2e(storage)` 写 `storage-native`，
 #   `sdk-node` 写 `mise-sdk-node-*`），避免并发 save 冲突。
-# - pnpm 的 key 不带 mise.toml 哈希，其它工具升版不会让它们整份换新。
+# - pnpm 的 key 不带 mise.toml 哈希，其它工具升版不会让它们整份换新；`sdk-journeys` 只读复用 `pnpm-web` /
+#   `pnpm-sdk-node` / `pnpm-sdk-browser` 三个独立 store，不额外保存三锁合一副本；`playwright-sdk-journeys-*`
+#   仅按 `playwright-core` 精确版本键控且不设跨版本 `restore-keys`。
 # - 不在这里清理 cache：删除要 actions: write，会扩大 token 权限面。
 #
 # 切片分支只靠 pull_request 跑一遍；push 只留给合并后的 main 和 integration 分支。
@@ -110,21 +115,22 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           MISE_CI_PROFILE: go-ci
       # GOMODCACHE 跨架构且跨 Go 版本共用，只由这个 job 保存；GOCACHE 按架构和 Go 版本隔离，
-      # 不跨 Go 版本回退，避免旧版编译产物滞留在新缓存里。
+      # 不跨 Go 版本回退，避免旧版编译产物滞留在新缓存里。main 上的 writer 取消 restore-keys，
+      # 精确未命中时从干净基线重新构建并保存单代缓存，防止跨代叠写滚雪球；PR 与只读消费者仍保留回退加速。
       - name: Restore Go module cache
         id: gomod-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/go/pkg/mod
           key: gomod-${{ steps.cache-keys.outputs.go }}
-          restore-keys: gomod-
+          restore-keys: ${{ github.ref != 'refs/heads/main' && 'gomod-' || '' }}
       - name: Restore Go build cache
         id: gobuild-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/go-build
           key: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-${{ steps.cache-keys.outputs.go }}
-          restore-keys: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-
+          restore-keys: ${{ github.ref != 'refs/heads/main' && format('gobuild-{0}-{1}-{2}-', runner.os, runner.arch, steps.cache-keys.outputs.go-toolchain) || '' }}
       - run: mise run workflow-check
       - run: mise run install-check
       - run: mise run release-prerequisites-test
@@ -177,17 +183,14 @@ jobs:
       - name: Calculate cache keys
         id: cache-keys
         run: bash scripts/ci-cache-keys.sh
-      # mise-base 是所有 base 工具集 job 的共用 key，唯一 writer 是本 job（覆盖 X64 与 ARM64）；
-      # restore-keys 的第二行是迁移用的旧 key（旧 key 过期后可删）。
+      # mise-base 是所有 base 工具集 job 的共用 key，唯一 writer 是本 job（覆盖 X64 与 ARM64）。
       - name: Restore mise cache
         id: mise-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -205,7 +208,7 @@ jobs:
         with:
           path: ~/.cache/go-build
           key: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-${{ steps.cache-keys.outputs.go }}
-          restore-keys: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-
+          restore-keys: ${{ (github.ref != 'refs/heads/main' || matrix.arch != 'arm64') && format('gobuild-{0}-{1}-{2}-', runner.os, runner.arch, steps.cache-keys.outputs.go-toolchain) || '' }}
       - name: Restore pnpm cache
         id: pnpm-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -307,9 +310,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -362,9 +363,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -411,9 +410,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -455,9 +452,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -495,9 +490,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -747,9 +740,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       # uv 的包缓存（wheel、sdist、构建环境）；key 带矩阵里的解释器版本，各格互不覆盖，
       # restore-keys 只回退到同一解释器版本的旧缓存。
       - name: Restore uv cache
@@ -810,9 +801,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
@@ -831,14 +820,27 @@ jobs:
           path: ~/.cache/go-build
           key: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-${{ steps.cache-keys.outputs.go }}
           restore-keys: gobuild-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.go-toolchain }}-
-      # web、sdk/node、sdk/browser 三个 pnpm 工作区共用一个内容寻址 store。
-      - name: Restore pnpm cache
-        id: pnpm-cache
+      # web、sdk/node、sdk/browser 三个工作区已有各自独立缓存（由 web / sdk-node / sdk-browser 在 main 上保存）；
+      # pnpm v10 store（~/.pnpm-store/v10/{files,index}）按内容哈希寻址，依次只读恢复到同一目录即可合并复用，
+      # 不再按三份锁文件联合哈希重复保存 pnpm-sdk-journeys-*。
+      - name: Restore pnpm cache (web)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.pnpm-store
-          key: pnpm-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('web/pnpm-lock.yaml', 'sdk/node/pnpm-lock.yaml', 'sdk/browser/pnpm-lock.yaml') }}
-          restore-keys: pnpm-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-
+          key: pnpm-web-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.pnpm-web }}
+          restore-keys: pnpm-web-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore pnpm cache (sdk-node)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-sdk-node-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('sdk/node/pnpm-lock.yaml') }}
+          restore-keys: pnpm-sdk-node-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore pnpm cache (sdk-browser)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-sdk-browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('sdk/browser/pnpm-lock.yaml') }}
+          restore-keys: pnpm-sdk-browser-${{ runner.os }}-${{ runner.arch }}-
       # storage-native 由 e2e(storage) 唯一保存，这里只读。
       - name: Restore storage archives cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -846,23 +848,18 @@ jobs:
           path: .cache/storage-bin/.archives
           key: storage-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.storage }}
           restore-keys: storage-native-${{ runner.os }}-${{ runner.arch }}-
+      # Playwright 浏览器按 sdk/browser/pnpm-lock.yaml 解析出的 playwright-core 精确版本缓存，
+      # 不设跨版本 restore-keys，避免升级后旧版 Chromium 残留且无关依赖改动不再重复保存。
       - name: Restore Playwright browser cache
         id: playwright-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('sdk/browser/pnpm-lock.yaml') }}
-          restore-keys: playwright-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-
+          key: playwright-sdk-journeys-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.playwright-sdk-browser }}
       # sdk_journeys_only 为空 = 四个 journey 都跑；否则是空格分隔的语言列表（只改 web/ 或单个 SDK 时收窄）。
       - run: mise run sdk-journeys
         env:
           LO_SDK_JOURNEYS_ONLY: ${{ needs.changes.outputs.sdk_journeys_only }}
-      - name: Save pnpm cache
-        if: github.ref == 'refs/heads/main' && steps.pnpm-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.pnpm-store
-          key: ${{ steps.pnpm-cache.outputs.cache-primary-key }}
       - name: Save Playwright browser cache
         if: github.ref == 'refs/heads/main' && steps.playwright-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -911,9 +908,7 @@ jobs:
         with:
           path: ~/.local/share/mise
           key: mise-base-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-keys.outputs.mise }}
-          restore-keys: |
-            mise-base-${{ runner.os }}-${{ runner.arch }}-
-            mise-go-cross-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: mise-base-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore uv cache
         id: uv-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

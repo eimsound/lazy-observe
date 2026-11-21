@@ -290,6 +290,7 @@ run = [
   "bash scripts/check-pipefail-pipelines.sh",
   "bash scripts/ci-setup-mise-test.sh",
   "bash scripts/merge-oci-layouts-test.sh",
+  "bash scripts/download-storage-bins-test.sh",
   "bash scripts/check-e2e-contract.sh",
   "bash scripts/ci-changes-test.sh",
 ]
