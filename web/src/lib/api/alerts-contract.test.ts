@@ -7,10 +7,18 @@ import {
   normalizeChannel,
   normalizeChannelList,
   normalizeChannelTestResult,
+  normalizeInhibitionRule,
+  normalizeInhibitionRuleList,
   normalizeSilence,
   normalizeSilenceList,
 } from "./alerts-contract.ts";
-import { testChannel } from "./alerts.ts";
+import {
+  createInhibitionRule,
+  deleteInhibitionRule,
+  listInhibitionRules,
+  testChannel,
+  updateInhibitionRule,
+} from "./alerts.ts";
 import { ApiError } from "./client.ts";
 
 const originalWindow = globalThis.window;
@@ -209,4 +217,187 @@ test("alert rules and alert events match Go gateway alertRuleResponse & alertEve
   assert.equal(events.length, 1);
   assert.equal(events[0].ends_at, undefined);
   assert.equal(events[0].inhibited, false);
+});
+
+test("inhibition rules contract aligns with Go meta.InhibitionRuleView including omitempty fields", () => {
+  // Exact Go meta.InhibitionRuleView when enabled=true and all optional fields present
+  const enabledWire = {
+    id: 14,
+    project_id: 3,
+    source_matchers: [{ name: "alertname", op: "=", value: "HostDown" }],
+    target_matchers: [{ name: "service", op: "=~", value: "api-.*" }],
+    equal_labels: ["instance", "cluster"],
+    enabled: true,
+    comment: "HostDown suppresses service alerts",
+    created_at: "2026-11-21T00:00:00Z",
+    updated_at: "2026-11-21T00:05:00Z",
+  };
+  assert.deepEqual(normalizeInhibitionRule(enabledWire), {
+    id: "14",
+    project_id: "3",
+    source_matchers: [{ name: "alertname", op: "=", value: "HostDown" }],
+    target_matchers: [{ name: "service", op: "=~", value: "api-.*" }],
+    equal_labels: ["instance", "cluster"],
+    enabled: true,
+    comment: "HostDown suppresses service alerts",
+    created_at: "2026-11-21T00:00:00Z",
+    updated_at: "2026-11-21T00:05:00Z",
+  });
+
+  // Exact Go meta.InhibitionRuleView when enabled=false, equal_labels=[], comment="":
+  // Go `omitempty` omits `enabled`, `equal_labels`, and `comment` completely from JSON.
+  const disabledOmitEmptyWire = {
+    id: 15,
+    project_id: 3,
+    source_matchers: [{ name: "severity", op: "=", value: "critical" }],
+    target_matchers: [{ name: "severity", op: "=", value: "warning" }],
+    created_at: "2026-11-21T00:00:00Z",
+    updated_at: "2026-11-21T00:05:00Z",
+  };
+  assert.deepEqual(normalizeInhibitionRule(disabledOmitEmptyWire), {
+    id: "15",
+    project_id: "3",
+    source_matchers: [{ name: "severity", op: "=", value: "critical" }],
+    target_matchers: [{ name: "severity", op: "=", value: "warning" }],
+    equal_labels: [],
+    enabled: false,
+    comment: "",
+    created_at: "2026-11-21T00:00:00Z",
+    updated_at: "2026-11-21T00:05:00Z",
+  });
+
+  assert.deepEqual(normalizeInhibitionRuleList(null), []);
+  assert.equal(normalizeInhibitionRuleList([enabledWire, disabledOmitEmptyWire]).length, 2);
+
+  // Backend matcher.go only supports "=" and "=~"; reject unsupported operators.
+  assert.throws(
+    () =>
+      normalizeInhibitionRule({
+        ...enabledWire,
+        source_matchers: [{ name: "alertname", op: "!=", value: "HostDown" }],
+      }),
+    /source_matchers\[0\]\.op/,
+  );
+  assert.throws(
+    () =>
+      normalizeInhibitionRule({
+        ...enabledWire,
+        target_matchers: [{ name: "service", op: "!~", value: "api-.*" }],
+      }),
+    /target_matchers\[0\]\.op/,
+  );
+  assert.throws(
+    () => normalizeInhibitionRule({ ...enabledWire, enabled: "true" }),
+    /inhibition rule\.enabled/,
+  );
+  assert.throws(
+    () => normalizeInhibitionRule({ ...enabledWire, equal_labels: [42] }),
+    /equal_labels\[0\]/,
+  );
+});
+
+test("inhibition rules API client uses /api/inhibition-rules with project scope, CSRF, and surfaces HTTP errors", async () => {
+  installBrowserOrigin();
+
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ url, init });
+      if (init?.method === "POST") {
+        return new Response(
+          JSON.stringify({
+            id: 21,
+            project_id: 2,
+            source_matchers: [{ name: "alertname", op: "=", value: "HostDown" }],
+            target_matchers: [{ name: "alertname", op: "=", value: "ServiceDown" }],
+            equal_labels: ["instance"],
+            enabled: true,
+            comment: "host down",
+            created_at: "2026-11-21T00:00:00Z",
+            updated_at: "2026-11-21T00:00:00Z",
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (init?.method === "PATCH") {
+        return new Response(
+          JSON.stringify({
+            id: 21,
+            project_id: 2,
+            source_matchers: [{ name: "alertname", op: "=", value: "HostDown" }],
+            target_matchers: [{ name: "alertname", op: "=", value: "ServiceDown" }],
+            equal_labels: ["instance"],
+            comment: "host down",
+            created_at: "2026-11-21T00:00:00Z",
+            updated_at: "2026-11-21T00:01:00Z",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (init?.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }),
+  );
+
+  const headerOf = (init: RequestInit | undefined, name: string): string | undefined => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    return headers?.[name];
+  };
+
+  const list = await listInhibitionRules(undefined, "proj-alpha");
+  assert.deepEqual(list, []);
+  assert.equal(calls[0].url, "/api/inhibition-rules");
+  assert.equal(headerOf(calls[0].init, "X-LO-Project"), "proj-alpha");
+
+  const created = await createInhibitionRule(
+    {
+      source_matchers: [{ name: "alertname", op: "=", value: "HostDown" }],
+      target_matchers: [{ name: "alertname", op: "=", value: "ServiceDown" }],
+      equal_labels: ["instance"],
+      enabled: true,
+      comment: "host down",
+    },
+    "proj-alpha",
+  );
+  assert.equal(created.id, "21");
+  assert.equal(created.enabled, true);
+  assert.equal(headerOf(calls[1].init, "X-CSRF-Token"), "test-token");
+  assert.equal(headerOf(calls[1].init, "X-LO-Project"), "proj-alpha");
+
+  // Disable via PATCH; response omits `enabled` due to Go `omitempty`, normalized to `false`.
+  const disabled = await updateInhibitionRule("21", { enabled: false }, "proj-alpha");
+  assert.equal(calls[2].url, "/api/inhibition-rules/21");
+  assert.equal(disabled.enabled, false);
+
+  await deleteInhibitionRule("21", "proj-alpha");
+  assert.equal(calls[3].url, "/api/inhibition-rules/21");
+  assert.equal(calls[3].init?.method, "DELETE");
+
+  // Never swallow 403 / 404 / 500 errors.
+  for (const [status, message] of [
+    [403, "forbidden"],
+    [404, "project_not_found"],
+    [500, "internal error"],
+  ] as const) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: message }), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    await assert.rejects(
+      () => listInhibitionRules(undefined, "proj-alpha"),
+      (err: unknown) => err instanceof ApiError && err.status === status && err.message === message,
+    );
+  }
 });

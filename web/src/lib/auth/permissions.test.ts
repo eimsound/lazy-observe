@@ -114,6 +114,10 @@ test("navigation access and route guards stay 1:1 aligned across all roles", () 
 
   // Trailing slashes and nested subpaths still resolve to their route rule.
   assert.equal(resolveRouteAccess("/alerts/rules/")?.capability, "alerts:read");
+  assert.equal(resolveRouteAccess("/alerts/inhibitions")?.capability, "alerts:read");
+  assert.equal(canAccessRoute("/alerts/inhibitions", "viewer"), false);
+  assert.equal(canAccessRoute("/alerts/inhibitions", "member"), true);
+  assert.equal(canAccessRoute("/alerts/inhibitions", "admin"), true);
   assert.equal(resolveRouteAccess("/alerts/channels/123")?.capability, "channels:write");
   assert.equal(canAccessRoute("/settings/diagnostics", "member"), false);
   assert.equal(canAccessRoute("/settings/diagnostics", "admin"), true);
