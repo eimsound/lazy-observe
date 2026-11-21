@@ -11,6 +11,15 @@ import type {
   EndpointStat,
   EndpointStatsResult,
 } from "./performance-contract";
+import type {
+  VitalBreakdownRow,
+  VitalBrowserFamily,
+  VitalDeviceType,
+  VitalFilters,
+  VitalOSFamily,
+  VitalsBreakdownResult,
+  VitalValuesDTO,
+} from "./performance-vitals-contract";
 import { makeRng } from "./mock-random";
 
 /**
@@ -69,33 +78,156 @@ function buildPoints(window: PerfWindow, center: number, jitter: number, seed: s
   return points;
 }
 
+interface MockVitalCohort {
+  page: string;
+  device_type: VitalDeviceType;
+  browser_family: VitalBrowserFamily;
+  os_family: VitalOSFamily;
+  country: string;
+  samples: number;
+  factor: number;
+}
+
+const MOCK_VITAL_COHORTS: MockVitalCohort[] = [
+  { page: "/checkout", device_type: "desktop", browser_family: "chrome", os_family: "macos", country: "US", samples: 180, factor: 0.88 },
+  { page: "/checkout", device_type: "mobile", browser_family: "safari", os_family: "ios", country: "US", samples: 140, factor: 1.24 },
+  { page: "/checkout", device_type: "mobile", browser_family: "chrome", os_family: "android", country: "CN", samples: 120, factor: 1.32 },
+  { page: "/orders/:id", device_type: "desktop", browser_family: "edge", os_family: "windows", country: "DE", samples: 95, factor: 0.96 },
+  { page: "/orders/:id", device_type: "tablet", browser_family: "safari", os_family: "ios", country: "JP", samples: 65, factor: 1.08 },
+  { page: "/settings/profile", device_type: "desktop", browser_family: "firefox", os_family: "linux", country: "GB", samples: 75, factor: 0.82 },
+  { page: "/product/:sku", device_type: "mobile", browser_family: "chrome", os_family: "android", country: "CN", samples: 110, factor: 1.18 },
+  { page: "/product/:sku", device_type: "desktop", browser_family: "chrome", os_family: "windows", country: "US", samples: 130, factor: 0.92 },
+  { page: "/settings/profile", device_type: "unknown", browser_family: "other", os_family: "other", country: "unknown", samples: 25, factor: 1.05 },
+];
+
+function matchMockCohort(cohort: MockVitalCohort, filters?: VitalFilters): boolean {
+  if (!filters) return true;
+  if (filters.page && cohort.page !== filters.page) return false;
+  if (filters.device_type && cohort.device_type !== filters.device_type) return false;
+  if (filters.browser_family && cohort.browser_family !== filters.browser_family) return false;
+  if (filters.os_family && cohort.os_family !== filters.os_family) return false;
+  if (filters.country && cohort.country !== filters.country) return false;
+  return true;
+}
+
+function cohortVitalValue(key: VitalKey, cohort: MockVitalCohort): number {
+  const m = VITALS.find((v) => v.key === key)!;
+  const pageIndex = Math.max(0, PERF_PAGES.indexOf(cohort.page));
+  return round(vitalValue(key, pageIndex) * cohort.factor, m.decimals);
+}
+
 export function mockVitalSeries(
   key: VitalKey,
   page: string | undefined,
   window: PerfWindow,
+  filters?: VitalFilters,
 ): Promise<TimeSeries[]> {
-  const pageIndex = page ? Math.max(0, PERF_PAGES.indexOf(page)) : -1;
-  // page === undefined => "all pages" aggregate (average across pages).
-  const center =
-    pageIndex >= 0
-      ? vitalValue(key, pageIndex)
-      : PERF_PAGES.reduce((sum, _p, i) => sum + vitalValue(key, i), 0) / PERF_PAGES.length;
+  const effectiveFilters: VitalFilters = { ...filters, ...(page ? { page } : {}) };
+  const matched = MOCK_VITAL_COHORTS.filter((c) => matchMockCohort(c, effectiveFilters));
+  if (matched.length === 0) {
+    return new Promise((resolve) => setTimeout(() => resolve([]), 160));
+  }
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const cohort of matched) {
+    weightedSum += cohortVitalValue(key, cohort) * cohort.samples;
+    totalWeight += cohort.samples;
+  }
+  const center = totalWeight > 0 ? weightedSum / totalWeight : 0;
   const m = VITALS.find((v) => v.key === key)!;
   const jitter = m.unit === "ms" ? center * 0.18 : center * 0.3;
+  const seedKey = [
+    key,
+    effectiveFilters.page ?? "all",
+    effectiveFilters.device_type ?? "all",
+    effectiveFilters.browser_family ?? "all",
+    effectiveFilters.os_family ?? "all",
+    effectiveFilters.country ?? "all",
+    window.end,
+  ].join("|");
+  const labels: Record<string, string> = { __name__: m.metric };
+  if (effectiveFilters.page) labels.page = effectiveFilters.page;
+  if (effectiveFilters.device_type) labels.device_type = effectiveFilters.device_type;
+  if (effectiveFilters.browser_family) labels.browser_family = effectiveFilters.browser_family;
+  if (effectiveFilters.os_family) labels.os_family = effectiveFilters.os_family;
+  if (effectiveFilters.country) labels.country = effectiveFilters.country;
   const series: TimeSeries = {
     name: page ? `${m.metric}{page="${page}"}` : m.metric,
-    labels: page ? { __name__: m.metric, page } : { __name__: m.metric },
-    points: buildPoints(window, center, jitter, `${key}|${page ?? "all"}|${window.end}`),
+    labels,
+    points: buildPoints(window, center, jitter, seedKey),
   };
   return new Promise((resolve) => setTimeout(() => resolve([series]), 260));
 }
 
-export function mockVitalsByPage(_window: PerfWindow): Promise<PageVitals[]> {
-  const rows: PageVitals[] = PERF_PAGES.map((page, i) => {
-    const values = {} as Record<VitalKey, number>;
-    for (const v of VITALS) values[v.key] = vitalValue(v.key, i);
-    return { page, values };
-  });
+function buildMockBreakdownRows(
+  cohorts: MockVitalCohort[],
+  keyOf: (cohort: MockVitalCohort) => string,
+): VitalBreakdownRow[] {
+  const groups = new Map<string, { samples: number; sums: Record<VitalKey, number> }>();
+  for (const cohort of cohorts) {
+    const groupKey = keyOf(cohort);
+    const entry = groups.get(groupKey) ?? {
+      samples: 0,
+      sums: { lcp: 0, inp: 0, cls: 0, ttfb: 0, fcp: 0 },
+    };
+    entry.samples += cohort.samples;
+    for (const v of VITALS) {
+      entry.sums[v.key] += cohortVitalValue(v.key, cohort) * cohort.samples;
+    }
+    groups.set(groupKey, entry);
+  }
+  return [...groups.entries()]
+    .map(([value, entry]) => {
+      const values: VitalValuesDTO = {};
+      for (const v of VITALS) {
+        values[v.key] = round(entry.sums[v.key] / entry.samples, v.decimals);
+      }
+      return { value, samples: entry.samples * VITALS.length, values };
+    })
+    .sort((a, b) => (b.samples !== a.samples ? b.samples - a.samples : a.value.localeCompare(b.value)));
+}
+
+export function mockVitalsBreakdown(
+  window: PerfWindow,
+  filters?: VitalFilters,
+  signal?: AbortSignal,
+): Promise<VitalsBreakdownResult> {
+  const matched = MOCK_VITAL_COHORTS.filter((c) => matchMockCohort(c, filters));
+  const summary: VitalValuesDTO = {};
+  let totalWeight = 0;
+  for (const cohort of matched) totalWeight += cohort.samples;
+  if (totalWeight > 0) {
+    for (const v of VITALS) {
+      let sum = 0;
+      for (const cohort of matched) sum += cohortVitalValue(v.key, cohort) * cohort.samples;
+      summary[v.key] = round(sum / totalWeight, v.decimals);
+    }
+  }
+  const result: VitalsBreakdownResult = {
+    start: window.start * 1000,
+    end: window.end * 1000,
+    step_seconds: window.step,
+    filters: filters ?? {},
+    summary,
+    total_samples: totalWeight * VITALS.length,
+    by_page: buildMockBreakdownRows(matched, (c) => c.page),
+    by_device: buildMockBreakdownRows(matched, (c) => c.device_type),
+    by_browser: buildMockBreakdownRows(matched, (c) => c.browser_family),
+    by_os: buildMockBreakdownRows(matched, (c) => c.os_family),
+    by_country: buildMockBreakdownRows(matched, (c) => c.country),
+    truncated: false,
+  };
+  return resolveAfter(result, 200, signal);
+}
+
+export function mockVitalsByPage(
+  _window: PerfWindow,
+  filters?: Omit<VitalFilters, "page">,
+): Promise<PageVitals[]> {
+  const matched = MOCK_VITAL_COHORTS.filter((c) => matchMockCohort(c, filters));
+  const rows: PageVitals[] = buildMockBreakdownRows(matched, (c) => c.page)
+    .sort((a, b) => a.value.localeCompare(b.value))
+    .map((row) => ({ page: row.value, values: row.values }));
   return new Promise((resolve) => setTimeout(() => resolve(rows), 240));
 }
 

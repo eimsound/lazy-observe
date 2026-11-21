@@ -2,25 +2,37 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { ArrowDown, ArrowUp, Database, Loader2, RefreshCw } from "lucide-react";
+import { ArrowDown, ArrowUp, Database, Loader2, RefreshCw, X } from "lucide-react";
 import {
   VITALS,
+  VITAL_BROWSER_FAMILIES,
+  VITAL_DEVICE_TYPES,
+  VITAL_OS_FAMILIES,
   aggregateTrend,
   rateVital,
   queryVitalSeries,
   getVitalPages,
+  getVitalsBreakdown,
   getVitalsByPage,
   getEndpointStats,
   lastValue,
   type EndpointStatsResult,
   type PageVitals,
   type PerfWindow,
+  type VitalBreakdownRow,
+  type VitalBrowserFamily,
+  type VitalDeviceType,
+  type VitalDimensionKey,
+  type VitalFilters,
   type VitalKey,
   type VitalMeta,
+  type VitalOSFamily,
   type VitalRating,
+  type VitalsBreakdownResult,
 } from "@/lib/api/performance";
 import { IS_MOCK } from "@/lib/settings";
 import { useProjectQuery } from "@/lib/project/use-project-query";
+import { useResetOnProjectChange } from "@/hooks/use-reset-on-project-change";
 import { useTimeWindow } from "@/hooks/use-time-window";
 import type { TimeSeries } from "@/lib/api/types";
 import { formatPercent } from "@/lib/format";
@@ -44,7 +56,7 @@ import { cn } from "@/lib/utils";
 import { buildEndpointTraceSearch, traceSearchToURL } from "./traces-search";
 import { queryViewState } from "./query-view-state";
 
-const ALL_PAGES = "__all__";
+const ALL_OPTION = "__all__";
 
 const RATING_CLASS: Record<VitalRating, string> = {
   good: "border-vital-good/40 text-vital-good",
@@ -66,6 +78,8 @@ const PERFORMANCE_QUERY_ROOTS = new Set([
   "vital",
   "vital-trend",
   "vitals-by-page",
+  "vitals-breakdown",
+  "vitals-country-options",
   "endpoints",
 ]);
 
@@ -119,12 +133,68 @@ export function PerformancePage() {
 
 // ── Web Vitals ────────────────────────────────────────────────────────────────
 
+function formatDimensionValue(
+  dimension: VitalDimensionKey,
+  value: string,
+  t: (key: string) => string,
+): string {
+  if (dimension === "device") return t(`performance.device_${value}`);
+  if (dimension === "browser") return t(`performance.browser_${value}`);
+  if (dimension === "os") return t(`performance.os_${value}`);
+  if (value === "unknown") return t("performance.country_unknown");
+  return value;
+}
+
 function WebVitalsTab({ getWindow }: { getWindow: () => PerfWindow }) {
   const { t } = useTranslation();
-  const [page, setPage] = useState(ALL_PAGES);
+  const [page, setPage] = useState(ALL_OPTION);
+  const [deviceType, setDeviceType] = useState<string>(ALL_OPTION);
+  const [browserFamily, setBrowserFamily] = useState<string>(ALL_OPTION);
+  const [osFamily, setOSFamily] = useState<string>(ALL_OPTION);
+  const [country, setCountry] = useState<string>(ALL_OPTION);
   const [selectedVital, setSelectedVital] = useState<VitalKey>("lcp");
+  const [breakdownDim, setBreakdownDim] = useState<VitalDimensionKey>("device");
 
-  const pageParam = page === ALL_PAGES ? undefined : page;
+  useResetOnProjectChange(() => {
+    setPage(ALL_OPTION);
+    setDeviceType(ALL_OPTION);
+    setBrowserFamily(ALL_OPTION);
+    setOSFamily(ALL_OPTION);
+    setCountry(ALL_OPTION);
+  });
+
+  const pageParam = page === ALL_OPTION ? undefined : page;
+  const dimensionFilters = useMemo<Omit<VitalFilters, "page">>(
+    () => ({
+      ...(deviceType !== ALL_OPTION ? { device_type: deviceType as VitalDeviceType } : {}),
+      ...(browserFamily !== ALL_OPTION ? { browser_family: browserFamily as VitalBrowserFamily } : {}),
+      ...(osFamily !== ALL_OPTION ? { os_family: osFamily as VitalOSFamily } : {}),
+      ...(country !== ALL_OPTION ? { country } : {}),
+    }),
+    [deviceType, browserFamily, osFamily, country],
+  );
+  const fullFilters = useMemo<VitalFilters>(
+    () => ({
+      ...(pageParam ? { page: pageParam } : {}),
+      ...dimensionFilters,
+    }),
+    [pageParam, dimensionFilters],
+  );
+  const hasActiveFilters =
+    page !== ALL_OPTION ||
+    deviceType !== ALL_OPTION ||
+    browserFamily !== ALL_OPTION ||
+    osFamily !== ALL_OPTION ||
+    country !== ALL_OPTION;
+
+  function resetFilters() {
+    setPage(ALL_OPTION);
+    setDeviceType(ALL_OPTION);
+    setBrowserFamily(ALL_OPTION);
+    setOSFamily(ALL_OPTION);
+    setCountry(ALL_OPTION);
+  }
+
   const pagesQuery = useProjectQuery<string[]>({
     queryKey: ["vital-pages"],
     queryFn: ({ signal, project }) => getVitalPages(getWindow(), signal, project),
@@ -137,23 +207,146 @@ function WebVitalsTab({ getWindow }: { getWindow: () => PerfWindow }) {
     isEmpty: pagesQuery.data?.length === 0,
   });
 
+  const breakdownQuery = useProjectQuery<VitalsBreakdownResult>({
+    queryKey: [
+      "vitals-breakdown",
+      fullFilters.page ?? "all",
+      fullFilters.device_type ?? "all",
+      fullFilters.browser_family ?? "all",
+      fullFilters.os_family ?? "all",
+      fullFilters.country ?? "all",
+    ],
+    queryFn: ({ signal, project }) => getVitalsBreakdown(getWindow(), fullFilters, signal, project),
+    retry: false,
+  });
+
+  // Keep country dropdown options populated from unfiltered project data so users
+  // can switch directly between observed regions without resetting first.
+  const countryOptionsQuery = useProjectQuery<VitalsBreakdownResult>({
+    queryKey: ["vitals-country-options"],
+    queryFn: ({ signal, project }) => getVitalsBreakdown(getWindow(), undefined, signal, project),
+    retry: false,
+  });
+  const countryOptions = useMemo(() => {
+    const codes = new Set<string>();
+    for (const row of countryOptionsQuery.data?.by_country ?? []) {
+      codes.add(row.value);
+    }
+    if (country !== ALL_OPTION) codes.add(country);
+    return [...codes].sort((a, b) => {
+      if (a === "unknown") return 1;
+      if (b === "unknown") return -1;
+      return a.localeCompare(b);
+    });
+  }, [countryOptionsQuery.data, country]);
+
+  function toggleBreakdownFilter(dim: VitalDimensionKey, value: string) {
+    if (dim === "device") {
+      setDeviceType((prev) => (prev === value ? ALL_OPTION : value));
+    } else if (dim === "browser") {
+      setBrowserFamily((prev) => (prev === value ? ALL_OPTION : value));
+    } else if (dim === "os") {
+      setOSFamily((prev) => (prev === value ? ALL_OPTION : value));
+    } else {
+      setCountry((prev) => (prev === value ? ALL_OPTION : value));
+    }
+  }
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-2">
-        <span className="text-sm text-muted-foreground">{t("performance.page")}</span>
-        <Select value={page} onValueChange={setPage}>
-          <SelectTrigger className="w-56">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL_PAGES}>{t("performance.allPages")}</SelectItem>
-            {(pagesQuery.data ?? []).map((p) => (
-              <SelectItem key={p} value={p}>
-                {p}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">{t("performance.page")}</span>
+          <Select value={page} onValueChange={setPage}>
+            <SelectTrigger className="h-8 w-44 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_OPTION}>{t("performance.allPages")}</SelectItem>
+              {(pagesQuery.data ?? []).map((p) => (
+                <SelectItem key={p} value={p}>
+                  {p}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">{t("performance.device")}</span>
+          <Select value={deviceType} onValueChange={setDeviceType}>
+            <SelectTrigger className="h-8 w-32 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_OPTION}>{t("performance.allDevices")}</SelectItem>
+              {VITAL_DEVICE_TYPES.map((d) => (
+                <SelectItem key={d} value={d}>
+                  {t(`performance.device_${d}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">{t("performance.browser")}</span>
+          <Select value={browserFamily} onValueChange={setBrowserFamily}>
+            <SelectTrigger className="h-8 w-32 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_OPTION}>{t("performance.allBrowsers")}</SelectItem>
+              {VITAL_BROWSER_FAMILIES.map((b) => (
+                <SelectItem key={b} value={b}>
+                  {t(`performance.browser_${b}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">{t("performance.os")}</span>
+          <Select value={osFamily} onValueChange={setOSFamily}>
+            <SelectTrigger className="h-8 w-32 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_OPTION}>{t("performance.allOS")}</SelectItem>
+              {VITAL_OS_FAMILIES.map((o) => (
+                <SelectItem key={o} value={o}>
+                  {t(`performance.os_${o}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">{t("performance.country")}</span>
+          <Select value={country} onValueChange={setCountry}>
+            <SelectTrigger className="h-8 w-32 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_OPTION}>{t("performance.allCountries")}</SelectItem>
+              {countryOptions.map((c) => (
+                <SelectItem key={c} value={c}>
+                  {c === "unknown" ? t("performance.country_unknown") : c}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        {hasActiveFilters && (
+          <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={resetFilters}>
+            <X className="size-3.5" />
+            {t("performance.resetFilters")}
+          </Button>
+        )}
+
         {pagesState === "pending" ? (
           <span className="text-xs text-muted-foreground">{t("performance.loading")}</span>
         ) : pagesState === "error" ? (
@@ -181,6 +374,7 @@ function WebVitalsTab({ getWindow }: { getWindow: () => PerfWindow }) {
             key={meta.key}
             meta={meta}
             page={pageParam}
+            filters={dimensionFilters}
             getWindow={getWindow}
             active={selectedVital === meta.key}
             onSelect={() => setSelectedVital(meta.key)}
@@ -188,9 +382,22 @@ function WebVitalsTab({ getWindow }: { getWindow: () => PerfWindow }) {
         ))}
       </div>
 
-      <VitalTrend meta={VITALS.find((v) => v.key === selectedVital)!} page={pageParam} getWindow={getWindow} />
+      <VitalTrend
+        meta={VITALS.find((v) => v.key === selectedVital)!}
+        page={pageParam}
+        filters={dimensionFilters}
+        getWindow={getWindow}
+      />
 
-      <VitalsByPageTable getWindow={getWindow} />
+      <VitalsBreakdownCard
+        dimension={breakdownDim}
+        onDimensionChange={setBreakdownDim}
+        filters={fullFilters}
+        onToggleFilter={toggleBreakdownFilter}
+        query={breakdownQuery}
+      />
+
+      <VitalsByPageTable filters={dimensionFilters} getWindow={getWindow} />
     </div>
   );
 }
@@ -198,20 +405,30 @@ function WebVitalsTab({ getWindow }: { getWindow: () => PerfWindow }) {
 function VitalCard({
   meta,
   page,
+  filters,
   getWindow,
   active,
   onSelect,
 }: {
   meta: VitalMeta;
   page: string | undefined;
+  filters: Omit<VitalFilters, "page">;
   getWindow: () => PerfWindow;
   active: boolean;
   onSelect: () => void;
 }) {
   const { t } = useTranslation();
   const query = useProjectQuery<TimeSeries[]>({
-    queryKey: ["vital", meta.key, page ?? "all"],
-    queryFn: ({ signal, project }) => queryVitalSeries(meta.key, page, getWindow(), signal, project),
+    queryKey: [
+      "vital",
+      meta.key,
+      page ?? "all",
+      filters.device_type ?? "all",
+      filters.browser_family ?? "all",
+      filters.os_family ?? "all",
+      filters.country ?? "all",
+    ],
+    queryFn: ({ signal, project }) => queryVitalSeries(meta.key, page, getWindow(), signal, project, filters),
     retry: false,
   });
 
@@ -278,16 +495,26 @@ function VitalCard({
 function VitalTrend({
   meta,
   page,
+  filters,
   getWindow,
 }: {
   meta: VitalMeta;
   page: string | undefined;
+  filters: Omit<VitalFilters, "page">;
   getWindow: () => PerfWindow;
 }) {
   const { t } = useTranslation();
   const query = useProjectQuery<TimeSeries[]>({
-    queryKey: ["vital-trend", meta.key, page ?? "all"],
-    queryFn: ({ signal, project }) => queryVitalSeries(meta.key, page, getWindow(), signal, project),
+    queryKey: [
+      "vital-trend",
+      meta.key,
+      page ?? "all",
+      filters.device_type ?? "all",
+      filters.browser_family ?? "all",
+      filters.os_family ?? "all",
+      filters.country ?? "all",
+    ],
+    queryFn: ({ signal, project }) => queryVitalSeries(meta.key, page, getWindow(), signal, project, filters),
     retry: false,
   });
   const viewState = queryViewState({
@@ -329,11 +556,229 @@ function VitalTrend({
   );
 }
 
-function VitalsByPageTable({ getWindow }: { getWindow: () => PerfWindow }) {
+const BREAKDOWN_TABS: Array<{ key: VitalDimensionKey; labelKey: string }> = [
+  { key: "device", labelKey: "performance.byDevice" },
+  { key: "country", labelKey: "performance.byCountry" },
+  { key: "browser", labelKey: "performance.byBrowser" },
+  { key: "os", labelKey: "performance.byOS" },
+];
+
+function rowsForDimension(
+  data: VitalsBreakdownResult | undefined,
+  dimension: VitalDimensionKey,
+): VitalBreakdownRow[] {
+  if (!data) return [];
+  switch (dimension) {
+    case "device":
+      return data.by_device;
+    case "country":
+      return data.by_country;
+    case "browser":
+      return data.by_browser;
+    case "os":
+      return data.by_os;
+  }
+}
+
+function isRowFiltered(dimension: VitalDimensionKey, value: string, filters: VitalFilters): boolean {
+  if (dimension === "device") return filters.device_type === value;
+  if (dimension === "browser") return filters.browser_family === value;
+  if (dimension === "os") return filters.os_family === value;
+  return filters.country === value;
+}
+
+function VitalsBreakdownCard({
+  dimension,
+  onDimensionChange,
+  filters,
+  onToggleFilter,
+  query,
+}: {
+  dimension: VitalDimensionKey;
+  onDimensionChange: (dim: VitalDimensionKey) => void;
+  filters: VitalFilters;
+  onToggleFilter: (dim: VitalDimensionKey, value: string) => void;
+  query: ReturnType<typeof useProjectQuery<VitalsBreakdownResult>>;
+}) {
+  const { t } = useTranslation();
+  const rows = rowsForDimension(query.data, dimension);
+  const totalSamples = query.data?.total_samples ?? 0;
+  const viewState = queryViewState({
+    hasData: query.data !== undefined,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    isEmpty: rows.length === 0,
+  });
+
+  return (
+    <Card>
+      <CardContent className="p-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2.5">
+          <div>
+            <div className="text-sm font-medium">{t("performance.breakdownTitle")}</div>
+            <p className="text-xs text-muted-foreground">{t("performance.breakdownHint")}</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-1" role="tablist" aria-label={t("performance.breakdownTitle")}>
+            {BREAKDOWN_TABS.map((tab) => (
+              <Button
+                key={tab.key}
+                type="button"
+                role="tab"
+                aria-selected={dimension === tab.key}
+                variant={dimension === tab.key ? "secondary" : "ghost"}
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => onDimensionChange(tab.key)}
+              >
+                {t(tab.labelKey)}
+              </Button>
+            ))}
+          </div>
+        </div>
+
+        {query.data?.truncated && (
+          <p className="border-b border-border px-4 py-1.5 text-xs text-vital-ni" role="status">
+            {t("performance.vitalsTruncated")}
+          </p>
+        )}
+
+        {viewState === "stale" && (
+          <div className="p-4 pb-0">
+            <QueryStaleNotice
+              isRetrying={query.isFetching}
+              onRetry={() => void query.refetch()}
+            />
+          </div>
+        )}
+
+        {viewState === "pending" ? (
+          <div className="space-y-2 p-4">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <Skeleton key={i} className="h-8 w-full" />
+            ))}
+          </div>
+        ) : viewState === "error" ? (
+          <div className="p-6 text-center text-sm text-destructive" role="alert">
+            <button type="button" className="underline-offset-2 hover:underline" onClick={() => void query.refetch()}>
+              {t("performance.errorTitle")} · {t("common.retry")}
+            </button>
+          </div>
+        ) : viewState === "empty" ? (
+          <div className="p-6 text-center text-sm text-muted-foreground">
+            {t("performance.empty")}
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border text-left text-xs text-muted-foreground">
+                  <th className="px-4 py-2 font-medium">{t("performance.colDimension")}</th>
+                  <th className="px-4 py-2 text-right font-medium">{t("performance.colSamples")}</th>
+                  <th className="w-32 px-4 py-2 font-medium">{t("performance.colShare")}</th>
+                  {VITALS.map((v) => (
+                    <th key={v.key} className="px-4 py-2 text-right font-medium uppercase">
+                      {v.key}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => {
+                  const share = totalSamples > 0 ? Math.min(1, row.samples / totalSamples) : 0;
+                  const active = isRowFiltered(dimension, row.value, filters);
+                  const displayLabel = formatDimensionValue(dimension, row.value, t);
+                  return (
+                    <tr
+                      key={row.value}
+                      tabIndex={0}
+                      onClick={() => onToggleFilter(dimension, row.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          onToggleFilter(dimension, row.value);
+                        }
+                      }}
+                      className={cn(
+                        "cursor-pointer border-b border-border/60 last:border-b-0 transition-colors hover:bg-muted/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                        active && "bg-accent/40",
+                      )}
+                    >
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          <span className={cn("text-xs font-medium", dimension === "country" && "font-mono")}>
+                            {displayLabel}
+                          </span>
+                          {active && (
+                            <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
+                              {t("performance.filterActive")}
+                            </Badge>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-2 text-right text-xs tabular-nums text-muted-foreground">
+                        {row.samples.toLocaleString()}
+                      </td>
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+                            <div
+                              className="h-full rounded-full bg-primary/70"
+                              style={{ width: `${Math.max(2, Math.round(share * 100))}%` }}
+                            />
+                          </div>
+                          <span className="w-10 text-right text-[11px] tabular-nums text-muted-foreground">
+                            {formatPercent(share)}
+                          </span>
+                        </div>
+                      </td>
+                      {VITALS.map((v) => {
+                        const value = row.values[v.key];
+                        if (value == null) {
+                          return (
+                            <td key={v.key} className="px-4 py-2 text-right text-muted-foreground">
+                              —
+                            </td>
+                          );
+                        }
+                        const rating = rateVital(v.key, value);
+                        return (
+                          <td
+                            key={v.key}
+                            className={cn("px-4 py-2 text-right tabular-nums", RATING_CLASS[rating].split(" ")[1])}
+                          >
+                            {formatVital(v, value)}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function VitalsByPageTable({
+  filters,
+  getWindow,
+}: {
+  filters: Omit<VitalFilters, "page">;
+  getWindow: () => PerfWindow;
+}) {
   const { t } = useTranslation();
   const query = useProjectQuery<PageVitals[]>({
-    queryKey: ["vitals-by-page"],
-    queryFn: ({ signal, project }) => getVitalsByPage(getWindow(), signal, project),
+    queryKey: [
+      "vitals-by-page",
+      filters.device_type ?? "all",
+      filters.browser_family ?? "all",
+      filters.os_family ?? "all",
+      filters.country ?? "all",
+    ],
+    queryFn: ({ signal, project }) => getVitalsByPage(getWindow(), signal, project, filters),
     retry: false,
   });
   const viewState = queryViewState({

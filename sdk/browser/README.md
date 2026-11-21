@@ -21,7 +21,8 @@ Importing either package has no global side effects. `init()` installs the confi
 |---|---:|---|
 | `dsn` | required | `<origin>/p/<project>@<token>` |
 | `errors` | `true` | Capture `error` and `unhandledrejection`, batch and upload |
-| `vitals` | `true` | Report LCP, CLS, INP, TTFB and FCP |
+| `vitals` | `true` | Report LCP, CLS, INP, TTFB and FCP with normalized low-cardinality device/browser/OS dimensions; pass `{ country: "US" }` to attach an explicit ISO-2 country code |
+| `country` | unset | Optional explicit 2-letter ISO 3166-1 alpha-2 country code attached to Web Vitals (never guessed from locale/timezone; update dynamically with `setCountry()`) |
 | `fetchTracing` | `true` | Patch fetch and XHR; use `{autoPatch:false}` for explicit `wrapFetch()` only |
 | `fetchTracing.allowlist` | `[]` | Extra cross-origin URL prefixes or regular expressions; same-origin is always allowed |
 | `replay` | enabled | `false` disables replay; see sampling below |

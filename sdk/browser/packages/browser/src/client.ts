@@ -39,6 +39,7 @@ import type {
 } from "./types";
 import { eventId, formatNonError, getSessionId, normalizePage, randomHex, safeSessionStorage } from "./utils";
 import { startVitals } from "./vitals";
+import { collectVitalDimensions, normalizeCountryCode } from "./vitals-dimensions";
 
 export { trimErrorEventToBudget };
 
@@ -226,6 +227,7 @@ export class Client implements BrowserClient {
   private replay?: ReplayController;
   private droppedTelemetry = 0;
   private currentPage: string;
+  private currentCountry: string | undefined;
   private started = false;
   private closed = false;
   private readonly onError = (event: ErrorEvent) => {
@@ -267,6 +269,8 @@ export class Client implements BrowserClient {
     this.limiter = new MinuteRateLimiter(config.errorLimitPerMinute ?? 60);
     this.sessionId = getSessionId(safeSessionStorage());
     this.currentPage = normalizePage(typeof location === "undefined" ? "/" : location.href);
+    const vitalsCountry = typeof config.vitals === "object" ? config.vitals.country : undefined;
+    this.currentCountry = normalizeCountryCode(vitalsCountry ?? config.country);
     this.allowlist = typeof config.fetchTracing === "object" ? config.fetchTracing.allowlist ?? [] : [];
     this.serviceName = config.serviceName?.trim()
       || (typeof location === "undefined" ? "browser" : location.hostname || "browser");
@@ -355,6 +359,7 @@ export class Client implements BrowserClient {
         () => this.currentPage,
         (sample) => this.replay?.vital(sample),
         (error) => this.recordVitalsFailure(error),
+        () => collectVitalDimensions(this.currentCountry),
       ));
     }
     if (this.config.fetchTracing !== false) {
@@ -488,6 +493,8 @@ export class Client implements BrowserClient {
   }
 
   setPage(page: string): void { this.currentPage = normalizePage(page); this.replay?.page(this.currentPage); }
+
+  setCountry(country: string | undefined): void { this.currentCountry = normalizeCountryCode(country); }
 
   diagnostics(): { droppedTelemetry: number } {
     return { droppedTelemetry: this.droppedTelemetry };

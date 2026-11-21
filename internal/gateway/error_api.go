@@ -115,10 +115,14 @@ func validErrorEvent(e errortrack.Event) bool {
 }
 
 type vitalInput struct {
-	Name      string          `json:"name"`
-	Value     float64         `json:"value"`
-	Page      string          `json:"page"`
-	Timestamp json.RawMessage `json:"timestamp"`
+	Name          string          `json:"name"`
+	Value         float64         `json:"value"`
+	Page          string          `json:"page"`
+	Timestamp     json.RawMessage `json:"timestamp"`
+	DeviceType    string          `json:"device_type,omitempty"`
+	BrowserFamily string          `json:"browser_family,omitempty"`
+	OSFamily      string          `json:"os_family,omitempty"`
+	Country       string          `json:"country,omitempty"`
 }
 
 func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
@@ -137,6 +141,7 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 			JSON(fiber.Map{"error": fmt.Sprintf("vitals batch exceeds %d items", maxVitalsBatchSize)})
 	}
 	project := currentProject(c)
+	reqDims := extractVitalRequestDimensions(c)
 	samples := make([]storage.MetricSample, 0, len(body.Vitals))
 	// Unknown metric names are a forward-compatibility signal (a newer SDK knows a
 	// vital this server does not), not a malformed batch: skip and count them so the
@@ -171,11 +176,16 @@ func (g *Gateway) vitalsIngest(c fiber.Ctx) error {
 			skipped++
 			continue
 		}
+		dims := resolveVitalDimensions(reqDims, vital)
 		samples = append(samples, storage.MetricSample{
 			Name: "web_vitals_" + name,
 			Labels: []storage.MetricLabel{
 				{Name: "project_id", Value: project.Slug},
 				{Name: "page", Value: page},
+				{Name: "device_type", Value: dims.DeviceType},
+				{Name: "browser_family", Value: dims.BrowserFamily},
+				{Name: "os_family", Value: dims.OSFamily},
+				{Name: "country", Value: dims.Country},
 			},
 			Value:     vital.Value,
 			Timestamp: timestamp,
