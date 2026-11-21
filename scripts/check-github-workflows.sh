@@ -122,6 +122,38 @@ if [[ -n $untrusted ]]; then
   fail "uses: owner must be one of: ${trusted_action_owners//|/, } (review a new owner before adding it to trusted_action_owners)"
 fi
 
+# 供应链/弃用清理：actions/attest-build-provenance 已弃用，统一使用 actions/attest
+#（不传 sbom-path / predicate* 时默认签发 SLSA build provenance）。
+deprecated_uses() {
+  local file n line
+  for file in "$@"; do
+    n=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      n=$((n + 1))
+      [[ $line =~ $uses_comment_re ]] && continue
+      [[ $line =~ $uses_ref_re ]] || continue
+      [[ ${BASH_REMATCH[3]} == actions/attest-build-provenance@* ]] || continue
+      printf '%s:%s: %s\n' "$file" "$n" "$line"
+    done <"$file"
+  done
+  return 0
+}
+deprecated_fixture=$(mktemp)
+cat >"$deprecated_fixture" <<'EOF'
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      # - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+EOF
+deprecated_self_test=$(deprecated_uses "$deprecated_fixture")
+rm -f "$deprecated_fixture"
+[[ $(grep -c . <<<"$deprecated_self_test" || true) -eq 1 ]] ||
+  fail "deprecated action self-test: expected 1 rejected ref, got: $deprecated_self_test"
+deprecated=$(deprecated_uses "${workflows[@]}" "${pin_files[@]}" | sort -u)
+if [[ -n $deprecated ]]; then
+  printf '%s\n' "$deprecated" >&2
+  fail 'deprecated actions/attest-build-provenance is forbidden; use actions/attest instead'
+fi
+
 # 供应链：job 容器的镜像同样带着仓库 token 跑步骤，却不受上面 uses: 的固定与属主检查约束。
 # 工具由 scripts/ci-setup-mise.sh 按 sha256 安装，不用 job 容器。
 job_containers=$(grep -En '^    container:' "${workflows[@]}" || true)
@@ -285,12 +317,58 @@ if [[ -f $release_wf ]]; then
     fail "$release_wf: docker must verify and assemble the multi-arch OCI layout via scripts/merge-oci-layouts.sh merge"
   [[ $docker_job == *'crane push --index'* ]] ||
     fail "$release_wf: docker must push the verified multi-arch OCI layout via crane push --index"
+  # 按 step 统计 job 里的 actions/attest@ 调用模式，防止 SBOM 与 provenance 共用同一 action 后漏掉其中之一。
+  count_attest_steps() {
+    local mode=$1
+    awk -v mode="$mode" '
+      function reset() {
+        has_attest = 0; has_subject_path = 0; has_subject_name = 0; has_subject_digest = 0
+        has_push_registry = 0; has_sbom = 0; has_custom_predicate = 0
+      }
+      function flush() {
+        if (has_attest) {
+          if (mode == "archive-provenance" && has_subject_path && !has_sbom && !has_custom_predicate) count++
+          if (mode == "container-provenance" && has_subject_name && has_subject_digest && has_push_registry && !has_sbom && !has_custom_predicate) count++
+          if (mode == "container-sbom" && has_subject_name && has_subject_digest && has_push_registry && has_sbom && !has_custom_predicate) count++
+        }
+        reset()
+      }
+      /^[[:space:]]*#/ { next }
+      /^      - / { flush() }
+      /uses:[[:space:]]*["'\'']?actions\/attest@/ { has_attest = 1 }
+      /^[[:space:]]+subject-path:/ { has_subject_path = 1 }
+      /^[[:space:]]+subject-name:/ { has_subject_name = 1 }
+      /^[[:space:]]+subject-digest:/ { has_subject_digest = 1 }
+      /^[[:space:]]+push-to-registry:[[:space:]]*true([[:space:]]*(#.*)?)?$/ { has_push_registry = 1 }
+      /^[[:space:]]+sbom-path:/ { has_sbom = 1 }
+      /^[[:space:]]+predicate(-type|-path)?:/ { has_custom_predicate = 1 }
+      END { flush(); print count + 0 }
+    '
+  }
+  attest_fixture=$(cat <<'ATTESTFIXTURE'
+      - name: Attest container SBOM only
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: ghcr.io/eimsound/lazy-observe
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: dist/lazy-observe-sbom.spdx.json
+          push-to-registry: true
+ATTESTFIXTURE
+  )
+  [[ $(count_attest_steps container-provenance <<<"$attest_fixture") -eq 0 && $(count_attest_steps container-sbom <<<"$attest_fixture") -eq 1 ]] ||
+    fail 'attest step counter self-test: SBOM step must not satisfy container-provenance'
+
+  [[ $archive_job == *'id-token: write'* && $archive_job == *'attestations: write'* ]] ||
+    fail "$release_wf: archive must declare id-token: write and attestations: write"
+  [[ $(count_attest_steps archive-provenance <<<"$archive_job") -ge 1 ]] ||
+    fail "$release_wf: archive must attest release archive build provenance via actions/attest"
+
   [[ $docker_job == *'cosign sign --yes'* ]] ||
     fail "$release_wf: docker must keyless-sign the pushed multi-arch digest with cosign"
-  [[ $docker_job == *'uses: actions/attest-build-provenance@'* ]] ||
-    fail "$release_wf: docker must attest build provenance for the pushed multi-arch digest"
-  [[ $docker_job == *'uses: actions/attest@'* && $docker_job == *'sbom-path:'* ]] ||
-    fail "$release_wf: docker must attest an SBOM for the pushed multi-arch digest"
+  [[ $(count_attest_steps container-provenance <<<"$docker_job") -ge 1 ]] ||
+    fail "$release_wf: docker must attest container build provenance via actions/attest"
+  [[ $(count_attest_steps container-sbom <<<"$docker_job") -ge 1 ]] ||
+    fail "$release_wf: docker must attest container SBOM via actions/attest with sbom-path"
   [[ $docker_job != *'gh release upload'* && $docker_job != *'gh release edit'* ]] ||
     fail "$release_wf: docker must not modify GitHub Releases; helm-values and publish-release own those steps"
 
