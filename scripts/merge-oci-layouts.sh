@@ -3,15 +3,15 @@ set -euo pipefail
 
 # 校验并合并由 BuildKit type=oci 导出的单架构 OCI 镜像归档：
 #   - inspect: 在 container-check 阶段校验单架构 OCI 归档的 manifest、config、全部 layer blob sha256
-#              与平台元数据，并输出不可变 manifest digest 与归档 sha256；
+#              与平台元数据，输出不可变 manifest digest 与归档 sha256，并可选封装 Docker save 归档；
 #   - merge:   在无构建的 docker 发布阶段复验归档 sha256 与预期 manifest digest，剥离 preflight 标签注解，
 #              组装干净的多架构 OCI image layout（可直接交给 `crane push --index` 推送），
-#              并可选导出单架构展开目录供 Trivy 离线生成 SPDX SBOM。
+#              并可选导出规范化的单架构 OCI 目录供 Trivy 离线生成 SPDX SBOM。
 
 usage() {
   cat >&2 <<'EOF'
 usage:
-  merge-oci-layouts.sh inspect --archive <oci.tar> --arch <amd64|arm64> --digest-out <file> --sha256-out <file>
+  merge-oci-layouts.sh inspect --archive <oci.tar> --arch <amd64|arm64> --digest-out <file> --sha256-out <file> [--docker-tar-out <file> --repo-tag <repo:tag>]
   merge-oci-layouts.sh merge --input-dir <dir> --output-dir <dir> [--sbom-dir <dir>]
 EOF
 }
@@ -108,28 +108,131 @@ resolve_single_manifest_descriptor() { # oci_dir arch
   ' <<<"$desc"
 }
 
+copy_verified_manifest_blobs() { # oci_dir manifest_digest dest_blobs_dir include_manifest use_hardlink
+  local oci_dir=$1 manifest_digest=$2 dest_blobs_dir=$3 include_manifest=$4 use_hardlink=$5
+  local manifest_hex manifest_path hex src dest
+  local -a ref_hexes=() hexes=()
+
+  manifest_hex=${manifest_digest#sha256:}
+  manifest_path=$oci_dir/blobs/sha256/$manifest_hex
+  mapfile -t ref_hexes < <(
+    jq -er '
+      [ .config.digest, (.layers[].digest) ]
+      | .[]
+      | sub("^sha256:"; "")
+    ' "$manifest_path"
+  )
+  if [[ $include_manifest == 1 ]]; then
+    hexes=("$manifest_hex" "${ref_hexes[@]}")
+  else
+    hexes=("${ref_hexes[@]}")
+  fi
+
+  for hex in "${hexes[@]}"; do
+    src=$oci_dir/blobs/sha256/$hex
+    dest=$dest_blobs_dir/$hex
+    if [[ ! -e $dest ]]; then
+      if [[ $use_hardlink == 1 ]]; then
+        ln "$src" "$dest" 2>/dev/null || cp -p "$src" "$dest"
+      else
+        cp -p "$src" "$dest"
+      fi
+    fi
+  done
+}
+
+# 将已校验的单 manifest 封装为标准 Docker save 归档（仅含 manifest.json 与被引用的 config/layers blob，
+# 不含 oci-layout / index.json，保证传统 overlay2 tarexport 与 containerd image store 均可按 RepoTags 加载）。
+write_docker_save_archive() { # oci_dir manifest_digest repo_tag dest_tar stage_dir
+  local oci_dir=$1 manifest_digest=$2 repo_tag=$3 dest_tar=$4 stage_dir=$5
+  local manifest_path
+  manifest_path=$oci_dir/blobs/sha256/${manifest_digest#sha256:}
+
+  rm -rf "$stage_dir"
+  mkdir -p "$stage_dir/blobs/sha256"
+  copy_verified_manifest_blobs "$oci_dir" "$manifest_digest" "$stage_dir/blobs/sha256" 0 1
+
+  jq -e --arg repo_tag "$repo_tag" '
+    [
+      {
+        Config: ("blobs/sha256/" + (.config.digest | sub("^sha256:"; ""))),
+        RepoTags: [$repo_tag],
+        Layers: [ .layers[].digest | "blobs/sha256/" + sub("^sha256:"; "") ]
+      }
+    ]
+  ' "$manifest_path" >"$stage_dir/manifest.json"
+
+  mkdir -p "$(dirname -- "$dest_tar")"
+  tar -cf "$dest_tar" -C "$stage_dir" manifest.json blobs
+}
+
 cmd_inspect() {
-  local archive= arch= digest_out= sha256_out=
+  local archive= arch= digest_out= sha256_out= docker_tar_out= repo_tag=
+  local has_docker_tar_out=0 has_repo_tag=0
   while (($# > 0)); do
     case $1 in
-    --archive) archive=${2:?}; shift 2 ;;
-    --arch) arch=${2:?}; shift 2 ;;
-    --digest-out) digest_out=${2:?}; shift 2 ;;
-    --sha256-out) sha256_out=${2:?}; shift 2 ;;
+    --archive)
+      (($# >= 2)) || { usage; exit 2; }
+      archive=$2
+      shift 2
+      ;;
+    --arch)
+      (($# >= 2)) || { usage; exit 2; }
+      arch=$2
+      shift 2
+      ;;
+    --digest-out)
+      (($# >= 2)) || { usage; exit 2; }
+      digest_out=$2
+      shift 2
+      ;;
+    --sha256-out)
+      (($# >= 2)) || { usage; exit 2; }
+      sha256_out=$2
+      shift 2
+      ;;
+    --docker-tar-out)
+      (($# >= 2)) || { usage; exit 2; }
+      has_docker_tar_out=1
+      docker_tar_out=$2
+      shift 2
+      ;;
+    --repo-tag)
+      (($# >= 2)) || { usage; exit 2; }
+      has_repo_tag=1
+      repo_tag=$2
+      shift 2
+      ;;
     *) usage; exit 2 ;;
     esac
   done
   [[ -n $archive && -n $arch && -n $digest_out && -n $sha256_out ]] || { usage; exit 2; }
+  if ((has_docker_tar_out != has_repo_tag)); then
+    printf 'merge-oci-layouts: --docker-tar-out and --repo-tag must be provided together\n' >&2
+    usage
+    exit 2
+  fi
+  if ((has_docker_tar_out)) && [[ -z $docker_tar_out || -z $repo_tag ]]; then
+    printf 'merge-oci-layouts: --docker-tar-out and --repo-tag must not be empty\n' >&2
+    usage
+    exit 2
+  fi
   [[ $arch == amd64 || $arch == arm64 ]] || fail "unsupported arch: $arch"
   [[ -s $archive ]] || fail "missing or empty OCI archive: $archive"
 
-  local desc digest archive_dir archive_base
+  local extract_dir desc digest archive_dir archive_base
   work=$(mktemp -d)
-  tar -xf "$archive" -C "$work"
+  extract_dir=$work/oci
+  mkdir -p "$extract_dir"
+  tar -xf "$archive" -C "$extract_dir"
 
-  desc=$(resolve_single_manifest_descriptor "$work" "$arch")
+  desc=$(resolve_single_manifest_descriptor "$extract_dir" "$arch")
   digest=$(jq -er '.digest' <<<"$desc")
   [[ $digest =~ $digest_re ]] || fail "unexpected manifest digest: $digest"
+
+  if ((has_docker_tar_out)); then
+    write_docker_save_archive "$extract_dir" "$digest" "$repo_tag" "$docker_tar_out" "$work/docker-stage"
+  fi
 
   mkdir -p "$(dirname -- "$digest_out")" "$(dirname -- "$sha256_out")"
   printf '%s\n' "$digest" >"$digest_out"
@@ -143,9 +246,21 @@ cmd_merge() {
   local input_dir= output_dir= sbom_dir=
   while (($# > 0)); do
     case $1 in
-    --input-dir) input_dir=${2:?}; shift 2 ;;
-    --output-dir) output_dir=${2:?}; shift 2 ;;
-    --sbom-dir) sbom_dir=${2:?}; shift 2 ;;
+    --input-dir)
+      (($# >= 2)) || { usage; exit 2; }
+      input_dir=$2
+      shift 2
+      ;;
+    --output-dir)
+      (($# >= 2)) || { usage; exit 2; }
+      output_dir=$2
+      shift 2
+      ;;
+    --sbom-dir)
+      (($# >= 2)) || { usage; exit 2; }
+      sbom_dir=$2
+      shift 2
+      ;;
     *) usage; exit 2 ;;
     esac
   done
@@ -158,7 +273,7 @@ cmd_merge() {
   mkdir -p "$output_dir/blobs/sha256"
 
   local -a descriptors=()
-  local arch tar_name sha_name digest_name expected_digest extract_dir desc actual_digest blob blob_name dest_blob
+  local arch tar_name sha_name digest_name expected_digest extract_dir desc actual_digest
   for arch in amd64 arm64; do
     tar_name="lazy-observe-linux-${arch}.oci.tar"
     sha_name="${tar_name}.sha256"
@@ -182,19 +297,20 @@ cmd_merge() {
     [[ $actual_digest == "$expected_digest" ]] ||
       fail "manifest digest mismatch for linux/${arch}: got $actual_digest, want $expected_digest"
 
-    for blob in "$extract_dir"/blobs/sha256/*; do
-      [[ -f $blob ]] || continue
-      blob_name=$(basename -- "$blob")
-      dest_blob="$output_dir/blobs/sha256/$blob_name"
-      if [[ ! -e $dest_blob ]]; then
-        cp -p "$blob" "$dest_blob"
-      fi
-    done
+    copy_verified_manifest_blobs "$extract_dir" "$actual_digest" "$output_dir/blobs/sha256" 1 0
 
     if [[ -n $sbom_dir && $arch == amd64 ]]; then
       rm -rf "$sbom_dir"
-      mkdir -p "$sbom_dir"
-      cp -a "$extract_dir/." "$sbom_dir/"
+      mkdir -p "$sbom_dir/blobs/sha256"
+      copy_verified_manifest_blobs "$extract_dir" "$actual_digest" "$sbom_dir/blobs/sha256" 1 0
+      printf '{"imageLayoutVersion":"1.0.0"}\n' >"$sbom_dir/oci-layout"
+      jq -n --argjson desc "$desc" '
+        {
+          schemaVersion: 2,
+          mediaType: "application/vnd.oci.image.index.v1+json",
+          manifests: [$desc]
+        }
+      ' >"$sbom_dir/index.json"
     fi
 
     descriptors+=("$desc")

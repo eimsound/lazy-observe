@@ -100,12 +100,17 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           oci_tar="${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.oci.tar"
+          docker_tar="${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.docker.tar"
+          trap 'rm -f "$docker_tar"' EXIT
           digest=$(bash scripts/merge-oci-layouts.sh inspect \
             --archive "$oci_tar" \
             --arch "$ARCH" \
             --digest-out "${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.digest" \
-            --sha256-out "${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.oci.tar.sha256")
-          docker load -i "$oci_tar"
+            --sha256-out "${RUNNER_TEMP}/lazy-observe-linux-${ARCH}.oci.tar.sha256" \
+            --docker-tar-out "$docker_tar" \
+            --repo-tag "lazy-observe:preflight-${ARCH}")
+          docker load -i "$docker_tar"
+          rm -f "$docker_tar"
           printf 'Verified and loaded linux/%s immutable manifest %s\n' "$ARCH" "$digest"
       # 发版前挡住：CRITICAL/HIGH 且已有修复版本的漏洞让 container-check 失败，archive 与 docker 都不会运行。
       # 扫描器按版本 + sha256 固定，例外写进 .trivyignore.yaml（见 scripts/check-image-vulns.sh）。
@@ -458,7 +463,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
           HELM_VALUES_FILE: dist/helm-values-lazy-observe-${{ needs.docker.outputs.version }}.yaml
-        run: gh release upload "$RELEASE_TAG" "$HELM_VALUES_FILE" --repo "$GITHUB_REPOSITORY" --clobber
+        run: |
+          max_attempts=5
+          delay=2
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$RELEASE_TAG" "$HELM_VALUES_FILE" --repo "$GITHUB_REPOSITORY" --clobber; then
+              exit 0
+            fi
+            if [[ $attempt -eq $max_attempts ]]; then
+              printf 'failed to upload %s to draft release %s after %d attempts\n' \
+                "$HELM_VALUES_FILE" "$RELEASE_TAG" "$max_attempts" >&2
+              exit 1
+            fi
+            printf 'gh release upload failed (attempt %d/%d); retrying in %ds...\n' \
+              "$attempt" "$max_attempts" "$delay" >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+          done
 
   # 仅在 GoReleaser 归档、多架构不可变容器推送、Cosign 签名、Provenance/SBOM Attestation
   # 与 digest 固定 helm-values 资产全部成功后，才将 draft Release 公开，避免中途失败留下半残公开 Release。
@@ -474,4 +495,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: |
+          max_attempts=5
+          delay=2
+          for attempt in 1 2 3 4 5; do
+            if gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false; then
+              exit 0
+            fi
+            if [[ $attempt -eq $max_attempts ]]; then
+              printf 'failed to publish draft release %s after %d attempts\n' \
+                "$RELEASE_TAG" "$max_attempts" >&2
+              exit 1
+            fi
+            printf 'gh release edit failed (attempt %d/%d); retrying in %ds...\n' \
+              "$attempt" "$max_attempts" "$delay" >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+          done
