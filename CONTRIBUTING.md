@@ -54,6 +54,7 @@ mise run web
 | `mise run perf-ha` | Gate exact medium-corpus query P95 and capacity-controlled per-replica weak scaling against a validating sink, with real-storage mirrored readback |
 | `mise run performance-gates` | Run the release, query, and HA scaling gates sequentially |
 | `mise run web` | Frozen pnpm install, Node test runner, typecheck, and production build |
+| `mise run web-e2e-real` | Build the gateway with embedded Web UI, start a real temporary instance, and run the real-backend Playwright E2E suite (`web/e2e-real`) |
 | `mise run sdk-go` / `sdk-node` / `sdk-browser` / `sdk-python` | Build and test one client SDK under `sdk/` (frozen installs for the JS packages). `sdk-python` uses uv (no pip, no system Python; `[tool.uv] exclude-newer = "7 days"` in `sdk/python/pyproject.toml` applies the same 7-day minimum release age as `scripts/release-age.env`, and `mise run sdk-python-release` builds the PyPI artifacts with `uv build`): `LO_SDK_PYTHON_VERSION=3.15t mise run sdk-python` picks the interpreter, default `3.13`; the CI matrix runs `3.9`, `3.13`, `3.15`, `3.15t` and a non-blocking `3.16` pre-release |
 | `mise run helm-lint` / `mise run helm-template-test` | Lint the chart and check its key-material and image-digest guards |
 | `mise run workflow-check` | Statically validate GitHub Actions workflows, reject shell pipelines that close early under `pipefail` (opt out with `# pipefail-ok: <reason>`), self-test the pinned mise bootstrap, and test the CI change detector's full-run fallbacks |
@@ -94,6 +95,14 @@ state, S3, probes, shutdown). Pull request CI runs it as the `HA E2E
 local run is optional; run it before pushing when you want the result early.
 It requires a working Docker daemon. Exit 77 means the prerequisite was absent
 and must be reported as `SKIP`, never PASS.
+
+### Real-backend Web E2E
+
+```sh
+mise run web-e2e-real
+```
+
+This builds the gateway with the embedded Web UI, prepares the pinned Victoria storage binaries, starts a real temporary `lazy-observe` instance with an isolated SQLite data directory, free ports below 30000, and an auto-generated bootstrap admin password, then runs `web/e2e-real` (`pnpm test:e2e:real`) in Chromium without `VITE_MOCK=1`. The existing mock Playwright suite (`cd web && pnpm test:e2e`) stays unchanged.
 
 ### SDK journeys
 

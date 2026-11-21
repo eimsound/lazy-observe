@@ -470,6 +470,11 @@ cd ..
 bash scripts/check-js-licenses.sh web
 '''
 
+[tasks.web-e2e-real]
+description = "Start a real lazy-observe server with embedded web assets and run the real-backend Playwright E2E suite"
+depends = ["build", "storage-bins"]
+run = "bash scripts/e2e-web-real.sh"
+
 [tasks.test-meta-pg]
 description = "Run PostgreSQL metadata tests against the current baseline"
 # embedded-postgres v2 从 GitHub（theseus-rs/postgresql-binaries）下载固定的 Postgres 18.6.1 发行包，
