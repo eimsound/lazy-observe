@@ -42,6 +42,9 @@ version: 2
 
 snapshot:
   version_template: "0.0.0-SNAPSHOT-{{ .ShortCommit }}"
+
+release:
+  draft: true
 GORELEASER
 printf 'FROM scratch\n' >"$repo/Dockerfile"
 printf '# Test repository\n' >"$repo/README.md"
@@ -170,5 +173,17 @@ expect_failure 'blank GitHub token' 'GITHUB_TOKEN must be set and non-empty' \
 
 expect_failure 'GoReleaser validation failure' 'GoReleaser configuration validation failed' \
   "${clean_env[@]}" GORELEASER_STUB_FAIL=1 "$checker" --snapshot
+
+cat >"$repo/.goreleaser.yaml" <<'GORELEASER'
+version: 2
+
+snapshot:
+  version_template: "0.0.0-SNAPSHOT-{{ .ShortCommit }}"
+
+release:
+  draft: false
+GORELEASER
+expect_failure 'non-draft GoReleaser release' '.goreleaser.yaml release.draft must be true' \
+  "${publish_env[@]}" "$checker"
 
 printf 'PASS: release prerequisite checker accepts only safe snapshot and release inputs\n'

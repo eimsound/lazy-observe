@@ -2,8 +2,8 @@ name: SDK release
 
 # SDK 按各自 tag 前缀单独发版（见 sdk/scripts/sdk-publish.sh）：
 #   sdk/go/vX.Y.Z      Go module（tag 即发布，再请 proxy.golang.org 拉取一次）
-#   sdk-node-vX.Y.Z    npm @lazy-observe/node（需要 NPM_TOKEN secret）
-#   sdk-browser-vX.Y.Z npm @lazy-observe/browser、react、bundler-plugin（需要 NPM_TOKEN）
+#   sdk-node-vX.Y.Z    npm @lazy-observe/node（environment: npm，需要 NPM_TOKEN secret）
+#   sdk-browser-vX.Y.Z npm @lazy-observe/browser、react、bundler-plugin（environment: npm，需要 NPM_TOKEN）
 #   sdk-python-vX.Y.Z  PyPI lazyobserve（PyPI trusted publishing，environment: pypi）
 # workflow_dispatch 只做 dry run：校验版本、构建、测试，不发布任何东西。
 on:
@@ -26,25 +26,72 @@ concurrency:
   group: sdk-release-${{ github.ref }}
   cancel-in-progress: false
 
+# mise 在 job 中途按需安装 task 工具时也要带 token，否则 GitHub API 匿名限流会让安装 403。
+env:
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+
 jobs:
-  release:
+  go:
     name: Release ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
-    if: "!startsWith(github.event_name == 'push' && github.ref_name || inputs.tag, 'sdk-python-v')"
+    if: startsWith(github.event_name == 'push' && github.ref_name || inputs.tag, 'sdk/go/v')
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
       SDK_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
       PUBLISH_FLAG: ${{ github.event_name == 'push' && '--publish' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify release commit is reachable from origin/main
+        if: github.event_name == 'push'
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+            echo 'SDK release tag commit is not reachable from origin/main' >&2
+            exit 1
+          }
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MISE_CI_PROFILE: sdk-go
+      - name: Verify and (on tag push) warm Go module proxy
+        # PUBLISH_FLAG is intentionally unquoted: empty means dry run.
+        run: mise exec -- bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
+
+  npm:
+    name: Release ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    if: startsWith(github.event_name == 'push' && github.ref_name || inputs.tag, 'sdk-node-v') || startsWith(github.event_name == 'push' && github.ref_name || inputs.tag, 'sdk-browser-v')
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+    env:
+      SDK_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      PUBLISH_FLAG: ${{ github.event_name == 'push' && '--publish' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify release commit is reachable from origin/main
+        if: github.event_name == 'push'
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+            echo 'SDK release tag commit is not reachable from origin/main' >&2
+            exit 1
+          }
+      - name: Install mise toolchain
+        run: bash scripts/ci-setup-mise.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MISE_CI_PROFILE: sdk-npm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: "!startsWith(env.SDK_TAG, 'sdk/go/v')"
         with:
           registry-url: https://registry.npmjs.org
-      - name: Verify, build, and (on tag push) publish
+      - name: Verify, build, and (on tag push) publish to npm
         # PUBLISH_FLAG is intentionally unquoted: empty means dry run.
         run: mise exec -- bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
         env:
@@ -64,6 +111,16 @@ jobs:
       PUBLISH_FLAG: ${{ github.event_name == 'push' && '--publish' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify release commit is reachable from origin/main
+        if: github.event_name == 'push'
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+            echo 'SDK release tag commit is not reachable from origin/main' >&2
+            exit 1
+          }
       # 与 ci.yml 的 sdk-python job 同一套引导：uv 由 mise 提供，不用 setup-python 与 pip，
       # 构建依赖受 sdk/python/pyproject.toml 的 [tool.uv] exclude-newer（7 天最小发布年龄）约束。
       - name: Install mise toolchain

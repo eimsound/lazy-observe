@@ -100,7 +100,8 @@ fi
 
 # 供应链：action 属主白名单。SHA 固定只保证代码不被换掉，管不了「该不该信任这个属主」；
 # 引入新属主等于让没审过的代码带着仓库 token 运行，所以先审属主、再加进这里。docker:// 没有属主，不收。
-trusted_action_owners='actions|docker|pypa'
+# sigstore: 官方 Cosign 安装器（sigstore/cosign-installer），用于 release.yml 无密钥签名多架构容器 digest。
+trusted_action_owners='actions|docker|pypa|sigstore'
 untrusted_uses() {
   local file n line
   for file in "$@"; do
@@ -251,19 +252,97 @@ if [[ -f $release_wf ]]; then
   [[ $(grep -Ec '^[[:space:]]+sha256=[0-9a-f]{64}$' scripts/install-trivy.sh) -eq 2 ]] ||
     fail 'scripts/install-trivy.sh must pin one sha256 per architecture (amd64, arm64)'
 
-  # 发版附带的 digest 固定 Helm values 片段由 helm-values job 上传。最小权限：docker job 会把 GITHUB_TOKEN 当
-  # BuildKit secret 挂进构建，不能同时持有写仓库的权限；workflow_dispatch 不得发布任何东西。
+  # 发版链路权限最小化与不可变容器发布流（#179 / #180）：
+  #   - container-check 仅持 contents: read（绝不向 BuildKit 暴露写权限），导出 OCI 归档、加载并扫描/冒烟同一份字节；
+  #   - docker job 无 Dockerfile/BuildKit 构建，直接推送已扫描的不可变多架构 OCI index，并绑定 Cosign 签名与 Provenance/SBOM Attestation；
+  #   - helm-values 绑定同一最终多架构 digest 上传至 draft Release；
+  #   - GoReleaser 先建 draft Release（.goreleaser.yaml release.draft: true），最后由 publish-release 公开。
   # 发版流程不能在本地真跑，这些静态断言是它唯一的门禁。
+  [[ $container_check != *'packages: write'* && $container_check != *'contents: write'* ]] ||
+    fail "$release_wf: container-check must not hold write permissions (BuildKit must stay read-only)"
+  [[ $container_check == *'outputs: type=oci,dest='* && $container_check == *'docker load -i'* ]] ||
+    fail "$release_wf: container-check must export an immutable OCI archive and load those exact bytes for scanning and smoke"
+  [[ $container_check == *'scripts/merge-oci-layouts.sh inspect'* ]] ||
+    fail "$release_wf: container-check must record verified OCI manifest digest and sha256 via scripts/merge-oci-layouts.sh inspect"
+  [[ $container_check == *'uses: actions/upload-artifact@'* ]] ||
+    fail "$release_wf: container-check must upload verified OCI archives for the build-free publish job"
+
   docker_job=$(release_job "$release_wf" docker)
   helm_values_job=$(release_job "$release_wf" helm-values)
+  publish_release_job=$(release_job "$release_wf" publish-release)
+
   [[ $docker_job == *'contents: read'* ]] ||
-    fail "$release_wf: docker must stay contents: read (it mounts the token into the build)"
+    fail "$release_wf: docker must stay contents: read"
   [[ $docker_job != *'contents: write'* ]] ||
     fail "$release_wf: docker must not hold contents: write; attach release assets from helm-values"
-  [[ $docker_job != *'gh release upload'* ]] ||
-    fail "$release_wf: docker must not upload release assets; helm-values owns that step"
+  [[ $docker_job == *'packages: write'* && $docker_job == *'id-token: write'* && $docker_job == *'attestations: write'* ]] ||
+    fail "$release_wf: docker must declare packages: write, id-token: write, and attestations: write"
+  [[ $docker_job != *'docker/build-push-action'* && $docker_job != *'docker build'* ]] ||
+    fail "$release_wf: docker publish job must not execute Dockerfile/BuildKit; push scanned OCI artifacts instead"
+  [[ $docker_job == *'uses: actions/download-artifact@'* ]] ||
+    fail "$release_wf: docker must download the verified OCI artifacts from container-check"
+  [[ $docker_job == *'scripts/merge-oci-layouts.sh merge'* ]] ||
+    fail "$release_wf: docker must verify and assemble the multi-arch OCI layout via scripts/merge-oci-layouts.sh merge"
+  [[ $docker_job == *'crane push --index'* ]] ||
+    fail "$release_wf: docker must push the verified multi-arch OCI layout via crane push --index"
+  [[ $docker_job == *'cosign sign --yes'* ]] ||
+    fail "$release_wf: docker must keyless-sign the pushed multi-arch digest with cosign"
+  [[ $docker_job == *'uses: actions/attest-build-provenance@'* ]] ||
+    fail "$release_wf: docker must attest build provenance for the pushed multi-arch digest"
+  [[ $docker_job == *'uses: actions/attest@'* && $docker_job == *'sbom-path:'* ]] ||
+    fail "$release_wf: docker must attest an SBOM for the pushed multi-arch digest"
+  [[ $docker_job != *'gh release upload'* && $docker_job != *'gh release edit'* ]] ||
+    fail "$release_wf: docker must not modify GitHub Releases; helm-values and publish-release own those steps"
+
   [[ $helm_values_job == *"if: github.event_name == 'push'"* ]] ||
     fail "$release_wf: helm-values must only run on tag pushes (workflow_dispatch publishes nothing)"
+  [[ $helm_values_job == *'needs: docker'* ]] ||
+    fail "$release_wf: helm-values must need docker so the immutable multi-arch digest exists"
+  [[ $helm_values_job == *'needs.docker.outputs.digest'* && $helm_values_job == *'scripts/render-helm-release-values.sh'* ]] ||
+    fail "$release_wf: helm-values must render values from needs.docker.outputs.digest"
+  [[ $helm_values_job == *'gh release upload'* && $helm_values_job == *'--clobber'* ]] ||
+    fail "$release_wf: helm-values must upload the rendered values file with --clobber"
+
+  [[ -n $publish_release_job ]] ||
+    fail "$release_wf: missing publish-release job to un-draft the Release after all assets succeed"
+  [[ $publish_release_job == *"if: github.event_name == 'push'"* ]] ||
+    fail "$release_wf: publish-release must only run on tag pushes"
+  [[ $publish_release_job == *'needs: helm-values'* ]] ||
+    fail "$release_wf: publish-release must wait for helm-values before publishing the draft Release"
+  [[ $publish_release_job == *'contents: write'* ]] ||
+    fail "$release_wf: publish-release must declare contents: write"
+  [[ $publish_release_job == *'gh release edit'* && $publish_release_job == *'--draft=false'* ]] ||
+    fail "$release_wf: publish-release must publish the draft Release with gh release edit --draft=false"
+
+  goreleaser_release=$(awk '
+    /^release:[[:space:]]*$/ { on = 1; next }
+    on && /^[^[:space:]#]/ { exit }
+    on { print }
+  ' .goreleaser.yaml)
+  grep -Eq '^[[:space:]]+draft:[[:space:]]*true[[:space:]]*(#.*)?$' <<<"$goreleaser_release" ||
+    fail ".goreleaser.yaml: release.draft must be true so the Release stays draft until publish-release"
+fi
+
+# SDK 发版防线（#179）：全部发布 job 必须拉全历史并校验 origin/main 祖先关系，配置 MISE_GITHUB_TOKEN，
+# npm 发布受 environment: npm 保护，Python 发布受 environment: pypi + id-token: write 保护。
+sdk_release_wf=.github/workflows/sdk-release.yml
+if [[ -f $sdk_release_wf ]]; then
+  grep -Eq '^[[:space:]]+MISE_GITHUB_TOKEN:' "$sdk_release_wf" ||
+    fail "$sdk_release_wf: must set MISE_GITHUB_TOKEN to avoid anonymous GitHub API rate limits"
+  for sdk_job_name in go npm python; do
+    sdk_job=$(release_job "$sdk_release_wf" "$sdk_job_name")
+    [[ -n $sdk_job ]] || fail "$sdk_release_wf: missing $sdk_job_name job"
+    [[ $sdk_job == *'fetch-depth: 0'* ]] ||
+      fail "$sdk_release_wf: $sdk_job_name job must checkout with fetch-depth: 0 for origin/main ancestry verification"
+    [[ $sdk_job == *'git merge-base --is-ancestor HEAD refs/remotes/origin/main'* ]] ||
+      fail "$sdk_release_wf: $sdk_job_name job must verify HEAD is an ancestor of origin/main before publishing"
+  done
+  sdk_npm_job=$(release_job "$sdk_release_wf" npm)
+  [[ $sdk_npm_job == *'environment: npm'* ]] ||
+    fail "$sdk_release_wf: npm job must be protected by environment: npm"
+  sdk_py_job=$(release_job "$sdk_release_wf" python)
+  [[ $sdk_py_job == *'environment: pypi'* && $sdk_py_job == *'id-token: write'* ]] ||
+    fail "$sdk_release_wf: python job must keep environment: pypi and id-token: write"
 fi
 
 # 镜像扫描例外清单：每条都要有理由和到期日，过期条目由 Trivy 自动失效。

@@ -89,8 +89,17 @@ else
   meta-pg)
     ci_tools=(go)
     ;;
+  sdk-go)
+    ci_tools=(go golangci-lint go:github.com/google/go-licenses/v2)
+    ;;
+  sdk-npm)
+    ci_tools=(node pnpm)
+    ;;
   sdk-python)
     ci_tools=(uv)
+    ;;
+  docker-publish)
+    ci_tools=(crane jq)
     ;;
   # SDK journeys：服务端构建（go、web 的 node/pnpm）、journey 的 jq/rg 与 sdk-python 任务的 uv（解释器由 uv 取）。
   sdk-journeys)

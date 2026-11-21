@@ -118,5 +118,17 @@ for marker in "${placeholder_markers[@]}"; do
   fi
 done
 
+# GoReleaser must create a draft Release first so the release workflow only
+# publishes it after the immutable container image, signatures, attestations,
+# and digest-pinned helm-values asset all succeed.
+release_block=$(awk '
+  /^release:[[:space:]]*$/ { on = 1; next }
+  on && /^[^[:space:]#]/ { exit }
+  on { print }
+' .goreleaser.yaml)
+if ! grep -Eq '^[[:space:]]+draft:[[:space:]]*true[[:space:]]*(#.*)?$' <<<"$release_block"; then
+  fail ".goreleaser.yaml release.draft must be true (publish-release publishes the draft after all assets succeed)"
+fi
+
 check_goreleaser_config
 printf 'PASS: release prerequisites are valid for %s\n' "$tag"
