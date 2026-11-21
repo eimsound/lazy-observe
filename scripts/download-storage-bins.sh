@@ -97,6 +97,23 @@ fetch "$vmutils_asset" "$vmutils_sha" "$vmutils_url"
 fetch "$logs_asset" "$logs_sha" "$logs_url"
 fetch "$traces_asset" "$traces_sha" "$traces_url"
 
+# 4 个当前归档均通过 SHA-256 校验后，清理当前平台归档目录下不再引用的历史归档，
+# 防止 restore-keys 恢复旧缓存后跨升级累积残留；仅扫 .archives/$platform 顶层文件，绝不触碰其它平台目录。
+prune_stale_archives() {
+  local entry name
+  while IFS= read -r -d '' entry; do
+    name=${entry##*/}
+    case "$name" in
+      "$metrics_asset" | "$vmutils_asset" | "$logs_asset" | "$traces_asset")
+        continue
+        ;;
+    esac
+    rm -f -- "$entry"
+    printf 'pruned stale archive %s\n' "$name"
+  done < <(find "$archive_dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -print0)
+}
+prune_stale_archives
+
 manifest="$bin_dir/.manifest"
 expected_manifest="$tmp_dir/manifest"
 {

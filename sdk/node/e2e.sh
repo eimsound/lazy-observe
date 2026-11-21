@@ -87,7 +87,15 @@ wait_http() {
 }
 
 printf 'building Node SDK...\n'
-(cd "$SDK_DIR" && pnpm install --frozen-lockfile && pnpm build)
+(
+	cd "$SDK_DIR"
+	set -- install --frozen-lockfile
+	if [ -n "${LO_PNPM_STORE_SDK_NODE:-}" ]; then
+		set -- "$@" --store-dir "$LO_PNPM_STORE_SDK_NODE"
+	fi
+	pnpm "$@"
+	pnpm build
+)
 
 # 读请求在 profile 断言就开始了，先登录拿会话 Cookie。
 jq -n --arg username admin --arg password "$PASSWORD" \

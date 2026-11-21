@@ -113,9 +113,19 @@ wait_http() {
 }
 
 
+pnpm_install_frozen() {
+	store_dir=$1
+	shift
+	if [ -n "$store_dir" ]; then
+		pnpm install --frozen-lockfile --store-dir "$store_dir" "$@"
+	else
+		pnpm install --frozen-lockfile "$@"
+	fi
+}
+
 printf 'building SDK workspace and examples from this repo...\n'
 (cd "$SDK_DIR/../go/examples/fiber" && CGO_ENABLED=0 go build -o "$WORK/fiber-example" .)
-(cd "$SDK_DIR/../node" && pnpm install --frozen-lockfile && pnpm build)
+(cd "$SDK_DIR/../node" && pnpm_install_frozen "${LO_PNPM_STORE_SDK_NODE:-}" && pnpm build)
 # --with-deps 要用 apt 装系统库，需要 root 或免密 sudo（CI runner 满足）；
 # 托管 runner 偶发 apt 索引过期或镜像半同步导致 fonts-unifont 等字体包找不到，先容错刷新索引并允许失败重试/降级到仅装浏览器，
 # 系统库若真缺失，后续启动 Chromium 会如实报错。没有 root/免密 sudo 的开发机不调用 apt/sudo，只装浏览器本身。
@@ -147,9 +157,9 @@ install_playwright_chromium() {
 	# bundler-plugin 的 bin（lazy-observe-sourcemaps）指向 dist/cli.js，examples/react 依赖它；
 	# dist 还没构建就整体 install，pnpm 会报 "Failed to create bin"。先只装并构建 bundler-plugin，
 	# 再整体 install，bin 链接就是完整的，发布产物（package.json 的 bin / files）不用动。
-	pnpm install --frozen-lockfile --filter @lazy-observe/bundler-plugin
+	pnpm_install_frozen "${LO_PNPM_STORE_SDK_BROWSER:-}" --filter @lazy-observe/bundler-plugin
 	pnpm --filter @lazy-observe/bundler-plugin build
-	pnpm install --frozen-lockfile
+	pnpm_install_frozen "${LO_PNPM_STORE_SDK_BROWSER:-}"
 	pnpm build
 	install_playwright_chromium
 )
