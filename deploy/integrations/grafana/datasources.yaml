@@ -1,0 +1,75 @@
+# Grafana data source provisioning for lazy-observe.
+#
+# Mount this file at /etc/grafana/provisioning/datasources/lazy-observe.yaml
+# and inject environment variables (never commit real lou_ tokens to Git):
+#   LAZY_OBSERVE_URL         - Gateway root URL, e.g. http://lazy-observe:3100
+#   LAZY_OBSERVE_PROXY_URL   - Lightweight path-rewrite proxy for Logs & Traces
+#                              (maps /select/logsql/* -> /api/v1/logs/* and
+#                               Jaeger /api/services, /api/traces -> /api/traces/*)
+#                              See docs/grafana-perses.md for Nginx/Caddy snippets.
+#   LAZY_OBSERVE_PROJECT     - Target project slug (defaults to "default")
+#   LAZY_OBSERVE_USER_TOKEN  - User API token (lou_...); NEVER use a project ingest
+#                              token (lo_...) or source-map upload token (los_...).
+#
+# One data source serves one project because X-LO-Project is fixed per data source.
+# For Logs, install the official VictoriaLogs plugin in Grafana:
+#   GF_INSTALL_PLUGINS=victoriametrics-logs-datasource
+
+apiVersion: 1
+
+datasources:
+  # 1. Metrics (PromQL / MetricsQL) — connects directly to the lazy-observe gateway.
+  # Supported routes: /api/v1/{query,query_range,series,labels,label/:name/values}
+  - name: lazy-observe Metrics
+    uid: lazy-observe-metrics
+    type: prometheus
+    access: proxy
+    url: ${LAZY_OBSERVE_URL:-http://lazy-observe:3100}
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      prometheusType: Prometheus
+      httpHeaderName1: Authorization
+      httpHeaderName2: X-LO-Project
+    secureJsonData:
+      httpHeaderValue1: Bearer ${LAZY_OBSERVE_USER_TOKEN}
+      httpHeaderValue2: ${LAZY_OBSERVE_PROJECT:-default}
+
+  # 2. Logs (VictoriaLogs / LogsQL) — connects through the path-rewrite proxy
+  # that maps /select/logsql/<op> to gateway /api/v1/logs/<op> while preserving
+  # Authorization and X-LO-Project headers (see docs/grafana-perses.md).
+  - name: lazy-observe Logs
+    uid: lazy-observe-logs
+    type: victoriametrics-logs-datasource
+    access: proxy
+    url: ${LAZY_OBSERVE_PROXY_URL:-http://lazy-observe-grafana-proxy:8080}
+    isDefault: false
+    editable: false
+    jsonData:
+      httpHeaderName1: Authorization
+      httpHeaderName2: X-LO-Project
+    secureJsonData:
+      httpHeaderValue1: Bearer ${LAZY_OBSERVE_USER_TOKEN}
+      httpHeaderValue2: ${LAZY_OBSERVE_PROJECT:-default}
+
+  # 3. Traces (Jaeger-compatible API) — connects through the path-rewrite proxy
+  # that maps /api/services, /api/services/<svc>/operations, and /api/traces to
+  # gateway /api/traces/{services,services/:svc/operations,search,:traceID}.
+  - name: lazy-observe Traces
+    uid: lazy-observe-traces
+    type: jaeger
+    access: proxy
+    url: ${LAZY_OBSERVE_PROXY_URL:-http://lazy-observe-grafana-proxy:8080}
+    isDefault: false
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: lazy-observe-logs
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+      httpHeaderName1: Authorization
+      httpHeaderName2: X-LO-Project
+    secureJsonData:
+      httpHeaderValue1: Bearer ${LAZY_OBSERVE_USER_TOKEN}
+      httpHeaderValue2: ${LAZY_OBSERVE_PROJECT:-default}

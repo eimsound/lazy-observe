@@ -1,0 +1,143 @@
+# Perses declarative provisioning resources for lazy-observe.
+#
+# Apply with:
+#   percli apply -f deploy/integrations/perses/datasources.yaml
+#
+# Security:
+#   - Replace the placeholder credential with a read-only viewer user API token
+#     (prefix: lou_...) created in Settings > Personal API tokens.
+#   - NEVER use a project ingest token (lo_...) or source-map upload token (los_...):
+#     the gateway rejects them on all read routes with HTTP 403 (ADR 0010).
+#   - In production, prefer `credentialsFile` mounted from a read-only Secret
+#     instead of embedding a literal token in YAML.
+#
+# One Datasource maps to one lazy-observe project via the X-LO-Project header.
+# See docs/grafana-perses.md for the lightweight path-rewrite proxy required by
+# VictoriaLogsDatasource and for Traces/Jaeger linking guidance.
+
+kind: Project
+metadata:
+  name: lazy-observe
+spec:
+  display:
+    name: lazy-observe
+
+---
+kind: Secret
+metadata:
+  name: lazy-observe-user-token
+  project: lazy-observe
+spec:
+  authorization:
+    type: Bearer
+    # Replace with a lou_... user API token (or switch to `credentialsFile: /etc/perses/secrets/lo-user-token`).
+    credentials: lou_replace_with_your_user_api_token
+
+---
+# 1. Metrics (PromQL / MetricsQL) — connects directly to the lazy-observe gateway.
+# allowedEndpoints matches the exact Prometheus-compatible query surface in
+# internal/gateway/gateway.go.
+kind: Datasource
+metadata:
+  name: lazy-observe-metrics
+  project: lazy-observe
+spec:
+  display:
+    name: lazy-observe Metrics (default)
+    description: Project-isolated PromQL/MetricsQL data source via lazy-observe gateway
+  default: true
+  plugin:
+    kind: PrometheusDatasource
+    spec:
+      proxy:
+        kind: HTTPProxy
+        spec:
+          url: http://lazy-observe:3100
+          secret: lazy-observe-user-token
+          headers:
+            X-LO-Project: default
+          allowedEndpoints:
+            - endpointPattern: ^/api/v1/query$
+              method: GET
+            - endpointPattern: ^/api/v1/query$
+              method: POST
+            - endpointPattern: ^/api/v1/query_range$
+              method: GET
+            - endpointPattern: ^/api/v1/query_range$
+              method: POST
+            - endpointPattern: ^/api/v1/series$
+              method: GET
+            - endpointPattern: ^/api/v1/series$
+              method: POST
+            - endpointPattern: ^/api/v1/labels$
+              method: GET
+            - endpointPattern: ^/api/v1/labels$
+              method: POST
+            - endpointPattern: ^/api/v1/label/[^/]+/values$
+              method: GET
+            - endpointPattern: ^/api/v1/label/[^/]+/values$
+              method: POST
+
+---
+# 2. Logs (VictoriaLogs / LogsQL) — requires the Perses VictoriaLogs plugin and
+# the path-rewrite proxy (see docs/grafana-perses.md) mapping /select/logsql/*
+# to gateway /api/v1/logs/* while forwarding Authorization and X-LO-Project.
+kind: Datasource
+metadata:
+  name: lazy-observe-logs
+  project: lazy-observe
+spec:
+  display:
+    name: lazy-observe Logs (default)
+    description: Project-isolated VictoriaLogs / LogsQL data source via path-rewrite proxy
+  default: false
+  plugin:
+    kind: VictoriaLogsDatasource
+    spec:
+      proxy:
+        kind: HTTPProxy
+        spec:
+          url: http://lazy-observe-proxy:8080
+          secret: lazy-observe-user-token
+          headers:
+            X-LO-Project: default
+          allowedEndpoints:
+            - endpointPattern: ^/select/logsql/query$
+              method: GET
+            - endpointPattern: ^/select/logsql/query$
+              method: POST
+            - endpointPattern: ^/select/logsql/hits$
+              method: GET
+            - endpointPattern: ^/select/logsql/hits$
+              method: POST
+            - endpointPattern: ^/select/logsql/stats_query_range$
+              method: GET
+            - endpointPattern: ^/select/logsql/stats_query_range$
+              method: POST
+            - endpointPattern: ^/select/logsql/query_time_range$
+              method: GET
+            - endpointPattern: ^/select/logsql/query_time_range$
+              method: POST
+            - endpointPattern: ^/select/logsql/field_names$
+              method: GET
+            - endpointPattern: ^/select/logsql/field_names$
+              method: POST
+            - endpointPattern: ^/select/logsql/field_values$
+              method: GET
+            - endpointPattern: ^/select/logsql/field_values$
+              method: POST
+            - endpointPattern: ^/select/logsql/stream_field_names$
+              method: GET
+            - endpointPattern: ^/select/logsql/stream_field_names$
+              method: POST
+            - endpointPattern: ^/select/logsql/stream_field_values$
+              method: GET
+            - endpointPattern: ^/select/logsql/stream_field_values$
+              method: POST
+
+# 3. Traces note:
+# lazy-observe exposes Jaeger-compatible trace query routes under /api/traces/*
+# (ADR 0013: VictoriaTraces only, no Tempo TraceQL API). Perses' native tracing
+# plugin targets Tempo (TempoDatasource), so for trace exploration link from
+# Perses panels to the lazy-observe Web UI or use Grafana's Jaeger data source
+# (deploy/integrations/grafana/datasources.yaml).
