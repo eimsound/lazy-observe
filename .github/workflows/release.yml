@@ -73,6 +73,8 @@ jobs:
             org.opencontainers.image.created=${{ needs.build-meta.outputs.date }}
             org.opencontainers.image.version=${{ needs.build-meta.outputs.version }}
             org.opencontainers.image.revision=${{ needs.build-meta.outputs.commit }}
+      # 不向共享 10 GB Actions 缓存写 BuildKit 层：原生冷构约 ~90s 且与约 ~15m 的
+      # performance-gates 并行，与 ci.yml 的 artifact-smoke 保持一致。
       - name: Build immutable OCI container archive
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -92,9 +94,6 @@ jobs:
             DATE=${{ needs.build-meta.outputs.date }}
           secrets: |
             github_token=${{ secrets.GITHUB_TOKEN }}
-          cache-from: type=gha,scope=container-${{ matrix.arch }}
-          # mode=max 的层缓存动辄 GB 级；tag 触发时写在 refs/tags/* 下，别的 tag 和 main 都读不到，只在 main 上写。
-          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=container-{0}', matrix.arch) || '' }}
       - name: Load and verify immutable OCI archive
         env:
           ARCH: ${{ matrix.arch }}
