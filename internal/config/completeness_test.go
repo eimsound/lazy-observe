@@ -66,6 +66,7 @@ func TestConfigReflectionCompleteness(t *testing.T) {
 
 	// Distinct valid non-default values (yaml, env, flag) for fields with semantic constraints.
 	customValues := map[string][3]string{
+		"otlp_grpc.listen":                  {`":14317"`, ":24317", ":34317"},
 		"topology":                          {`"standalone"`, "standalone", "all-in-one"},
 		"standalone":                        {"true", "false", "true"},
 		"storage.metrics.kind":              {`"prometheus"`, "prometheus", "prometheus"},

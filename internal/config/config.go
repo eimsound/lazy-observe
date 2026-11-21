@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -52,6 +53,7 @@ const (
 
 type Config struct {
 	Listen         string         `yaml:"listen"`
+	OTLPGRPC       OTLPGRPC       `yaml:"otlp_grpc"`
 	DataDir        string         `yaml:"data_dir"`
 	ServeWebUI     bool           `yaml:"serve_web_ui"`
 	Topology       string         `yaml:"topology"`
@@ -70,6 +72,15 @@ type Config struct {
 	Process        Process        `yaml:"process"`
 	Security       Security       `yaml:"security"`
 	SelfMonitoring SelfMonitoring `yaml:"self_monitoring"`
+}
+
+// OTLPGRPC configures the native OTLP/gRPC ingest listener (Traces, Metrics,
+// and Logs on default port :4317). Disabled by default so existing deployments
+// and multi-instance test fixtures do not collide on :4317 until enabled.
+type OTLPGRPC struct {
+	Enabled      bool   `yaml:"enabled"`
+	Listen       string `yaml:"listen"`
+	MaxRecvBytes int    `yaml:"max_recv_bytes"`
 }
 
 // Security groups browser-facing hardening controls.
@@ -225,6 +236,11 @@ type Process struct {
 func Defaults() Config {
 	return Config{
 		Listen: ":3100", DataDir: "./data", ServeWebUI: true,
+		OTLPGRPC: OTLPGRPC{
+			Enabled:      false,
+			Listen:       ":4317",
+			MaxRecvBytes: 52 << 20,
+		},
 		Meta:    Meta{MigrationLockTimeout: Duration(time.Minute)},
 		Redis:   Redis{Addr: "127.0.0.1:6379", KeyPrefix: "lazy-observe"},
 		Storage: Storage{Metrics: Metrics{Kind: "vm"}},
@@ -331,6 +347,24 @@ func LoadFlagSet(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) (Conf
 func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 	fs.StringVar(configPath, "config", *configPath, "configuration YAML file")
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "public gateway listen address")
+	fs.BoolVar(
+		&cfg.OTLPGRPC.Enabled,
+		"otlp-grpc-enabled",
+		cfg.OTLPGRPC.Enabled,
+		"enable the native OTLP/gRPC ingest server (traces, metrics, logs)",
+	)
+	fs.StringVar(
+		&cfg.OTLPGRPC.Listen,
+		"otlp-grpc-listen",
+		cfg.OTLPGRPC.Listen,
+		"OTLP/gRPC ingest listen address",
+	)
+	fs.IntVar(
+		&cfg.OTLPGRPC.MaxRecvBytes,
+		"otlp-grpc-max-recv-bytes",
+		cfg.OTLPGRPC.MaxRecvBytes,
+		"maximum decoded OTLP/gRPC request message size in bytes",
+	)
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "root data directory")
 	fs.BoolVar(&cfg.ServeWebUI, "serve-web-ui", cfg.ServeWebUI, "serve the embedded web UI from the gateway")
 	fs.StringVar(
@@ -558,6 +592,7 @@ func configFlag(args []string) (string, error) {
 func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 	stringsMap := map[string]*string{
 		"LO_LISTEN":           &c.Listen,
+		"LO_OTLP_GRPC_LISTEN": &c.OTLPGRPC.Listen,
 		"LO_DATA_DIR":         &c.DataDir,
 		"LO_TOPOLOGY":         &c.Topology,
 		"LO_STORAGE_BIN_DIR":  &c.StorageBinDir,
@@ -619,6 +654,7 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		c.Standalone = parsed
 	}
 	for name, dst := range map[string]*bool{
+		"LO_OTLP_GRPC_ENABLED":              &c.OTLPGRPC.Enabled,
 		"LO_SERVE_WEB_UI":                   &c.ServeWebUI,
 		"LO_STORAGE_METRICS_CLUSTER":        &c.Storage.Metrics.Cluster,
 		"LO_SECURITY_CSRF":                  &c.Security.CSRF,
@@ -638,6 +674,13 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 			return fmt.Errorf("parse LO_REDIS_ENABLED: %w", err)
 		}
 		c.Redis.Enabled = parsed
+	}
+	if v, ok := lookup("LO_OTLP_GRPC_MAX_RECV_BYTES"); ok {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("parse LO_OTLP_GRPC_MAX_RECV_BYTES: %w", err)
+		}
+		c.OTLPGRPC.MaxRecvBytes = parsed
 	}
 	if v, ok := lookup("LO_REDIS_DB"); ok {
 		parsed, err := strconv.Atoi(v)
@@ -822,6 +865,18 @@ func (c Config) HAConfigChecks() []CheckResult {
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Listen) == "" || strings.TrimSpace(c.DataDir) == "" {
 		return errors.New("listen and data-dir are required")
+	}
+	otlpGRPCListen := strings.TrimSpace(c.OTLPGRPC.Listen)
+	if c.OTLPGRPC.Enabled && otlpGRPCListen == "" {
+		return errors.New("otlp_grpc.listen is required when otlp_grpc.enabled is true")
+	}
+	if otlpGRPCListen != "" {
+		if _, _, err := net.SplitHostPort(otlpGRPCListen); err != nil {
+			return fmt.Errorf("otlp_grpc.listen must be a valid host:port address: %w", err)
+		}
+	}
+	if c.OTLPGRPC.MaxRecvBytes <= 0 {
+		return errors.New("otlp_grpc.max_recv_bytes must be positive")
 	}
 	switch c.Topology {
 	case "", TopologyAllInOne, TopologyStandalone, TopologyHA:

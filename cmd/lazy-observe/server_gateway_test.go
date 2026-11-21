@@ -15,6 +15,9 @@ import (
 	"time"
 
 	appconfig "github.com/eimsound/lazy-observe/internal/config"
+	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/otlpgrpc"
+	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
 )
 
 type fatalSupervisor struct {
@@ -334,5 +337,70 @@ func TestWaitForServerExitGatewayErrorDrainsWithDeadlineAndStopsSupervisor(t *te
 			gw.drainHasDL.Load(),
 			supervisor.shutdowns.Load(),
 		)
+	}
+}
+
+func TestCollectPlatformEndpointsIncludesOTLPGRPCPortWhenEnabled(t *testing.T) {
+	cfg := appconfig.Defaults()
+	cfg.OTLPGRPC.Enabled = true
+	cfg.OTLPGRPC.Listen = "0.0.0.0:4317"
+
+	ports, _ := collectPlatformEndpoints(cfg, nil, nil)
+	if !slices.Contains(ports, 4317) {
+		t.Fatalf("platform ports=%v missing enabled OTLP/gRPC port 4317", ports)
+	}
+
+	policy, err := serverOutboundPolicy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := policy.BlockedPorts[4317]; !ok {
+		t.Fatalf("outbound policy BlockedPorts=%v missing 4317", policy.BlockedPorts)
+	}
+}
+
+type noopGRPCAuth struct{}
+
+func (noopGRPCAuth) AuthenticateProjectToken(context.Context, string) (meta.ProjectInfo, error) {
+	return meta.ProjectInfo{}, meta.ErrInvalidProjectAPIToken
+}
+
+func TestCompositeGatewayLifecycleDrainsOTLPGRPCAndHTTP(t *testing.T) {
+	backend, err := storagepkg.New(
+		storagepkg.MetricsVM,
+		"http://127.0.0.1:18428",
+		"http://127.0.0.1:18428",
+		"http://127.0.0.1:19428",
+		"http://127.0.0.1:20428",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcSrv, err := otlpgrpc.NewServer(otlpgrpc.Config{
+		Auth:    noopGRPCAuth{},
+		Storage: backend,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpGW := &recordingGatewayLifecycle{}
+	composite := &compositeGatewayLifecycle{
+		httpGateway: httpGW,
+		otlpGRPC:    grpcSrv,
+		drainLimit:  time.Second,
+	}
+	composite.BeginDrain()
+	if httpGW.beginDrains.Load() != 1 {
+		t.Fatalf("beginDrains=%d want=1", httpGW.beginDrains.Load())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := composite.Drain(ctx); err != nil {
+		t.Fatalf("composite Drain err=%v", err)
+	}
+	if httpGW.drains.Load() != 1 {
+		t.Fatalf("http drains=%d want=1", httpGW.drains.Load())
 	}
 }

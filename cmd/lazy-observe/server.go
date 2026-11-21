@@ -46,6 +46,12 @@ func runServer(cfg appconfig.Config) error {
 	}
 	cleanups.Push("public-listener", publicListener.Close)
 
+	otlpGRPCListener, err := openOTLPGRPCListener(cfg, logger)
+	if err != nil {
+		return err
+	}
+	cleanups.Push("otlp-grpc-listener", otlpGRPCListener.Close)
+
 	loopback, err := openInternalLoopback(cfg)
 	if err != nil {
 		return err
@@ -82,6 +88,9 @@ func runServer(cfg appconfig.Config) error {
 	cleanups.Push("signal-storage", signals.supervisor.Shutdown)
 
 	enrichServerOutboundPolicy(&essentials.outboundPolicy, cfg, loopback, signals)
+	if port := otlpGRPCListener.Port(); port > 0 {
+		essentials.outboundPolicy.BlockedPorts[port] = struct{}{}
+	}
 
 	monitoring := startSelfMonitoring(cfg, loopback.baseURL, metadata.selfProject, metadata.selfToken, logger)
 	cleanups.PushFunc("self-monitoring", monitoring.Shutdown)
@@ -100,6 +109,8 @@ func runServer(cfg appconfig.Config) error {
 		services,
 		loopback,
 		publicListener,
+		otlpGRPCListener,
+		cleanups,
 	)
 	if err != nil {
 		return err

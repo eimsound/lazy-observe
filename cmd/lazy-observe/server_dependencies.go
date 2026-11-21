@@ -54,6 +54,11 @@ func serverOutboundPolicy(cfg appconfig.Config) (outbound.Policy, error) {
 	if port := listenPort(cfg.Listen); port > 0 {
 		blocked[port] = struct{}{}
 	}
+	if cfg.OTLPGRPC.Enabled {
+		if port := explicitListenPort(cfg.OTLPGRPC.Listen); port > 0 {
+			blocked[port] = struct{}{}
+		}
+	}
 	if offset := cfg.Process.ComponentPortOffset; offset != 0 {
 		for _, basePort := range []int{18428, 19428, 20428, 21428, 22428} {
 			if p := basePort + offset; p > 0 && p <= 65535 {
@@ -106,6 +111,11 @@ func collectPlatformEndpoints(
 	}
 	if port := listenPort(cfg.Listen); port > 0 && port <= 65535 {
 		portSet[port] = struct{}{}
+	}
+	if cfg.OTLPGRPC.Enabled {
+		if port := explicitListenPort(cfg.OTLPGRPC.Listen); port > 0 && port <= 65535 {
+			portSet[port] = struct{}{}
+		}
 	}
 	if offset := cfg.Process.ComponentPortOffset; offset != 0 {
 		for _, basePort := range []int{18428, 19428, 20428, 21428, 22428} {

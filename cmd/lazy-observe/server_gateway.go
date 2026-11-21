@@ -18,6 +18,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/gateway"
 	"github.com/eimsound/lazy-observe/internal/management"
+	"github.com/eimsound/lazy-observe/internal/otlpgrpc"
 	"github.com/eimsound/lazy-observe/internal/symbolicate"
 )
 
@@ -67,6 +68,94 @@ func (m *managedPublicListener) Close() error {
 	return listener.Close()
 }
 
+type managedOTLPGRPCListener struct {
+	listener  net.Listener
+	tlsConfig *tls.Config
+}
+
+func openOTLPGRPCListener(cfg appconfig.Config, logger *slog.Logger) (*managedOTLPGRPCListener, error) {
+	if !cfg.OTLPGRPC.Enabled {
+		return nil, nil
+	}
+	listener, err := net.Listen("tcp", cfg.OTLPGRPC.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("listen otlp grpc: %w", err)
+	}
+	tlsConfig, err := gatewayTLSConfig(cfg)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("configure otlp grpc TLS: %w", err)
+	}
+	if tlsConfig != nil && logger != nil {
+		logger.Info("OTLP/gRPC TLS termination enabled", "cert", cfg.Security.TLSCert)
+	}
+	return &managedOTLPGRPCListener{listener: listener, tlsConfig: tlsConfig}, nil
+}
+
+func (m *managedOTLPGRPCListener) take() (net.Listener, *tls.Config) {
+	if m == nil {
+		return nil, nil
+	}
+	listener := m.listener
+	tlsConfig := m.tlsConfig
+	m.listener = nil
+	m.tlsConfig = nil
+	return listener, tlsConfig
+}
+
+func (m *managedOTLPGRPCListener) Port() int {
+	if m == nil || m.listener == nil {
+		return 0
+	}
+	if tcpAddr, ok := m.listener.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
+		return tcpAddr.Port
+	}
+	return explicitListenPort(m.listener.Addr().String())
+}
+
+func (m *managedOTLPGRPCListener) Close() error {
+	if m == nil || m.listener == nil {
+		return nil
+	}
+	listener := m.listener
+	m.listener = nil
+	return listener.Close()
+}
+
+type compositeGatewayLifecycle struct {
+	httpGateway serverGatewayLifecycle
+	otlpGRPC    *otlpgrpc.Server
+	drainLimit  time.Duration
+}
+
+func (c *compositeGatewayLifecycle) BeginDrain() {
+	if c.httpGateway != nil {
+		c.httpGateway.BeginDrain()
+	}
+}
+
+func (c *compositeGatewayLifecycle) Drain(ctx context.Context) error {
+	var grpcErr error
+	if c.otlpGRPC != nil {
+		grpcErr = c.otlpGRPC.Shutdown(ctx)
+	}
+	var httpErr error
+	if c.httpGateway != nil {
+		httpErr = c.httpGateway.Drain(ctx)
+	}
+	return errors.Join(grpcErr, httpErr)
+}
+
+func (c *compositeGatewayLifecycle) Shutdown() error {
+	timeout := c.drainLimit
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.Drain(ctx)
+}
+
 func startGateway(
 	cfg appconfig.Config,
 	logger *slog.Logger,
@@ -78,6 +167,8 @@ func startGateway(
 	services *serverServices,
 	loopback *internalLoopback,
 	publicListener *managedPublicListener,
+	otlpGRPCListener *managedOTLPGRPCListener,
+	cleanups *cleanupStack,
 ) (*runningServerGateway, error) {
 	readiness := serverReadiness(cfg, shared, metadata, signals)
 	var sessionAdapter account.Sessions
@@ -165,14 +256,60 @@ func startGateway(
 			return nil, err
 		}
 	}
-	serverErr := make(chan error, 2)
+	var grpcServer *otlpgrpc.Server
+	var grpcAddr string
+	var grpcTLS bool
+	grpcListener, grpcTLSConfig := otlpGRPCListener.take()
+	if grpcListener != nil {
+		grpcServer, err = otlpgrpc.NewServer(otlpgrpc.Config{
+			Auth:           gw.IngestAuthenticator(),
+			Storage:        signals.backend,
+			TLSConfig:      grpcTLSConfig,
+			MaxRecvMsgSize: cfg.OTLPGRPC.MaxRecvBytes,
+			DrainTimeout:   cfg.Process.DrainTimeout.Value(),
+			Logger:         logger,
+		})
+		if err != nil {
+			_ = grpcListener.Close()
+			_ = listener.Close()
+			_ = errorTracker.Close(context.Background())
+			return nil, fmt.Errorf("initialize OTLP/gRPC server: %w", err)
+		}
+		grpcAddr = grpcListener.Addr().String()
+		grpcTLS = grpcTLSConfig != nil
+		if cleanups != nil {
+			drainTimeout := cfg.Process.DrainTimeout.Value()
+			cleanups.Push("otlp-grpc-server", func() error {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+				defer cancel()
+				return grpcServer.Shutdown(shutdownCtx)
+			})
+		}
+	}
+
+	serverErr := make(chan error, 3)
 	go func() { serverErr <- gw.Serve(listener) }()
 	if internal := loopback.take(); internal != nil {
 		go func() { serverErr <- gw.Serve(internal) }()
 	}
+	if grpcServer != nil {
+		go func() {
+			if serveErr := grpcServer.Serve(grpcListener); serveErr != nil {
+				serverErr <- fmt.Errorf("otlp grpc server: %w", serveErr)
+			}
+		}()
+	}
 	gw.MarkReady()
-	logGatewayReady(cfg, logger)
-	return &runningServerGateway{gateway: gw, errors: serverErr}, nil
+	logGatewayReady(cfg, logger, grpcAddr, grpcTLS)
+	lifecycle := serverGatewayLifecycle(gw)
+	if grpcServer != nil {
+		lifecycle = &compositeGatewayLifecycle{
+			httpGateway: gw,
+			otlpGRPC:    grpcServer,
+			drainLimit:  cfg.Process.DrainTimeout.Value(),
+		}
+	}
+	return &runningServerGateway{gateway: lifecycle, errors: serverErr}, nil
 }
 
 func effectiveSecureSessionCookie(cfg appconfig.Config) bool {
@@ -200,31 +337,41 @@ func serverReadiness(
 	return readiness
 }
 
+func gatewayTLSConfig(cfg appconfig.Config) (*tls.Config, error) {
+	if cfg.Security.TLSCert == "" && cfg.Security.TLSKey == "" {
+		return nil, nil
+	}
+	if cfg.Security.TLSCert == "" || cfg.Security.TLSKey == "" {
+		return nil, errors.New("tls-cert and tls-key must be set together")
+	}
+	certificate, err := tls.LoadX509KeyPair(cfg.Security.TLSCert, cfg.Security.TLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS certificate: %w", err)
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{certificate},
+	}, nil
+}
+
 func gatewayListener(cfg appconfig.Config, logger *slog.Logger) (net.Listener, error) {
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("listen gateway: %w", err)
 	}
-	if cfg.Security.TLSCert == "" && cfg.Security.TLSKey == "" {
-		return listener, nil
-	}
-	if cfg.Security.TLSCert == "" || cfg.Security.TLSKey == "" {
-		_ = listener.Close()
-		return nil, errors.New("tls-cert and tls-key must be set together")
-	}
-	certificate, err := tls.LoadX509KeyPair(cfg.Security.TLSCert, cfg.Security.TLSKey)
+	tlsConfig, err := gatewayTLSConfig(cfg)
 	if err != nil {
 		_ = listener.Close()
-		return nil, fmt.Errorf("load TLS certificate: %w", err)
+		return nil, err
+	}
+	if tlsConfig == nil {
+		return listener, nil
 	}
 	logger.Info("TLS termination enabled", "cert", cfg.Security.TLSCert)
-	return tls.NewListener(listener, &tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{certificate},
-	}), nil
+	return tls.NewListener(listener, tlsConfig), nil
 }
 
-func logGatewayReady(cfg appconfig.Config, logger *slog.Logger) {
+func logGatewayReady(cfg appconfig.Config, logger *slog.Logger, otlpGRPCAddr string, otlpGRPCTLS bool) {
 	logger.Info(
 		"gateway listening",
 		"address",
@@ -236,6 +383,9 @@ func logGatewayReady(cfg appconfig.Config, logger *slog.Logger) {
 		"metrics_kind",
 		cfg.Storage.Metrics.Kind,
 	)
+	if otlpGRPCAddr != "" {
+		logger.Info("otlp grpc listening", "address", otlpGRPCAddr, "tls", otlpGRPCTLS)
+	}
 	if cfg.ServeWebUI {
 		logger.Info("web UI ready", "url", "http://"+loopbackAddress(cfg.Listen))
 	} else {
@@ -385,13 +535,20 @@ func loopbackAddress(listen string) string {
 }
 
 func listenPort(listen string) int {
+	if port := explicitListenPort(listen); port > 0 {
+		return port
+	}
+	return 3100
+}
+
+func explicitListenPort(listen string) int {
 	_, raw, err := net.SplitHostPort(listen)
 	if err != nil {
-		return 3100
+		return 0
 	}
 	port, err := net.LookupPort("tcp", raw)
-	if err != nil {
-		return 3100
+	if err != nil || port <= 0 {
+		return 0
 	}
 	return port
 }

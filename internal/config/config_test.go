@@ -852,3 +852,63 @@ storage:
 		t.Fatal("non-http logs.query_url should fail validation")
 	}
 }
+
+func TestOTLPGRPCDefaultsPrecedenceAndValidation(t *testing.T) {
+	def := Defaults().OTLPGRPC
+	if def.Enabled || def.Listen != ":4317" || def.MaxRecvBytes != 52<<20 {
+		t.Fatalf("unexpected OTLP/gRPC defaults: %+v", def)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	yamlData := "otlp_grpc:\n  enabled: true\n  listen: 127.0.0.1:14317\n  max_recv_bytes: 1048576\n"
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{
+		"LO_OTLP_GRPC_LISTEN":         "127.0.0.1:24317",
+		"LO_OTLP_GRPC_MAX_RECV_BYTES": "2097152",
+	}
+	cfg, _, err := Load(
+		[]string{"--config", path, "--otlp-grpc-listen", "127.0.0.1:34317"},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatalf("Load OTLP/gRPC precedence: %v", err)
+	}
+	if !cfg.OTLPGRPC.Enabled || cfg.OTLPGRPC.Listen != "127.0.0.1:34317" || cfg.OTLPGRPC.MaxRecvBytes != 2097152 {
+		t.Fatalf("unexpected OTLP/gRPC precedence result: %+v", cfg.OTLPGRPC)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "enabled with empty listen",
+			mutate: func(c *Config) {
+				c.OTLPGRPC.Enabled = true
+				c.OTLPGRPC.Listen = ""
+			},
+		},
+		{
+			name: "invalid listen address",
+			mutate: func(c *Config) {
+				c.OTLPGRPC.Listen = "not-a-host-port"
+			},
+		},
+		{
+			name: "non-positive max_recv_bytes",
+			mutate: func(c *Config) {
+				c.OTLPGRPC.MaxRecvBytes = 0
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			invalid := Defaults()
+			tc.mutate(&invalid)
+			if err := invalid.Validate(); err == nil {
+				t.Fatalf("invalid OTLP/gRPC config accepted: %+v", invalid.OTLPGRPC)
+			}
+		})
+	}
+}

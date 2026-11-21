@@ -72,6 +72,28 @@ func TestRunServerFailsFastOnPortConflictWithoutTouchingDataDir(t *testing.T) {
 	}
 }
 
+func TestRunServerFailsFastOnOTLPGRPCPortConflictWithoutTouchingDataDir(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	dataDir := filepath.Join(t.TempDir(), "untouched-otlp-data")
+	cfg := appconfig.Defaults()
+	cfg.Listen = "127.0.0.1:0"
+	cfg.OTLPGRPC.Enabled = true
+	cfg.OTLPGRPC.Listen = occupied.Addr().String()
+	cfg.DataDir = dataDir
+
+	if err := runServer(cfg); err == nil || !strings.Contains(err.Error(), "listen otlp grpc") {
+		t.Fatalf("runServer OTLP/gRPC port conflict err=%v want listen otlp grpc failure", err)
+	}
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("runServer touched data_dir despite OTLP/gRPC port conflict: err=%v", err)
+	}
+}
+
 func TestDoctorIsStrictlyReadOnly(t *testing.T) {
 	t.Run("nonexistent data dir is not created", func(t *testing.T) {
 		dataDir := filepath.Join(t.TempDir(), "never-created")
