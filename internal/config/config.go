@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eimsound/lazy-observe/internal/ingestlimit"
 	"github.com/eimsound/lazy-observe/internal/outbound"
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v3"
@@ -52,26 +54,28 @@ const (
 )
 
 type Config struct {
-	Listen         string         `yaml:"listen"`
-	OTLPGRPC       OTLPGRPC       `yaml:"otlp_grpc"`
-	DataDir        string         `yaml:"data_dir"`
-	ServeWebUI     bool           `yaml:"serve_web_ui"`
-	Topology       string         `yaml:"topology"`
-	Standalone     bool           `yaml:"standalone"`
-	StorageBinDir  string         `yaml:"storage_bin_dir"`
-	Storage        Storage        `yaml:"storage"`
-	Meta           Meta           `yaml:"meta"`
-	Redis          Redis          `yaml:"redis"`
-	Retention      Retention      `yaml:"retention"`
-	Replay         Replay         `yaml:"replay"`
-	Blob           Blob           `yaml:"blob"`
-	Alert          Alert          `yaml:"alert"`
-	Scrape         Scrape         `yaml:"scrape"`
-	AI             AI             `yaml:"ai"`
-	ErrorInbox     ErrorInbox     `yaml:"error_inbox"`
-	Process        Process        `yaml:"process"`
-	Security       Security       `yaml:"security"`
-	SelfMonitoring SelfMonitoring `yaml:"self_monitoring"`
+	Listen          string          `yaml:"listen"`
+	OTLPGRPC        OTLPGRPC        `yaml:"otlp_grpc"`
+	IngestRateLimit IngestRateLimit `yaml:"ingest_rate_limit"`
+	MetricsEndpoint MetricsEndpoint `yaml:"metrics_endpoint"`
+	DataDir         string          `yaml:"data_dir"`
+	ServeWebUI      bool            `yaml:"serve_web_ui"`
+	Topology        string          `yaml:"topology"`
+	Standalone      bool            `yaml:"standalone"`
+	StorageBinDir   string          `yaml:"storage_bin_dir"`
+	Storage         Storage         `yaml:"storage"`
+	Meta            Meta            `yaml:"meta"`
+	Redis           Redis           `yaml:"redis"`
+	Retention       Retention       `yaml:"retention"`
+	Replay          Replay          `yaml:"replay"`
+	Blob            Blob            `yaml:"blob"`
+	Alert           Alert           `yaml:"alert"`
+	Scrape          Scrape          `yaml:"scrape"`
+	AI              AI              `yaml:"ai"`
+	ErrorInbox      ErrorInbox      `yaml:"error_inbox"`
+	Process         Process         `yaml:"process"`
+	Security        Security        `yaml:"security"`
+	SelfMonitoring  SelfMonitoring  `yaml:"self_monitoring"`
 }
 
 // OTLPGRPC configures the native OTLP/gRPC ingest listener (Traces, Metrics,
@@ -81,6 +85,31 @@ type OTLPGRPC struct {
 	Enabled      bool   `yaml:"enabled"`
 	Listen       string `yaml:"listen"`
 	MaxRecvBytes int    `yaml:"max_recv_bytes"`
+}
+
+// IngestRateLimit configures unified per-project token-bucket rate limiting
+// across HTTP and OTLP/gRPC telemetry ingest endpoints.
+type IngestRateLimit struct {
+	Enabled            bool    `yaml:"enabled"`
+	RequestsPerSecond  float64 `yaml:"requests_per_second"`
+	Burst              int     `yaml:"burst"`
+	BytesPerSecond     int64   `yaml:"bytes_per_second"`
+	MaxTrackedProjects int     `yaml:"max_tracked_projects"`
+}
+
+// MetricsEndpoint configures the Prometheus-format self-observability /metrics
+// endpoint on the HTTP gateway.
+type MetricsEndpoint struct {
+	// Enabled exposes GET /metrics in Prometheus text exposition format 0.0.4.
+	Enabled bool `yaml:"enabled"`
+	// BearerToken optionally authenticates scrapers using a dedicated
+	// Authorization: Bearer <token> credential (checked in constant time).
+	// When empty, GET /metrics requires an admin session or user API token
+	// unless AllowUnauthenticated is explicitly true.
+	BearerToken string `yaml:"bearer_token"`
+	// AllowUnauthenticated allows scraping GET /metrics without credentials.
+	// Cannot be combined with BearerToken.
+	AllowUnauthenticated bool `yaml:"allow_unauthenticated"`
 }
 
 // Security groups browser-facing hardening controls.
@@ -241,6 +270,18 @@ func Defaults() Config {
 			Listen:       ":4317",
 			MaxRecvBytes: 52 << 20,
 		},
+		IngestRateLimit: IngestRateLimit{
+			Enabled:            false,
+			RequestsPerSecond:  ingestlimit.DefaultRequestsPerSecond,
+			Burst:              ingestlimit.DefaultBurst,
+			BytesPerSecond:     0,
+			MaxTrackedProjects: ingestlimit.DefaultMaxTrackedProjects,
+		},
+		MetricsEndpoint: MetricsEndpoint{
+			Enabled:              false,
+			BearerToken:          "",
+			AllowUnauthenticated: false,
+		},
 		Meta:    Meta{MigrationLockTimeout: Duration(time.Minute)},
 		Redis:   Redis{Addr: "127.0.0.1:6379", KeyPrefix: "lazy-observe"},
 		Storage: Storage{Metrics: Metrics{Kind: "vm"}},
@@ -364,6 +405,54 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 		"otlp-grpc-max-recv-bytes",
 		cfg.OTLPGRPC.MaxRecvBytes,
 		"maximum decoded OTLP/gRPC request message size in bytes",
+	)
+	fs.BoolVar(
+		&cfg.IngestRateLimit.Enabled,
+		"ingest-rate-limit-enabled",
+		cfg.IngestRateLimit.Enabled,
+		"enable unified per-project token-bucket ingest rate limiting across HTTP and OTLP/gRPC",
+	)
+	fs.Float64Var(
+		&cfg.IngestRateLimit.RequestsPerSecond,
+		"ingest-rate-limit-requests-per-second",
+		cfg.IngestRateLimit.RequestsPerSecond,
+		"steady-state per-project ingest request rate limit (requests per second)",
+	)
+	fs.IntVar(
+		&cfg.IngestRateLimit.Burst,
+		"ingest-rate-limit-burst",
+		cfg.IngestRateLimit.Burst,
+		"per-project ingest request token-bucket burst capacity",
+	)
+	fs.Int64Var(
+		&cfg.IngestRateLimit.BytesPerSecond,
+		"ingest-rate-limit-bytes-per-second",
+		cfg.IngestRateLimit.BytesPerSecond,
+		"optional per-project ingest byte rate limit in bytes per second (0 disables byte limiting)",
+	)
+	fs.IntVar(
+		&cfg.IngestRateLimit.MaxTrackedProjects,
+		"ingest-rate-limit-max-tracked-projects",
+		cfg.IngestRateLimit.MaxTrackedProjects,
+		"maximum number of projects tracked concurrently by the in-memory ingest rate limiter",
+	)
+	fs.BoolVar(
+		&cfg.MetricsEndpoint.Enabled,
+		"metrics-endpoint-enabled",
+		cfg.MetricsEndpoint.Enabled,
+		"expose the gateway Prometheus self-observability /metrics endpoint",
+	)
+	fs.StringVar(
+		&cfg.MetricsEndpoint.BearerToken,
+		"metrics-endpoint-bearer-token",
+		cfg.MetricsEndpoint.BearerToken,
+		"optional static Bearer token required to scrape GET /metrics",
+	)
+	fs.BoolVar(
+		&cfg.MetricsEndpoint.AllowUnauthenticated,
+		"metrics-endpoint-allow-unauthenticated",
+		cfg.MetricsEndpoint.AllowUnauthenticated,
+		"allow scraping GET /metrics without authentication when bearer_token is unset",
 	)
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "root data directory")
 	fs.BoolVar(&cfg.ServeWebUI, "serve-web-ui", cfg.ServeWebUI, "serve the embedded web UI from the gateway")
@@ -591,17 +680,18 @@ func configFlag(args []string) (string, error) {
 
 func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 	stringsMap := map[string]*string{
-		"LO_LISTEN":           &c.Listen,
-		"LO_OTLP_GRPC_LISTEN": &c.OTLPGRPC.Listen,
-		"LO_DATA_DIR":         &c.DataDir,
-		"LO_TOPOLOGY":         &c.Topology,
-		"LO_STORAGE_BIN_DIR":  &c.StorageBinDir,
-		"LO_META_DB_URL":      &c.Meta.DBURL,
-		"LO_REDIS_ADDR":       &c.Redis.Addr,
-		"LO_REDIS_PASSWORD":   &c.Redis.Password,
-		"LO_REDIS_KEY_PREFIX": &c.Redis.KeyPrefix,
-		"LO_SCRAPE_MODE":      &c.Scrape.Mode,
-		"LO_AI_PRICING_FILE":  &c.AI.PricingFile,
+		"LO_LISTEN":                        &c.Listen,
+		"LO_OTLP_GRPC_LISTEN":              &c.OTLPGRPC.Listen,
+		"LO_METRICS_ENDPOINT_BEARER_TOKEN": &c.MetricsEndpoint.BearerToken,
+		"LO_DATA_DIR":                      &c.DataDir,
+		"LO_TOPOLOGY":                      &c.Topology,
+		"LO_STORAGE_BIN_DIR":               &c.StorageBinDir,
+		"LO_META_DB_URL":                   &c.Meta.DBURL,
+		"LO_REDIS_ADDR":                    &c.Redis.Addr,
+		"LO_REDIS_PASSWORD":                &c.Redis.Password,
+		"LO_REDIS_KEY_PREFIX":              &c.Redis.KeyPrefix,
+		"LO_SCRAPE_MODE":                   &c.Scrape.Mode,
+		"LO_AI_PRICING_FILE":               &c.AI.PricingFile,
 		// Paths, not the secrets: the key material itself never travels via env.
 		"LO_SECURITY_SECRET_KEY_FILE":     &c.Security.SecretKeyFile,
 		"LO_SECURITY_ADMIN_PASSWORD_FILE": &c.Security.AdminPasswordFile,
@@ -654,11 +744,14 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		c.Standalone = parsed
 	}
 	for name, dst := range map[string]*bool{
-		"LO_OTLP_GRPC_ENABLED":              &c.OTLPGRPC.Enabled,
-		"LO_SERVE_WEB_UI":                   &c.ServeWebUI,
-		"LO_STORAGE_METRICS_CLUSTER":        &c.Storage.Metrics.Cluster,
-		"LO_SECURITY_CSRF":                  &c.Security.CSRF,
-		"LO_SECURITY_SESSION_SECURE_COOKIE": &c.Security.SessionSecureCookie,
+		"LO_OTLP_GRPC_ENABLED":                      &c.OTLPGRPC.Enabled,
+		"LO_INGEST_RATE_LIMIT_ENABLED":              &c.IngestRateLimit.Enabled,
+		"LO_METRICS_ENDPOINT_ENABLED":               &c.MetricsEndpoint.Enabled,
+		"LO_METRICS_ENDPOINT_ALLOW_UNAUTHENTICATED": &c.MetricsEndpoint.AllowUnauthenticated,
+		"LO_SERVE_WEB_UI":                           &c.ServeWebUI,
+		"LO_STORAGE_METRICS_CLUSTER":                &c.Storage.Metrics.Cluster,
+		"LO_SECURITY_CSRF":                          &c.Security.CSRF,
+		"LO_SECURITY_SESSION_SECURE_COOKIE":         &c.Security.SessionSecureCookie,
 	} {
 		if v, ok := lookup(name); ok {
 			parsed, err := strconv.ParseBool(v)
@@ -681,6 +774,32 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 			return fmt.Errorf("parse LO_OTLP_GRPC_MAX_RECV_BYTES: %w", err)
 		}
 		c.OTLPGRPC.MaxRecvBytes = parsed
+	}
+	if v, ok := lookup("LO_INGEST_RATE_LIMIT_REQUESTS_PER_SECOND"); ok {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("parse LO_INGEST_RATE_LIMIT_REQUESTS_PER_SECOND: %w", err)
+		}
+		c.IngestRateLimit.RequestsPerSecond = parsed
+	}
+	for name, dst := range map[string]*int{
+		"LO_INGEST_RATE_LIMIT_BURST":                &c.IngestRateLimit.Burst,
+		"LO_INGEST_RATE_LIMIT_MAX_TRACKED_PROJECTS": &c.IngestRateLimit.MaxTrackedProjects,
+	} {
+		if v, ok := lookup(name); ok {
+			parsed, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("parse %s: %w", name, err)
+			}
+			*dst = parsed
+		}
+	}
+	if v, ok := lookup("LO_INGEST_RATE_LIMIT_BYTES_PER_SECOND"); ok {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse LO_INGEST_RATE_LIMIT_BYTES_PER_SECOND: %w", err)
+		}
+		c.IngestRateLimit.BytesPerSecond = parsed
 	}
 	if v, ok := lookup("LO_REDIS_DB"); ok {
 		parsed, err := strconv.Atoi(v)
@@ -885,6 +1004,28 @@ func (c Config) Validate() error {
 	}
 	if c.OTLPGRPC.MaxRecvBytes <= 0 {
 		return errors.New("otlp_grpc.max_recv_bytes must be positive")
+	}
+	if math.IsNaN(c.IngestRateLimit.RequestsPerSecond) ||
+		math.IsInf(c.IngestRateLimit.RequestsPerSecond, 0) ||
+		c.IngestRateLimit.RequestsPerSecond <= 0 {
+		return errors.New("ingest_rate_limit.requests_per_second must be a positive finite number")
+	}
+	if c.IngestRateLimit.Burst <= 0 {
+		return errors.New("ingest_rate_limit.burst must be positive")
+	}
+	if c.IngestRateLimit.BytesPerSecond < 0 {
+		return errors.New("ingest_rate_limit.bytes_per_second must not be negative")
+	}
+	if c.IngestRateLimit.MaxTrackedProjects <= 0 {
+		return errors.New("ingest_rate_limit.max_tracked_projects must be positive")
+	}
+	if strings.ContainsAny(c.MetricsEndpoint.BearerToken, " \t\r\n") {
+		return errors.New("metrics_endpoint.bearer_token must not contain whitespace")
+	}
+	if c.MetricsEndpoint.AllowUnauthenticated && strings.TrimSpace(c.MetricsEndpoint.BearerToken) != "" {
+		return errors.New(
+			"metrics_endpoint.allow_unauthenticated cannot be true when metrics_endpoint.bearer_token is set",
+		)
 	}
 	switch c.Topology {
 	case "", TopologyAllInOne, TopologyStandalone, TopologyHA:

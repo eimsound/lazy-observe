@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"math"
+
 	"github.com/spf13/pflag"
 )
 
@@ -944,5 +946,96 @@ func TestOTLPGRPCDefaultsPrecedenceAndValidation(t *testing.T) {
 		if err := valid.Validate(); err != nil {
 			t.Fatalf("valid OTLP/gRPC listen %q rejected: %v", addr, err)
 		}
+	}
+}
+
+func TestIngestRateLimitAndMetricsEndpointPrecedenceAndValidation(t *testing.T) {
+	def := Defaults()
+	if def.IngestRateLimit.Enabled ||
+		def.IngestRateLimit.RequestsPerSecond != 500 ||
+		def.IngestRateLimit.Burst != 1000 ||
+		def.IngestRateLimit.BytesPerSecond != 0 ||
+		def.IngestRateLimit.MaxTrackedProjects != 4096 {
+		t.Fatalf("unexpected IngestRateLimit defaults: %+v", def.IngestRateLimit)
+	}
+	if def.MetricsEndpoint.Enabled ||
+		def.MetricsEndpoint.BearerToken != "" ||
+		def.MetricsEndpoint.AllowUnauthenticated {
+		t.Fatalf("unexpected MetricsEndpoint defaults: %+v", def.MetricsEndpoint)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	yamlData := `ingest_rate_limit:
+  enabled: true
+  requests_per_second: 120.5
+  burst: 250
+  bytes_per_second: 1048576
+  max_tracked_projects: 128
+metrics_endpoint:
+  enabled: true
+  bearer_token: file-scrape-token
+`
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{
+		"LO_INGEST_RATE_LIMIT_REQUESTS_PER_SECOND": "200.25",
+		"LO_INGEST_RATE_LIMIT_BURST":               "400",
+		"LO_METRICS_ENDPOINT_BEARER_TOKEN":         "env-scrape-token",
+	}
+	cfg, _, err := Load(
+		[]string{
+			"--config", path,
+			"--ingest-rate-limit-burst", "600",
+			"--metrics-endpoint-bearer-token", "flag-scrape-token",
+		},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatalf("Load precedence failed: %v", err)
+	}
+	if !cfg.IngestRateLimit.Enabled ||
+		cfg.IngestRateLimit.RequestsPerSecond != 200.25 ||
+		cfg.IngestRateLimit.Burst != 600 ||
+		cfg.IngestRateLimit.BytesPerSecond != 1048576 ||
+		cfg.IngestRateLimit.MaxTrackedProjects != 128 {
+		t.Fatalf("unexpected IngestRateLimit precedence: %+v", cfg.IngestRateLimit)
+	}
+	if !cfg.MetricsEndpoint.Enabled || cfg.MetricsEndpoint.BearerToken != "flag-scrape-token" {
+		t.Fatalf("unexpected MetricsEndpoint precedence: %+v", cfg.MetricsEndpoint)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "zero rps", mutate: func(c *Config) { c.IngestRateLimit.RequestsPerSecond = 0 }},
+		{name: "negative rps", mutate: func(c *Config) { c.IngestRateLimit.RequestsPerSecond = -5 }},
+		{name: "NaN rps", mutate: func(c *Config) { c.IngestRateLimit.RequestsPerSecond = math.NaN() }},
+		{name: "Inf rps", mutate: func(c *Config) { c.IngestRateLimit.RequestsPerSecond = math.Inf(1) }},
+		{name: "neg Inf rps", mutate: func(c *Config) { c.IngestRateLimit.RequestsPerSecond = math.Inf(-1) }},
+		{name: "zero burst", mutate: func(c *Config) { c.IngestRateLimit.Burst = 0 }},
+		{name: "negative bytes_per_second", mutate: func(c *Config) { c.IngestRateLimit.BytesPerSecond = -1 }},
+		{name: "zero max_tracked_projects", mutate: func(c *Config) { c.IngestRateLimit.MaxTrackedProjects = 0 }},
+		{
+			name:   "metrics bearer token with whitespace",
+			mutate: func(c *Config) { c.MetricsEndpoint.BearerToken = "bad token" },
+		},
+		{
+			name: "metrics bearer token conflicts with allow_unauthenticated",
+			mutate: func(c *Config) {
+				c.MetricsEndpoint.Enabled = true
+				c.MetricsEndpoint.BearerToken = "scrape-secret"
+				c.MetricsEndpoint.AllowUnauthenticated = true
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			invalid := Defaults()
+			tc.mutate(&invalid)
+			if err := invalid.Validate(); err == nil {
+				t.Fatalf("expected validation failure for %s", tc.name)
+			}
+		})
 	}
 }
