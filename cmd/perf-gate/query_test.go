@@ -305,12 +305,51 @@ func TestMeasureQueryEndpointValidatesEveryResponse(t *testing.T) {
 		1,
 		3,
 		1000,
+		1500,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if served.Load() != 4 || validated.Load() != 4 || result.Failures != 1 || result.GatePassed {
 		t.Fatalf("served=%d validated=%d result=%#v", served.Load(), validated.Load(), result)
+	}
+}
+
+func TestMeasureQueryEndpointRejectsP99OverBudget(t *testing.T) {
+	var served atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if served.Add(1) == 20 {
+			time.Sleep(25 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, validIssueListFixture)
+	}))
+	defer server.Close()
+
+	target := queryTarget{
+		name:     "issues",
+		path:     "/api/v1/issues",
+		validate: validateIssueListResponse(42, 1, 1),
+	}
+	result, err := measureQueryEndpoint(
+		context.Background(),
+		server.Client(),
+		server.URL,
+		testReadAuth,
+		target,
+		0,
+		20,
+		20,
+		20,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Latency.P95MS >= 20 {
+		t.Fatalf("expected p95 below 20ms so only p99 fails: %#v", result.Latency)
+	}
+	if result.Latency.P99MS < 20 || result.GatePassed {
+		t.Fatalf("p99 over budget must fail endpoint gate: %#v", result)
 	}
 }
 
@@ -324,6 +363,7 @@ func TestMeasureQueryEndpointRejectsMissingValidator(t *testing.T) {
 		0,
 		1,
 		1000,
+		1500,
 	)
 	if err == nil || !strings.Contains(err.Error(), "no response contract validator") {
 		t.Fatalf("missing-validator error = %v", err)
@@ -350,6 +390,7 @@ func TestMeasureQueryEndpointIncludesValidationLatency(t *testing.T) {
 		0,
 		2,
 		1000,
+		1500,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -370,7 +411,7 @@ func TestWarmupContractErrorDoesNotLeakToken(t *testing.T) {
 	auth := readCredential{token: token, project: "default"}
 	_, err := measureQueryEndpoint(context.Background(), server.Client(), server.URL, auth, queryTarget{
 		name: "issues", path: "/api/v1/issues", validate: validateIssueListResponse(42, 1, 1),
-	}, 1, 1, 1000)
+	}, 1, 1, 1000, 1500)
 	if err == nil {
 		t.Fatal("invalid warmup response passed")
 	}

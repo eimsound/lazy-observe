@@ -22,10 +22,18 @@ func TestRepositoryGateConfig(t *testing.T) {
 	}
 	if cfg.Release.MaxBinaryBytes != 150_000_000 || cfg.Release.MaxIdleRSSBytes != 500*1024*1024 ||
 		cfg.Query.MaxP95MS["trace"] != 1000 ||
+		cfg.Query.MaxP99MS["issues"] != 1500 ||
+		cfg.Query.MaxP99MS["logs"] != 1500 ||
+		cfg.Query.MaxP99MS["trace"] != 1500 ||
 		cfg.Query.MediumFixture.Issues != 10_000 ||
 		cfg.Query.MediumFixture.Logs != 100_000 ||
 		cfg.Query.MediumFixture.Traces != 10_000 {
 		t.Fatalf("unexpected release/query budgets: %#v", cfg)
+	}
+	invalidP99 := cfg
+	invalidP99.Query.MaxP99MS = map[string]float64{"issues": 900, "logs": 1500, "trace": 1500}
+	if err := invalidP99.validate(); err == nil || !strings.Contains(err.Error(), "max_p99_ms.issues") {
+		t.Fatalf("max_p99_ms below max_p95_ms validation error = %v", err)
 	}
 	if cfg.HAScaling.MinReplicaEfficiency != 0.68 || cfg.HAScaling.MinPassingRoundRatio != 0.75 ||
 		cfg.HAScaling.MinTargetBalanceRatio != 0.7 ||

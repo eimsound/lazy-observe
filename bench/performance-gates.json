@@ -16,6 +16,11 @@
       "issues": 1000,
       "logs": 1000,
       "trace": 1000
+    },
+    "max_p99_ms": {
+      "issues": 1500,
+      "logs": 1500,
+      "trace": 1500
     }
   },
   "ha_scaling": {
