@@ -32,6 +32,7 @@ type queryEndpointResult struct {
 	Failures   int            `json:"failures"`
 	Latency    latencySummary `json:"latency"`
 	MaxP95MS   float64        `json:"max_p95_ms"`
+	MaxP99MS   float64        `json:"max_p99_ms"`
 	GatePassed bool           `json:"gate_passed"`
 }
 
@@ -236,6 +237,7 @@ func runQueryGate(args []string) error {
 			warmup,
 			requests,
 			cfg.Query.MaxP95MS[target.name],
+			cfg.Query.MaxP99MS[target.name],
 		)
 		if endpointErr != nil {
 			return fmt.Errorf("measure %s query: %w", target.name, endpointErr)
@@ -258,6 +260,17 @@ func runQueryGate(args []string) error {
 				),
 			)
 		}
+		if endpoint.Latency.P99MS >= endpoint.MaxP99MS {
+			result.GateFailures = append(
+				result.GateFailures,
+				fmt.Sprintf(
+					"%s query p99 %.3fms is not below %.3fms",
+					target.name,
+					endpoint.Latency.P99MS,
+					endpoint.MaxP99MS,
+				),
+			)
+		}
 	}
 	result.GatePassed = len(result.GateFailures) == 0
 	if err := writeResult(*output, result); err != nil {
@@ -268,10 +281,12 @@ func runQueryGate(args []string) error {
 	}
 	for _, endpoint := range result.Endpoints {
 		fmt.Printf(
-			"PASS: %s query p95 %.3fms (< %.3fms), %d measured requests\n",
+			"PASS: %s query p95 %.3fms (< %.3fms), p99 %.3fms (< %.3fms), %d measured requests\n",
 			endpoint.Name,
 			endpoint.Latency.P95MS,
 			endpoint.MaxP95MS,
+			endpoint.Latency.P99MS,
+			endpoint.MaxP99MS,
 			endpoint.Requests,
 		)
 	}
@@ -436,7 +451,7 @@ func measureQueryEndpoint(
 	auth readCredential,
 	target queryTarget,
 	warmup, requests int,
-	maxP95MS float64,
+	maxP95MS, maxP99MS float64,
 ) (queryEndpointResult, error) {
 	if target.validate == nil {
 		return queryEndpointResult{}, fmt.Errorf("query target %s has no response contract validator", target.name)
@@ -471,8 +486,8 @@ func measureQueryEndpoint(
 	summary := summarizeLatencies(latencies)
 	return queryEndpointResult{
 		Name: target.name, Path: target.path, Requests: requests, Failures: failures,
-		Latency: summary, MaxP95MS: maxP95MS,
-		GatePassed: failures == 0 && summary.P95MS < maxP95MS,
+		Latency: summary, MaxP95MS: maxP95MS, MaxP99MS: maxP99MS,
+		GatePassed: failures == 0 && summary.P95MS < maxP95MS && summary.P99MS < maxP99MS,
 	}, nil
 }
 
