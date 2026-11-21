@@ -353,7 +353,7 @@ jobs:
           merge-multiple: true
       - name: Verify checksums and assemble multi-platform OCI layout
         run: |
-          mise exec -- bash scripts/merge-oci-layouts.sh merge \
+          mise exec jq -- bash scripts/merge-oci-layouts.sh merge \
             --input-dir "${RUNNER_TEMP}/oci-artifacts" \
             --output-dir "${RUNNER_TEMP}/merged-oci" \
             --sbom-dir "${RUNNER_TEMP}/sbom-amd64"
@@ -377,7 +377,7 @@ jobs:
           IMAGE_VERSION: ${{ needs.build-meta.outputs.version }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          pushed_ref=$(mise exec -- crane push --index "${RUNNER_TEMP}/merged-oci" "${IMAGE_REPO}:${IMAGE_VERSION}")
+          pushed_ref=$(mise exec crane -- crane push --index "${RUNNER_TEMP}/merged-oci" "${IMAGE_REPO}:${IMAGE_VERSION}")
           digest=${pushed_ref##*@}
           if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
             printf 'unexpected pushed index digest: %s\n' "$pushed_ref" >&2
@@ -387,12 +387,12 @@ jobs:
             [[ -n $full_tag ]] || continue
             tag_name=${full_tag#"${IMAGE_REPO}:"}
             [[ $tag_name == "$IMAGE_VERSION" ]] && continue
-            mise exec -- crane tag "${IMAGE_REPO}@${digest}" "$tag_name"
+            mise exec crane -- crane tag "${IMAGE_REPO}@${digest}" "$tag_name"
           done <<<"$META_TAGS"
-          remote_index=$(mise exec -- crane manifest "${IMAGE_REPO}@${digest}")
+          remote_index=$(mise exec crane -- crane manifest "${IMAGE_REPO}@${digest}")
           for arch in amd64 arm64; do
             want=$(tr -d '[:space:]' <"${RUNNER_TEMP}/oci-artifacts/lazy-observe-linux-${arch}.digest")
-            got=$(mise exec -- jq -er --arg arch "$arch" \
+            got=$(mise exec jq -- jq -er --arg arch "$arch" \
               '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' \
               <<<"$remote_index")
             if [[ $got != "$want" ]]; then

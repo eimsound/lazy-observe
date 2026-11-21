@@ -59,7 +59,7 @@ jobs:
           MISE_CI_PROFILE: sdk-go
       - name: Verify and (on tag push) warm Go module proxy
         # PUBLISH_FLAG is intentionally unquoted: empty means dry run.
-        run: mise exec -- bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
+        run: mise exec go golangci-lint go:github.com/google/go-licenses/v2 -- bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
 
   npm:
     name: Release ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
@@ -93,7 +93,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Verify, build, and (on tag push) publish to npm
         # PUBLISH_FLAG is intentionally unquoted: empty means dry run.
-        run: mise exec -- bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
+        run: mise exec node pnpm -- bash sdk/scripts/sdk-publish.sh "$SDK_TAG" $PUBLISH_FLAG
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -130,7 +130,7 @@ jobs:
           MISE_CI_PROFILE: sdk-python
       - name: Verify and build
         # mise task 读 SDK_TAG / PUBLISH_FLAG（上面的 job env）；PUBLISH_FLAG 为空就是 dry run。
-        run: mise run sdk-python-release
+        run: mise run --skip-tools sdk-python-release
       - name: Upload Python distribution to PyPI
         if: github.event_name == 'push'
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
