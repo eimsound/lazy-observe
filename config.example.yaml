@@ -7,6 +7,26 @@ otlp_grpc:
   listen: ":4317"
   # Maximum decoded OTLP/gRPC request message size in bytes (default 52 MiB).
   max_recv_bytes: 54525952
+# Unified per-project token-bucket rate limiter shared by HTTP and OTLP/gRPC
+# telemetry ingest endpoints. Disabled by default so existing benchmarks and
+# self-hosted deployments stay unaffected until opted in.
+ingest_rate_limit:
+  enabled: false
+  requests_per_second: 500
+  burst: 1000
+  # Optional per-project byte throughput cap in bytes/sec (0 disables byte limiting).
+  bytes_per_second: 0
+  # Upper bound on concurrently tracked per-project buckets in memory.
+  max_tracked_projects: 4096
+# Prometheus text exposition (/metrics) for the gateway's own operational metrics.
+# Disabled by default. When enabled without bearer_token or allow_unauthenticated,
+# GET /metrics requires an authenticated admin session or admin user API token.
+metrics_endpoint:
+  enabled: false
+  # Optional static Authorization: Bearer <token> credential for scrapers.
+  bearer_token: ""
+  # Explicit opt-in for unauthenticated pod/private-network scraping (forbidden when bearer_token is set).
+  allow_unauthenticated: false
 data_dir: "./data"
 # Production defaults to serving the embedded UI. The repository development
 # launcher overrides this to false because Vite owns the development UI.
@@ -167,6 +187,11 @@ ai:
 
 # Environment names use LO_ and upper-case field paths. Common examples:
 # LO_LISTEN, LO_OTLP_GRPC_ENABLED, LO_OTLP_GRPC_LISTEN, LO_OTLP_GRPC_MAX_RECV_BYTES,
+# LO_INGEST_RATE_LIMIT_ENABLED, LO_INGEST_RATE_LIMIT_REQUESTS_PER_SECOND,
+# LO_INGEST_RATE_LIMIT_BURST, LO_INGEST_RATE_LIMIT_BYTES_PER_SECOND,
+# LO_INGEST_RATE_LIMIT_MAX_TRACKED_PROJECTS,
+# LO_METRICS_ENDPOINT_ENABLED, LO_METRICS_ENDPOINT_BEARER_TOKEN,
+# LO_METRICS_ENDPOINT_ALLOW_UNAUTHENTICATED,
 # LO_DATA_DIR, LO_META_DB_URL, LO_META_MIGRATION_LOCK_TIMEOUT,
 # LO_STANDALONE, LO_TOPOLOGY, LO_SCRAPE_MODE, LO_STORAGE_BIN_DIR, LO_AI_PRICING_FILE,
 # LO_REDIS_ENABLED, LO_REDIS_ADDR, LO_REDIS_PASSWORD, LO_REDIS_DB, LO_REDIS_KEY_PREFIX,

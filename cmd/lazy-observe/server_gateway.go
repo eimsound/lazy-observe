@@ -19,8 +19,10 @@ import (
 	appconfig "github.com/eimsound/lazy-observe/internal/config"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/gateway"
+	"github.com/eimsound/lazy-observe/internal/ingestlimit"
 	"github.com/eimsound/lazy-observe/internal/management"
 	"github.com/eimsound/lazy-observe/internal/otlpgrpc"
+	"github.com/eimsound/lazy-observe/internal/selfmetrics"
 	"github.com/eimsound/lazy-observe/internal/symbolicate"
 )
 
@@ -198,36 +200,54 @@ func startGateway(
 	if monitoring.client != nil {
 		meterProvider = monitoring.client.MeterProvider()
 	}
+	ingestLimiter := ingestlimit.New(ingestlimit.Config{
+		Enabled:            cfg.IngestRateLimit.Enabled,
+		RequestsPerSecond:  cfg.IngestRateLimit.RequestsPerSecond,
+		Burst:              cfg.IngestRateLimit.Burst,
+		BytesPerSecond:     cfg.IngestRateLimit.BytesPerSecond,
+		MaxTrackedProjects: cfg.IngestRateLimit.MaxTrackedProjects,
+	})
+	selfMetrics := selfmetrics.New(selfmetrics.Config{
+		Version: Version,
+		Commit:  Commit,
+	})
 	gw := gateway.New(
 		gateway.Config{
-			Tokens:                   metadata.store,
-			UploadTokens:             metadata.store,
-			Store:                    metadata.store,
-			Account:                  accounts,
-			Management:               management.New(metadata.store).WithSessions(sessionAdapter),
-			Health:                   combinedHealth{signals.supervisor, signals.backend},
-			Readiness:                readiness,
-			Storage:                  signals.backend,
-			Alerts:                   services.alerts,
-			Replays:                  metadata.store,
-			Issues:                   metadata.store,
-			SourceMaps:               metadata.store,
-			Profiles:                 metadata.store,
-			Notifications:            metadata.store,
-			Blobs:                    metadata.blobs,
-			Scrapes:                  services.scrapes,
-			ScrapeUnavailableReason:  services.scrapeUnavailableReason,
-			MCPBaseURL:               loopback.baseURL,
-			AISettingsStore:          metadata.store,
-			AISecretBox:              essentials.secretBox,
-			AIBuildClient:            ai.New,
-			AITimeout:                60 * time.Second,
-			OutboundPolicy:           essentials.outboundPolicy,
-			LLMPricing:               essentials.llmPricing,
-			DisableWebUI:             !cfg.ServeWebUI,
-			Instrumentation:          monitoring.instrumentation,
-			SelfMonitoringToken:      metadata.selfToken,
-			Limits:                   shared.limits,
+			Tokens:                  metadata.store,
+			UploadTokens:            metadata.store,
+			Store:                   metadata.store,
+			Account:                 accounts,
+			Management:              management.New(metadata.store).WithSessions(sessionAdapter),
+			Health:                  combinedHealth{signals.supervisor, signals.backend},
+			Readiness:               readiness,
+			Storage:                 signals.backend,
+			Alerts:                  services.alerts,
+			Replays:                 metadata.store,
+			Issues:                  metadata.store,
+			SourceMaps:              metadata.store,
+			Profiles:                metadata.store,
+			Notifications:           metadata.store,
+			Blobs:                   metadata.blobs,
+			Scrapes:                 services.scrapes,
+			ScrapeUnavailableReason: services.scrapeUnavailableReason,
+			MCPBaseURL:              loopback.baseURL,
+			AISettingsStore:         metadata.store,
+			AISecretBox:             essentials.secretBox,
+			AIBuildClient:           ai.New,
+			AITimeout:               60 * time.Second,
+			OutboundPolicy:          essentials.outboundPolicy,
+			LLMPricing:              essentials.llmPricing,
+			DisableWebUI:            !cfg.ServeWebUI,
+			Instrumentation:         monitoring.instrumentation,
+			SelfMonitoringToken:     metadata.selfToken,
+			Limits:                  shared.limits,
+			IngestLimiter:           ingestLimiter,
+			SelfMetrics:             selfMetrics,
+			MetricsEndpoint: gateway.MetricsEndpointConfig{
+				Enabled:              cfg.MetricsEndpoint.Enabled,
+				BearerToken:          cfg.MetricsEndpoint.BearerToken,
+				AllowUnauthenticated: cfg.MetricsEndpoint.AllowUnauthenticated,
+			},
 			AuthInvalidator:          shared.authInvalidator,
 			RequireCSRF:              cfg.Security.CSRF,
 			SecureSessionCookie:      effectiveSecureSessionCookie(cfg),
@@ -279,6 +299,8 @@ func startGateway(
 			Auth:           gw.IngestAuthenticator(),
 			Storage:        signals.backend,
 			TLSConfig:      grpcTLSConfig,
+			IngestLimiter:  ingestLimiter,
+			SelfMetrics:    selfMetrics,
 			MaxRecvMsgSize: cfg.OTLPGRPC.MaxRecvBytes,
 			DrainTimeout:   cfg.Process.DrainTimeout.Value(),
 			Logger:         logger,

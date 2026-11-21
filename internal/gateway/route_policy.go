@@ -9,6 +9,7 @@ import (
 
 	"github.com/eimsound/lazy-observe/internal/account"
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/selfmetrics"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -67,6 +68,7 @@ const (
 	authPublic authMode = iota
 	authProjectToken
 	authUploadToken
+	authMetricsScrapeToken
 	authSessionOnly
 	authUser
 	authUserTokenOnly
@@ -97,6 +99,25 @@ type routePolicy struct {
 	projectScope        bool
 	allowWhenMustChange bool
 	browserIngestCORS   bool
+	ingestSignal        selfmetrics.Signal
+	hasIngestSignal     bool
+}
+
+func projectIngestPolicy(signal selfmetrics.Signal) routePolicy {
+	return routePolicy{
+		auth:            authProjectToken,
+		ingestSignal:    signal,
+		hasIngestSignal: true,
+	}
+}
+
+func browserIngestPolicy(signal selfmetrics.Signal) routePolicy {
+	return routePolicy{
+		auth:              authProjectToken,
+		browserIngestCORS: true,
+		ingestSignal:      signal,
+		hasIngestSignal:   true,
+	}
 }
 
 type registeredRoute struct {
@@ -127,13 +148,20 @@ func validateRoutePolicy(method, routePath string, p routePolicy) {
 	if p.allowWhenMustChange && !p.auth.isUserBearing() {
 		panic(fmt.Sprintf("gateway: route %s %s sets allowWhenMustChange without user auth", method, routePath))
 	}
-	if p.projectScope && (p.auth == authPublic || p.auth == authProjectToken || p.auth == authUploadToken) {
+	if p.projectScope &&
+		(p.auth == authPublic || p.auth == authProjectToken || p.auth == authUploadToken || p.auth == authMetricsScrapeToken) {
 		panic(fmt.Sprintf("gateway: route %s %s sets projectScope with incompatible auth mode", method, routePath))
 	}
 	if p.browserIngestCORS && p.auth != authProjectToken {
 		panic(
 			fmt.Sprintf("gateway: route %s %s enables browserIngestCORS without project token auth", method, routePath),
 		)
+	}
+	if p.auth == authProjectToken && !p.hasIngestSignal {
+		panic(fmt.Sprintf("gateway: project-token ingest route %s %s must declare an ingestSignal", method, routePath))
+	}
+	if p.hasIngestSignal && p.auth != authProjectToken {
+		panic(fmt.Sprintf("gateway: route %s %s declares ingestSignal without project token auth", method, routePath))
 	}
 }
 
@@ -165,7 +193,7 @@ func (g *Gateway) route(method, routePath string, policy routePolicy, handlers .
 		g.app.Options(routePath, browserIngestCORS)
 	}
 
-	chain := g.buildRouteChain(policy, handlers)
+	chain := g.buildRouteChain(routePath, policy, handlers)
 	g.app.Add([]string{method}, routePath, chain[0], toAnyHandlers(chain[1:])...)
 }
 
@@ -176,12 +204,17 @@ func (g *Gateway) routeAll(routePath string, policy routePolicy, handlers ...fib
 	validateRoutePolicy(routeMethodAll, routePath, policy)
 	g.recordRoute(routeMethodAll, routePath, policy)
 
-	chain := g.buildRouteChain(policy, handlers)
+	chain := g.buildRouteChain(routePath, policy, handlers)
 	g.app.All(routePath, chain[0], toAnyHandlers(chain[1:])...)
 }
 
-func (g *Gateway) buildRouteChain(policy routePolicy, handlers []fiber.Handler) []fiber.Handler {
-	chain := make([]fiber.Handler, 0, len(handlers)+2)
+func (g *Gateway) buildRouteChain(routePath string, policy routePolicy, handlers []fiber.Handler) []fiber.Handler {
+	surface := surfaceForRoute(routePath, policy)
+	chain := make([]fiber.Handler, 0, len(handlers)+3)
+	chain = append(chain, func(c fiber.Ctx) error {
+		c.Locals(surfaceLocal, surface)
+		return c.Next()
+	})
 	if policy.browserIngestCORS {
 		chain = append(chain, browserIngestCORS)
 	}
@@ -213,9 +246,11 @@ func (g *Gateway) policyMiddleware(policy routePolicy) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		switch policy.auth {
 		case authProjectToken:
-			return g.auth.Middleware(c)
+			return g.authenticateAndLimitIngest(c, policy)
 		case authUploadToken:
 			return g.uploadAuth.UploadMiddleware(c)
+		case authMetricsScrapeToken:
+			return g.metricsScrapeTokenMiddleware(c)
 		}
 
 		user, authBySession, err := g.authenticateUser(c, policy)

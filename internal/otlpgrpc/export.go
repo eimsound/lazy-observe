@@ -243,6 +243,18 @@ func throttledStatusError(msg string, delay time.Duration) error {
 	return detailed.Err()
 }
 
+func hasRetryInfoDetail(st *status.Status) bool {
+	if st == nil {
+		return false
+	}
+	for _, detail := range st.Details() {
+		if _, ok := detail.(*errdetails.RetryInfo); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func parseRetryAfter(raw string) time.Duration {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {

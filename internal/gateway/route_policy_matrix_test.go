@@ -17,42 +17,90 @@ import (
 )
 
 func TestAllRegisteredRoutesHaveExplicitDeclarativePolicy(t *testing.T) {
-	store := testStore(t)
-	gw := newMetadataTestGateway(store, Config{
-		Store:      store,
-		Tokens:     store,
-		Management: management.New(store),
-	})
-	t.Cleanup(func() { _ = gw.Shutdown() })
-
-	fiberRoutes := gw.App().GetRoutes(true)
-	if len(fiberRoutes) == 0 {
-		t.Fatal("expected registered Fiber routes")
+	modes := []struct {
+		name            string
+		metricsEndpoint MetricsEndpointConfig
+		wantMetricsAuth *authMode
+		wantMetricsRole routeRole
+	}{
+		{
+			name:            "metrics-disabled",
+			metricsEndpoint: MetricsEndpointConfig{},
+		},
+		{
+			name:            "metrics-admin-default",
+			metricsEndpoint: MetricsEndpointConfig{Enabled: true},
+			wantMetricsAuth: ptrAuthMode(authUser),
+			wantMetricsRole: roleAdmin,
+		},
+		{
+			name: "metrics-bearer-token",
+			metricsEndpoint: MetricsEndpointConfig{
+				Enabled:     true,
+				BearerToken: "declarative-scrape-token",
+			},
+			wantMetricsAuth: ptrAuthMode(authMetricsScrapeToken),
+		},
 	}
 
-	seen := make(map[string]bool)
-	for _, r := range fiberRoutes {
-		if r.Method == "USE" {
-			continue
-		}
-		key := r.Method + " " + r.Path
-		allKey := routeMethodAll + " " + r.Path
-		_, exactOK := gw.registeredIndex[key]
-		_, allOK := gw.registeredIndex[allKey]
-		if !exactOK && !allOK {
-			t.Errorf("Fiber route %s %s is missing from declarative registeredIndex", r.Method, r.Path)
-		}
-		seen[key] = true
-		seen[allKey] = true
-	}
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testStore(t)
+			gw := newMetadataTestGateway(store, Config{
+				Store:           store,
+				Tokens:          store,
+				Management:      management.New(store),
+				MetricsEndpoint: tc.metricsEndpoint,
+			})
+			t.Cleanup(func() { _ = gw.Shutdown() })
 
-	for _, reg := range gw.registeredRoutes {
-		key := reg.method + " " + reg.path
-		if !seen[key] {
-			t.Errorf("declarative route %s was not registered on Fiber app", key)
-		}
+			fiberRoutes := gw.App().GetRoutes(true)
+			if len(fiberRoutes) == 0 {
+				t.Fatal("expected registered Fiber routes")
+			}
+
+			seen := make(map[string]bool)
+			for _, r := range fiberRoutes {
+				if r.Method == "USE" {
+					continue
+				}
+				key := r.Method + " " + r.Path
+				allKey := routeMethodAll + " " + r.Path
+				_, exactOK := gw.registeredIndex[key]
+				_, allOK := gw.registeredIndex[allKey]
+				if !exactOK && !allOK {
+					t.Errorf("Fiber route %s %s is missing from declarative registeredIndex", r.Method, r.Path)
+				}
+				seen[key] = true
+				seen[allKey] = true
+			}
+
+			for _, reg := range gw.registeredRoutes {
+				key := reg.method + " " + reg.path
+				if !seen[key] {
+					t.Errorf("declarative route %s was not registered on Fiber app", key)
+				}
+			}
+
+			policy, ok := gw.registeredIndex[fiber.MethodGet+" /metrics"]
+			if tc.wantMetricsAuth == nil {
+				if ok {
+					t.Fatalf("GET /metrics should not be registered when disabled, got %+v", policy)
+				}
+			} else if !ok || policy.auth != *tc.wantMetricsAuth || policy.role != tc.wantMetricsRole {
+				t.Fatalf(
+					"GET /metrics policy=%+v ok=%v want auth=%v role=%v",
+					policy,
+					ok,
+					*tc.wantMetricsAuth,
+					tc.wantMetricsRole,
+				)
+			}
+		})
 	}
 }
+
+func ptrAuthMode(m authMode) *authMode { return &m }
 
 func TestRoutePolicyValidationPanicsOnInvalidCombinations(t *testing.T) {
 	cases := []struct {
@@ -97,6 +145,24 @@ func TestRoutePolicyValidationPanicsOnInvalidCombinations(t *testing.T) {
 			path:   "/bad",
 			policy: routePolicy{auth: authUser, browserIngestCORS: true},
 		},
+		{
+			name:   "project token route missing ingestSignal",
+			method: fiber.MethodPost,
+			path:   "/bad",
+			policy: routePolicy{auth: authProjectToken},
+		},
+		{
+			name:   "metrics scrape token route with role",
+			method: fiber.MethodGet,
+			path:   "/bad",
+			policy: routePolicy{auth: authMetricsScrapeToken, role: roleAdmin},
+		},
+		{
+			name:   "metrics scrape token route with projectScope",
+			method: fiber.MethodGet,
+			path:   "/bad",
+			policy: routePolicy{auth: authMetricsScrapeToken, projectScope: true},
+		},
 	}
 
 	for _, tc := range cases {
@@ -127,6 +193,19 @@ func samplePathForRoute(pattern string) string {
 }
 
 func TestFullRoutePermissionMatrix(t *testing.T) {
+	t.Run("default-with-admin-metrics", func(t *testing.T) {
+		runFullRoutePermissionMatrix(t, MetricsEndpointConfig{Enabled: true}, "")
+	})
+	t.Run("metrics-bearer-token", func(t *testing.T) {
+		const scrapeToken = "matrix-scrape-secret"
+		runFullRoutePermissionMatrix(t, MetricsEndpointConfig{
+			Enabled:     true,
+			BearerToken: scrapeToken,
+		}, scrapeToken)
+	})
+}
+
+func runFullRoutePermissionMatrix(t *testing.T, metricsCfg MetricsEndpointConfig, scrapeToken string) {
 	store := testStore(t)
 	ctx := t.Context()
 
@@ -183,14 +262,15 @@ func TestFullRoutePermissionMatrix(t *testing.T) {
 		t.Fatal(err)
 	}
 	gw := newMetadataTestGateway(store, Config{
-		Store:       store,
-		Tokens:      store,
-		Management:  management.New(store),
-		Blobs:       blobs,
-		Metrics:     upstream.URL,
-		Logs:        upstream.URL,
-		Traces:      upstream.URL,
-		RequireCSRF: true,
+		Store:           store,
+		Tokens:          store,
+		Management:      management.New(store),
+		Blobs:           blobs,
+		Metrics:         upstream.URL,
+		Logs:            upstream.URL,
+		Traces:          upstream.URL,
+		RequireCSRF:     true,
+		MetricsEndpoint: metricsCfg,
 	})
 	t.Cleanup(func() { _ = gw.Shutdown() })
 	app := gw.App()
@@ -331,10 +411,14 @@ func TestFullRoutePermissionMatrix(t *testing.T) {
 					http.StatusForbidden,
 					"source_map_upload_token_required",
 				)
+			case authMetricsScrapeToken:
+				assertDenied(t, "project token", status, code, body, http.StatusUnauthorized, "")
 			case authSessionOnly:
 				assertDenied(t, "project token", status, code, body, http.StatusUnauthorized, "")
 			case authUser, authUserTokenOnly:
 				assertDenied(t, "project token", status, code, body, http.StatusForbidden, "ingest_only_token")
+			default:
+				t.Fatalf("unhandled authMode %v", policy.auth)
 			}
 
 			// 3. Source Map upload token (los_...)
@@ -342,10 +426,14 @@ func TestFullRoutePermissionMatrix(t *testing.T) {
 			switch policy.auth {
 			case authUploadToken:
 				assertPassedPolicy(t, "upload token", status, code, body)
+			case authMetricsScrapeToken:
+				assertDenied(t, "upload token", status, code, body, http.StatusUnauthorized, "")
 			case authSessionOnly:
 				assertDenied(t, "upload token", status, code, body, http.StatusUnauthorized, "")
 			case authProjectToken, authUser, authUserTokenOnly:
 				assertDenied(t, "upload token", status, code, body, http.StatusForbidden, "upload_only_token")
+			default:
+				t.Fatalf("unhandled authMode %v", policy.auth)
 			}
 
 			// 4. User API token (lou_...) across viewer / member / admin
@@ -372,6 +460,8 @@ func TestFullRoutePermissionMatrix(t *testing.T) {
 						http.StatusForbidden,
 						"source_map_upload_token_required",
 					)
+				case authMetricsScrapeToken:
+					assertDenied(t, "user token "+ut.role, status, code, body, http.StatusUnauthorized, "")
 				case authSessionOnly:
 					assertDenied(t, "user token "+ut.role, status, code, body, http.StatusUnauthorized, "")
 				case authUser, authUserTokenOnly:
@@ -380,6 +470,8 @@ func TestFullRoutePermissionMatrix(t *testing.T) {
 					} else {
 						assertPassedPolicy(t, "user token "+ut.role, status, code, body)
 					}
+				default:
+					t.Fatalf("unhandled authMode %v", policy.auth)
 				}
 			}
 
@@ -398,9 +490,16 @@ func TestFullRoutePermissionMatrix(t *testing.T) {
 				}[role]
 			}
 
-			if policy.auth == authUserTokenOnly {
+			if policy.auth == authUserTokenOnly || policy.auth == authMetricsScrapeToken {
 				status, code, body = doReq(method, target, withSession(adminCookie, true, "default"))
-				assertDenied(t, "session on user-token-only", status, code, body, http.StatusUnauthorized, "")
+				assertDenied(t, "session on non-session route", status, code, body, http.StatusUnauthorized, "")
+			}
+
+			if policy.auth == authMetricsScrapeToken && scrapeToken != "" {
+				status, _, body = doReq(method, target, withBearer(scrapeToken, ""))
+				if status != http.StatusOK {
+					t.Errorf("valid scrape bearer token: status=%d want=200 body=%s", status, body)
+				}
 			}
 
 			if policy.auth.supportsSessionCookie() {

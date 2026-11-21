@@ -47,6 +47,7 @@
 | 私有 ingest | `POST /api/replay/segments` | 会话回放分段上报 |
 | 私有 ingest | `POST /api/profiles` | 持续剖析（pprof）上报 |
 | 私有上传 | `POST /api/releases/:release/sourcemaps` | Source Map 制品上传；**只**接受 Source Map 上传 Token（`los_...`，§2.2），项目 API Token 与用户 API Token 返回 `403` `source_map_upload_token_required` |
+| 自身运维指标 | `GET /metrics` | Prometheus 文本格式 0.0.4（`text/plain; version=0.0.4; charset=utf-8`）；通过 `metrics_endpoint.enabled` 显式开启（默认关闭），默认需管理员鉴权，可选静态 scrape Bearer Token 或显式 `allow_unauthenticated`（§2.2） |
 
 `POST /api/events/diagnostics` 的枚举值当前为：
 
@@ -98,6 +99,23 @@ MCP（`lazy-observe mcp --dsn`）的 DSN 形状与上面相同，但 `<token>` �
 `lou_...` 前缀的用户 API Token（在 Web UI「设置 → 个人 API Token」创建）；
 `<project-slug>` 通过 `X-LO-Project` 请求头发送。`lazy-observe mcp` 在启动时拒绝
 非 `lou_` 的 Token，不会等到第一次工具调用才收到 `403`。
+
+#### 统一摄入限速与背压契约
+
+网关支持通过 `ingest_rate_limit` 配置按项目（`project.ID`）执行统一的令牌桶限速（覆盖全部 HTTP 摄入端点与原生 OTLP/gRPC 服务，默认关闭，开启后按 `requests_per_second`、`burst` 及可选 `bytes_per_second` 约束，并在 `max_tracked_projects` 内有界回收）：
+
+- **HTTP 摄入路由**：超限时在转发至上游存储前拒绝，返回 `429 Too Many Requests`、`Retry-After: <正整数秒>`（下限 `1` 秒、上限 `300` 秒）与脱敏 JSON 响应体 `{"code":"ingest_rate_limited","error":"project ingest rate limit exceeded"}`。
+- **OTLP/gRPC 摄入服务**：复用同一限流器实例，超限时返回 gRPC `codes.ResourceExhausted` 并附带 `google.rpc.RetryInfo`（`retry_delay` 为正整数秒）。
+- 不同项目的令牌桶严格隔离，单个项目触发限速不影响其他项目。
+
+#### 自身 `/metrics` 端点鉴权与低基数契约
+
+`GET /metrics` 通过 `metrics_endpoint.enabled` 控制（默认 `false`，关闭时返回 `404` 且不落入前端 SPA 回退）。启用时按 fail-closed 策略鉴权：
+
+- 配置了 `metrics_endpoint.bearer_token`：只接受匹配的 `Authorization: Bearer <token>`（常数时间校验），且禁止与 `allow_unauthenticated: true` 同时配置；其余请求返回 `401`。
+- 未配置 `bearer_token` 且 `allow_unauthenticated: false`（启用后的默认策略）：要求已认证的 `admin` 会话或 `admin` 用户 API Token（`lou_...`）；匿名返回 `401`，项目 API Token 返回 `403` `ingest_only_token`，上传 Token 返回 `403` `upload_only_token`，非管理员角色返回 `403`。
+- 未配置 `bearer_token` 且显式设置 `allow_unauthenticated: true`：允许无鉴权抓取（适用于内网/Pod 采集场景）。
+- 指标标签仅使用有限静态枚举（如 `surface`、`status_class`、`protocol`、`signal`、`outcome`），绝不暴露 `project_id`、`trace_id`、动态 URL 或凭据文本。
 
 ### 2.3 协议版本变更规则
 
