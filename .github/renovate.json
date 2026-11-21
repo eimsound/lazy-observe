@@ -546,7 +546,7 @@
       "groupSlug": "pnpm"
     },
     {
-      "description": "timestamp-optional 只是兜底：Quay（vm*）、GCR（distroless）、mise 的 go 后端（govulncheck）拿不到发布时间，默认的 timestamp-required 会让它们被无限期搁置，所以有新版就开 PR，不受 7 天限制，也不设 dependencyDashboardApproval（ADR 0015「后果」）。托管 Renovate 上实测 Docker Hub（seaweedfs、postgres 标签都超过 1000 个）能拿到时间戳、照样等满 7 天；本地 44.253.4 抓 Hub 标签时第 11 页起 403、回退成无时间戳，两者不一致，以托管环境为准，所以 seaweedfs、postgres、debian 留在名单里作兜底（拿得到时间戳时仍受 7 天限制）。每个依赖单独成 PR（不并入任何组）",
+      "description": "仅对确实不提供发布时间戳的来源使用 timestamp-optional：Quay（vm*）、GCR（distroless）、mise 的 go 后端（govulncheck），否则默认的 timestamp-required 会让它们被无限期搁置；有新版即单独成 PR（不并入任何组），不设 dependencyDashboardApproval（ADR 0015「后果」）。Docker Hub 镜像（chrislusf/seaweedfs、postgres、debian）已移出此豁免并走全局默认 timestamp-required（fail-closed）：2026-11-21 PR #283 实测 timestamp-optional 在托管环境偶发抓不到 Hub 分页时间戳时会绕过 7 天门禁提前开 PR；改为 timestamp-required 后，偶发抓不到只会在 Dependency Dashboard #135 维持 Pending Status Checks，待下一轮正常抓取并满 7 天后自动开 PR",
       "matchManagers": [
         "custom.regex",
         "mise",
@@ -556,11 +556,8 @@
         "quay.io/victoriametrics/vmstorage",
         "quay.io/victoriametrics/vminsert",
         "quay.io/victoriametrics/vmselect",
-        "chrislusf/seaweedfs",
-        "postgres",
         "go:golang.org/x/vuln/cmd/govulncheck",
-        "gcr.io/distroless/static-debian13",
-        "debian"
+        "gcr.io/distroless/static-debian13"
       ],
       "minimumReleaseAgeBehaviour": "timestamp-optional",
       "groupName": null
