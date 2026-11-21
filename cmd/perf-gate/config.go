@@ -23,6 +23,7 @@ type gateConfig struct {
 			Traces int `json:"traces"`
 		} `json:"medium_fixture"`
 		MaxP95MS map[string]float64 `json:"max_p95_ms"`
+		MaxP99MS map[string]float64 `json:"max_p99_ms"`
 	} `json:"query"`
 	HAScaling struct {
 		SettleSeconds               float64 `json:"settle_seconds"`
@@ -79,6 +80,12 @@ func (cfg gateConfig) validate() error {
 	for _, name := range []string{"issues", "logs", "trace"} {
 		if cfg.Query.MaxP95MS[name] <= 0 {
 			return fmt.Errorf("query.max_p95_ms.%s must be positive", name)
+		}
+		if cfg.Query.MaxP99MS[name] <= 0 {
+			return fmt.Errorf("query.max_p99_ms.%s must be positive", name)
+		}
+		if cfg.Query.MaxP99MS[name] < cfg.Query.MaxP95MS[name] {
+			return fmt.Errorf("query.max_p99_ms.%s must not be lower than max_p95_ms.%s", name, name)
 		}
 	}
 	if cfg.HAScaling.SettleSeconds < 0 || cfg.HAScaling.SettleSeconds > 60 || cfg.HAScaling.WarmupSeconds < 0 ||
