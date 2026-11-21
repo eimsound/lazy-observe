@@ -1,7 +1,12 @@
 # Deployment
 
-lazy-observe ships all-in-one release archives, a Linux container image, and a
-Helm chart for single-replica embedded or multi-replica standalone deployment.
+lazy-observe ships all-in-one release archives, a Linux container image,
+[Docker Compose](../deploy/compose/README.md) and
+[systemd](../deploy/systemd/README.md) reference manifests, and a Helm chart
+for single-replica embedded or multi-replica standalone deployment. For
+day-two backup, restore, upgrade/rollback, and secret-rotation runbooks, see
+[Operations](operations.md); for connecting external dashboards, see
+[Grafana and Perses](grafana-perses.md).
 
 ## Install a release
 
@@ -28,7 +33,11 @@ docker run --rm -p 3100:3100 -v lazy-observe-data:/data \
   ghcr.io/eimsound/lazy-observe:latest
 ```
 
-Only port 3100 is public. Persist `/data`; the image runs as a non-root user.
+Only port 3100 is public. Persist `/data`; the image runs as a non-root user
+(`65532:65532`). For hardened non-Kubernetes stacks, see the
+[Docker Compose reference](../deploy/compose/README.md) (all-in-one and
+external-storage profiles) and the
+[systemd service unit](../deploy/systemd/README.md).
 
 ## All-in-one
 
@@ -498,6 +507,14 @@ project. Grafana features that call other Prometheus endpoints — metadata,
 exemplars, and rules — have no registered gateway route and answer `404`; the
 endpoints in the table above are the supported surface.
 
+For ready-to-use Grafana and Perses provisioning examples covering metrics,
+logs, and traces (including the path-rewrite proxy for LogsQL and Jaeger
+endpoints and the [ADR 0017](../.agents/docs/adr/0017-no-built-in-dashboards.md)
+dashboard boundary), see [Grafana and Perses](grafana-perses.md),
+[`deploy/integrations/grafana/datasources.yaml`](../deploy/integrations/grafana/datasources.yaml),
+and
+[`deploy/integrations/perses/datasources.yaml`](../deploy/integrations/perses/datasources.yaml).
+
 ### MCP
 
 `lazy-observe mcp` runs a project-scoped stdio proxy for MCP clients:
@@ -730,6 +747,12 @@ Retention is global by signal, not per project. In all-in-one mode the three VM 
 Reducing retention makes older data eligible for engine or janitor deletion; take a backup first if the data may be needed.
 
 ## Pre-release replacement and backup
+
+> See [Operations](operations.md) for the complete day-two runbook covering
+> All-in-One and HA hot/cold backups, restore verification with
+> `lazy-observe doctor --ha`, upgrades/rollbacks, key rotation
+> (`admin reset-key-fingerprint`), and password recovery
+> (`admin reset-password`).
 
 v0.x releases are public previews. Upgrading may require recreating the
 database, and protocols and SDKs may change incompatibly between versions. The

@@ -1,0 +1,322 @@
+# Docker Compose reference deployment for lazy-observe.
+#
+# Modes:
+#   1. All-in-One (default):
+#        cp .env.example .env
+#        docker compose up -d
+#      Runs only `lazy-observe` with SQLite, local /data/blobs, and embedded
+#      VictoriaMetrics / VictoriaLogs / VictoriaTraces / vmagent.
+#
+#   2. Standalone / External storage reference (PostgreSQL + Valkey + SeaweedFS S3
+#      + external VictoriaMetrics / VictoriaLogs / VictoriaTraces):
+#        cp .env.example .env
+#        # Generate shared platform encryption key and initial admin password first (see README.md)
+#        docker compose --profile standalone up -d
+#
+# Security & image notes:
+#   - ghcr.io/eimsound/lazy-observe runs on gcr.io/distroless/static-debian13:nonroot
+#     (UID/GID 65532:65532, no shell, no curl/wget).
+#   - Root filesystem is mounted read-only; /data MUST remain writable and executable
+#     (not `noexec`) because lazy-observe extracts verified embedded binaries to /data/bin.
+#   - Because the distroless image has no shell/curl, probe GET /livez, /readyz, and
+#     /healthz from the host, reverse proxy, or external monitoring rather than an
+#     in-container curl healthcheck.
+#   - Pin LO_IMAGE to a released tag + immutable digest in production.
+
+services:
+  lazy-observe:
+    image: ${LO_IMAGE:-ghcr.io/eimsound/lazy-observe:latest}
+    container_name: lazy-observe
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_signal: SIGTERM
+    stop_grace_period: 45s
+    ports:
+      - "${LO_BIND_ADDR:-127.0.0.1}:${LO_PORT:-3100}:3100"
+    environment:
+      LO_LISTEN: ":3100"
+      LO_DATA_DIR: "/data"
+      LO_TOPOLOGY: "all-in-one"
+      LO_RETENTION_METRICS: "${LO_RETENTION_METRICS:-90d}"
+      LO_RETENTION_LOGS: "${LO_RETENTION_LOGS:-14d}"
+      LO_RETENTION_TRACES: "${LO_RETENTION_TRACES:-7d}"
+      LO_RETENTION_REPLAY: "${LO_RETENTION_REPLAY:-3d}"
+      LO_RETENTION_SOURCEMAPS: "${LO_RETENTION_SOURCEMAPS:-90d}"
+      LO_RETENTION_ALERT_EVENTS: "${LO_RETENTION_ALERT_EVENTS:-30d}"
+      LO_RETENTION_PROFILES: "${LO_RETENTION_PROFILES:-7d}"
+      LO_RETENTION_ISSUES_CLOSED: "${LO_RETENTION_ISSUES_CLOSED:-true}"
+      LO_SCRAPE_MODE: "${LO_SCRAPE_MODE:-auto}"
+      LO_SELF_MONITORING_ENABLED: "${LO_SELF_MONITORING_ENABLED:-true}"
+      LO_SELF_MONITORING_PROFILING: "${LO_SELF_MONITORING_PROFILING:-false}"
+      LO_SECURITY_SESSION_SECURE_COOKIE: "${LO_SECURITY_SESSION_SECURE_COOKIE:-false}"
+      LO_SECURITY_TRUSTED_PROXIES: "${LO_SECURITY_TRUSTED_PROXIES:-}"
+      LO_PROCESS_STARTUP_TIMEOUT: "${LO_PROCESS_STARTUP_TIMEOUT:-20s}"
+      LO_PROCESS_SHUTDOWN_TIMEOUT: "${LO_PROCESS_SHUTDOWN_TIMEOUT:-15s}"
+      LO_PROCESS_DRAIN_TIMEOUT: "${LO_PROCESS_DRAIN_TIMEOUT:-20s}"
+    volumes:
+      - lazy-observe-data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    deploy:
+      resources:
+        limits:
+          cpus: "${LO_CPU_LIMIT:-2.0}"
+          memory: "${LO_MEMORY_LIMIT:-2G}"
+        reservations:
+          cpus: "${LO_CPU_RESERVATION:-0.25}"
+          memory: "${LO_MEMORY_RESERVATION:-512M}"
+    networks:
+      - lazy-observe
+
+  # ---------------------------------------------------------------------------
+  # Standalone / HA-shaped external storage reference stack (--profile standalone)
+  # ---------------------------------------------------------------------------
+  lazy-observe-standalone:
+    profiles: ["standalone"]
+    image: ${LO_IMAGE:-ghcr.io/eimsound/lazy-observe:latest}
+    container_name: lazy-observe-standalone
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_signal: SIGTERM
+    stop_grace_period: 45s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      victoria-metrics:
+        condition: service_started
+      victoria-logs:
+        condition: service_started
+      victoria-traces:
+        condition: service_started
+    ports:
+      - "${LO_BIND_ADDR:-127.0.0.1}:${LO_STANDALONE_PORT:-3100}:3100"
+    environment:
+      LO_LISTEN: ":3100"
+      LO_DATA_DIR: "/data"
+      LO_TOPOLOGY: "ha"
+      LO_STANDALONE: "true"
+      LO_META_DB_URL: "postgres://${LO_PG_USER:-lazy_observe}:${LO_PG_PASSWORD:?set LO_PG_PASSWORD in .env}@postgres:5432/${LO_PG_DB:-lazy_observe}?sslmode=disable"
+      LO_META_MIGRATION_LOCK_TIMEOUT: "${LO_META_MIGRATION_LOCK_TIMEOUT:-60s}"
+      LO_REDIS_ENABLED: "true"
+      LO_REDIS_ADDR: "valkey:6379"
+      LO_REDIS_PASSWORD: "${LO_REDIS_PASSWORD:-}"
+      LO_REDIS_DB: "${LO_REDIS_DB:-0}"
+      LO_REDIS_KEY_PREFIX: "${LO_REDIS_KEY_PREFIX:-lazy-observe}"
+      LO_STORAGE_METRICS_KIND: "vm"
+      LO_STORAGE_METRICS_QUERY_URL: "http://victoria-metrics:8428"
+      LO_STORAGE_METRICS_INGEST_URL: "http://victoria-metrics:8428"
+      LO_STORAGE_LOGS_URL: "http://victoria-logs:9428"
+      LO_STORAGE_TRACES_URL: "http://victoria-traces:10428"
+      LO_BLOB_BACKEND: "s3"
+      LO_BLOB_S3_BUCKET: "${LO_BLOB_S3_BUCKET:-lazy-observe}"
+      LO_BLOB_S3_REGION: "${LO_BLOB_S3_REGION:-us-east-1}"
+      LO_BLOB_S3_ENDPOINT: "http://seaweedfs:8333"
+      LO_BLOB_S3_ACCESS_KEY: "${LO_BLOB_S3_ACCESS_KEY:-lazyobserve}"
+      LO_BLOB_S3_SECRET_KEY: "${LO_BLOB_S3_SECRET_KEY:?set LO_BLOB_S3_SECRET_KEY in .env}"
+      LO_RETENTION_REPLAY: "${LO_RETENTION_REPLAY:-3d}"
+      LO_RETENTION_SOURCEMAPS: "${LO_RETENTION_SOURCEMAPS:-90d}"
+      LO_RETENTION_ALERT_EVENTS: "${LO_RETENTION_ALERT_EVENTS:-30d}"
+      LO_RETENTION_PROFILES: "${LO_RETENTION_PROFILES:-7d}"
+      LO_RETENTION_ISSUES_CLOSED: "${LO_RETENTION_ISSUES_CLOSED:-true}"
+      LO_SCRAPE_MODE: "${LO_SCRAPE_MODE:-auto}"
+      LO_SELF_MONITORING_ENABLED: "${LO_SELF_MONITORING_ENABLED:-true}"
+      LO_SELF_MONITORING_PROFILING: "${LO_SELF_MONITORING_PROFILING:-false}"
+      LO_SECURITY_SESSION_SECURE_COOKIE: "${LO_SECURITY_SESSION_SECURE_COOKIE:-false}"
+      LO_SECURITY_TRUSTED_PROXIES: "${LO_SECURITY_TRUSTED_PROXIES:-}"
+      LO_SECURITY_SECRET_KEY_FILE: "/etc/lazy-observe-key/secret.key"
+      LO_SECURITY_ADMIN_PASSWORD_FILE: "/etc/lazy-observe-admin/admin-password"
+      LO_PROCESS_STARTUP_TIMEOUT: "${LO_PROCESS_STARTUP_TIMEOUT:-20s}"
+      LO_PROCESS_SHUTDOWN_TIMEOUT: "${LO_PROCESS_SHUTDOWN_TIMEOUT:-15s}"
+      LO_PROCESS_DRAIN_TIMEOUT: "${LO_PROCESS_DRAIN_TIMEOUT:-20s}"
+    volumes:
+      - lazy-observe-standalone-data:/data
+      - "${LO_SECRET_KEY_HOST_PATH:-./secrets/secret.key}:/etc/lazy-observe-key/secret.key:ro"
+      - "${LO_ADMIN_PASSWORD_HOST_PATH:-./secrets/admin-password}:/etc/lazy-observe-admin/admin-password:ro"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    deploy:
+      resources:
+        limits:
+          cpus: "${LO_CPU_LIMIT:-2.0}"
+          memory: "${LO_MEMORY_LIMIT:-2G}"
+        reservations:
+          cpus: "${LO_CPU_RESERVATION:-0.25}"
+          memory: "${LO_MEMORY_RESERVATION:-512M}"
+    networks:
+      - lazy-observe
+
+  postgres:
+    profiles: ["standalone"]
+    image: ${LO_POSTGRES_IMAGE:-postgres:16-trixie}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_USER: "${LO_PG_USER:-lazy_observe}"
+      POSTGRES_PASSWORD: "${LO_PG_PASSWORD:?set LO_PG_PASSWORD in .env}"
+      POSTGRES_DB: "${LO_PG_DB:-lazy_observe}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "1G"
+    networks:
+      - lazy-observe
+
+  # Valkey (BSD-3-Clause, Redis-protocol compatible)
+  valkey:
+    profiles: ["standalone"]
+    image: ${LO_VALKEY_IMAGE:-valkey/valkey:8-trixie}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - "valkey-server"
+      - "--appendonly"
+      - "no"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+    networks:
+      - lazy-observe
+
+  # SeaweedFS (Apache-2.0, S3-compatible object storage for replays/sourcemaps/profiles)
+  seaweedfs:
+    profiles: ["standalone"]
+    image: ${LO_SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.53}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - "mini"
+      - "-dir=/data"
+    environment:
+      AWS_ACCESS_KEY_ID: "${LO_BLOB_S3_ACCESS_KEY:-lazyobserve}"
+      AWS_SECRET_ACCESS_KEY: "${LO_BLOB_S3_SECRET_KEY:?set LO_BLOB_S3_SECRET_KEY in .env}"
+      S3_BUCKET: "${LO_BLOB_S3_BUCKET:-lazy-observe}"
+    volumes:
+      - seaweedfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8333"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "512M"
+    networks:
+      - lazy-observe
+
+  victoria-metrics:
+    profiles: ["standalone"]
+    image: ${LO_VICTORIA_METRICS_IMAGE:-quay.io/victoriametrics/victoria-metrics:v1.156.0-scratch}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=${LO_RETENTION_METRICS:-90d}"
+      - "-search.latencyOffset=0s"
+    volumes:
+      - vm-metrics-data:/storage
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2G"
+    networks:
+      - lazy-observe
+
+  victoria-logs:
+    profiles: ["standalone"]
+    image: ${LO_VICTORIA_LOGS_IMAGE:-quay.io/victoriametrics/victoria-logs:v1.54.0}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=${LO_RETENTION_LOGS:-14d}"
+    volumes:
+      - vm-logs-data:/storage
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2G"
+    networks:
+      - lazy-observe
+
+  victoria-traces:
+    profiles: ["standalone"]
+    image: ${LO_VICTORIA_TRACES_IMAGE:-quay.io/victoriametrics/victoria-traces:v0.13.0}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=${LO_RETENTION_TRACES:-7d}"
+      - "-search.latencyOffset=0s"
+      - "-insert.indexFlushInterval=1s"
+    volumes:
+      - vm-traces-data:/storage
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2G"
+    networks:
+      - lazy-observe
+
+volumes:
+  lazy-observe-data:
+  lazy-observe-standalone-data:
+  postgres-data:
+  seaweedfs-data:
+  vm-metrics-data:
+  vm-logs-data:
+  vm-traces-data:
+
+networks:
+  lazy-observe:
+    driver: bridge

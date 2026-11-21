@@ -179,6 +179,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, checks, and pull request rules
 
 - [Architecture](.agents/docs/architecture.md)
 - [Deployment](docs/deployment.md)
+- [Operations (backup, restore, upgrade, rollback)](docs/operations.md)
+- [Grafana and Perses integration](docs/grafana-perses.md)
+- [Docker Compose deployment](deploy/compose/README.md)
+- [systemd service deployment](deploy/systemd/README.md)
 - [SDK and server compatibility](docs/version-matrix.md)
 - [Architecture decision records](.agents/docs/adr/)
 - [Contributing](CONTRIBUTING.md)
