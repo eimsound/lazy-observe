@@ -18,7 +18,7 @@ VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-quay.io/victoriametrics/vmselect:v1.156.
 # SeaweedFS is Apache-2.0 and provides a real S3-compatible API without adding
 # a copyleft test dependency. Upstream only publishes Alpine-based images, so
 # this one stays Alpine; the digest pin keeps the gate repeatable.
-SEAWEED_IMAGE=${LO_E2E_SEAWEED_IMAGE:-chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0}
+SEAWEED_IMAGE=${LO_E2E_SEAWEED_IMAGE:-chrislusf/seaweedfs:4.54@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15}
 # Valkey is Redis-protocol compatible and BSD-3-Clause. Keep both the version
 # and multi-platform manifest digest fixed so this gate cannot drift to a
 # differently licensed Redis release through a floating image tag.
