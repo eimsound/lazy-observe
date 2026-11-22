@@ -33,6 +33,7 @@ Importing either package has no global side effects. `init()` installs the confi
 | `errorFlushIntervalMs` | `5000` | Periodic error queue flush |
 | `delivery.errorQueueCapacity` | `100` | Maximum queued plus in-flight error events |
 | `delivery.traceQueueCapacity` | `1000` | Maximum queued plus in-flight browser spans |
+| `delivery.vitalQueueCapacity` | `50` | Maximum queued plus in-flight Web Vitals measurements |
 | `delivery.replayQueueCapacity` | `10` | Maximum queued plus in-flight Replay segments |
 | `delivery.diagnosticQueueCapacity` | `20` | Maximum queued plus in-flight drop measurements |
 | `delivery.maxAttempts` | `3` | Total attempts per custom batch |
@@ -85,15 +86,17 @@ const tracedFetch = client.wrapFetch(window.fetch.bind(window));
 
 ### Delivery reliability
 
-Errors, browser spans, Replay segments, and SDK drop diagnostics use separate
-bounded in-memory queues. Capacity includes the batch currently being exported;
-enqueue never waits for the network. A full queue drops new telemetry, and a
-failed batch (including a drained Replay segment) remains resident until its
-finite retry budget is exhausted. Web Vitals skip the queues and are posted once
-per metric; a failed upload is counted and reported like a queue drop, with
-reason `server_rejected` for a 4xx refusal (408 and 429 are transient and report
-`retry_exhausted`) and `retry_exhausted` for a network error or 5xx (single
-attempt). Each drop emits a local `console.warn`.
+Errors, browser spans, Web Vitals, Replay segments, and SDK drop diagnostics use
+separate bounded in-memory queues. Capacity includes the batch currently being
+exported; enqueue never waits for the network. A full queue drops new telemetry,
+and a failed batch (including a drained Replay segment) remains resident until
+its finite retry budget is exhausted. Web Vitals use a dedicated queue
+(`capacity: 50`, `batchSize: 10`, `flushIntervalMs: 1500`, `60 KiB` keepalive
+budget) that deduplicates unsent readings by `(name, page)` keeping the latest
+value and splits batches at `<= 32` distinct pages; permanent 4xx rejections
+drop immediately as `server_rejected` (408 and 429 are transient and retry),
+and exhausted or full-queue drops report with `signal: "vitals"`. Each drop
+emits a local `console.warn`.
 
 `client.diagnostics().droppedTelemetry` returns the page-local total. Drop
 measurements use stable IDs and are sent to the dedicated SDK diagnostic ingest,
@@ -104,8 +107,10 @@ another diagnostic: a `422` from an older server rejects the whole batch
 exhausted, the batch is dropped as a `diagnostic` / `retry_exhausted` drop whose
 count is the batch size.
 
-`pagehide` calls `flush()` with Fetch `keepalive` as best effort only. It does
-not claim durable or guaranteed unload delivery. `close()` drains finite retry
+`visibilitychange` (`hidden`) and `pagehide` call `flush(true)` with Fetch
+`keepalive` as best effort only, synchronously dispatching queued keepalive
+batches even while an earlier async drain or retry is in flight. It does not
+claim durable or guaranteed unload delivery. `close()` drains finite retry
 budgets, restores installed hooks, and uses no disk spool.
 
 ### React

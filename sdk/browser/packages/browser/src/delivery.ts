@@ -75,6 +75,9 @@ export interface DeliveryQueueOptions<T> {
   keepaliveMaxBatchBytes?: number;
   batchOverheadBytes?: number;
   estimateItemBytes?: (item: T) => number;
+  dedupeKey?: (item: T) => string;
+  batchDistinctKey?: (item: T) => string;
+  maxBatchDistinctKeys?: number;
   send: (batch: T[], options: DeliverySendOptions) => Promise<void>;
   wait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   onDrop?: (drop: DeliveryDrop) => void;
@@ -86,10 +89,12 @@ export interface DeliveryQueueOptions<T> {
 interface QueuedEntry<T> {
   item: T;
   bytes: number;
+  dedupeKey?: string;
 }
 
 export class DeliveryQueue<T> {
   private readonly items: Array<QueuedEntry<T>> = [];
+  private readonly pendingByKey = new Map<string, QueuedEntry<T>>();
   private readonly controller = new AbortController();
   private readonly wait: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   private readonly isNonRetryable: (error: unknown) => boolean;
@@ -101,8 +106,13 @@ export class DeliveryQueue<T> {
   private readonly keepaliveMaxBatchBytes?: number;
   private readonly batchOverheadBytes: number;
   private readonly estimateItemBytes?: (item: T) => number;
+  private readonly dedupeKey?: (item: T) => string;
+  private readonly batchDistinctKey?: (item: T) => string;
+  private readonly maxBatchDistinctKeys?: number;
   private timer?: ReturnType<typeof setTimeout>;
   private running?: Promise<void>;
+  private readonly inFlight = new Set<Promise<void>>();
+  private readonly keepaliveInFlight = new Set<Promise<void>>();
   private queuedBytes = 0;
   private resident = 0;
   private dropped = 0;
@@ -137,6 +147,14 @@ export class DeliveryQueue<T> {
     if (options.batchOverheadBytes !== undefined && (!Number.isFinite(options.batchOverheadBytes) || options.batchOverheadBytes < 0)) {
       throw new Error("delivery batchOverheadBytes cannot be negative");
     }
+    if (options.maxBatchDistinctKeys !== undefined) {
+      if (!Number.isInteger(options.maxBatchDistinctKeys) || options.maxBatchDistinctKeys <= 0) {
+        throw new Error("delivery maxBatchDistinctKeys must be a positive integer");
+      }
+      if (!options.batchDistinctKey) {
+        throw new Error("delivery maxBatchDistinctKeys requires batchDistinctKey");
+      }
+    }
     this.wait = options.wait ?? waitForRetry;
     this.isNonRetryable = options.isNonRetryable ?? isServerRejection;
     this.retryAfterMs = options.retryAfterMs ?? defaultRetryAfterMs;
@@ -147,6 +165,9 @@ export class DeliveryQueue<T> {
     this.keepaliveMaxBatchBytes = options.keepaliveMaxBatchBytes;
     this.batchOverheadBytes = options.batchOverheadBytes ?? 0;
     this.estimateItemBytes = options.estimateItemBytes;
+    this.dedupeKey = options.dedupeKey;
+    this.batchDistinctKey = options.batchDistinctKey;
+    this.maxBatchDistinctKeys = options.maxBatchDistinctKeys;
   }
 
   enqueue(item: T): boolean {
@@ -154,35 +175,47 @@ export class DeliveryQueue<T> {
       this.recordDrop({ reason: "shutdown_budget", count: 1 });
       return false;
     }
+    const bytes = this.estimateItemBytes ? Math.max(0, this.estimateItemBytes(item)) : 0;
+    let key: string | undefined;
+    if (this.dedupeKey) {
+      key = this.dedupeKey(item);
+      const existing = this.pendingByKey.get(key);
+      if (existing) {
+        this.queuedBytes += bytes - existing.bytes;
+        existing.item = item;
+        existing.bytes = bytes;
+        this.scheduleFlush();
+        return true;
+      }
+    }
     if (this.resident >= this.options.capacity) {
       this.recordDrop({ reason: "queue_full", count: 1 });
       return false;
     }
-    const bytes = this.estimateItemBytes ? Math.max(0, this.estimateItemBytes(item)) : 0;
-    this.items.push({ item, bytes });
+    const entry: QueuedEntry<T> = key !== undefined ? { item, bytes, dedupeKey: key } : { item, bytes };
+    this.items.push(entry);
+    if (key !== undefined) this.pendingByKey.set(key, entry);
     this.queuedBytes += bytes;
     this.resident++;
-    const effectiveBatchSize = Math.min(this.options.batchSize, this.options.capacity);
-    const bytesFull = this.maxBatchBytes !== undefined
-      && this.estimateItemBytes !== undefined
-      && (this.batchOverheadBytes + this.queuedBytes + Math.max(0, this.items.length - 1)) >= this.maxBatchBytes;
-    if (this.items.length >= effectiveBatchSize || bytesFull) {
-      this.clearTimer();
-      queueMicrotask(() => { void this.startDrain(false); });
-    } else if (!this.timer) {
-      this.timer = setTimeout(() => {
-        this.timer = undefined;
-        void this.startDrain(false);
-      }, this.options.flushIntervalMs);
-    }
+    this.scheduleFlush();
     return true;
   }
 
   async flush(keepalive = false): Promise<void> {
     this.clearTimer();
-    while (this.running || this.items.length > 0) {
-      if (!this.running) this.startDrain(keepalive);
-      await this.running;
+    if (keepalive) {
+      await this.drainKeepalive();
+      return;
+    }
+    while (this.running || this.items.length > 0 || this.inFlight.size > 0) {
+      if (this.items.length > 0 && !this.running) {
+        this.startDrain();
+      }
+      if (this.running) {
+        await this.running;
+      } else if (this.inFlight.size > 0) {
+        await Promise.all(Array.from(this.inFlight));
+      }
     }
   }
 
@@ -209,12 +242,45 @@ export class DeliveryQueue<T> {
     return { pending: this.resident, dropped: this.dropped, lastError: this.lastError };
   }
 
-  private startDrain(keepalive: boolean): Promise<void> {
+  private scheduleFlush(): void {
+    const effectiveBatchSize = Math.min(this.options.batchSize, this.options.capacity);
+    const bytesFull = this.maxBatchBytes !== undefined
+      && this.estimateItemBytes !== undefined
+      && (this.batchOverheadBytes + this.queuedBytes + Math.max(0, this.items.length - 1)) >= this.maxBatchBytes;
+    if (this.items.length >= effectiveBatchSize || bytesFull || this.hasFullDistinctKeyBatch()) {
+      this.clearTimer();
+      queueMicrotask(() => { void this.startDrain(); });
+    } else if (!this.timer) {
+      this.timer = setTimeout(() => {
+        this.timer = undefined;
+        void this.startDrain();
+      }, this.options.flushIntervalMs);
+    }
+  }
+
+  private hasFullDistinctKeyBatch(): boolean {
+    if (
+      this.maxBatchDistinctKeys === undefined
+      || !this.batchDistinctKey
+      || this.items.length < this.maxBatchDistinctKeys
+    ) {
+      return false;
+    }
+    const seen = new Set<string>();
+    for (const entry of this.items) {
+      seen.add(this.batchDistinctKey(entry.item));
+      if (seen.size >= this.maxBatchDistinctKeys) return true;
+    }
+    return false;
+  }
+
+  private startDrain(): Promise<void> {
     if (this.running) return this.running;
-    const run = this.drain(keepalive).finally(() => {
+    if (this.items.length === 0) return Promise.resolve();
+    const run = this.drain().finally(() => {
       if (this.running === run) this.running = undefined;
       if (this.items.length > 0 && !this.timer) {
-        queueMicrotask(() => { void this.startDrain(false); });
+        queueMicrotask(() => { void this.startDrain(); });
       }
     });
     this.running = run;
@@ -227,31 +293,81 @@ export class DeliveryQueue<T> {
     const budget = keepalive && this.keepaliveMaxBatchBytes !== undefined
       ? Math.min(this.keepaliveMaxBatchBytes, this.maxBatchBytes ?? Number.POSITIVE_INFINITY)
       : this.maxBatchBytes;
-    let count = limit;
-    if (budget !== undefined && this.estimateItemBytes) {
-      let batchBytes = this.batchOverheadBytes + this.items[0].bytes;
-      count = 1;
-      while (count < limit) {
-        const nextBytes = this.items[count].bytes + 1;
-        if (batchBytes + nextBytes > budget) break;
-        batchBytes += nextBytes;
-        count++;
+    const enforceBytes = budget !== undefined && this.estimateItemBytes !== undefined;
+    const distinctKeys = this.maxBatchDistinctKeys !== undefined && this.batchDistinctKey
+      ? new Set<string>([this.batchDistinctKey(this.items[0].item)])
+      : undefined;
+    let batchBytes = enforceBytes ? this.batchOverheadBytes + this.items[0].bytes : 0;
+    let count = 1;
+    while (count < limit) {
+      const entry = this.items[count];
+      let nextBatchBytes = batchBytes;
+      if (enforceBytes) {
+        nextBatchBytes += entry.bytes + 1;
+        if (nextBatchBytes > budget!) break;
       }
+      let nextKey: string | undefined;
+      if (distinctKeys) {
+        nextKey = this.batchDistinctKey!(entry.item);
+        if (!distinctKeys.has(nextKey) && distinctKeys.size >= this.maxBatchDistinctKeys!) break;
+      }
+      batchBytes = nextBatchBytes;
+      if (distinctKeys && nextKey !== undefined) distinctKeys.add(nextKey);
+      count++;
     }
     const entries = this.items.splice(0, count);
-    for (const entry of entries) this.queuedBytes -= entry.bytes;
+    for (const entry of entries) {
+      this.queuedBytes -= entry.bytes;
+      if (entry.dedupeKey !== undefined) this.pendingByKey.delete(entry.dedupeKey);
+    }
     return entries.map((entry) => entry.item);
   }
 
-  private async drain(keepalive: boolean): Promise<void> {
+  private startBatchDelivery(batch: T[], keepalive: boolean): Promise<void> {
+    const delivery = this.deliver(batch, keepalive);
+    const tracked = delivery.finally(() => {
+      this.resident -= batch.length;
+      this.inFlight.delete(tracked);
+      if (keepalive) this.keepaliveInFlight.delete(tracked);
+    });
+    this.inFlight.add(tracked);
+    if (keepalive) this.keepaliveInFlight.add(tracked);
+    return tracked;
+  }
+
+  private async drain(): Promise<void> {
     while (this.items.length > 0) {
       if (this.controller.signal.aborted) {
         this.dropQueued(abortReason(this.controller.signal));
         return;
       }
-      const batch = this.takeBatch(keepalive);
-      await this.deliver(batch, keepalive);
-      this.resident -= batch.length;
+      const batch = this.takeBatch(false);
+      await this.startBatchDelivery(batch, false);
+    }
+  }
+
+  private async drainKeepalive(): Promise<void> {
+    while (this.items.length > 0 || this.keepaliveInFlight.size > 0) {
+      if (this.items.length > 0) {
+        if (this.controller.signal.aborted) {
+          this.dropQueued(abortReason(this.controller.signal));
+        } else {
+          // Dispatch all queued batches synchronously before awaiting so pagehide/visibilitychange
+          // unload handlers fire fetch(..., { keepalive: true }) even if an async drain is stalled.
+          while (this.items.length > 0) {
+            if (this.controller.signal.aborted) {
+              this.dropQueued(abortReason(this.controller.signal));
+              break;
+            }
+            const batch = this.takeBatch(true);
+            if (batch.length === 0) break;
+            this.startBatchDelivery(batch, true);
+          }
+        }
+      }
+      if (this.keepaliveInFlight.size > 0) {
+        await Promise.all(Array.from(this.keepaliveInFlight));
+      }
     }
   }
 
@@ -321,6 +437,7 @@ export class DeliveryQueue<T> {
   private dropQueued(error: unknown): void {
     const count = this.items.length;
     this.items.length = 0;
+    this.pendingByKey.clear();
     this.queuedBytes = 0;
     this.resident -= count;
     this.lastError = error;

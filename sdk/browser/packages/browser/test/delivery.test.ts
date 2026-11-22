@@ -402,6 +402,229 @@ describe("DeliveryQueue", () => {
     expect(send).toHaveBeenCalledWith([1], { keepalive: true, signal: expect.any(AbortSignal) });
   });
 
+  it("dispatches keepalive batches synchronously from flush(true) while an async drain is in flight", async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const sent: Array<{ batch: number[]; keepalive: boolean }> = [];
+    const send = vi.fn(async (batch: number[], options: DeliverySendOptions) => {
+      sent.push({ batch, keepalive: options.keepalive });
+      if (batch[0] === 1) await firstGate;
+    });
+    const queue = new DeliveryQueue<number>({
+      capacity: 10,
+      batchSize: 1,
+      flushIntervalMs: 60_000,
+      maxAttempts: 1,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      send,
+    });
+
+    queue.enqueue(1);
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+
+    queue.enqueue(2);
+    queue.enqueue(3);
+
+    const keepaliveFlush = queue.flush(true);
+    // Remaining batches must be dispatched synchronously with keepalive: true without waiting for item 1.
+    expect(sent).toEqual([
+      { batch: [1], keepalive: false },
+      { batch: [2], keepalive: true },
+      { batch: [3], keepalive: true },
+    ]);
+    await keepaliveFlush;
+    expect(queue.diagnostics()).toMatchObject({ pending: 1, dropped: 0 });
+
+    releaseFirst();
+    await queue.flush();
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(queue.diagnostics()).toMatchObject({ pending: 0, dropped: 0 });
+  });
+
+  it("dispatches keepalive batches synchronously from flush(true) while an async drain is stalled in retry backoff", async () => {
+    let releaseRetry!: () => void;
+    const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    let firstAttempt = true;
+    const sent: Array<{ batch: string[]; keepalive: boolean }> = [];
+    const send = vi.fn(async (batch: string[], options: DeliverySendOptions) => {
+      sent.push({ batch, keepalive: options.keepalive });
+      if (batch[0].startsWith("a") && firstAttempt) {
+        firstAttempt = false;
+        throw new TransportError(503, "unavailable");
+      }
+    });
+    const wait = vi.fn(async () => retryGate);
+    const queue = new DeliveryQueue<string>({
+      capacity: 10,
+      batchSize: 10,
+      flushIntervalMs: 60_000,
+      maxAttempts: 2,
+      retryInitialMs: 100,
+      retryMaxMs: 200,
+      maxBatchBytes: 200 * 1024,
+      keepaliveMaxBatchBytes: MAX_KEEPALIVE_BYTES,
+      batchOverheadBytes: 16,
+      estimateItemBytes: (item) => new TextEncoder().encode(item).byteLength,
+      send,
+      wait,
+    });
+
+    const itemA = "a".repeat(35 * 1024);
+    const itemB = "b".repeat(35 * 1024);
+    const itemC = "c".repeat(35 * 1024);
+
+    // Trigger an async drain for itemA alone and stall inside retry wait.
+    queue.enqueue(itemA);
+    const normalFlush = queue.flush(false);
+    await vi.waitFor(() => expect(wait).toHaveBeenCalledTimes(1));
+
+    // Enqueue two 35KB items while itemA is waiting to retry.
+    queue.enqueue(itemB);
+    queue.enqueue(itemC);
+
+    const keepaliveFlush = queue.flush(true);
+    // Keepalive budget (60KB) must split [itemB] and [itemC] and dispatch both synchronously.
+    expect(sent).toEqual([
+      { batch: [itemA], keepalive: false },
+      { batch: [itemB], keepalive: true },
+      { batch: [itemC], keepalive: true },
+    ]);
+    await keepaliveFlush;
+    expect(queue.diagnostics().pending).toBe(1);
+
+    // Let itemA retry and succeed; ensure itemB/itemC are never sent a second time.
+    releaseRetry();
+    await normalFlush;
+    expect(sent).toEqual([
+      { batch: [itemA], keepalive: false },
+      { batch: [itemB], keepalive: true },
+      { batch: [itemC], keepalive: true },
+      { batch: [itemA], keepalive: false },
+    ]);
+    expect(queue.diagnostics()).toMatchObject({ pending: 0, dropped: 0, lastError: undefined });
+  });
+
+  it("aborts both in-flight async drains and in-flight keepalive deliveries when close({ timeoutMs }) expires", async () => {
+    const drops: Array<{ reason: string; count: number }> = [];
+    const queue = new DeliveryQueue<number>({
+      capacity: 4,
+      batchSize: 1,
+      flushIntervalMs: 60_000,
+      maxAttempts: 2,
+      retryInitialMs: 10,
+      retryMaxMs: 20,
+      send: async () => new Promise<void>(() => {}),
+      onDrop: (drop) => drops.push({ reason: drop.reason, count: drop.count }),
+    });
+
+    queue.enqueue(1);
+    const normalFlush = queue.flush(false);
+    queue.enqueue(2);
+    const keepaliveFlush = queue.flush(true);
+
+    await expect(queue.close({ timeoutMs: 25 })).resolves.toBeUndefined();
+    await Promise.all([normalFlush, keepaliveFlush]);
+    expect(drops).toEqual([
+      { reason: "shutdown_budget", count: 1 },
+      { reason: "shutdown_budget", count: 1 },
+    ]);
+    expect(queue.diagnostics()).toMatchObject({ pending: 0, dropped: 2 });
+  });
+
+  it("deduplicates unsent items by dedupeKey keeping the latest value without mutating in-flight batches", async () => {
+    const sent: Array<Array<{ key: string; value: number }>> = [];
+    const drops: Array<{ reason: string; count: number }> = [];
+    const cappedQueue = new DeliveryQueue<{ key: string; value: number }>({
+      capacity: 2,
+      batchSize: 10,
+      flushIntervalMs: 60_000,
+      maxAttempts: 1,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      estimateItemBytes: (item) => JSON.stringify(item).length,
+      dedupeKey: (item) => item.key,
+      send: async (batch) => { sent.push(batch); },
+      onDrop: (drop) => drops.push({ reason: drop.reason, count: drop.count }),
+    });
+
+    expect(cappedQueue.enqueue({ key: "LCP:/a", value: 100 })).toBe(true);
+    expect(cappedQueue.enqueue({ key: "LCP:/a", value: 250 })).toBe(true);
+    expect(cappedQueue.enqueue({ key: "CLS:/a", value: 0.1 })).toBe(true);
+    // Queue is at capacity (2 resident keys), so updating an existing key must still succeed in-place.
+    expect(cappedQueue.enqueue({ key: "CLS:/a", value: 0.2 })).toBe(true);
+    // A brand-new key overflows capacity and drops as queue_full.
+    expect(cappedQueue.enqueue({ key: "INP:/a", value: 50 })).toBe(false);
+    expect(drops).toEqual([{ reason: "queue_full", count: 1 }]);
+    expect(cappedQueue.diagnostics()).toMatchObject({ pending: 2, dropped: 1 });
+    await cappedQueue.flush();
+    expect(sent).toEqual([[{ key: "LCP:/a", value: 250 }, { key: "CLS:/a", value: 0.2 }]]);
+
+    // While a batch is in flight, a new reading for the same key must queue separately without mutating it.
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const inFlightSent: Array<Array<{ key: string; value: number }>> = [];
+    const inFlightQueue = new DeliveryQueue<{ key: string; value: number }>({
+      capacity: 3,
+      batchSize: 2,
+      flushIntervalMs: 60_000,
+      maxAttempts: 1,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      dedupeKey: (item) => item.key,
+      send: async (batch) => {
+        inFlightSent.push(batch);
+        if (inFlightSent.length === 1) await firstGate;
+      },
+    });
+    expect(inFlightQueue.enqueue({ key: "LCP:/a", value: 250 })).toBe(true);
+    expect(inFlightQueue.enqueue({ key: "CLS:/a", value: 0.2 })).toBe(true);
+    const firstFlush = inFlightQueue.flush();
+    await vi.waitFor(() => expect(inFlightSent).toHaveLength(1));
+
+    expect(inFlightQueue.enqueue({ key: "LCP:/a", value: 300 })).toBe(true);
+    releaseFirst();
+    await firstFlush;
+
+    expect(inFlightSent).toEqual([
+      [
+        { key: "LCP:/a", value: 250 },
+        { key: "CLS:/a", value: 0.2 },
+      ],
+      [{ key: "LCP:/a", value: 300 }],
+    ]);
+    expect(inFlightQueue.diagnostics()).toMatchObject({ pending: 0, dropped: 0 });
+  });
+
+  it("splits batches so each batch contains at most maxBatchDistinctKeys distinct keys", async () => {
+    const sent: Array<Array<{ page: string; name: string }>> = [];
+    const queue = new DeliveryQueue<{ page: string; name: string }>({
+      capacity: 100,
+      batchSize: 100,
+      flushIntervalMs: 60_000,
+      maxAttempts: 1,
+      retryInitialMs: 1,
+      retryMaxMs: 1,
+      batchDistinctKey: (item) => item.page,
+      maxBatchDistinctKeys: 32,
+      send: async (batch) => { sent.push(batch); },
+    });
+
+    for (let i = 0; i < 32; i++) {
+      expect(queue.enqueue({ page: `/p${i}`, name: "LCP" })).toBe(true);
+    }
+    // Same page as an already-included page fits inside the first batch (still 32 distinct pages).
+    expect(queue.enqueue({ page: "/p0", name: "CLS" })).toBe(true);
+    // 33rd distinct page must split into a second batch.
+    expect(queue.enqueue({ page: "/p32", name: "LCP" })).toBe(true);
+
+    await queue.flush();
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toHaveLength(33);
+    expect(new Set(sent[0].map((item) => item.page)).size).toBe(32);
+    expect(sent[1]).toEqual([{ page: "/p32", name: "LCP" }]);
+  });
+
   it("exports a low-cardinality diagnostic when the browser error queue is full", async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => (
       new Response(null, { status: 204 })

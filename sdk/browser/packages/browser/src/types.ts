@@ -71,6 +71,7 @@ export interface ReplayConfig {
 export interface DeliveryConfig {
   errorQueueCapacity?: number;
   traceQueueCapacity?: number;
+  vitalQueueCapacity?: number;
   replayQueueCapacity?: number;
   diagnosticQueueCapacity?: number;
   maxAttempts?: number;

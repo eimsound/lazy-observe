@@ -71,14 +71,14 @@ The module-level `captureException()` targets the latest initialized client. `be
 
 ## Telemetry drop diagnostics
 
-Errors, spans, replay segments, and drop diagnostics use bounded, protocol-aware in-memory queues. These queues drop permanent 4xx rejections immediately as `server_rejected`, retry `408`, `429`, `5xx`, and transient failures with `Retry-After` or Full Jitter exponential backoff, enforce per-attempt timeouts, and split batches by byte budget. Batch splitting stays under the 64 KiB `keepalive` cap on page unload and aligns with the 200 KiB error-event limit.
+Errors, spans, Web Vitals, replay segments, and drop diagnostics use bounded, protocol-aware in-memory queues. These queues drop permanent 4xx rejections immediately as `server_rejected`, retry `408`, `429`, `5xx`, and transient failures with `Retry-After` or Full Jitter exponential backoff, enforce per-attempt timeouts, and split batches by byte budget (and `<= 32` distinct pages for Web Vitals). Unsent Web Vitals are deduplicated by `(name, page)` keeping the latest value; batch splitting stays under the 64 KiB `keepalive` cap on page unload (with `visibilitychange`/`pagehide` flushing synchronously even if an async retry is in flight) and aligns with the 200 KiB error-event limit.
 
-Before queuing an error event, the built-in `sanitize` pipeline strips URL credentials, query strings, and fragments, and caps oversized fields and stack frames. Web Vitals bypass these queues and post once per metric. The SDK never throws an ingest failure into the page. Every drop increments `client.diagnostics().droppedTelemetry`, emits one local `console.warn`, and reports to `/api/events/diagnostics`.
+Before queuing an error event, the built-in `sanitize` pipeline strips URL credentials, query strings, and fragments, and caps oversized fields and stack frames. The SDK never throws an ingest failure into the page. Every drop increments `client.diagnostics().droppedTelemetry`, emits one local `console.warn`, and reports to `/api/events/diagnostics`.
 
 | `reason` | Meaning |
 | --- | --- |
 | `queue_full` | A bounded queue was full and the SDK dropped the new telemetry. |
-| `retry_exhausted` | The finite delivery budget ran out. Vitals are sent once, so a network error, 5xx, 408, or 429 reports this reason. |
+| `retry_exhausted` | The finite delivery budget ran out after exhausting configured retry attempts. |
 | `shutdown_budget` | Telemetry was enqueued after `close()`. |
 | `server_rejected` | Ingest returned 4xx, excluding 408 and 429 which are transient. The payload will never be accepted as-is, so the SDK does not retry it. |
 
