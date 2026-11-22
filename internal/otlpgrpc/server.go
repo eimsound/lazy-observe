@@ -20,16 +20,13 @@ import (
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/selfmetrics"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
-	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
-	metricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
-	tracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	_ "google.golang.org/grpc/encoding/gzip" // Register gzip decompressor for standard OTel gRPC exporters.
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -137,6 +134,7 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	opts := []grpc.ServerOption{
+		grpc.ForceServerCodecV2(newRawOrProtoCodec(mem.DefaultBufferPool())),
 		grpc.MaxRecvMsgSize(cfg.MaxRecvMsgSize),
 		grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
@@ -148,13 +146,6 @@ func NewServer(cfg Config) (*Server, error) {
 			Time:              2 * time.Minute,
 			Timeout:           20 * time.Second,
 		}),
-		grpc.ChainUnaryInterceptor(
-			s.metricsUnaryInterceptor,
-			s.recoverUnaryInterceptor,
-			s.concurrencyUnaryInterceptor,
-			s.authUnaryInterceptor,
-			s.rateLimitUnaryInterceptor,
-		),
 	}
 	if cfg.TLSConfig != nil {
 		tlsCfg := cfg.TLSConfig.Clone()
@@ -165,9 +156,9 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	s.grpcServer = grpc.NewServer(opts...)
-	tracepb.RegisterTraceServiceServer(s.grpcServer, &traceService{server: s})
-	metricspb.RegisterMetricsServiceServer(s.grpcServer, &metricsService{server: s})
-	logspb.RegisterLogsServiceServer(s.grpcServer, &logsService{server: s})
+	s.grpcServer.RegisterService(&traceRawServiceDesc, s)
+	s.grpcServer.RegisterService(&metricsRawServiceDesc, s)
+	s.grpcServer.RegisterService(&logsRawServiceDesc, s)
 	return s, nil
 }
 
@@ -214,48 +205,31 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.stopErr
 }
 
-func (s *Server) recoverUnaryInterceptor(
-	ctx context.Context,
-	req any,
-	info *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (resp any, err error) {
+// handleExportStream enforces the required per-RPC pipeline on a single-request
+// custom StreamDesc: metrics -> recover -> concurrency -> auth -> RecvMsg ->
+// top-level wire validation -> rate limit -> upstream forward -> SendMsg.
+func (s *Server) handleExportStream(stream grpc.ServerStream, spec exportSignalSpec) (err error) {
+	// 1. metrics (registered first so it observes panic recovery and RecvMsg errors).
+	defer func() {
+		if s.selfMetrics != nil {
+			s.selfMetrics.ObserveIngest(selfmetrics.ProtocolGRPC, spec.metricSignal, classifyGRPCOutcome(err))
+		}
+	}()
+
+	// 2. recover (registered second so panics become codes.Internal before metrics records).
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error(
 				"otlp grpc handler panic",
-				"method", info.FullMethod,
+				"method", spec.fullMethod,
 				"panic", fmt.Sprint(r),
 				"stack", string(debug.Stack()),
 			)
-			resp = nil
 			err = status.Error(codes.Internal, "internal server error")
 		}
 	}()
-	return handler(ctx, req)
-}
 
-func (s *Server) metricsUnaryInterceptor(
-	ctx context.Context,
-	req any,
-	info *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (any, error) {
-	resp, err := handler(ctx, req)
-	if s.selfMetrics != nil {
-		if sig, ok := signalFromGRPCMethod(info.FullMethod); ok {
-			s.selfMetrics.ObserveIngest(selfmetrics.ProtocolGRPC, sig, classifyGRPCOutcome(err))
-		}
-	}
-	return resp, err
-}
-
-func (s *Server) concurrencyUnaryInterceptor(
-	ctx context.Context,
-	req any,
-	_ *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (any, error) {
+	// 3. concurrency limit (before auth and RecvMsg).
 	if s.inFlightSem != nil {
 		select {
 		case s.inFlightSem <- struct{}{}:
@@ -269,62 +243,65 @@ func (s *Server) concurrencyUnaryInterceptor(
 				<-s.inFlightSem
 			}()
 		default:
-			return nil, throttledStatusError("too many concurrent OTLP gRPC requests", defaultRetryDelay)
+			return throttledStatusError("too many concurrent OTLP gRPC requests", defaultRetryDelay)
 		}
 	}
-	return handler(ctx, req)
-}
 
-func (s *Server) authUnaryInterceptor(
-	ctx context.Context,
-	req any,
-	_ *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (any, error) {
-	project, err := authenticateContext(ctx, s.auth, s.logger)
-	if err != nil {
-		return nil, err
+	// 4. auth (before RecvMsg so unauthenticated calls do not decompress/buffer payloads).
+	ctx := stream.Context()
+	project, authErr := authenticateContext(ctx, s.auth, s.logger)
+	if authErr != nil {
+		return authErr
 	}
-	return handler(withProject(ctx, project), req)
+
+	// 5. RecvMsg into rawPayload and deterministically release pooled memory.
+	var rawReq rawPayload
+	defer rawReq.Free()
+	if recvErr := stream.RecvMsg(&rawReq); recvErr != nil {
+		return recvErr
+	}
+
+	// 6. top-level wire check -> rate limit -> forwardRawProtobuf -> SendMsg.
+	if valErr := validateTopLevelOTLPRequest(rawReq.Bytes()); valErr != nil {
+		return valErr
+	}
+	if rlErr := s.checkIngestRateLimit(project.ID, int64(rawReq.Len())); rlErr != nil {
+		return rlErr
+	}
+	targetURL, applyTenantHeaders, targetErr := spec.resolveTarget(s, project)
+	if targetErr != nil {
+		return targetErr
+	}
+	resp := spec.newResponse()
+	if fwdErr := s.forwardRawProtobuf(
+		ctx,
+		spec.name,
+		targetURL,
+		project,
+		applyTenantHeaders,
+		&rawReq,
+		resp,
+	); fwdErr != nil {
+		return fwdErr
+	}
+	if sendErr := stream.SendMsg(resp); sendErr != nil {
+		return sendErr
+	}
+	return nil
 }
 
-func (s *Server) rateLimitUnaryInterceptor(
-	ctx context.Context,
-	req any,
-	_ *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (any, error) {
+func (s *Server) checkIngestRateLimit(projectID int, payloadBytes int64) error {
 	if s.ingestLimiter == nil || !s.ingestLimiter.Enabled() {
-		return handler(ctx, req)
+		return nil
 	}
-	project, ok := projectFromContext(ctx)
-	if !ok || project.ID <= 0 {
-		return nil, status.Error(codes.Internal, "project context is missing")
+	if projectID <= 0 {
+		return status.Error(codes.Internal, "project context is missing")
 	}
-	var payloadBytes int64
-	if s.ingestLimiter.ByteLimitEnabled() {
-		if msg, ok := req.(proto.Message); ok {
-			payloadBytes = int64(proto.Size(msg))
-		}
-	}
-	decision := s.ingestLimiter.Allow(project.ID, payloadBytes)
+	decision := s.ingestLimiter.Allow(projectID, payloadBytes)
 	if !decision.Allowed {
-		return nil, throttledStatusError("project ingest rate limit exceeded", decision.RetryAfter)
+		return throttledStatusError("project ingest rate limit exceeded", decision.RetryAfter)
 	}
-	return handler(ctx, req)
-}
-
-func signalFromGRPCMethod(fullMethod string) (selfmetrics.Signal, bool) {
-	switch fullMethod {
-	case tracepb.TraceService_Export_FullMethodName:
-		return selfmetrics.SignalTraces, true
-	case metricspb.MetricsService_Export_FullMethodName:
-		return selfmetrics.SignalMetrics, true
-	case logspb.LogsService_Export_FullMethodName:
-		return selfmetrics.SignalLogs, true
-	default:
-		return 0, false
-	}
+	return nil
 }
 
 func classifyGRPCOutcome(err error) selfmetrics.Outcome {

@@ -1,7 +1,6 @@
 package otlpgrpc
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -13,10 +12,12 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
+	"github.com/eimsound/lazy-observe/internal/selfmetrics"
 	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -37,115 +38,135 @@ const (
 	upstreamLogsPath    = "/insert/opentelemetry/v1/logs"
 )
 
-type traceService struct {
-	tracepb.UnimplementedTraceServiceServer
-	server *Server
+type rawExportServer interface {
+	handleExportStream(stream grpc.ServerStream, spec exportSignalSpec) error
 }
 
-func (svc *traceService) Export(
-	ctx context.Context,
-	req *tracepb.ExportTraceServiceRequest,
-) (*tracepb.ExportTraceServiceResponse, error) {
-	resp := &tracepb.ExportTraceServiceResponse{}
-	if err := svc.server.exportTenantSignal(
-		ctx,
-		"traces",
-		svc.server.storage.TracesIngestBase(),
-		upstreamTracesPath,
-		req,
-		resp,
-	); err != nil {
-		return nil, err
-	}
-	return resp, nil
+type exportSignalSpec struct {
+	name          string
+	fullMethod    string
+	metricSignal  selfmetrics.Signal
+	resolveTarget func(s *Server, project meta.ProjectInfo) (targetURL string, applyTenantHeaders bool, err error)
+	newResponse   func() proto.Message
 }
 
-type metricsService struct {
-	metricspb.UnimplementedMetricsServiceServer
-	server *Server
+var (
+	tracesExportSpec = exportSignalSpec{
+		name:         "traces",
+		fullMethod:   tracepb.TraceService_Export_FullMethodName,
+		metricSignal: selfmetrics.SignalTraces,
+		resolveTarget: func(s *Server, project meta.ProjectInfo) (string, bool, error) {
+			if project.ID <= 0 {
+				return "", false, status.Error(codes.Internal, "project context is missing")
+			}
+			return buildTargetURL(s.storage.TracesIngestBase(), upstreamTracesPath, nil), true, nil
+		},
+		newResponse: func() proto.Message {
+			return &tracepb.ExportTraceServiceResponse{}
+		},
+	}
+
+	metricsExportSpec = exportSignalSpec{
+		name:         "metrics",
+		fullMethod:   metricspb.MetricsService_Export_FullMethodName,
+		metricSignal: selfmetrics.SignalMetrics,
+		resolveTarget: func(s *Server, project meta.ProjectInfo) (string, bool, error) {
+			if !s.storage.MetricsIngestEnabled() {
+				return "", false, status.Error(codes.Unimplemented, "metrics ingest is disabled")
+			}
+			if project.ID <= 0 || strings.TrimSpace(project.Slug) == "" {
+				return "", false, status.Error(codes.Internal, "project context is missing")
+			}
+			extraLabel, err := s.storage.MetricsIngestExtraLabel(project.Slug)
+			if err != nil {
+				return "", false, status.Error(codes.Internal, "project context is missing")
+			}
+			query := url.Values{"extra_label": []string{extraLabel}}
+			return buildTargetURL(s.storage.MetricsIngestBase(), upstreamMetricsPath, query), false, nil
+		},
+		newResponse: func() proto.Message {
+			return &metricspb.ExportMetricsServiceResponse{}
+		},
+	}
+
+	logsExportSpec = exportSignalSpec{
+		name:         "logs",
+		fullMethod:   logspb.LogsService_Export_FullMethodName,
+		metricSignal: selfmetrics.SignalLogs,
+		resolveTarget: func(s *Server, project meta.ProjectInfo) (string, bool, error) {
+			if project.ID <= 0 {
+				return "", false, status.Error(codes.Internal, "project context is missing")
+			}
+			return buildTargetURL(s.storage.LogsIngestBase(), upstreamLogsPath, nil), true, nil
+		},
+		newResponse: func() proto.Message {
+			return &logspb.ExportLogsServiceResponse{}
+		},
+	}
+
+	traceRawServiceDesc = grpc.ServiceDesc{
+		ServiceName: "opentelemetry.proto.collector.trace.v1.TraceService",
+		HandlerType: (*rawExportServer)(nil),
+		Streams: []grpc.StreamDesc{{
+			StreamName:    "Export",
+			Handler:       _TraceService_RawExport_Handler,
+			ClientStreams: false,
+			ServerStreams: false,
+		}},
+		Metadata: "opentelemetry/proto/collector/trace/v1/trace_service.proto",
+	}
+
+	metricsRawServiceDesc = grpc.ServiceDesc{
+		ServiceName: "opentelemetry.proto.collector.metrics.v1.MetricsService",
+		HandlerType: (*rawExportServer)(nil),
+		Streams: []grpc.StreamDesc{{
+			StreamName:    "Export",
+			Handler:       _MetricsService_RawExport_Handler,
+			ClientStreams: false,
+			ServerStreams: false,
+		}},
+		Metadata: "opentelemetry/proto/collector/metrics/v1/metrics_service.proto",
+	}
+
+	logsRawServiceDesc = grpc.ServiceDesc{
+		ServiceName: "opentelemetry.proto.collector.logs.v1.LogsService",
+		HandlerType: (*rawExportServer)(nil),
+		Streams: []grpc.StreamDesc{{
+			StreamName:    "Export",
+			Handler:       _LogsService_RawExport_Handler,
+			ClientStreams: false,
+			ServerStreams: false,
+		}},
+		Metadata: "opentelemetry/proto/collector/logs/v1/logs_service.proto",
+	}
+)
+
+func _TraceService_RawExport_Handler(srv any, stream grpc.ServerStream) error {
+	return srv.(rawExportServer).handleExportStream(stream, tracesExportSpec)
 }
 
-func (svc *metricsService) Export(
-	ctx context.Context,
-	req *metricspb.ExportMetricsServiceRequest,
-) (*metricspb.ExportMetricsServiceResponse, error) {
-	if !svc.server.storage.MetricsIngestEnabled() {
-		return nil, status.Error(codes.Unimplemented, "metrics ingest is disabled")
-	}
-	project, ok := projectFromContext(ctx)
-	if !ok || project.ID <= 0 || strings.TrimSpace(project.Slug) == "" {
-		return nil, status.Error(codes.Internal, "project context is missing")
-	}
-	extraLabel, err := svc.server.storage.MetricsIngestExtraLabel(project.Slug)
-	if err != nil {
-		return nil, status.Error(codes.Internal, "project context is missing")
-	}
-	query := url.Values{"extra_label": []string{extraLabel}}
-	target := buildTargetURL(svc.server.storage.MetricsIngestBase(), upstreamMetricsPath, query)
-
-	resp := &metricspb.ExportMetricsServiceResponse{}
-	if err := svc.server.forwardProtobuf(ctx, "metrics", target, project, false, req, resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
+func _MetricsService_RawExport_Handler(srv any, stream grpc.ServerStream) error {
+	return srv.(rawExportServer).handleExportStream(stream, metricsExportSpec)
 }
 
-type logsService struct {
-	logspb.UnimplementedLogsServiceServer
-	server *Server
+func _LogsService_RawExport_Handler(srv any, stream grpc.ServerStream) error {
+	return srv.(rawExportServer).handleExportStream(stream, logsExportSpec)
 }
 
-func (svc *logsService) Export(
-	ctx context.Context,
-	req *logspb.ExportLogsServiceRequest,
-) (*logspb.ExportLogsServiceResponse, error) {
-	resp := &logspb.ExportLogsServiceResponse{}
-	if err := svc.server.exportTenantSignal(
-		ctx,
-		"logs",
-		svc.server.storage.LogsIngestBase(),
-		upstreamLogsPath,
-		req,
-		resp,
-	); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (s *Server) exportTenantSignal(
-	ctx context.Context,
-	signal string,
-	baseURL string,
-	upstreamPath string,
-	reqMsg proto.Message,
-	respMsg proto.Message,
-) error {
-	project, ok := projectFromContext(ctx)
-	if !ok || project.ID <= 0 {
-		return status.Error(codes.Internal, "project context is missing")
-	}
-	target := buildTargetURL(baseURL, upstreamPath, nil)
-	return s.forwardProtobuf(ctx, signal, target, project, true, reqMsg, respMsg)
-}
-
-func (s *Server) forwardProtobuf(
+func (s *Server) forwardRawProtobuf(
 	ctx context.Context,
 	signal string,
 	targetURL string,
 	project meta.ProjectInfo,
 	applyTenantHeaders bool,
-	reqMsg proto.Message,
+	rawReq *rawPayload,
 	respMsg proto.Message,
 ) error {
-	if reqMsg == nil {
+	if rawReq == nil {
 		return status.Error(codes.InvalidArgument, "empty OTLP export request")
 	}
-	payload, err := proto.Marshal(reqMsg)
-	if err != nil {
-		return status.Error(codes.InvalidArgument, "failed to encode OTLP request")
-	}
-	if len(payload) > s.maxRecvMsgSize {
+	payloadLen := rawReq.Len()
+	if s.maxRecvMsgSize > 0 && payloadLen > s.maxRecvMsgSize {
 		return status.Error(codes.ResourceExhausted, "OTLP request exceeds size limit")
 	}
 
@@ -156,11 +177,19 @@ func (s *Server) forwardProtobuf(
 		defer stopAfter()
 	}
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(payload))
+	var body io.Reader = http.NoBody
+	if payloadLen > 0 {
+		bodyReader := newRawBufferReader(rawReq.buf)
+		defer bodyReader.Close()
+		body = bodyReader
+	}
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, body)
 	if err != nil {
 		s.logger.Error("otlp grpc build upstream request failed", "signal", signal, "error", err)
 		return status.Error(codes.Internal, "failed to construct upstream request")
 	}
+	httpReq.ContentLength = int64(payloadLen)
 	httpReq.Header.Set("Content-Type", otlpProtobufContentType)
 	if applyTenantHeaders {
 		if err := s.storage.ApplyTenantHeaders(httpReq.Header, project.ID); err != nil {
@@ -210,7 +239,9 @@ func (s *Server) forwardProtobuf(
 	// Best-effort protobuf response decoding preserves partial_success details
 	// when the upstream returns an OTLP Export*ServiceResponse, while remaining
 	// tolerant of Victoria* endpoints that return an empty or plain-text 200.
-	_ = proto.Unmarshal(respBody, respMsg)
+	if err := proto.Unmarshal(respBody, respMsg); err != nil {
+		proto.Reset(respMsg)
+	}
 	return nil
 }
 

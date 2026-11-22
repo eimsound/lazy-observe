@@ -25,7 +25,9 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/status"
 )
 
@@ -502,5 +504,122 @@ func TestOTLPGRPCPanicRecordsUpstreamErrorMetric(t *testing.T) {
 	}
 	if grpcErrCount != 1 {
 		t.Fatalf("grpc traces upstream_error=%v want 1", grpcErrCount)
+	}
+}
+
+func TestOTLPGRPCRecvMsgErrorsRecordMetricsAndReleaseInFlight(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	backend, err := storagepkg.New(
+		storagepkg.MetricsVM,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsReg := selfmetrics.New(selfmetrics.Config{})
+	auth := &stubAuth{tokens: map[string]meta.ProjectInfo{"lo_ok": {ID: 1, Slug: "default"}}}
+
+	_, conn, _ := startTestServer(t, otlpgrpc.Config{
+		Auth:           auth,
+		Storage:        backend,
+		HTTPClient:     upstream.Client(),
+		SelfMetrics:    metricsReg,
+		MaxRecvMsgSize: 2048,
+	})
+
+	ctx := withAuthHeader(context.Background(), "Bearer lo_ok")
+	tracesClient := tracepb.NewTraceServiceClient(conn)
+	metricsClient := metricspb.NewMetricsServiceClient(conn)
+	logsClient := logspb.NewLogsServiceClient(conn)
+
+	// 1. Oversized traces, metrics, logs requests fail in RecvMsg (ResourceExhausted, no RetryInfo).
+	if _, err := tracesClient.Export(
+		ctx,
+		sampleTraceRequest(strings.Repeat("t", 4096)),
+	); status.Code(
+		err,
+	) != codes.ResourceExhausted {
+		t.Fatalf("oversized traces code=%s want=ResourceExhausted (err=%v)", status.Code(err), err)
+	}
+	if _, err := metricsClient.Export(
+		ctx,
+		sampleMetricsRequest(strings.Repeat("m", 4096)),
+	); status.Code(
+		err,
+	) != codes.ResourceExhausted {
+		t.Fatalf("oversized metrics code=%s want=ResourceExhausted (err=%v)", status.Code(err), err)
+	}
+	if _, err := logsClient.Export(
+		ctx,
+		sampleLogsRequest(strings.Repeat("l", 4096)),
+	); status.Code(
+		err,
+	) != codes.ResourceExhausted {
+		t.Fatalf("oversized logs code=%s want=ResourceExhausted (err=%v)", status.Code(err), err)
+	}
+
+	// 2. Gzip bomb fails in RecvMsg during decompression size check.
+	_, err = tracesClient.Export(
+		ctx,
+		sampleTraceRequest(strings.Repeat("z", 16384)),
+		grpc.UseCompressor(gzip.Name),
+	)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("gzip bomb code=%s want=ResourceExhausted (err=%v)", status.Code(err), err)
+	}
+	if _, hasRetryInfo := retryInfoDelay(err); hasRetryInfo {
+		t.Fatalf("gzip bomb must not attach RetryInfo: %v", err)
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("upstreamHits=%d want 0", upstreamHits.Load())
+	}
+
+	var buf bytes.Buffer
+	if err := metricsReg.WritePrometheus(&buf); err != nil {
+		t.Fatal(err)
+	}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatalf("invalid prometheus output: %v", err)
+	}
+
+	rejected := map[string]float64{}
+	for _, m := range families["lazy_observe_ingest_requests_total"].GetMetric() {
+		lbls := map[string]string{}
+		for _, lp := range m.GetLabel() {
+			lbls[lp.GetName()] = lp.GetValue()
+		}
+		if lbls["protocol"] == "grpc" && lbls["outcome"] == "rejected" {
+			rejected[lbls["signal"]] = m.GetCounter().GetValue()
+		}
+	}
+	if rejected["traces"] != 2 || rejected["metrics"] != 1 || rejected["logs"] != 1 {
+		t.Fatalf("unexpected grpc rejected counts=%v want traces=2 metrics=1 logs=1", rejected)
+	}
+
+	for _, m := range families["lazy_observe_ingest_rate_limited_total"].GetMetric() {
+		lbls := map[string]string{}
+		for _, lp := range m.GetLabel() {
+			lbls[lp.GetName()] = lp.GetValue()
+		}
+		if lbls["protocol"] == "grpc" && m.GetCounter().GetValue() != 0 {
+			t.Fatalf("unexpected grpc rate_limited_total for %s: %v", lbls["signal"], m.GetCounter().GetValue())
+		}
+	}
+
+	inFlight := families["lazy_observe_otlp_grpc_in_flight_requests"].GetMetric()[0].GetGauge().GetValue()
+	if inFlight != 0 {
+		t.Fatalf("in_flight=%v want 0", inFlight)
 	}
 }

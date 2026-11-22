@@ -17,17 +17,6 @@ const (
 	projectTokenPrefix = "lo_"
 )
 
-type projectContextKey struct{}
-
-func withProject(ctx context.Context, project meta.ProjectInfo) context.Context {
-	return context.WithValue(ctx, projectContextKey{}, project)
-}
-
-func projectFromContext(ctx context.Context) (meta.ProjectInfo, bool) {
-	project, ok := ctx.Value(projectContextKey{}).(meta.ProjectInfo)
-	return project, ok
-}
-
 // extractBearerToken parses the gRPC incoming "authorization" metadata header
 // (case-insensitive "Bearer <token>"). Ambiguous multiple values are rejected.
 func extractBearerToken(ctx context.Context) (string, bool) {
