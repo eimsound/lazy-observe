@@ -147,12 +147,12 @@ expect_flag 'sdk/python/lazy_observe/__init__.py' sdk_python sdk_journeys
 expect_flag 'sdk/scripts/sdk-publish.sh' go sdk_go sdk_node sdk_browser sdk_python sdk_journeys
 expect_flag 'scripts/sdk-journeys.sh' go sdk_journeys
 
-# --- 5.5 Zensical 文档站变更面（纯文档站不触发重型业务 job；tools/docs/pyproject.toml 同时触发 go 的 7 天发布年龄校验） ---
+# --- 5.5 Zensical 文档站变更面（纯文档站不触发重型业务 job；docs/pyproject.toml 同时触发 go 的 7 天发布年龄校验） ---
 expect_only_flags 'docs/index.md' docs
 expect_only_flags 'docs/zh/quickstart.md' docs
-expect_only_flags 'zensical.toml' docs
-expect_only_flags 'zensical.zh.toml' docs
-expect_only_flags 'tools/docs/pyproject.toml' go docs
+expect_only_flags 'docs/zensical.toml' docs
+expect_only_flags 'docs/zensical.zh.toml' docs
+expect_only_flags 'docs/pyproject.toml' go docs
 expect_only_flags 'README.md'
 
 # --- 6. --all 与无可用 base 事件兜底 ---

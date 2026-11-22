@@ -150,8 +150,8 @@ classify() {
   web/THIRD_PARTY_LICENSES.md)
     set_flags web
     ;;
-  # Zensical 双语用户文档站：必须在 *.md 之前命中，只触发轻量 docs 构建（tools/docs/pyproject.toml 由上方规则同时触发 go）。
-  docs/* | zensical*.toml | tools/docs/*)
+  # Zensical 双语用户文档站：必须在 *.md 之前命中，只触发轻量 docs 构建（docs/pyproject.toml 由上方规则同时触发 go）。
+  docs/*)
     set_flags docs
     ;;
   # 纯文档与 agent 流程：不跑业务 job。

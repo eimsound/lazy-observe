@@ -6,8 +6,6 @@ on:
       - main
     paths:
       - "docs/**"
-      - "zensical*.toml"
-      - "tools/docs/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -51,7 +49,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/uv
-          key: uv-docs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/docs/pyproject.toml') }}
+          key: uv-docs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('docs/pyproject.toml') }}
           restore-keys: uv-docs-${{ runner.os }}-${{ runner.arch }}-
       - name: Install mise toolchain
         run: bash scripts/ci-setup-mise.sh

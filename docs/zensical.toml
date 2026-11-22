@@ -1,35 +1,47 @@
 [project]
 site_name = "lazy-observe"
-site_description = "基于 VictoriaMetrics、VictoriaLogs 与 VictoriaTraces 的单二进制自托管全栈可观测性平台。"
-site_url = "https://eimsound.github.io/lazy-observe/zh/"
+site_description = "Self-hosted, single-binary full-stack observability platform built on VictoriaMetrics, VictoriaLogs, and VictoriaTraces."
+site_url = "https://eimsound.github.io/lazy-observe/"
 repo_url = "https://github.com/eimsound/lazy-observe"
 repo_name = "eimsound/lazy-observe"
-docs_dir = "docs/zh"
-site_dir = "site/zh"
+docs_dir = "."
+exclude_docs = """
+zh/**
+.venv/**
+.cache/**
+site/**
+pyproject.toml
+uv.lock
+zensical*.toml
+"""
+# Zensical 0.1.1 requires site_dir to stay within the config directory (docs/),
+# while permitting site_dir inside docs_dir when docs_dir == project_root (".").
+# `mise run docs-build` stages docs/site to repo-root site/ after both builds.
+site_dir = "site"
 
 nav = [
-  { "概览" = "index.md" },
-  { "快速上手" = "quickstart.md" },
-  { "部署与运维" = [
-    { "部署指南" = "deployment.md" },
-    { "运维手册" = "operations.md" },
-    { "Grafana 与 Perses" = "grafana-perses.md" },
+  { "Overview" = "index.md" },
+  { "Quickstart" = "quickstart.md" },
+  { "Deployment and operations" = [
+    { "Deployment" = "deployment.md" },
+    { "Operations" = "operations.md" },
+    { "Grafana and Perses" = "grafana-perses.md" },
   ] },
-  { "客户端 SDK" = [
+  { "Client SDKs" = [
     { "Go" = "sdk/go.md" },
     { "Node.js" = "sdk/node.md" },
-    { "Browser 与 React" = "sdk/browser.md" },
+    { "Browser and React" = "sdk/browser.md" },
     { "Python" = "sdk/python.md" },
   ] },
-  { "参考" = [
-    { "平台对比" = "comparison.md" },
-    { "版本兼容矩阵" = "version-matrix.md" },
+  { "Reference" = [
+    { "Platform comparison" = "comparison.md" },
+    { "Version compatibility matrix" = "version-matrix.md" },
   ] },
 ]
 
 [project.theme]
 variant = "modern"
-language = "zh"
+language = "en"
 features = [
   "content.code.copy",
   "navigation.footer",
@@ -43,19 +55,19 @@ features = [
 [[project.theme.palette]]
 media = "(prefers-color-scheme)"
 toggle.icon = "lucide/sun-moon"
-toggle.name = "切换到浅色模式"
+toggle.name = "Switch to light mode"
 
 [[project.theme.palette]]
 media = "(prefers-color-scheme: light)"
 scheme = "default"
 toggle.icon = "lucide/sun"
-toggle.name = "切换到深色模式"
+toggle.name = "Switch to dark mode"
 
 [[project.theme.palette]]
 media = "(prefers-color-scheme: dark)"
 scheme = "slate"
 toggle.icon = "lucide/moon"
-toggle.name = "跟随系统主题"
+toggle.name = "Switch to system preference"
 
 [[project.extra.alternate]]
 name = "English"

@@ -22,7 +22,7 @@ ISC、0BSD、Unlicense 是宽松许可证，可以与 MIT 一起分发，所以 
 
 ### MPL-2.0：目前有 `lightningcss` 与 `pathspec`
 
-`lightningcss` 是 Vite 8 和 `@tailwindcss/vite` 的 CSS 处理器，`web` 已经通过 `@tailwindcss/vite` 使用它；`pathspec` 是文档静态站构建工具 Zensical（`tools/docs/pyproject.toml`）的传递依赖，仅用于文档静态站构建。
+`lightningcss` 是 Vite 8 和 `@tailwindcss/vite` 的 CSS 处理器，`web` 已经通过 `@tailwindcss/vite` 使用它；`pathspec` 是文档静态站构建工具 Zensical（`docs/pyproject.toml`）的传递依赖，仅用于文档静态站构建。
 
 - 只能出现在 devDependencies 或构建工具的依赖树里（其中 `pathspec` 仅限文档静态站构建工具依赖树）。
 - 不得进入任何生产或运行时依赖树，不得链接进 Go 二进制，不得打包进产品。
