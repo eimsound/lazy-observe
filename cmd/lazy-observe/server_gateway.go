@@ -8,7 +8,6 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -263,6 +262,7 @@ func startGateway(
 			MaxItems: cfg.ErrorInbox.MaxItems, MaxBytes: cfg.ErrorInbox.MaxBytes,
 			ReadinessItems: cfg.ErrorInbox.ReadinessItems, ReadinessBytes: cfg.ErrorInbox.ReadinessBytes,
 		},
+		Workers:      errorInboxWorkerCount(metadata.store.IsClustered()),
 		Symbolicator: symbolicate.New(metadata.blobs, 128), OnChange: gw.HandleIssueChange,
 		OnEvent: gw.HandleErrorEvent,
 	}
@@ -271,7 +271,7 @@ func startGateway(
 	}
 	errorTracker, err := errortrack.NewInbox(
 		metadata.store,
-		errortrack.NewVictoriaLogsWriter(signals.backend, http.DefaultClient),
+		errortrack.NewVictoriaLogsWriter(signals.backend, errortrack.NewVictoriaLogsHTTPClient()),
 		inboxOptions,
 	)
 	if err != nil {
@@ -346,6 +346,13 @@ func startGateway(
 		}
 	}
 	return &runningServerGateway{gateway: lifecycle, errors: serverErr}, nil
+}
+
+func errorInboxWorkerCount(clustered bool) int {
+	if clustered {
+		return errortrack.DefaultClusteredWorkers
+	}
+	return 1
 }
 
 func effectiveSecureSessionCookie(cfg appconfig.Config) bool {

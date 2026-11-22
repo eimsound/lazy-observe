@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -708,4 +712,570 @@ func TestInboxPersistsAndRedeliversIssueLifecycleAcrossRestarts(t *testing.T) {
 	if len(delivered) != 1 || delivered[0].Kind != "new_issue" || delivered[0].ProjectID != project.ID {
 		t.Fatalf("delivered lifecycle changes=%#v attempts=%d", delivered, attempts.Load())
 	}
+}
+
+type batchLifecycleSpyStore struct {
+	*meta.Store
+	clustered           bool
+	completeBatchCalls  atomic.Int64
+	completeSingleCalls atomic.Int64
+	claimLifecycleCalls atomic.Int64
+	claimLifecycleCh    chan struct{}
+}
+
+func (s *batchLifecycleSpyStore) IsClustered() bool {
+	return s.clustered
+}
+
+func (s *batchLifecycleSpyStore) CompleteErrorEvent(
+	ctx context.Context,
+	id int64,
+	owner string,
+	claimEpoch int64,
+	delta errortrack.IssueDelta,
+	processedAt time.Time,
+) ([]errortrack.IssueChange, error) {
+	s.completeSingleCalls.Add(1)
+	return s.Store.CompleteErrorEvent(ctx, id, owner, claimEpoch, delta, processedAt)
+}
+
+func (s *batchLifecycleSpyStore) CompleteErrorEvents(
+	ctx context.Context,
+	owner string,
+	completions []errortrack.ErrorCompletion,
+) (errortrack.BatchCompletionResult, error) {
+	s.completeBatchCalls.Add(1)
+	return s.Store.CompleteErrorEvents(ctx, owner, completions)
+}
+
+func (s *batchLifecycleSpyStore) ClaimIssueLifecycleEvents(
+	ctx context.Context,
+	owner string,
+	limit int,
+	now time.Time,
+	ttl time.Duration,
+) ([]errortrack.LifecycleEvent, error) {
+	s.claimLifecycleCalls.Add(1)
+	events, err := s.Store.ClaimIssueLifecycleEvents(ctx, owner, limit, now, ttl)
+	if s.claimLifecycleCh != nil {
+		select {
+		case s.claimLifecycleCh <- struct{}{}:
+		default:
+		}
+	}
+	return events, err
+}
+
+func TestInboxBatchWritesOnceAndDispatchesLifecycleOncePerBatch(t *testing.T) {
+	baseStore, project := newInboxTestStore(t, "batch-lifecycle")
+	spy := &batchLifecycleSpyStore{Store: baseStore, claimLifecycleCh: make(chan struct{}, 4)}
+
+	var vlogsPosts atomic.Int64
+	var vlogsLines atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		vlogsPosts.Add(1)
+		vlogsLines.Add(int64(bytes.Count(bytes.TrimSpace(body), []byte("\n")) + 1))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	var changeMu sync.Mutex
+	var changes []errortrack.IssueChange
+	writer := errortrack.NewVictoriaLogsWriter(&testLogsBackend{baseURL: srv.URL}, srv.Client())
+	inbox, err := errortrack.NewInbox(spy, writer, errortrack.InboxOptions{
+		PollInterval: time.Hour,
+		OnChange: func(_ context.Context, change errortrack.IssueChange) error {
+			changeMu.Lock()
+			changes = append(changes, change)
+			changeMu.Unlock()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	select {
+	case <-spy.claimLifecycleCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial startup lifecycle poll did not complete")
+	}
+
+	firstBatch := make([]errortrack.AcceptedEvent, 10)
+	for i := range firstBatch {
+		firstBatch[i] = inboxEvent(fmt.Sprintf("batch1-%d", i))
+	}
+	if err := inbox.Accept(context.Background(), project, firstBatch); err != nil {
+		t.Fatal(err)
+	}
+	waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool { return d.ActiveItems == 0 })
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		changeMu.Lock()
+		n := len(changes)
+		changeMu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	changeMu.Lock()
+	gotChanges := len(changes)
+	changeMu.Unlock()
+	if gotChanges != 1 {
+		t.Fatalf("delivered changes=%d want 1", gotChanges)
+	}
+	if vlogsPosts.Load() != 1 || vlogsLines.Load() != 10 {
+		t.Fatalf("after batch 1: vlogsPosts=%d vlogsLines=%d want 1 and 10", vlogsPosts.Load(), vlogsLines.Load())
+	}
+	if spy.completeBatchCalls.Load() != 1 || spy.completeSingleCalls.Load() != 0 {
+		t.Fatalf("completeBatch=%d completeSingle=%d", spy.completeBatchCalls.Load(), spy.completeSingleCalls.Load())
+	}
+	lifecycleCallsAfterFirst := spy.claimLifecycleCalls.Load()
+
+	// Second batch on the same open issue produces 0 lifecycle changes -> must
+	// not call ClaimIssueLifecycleEvents at batch end.
+	secondBatch := make([]errortrack.AcceptedEvent, 10)
+	for i := range secondBatch {
+		secondBatch[i] = inboxEvent(fmt.Sprintf("batch2-%d", i))
+	}
+	if err := inbox.Accept(context.Background(), project, secondBatch); err != nil {
+		t.Fatal(err)
+	}
+	waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool { return d.ActiveItems == 0 })
+	if vlogsPosts.Load() != 2 || vlogsLines.Load() != 20 {
+		t.Fatalf("after batch 2: vlogsPosts=%d vlogsLines=%d want 2 and 20", vlogsPosts.Load(), vlogsLines.Load())
+	}
+	if spy.claimLifecycleCalls.Load() != lifecycleCallsAfterFirst {
+		t.Fatalf(
+			"expected no extra ClaimIssueLifecycleEvents when batch has no changes: before=%d after=%d",
+			lifecycleCallsAfterFirst,
+			spy.claimLifecycleCalls.Load(),
+		)
+	}
+	issues, err := baseStore.ListIssues(context.Background(), project.ID, meta.IssueListOptions{})
+	if err != nil || len(issues) != 1 || issues[0].Count != 20 {
+		t.Fatalf("issues=%#v err=%v", issues, err)
+	}
+}
+
+func TestInboxBatch4xxFallbackCompletesGoodAndRetriesBad(t *testing.T) {
+	store, project := newInboxTestStore(t, "inbox-4xx-fallback")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte(`"bad-4xx"`)) {
+			http.Error(w, "bad payload", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	writer := errortrack.NewVictoriaLogsWriter(&testLogsBackend{baseURL: srv.URL}, srv.Client())
+	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		MaxAttempts:  2,
+		RetryInitial: time.Millisecond,
+		RetryCap:     time.Millisecond,
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	if err := inbox.Accept(context.Background(), project, []errortrack.AcceptedEvent{
+		inboxEvent("good-1"),
+		inboxEvent("bad-4xx"),
+		inboxEvent("good-2"),
+		inboxEvent("good-3"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	diag := waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool {
+		return d.ActiveItems == 0 && d.TerminalFailuresTotal == 1
+	})
+	if len(diag.RecentTerminal) != 1 || diag.RecentTerminal[0].EventID != "bad-4xx" {
+		t.Fatalf("terminal diagnostics=%#v", diag.RecentTerminal)
+	}
+	issues, err := store.ListIssues(context.Background(), project.ID, meta.IssueListOptions{})
+	if err != nil || len(issues) != 1 || issues[0].Count != 3 {
+		t.Fatalf("expected 3 good events in issue, got issues=%#v err=%v", issues, err)
+	}
+}
+
+func TestInboxBatch5xxRetriesPerEvent(t *testing.T) {
+	store, project := newInboxTestStore(t, "inbox-5xx-retry")
+	var attempts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "vlogs down", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	writer := errortrack.NewVictoriaLogsWriter(&testLogsBackend{baseURL: srv.URL}, srv.Client())
+	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		MaxAttempts:  5,
+		RetryInitial: time.Millisecond,
+		RetryCap:     time.Millisecond,
+		PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	if err := inbox.Accept(context.Background(), project, []errortrack.AcceptedEvent{
+		inboxEvent("retry-1"), inboxEvent("retry-2"), inboxEvent("retry-3"), inboxEvent("retry-4"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	diag := waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool { return d.ActiveItems == 0 })
+	if diag.RetriesTotal != 4 || attempts.Load() < 2 {
+		t.Fatalf("diag=%#v attempts=%d", diag, attempts.Load())
+	}
+	issues, err := store.ListIssues(context.Background(), project.ID, meta.IssueListOptions{})
+	if err != nil || len(issues) != 1 || issues[0].Count != 4 {
+		t.Fatalf("issues=%#v err=%v", issues, err)
+	}
+}
+
+type blockingBatchWriter struct {
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+func (w *blockingBatchWriter) WriteErrorEvent(
+	_ context.Context,
+	_ errortrack.Project,
+	_ json.RawMessage,
+	_ errortrack.Event,
+) error {
+	return nil
+}
+
+func (w *blockingBatchWriter) WriteErrorEvents(ctx context.Context, events []errortrack.PreparedEvent) []error {
+	w.calls.Add(1)
+	if w.started != nil {
+		select {
+		case w.started <- struct{}{}:
+		default:
+		}
+	}
+	if w.release != nil {
+		select {
+		case <-w.release:
+		case <-ctx.Done():
+			errs := make([]error, len(events))
+			for i := range errs {
+				errs[i] = ctx.Err()
+			}
+			return errs
+		}
+	}
+	return make([]error, len(events))
+}
+
+func TestInboxBatchPartialClaimLostLogsWarnAndCompletesValid(t *testing.T) {
+	store, project := newInboxTestStore(t, "batch-partial-claim-lost")
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, buf: &logBuf}, nil))
+	fixedNow := time.Date(2026, 11, 23, 2, 0, 0, 0, time.UTC)
+	writer := &blockingBatchWriter{started: make(chan struct{}, 1), release: make(chan struct{})}
+	var onEventCalls atomic.Int64
+
+	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		Owner:        "replica-a",
+		Logger:       logger,
+		Now:          func() time.Time { return fixedNow },
+		ClaimTTL:     time.Minute,
+		PollInterval: time.Hour,
+		OnEvent: func(context.Context, errortrack.ErrorOccurrence) error {
+			onEventCalls.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	if err := inbox.Accept(context.Background(), project, []errortrack.AcceptedEvent{
+		inboxEvent("partial-1"),
+		inboxEvent("partial-2"),
+		inboxEvent("partial-3"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("batch writer was not invoked")
+	}
+
+	// Replica B steals ONLY the first item while replica-a is blocked in writer.
+	stolen, err := store.ClaimErrorEvents(
+		context.Background(),
+		"replica-b",
+		1,
+		fixedNow.Add(2*time.Minute),
+		time.Minute,
+	)
+	if err != nil || len(stolen) != 1 || stolen[0].EventID != "partial-1" {
+		t.Fatalf("stolen=%#v err=%v", stolen, err)
+	}
+	close(writer.release)
+
+	// Items 2 and 3 must commit while item 1 remains owned by replica-b.
+	waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool {
+		return d.ActiveItems == 1 && onEventCalls.Load() >= 2
+	})
+	if err := inbox.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := onEventCalls.Load(); got != 2 {
+		t.Fatalf("onEventCalls=%d want 2 (must skip lost item)", got)
+	}
+	issues, err := store.ListIssues(context.Background(), project.ID, meta.IssueListOptions{})
+	if err != nil || len(issues) != 1 || issues[0].Count != 2 {
+		t.Fatalf("issues=%#v err=%v", issues, err)
+	}
+	logMu.Lock()
+	logged := logBuf.String()
+	logMu.Unlock()
+	if !strings.Contains(logged, "losing claim lease") ||
+		!strings.Contains(logged, "event_id=partial-1") ||
+		!strings.Contains(logged, "owner=replica-a") ||
+		!strings.Contains(logged, "claim_epoch=1") {
+		t.Fatalf("expected slog.Warn with event_id, owner, and claim_epoch, got: %s", logged)
+	}
+}
+
+type clockAdvancingSymbolicator struct {
+	now   *atomic.Int64
+	step  time.Duration
+	calls atomic.Int64
+}
+
+func (s *clockAdvancingSymbolicator) Symbolicate(
+	_ context.Context,
+	_ string,
+	_ json.RawMessage,
+	event errortrack.Event,
+) (errortrack.Event, error) {
+	if s.calls.Add(1) == 1 {
+		s.now.Add(int64(s.step))
+	}
+	return event, nil
+}
+
+func TestInboxSkipsSymbolicationWhenRemainingLeaseIsLow(t *testing.T) {
+	store, project := newInboxTestStore(t, "low-lease-symbolicate")
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, buf: &logBuf}, nil))
+
+	start := time.Date(2026, 11, 23, 3, 0, 0, 0, time.UTC)
+	seedEntries := make([]errortrack.InboxEntry, 0, 2)
+	for _, id := range []string{"lease-1", "lease-2"} {
+		ev := inboxEvent(id)
+		ev.Event.Timestamp = start
+		payload, err := json.Marshal(ev.Event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedEntries = append(seedEntries, errortrack.InboxEntry{
+			ProjectID:       project.ID,
+			EventID:         ev.Event.EventID,
+			CanonicalDigest: "digest-" + id,
+			Payload:         payload,
+			PayloadBytes:    int64(len(payload)),
+			OccurredAt:      start,
+			AcceptedAt:      start,
+		})
+	}
+	if err := store.AcceptErrorEvents(
+		context.Background(),
+		seedEntries,
+		errortrack.InboxCapacity{MaxItems: 10, MaxBytes: 1 << 20},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var nowNanos atomic.Int64
+	nowNanos.Store(start.UnixNano())
+	sym := &clockAdvancingSymbolicator{now: &nowNanos, step: 58 * time.Second}
+
+	inbox, err := errortrack.NewInbox(store, &inboxTestWriter{}, errortrack.InboxOptions{
+		Logger:       logger,
+		Now:          func() time.Time { return time.Unix(0, nowNanos.Load()).UTC() },
+		Symbolicator: sym,
+		ClaimTTL:     time.Minute,
+		PollInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inbox.Close(context.Background()) }()
+
+	waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool {
+		return d.ActiveItems == 1 && d.PendingItems == 1
+	})
+	if err := inbox.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if sym.calls.Load() != 1 {
+		t.Fatalf("symbolicator calls=%d want 1 (item 2 skipped due to low remaining lease)", sym.calls.Load())
+	}
+	logMu.Lock()
+	logged := logBuf.String()
+	logMu.Unlock()
+	if !strings.Contains(logged, "insufficient remaining lease") {
+		t.Fatalf("expected low-lease warning log, got: %s", logged)
+	}
+	// Item 2 was released back to pending and can be claimed cleanly now.
+	claimed, err := store.ClaimErrorEvents(
+		context.Background(),
+		"next-worker",
+		10,
+		start.Add(58*time.Second),
+		time.Minute,
+	)
+	if err != nil || len(claimed) != 1 || claimed[0].EventID != "lease-2" || claimed[0].Attempts != 1 {
+		t.Fatalf("claimed=%#v err=%v", claimed, err)
+	}
+}
+
+func TestInboxWorkersClampedOnSQLiteAndScaledWhenClustered(t *testing.T) {
+	store, _ := newInboxTestStore(t, "workers-mode")
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, buf: &logBuf}, nil))
+
+	sqliteInbox, err := errortrack.NewInbox(store, &inboxTestWriter{}, errortrack.InboxOptions{
+		Logger:       logger,
+		Workers:      4,
+		PollInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqliteInbox.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if sqliteInbox.Workers() != 1 {
+		t.Fatalf("SQLite Inbox.Workers()=%d want 1", sqliteInbox.Workers())
+	}
+	logMu.Lock()
+	logged := logBuf.String()
+	logMu.Unlock()
+	if !strings.Contains(logged, "forcing error Inbox worker count to 1") {
+		t.Fatalf("expected SQLite worker clamp warning, got: %s", logged)
+	}
+
+	clustered := &batchLifecycleSpyStore{Store: store, clustered: true}
+	for _, tc := range []struct {
+		requested int
+		want      int
+	}{
+		{requested: 0, want: errortrack.DefaultClusteredWorkers},
+		{requested: 3, want: 3},
+		{requested: 10, want: errortrack.MaxClusteredWorkers},
+	} {
+		inbox, err := errortrack.NewInbox(clustered, &inboxTestWriter{}, errortrack.InboxOptions{
+			Workers:      tc.requested,
+			PollInterval: time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := inbox.Workers()
+		if err := inbox.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("clustered Workers(requested=%d)=%d want %d", tc.requested, got, tc.want)
+		}
+	}
+}
+
+func BenchmarkInbox(b *testing.B) {
+	store, err := meta.OpenStore(context.Background(), filepath.Join(b.TempDir(), "bench.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	projectRow, err := store.CreateProject(context.Background(), "Bench", "bench")
+	if err != nil {
+		b.Fatal(err)
+	}
+	project := errortrack.Project{ID: projectRow.ID, Slug: projectRow.Slug}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	const batchSize = 16
+	doneCh := make(chan struct{}, batchSize*4)
+	writer := errortrack.NewVictoriaLogsWriter(&testLogsBackend{baseURL: srv.URL}, srv.Client())
+	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
+		PollInterval: 10 * time.Millisecond,
+		OnEvent: func(context.Context, errortrack.ErrorOccurrence) error {
+			doneCh <- struct{}{}
+			return nil
+		},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = inbox.Close(ctx)
+	}()
+
+	ts := time.Date(2026, 11, 23, 0, 0, 0, 0, time.UTC)
+	baseEvents := make([]errortrack.AcceptedEvent, batchSize)
+	for j := range baseEvents {
+		ev := errortrack.Event{
+			EventID:   fmt.Sprintf("seed-%d", j),
+			Timestamp: ts,
+			Platform:  "go",
+			Level:     "error",
+			Exception: errortrack.Exception{
+				Type:  "BenchError",
+				Value: "boom",
+				Stacktrace: errortrack.Stacktrace{Frames: []errortrack.Frame{
+					{Function: "main.bench", Filename: "bench.go", InApp: true},
+				}},
+			},
+		}
+		raw, _ := json.Marshal(ev)
+		baseEvents[j] = errortrack.AcceptedEvent{Raw: raw, Event: ev}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		batch := make([]errortrack.AcceptedEvent, batchSize)
+		for j := range batchSize {
+			batch[j] = baseEvents[j]
+			batch[j].Event.EventID = fmt.Sprintf("bench-%d-%d", i, j)
+		}
+		if err := inbox.Accept(context.Background(), project, batch); err != nil {
+			b.Fatal(err)
+		}
+		for range batchSize {
+			<-doneCh
+		}
+	}
+	b.StopTimer()
 }

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -401,6 +403,7 @@ func (s *Store) claimSQLiteErrorEvents(
 		return nil, err
 	}
 	items := make([]errortrack.InboxItem, 0, len(ids))
+	slugs := make(map[int]string)
 	for _, id := range ids {
 		query := `UPDATE telemetry_inbox SET status = 'processing', claim_owner = ?,
 			claim_until = ?, claim_epoch = claim_epoch + 1, attempts = attempts + 1, updated_at = ?
@@ -429,10 +432,15 @@ func (s *Store) claimSQLiteErrorEvents(
 			return nil, fmt.Errorf("claim SQLite error Inbox item %d: %w", id, err)
 		}
 		item.SourceMapSnapshot = json.RawMessage(snapshot)
-		if err := tx.QueryRowContext(ctx, `SELECT slug FROM projects WHERE id = ?`, item.ProjectID).
-			Scan(&item.ProjectSlug); err != nil {
-			return nil, fmt.Errorf("read error Inbox project %d: %w", item.ProjectID, err)
+		slug, cached := slugs[item.ProjectID]
+		if !cached {
+			if err := tx.QueryRowContext(ctx, `SELECT slug FROM projects WHERE id = ?`, item.ProjectID).
+				Scan(&slug); err != nil {
+				return nil, fmt.Errorf("read error Inbox project %d: %w", item.ProjectID, err)
+			}
+			slugs[item.ProjectID] = slug
 		}
+		item.ProjectSlug = slug
 		items = append(items, item)
 	}
 	if err := tx.Commit(); err != nil {
@@ -453,117 +461,311 @@ func (s *Store) CompleteErrorEvent(
 		processedAt.IsZero() {
 		return nil, fmt.Errorf("%w: incomplete completion input", errortrack.ErrInvalid)
 	}
-	processedAt = processedAt.UTC()
+	res, err := s.completeErrorEvents(
+		ctx,
+		owner,
+		[]errortrack.ErrorCompletion{{
+			ID:          id,
+			EventID:     delta.LastEventID,
+			ClaimEpoch:  claimEpoch,
+			Delta:       delta,
+			ProcessedAt: processedAt,
+		}},
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return res.Changes, nil
+}
+
+// CompleteErrorEvents atomically completes a batch of claimed error Inbox
+// items in one transaction respecting canonical lock ordering:
+// telemetry_inbox_state(id=1) -> telemetry_inbox(id ASC) -> issues(project_id, fingerprint).
+func (s *Store) CompleteErrorEvents(
+	ctx context.Context,
+	owner string,
+	completions []errortrack.ErrorCompletion,
+) (errortrack.BatchCompletionResult, error) {
+	return s.completeErrorEvents(ctx, owner, completions, false)
+}
+
+func (s *Store) completeErrorEvents(
+	ctx context.Context,
+	owner string,
+	completions []errortrack.ErrorCompletion,
+	failOnClaimLost bool,
+) (errortrack.BatchCompletionResult, error) {
+	if owner == "" {
+		return errortrack.BatchCompletionResult{}, fmt.Errorf("%w: incomplete completion input", errortrack.ErrInvalid)
+	}
+	if len(completions) == 0 {
+		return errortrack.BatchCompletionResult{}, nil
+	}
+	ordered := make([]errortrack.ErrorCompletion, len(completions))
+	seenIDs := make(map[int64]struct{}, len(completions))
+	for idx, comp := range completions {
+		if comp.ID <= 0 || comp.ClaimEpoch <= 0 || comp.Delta.ProjectID <= 0 || comp.Delta.LastEventID == "" ||
+			comp.ProcessedAt.IsZero() {
+			return errortrack.BatchCompletionResult{}, fmt.Errorf(
+				"%w: incomplete completion input",
+				errortrack.ErrInvalid,
+			)
+		}
+		if _, dup := seenIDs[comp.ID]; dup {
+			return errortrack.BatchCompletionResult{}, fmt.Errorf(
+				"%w: duplicate completion item %d",
+				errortrack.ErrInvalid,
+				comp.ID,
+			)
+		}
+		seenIDs[comp.ID] = struct{}{}
+		if comp.EventID == "" {
+			comp.EventID = comp.Delta.LastEventID
+		}
+		comp.ProcessedAt = comp.ProcessedAt.UTC()
+		ordered[idx] = comp
+	}
+	if len(ordered) > 1 {
+		sort.Slice(ordered, func(i, j int) bool {
+			return ordered[i].ID < ordered[j].ID
+		})
+	}
+
 	if s.dialect != dialect.Postgres {
 		s.issueMu.Lock()
 		defer s.issueMu.Unlock()
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("begin error Inbox completion: %w", err)
+		return errortrack.BatchCompletionResult{}, fmt.Errorf("begin error Inbox completion: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Canonical lock order step 1: lock telemetry_inbox_state(id=1) before
+	// touching telemetry_inbox or issues to match Accept/Retry/Terminal/DeleteProject.
 	state, err := s.lockErrorInboxStateTx(ctx, tx)
 	if err != nil {
-		return nil, fmt.Errorf("lock error Inbox completion capacity: %w", err)
+		return errortrack.BatchCompletionResult{}, fmt.Errorf("lock error Inbox completion capacity: %w", err)
 	}
-	query := `SELECT project_id, event_id, payload_bytes, accepted_at FROM telemetry_inbox
+
+	readQuery := `SELECT project_id, event_id, payload_bytes, accepted_at FROM telemetry_inbox
 		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`
 	if s.dialect == dialect.Postgres {
-		query += " FOR UPDATE"
+		readQuery += " FOR UPDATE"
 	}
-	var projectID int
-	var eventID string
-	var payloadBytes int64
-	var acceptedAt time.Time
-	if err := tx.QueryRowContext(ctx, bind(s.dialect, query), id, owner, claimEpoch).
-		Scan(&projectID, &eventID, &payloadBytes, &acceptedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errortrack.ErrClaimLost
+	readQuery = bind(s.dialect, readQuery)
+
+	type verifiedCompletion struct {
+		comp         errortrack.ErrorCompletion
+		payloadBytes int64
+	}
+	valid := make([]verifiedCompletion, 0, len(ordered))
+	result := errortrack.BatchCompletionResult{
+		CompletedIDs: make([]int64, 0, len(ordered)),
+	}
+	var totalPayloadBytes int64
+	var batchUpdatedAt time.Time
+
+	// Canonical lock order step 2: lock/verify claimed telemetry_inbox rows in
+	// deterministic ascending ID order.
+	for _, comp := range ordered {
+		var projectID int
+		var eventID string
+		var payloadBytes int64
+		var acceptedAt time.Time
+		if err := tx.QueryRowContext(ctx, readQuery, comp.ID, owner, comp.ClaimEpoch).
+			Scan(&projectID, &eventID, &payloadBytes, &acceptedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				if failOnClaimLost {
+					return errortrack.BatchCompletionResult{}, errortrack.ErrClaimLost
+				}
+				slog.Warn(
+					"skip error Inbox completion after losing claim lease",
+					"item_id", comp.ID,
+					"event_id", comp.EventID,
+					"project_id", comp.Delta.ProjectID,
+					"owner", owner,
+					"claim_epoch", comp.ClaimEpoch,
+					"attempts", comp.Attempts,
+					"error", errortrack.ErrClaimLost,
+				)
+				result.LostIDs = append(result.LostIDs, comp.ID)
+				continue
+			}
+			return errortrack.BatchCompletionResult{}, fmt.Errorf("read error Inbox claim %d: %w", comp.ID, err)
 		}
-		return nil, fmt.Errorf("read error Inbox claim %d: %w", id, err)
+		if projectID != comp.Delta.ProjectID || eventID != comp.Delta.LastEventID {
+			return errortrack.BatchCompletionResult{}, fmt.Errorf(
+				"%w: completion identity mismatch",
+				errortrack.ErrInvalid,
+			)
+		}
+		comp.Delta.AcceptedAt = acceptedAt.UTC()
+		comp.Delta.AppliedAt = comp.ProcessedAt
+		valid = append(valid, verifiedCompletion{comp: comp, payloadBytes: payloadBytes})
+		totalPayloadBytes += payloadBytes
+		if batchUpdatedAt.IsZero() || comp.ProcessedAt.After(batchUpdatedAt) {
+			batchUpdatedAt = comp.ProcessedAt
+		}
 	}
-	if projectID != delta.ProjectID || eventID != delta.LastEventID {
-		return nil, fmt.Errorf("%w: completion identity mismatch", errortrack.ErrInvalid)
+	if len(valid) == 0 {
+		return result, nil
 	}
-	if state.activeItems < 1 || state.activeBytes < payloadBytes {
-		return nil, errors.New("error Inbox capacity counters are inconsistent")
+	if state.activeItems < int64(len(valid)) || state.activeBytes < totalPayloadBytes {
+		return errortrack.BatchCompletionResult{}, errors.New("error Inbox capacity counters are inconsistent")
 	}
-	delta.AcceptedAt = acceptedAt.UTC()
-	delta.AppliedAt = processedAt
-	changes, err := s.applyIssueDeltasTx(ctx, tx, []errortrack.IssueDelta{delta})
+
+	type mergedDeltaEntry struct {
+		delta     errortrack.IssueDelta
+		repItemID int64
+	}
+	mergedKeys := make([]issueKey, 0, len(valid))
+	mergedByKey := make(map[issueKey]*mergedDeltaEntry, len(valid))
+	for _, v := range valid {
+		d := v.comp.Delta
+		key := issueKey{projectID: d.ProjectID, fingerprint: d.Fingerprint}
+		cur, exists := mergedByKey[key]
+		if !exists {
+			mergedKeys = append(mergedKeys, key)
+			mergedByKey[key] = &mergedDeltaEntry{delta: d, repItemID: v.comp.ID}
+			continue
+		}
+		cur.delta.Count += d.Count
+		cur.delta.SessionBits |= d.SessionBits
+		if cur.delta.FirstSeen.IsZero() || (!d.FirstSeen.IsZero() && d.FirstSeen.Before(cur.delta.FirstSeen)) {
+			cur.delta.FirstSeen = d.FirstSeen
+		}
+		if !d.LastSeen.Before(cur.delta.LastSeen) {
+			cur.delta.LastSeen = d.LastSeen
+			cur.delta.LastEventID = d.LastEventID
+			cur.delta.Title = d.Title
+			cur.delta.Level = d.Level
+		}
+		if d.AcceptedAt.After(cur.delta.AcceptedAt) {
+			cur.delta.AcceptedAt = d.AcceptedAt
+			cur.repItemID = v.comp.ID
+		}
+		if d.AppliedAt.Before(cur.delta.AppliedAt) {
+			cur.delta.AppliedAt = d.AppliedAt
+		}
+	}
+	mergedDeltas := make([]errortrack.IssueDelta, 0, len(mergedKeys))
+	for _, key := range mergedKeys {
+		mergedDeltas = append(mergedDeltas, mergedByKey[key].delta)
+	}
+
+	// Canonical lock order step 3: apply merged issue deltas (internally sorted
+	// by project_id, fingerprint) and receive both lifecycle changes and issue IDs.
+	changes, issueIDs, err := s.applyIssueDeltasWithIDsTx(ctx, tx, mergedDeltas)
 	if err != nil {
-		return nil, fmt.Errorf("apply accepted error event %q: %w", eventID, err)
+		return errortrack.BatchCompletionResult{}, fmt.Errorf("apply accepted error events: %w", err)
 	}
-	var issueID int
-	if err := tx.QueryRowContext(
-		ctx,
-		bind(s.dialect, `SELECT id FROM issues WHERE project_id = ? AND fingerprint = ?`),
-		delta.ProjectID,
-		delta.Fingerprint,
-	).Scan(&issueID); err != nil {
-		return nil, fmt.Errorf("read completed error event issue %q: %w", eventID, err)
+
+	issueIDToKey := make(map[int]issueKey, len(issueIDs))
+	for key, id := range issueIDs {
+		issueIDToKey[id] = key
 	}
-	for _, change := range changes {
-		if _, err := tx.ExecContext(ctx, bind(s.dialect, `INSERT INTO issue_lifecycle_events(
+	changeByItemID := make(map[int64]*errortrack.IssueChange, len(changes))
+	if len(changes) > 0 {
+		insertLifecycleQuery := bind(s.dialect, `INSERT INTO issue_lifecycle_events(
 			project_id, issue_id, inbox_item_id, kind, title, level, seen_at,
 			status, available_at, claim_owner, claim_epoch, attempts, last_error, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0, 0, '', ?, ?)`),
-			change.ProjectID,
-			change.IssueID,
-			id,
-			change.Kind,
-			change.Title,
-			change.Level,
-			change.SeenAt.UTC(),
-			processedAt,
-			processedAt,
-			processedAt,
-		); err != nil {
-			return nil, fmt.Errorf("persist issue lifecycle event for %q: %w", eventID, err)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0, 0, '', ?, ?)`)
+		for idx := range changes {
+			change := changes[idx]
+			key := issueIDToKey[change.IssueID]
+			inboxItemID := mergedByKey[key].repItemID
+			if _, err := tx.ExecContext(
+				ctx,
+				insertLifecycleQuery,
+				change.ProjectID,
+				change.IssueID,
+				inboxItemID,
+				change.Kind,
+				change.Title,
+				change.Level,
+				change.SeenAt.UTC(),
+				batchUpdatedAt,
+				batchUpdatedAt,
+				batchUpdatedAt,
+			); err != nil {
+				return errortrack.BatchCompletionResult{}, fmt.Errorf(
+					"persist issue lifecycle event for item %d: %w",
+					inboxItemID,
+					err,
+				)
+			}
+			c := change
+			changeByItemID[inboxItemID] = &c
 		}
 	}
-	var lifecycle *errortrack.IssueChange
-	lifecycleKind := ""
-	if len(changes) > 0 {
-		lifecycle = &changes[0]
-		lifecycleKind = changes[0].Kind
-	}
-	outcome, err := json.Marshal(struct {
-		Fingerprint   string                  `json:"fingerprint"`
-		IssueID       int                     `json:"issue_id"`
-		LifecycleKind string                  `json:"lifecycle_kind,omitempty"`
-		Lifecycle     *errortrack.IssueChange `json:"lifecycle,omitempty"`
-	}{
-		Fingerprint: delta.Fingerprint, IssueID: issueID, LifecycleKind: lifecycleKind, Lifecycle: lifecycle,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("encode completed error event outcome %q: %w", eventID, err)
-	}
-	result, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox SET
+
+	updateInboxQuery := bind(s.dialect, `UPDATE telemetry_inbox SET
 		status = 'completed', payload = NULL, payload_bytes = 0, claim_owner = '', claim_until = NULL,
 		outcome = ?, processed_at = ?, completed_at = ?, updated_at = ?
-		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`),
-		string(outcome), processedAt, processedAt, processedAt, id, owner, claimEpoch)
-	if err != nil {
-		return nil, fmt.Errorf("complete error Inbox item %d: %w", id, err)
+		WHERE id = ? AND status = 'processing' AND claim_owner = ? AND claim_epoch = ?`)
+	for _, v := range valid {
+		key := issueKey{projectID: v.comp.Delta.ProjectID, fingerprint: v.comp.Delta.Fingerprint}
+		issueID := issueIDs[key]
+		var lifecycle *errortrack.IssueChange
+		lifecycleKind := ""
+		if ch := changeByItemID[v.comp.ID]; ch != nil {
+			lifecycle = ch
+			lifecycleKind = ch.Kind
+		}
+		outcome, err := json.Marshal(struct {
+			Fingerprint   string                  `json:"fingerprint"`
+			IssueID       int                     `json:"issue_id"`
+			LifecycleKind string                  `json:"lifecycle_kind,omitempty"`
+			Lifecycle     *errortrack.IssueChange `json:"lifecycle,omitempty"`
+		}{
+			Fingerprint:   v.comp.Delta.Fingerprint,
+			IssueID:       issueID,
+			LifecycleKind: lifecycleKind,
+			Lifecycle:     lifecycle,
+		})
+		if err != nil {
+			return errortrack.BatchCompletionResult{}, fmt.Errorf(
+				"encode completed error event outcome %q: %w",
+				v.comp.EventID,
+				err,
+			)
+		}
+		execRes, err := tx.ExecContext(
+			ctx,
+			updateInboxQuery,
+			string(outcome),
+			v.comp.ProcessedAt,
+			v.comp.ProcessedAt,
+			v.comp.ProcessedAt,
+			v.comp.ID,
+			owner,
+			v.comp.ClaimEpoch,
+		)
+		if err != nil {
+			return errortrack.BatchCompletionResult{}, fmt.Errorf("complete error Inbox item %d: %w", v.comp.ID, err)
+		}
+		updated, err := execRes.RowsAffected()
+		if err != nil {
+			return errortrack.BatchCompletionResult{}, err
+		}
+		if updated != 1 {
+			return errortrack.BatchCompletionResult{}, errortrack.ErrClaimLost
+		}
+		result.CompletedIDs = append(result.CompletedIDs, v.comp.ID)
 	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if updated != 1 {
-		return nil, errortrack.ErrClaimLost
-	}
+
 	if _, err := tx.ExecContext(ctx, bind(s.dialect, `UPDATE telemetry_inbox_state SET
-		active_items = active_items - 1, active_bytes = active_bytes - ?, updated_at = ? WHERE id = 1`),
-		payloadBytes, processedAt); err != nil {
-		return nil, fmt.Errorf("release completed error Inbox capacity: %w", err)
+		active_items = active_items - ?, active_bytes = active_bytes - ?, updated_at = ? WHERE id = 1`),
+		len(valid), totalPayloadBytes, batchUpdatedAt); err != nil {
+		return errortrack.BatchCompletionResult{}, fmt.Errorf("release completed error Inbox capacity: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit error Inbox item %d: %w", id, err)
+		return errortrack.BatchCompletionResult{}, fmt.Errorf("commit error Inbox batch completion: %w", err)
 	}
-	return changes, nil
+	result.Changes = changes
+	return result, nil
 }
 
 // IssueIDForErrorEvent resolves the stable event-to-Issue relation retained in
