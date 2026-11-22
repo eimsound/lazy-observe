@@ -4,7 +4,7 @@
 
 **lazy-observe** 是采用纯 Go 静态编译（`CGO_ENABLED=0`，支持 Linux `amd64` 与 `arm64`）的单二进制自托管全栈可观测性平台。它在一个项目隔离的平台内统一覆盖 Metrics、Logs、Traces、Error Tracking、Web Vitals、Session Replay、Continuous Profiling、Alerting 以及 GenAI 用量与成本统计。默认形态下，单个二进制内嵌 VictoriaMetrics、VictoriaLogs、VictoriaTraces、`vmagent` 与 Web UI，零外部依赖即可启动；需要扩展容量或高可用时，同一份二进制可切换到外部 Victoria 集群，搭配 PostgreSQL、Valkey 或 Redis 以及 S3 兼容对象存储运行。
 
-> **公开预览期（v0.x）。** 当前尚未发布带版本号的正式 Release（`v0.1.0`）。发布前阶段元数据仅维护一份可变的基线（`001_baseline.sql`，见 [ADR 0003](.agents/docs/adr/0003-pre-release-single-database-baseline.md)）。跨不兼容 schema 变更升级可能需要重建元数据数据库，协议面与 SDK 也可能发生不兼容调整。升级前请先查阅 [docs/zh/version-matrix.md](docs/zh/version-matrix.md) 与 [CHANGELOG.md](CHANGELOG.md)。
+> **公开预览期（v0.x）。** 当前尚未发布带版本号的正式 Release（`v0.1.0`）。发布前阶段元数据仅维护一份可变的基线（`001_baseline.sql`，见 [ADR 0003](.agents/docs/adr/0003-pre-release-single-database-baseline.md)）。跨不兼容 schema 变更升级可能需要重建元数据数据库，协议面与 SDK 也可能发生不兼容调整。升级前请先查阅 [docs/zh/version-matrix.md](docs/zh/version-matrix.md)。
 
 ## 架构总览
 
@@ -215,7 +215,6 @@ mise exec -- go run . load --url http://127.0.0.1:3320 --duration 30s --concurre
 | [docs/zh/sdk/go.md](docs/zh/sdk/go.md)、[node.md](docs/zh/sdk/node.md)、[browser.md](docs/zh/sdk/browser.md)、[python.md](docs/zh/sdk/python.md) | 四端客户端 SDK 安装、配置与框架集成指南 |
 | [SECURITY.md](SECURITY.md) | 安全策略、预览期支持范围与私下漏洞上报流程 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献者指南：`mise` 任务、测试分层（`e2e`、`e2e-ha`、`web-e2e-real`、`sdk-journeys`）与 PR 规则 |
-| [CHANGELOG.md](CHANGELOG.md) | 未发布变更清单与历史演进记录 |
 | [.agents/docs/architecture.md](.agents/docs/architecture.md) 与 [.agents/docs/adr/](.agents/docs/adr/) | 深入架构说明与架构决策记录（ADR） |
 
 ## 关键设计取舍与预览期说明

@@ -10,7 +10,7 @@
 | Latest `v0.x` preview release (server and in-repo SDKs) | Yes |
 | Older `v0.x` preview releases or commits | No |
 
-Per the public preview policy in [CHANGELOG.md](CHANGELOG.md), [docs/version-matrix.md](docs/version-matrix.md), and [docs/operations.md](docs/operations.md), upgrading between `v0.x` preview builds may require recreating the metadata database when `001_baseline.sql` changes, and protocols or SDKs may change incompatibly between preview versions.
+Per the public preview policy in [docs/version-matrix.md](docs/version-matrix.md) and [docs/operations.md](docs/operations.md), upgrading between `v0.x` preview builds may require recreating the metadata database when `001_baseline.sql` changes, and protocols or SDKs may change incompatibly between preview versions.
 
 ## Reporting a Vulnerability
 

@@ -38,7 +38,7 @@ description: lazy-observe 的单一工作入口。改代码、改配置、发版
 | 报错、回归、flaky 测试 | bug-fix | `/skill:diagnosing-bugs` | 回归测试 + 证据 |
 | 只读问题（"这块怎么工作"） | investigate | 直接查代码，不改 | 回答 + 文件行号 |
 | 不改外部行为的结构重构 | refactor | `/skill:tdd` 保护接缝 | 全绿 diff |
-| 发版、打 tag、容器镜像与 Release 资产 | release | `/skill:wizard` 处理凭据 | `CHANGELOG.md` + tag |
+| 发版、打 tag、容器镜像与 Release 资产 | release | `/skill:wizard` 处理凭据 | `docs/version-matrix.md` + tag + GitHub Release |
 | 文档、README、调研归档 | docs | 直接改 | 按读者选目录：用户文档放 `docs/`，AI/规划放 `.agents/docs/`（见 `AGENTS.md`） |
 | 长时间无人值守 | afk-run | `/skill:chief-of-staff` + `/skill:implement-spec` | `.agents/docs/afk/<goal>/` |
 | 方向没定、要拍板 | 先 `/skill:grill-with-docs`，再回本文件 | ADR | `.agents/docs/adr/` |
@@ -54,7 +54,7 @@ description: lazy-observe 的单一工作入口。改代码、改配置、发版
 1. 读 `.agents/docs/requirements.md` 对应小节、相关 ADR、`.agents/docs/GLOSSARY.md` 术语。
 2. `/skill:spec-to-plan` 产出计划，落到 `.agents/docs/plans/<topic>.md`；计划里必须有仓库证据、两条备选路线、Tracer Bullet 切片、每切片的 red/green 命令。
 3. `/skill:implement`：每个切片先写失败测试，再最小实现，跑门禁，在计划里勾选并贴证据（命令 + 结论）。
-4. 收尾：`/skill:code-review`（Spec 对照计划）→ 更新 `CHANGELOG.md` → 按「收尾」条件运行 `/skill:retro`。
+4. 收尾：`/skill:code-review`（Spec 对照计划）→ 按「收尾」条件运行 `/skill:retro`。
 
 ### feature-multi
 
@@ -74,7 +74,7 @@ description: lazy-observe 的单一工作入口。改代码、改配置、发版
 
 1. 打 tag 前，在 Renovate Dependency Dashboard 勾选重跑，确认 Victoria、Trivy 等手工固定点没有待合并的升级；有就先合并或明确放过。
    版本是否落后只看这一步，`storage-bin-scan` 不查（ADR 0016）。依赖升级统一由 Renovate 提 PR（ADR 0015、`.agents/docs/plans/renovate.md`）；人工改 pin 时版本、sha 与 sha 行尾的 `# <tag>` 一起改（Trivy 没有行尾 `# <tag>`，Renovate 只改 `trivy_version`，两个 sha 由 agent 按 `.agents/docs/plans/renovate.md` 审查清单补）。
-2. 更新 `docs/version-matrix.md`（先矩阵、后发布），确认该提交的 CI 为绿，更新 `CHANGELOG.md`。
+2. 更新 `docs/version-matrix.md`（先矩阵、后发布），确认该提交的 CI 为绿；Release Notes 由 `.goreleaser.yaml` 从 `git log` 自动生成（首个正式版发布前不维护 `CHANGELOG.md`）。
 3. 打 tag 属于「必须停下来等人」的动作：由负责人确认后再打。`release.yml` 的 `storage-bin-scan` 命中只警告，
    发版后看 run 的 step summary 里的警告表即可；扫描失败才会挡住出包。
 
@@ -199,7 +199,7 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 - 需要新增依赖（先过许可证 allowlist：Go 侧 Apache-2.0/MIT/BSD，JS 侧另加 ISC/0BSD/Unlicense；MPL-2.0 仅限开发/构建期工具（如 lightningcss）；以 `AGENTS.md` 为准；禁 AGPL/GPL）；
 - 改宿主机全局环境：docker 镜像改 tag 或换拉取来源、全局安装工具、改 DNS 或代理、改 shell 配置。拉镜像或装工具失败时停下报告，不要自行绕路。
 
-可以自己往前走的：本地改代码、本地跑门禁、写测试、更新 `CHANGELOG.md`、本地 commit、按下一节推自己的切片分支、开 PR、等 CI、CI 绿后合并该 PR。
+可以自己往前走的：本地改代码、本地跑门禁、写测试、本地 commit、按下一节推自己的切片分支、开 PR、等 CI、CI 绿后合并该 PR。
 
 `/skill:implement-spec` 会开 worktree 和 integration branch。每个 implementer 必须基于 integration branch 开工，收尾前把 integration branch 的 tip 合回自己的分支。并行实现线程之间不共享工作树。
 
@@ -247,7 +247,6 @@ feature-multi：每个 implementer 的 PR base 是 integration branch，各自�
 ## 收尾
 
 - `/skill:code-review`：Standards 按 `code-review` 第 3 步，Spec 对照计划或票。放在最后一条切片 PR 合并之前跑；发现问题就开一条修复分支走同一条流水线。
-- 更新 `CHANGELOG.md` 作为独立的 `chore/changelog-<topic>` 分支，走同一条流水线。
 - `/skill:retro`：完成多票 spec、发版前，或自上次修订 `.agents/skills/pitfalls/` 以来出现新的 `## Pitfall Signals` 或 `main` 分支 CI 出现基线外失败时运行；能自动检查的错误沉淀为 linter/测试/CI，其余按信号批量修订 `.agents/skills/pitfalls/`（删旧/毕业优先于新增）。
 - 汇报时列出真实跑过的命令和结果，以及每个 PR 的链接和它对应 CI run 的结论。没跑的不要说通过。
 - 发现流程本身有缺口（比如某类改动没有对应门禁），在这里补一行，不要绕过去。

@@ -5,7 +5,7 @@
 > **说明与口径**
 >
 > - 本文只对比架构事实与工程取舍，不提供脱离硬件与负载条件的性能跑分，也不贬低竞品。
-> - lazy-observe 的所有能力声明均以本仓库当前主分支实现为准，并附对应文档与 ADR 链接；当前项目处于 v0.x 公开预览期，具体兼容面以[版本兼容矩阵](version-matrix.md)与 [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) 为准。
+> - lazy-observe 的所有能力声明均以本仓库当前主分支实现为准，并附对应文档与 ADR 链接；当前项目处于 v0.x 公开预览期，具体兼容面以[版本兼容矩阵](version-matrix.md)为准。
 > - 竞品的架构细节、功能范围与许可证可能随上游版本演进变化，最终选型前请以各自上游仓库与官方文档为准。
 
 ## 1. lazy-observe 的定位与核心差异点
@@ -102,4 +102,3 @@ lazy-observe 的目标不是超大规模多租户 SaaS 或替代 Grafana 的大�
 - [运维手册（备份、恢复、升级、回滚与应急操作）](operations.md)
 - [Grafana 与 Perses 对接指南](grafana-perses.md)
 - [服务端与客户端 SDK 版本兼容矩阵](version-matrix.md)
-- [变更日志](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md)

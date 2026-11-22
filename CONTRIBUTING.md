@@ -229,8 +229,7 @@ fix|feat|chore: 中文简述
 
 Examples are `fix: 修复回放项目隔离`、`feat: 增加集群性能门禁` and
 `chore: 迁移构建任务到 mise`. Keep each commit scoped to one reviewable
-feature point or milestone, and update `CHANGELOG.md` in the same commit when
-the change affects delivered behavior.
+feature point or milestone.
 
 Before opening a GitHub pull request:
 
