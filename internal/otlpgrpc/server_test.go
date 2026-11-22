@@ -25,9 +25,13 @@ import (
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/gateway"
+	"github.com/eimsound/lazy-observe/internal/ingestlimit"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/otlpgrpc"
+	"github.com/eimsound/lazy-observe/internal/selfmetrics"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -41,9 +45,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -973,4 +980,552 @@ func selfSignedLoopbackTLS(t *testing.T) (*tls.Config, *tls.Config) {
 		ServerName: "127.0.0.1",
 	}
 	return serverTLS, clientTLS
+}
+
+type rawWireBytes []byte
+
+type rawClientCodec struct {
+	proto encoding.CodecV2
+}
+
+func newRawClientCodec() encoding.CodecV2 {
+	return &rawClientCodec{proto: encoding.GetCodecV2("proto")}
+}
+
+func (c *rawClientCodec) Marshal(v any) (mem.BufferSlice, error) {
+	if raw, ok := v.(rawWireBytes); ok {
+		return mem.BufferSlice{mem.SliceBuffer(raw)}, nil
+	}
+	return c.proto.Marshal(v)
+}
+
+func (c *rawClientCodec) Unmarshal(data mem.BufferSlice, v any) error {
+	return c.proto.Unmarshal(data, v)
+}
+
+func (c *rawClientCodec) Name() string {
+	return "proto"
+}
+
+type countingAuth struct {
+	calls atomic.Int64
+	inner *stubAuth
+}
+
+func (a *countingAuth) AuthenticateProjectToken(ctx context.Context, token string) (meta.ProjectInfo, error) {
+	a.calls.Add(1)
+	return a.inner.AuthenticateProjectToken(ctx, token)
+}
+
+func TestOTLPGRPCAuthAndConcurrencyRunBeforeRecvMsg(t *testing.T) {
+	t.Run("unauthenticated and wrong-token oversized/malformed requests fail before RecvMsg", func(t *testing.T) {
+		var upstreamHits atomic.Int64
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstreamHits.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer upstream.Close()
+
+		backend, err := storagepkg.New(
+			storagepkg.MetricsVM,
+			upstream.URL,
+			upstream.URL,
+			upstream.URL,
+			upstream.URL,
+			upstream.Client(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		auth := &countingAuth{
+			inner: &stubAuth{tokens: map[string]meta.ProjectInfo{"lo_valid": {ID: 1, Slug: "alpha"}}},
+		}
+		_, conn, _ := startTestServer(t, otlpgrpc.Config{
+			Auth:           auth,
+			Storage:        backend,
+			HTTPClient:     upstream.Client(),
+			MaxRecvMsgSize: 1024,
+		})
+
+		traceClient := tracepb.NewTraceServiceClient(conn)
+
+		// Oversized unauthenticated request must return Unauthenticated, not ResourceExhausted.
+		_, err = traceClient.Export(context.Background(), sampleTraceRequest(strings.Repeat("x", 4096)))
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("oversized unauthenticated code=%s want=Unauthenticated (err=%v)", status.Code(err), err)
+		}
+
+		// Gzip bomb unauthenticated request must return Unauthenticated, not ResourceExhausted.
+		_, err = traceClient.Export(
+			context.Background(),
+			sampleTraceRequest(strings.Repeat("z", 16384)),
+			grpc.UseCompressor(gzip.Name),
+		)
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("gzip bomb unauthenticated code=%s want=Unauthenticated (err=%v)", status.Code(err), err)
+		}
+
+		// Malformed wire frame without auth must return Unauthenticated, not InvalidArgument.
+		var resp tracepb.ExportTraceServiceResponse
+		err = conn.Invoke(
+			context.Background(),
+			tracepb.TraceService_Export_FullMethodName,
+			rawWireBytes([]byte{0x80, 0x08, 0x01}),
+			&resp,
+			grpc.ForceCodecV2(newRawClientCodec()),
+		)
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("malformed unauthenticated code=%s want=Unauthenticated (err=%v)", status.Code(err), err)
+		}
+
+		// Wrong token kind (lou_) with oversized request must return PermissionDenied, not ResourceExhausted.
+		_, err = traceClient.Export(
+			withAuthHeader(context.Background(), "Bearer lou_user_token"),
+			sampleTraceRequest(strings.Repeat("u", 4096)),
+		)
+		if status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("user token oversized code=%s want=PermissionDenied (err=%v)", status.Code(err), err)
+		}
+
+		if upstreamHits.Load() != 0 {
+			t.Fatalf("upstreamHits=%d want 0", upstreamHits.Load())
+		}
+	})
+
+	t.Run("concurrency cap runs before auth and RecvMsg", func(t *testing.T) {
+		started := make(chan struct{}, 1)
+		release := make(chan struct{})
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started <- struct{}{}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer upstream.Close()
+
+		backend, err := storagepkg.New(
+			storagepkg.MetricsVM,
+			upstream.URL,
+			upstream.URL,
+			upstream.URL,
+			upstream.URL,
+			upstream.Client(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		auth := &countingAuth{
+			inner: &stubAuth{tokens: map[string]meta.ProjectInfo{"lo_valid": {ID: 1, Slug: "alpha"}}},
+		}
+		_, conn, _ := startTestServer(t, otlpgrpc.Config{
+			Auth:           auth,
+			Storage:        backend,
+			HTTPClient:     upstream.Client(),
+			MaxRecvMsgSize: 1024,
+			MaxInFlight:    1,
+		})
+
+		traceClient := tracepb.NewTraceServiceClient(conn)
+		firstDone := make(chan error, 1)
+		go func() {
+			_, callErr := traceClient.Export(
+				withAuthHeader(context.Background(), "Bearer lo_valid"),
+				sampleTraceRequest("hold-slot"),
+			)
+			firstDone <- callErr
+		}()
+
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first export did not reach upstream")
+		}
+
+		callsBefore := auth.calls.Load()
+
+		// Overflow with missing auth + oversized payload must hit concurrency first.
+		_, err = traceClient.Export(context.Background(), sampleTraceRequest(strings.Repeat("x", 4096)))
+		if status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("overflow code=%s want=ResourceExhausted (err=%v)", status.Code(err), err)
+		}
+		if delay, ok := retryInfoDelay(err); !ok || delay != time.Second {
+			t.Fatalf("overflow RetryInfo=(%s, %v) want (1s, true)", delay, ok)
+		}
+
+		// Overflow with valid token + malformed wire bytes must also stop at concurrency.
+		var resp tracepb.ExportTraceServiceResponse
+		err = conn.Invoke(
+			withAuthHeader(context.Background(), "Bearer lo_valid"),
+			tracepb.TraceService_Export_FullMethodName,
+			rawWireBytes([]byte{0x80}),
+			&resp,
+			grpc.ForceCodecV2(newRawClientCodec()),
+		)
+		if status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("overflow raw code=%s want=ResourceExhausted (err=%v)", status.Code(err), err)
+		}
+		if auth.calls.Load() != callsBefore {
+			t.Fatalf("auth calls increased during concurrency saturation: before=%d after=%d",
+				callsBefore, auth.calls.Load())
+		}
+
+		close(release)
+		if err := <-firstDone; err != nil {
+			t.Fatalf("first export failed: %v", err)
+		}
+	})
+}
+
+func TestOTLPGRPCMalformedWireFramesRejectedWithInvalidArgument(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	backend, err := storagepkg.New(
+		storagepkg.MetricsVM,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	limiter := ingestlimit.New(ingestlimit.Config{
+		Enabled:           true,
+		RequestsPerSecond: 1,
+		Burst:             1,
+		Now:               func() time.Time { return now },
+	})
+	metricsReg := selfmetrics.New(selfmetrics.Config{Now: func() time.Time { return now }})
+	auth := &stubAuth{tokens: map[string]meta.ProjectInfo{"lo_valid": {ID: 7, Slug: "proj7"}}}
+
+	_, conn, _ := startTestServer(t, otlpgrpc.Config{
+		Auth:          auth,
+		Storage:       backend,
+		HTTPClient:    upstream.Client(),
+		IngestLimiter: limiter,
+		SelfMetrics:   metricsReg,
+	})
+
+	ctx := withAuthHeader(context.Background(), "Bearer lo_valid")
+	rawCodecOpt := grpc.ForceCodecV2(newRawClientCodec())
+
+	badFrames := []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "truncated tag", raw: []byte{0x80}},
+		{name: "truncated length", raw: []byte{0x0a, 0x10, 0x01, 0x02}},
+		{name: "field 1 varint", raw: []byte{0x08, 0x01}},
+		{name: "field 1 fixed32", raw: []byte{0x0d, 1, 2, 3, 4}},
+		{name: "plaintext json", raw: []byte(`{"resourceSpans":[]}`)},
+	}
+	methods := []string{
+		tracepb.TraceService_Export_FullMethodName,
+		metricspb.MetricsService_Export_FullMethodName,
+		logspb.LogsService_Export_FullMethodName,
+	}
+
+	for _, method := range methods {
+		for _, bf := range badFrames {
+			var resp tracepb.ExportTraceServiceResponse
+			callErr := conn.Invoke(ctx, method, rawWireBytes(bf.raw), &resp, rawCodecOpt)
+			if status.Code(callErr) != codes.InvalidArgument {
+				t.Fatalf("%s (%s) code=%s want=InvalidArgument (err=%v)",
+					method, bf.name, status.Code(callErr), callErr)
+			}
+		}
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("malformed frames hit upstream %d times", upstreamHits.Load())
+	}
+
+	// Single burst token must still be untouched after malformed requests!
+	if _, err := tracepb.NewTraceServiceClient(conn).Export(ctx, sampleTraceRequest("valid-after-bad")); err != nil {
+		t.Fatalf("valid export after malformed frames failed (rate limit leaked?): %v", err)
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("upstreamHits=%d want 1", upstreamHits.Load())
+	}
+
+	var buf bytes.Buffer
+	if err := metricsReg.WritePrometheus(&buf); err != nil {
+		t.Fatal(err)
+	}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rejected := map[string]float64{}
+	accepted := map[string]float64{}
+	for _, m := range families["lazy_observe_ingest_requests_total"].GetMetric() {
+		lbls := map[string]string{}
+		for _, lp := range m.GetLabel() {
+			lbls[lp.GetName()] = lp.GetValue()
+		}
+		if lbls["protocol"] != "grpc" {
+			continue
+		}
+		switch lbls["outcome"] {
+		case "rejected":
+			rejected[lbls["signal"]] = m.GetCounter().GetValue()
+		case "accepted":
+			accepted[lbls["signal"]] = m.GetCounter().GetValue()
+		}
+	}
+	wantRejected := float64(len(badFrames))
+	if rejected["traces"] != wantRejected || rejected["metrics"] != wantRejected || rejected["logs"] != wantRejected {
+		t.Fatalf("rejected counts=%v want %v per signal", rejected, wantRejected)
+	}
+	if accepted["traces"] != 1 {
+		t.Fatalf("accepted traces=%v want 1", accepted["traces"])
+	}
+}
+
+func TestOTLPGRPCRawPassthroughExactBytesGzipAndUnknownService(t *testing.T) {
+	var mu sync.Mutex
+	var bodies [][]byte
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read failed", http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		bodies = append(bodies, body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	backend, err := storagepkg.New(
+		storagepkg.MetricsVM,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &stubAuth{tokens: map[string]meta.ProjectInfo{"lo_raw": {ID: 12, Slug: "raw"}}}
+	_, conn, _ := startTestServer(t, otlpgrpc.Config{
+		Auth:       auth,
+		Storage:    backend,
+		HTTPClient: upstream.Client(),
+	})
+
+	// Place unknown field 99 BEFORE field 1. Re-marshaling with proto.Marshal would
+	// reorder fields by number, whereas raw passthrough preserves exact wire bytes.
+	baseReq, err := proto.Marshal(sampleTraceRequest(strings.Repeat("raw-span-", 300)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireWithLeadingUnknown := protowire.AppendTag(nil, 99, protowire.BytesType)
+	wireWithLeadingUnknown = protowire.AppendString(wireWithLeadingUnknown, "passthrough-order-sentinel")
+	wireWithLeadingUnknown = append(wireWithLeadingUnknown, baseReq...)
+
+	ctx := withAuthHeader(context.Background(), "Bearer lo_raw")
+	rawCodecOpt := grpc.ForceCodecV2(newRawClientCodec())
+
+	var resp tracepb.ExportTraceServiceResponse
+	if err := conn.Invoke(
+		ctx,
+		tracepb.TraceService_Export_FullMethodName,
+		rawWireBytes(wireWithLeadingUnknown),
+		&resp,
+		rawCodecOpt,
+	); err != nil {
+		t.Fatalf("raw invoke failed: %v", err)
+	}
+
+	// Also exercise gzip + pooled buffer (>1024B) passthrough.
+	if err := conn.Invoke(
+		ctx,
+		tracepb.TraceService_Export_FullMethodName,
+		rawWireBytes(wireWithLeadingUnknown),
+		&resp,
+		rawCodecOpt,
+		grpc.UseCompressor(gzip.Name),
+	); err != nil {
+		t.Fatalf("gzip raw invoke failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("captured bodies=%d want 2", len(bodies))
+	}
+	for i, got := range bodies {
+		if !bytes.Equal(got, wireWithLeadingUnknown) {
+			t.Fatalf("body[%d] not byte-for-byte identical: got len=%d want len=%d",
+				i, len(got), len(wireWithLeadingUnknown))
+		}
+	}
+
+	// Unregistered service must return Unimplemented (no UnknownServiceHandler).
+	err = conn.Invoke(
+		ctx,
+		"/opentelemetry.proto.collector.custom.v1.CustomService/Export",
+		rawWireBytes(wireWithLeadingUnknown),
+		&resp,
+		rawCodecOpt,
+	)
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("unknown service code=%s want=Unimplemented (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestOTLPGRPCPlaintextHTTP200ResponseCompatibility(t *testing.T) {
+	var mu sync.Mutex
+	var upstreamRespBody []byte
+	var upstreamContentType string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		body := append([]byte(nil), upstreamRespBody...)
+		ct := upstreamContentType
+		mu.Unlock()
+		if ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+
+	backend, err := storagepkg.New(
+		storagepkg.MetricsVM,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.URL,
+		upstream.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &stubAuth{tokens: map[string]meta.ProjectInfo{"lo_resp": {ID: 15, Slug: "resp"}}}
+	_, conn, _ := startTestServer(t, otlpgrpc.Config{
+		Auth:       auth,
+		Storage:    backend,
+		HTTPClient: upstream.Client(),
+	})
+
+	ctx := withAuthHeader(context.Background(), "Bearer lo_resp")
+	traceClient := tracepb.NewTraceServiceClient(conn)
+	metricsClient := metricspb.NewMetricsServiceClient(conn)
+	logsClient := logspb.NewLogsServiceClient(conn)
+
+	// 1. Plaintext HTTP 200 ("OK\n") and non-protobuf binary must succeed cleanly.
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		body        []byte
+	}{
+		{name: "plaintext OK", contentType: "text/plain; charset=utf-8", body: []byte("OK\n")},
+		{name: "invalid protobuf response", contentType: "application/x-protobuf", body: []byte{0x0a, 0xff}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			upstreamContentType = tc.contentType
+			upstreamRespBody = tc.body
+			mu.Unlock()
+
+			trResp, err := traceClient.Export(ctx, sampleTraceRequest("plain-200"))
+			if err != nil {
+				t.Fatalf("TraceService.Export failed: %v", err)
+			}
+			if trResp.GetPartialSuccess() != nil {
+				t.Fatalf("unexpected trace PartialSuccess: %+v", trResp.GetPartialSuccess())
+			}
+
+			mResp, err := metricsClient.Export(ctx, sampleMetricsRequest("plain-200"))
+			if err != nil {
+				t.Fatalf("MetricsService.Export failed: %v", err)
+			}
+			if mResp.GetPartialSuccess() != nil {
+				t.Fatalf("unexpected metrics PartialSuccess: %+v", mResp.GetPartialSuccess())
+			}
+
+			lResp, err := logsClient.Export(ctx, sampleLogsRequest("plain-200"))
+			if err != nil {
+				t.Fatalf("LogsService.Export failed: %v", err)
+			}
+			if lResp.GetPartialSuccess() != nil {
+				t.Fatalf("unexpected logs PartialSuccess: %+v", lResp.GetPartialSuccess())
+			}
+		})
+	}
+
+	// 2. Valid protobuf PartialSuccess responses are preserved across all three signals.
+	t.Run("protobuf PartialSuccess preserved", func(t *testing.T) {
+		mu.Lock()
+		upstreamContentType = "application/x-protobuf"
+		upstreamRespBody, _ = proto.Marshal(&tracepb.ExportTraceServiceResponse{
+			PartialSuccess: &tracepb.ExportTracePartialSuccess{
+				RejectedSpans: 2,
+				ErrorMessage:  "partial trace",
+			},
+		})
+		mu.Unlock()
+		trResp, err := traceClient.Export(ctx, sampleTraceRequest("ps-trace"))
+		if err != nil {
+			t.Fatalf("TraceService.Export failed: %v", err)
+		}
+		if trResp.GetPartialSuccess().GetRejectedSpans() != 2 ||
+			trResp.GetPartialSuccess().GetErrorMessage() != "partial trace" {
+			t.Fatalf("unexpected trace PartialSuccess: %+v", trResp.GetPartialSuccess())
+		}
+
+		mu.Lock()
+		upstreamRespBody, _ = proto.Marshal(&metricspb.ExportMetricsServiceResponse{
+			PartialSuccess: &metricspb.ExportMetricsPartialSuccess{
+				RejectedDataPoints: 5,
+				ErrorMessage:       "partial metric",
+			},
+		})
+		mu.Unlock()
+		mResp, err := metricsClient.Export(ctx, sampleMetricsRequest("ps-metric"))
+		if err != nil {
+			t.Fatalf("MetricsService.Export failed: %v", err)
+		}
+		if mResp.GetPartialSuccess().GetRejectedDataPoints() != 5 ||
+			mResp.GetPartialSuccess().GetErrorMessage() != "partial metric" {
+			t.Fatalf("unexpected metrics PartialSuccess: %+v", mResp.GetPartialSuccess())
+		}
+
+		mu.Lock()
+		upstreamRespBody, _ = proto.Marshal(&logspb.ExportLogsServiceResponse{
+			PartialSuccess: &logspb.ExportLogsPartialSuccess{
+				RejectedLogRecords: 4,
+				ErrorMessage:       "partial log",
+			},
+		})
+		mu.Unlock()
+		lResp, err := logsClient.Export(ctx, sampleLogsRequest("ps-log"))
+		if err != nil {
+			t.Fatalf("LogsService.Export failed: %v", err)
+		}
+		if lResp.GetPartialSuccess().GetRejectedLogRecords() != 4 ||
+			lResp.GetPartialSuccess().GetErrorMessage() != "partial log" {
+			t.Fatalf("unexpected logs PartialSuccess: %+v", lResp.GetPartialSuccess())
+		}
+	})
 }
