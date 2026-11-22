@@ -8,7 +8,7 @@ import time
 
 import httpx
 
-from lazyobserve._profile_upload import (
+from lazy_observe._profile_upload import (
     CollectedProfile,
     ProfileUploader,
     new_upload_id,
@@ -205,7 +205,7 @@ def test_408_and_429_are_retried_until_accepted():
 
 
 def test_profile_exceeding_10mb_is_rejected_before_upload():
-    from lazyobserve._profile_upload import MAX_PROFILE_SIZE
+    from lazy_observe._profile_upload import MAX_PROFILE_SIZE
 
     transport = _FakeTransport([201])
     drops = []

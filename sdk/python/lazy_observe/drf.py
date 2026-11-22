@@ -4,7 +4,7 @@ aggregation with request context (method/route/status, query-free URL).
 
 Configure in ``REST_FRAMEWORK``:
 
-    "EXCEPTION_HANDLER": "lazyobserve.drf.exception_handler"
+    "EXCEPTION_HANDLER": "lazy_observe.drf.exception_handler"
 
 or bind explicitly with ``lo.drf_exception_handler()``.
 """

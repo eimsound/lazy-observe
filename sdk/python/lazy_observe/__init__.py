@@ -2,10 +2,10 @@
 
 Three-line setup:
 
-    import lazyobserve
-    lo = lazyobserve.init({"dsn": "http://host:3100/p/myapp@token", "service_name": "checkout-api"})
-    # MIDDLEWARE += ["lazyobserve.DjangoMiddleware"]
-    # REST_FRAMEWORK["EXCEPTION_HANDLER"] = "lazyobserve.drf.exception_handler"
+    import lazy_observe
+    lo = lazy_observe.init({"dsn": "http://host:3100/p/myapp@token", "service_name": "checkout-api"})
+    # MIDDLEWARE += ["lazy_observe.DjangoMiddleware"]
+    # REST_FRAMEWORK["EXCEPTION_HANDLER"] = "lazy_observe.drf.exception_handler"
 """
 
 from . import _registry  # noqa: F401
@@ -14,7 +14,7 @@ from .config import Config, DeliveryConfig, InvalidConfigError, config_from_mapp
 from .dsn import DSN, parse_dsn
 from .django import DjangoMiddleware
 from .logging import LazyObserveLogHandler
-from . import drf  # noqa: F401  (module path lazyobserve.drf.exception_handler)
+from . import drf  # noqa: F401  (module path lazy_observe.drf.exception_handler)
 
 __version__ = "0.1.0"
 
@@ -25,14 +25,14 @@ def init(config: "Config | dict | None" = None, **kwargs) -> Client:
     inspect ``client.err()`` to report the construction failure.
 
     The constructed client becomes the registry's active instance so that
-    registry-bound integrations (``lazyobserve.DjangoMiddleware``,
-    ``lazyobserve.drf.exception_handler``, ``LazyObserveLogHandler``) resolve it.
+    registry-bound integrations (``lazy_observe.DjangoMiddleware``,
+    ``lazy_observe.drf.exception_handler``, ``LazyObserveLogHandler``) resolve it.
     """
     if isinstance(config, dict):
         merged = {**config, **kwargs} if kwargs else config
-        config = config_from_mapping(merged, source="lazyobserve.init")
+        config = config_from_mapping(merged, source="lazy_observe.init")
     elif kwargs:
-        config = config_from_mapping(kwargs, source="lazyobserve.init")
+        config = config_from_mapping(kwargs, source="lazy_observe.init")
     if config is None:
         config = Config()
     client = init_client(config)

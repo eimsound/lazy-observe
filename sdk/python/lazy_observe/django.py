@@ -23,7 +23,7 @@ WSGI / ASGI and streaming support boundaries:
 
 Usage (registry-bound, keeps Django's string-based MIDDLEWARE config):
 
-    MIDDLEWARE = ["lazyobserve.DjangoMiddleware", ...]
+    MIDDLEWARE = ["lazy_observe.DjangoMiddleware", ...]
 
 or bind explicitly on an instance:
 
@@ -44,8 +44,8 @@ from opentelemetry import trace as _otel_trace
 
 from .client import _create_histogram_compat
 
-logger = logging.getLogger("lazyobserve")
-_django_logger = logging.getLogger("lazyobserve.django")
+logger = logging.getLogger("lazy_observe")
+_django_logger = logging.getLogger("lazy_observe.django")
 
 _HTTP_DURATION_BUCKETS = [
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75,
@@ -54,9 +54,9 @@ _HTTP_DURATION_BUCKETS = [
 
 _PROTOCOL_RE = re.compile(r"HTTP/([12]\.\d)$")
 
-_SPAN_ATTR = "_lazyobserve_span"
-_START_ATTR = "_lazyobserve_start"
-_RECORDED_EXCS_ATTR = "_lazyobserve_recorded_exceptions"
+_SPAN_ATTR = "_lazy_observe_span"
+_START_ATTR = "_lazy_observe_start"
+_RECORDED_EXCS_ATTR = "_lazy_observe_recorded_exceptions"
 _UNMATCHED_ROUTE = "unmatched"
 
 
@@ -213,13 +213,13 @@ class _BaseMiddleware:
                 self._instrumentation = _Instrumentation(client)
                 self._instrumentation_client = client
             except Exception as exc:  # noqa: BLE001 - silent degradation on SDK init failure
-                logger.warning("lazyobserve Django middleware instrumentation degraded: %s", exc)
+                logger.warning("lazy_observe Django middleware instrumentation degraded: %s", exc)
                 return None
         return self._instrumentation
 
 
 class DjangoMiddleware(_BaseMiddleware):
-    """Django middleware bound to the active lazyobserve client."""
+    """Django middleware bound to the active lazy_observe client."""
 
     def __init__(self, get_response: Any) -> None:
         self._instrumentation: Optional[_Instrumentation] = None
@@ -328,7 +328,7 @@ def _setup_request_instrumentation(
         active_added = True
         return token, span, method, start
     except Exception as exc:  # noqa: BLE001 - SDK setup failure must never break the request
-        logger.warning("lazyobserve Django middleware request setup failed: %s", exc)
+        logger.warning("lazy_observe Django middleware request setup failed: %s", exc)
         if active_added:
             try:
                 instrumentation.active.add(-1, {"http.request.method": method})
@@ -551,7 +551,7 @@ def _observe_exception(client: Any, request: Any, exc: BaseException) -> bool:
             span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR, str(exc)))
         exc_logger = (
             _django_logger
-            if getattr(client.logger, "name", "") == "lazyobserve"
+            if getattr(client.logger, "name", "") == "lazy_observe"
             else client.logger
         )
         exc_logger.error(

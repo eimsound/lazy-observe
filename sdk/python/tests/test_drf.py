@@ -61,9 +61,9 @@ def test_non_api_exception_returns_none_per_drf_contract(client):
 
 
 def test_drf_apiview_uncaught_exception_uses_raise_uncaught_exception(client, monkeypatch):
-    import lazyobserve
+    import lazy_observe
 
-    lazyobserve._set_active(client)
+    lazy_observe._set_active(client)
     raised = []
 
     class _ExplodingView(APIView):
@@ -84,7 +84,7 @@ def test_drf_apiview_uncaught_exception_uses_raise_uncaught_exception(client, mo
             view.handle_exception(RuntimeError("non-api boom"))
         assert len(raised) == 1
     finally:
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
 
 def test_drf_disallowed_host_does_not_crash_5xx_capture(client, monkeypatch):

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lazyobserve._pprof import encode_cpu_profile
+from lazy_observe._pprof import encode_cpu_profile
 
 PERIOD_NS = 10_000_000  # 100 Hz
 START_NS = 1_700_000_000_000_000_000

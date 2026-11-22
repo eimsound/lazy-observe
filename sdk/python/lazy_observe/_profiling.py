@@ -3,7 +3,7 @@
 ``Config(profiling=True)`` makes ``build_client`` start one
 :class:`ProfilingController`. It owns a single daemon thread that
 
-1. builds the sampler (:meth:`lazyobserve._sampler.Sampler.create`, whose probe runs a
+1. builds the sampler (:meth:`lazy_observe._sampler.Sampler.create`, whose probe runs a
    0.1 s trial sample, hence in this thread and never inside ``build_client``) and,
    if the interpreter cannot be sampled, logs one warning with a stable reason code
    and ends;
@@ -71,7 +71,7 @@ from ._sampler import (
 DOC_URL = "https://github.com/eimsound/lazy-observe/blob/main/docs/sdk/python.md#continuous-profiling"
 #: A window cut short by ``shutdown`` is uploaded only if it already ran this long.
 SHUTDOWN_MIN_WINDOW_SECONDS = 5.0
-THREAD_NAME = "lazyobserve-profiling"
+THREAD_NAME = "lazy_observe-profiling"
 
 #: Warning codes (ADR 0014); stable, documented, and the only thing users should match on.
 CODE_PYTHON_TOO_OLD = "python_too_old"
@@ -119,7 +119,7 @@ def _warn_once(logger: logging.Logger, code: str, detail: str) -> None:
         _warned.add(code)
     try:
         logger.warning(
-            "lazyobserve continuous profiling is off: reason=%s (%s); see %s", code, detail, DOC_URL
+            "lazy_observe continuous profiling is off: reason=%s (%s); see %s", code, detail, DOC_URL
         )
     except Exception:  # noqa: BLE001 - a broken log handler must not reach the app
         return

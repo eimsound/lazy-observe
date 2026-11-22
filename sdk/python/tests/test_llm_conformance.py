@@ -12,7 +12,7 @@ import httpx
 import pytest
 from opentelemetry.trace import SpanKind, StatusCode
 
-from lazyobserve.llm import (
+from lazy_observe.llm import (
     GEN_AI_ATTRS,
     LLM_BODY_INSPECTION_LIMIT,
     LLM_CONTENT_LIMIT,

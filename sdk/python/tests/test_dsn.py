@@ -1,6 +1,6 @@
 import pytest
 
-from lazyobserve.dsn import parse_dsn
+from lazy_observe.dsn import parse_dsn
 
 
 def test_valid_dsn():

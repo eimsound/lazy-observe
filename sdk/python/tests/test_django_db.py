@@ -98,7 +98,7 @@ def test_db_handles_non_str_sql_without_type_error(db_ready):
 
     client = make_client(capture_db_statement=True)
     try:
-        from lazyobserve.db import django_db_wrapper
+        from lazy_observe.db import django_db_wrapper
 
         executed = []
 
@@ -120,9 +120,9 @@ def test_db_handles_non_str_sql_without_type_error(db_ready):
 
 
 def test_db_degraded_client_yields_directly(db_ready):
-    import lazyobserve
+    import lazy_observe
 
-    degraded = lazyobserve.init({"dsn": "bad-dsn", "service_name": "degraded"})
+    degraded = lazy_observe.init({"dsn": "bad-dsn", "service_name": "degraded"})
     assert degraded.degraded
     with degraded.django_db():
         with connection.cursor() as cursor:

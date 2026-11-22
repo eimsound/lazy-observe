@@ -147,7 +147,7 @@ class ProfileUploader:
 
 
 def _encode_multipart(service: str, profile: CollectedProfile) -> Tuple[bytes, str]:
-    boundary = "lazyobserve" + secrets.token_hex(16)
+    boundary = "lazy_observe" + secrets.token_hex(16)
     body = bytearray()
     fields = (
         ("service", service),

@@ -3,7 +3,7 @@
 Both error-event delivery (``POST /api/events/errors``) and continuous-profiling
 uploads (``POST /api/profiles``) share :class:`InternalHTTPTransport`, backed by
 an isolated ``httpx.Client(follow_redirects=False)`` connection pool owned by
-:class:`lazyobserve.client.Client` and cleanly closed during ``Client.shutdown``.
+:class:`lazy_observe.client.Client` and cleanly closed during ``Client.shutdown``.
 
 Centralizes:
 - Non-redirecting pooled HTTP transport (isolated from global ``urllib`` state

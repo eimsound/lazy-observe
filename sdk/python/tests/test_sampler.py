@@ -1,6 +1,6 @@
 """Tests for the CPython 3.15 in-process CPU sampler.
 
-Most tests drive ``lazyobserve._sampler`` through a fake ``profiling.sampling``
+Most tests drive ``lazy_observe._sampler`` through a fake ``profiling.sampling``
 package, so they run on 3.9-3.14 too. The fake mirrors what 3.15.2 really hands
 out: ``sample()`` is called as ``sample(pid, collector, *, duration_sec,
 all_threads, mode)``, stacks arrive as ``InterpreterInfo -> ThreadInfo ->
@@ -26,7 +26,7 @@ from collections import namedtuple
 
 import pytest
 
-from lazyobserve import _sampler
+from lazy_observe import _sampler
 
 # 3.15 hands out ``_remote_debugging.LocationInfo`` namedtuples.
 Location = namedtuple("Location", "lineno end_lineno col_offset end_col_offset")
@@ -438,7 +438,7 @@ def test_collect_window_accepts_object_frames():
 
 def test_collect_window_excludes_the_sampling_thread_by_native_id():
     native_id = threading.get_native_id()
-    self_frames = [_frame("_sampler.collect_window", "lazyobserve/_sampler.py", 200)]
+    self_frames = [_frame("_sampler.collect_window", "lazy_observe/_sampler.py", 200)]
     other_frames = [_frame("view", "app.py", 11)]
     fake = FakeSampling(stacks=_stacks((native_id, self_frames), (native_id + 1, other_frames)))
 

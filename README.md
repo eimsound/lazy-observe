@@ -193,7 +193,7 @@ All four SDKs live in this monorepo under [`sdk/`](sdk/) and use explicit instru
 | Node.js | `@lazy-observe/node` | Express, Pino, Winston, runtime metrics, errors, V8 CPU/heap profiling | [docs/sdk/node.md](docs/sdk/node.md) |
 | Browser | `@lazy-observe/browser`, `@lazy-observe/react` | Errors, Web Vitals with geography and device dimensions, `fetch` and XHR tracing, session replay, React ErrorBoundary and route tracking | [docs/sdk/browser.md](docs/sdk/browser.md) |
 | Browser builds | `@lazy-observe/bundler-plugin` | Vite plugin and `lazy-observe-sourcemaps` CLI for source-map upload with `los_...` tokens | [docs/sdk/browser.md#source-maps](docs/sdk/browser.md#source-maps) |
-| Python | `lazyobserve` | Django WSGI/ASGI and streaming, DRF, `logging`, database queries, LLM calls, experimental CPU profiling on 3.15t | [docs/sdk/python.md](docs/sdk/python.md) |
+| Python | `lazy-observe` | Django WSGI/ASGI and streaming, DRF, `logging`, database queries, LLM calls, experimental CPU profiling on 3.15t | [docs/sdk/python.md](docs/sdk/python.md) |
 
 Server and SDK compatibility rules live in [docs/version-matrix.md](docs/version-matrix.md).
 

@@ -41,7 +41,7 @@ SDK 面向 lazy-observe 服务端上报遥测时必须遵守以下守则（与 `
 - 四语言包各自独立：`sdk/go`（嵌套模块 `github.com/eimsound/lazy-observe/sdk/go`，
   网关经根 `go.mod` 的 `replace => ./sdk/go` 引用）、`sdk/node`（pnpm workspace，包在
   `packages/`）、`sdk/browser`（pnpm workspace，含 browser/react/bundler-plugin）、
-  `sdk/python`（`lazyobserve` 包，含 Django/DRF 适配）。
+  `sdk/python`（PyPI 包 `lazy-observe`，导入模块 `lazy_observe`，含 Django/DRF 适配）。
 - 本地入口：`mise run sdk-go`、`mise run sdk-node`、`mise run sdk-browser`、
   `mise run sdk-python`；四个语言的 journey（对着真实平台的端到端）由 `mise run sdk-journeys`
   起临时平台后依次跑。CI 由根 `.github/workflows/ci.yml` 的 `changes` 作业按目录

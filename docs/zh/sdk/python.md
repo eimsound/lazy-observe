@@ -1,6 +1,6 @@
 # Python SDK（Django 与 DRF）
 
-Python SDK 为 lazy-observe 提供显式的 Django 与 Django REST Framework（DRF）插桩，能力与 [Go/Fiber SDK](go.md) 对齐。导入 `lazyobserve` 不会安装钩子，不会改动全局 OpenTelemetry Provider，也不会调用 `set_meter_provider`、`set_tracer_provider` 或 `set_logger_provider`。
+Python SDK 为 lazy-observe 提供显式的 Django 与 Django REST Framework（DRF）插桩，能力与 [Go/Fiber SDK](go.md) 对齐。导入 `lazy_observe` 不会安装钩子，不会改动全局 OpenTelemetry Provider，也不会调用 `set_meter_provider`、`set_tracer_provider` 或 `set_logger_provider`。
 
 ## 安装
 
@@ -21,9 +21,9 @@ uv pip install -e "/abs/lazy-observe/sdk/python[django]"
 ## 初始化与关闭
 
 ```python
-import lazyobserve
+import lazy_observe
 
-lo = lazyobserve.init({
+lo = lazy_observe.init({
     "dsn": "http://127.0.0.1:3100/p/default@TOKEN",
     "service_name": "checkout-api",
 })
@@ -33,7 +33,7 @@ if lo.err():
 
 DSN 格式必须为 `http(s)://host[:port]/p/<slug>@<token>`，不能包含查询参数或片段，解析规则与 Go SDK 完全一致。Token 仅通过 `Authorization: Bearer <token>` 请求头发送。
 
-`init` 会将该客户端注册为全局注册表的当前实例，供依赖注册表的集成组件（`lazyobserve.DjangoMiddleware`、`lazyobserve.drf.exception_handler`、`LazyObserveLogHandler`）解析。
+`init` 会将该客户端注册为全局注册表的当前实例，供依赖注册表的集成组件（`lazy_observe.DjangoMiddleware`、`lazy_observe.drf.exception_handler`、`LazyObserveLogHandler`）解析。
 
 进程退出前请调用关闭方法，以排空有界队列并刷新导出器：
 
@@ -59,13 +59,13 @@ lo.shutdown(timeout=10.0)
 | `profiling` | `false` | **实验特性。** 显式开启持续性能剖析（见下文“持续性能剖析”一节）；仅在 Linux 且关闭 GIL 的自由线程 CPython 3.15 及以上版本采样。 |
 | `profiling_interval` | `60`（秒） | 相邻两次 10 秒剖析窗口起始时间之间的间隔；`<= 0`、NaN 和无穷大会回退到 `60`；小于 `10` 时窗口连续运行。 |
 
-当传给 `lazyobserve.init` 的 `dict` 或关键字参数包含无法识别的顶层键或 `delivery.*` 键时，SDK 会在 `lazyobserve` logger 上记录一次警告并列出被忽略的字段，不会静默吞掉拼写错误。
+当传给 `lazy_observe.init` 的 `dict` 或关键字参数包含无法识别的顶层键或 `delivery.*` 键时，SDK 会在 `lazy_observe` logger 上记录一次警告并列出被忽略的字段，不会静默吞掉拼写错误。
 
 信号矩阵规则：`metrics`、`logs`、`traces` 全为 `false` 时三者全部启用；只要任一字段为 `true`，这三个值就构成显式启用集合。如需关闭全部遥测，不要调用 `init`。
 
 ## Django
 
-将 `lazyobserve.DjangoMiddleware` 加入 `MIDDLEWARE`。中间件会完成以下工作：
+将 `lazy_observe.DjangoMiddleware` 加入 `MIDDLEWARE`。中间件会完成以下工作：
 
 - 提取 W3C `traceparent` 并创建 SERVER Span，记录 `url.path`、`http.request.method`、`url.scheme`、`server.address` 和协议版本。
 - 记录 `http.server.request.duration` 和 `http.server.active_requests` 指标。
@@ -74,7 +74,7 @@ lo.shutdown(timeout=10.0)
 
 ```python
 MIDDLEWARE = [
-    "lazyobserve.DjangoMiddleware",
+    "lazy_observe.DjangoMiddleware",
     "django.middleware.common.CommonMiddleware",
 ]
 ```
@@ -93,7 +93,7 @@ MIDDLEWARE = [
 
 ```python
 REST_FRAMEWORK = {
-    "EXCEPTION_HANDLER": "lazyobserve.drf.exception_handler",
+    "EXCEPTION_HANDLER": "lazy_observe.drf.exception_handler",
 }
 ```
 
@@ -107,7 +107,7 @@ REST_FRAMEWORK = {
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "handlers": {"lazy_observe": {"class": "lazyobserve.LazyObserveLogHandler"}},
+    "handlers": {"lazy_observe": {"class": "lazy_observe.LazyObserveLogHandler"}},
     "loggers": {"": {"handlers": ["lazy_observe"], "level": "INFO"}},
 }
 ```
@@ -172,7 +172,7 @@ event_id = lo.capture_exception(exc, tags={"http.route": "/checkout"})
 ### 开启方式
 
 ```python
-lo = lazyobserve.init({
+lo = lazy_observe.init({
     "dsn": "http://127.0.0.1:3100/p/default@TOKEN",
     "service_name": "checkout-api",
     "profiling": True,          # default False
@@ -180,7 +180,7 @@ lo = lazyobserve.init({
 })
 ```
 
-`init` 会立即返回，可用性探测和采样循环运行在名为 `lazyobserve-profiling` 的守护线程中。调用 `lo.shutdown(timeout)` 会立即停止采样；若当前窗口已运行至少 5 秒，会在关闭预算内上传，不足 5 秒则直接丢弃。支持 gunicorn、uWSGI 等 prefork 服务器：每个 worker 进程在 `fork` 后都会重启独立的采样器并开启新窗口，避免预加载阶段主进程采集的样本被各个 worker 重复上传。
+`init` 会立即返回，可用性探测和采样循环运行在名为 `lazy_observe-profiling` 的守护线程中。调用 `lo.shutdown(timeout)` 会立即停止采样；若当前窗口已运行至少 5 秒，会在关闭预算内上传，不足 5 秒则直接丢弃。支持 gunicorn、uWSGI 等 prefork 服务器：每个 worker 进程在 `fork` 后都会重启独立的采样器并开启新窗口，避免预加载阶段主进程采集的样本被各个 worker 重复上传。
 
 ### 支持范围
 
@@ -231,10 +231,10 @@ lo = lazyobserve.init({
 
 ### 警告码
 
-无法运行剖析时，SDK 会通过 `lazyobserve` logger 输出一条警告，每个进程对每个警告码最多打印一次（`fork` 出的子进程可能再次警告一次）：
+无法运行剖析时，SDK 会通过 `lazy_observe` logger 输出一条警告，每个进程对每个警告码最多打印一次（`fork` 出的子进程可能再次警告一次）：
 
 ```
-lazyobserve continuous profiling is off: reason=<code> (<detail>); see <link to this section>
+lazy_observe continuous profiling is off: reason=<code> (<detail>); see <link to this section>
 ```
 
 请按 `code` 匹配，不要匹配 `detail` 文本。发出警告后不再采样或上传，且已停止的采样器在同一进程内不会重启，因为触发原因不会自行消失。
@@ -246,7 +246,7 @@ lazyobserve continuous profiling is off: reason=<code> (<detail>); see <link to 
 | `gil_build` | 常规带 GIL 构建，包括标准 3.15。 | 改用自由线程构建 `python3.15t`。 |
 | `gil_enabled` | 自由线程构建，但因 `PYTHON_GIL=1`、`-X gil=1` 或不支持自由线程的 C 扩展导致 `sys._is_gil_enabled()` 为 `True`。窗口间隙 GIL 被重新开启并停止采样时也会报此码。 | 移除对应启动参数或重新启用 GIL 的扩展。 |
 | `probe_failed` | 启动探测发现当前解释器的 `profiling.sampling` 与 SDK 预期不符：导入失败、`sample()` 签名或 CPU 模式常量变更，或 0.1 秒试采失败。因接口未公开文档，常见于 CPython 升级后。 | 提交 `detail` 文本，在 SDK 适配该版本前保持 `profiling` 关闭。 |
-| `too_many_failures` | 连续 3 个窗口失败（合并计入采样和编码错误）。 | 查看 `lazyobserve` logger 的 debug 日志排查原因。 |
+| `too_many_failures` | 连续 3 个窗口失败（合并计入采样和编码错误）。 | 查看 `lazy_observe` logger 的 debug 日志排查原因。 |
 | `sample_failure_rate` | 单个窗口内超过 50% 的采样 tick 失败（至少达到 100 次采样尝试才判定，100 Hz 下约 1 秒）。常见于 gevent 和 eventlet。 | 不要将性能剖析与基于 greenlet 的并发模型混用。 |
 | `internal_error` | 其他未预期错误，例如剖析线程启动失败或未分类的停止原因，`detail` 中附带异常信息。 | 提交 `detail` 文本以便排查。 |
 
@@ -271,11 +271,11 @@ lazyobserve continuous profiling is off: reason=<code> (<detail>); see <link to 
 
 | Go SDK | Python SDK |
 | --- | --- |
-| `lazyobserve.Init(Config)` | `lazyobserve.init(cfg)` |
+| `lazyobserve.Init(Config)` | `lazy_observe.init(cfg)` |
 | `lo.Err()` / 降级实例 | `lo.err()` / `lo.degraded` |
 | `signalMatrix` 全 `false` 默认全开 | `metrics`/`logs`/`traces` 规则一致 |
-| `lo.Fiber()` | `lazyobserve.DjangoMiddleware` |
-| Fiber 5xx 捕获 | `lazyobserve.drf.exception_handler` |
+| `lo.Fiber()` | `lazy_observe.DjangoMiddleware` |
+| Fiber 5xx 捕获 | `lazy_observe.drf.exception_handler` |
 | `lo.Slog()` 关联处理器 | `LazyObserveLogHandler` |
 | `lo.WrapDB(driver, dsn)` | `lo.django_db()` 上下文管理器 |
 | `lo.LLMTransport(base)` | `lo.llm_transport(base=...)` |

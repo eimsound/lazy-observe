@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from lazyobserve.delivery import DeliveryQueue
+from lazy_observe.delivery import DeliveryQueue
 
 
 def test_enqueue_and_batch_flush():
@@ -397,7 +397,7 @@ def test_enqueue_and_close_race_never_silently_loses_accepted_items():
 
 
 def test_retry_delay_applies_jitter_and_respects_retry_after():
-    from lazyobserve.delivery import MAX_RETRY_AFTER, RetryableError, parse_retry_after
+    from lazy_observe.delivery import MAX_RETRY_AFTER, RetryableError, parse_retry_after
 
     q = DeliveryQueue(
         send=lambda batch, _t: None,

@@ -1,6 +1,6 @@
 # Python SDK for Django and DRF
 
-The Python SDK provides explicit Django and Django REST Framework (DRF) instrumentation for lazy-observe, aligned with the [Go/Fiber SDK](go.md). Importing `lazyobserve` installs no hooks, changes no global OpenTelemetry providers, and never calls `set_meter_provider`, `set_tracer_provider`, or `set_logger_provider`.
+The Python SDK provides explicit Django and Django REST Framework (DRF) instrumentation for lazy-observe, aligned with the [Go/Fiber SDK](go.md). Importing `lazy_observe` installs no hooks, changes no global OpenTelemetry providers, and never calls `set_meter_provider`, `set_tracer_provider`, or `set_logger_provider`.
 
 ## Install
 
@@ -21,9 +21,9 @@ uv pip install -e "/abs/lazy-observe/sdk/python[django]"
 ## Initialize and shut down
 
 ```python
-import lazyobserve
+import lazy_observe
 
-lo = lazyobserve.init({
+lo = lazy_observe.init({
     "dsn": "http://127.0.0.1:3100/p/default@TOKEN",
     "service_name": "checkout-api",
 })
@@ -33,7 +33,7 @@ if lo.err():
 
 The DSN must match `http(s)://host[:port]/p/<slug>@<token>` with no query string or fragment. Parsing rules match the Go SDK. The SDK sends the token only in `Authorization: Bearer <token>`.
 
-`init` registers the client as the active registry instance so that registry-bound integrations (`lazyobserve.DjangoMiddleware`, `lazyobserve.drf.exception_handler`, and `LazyObserveLogHandler`) resolve it.
+`init` registers the client as the active registry instance so that registry-bound integrations (`lazy_observe.DjangoMiddleware`, `lazy_observe.drf.exception_handler`, and `LazyObserveLogHandler`) resolve it.
 
 Shut down before process exit to drain bounded queues and flush exporters:
 
@@ -59,13 +59,13 @@ lo.shutdown(timeout=10.0)
 | `profiling` | `false` | **Experimental.** Opt in to [continuous profiling](#continuous-profiling). Samples only on Linux with free-threaded CPython 3.15 or newer when the GIL is off. |
 | `profiling_interval` | `60` seconds | Time between the starts of two 10-second profiling windows. Values `<= 0`, NaN, and infinity fall back to `60`. Below `10`, windows run back to back. |
 
-When `lazyobserve.init` receives a `dict` or keyword arguments containing unrecognized top-level or `delivery.*` keys, the SDK logs a single warning on the `lazyobserve` logger listing the ignored fields instead of silently ignoring typos.
+When `lazy_observe.init` receives a `dict` or keyword arguments containing unrecognized top-level or `delivery.*` keys, the SDK logs a single warning on the `lazy_observe` logger listing the ignored fields instead of silently ignoring typos.
 
 For the signal matrix, setting all three of `metrics`, `logs`, and `traces` to `false` enables all three signals. Once any flag is `true`, the three values form an explicit enabled set. To disable all telemetry, do not call `init`.
 
 ## Django
 
-Add `lazyobserve.DjangoMiddleware` to `MIDDLEWARE`. The middleware does the following:
+Add `lazy_observe.DjangoMiddleware` to `MIDDLEWARE`. The middleware does the following:
 
 - Extracts W3C `traceparent` and creates a SERVER span with `url.path`, `http.request.method`, `url.scheme`, `server.address`, and protocol version.
 - Records `http.server.request.duration` and `http.server.active_requests`.
@@ -74,7 +74,7 @@ Add `lazyobserve.DjangoMiddleware` to `MIDDLEWARE`. The middleware does the foll
 
 ```python
 MIDDLEWARE = [
-    "lazyobserve.DjangoMiddleware",
+    "lazy_observe.DjangoMiddleware",
     "django.middleware.common.CommonMiddleware",
 ]
 ```
@@ -93,7 +93,7 @@ Configure the exception handler so API exceptions resolving to 5xx are queued fo
 
 ```python
 REST_FRAMEWORK = {
-    "EXCEPTION_HANDLER": "lazyobserve.drf.exception_handler",
+    "EXCEPTION_HANDLER": "lazy_observe.drf.exception_handler",
 }
 ```
 
@@ -107,7 +107,7 @@ Configuring the handler in Django's `LOGGING` exports records as OTLP logs with 
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "handlers": {"lazy_observe": {"class": "lazyobserve.LazyObserveLogHandler"}},
+    "handlers": {"lazy_observe": {"class": "lazy_observe.LazyObserveLogHandler"}},
     "loggers": {"": {"handlers": ["lazy_observe"], "level": "INFO"}},
 }
 ```
@@ -172,7 +172,7 @@ Continuous profiling samples the call stacks of your process on a fixed schedule
 ### Enable continuous profiling
 
 ```python
-lo = lazyobserve.init({
+lo = lazy_observe.init({
     "dsn": "http://127.0.0.1:3100/p/default@TOKEN",
     "service_name": "checkout-api",
     "profiling": True,          # default False
@@ -180,7 +180,7 @@ lo = lazyobserve.init({
 })
 ```
 
-`init` returns immediately. The availability probe and the sampling loop run in a daemon thread named `lazyobserve-profiling`. `lo.shutdown(timeout)` stops sampling at once. The SDK uploads a window that has already run for at least 5 seconds within the shutdown budget and drops any shorter window. Prefork servers such as gunicorn and uWSGI are supported. Each worker process restarts its own sampler after `fork` with a fresh window, so samples collected by a preloading master are not uploaded again by every worker.
+`init` returns immediately. The availability probe and the sampling loop run in a daemon thread named `lazy_observe-profiling`. `lo.shutdown(timeout)` stops sampling at once. The SDK uploads a window that has already run for at least 5 seconds within the shutdown budget and drops any shorter window. Prefork servers such as gunicorn and uWSGI are supported. Each worker process restarts its own sampler after `fork` with a fresh window, so samples collected by a preloading master are not uploaded again by every worker.
 
 ### Support range
 
@@ -231,10 +231,10 @@ When a thread runs inside a non-main greenlet, CPython's sampler cannot walk the
 
 ### Warning codes
 
-When profiling cannot run, the SDK logs one warning through the `lazyobserve` logger, at most once per code per process. A forked child process may warn once again:
+When profiling cannot run, the SDK logs one warning through the `lazy_observe` logger, at most once per code per process. A forked child process may warn once again:
 
 ```
-lazyobserve continuous profiling is off: reason=<code> (<detail>); see <link to this section>
+lazy_observe continuous profiling is off: reason=<code> (<detail>); see <link to this section>
 ```
 
 Match on the code, not on the detail text. The SDK samples and uploads nothing after a warning. A stopped sampler never restarts within the same process because the underlying causes do not clear.
@@ -246,7 +246,7 @@ Match on the code, not on the detail text. The SDK samples and uploads nothing a
 | `gil_build` | Regular build with the GIL, including standard 3.15. | Use the free-threaded `python3.15t` build. |
 | `gil_enabled` | Free-threaded build where `sys._is_gil_enabled()` is true because of `PYTHON_GIL=1`, `-X gil=1`, or a C extension that does not support free threading. Also raised when the GIL turns on between windows and sampling stops. | Remove the flag or the extension that re-enables the GIL. |
 | `probe_failed` | The startup probe found that this interpreter's `profiling.sampling` does not match what the SDK expects. The import failed, the `sample()` signature or CPU-mode constant changed, or a 0.1-second trial sample failed. This is typical after a CPython upgrade because the interface is undocumented. | Report the detail text and keep `profiling` off until the SDK supports that CPython version. |
-| `too_many_failures` | Three windows in a row failed, counting both sampling and encoding errors. | Inspect the debug log of the `lazyobserve` logger. |
+| `too_many_failures` | Three windows in a row failed, counting both sampling and encoding errors. | Inspect the debug log of the `lazy_observe` logger. |
 | `sample_failure_rate` | More than 50% of sampling ticks in one window failed, evaluated only with at least 100 attempts (about 1 second at 100 Hz). Typical of gevent and eventlet. | Do not combine profiling with greenlet-based concurrency. |
 | `internal_error` | Another unexpected failure occurred, such as the profiling thread failing to start or an unclassified stop reason. The detail carries the exception. | Report the detail text. |
 
@@ -271,11 +271,11 @@ The SDK counts dropped error events with `signal="error"` and the reasons `queue
 
 | Go SDK | Python SDK |
 | --- | --- |
-| `lazyobserve.Init(Config)` | `lazyobserve.init(cfg)` |
+| `lazyobserve.Init(Config)` | `lazy_observe.init(cfg)` |
 | `lo.Err()` / degraded instance | `lo.err()` / `lo.degraded` |
 | `signalMatrix` all-false default | same rule on `metrics`/`logs`/`traces` |
-| `lo.Fiber()` | `lazyobserve.DjangoMiddleware` |
-| Fiber 5xx capture | `lazyobserve.drf.exception_handler` |
+| `lo.Fiber()` | `lazy_observe.DjangoMiddleware` |
+| Fiber 5xx capture | `lazy_observe.drf.exception_handler` |
 | `lo.Slog()` correlating handler | `LazyObserveLogHandler` |
 | `lo.WrapDB(driver, dsn)` | `lo.django_db()` context manager |
 | `lo.LLMTransport(base)` | `lo.llm_transport(base=...)` |

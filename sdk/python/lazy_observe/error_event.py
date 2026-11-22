@@ -38,7 +38,7 @@ _MAX_URL_BYTES = 2048
 _MAX_FRAMES = 200
 
 _NON_APP_MODULE_PREFIXES = (
-    "lazyobserve",
+    "lazy_observe",
     "django",
     "rest_framework",
     "opentelemetry",

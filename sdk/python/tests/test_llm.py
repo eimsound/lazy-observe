@@ -5,7 +5,7 @@ import httpx
 import pytest
 from opentelemetry.trace import StatusCode
 
-from lazyobserve.llm import LLM_CONTENT_LIMIT, detect_llm_system
+from lazy_observe.llm import LLM_CONTENT_LIMIT, detect_llm_system
 from tests.helpers import last_span
 
 

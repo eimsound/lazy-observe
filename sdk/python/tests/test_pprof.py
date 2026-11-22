@@ -11,7 +11,7 @@ import gzip
 
 import pytest
 
-from lazyobserve._pprof import encode_cpu_profile
+from lazy_observe._pprof import encode_cpu_profile
 from tests.pprof_fixture import FIXTURE_PATH, build_fixture
 
 PERIOD_NS = 10_000_000

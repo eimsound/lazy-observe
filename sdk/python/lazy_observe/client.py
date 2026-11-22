@@ -368,7 +368,7 @@ class Client:
 # Same shape as ``delivery.py`` and ``_profiling.py``: clients are tracked weakly and one
 # module-level hook gives every live client a fresh lock in a forked child. Unlike theirs,
 # it is registered when this module is imported, not by the first instance:
-# ``lazyobserve/__init__`` imports this module before anything else in the package can
+# ``lazy_observe/__init__`` imports this module before anything else in the package can
 # run, and the delivery and profiling hooks are registered only when their first queue or
 # controller is built, so this hook is always first, whatever is built in which order.
 # ``register_at_fork`` runs hooks in registration order, so the lock is already new by the
@@ -432,7 +432,7 @@ def _run_bounded(name: str, fn: Any, budget: float) -> Optional[BaseException]:
     if sys.is_finalizing():
         target()
         return outcome[0]
-    thread = threading.Thread(target=target, name=f"lazyobserve-shutdown-{name}", daemon=True)
+    thread = threading.Thread(target=target, name=f"lazy_observe-shutdown-{name}", daemon=True)
     try:
         thread.start()
     except RuntimeError:  # can't start a thread (finalizing, or out of threads)
@@ -535,7 +535,7 @@ def build_client(config: Any, parsed: Any) -> Client:
 
         import logging as _stdlib_logging
 
-        logger = _stdlib_logging.getLogger("lazyobserve")
+        logger = _stdlib_logging.getLogger("lazy_observe")
         http_transport = InternalHTTPTransport()
 
         client = Client(
@@ -641,11 +641,11 @@ def _register_dropped_counter(client: Client) -> Any:
 def noop_logger(config: Any) -> logging.Logger:
     import logging as _stdlib_logging
 
-    logger = _stdlib_logging.getLogger("lazyobserve")
+    logger = _stdlib_logging.getLogger("lazy_observe")
     if not logger.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(
-            logging.Formatter("[%(asctime)s lazyobserve] %(levelname)s %(message)s")
+            logging.Formatter("[%(asctime)s lazy_observe] %(levelname)s %(message)s")
         )
         logger.addHandler(handler)
     return logger

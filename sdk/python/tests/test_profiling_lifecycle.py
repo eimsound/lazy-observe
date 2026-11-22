@@ -1,9 +1,9 @@
 """Lifecycle of continuous profiling: switch, window loop, shutdown and fork.
 
-The window loop (``lazyobserve._profiling.ProfilingController``) is driven with a
+The window loop (``lazy_observe._profiling.ProfilingController``) is driven with a
 fake sampler, a fake clock and a fake uploader, so none of these tests samples the
 real interpreter or waits for a real 10 s window. The sampler fake implements the
-surface the loop uses from ``lazyobserve._sampler.Sampler``; a few tests use the
+surface the loop uses from ``lazy_observe._sampler.Sampler``; a few tests use the
 real ``Sampler`` around a fake ``sample()`` function to cover its interplay with the
 loop (encoder errors, ``running``). Fork tests use a real ``os.fork``.
 """
@@ -22,12 +22,12 @@ from types import SimpleNamespace
 
 import pytest
 
-import lazyobserve
-from lazyobserve import _profiling, _sampler
-from lazyobserve._profile_upload import CollectedProfile, ProfileUploader
-from lazyobserve._sampler import SamplingWindow
+import lazy_observe
+from lazy_observe import _profiling, _sampler
+from lazy_observe._profile_upload import CollectedProfile, ProfileUploader
+from lazy_observe._sampler import SamplingWindow
 
-LOGGER_NAME = "lazyobserve-test-profiling"
+LOGGER_NAME = "lazy_observe-test-profiling"
 UNSET = object()
 
 needs_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
@@ -523,7 +523,7 @@ def test_each_uploaded_window_carries_its_own_id_type_and_span():
 
 
 def test_real_upload_ids_are_32_hex_and_unique_across_windows():
-    from lazyobserve._profile_upload import new_upload_id
+    from lazy_observe._profile_upload import new_upload_id
 
     sampler = FakeSampler(steps=[{"window": make_window(f"w{i}")} for i in range(5)])
     rig = run(build(sampler, cycles=5, new_upload_id=new_upload_id))
@@ -703,7 +703,7 @@ def test_shutdown_does_not_leak_threads():
     import httpx
 
     def names():
-        return {t.name for t in threading.enumerate() if t.name.startswith("lazyobserve-profil")}
+        return {t.name for t in threading.enumerate() if t.name.startswith("lazy_observe-profil")}
 
     before = names()
     sampler = BlockingSampler(partial_seconds=6.0)
@@ -742,11 +742,11 @@ def _init(**overrides):
     # to the unreachable DSN and make every test wait for its retries.
     fields = {"dsn": "http://127.0.0.1:1/p/default@TOKEN", "service_name": "lifecycle", "traces": True}
     fields.update(overrides)
-    return lazyobserve.init(**fields)
+    return lazy_observe.init(**fields)
 
 
 def _profiling_threads():
-    return [t for t in threading.enumerate() if t.name == "lazyobserve-profiling" and t.is_alive()]
+    return [t for t in threading.enumerate() if t.name == "lazy_observe-profiling" and t.is_alive()]
 
 
 def test_profiling_is_off_by_default(monkeypatch):
@@ -762,7 +762,7 @@ def test_profiling_is_off_by_default(monkeypatch):
 
 
 def test_build_client_warns_once_with_a_code_when_this_interpreter_cannot_sample(monkeypatch, caplog):
-    caplog.set_level(logging.WARNING, logger="lazyobserve")
+    caplog.set_level(logging.WARNING, logger="lazy_observe")
     monkeypatch.setattr(
         _sampler,
         "probe_sampler",
@@ -772,7 +772,7 @@ def test_build_client_warns_once_with_a_code_when_this_interpreter_cannot_sample
     try:
         assert lo.profiling is not None
         assert lo.profiling.join(5)
-        messages = [r.getMessage() for r in caplog.records if r.name == "lazyobserve" and "profiling" in r.getMessage().lower()]
+        messages = [r.getMessage() for r in caplog.records if r.name == "lazy_observe" and "profiling" in r.getMessage().lower()]
         assert len(messages) == 1
         assert "reason=gil_build" in messages[0]
         assert _profiling.DOC_URL in messages[0]
