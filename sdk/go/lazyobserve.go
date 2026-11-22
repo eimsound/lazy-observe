@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	rtmetrics "runtime/metrics"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,15 +46,27 @@ const (
 	otelLogBatchSize   = 512
 )
 
+const (
+	// CompressionNone sends uncompressed OTLP/HTTP payloads (default).
+	CompressionNone = "none"
+	// CompressionGzip sends gzip-compressed OTLP/HTTP payloads.
+	CompressionGzip = "gzip"
+)
+
 // Config controls SDK construction. An all-zero Metrics/Logs/Traces matrix
 // means all signals enabled; otherwise the three fields are an explicit matrix.
 type Config struct {
-	DSN                string
-	Metrics            bool
-	Logs               bool
-	Traces             bool
-	SampleRate         float64
-	ServiceName        string
+	DSN         string
+	Metrics     bool
+	Logs        bool
+	Traces      bool
+	SampleRate  float64
+	ServiceName string
+	// Compression configures OTLP/HTTP payload compression for metrics, logs,
+	// and traces ("", "none", or "gzip"). When empty, standard
+	// OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION and OTEL_EXPORTER_OTLP_COMPRESSION
+	// environment variables apply, defaulting to "none".
+	Compression        string
 	TeeToStderr        *bool
 	CaptureDBStatement bool
 	// CaptureLLMContent records prompt/completion content up to 4 KiB. It is
@@ -184,6 +197,11 @@ func normalizedConfig(cfg Config) (Config, error) {
 	if cfg.SampleRate < 0 || cfg.SampleRate > 1 {
 		return cfg, fmt.Errorf("sample rate must be between 0 and 1")
 	}
+	compression, err := normalizeCompression(cfg.Compression)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Compression = compression
 	if cfg.ExportInterval <= 0 {
 		cfg.ExportInterval = 5 * time.Second
 	}
@@ -203,6 +221,46 @@ func normalizedConfig(cfg Config) (Config, error) {
 	}
 	cfg.Tags = maps.Clone(cfg.Tags)
 	return cfg, nil
+}
+
+func normalizeCompression(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case CompressionNone:
+		return CompressionNone, nil
+	case CompressionGzip:
+		return CompressionGzip, nil
+	default:
+		return "", fmt.Errorf(
+			"invalid OTLP compression %q: must be \"\", %q, or %q",
+			raw,
+			CompressionNone,
+			CompressionGzip,
+		)
+	}
+}
+
+func resolveSignalCompression(explicit, signal string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	signalVar := "OTEL_EXPORTER_OTLP_" + signal + "_COMPRESSION"
+	if raw := strings.TrimSpace(os.Getenv(signalVar)); raw != "" {
+		normalized, err := normalizeCompression(raw)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", signalVar, err)
+		}
+		return normalized, nil
+	}
+	if raw := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_COMPRESSION")); raw != "" {
+		normalized, err := normalizeCompression(raw)
+		if err != nil {
+			return "", fmt.Errorf("OTEL_EXPORTER_OTLP_COMPRESSION: %w", err)
+		}
+		return normalized, nil
+	}
+	return CompressionNone, nil
 }
 
 func normalizeDeliveryConfig(cfg *DeliveryConfig) error {
@@ -248,6 +306,26 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, err
 	}
 	metricsOn, logsOn, tracesOn := signalMatrix(cfg)
+	var metricsCompression, tracesCompression, logsCompression string
+	if metricsOn {
+		metricsCompression, err = resolveSignalCompression(cfg.Compression, "METRICS")
+		if err != nil {
+			return nil, err
+		}
+	}
+	if tracesOn {
+		tracesCompression, err = resolveSignalCompression(cfg.Compression, "TRACES")
+		if err != nil {
+			return nil, err
+		}
+	}
+	if logsOn {
+		logsCompression, err = resolveSignalCompression(cfg.Compression, "LOGS")
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	res, err := buildResource(resource.Default(), cfg.ServiceName, parsed.project)
 	if err != nil {
 		return nil, fmt.Errorf("create resource: %w", err)
@@ -260,10 +338,15 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 	headers := map[string]string{"Authorization": "Bearer " + parsed.token}
 
 	if metricsOn {
+		metricCompressionOpt := otlpmetrichttp.WithCompression(otlpmetrichttp.NoCompression)
+		if metricsCompression == CompressionGzip {
+			metricCompressionOpt = otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression)
+		}
 		exporter, exportErr := otlpmetrichttp.New(ctx,
 			otlpmetrichttp.WithEndpointURL(parsed.endpoint),
 			otlpmetrichttp.WithURLPath("/v1/metrics"),
 			otlpmetrichttp.WithHeaders(headers),
+			metricCompressionOpt,
 		)
 		if exportErr != nil {
 			return nil, fmt.Errorf("create metrics exporter: %w", exportErr)
@@ -280,10 +363,15 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	if tracesOn {
+		traceCompressionOpt := otlptracehttp.WithCompression(otlptracehttp.NoCompression)
+		if tracesCompression == CompressionGzip {
+			traceCompressionOpt = otlptracehttp.WithCompression(otlptracehttp.GzipCompression)
+		}
 		exporter, exportErr := otlptracehttp.New(ctx,
 			otlptracehttp.WithEndpointURL(parsed.endpoint),
 			otlptracehttp.WithURLPath("/v1/traces"),
 			otlptracehttp.WithHeaders(headers),
+			traceCompressionOpt,
 		)
 		if exportErr != nil {
 			_ = c.closeCreated(ctx)
@@ -305,10 +393,15 @@ func newClient(ctx context.Context, cfg Config) (*Client, error) {
 
 	var otelHandler slog.Handler
 	if logsOn {
+		logCompressionOpt := otlploghttp.WithCompression(otlploghttp.NoCompression)
+		if logsCompression == CompressionGzip {
+			logCompressionOpt = otlploghttp.WithCompression(otlploghttp.GzipCompression)
+		}
 		exporter, exportErr := otlploghttp.New(ctx,
 			otlploghttp.WithEndpointURL(parsed.endpoint),
 			otlploghttp.WithURLPath("/v1/logs"),
 			otlploghttp.WithHeaders(headers),
+			logCompressionOpt,
 		)
 		if exportErr != nil {
 			_ = c.closeCreated(ctx)

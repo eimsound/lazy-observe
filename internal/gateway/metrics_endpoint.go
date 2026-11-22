@@ -116,7 +116,7 @@ func (g *Gateway) authenticateAndLimitIngest(c fiber.Ctx, policy routePolicy) er
 	c.Locals(projectLocal, project)
 
 	if g.ingestLimiter != nil && g.ingestLimiter.Enabled() {
-		payloadBytes := int64(len(c.Request().Body()))
+		payloadBytes := ingestPayloadBytes(c)
 		decision := g.ingestLimiter.Allow(project.ID, payloadBytes)
 		if !decision.Allowed {
 			retryAfterSecs := ingestlimit.RetryAfterSeconds(decision.RetryAfter)
@@ -156,6 +156,13 @@ func (g *Gateway) authenticateAndLimitIngest(c fiber.Ctx, policy routePolicy) er
 		)
 	}
 	return nextErr
+}
+
+func ingestPayloadBytes(c fiber.Ctx) int64 {
+	if decodedSize, ok := c.Locals(decodedBodySizeLocal).(int64); ok && decodedSize >= 0 {
+		return decodedSize
+	}
+	return int64(len(c.Request().Body()))
 }
 
 func effectiveHTTPStatus(c fiber.Ctx, err error) int {

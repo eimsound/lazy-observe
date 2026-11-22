@@ -19,6 +19,8 @@ DELIVERY_RETRY_INITIAL = 0.1
 DELIVERY_RETRY_MAX = 1.0
 #: Default gap between the starts of two profiling windows (Go: ``ProfilingInterval``).
 PROFILING_INTERVAL = 60.0
+COMPRESSION_NONE = "none"
+COMPRESSION_GZIP = "gzip"
 
 
 @dataclass
@@ -46,6 +48,7 @@ class Config:
     logs: bool = False
     traces: bool = False
     sample_rate: float = 0.0
+    compression: str = ""
     tee_to_stderr: bool = True
     capture_db_statement: bool = False
     capture_llm_content: bool = False
@@ -145,6 +148,7 @@ def normalize_config(cfg: Config) -> Config:
     cfg.re_raise_on_500 = bool(cfg.re_raise_on_500)
     if not (cfg.profiling_interval > 0 and math.isfinite(cfg.profiling_interval)):
         cfg.profiling_interval = PROFILING_INTERVAL  # also catches NaN and +-inf
+    cfg.compression = normalize_compression(cfg.compression)
     cfg.delivery = _coerce_delivery_config(cfg.delivery)
     normalize_delivery(cfg.delivery)
     if cfg.tags is None:
@@ -154,6 +158,46 @@ def normalize_config(cfg: Config) -> Config:
     else:
         raise InvalidConfigError("tags must be a dict")
     return cfg
+
+
+def normalize_compression(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise InvalidConfigError("compression must be a string")
+    normalized = value.strip().lower()
+    if normalized in ("", COMPRESSION_NONE, COMPRESSION_GZIP):
+        return normalized
+    raise InvalidConfigError(
+        f"invalid OTLP compression {value!r}: must be '', 'none', or 'gzip'"
+    )
+
+
+def resolve_signal_compression(
+    explicit: str,
+    signal: str,
+    env: Optional[Mapping[str, str]] = None,
+) -> str:
+    explicit_norm = normalize_compression(explicit)
+    if explicit_norm:
+        return explicit_norm
+    environ = os.environ if env is None else env
+    signal_var = f"OTEL_EXPORTER_OTLP_{signal.upper()}_COMPRESSION"
+    raw_signal = environ.get(signal_var, "").strip()
+    if raw_signal:
+        try:
+            return normalize_compression(raw_signal)
+        except InvalidConfigError as exc:
+            raise InvalidConfigError(f"{signal_var}: {exc}") from exc
+    raw_shared = environ.get("OTEL_EXPORTER_OTLP_COMPRESSION", "").strip()
+    if raw_shared:
+        try:
+            return normalize_compression(raw_shared)
+        except InvalidConfigError as exc:
+            raise InvalidConfigError(
+                f"OTEL_EXPORTER_OTLP_COMPRESSION: {exc}"
+            ) from exc
+    return COMPRESSION_NONE
 
 
 def _coerce_delivery_config(value: object) -> DeliveryConfig:

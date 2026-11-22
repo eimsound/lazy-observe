@@ -49,6 +49,7 @@ lo.shutdown(timeout=10.0)
 | `service_name` | executable basename | OpenTelemetry `service.name` and log field. |
 | `metrics`, `logs`, `traces` | all enabled | Follows the signal matrix below. |
 | `sample_rate` | `1` | Parent-based head sampling, `(0, 1]`. |
+| `compression` | `"none"` | OTLP/HTTP payload compression (`""`, `"none"`, or `"gzip"`). When empty, honors `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` then `OTEL_EXPORTER_OTLP_COMPRESSION`, defaulting to `"none"`. Explicit config overrides env vars. |
 | `tee_to_stderr` | `true` | Also write records locally through the log handler. |
 | `capture_db_statement` | `false` | Include SQL text on database spans. Bound parameters are never captured. |
 | `capture_llm_content` | `false` | Capture `gen_ai.prompt` and `gen_ai.completion`, truncated to 4 KiB. |

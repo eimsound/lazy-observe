@@ -63,6 +63,37 @@ export interface SDKDiagnostics {
   droppedTelemetry: number;
 }
 
+export type Compression = "none" | "gzip";
+
+type ExporterCompression = NonNullable<ConstructorParameters<typeof OTLPTraceExporter>[0]>["compression"];
+
+function parseCompressionValue(value: unknown, source: string): Compression | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`${source} must be "none" or "gzip"`);
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "") return undefined;
+  if (normalized === "none" || normalized === "gzip") return normalized;
+  throw new Error(`invalid ${source} ${JSON.stringify(value)}: must be "", "none", or "gzip"`);
+}
+
+export function resolveCompression(
+  config: Pick<Config, "compression">,
+  signal: "metrics" | "logs" | "traces",
+  env: NodeJS.ProcessEnv = process.env,
+): Compression {
+  const explicit = parseCompressionValue(config.compression, "compression");
+  if (explicit !== undefined) return explicit;
+  const signalKey = `OTEL_EXPORTER_OTLP_${signal.toUpperCase()}_COMPRESSION`;
+  const signalEnv = parseCompressionValue(env[signalKey], signalKey);
+  if (signalEnv !== undefined) return signalEnv;
+  const sharedKey = "OTEL_EXPORTER_OTLP_COMPRESSION";
+  const sharedEnv = parseCompressionValue(env[sharedKey], sharedKey);
+  if (sharedEnv !== undefined) return sharedEnv;
+  return "none";
+}
+
 export interface Config {
   dsn: string;
   serviceName?: string;
@@ -71,6 +102,7 @@ export interface Config {
   logs?: boolean;
   traces?: boolean;
   sampleRate?: number;
+  compression?: Compression | "";
   teeToStdout?: boolean;
   exportIntervalMs?: number;
   runtimeMetricsIntervalMs?: number;
@@ -192,6 +224,10 @@ export function init(config: Config): LazyObserve {
   const serviceName = config.serviceName ?? process.title ?? "unknown_service";
   const exportInterval = config.exportIntervalMs ?? 5_000;
   const signals = resolveSignals(config);
+  parseCompressionValue(config.compression, "compression");
+  const tracesCompression = signals.traces ? resolveCompression(config, "traces") : "none";
+  const metricsCompression = signals.metrics ? resolveCompression(config, "metrics") : "none";
+  const logsCompression = signals.logs ? resolveCompression(config, "logs") : "none";
   const profiling = resolveProfilingConfig(config);
   const resource = resourceFromAttributes({
     [ATTR_SERVICE_NAME]: serviceName,
@@ -210,7 +246,11 @@ export function init(config: Config): LazyObserve {
         resource,
         sampler: new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(sampleRate) }),
         spanProcessors: [new BatchSpanProcessor({
-          exporter: new OTLPTraceExporter({ ...exporterOptions, url: `${dsn.endpoint}/v1/traces` }),
+          exporter: new OTLPTraceExporter({
+            ...exporterOptions,
+            url: `${dsn.endpoint}/v1/traces`,
+            compression: tracesCompression as unknown as ExporterCompression,
+          }),
           maxQueueSize: OTEL_TRACE_QUEUE_SIZE,
           maxExportBatchSize: OTEL_TRACE_BATCH_SIZE,
         })],
@@ -222,7 +262,14 @@ export function init(config: Config): LazyObserve {
     if (signals.metrics) {
       meterProvider = new MeterProvider({
         resource,
-        readers: [new PeriodicExportingMetricReader({ exporter: new OTLPMetricExporter({ ...exporterOptions, url: `${dsn.endpoint}/v1/metrics` }), exportIntervalMillis: exportInterval })],
+        readers: [new PeriodicExportingMetricReader({
+          exporter: new OTLPMetricExporter({
+            ...exporterOptions,
+            url: `${dsn.endpoint}/v1/metrics`,
+            compression: metricsCompression as unknown as ExporterCompression,
+          }),
+          exportIntervalMillis: exportInterval,
+        })],
       });
       disposers.push(startRuntimeMetrics(meterProvider.getMeter(`${instrumentationName}/runtime`), config.runtimeMetricsIntervalMs ?? 1_000));
     }
@@ -236,7 +283,11 @@ export function init(config: Config): LazyObserve {
       loggerProvider = new LoggerProvider({
         resource,
         processors: [new BatchLogRecordProcessor({
-          exporter: new OTLPLogExporter({ ...exporterOptions, url: `${dsn.endpoint}/v1/logs` }),
+          exporter: new OTLPLogExporter({
+            ...exporterOptions,
+            url: `${dsn.endpoint}/v1/logs`,
+            compression: logsCompression as unknown as ExporterCompression,
+          }),
           scheduledDelayMillis: exportInterval,
           maxQueueSize: OTEL_LOG_QUEUE_SIZE,
           maxExportBatchSize: OTEL_LOG_BATCH_SIZE,

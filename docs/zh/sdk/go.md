@@ -95,6 +95,7 @@ row := db.QueryRowContext(c.Context(), "SELECT status FROM orders WHERE id = $1"
 | `ServiceName` | 可执行文件名 | OpenTelemetry `service.name` 及 `slog` 字段。 |
 | `Metrics`、`Logs`、`Traces` | 全为 `false` 时全部启用 | 只要任一字段设为 `true`，这三个布尔值就构成显式启用集合。 |
 | `SampleRate` | `1` | 基于父 Span 的头部采样；`0` 表示“未设置”并回退为 `1`，显式有效范围为 `(0, 1]`。 |
+| `Compression` | `"none"` | OTLP/HTTP 载荷压缩方式（`""`、`"none"` 或 `"gzip"`）。留空时依次读取 `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` 与 `OTEL_EXPORTER_OTLP_COMPRESSION`，默认 `"none"`；显式配置优先于环境变量。 |
 | `TeeToStderr` | 启用 | 设为指向 `false` 的指针可关闭本地文本输出。 |
 | `CaptureDBStatement` | `false` | 在数据库 Span 中附带 SQL 语句文本。 |
 | `Release`、`Environment` | 空 | 附加到错误事件的部署元数据。 |

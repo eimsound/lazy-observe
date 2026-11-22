@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/eimsound/lazy-observe/internal/meta"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
@@ -353,11 +354,18 @@ func (p *storageProxy) unary(c fiber.Ctx, spec proxySpec) error {
 	}
 	parentCtx := c.Context()
 	reqCtx, cancel := context.WithTimeout(parentCtx, timeout)
-	req, err := http.NewRequestWithContext(reqCtx, c.Method(), target, requestBodyReader(body))
+	bodyReader, contentLength, cleanupBody := proxyRequestBodyReader(c, body)
+	req, err := http.NewRequestWithContext(reqCtx, c.Method(), target, bodyReader)
 	if err != nil {
+		if cleanupBody != nil {
+			cleanupBody()
+		}
 		cancel()
 		p.log().Error("build upstream proxy request failed", "path", spec.upstreamPath, "error", err)
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to construct upstream request")
+	}
+	if contentLength > 0 {
+		req.ContentLength = contentLength
 	}
 	reqAllowlist := spec.requestHeaders
 	if reqAllowlist == nil {
@@ -366,6 +374,9 @@ func (p *storageProxy) unary(c fiber.Ctx, spec proxySpec) error {
 	copyAllowlistedRequestHeaders(req.Header, &c.Request().Header, reqAllowlist)
 	if spec.projectID > 0 {
 		if err := p.storage.ApplyTenantHeaders(req.Header, spec.projectID); err != nil {
+			if cleanupBody != nil {
+				cleanupBody()
+			}
 			cancel()
 			return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
 		}
@@ -449,11 +460,18 @@ func (p *storageProxy) stream(c fiber.Ctx, spec proxySpec) error {
 	parentCtx := c.Context()
 	streamCtx, streamCancel := context.WithTimeout(shutdownCtx, maxDuration)
 	body := ownedProxyRequestBody(c, spec.body)
-	req, err := http.NewRequestWithContext(streamCtx, c.Method(), target, requestBodyReader(body))
+	bodyReader, contentLength, cleanupBody := proxyRequestBodyReader(c, body)
+	req, err := http.NewRequestWithContext(streamCtx, c.Method(), target, bodyReader)
 	if err != nil {
+		if cleanupBody != nil {
+			cleanupBody()
+		}
 		streamCancel()
 		releaseSlot()
 		return fiber.NewError(fiber.StatusInternalServerError, "failed to construct upstream request")
+	}
+	if contentLength > 0 {
+		req.ContentLength = contentLength
 	}
 	reqAllowlist := spec.requestHeaders
 	if reqAllowlist == nil {
@@ -463,6 +481,9 @@ func (p *storageProxy) stream(c fiber.Ctx, spec proxySpec) error {
 	req.Header.Del("Accept-Encoding")
 	if spec.projectID > 0 {
 		if err := p.storage.ApplyTenantHeaders(req.Header, spec.projectID); err != nil {
+			if cleanupBody != nil {
+				cleanupBody()
+			}
 			streamCancel()
 			releaseSlot()
 			return fiber.NewError(fiber.StatusInternalServerError, "project context is missing")
@@ -713,11 +734,20 @@ func ownedProxyRequestBody(c fiber.Ctx, override []byte) []byte {
 	return append([]byte(nil), raw...)
 }
 
-func requestBodyReader(body []byte) io.Reader {
+func proxyRequestBodyReader(c fiber.Ctx, body []byte) (io.Reader, int64, func()) {
 	if len(body) == 0 {
-		return http.NoBody
+		return http.NoBody, 0, nil
 	}
-	return bytes.NewReader(body)
+	if pb, ok := c.Locals(decodedBufLocal).(*pooledDecodeBuf); ok && pb != nil {
+		pbBytes := pb.buf.Bytes()
+		if len(pbBytes) == len(body) && unsafe.SliceData(pbBytes) == unsafe.SliceData(body) {
+			pb.retain()
+			reader := &pooledBodyReader{buf: pb}
+			reader.r.Reset(body)
+			return reader, int64(len(body)), func() { _ = reader.Close() }
+		}
+	}
+	return bytes.NewReader(body), int64(len(body)), nil
 }
 
 func applyProxyQueryRules(query url.Values, allowedParams map[string]bool, addQuery url.Values) {

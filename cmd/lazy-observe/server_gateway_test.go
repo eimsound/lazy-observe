@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -514,5 +515,60 @@ func TestErrorInboxWorkerCountRespectsClusteredMode(t *testing.T) {
 	}
 	if got := errorInboxWorkerCount(true); got != errortrack.DefaultClusteredWorkers || got < 2 || got > 4 {
 		t.Fatalf("clustered errorInboxWorkerCount=%d want %d (in 2..4)", got, errortrack.DefaultClusteredWorkers)
+	}
+}
+
+func TestStartSelfMonitoringForcesUncompressedOTLPOverLoopback(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "gzip")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "gzip")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "gzip")
+
+	var mu sync.Mutex
+	var seenPaths []string
+	var seenEncodings []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		seenPaths = append(seenPaths, r.URL.Path)
+		seenEncodings = append(seenEncodings, r.Header.Get("Content-Encoding"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := appconfig.Defaults()
+	cfg.SelfMonitoring.Enabled = true
+	cfg.SelfMonitoring.Profiling = false
+
+	monitoring := startSelfMonitoring(
+		cfg,
+		upstream.URL,
+		meta.ProjectInfo{ID: 1, Slug: "_internal"},
+		"lo_self_monitoring_test_token",
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if monitoring.client == nil {
+		t.Fatal("expected self-monitoring client to initialize")
+	}
+	if err := monitoring.client.Err(); err != nil {
+		t.Fatalf("self-monitoring client error: %v", err)
+	}
+	monitoring.logger.Info("self-monitoring compression check")
+	monitoring.Shutdown()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenPaths) == 0 {
+		t.Fatal("expected self-monitoring shutdown to flush at least one OTLP request")
+	}
+	for i, enc := range seenEncodings {
+		if enc != "" {
+			t.Fatalf(
+				"request %s carried Content-Encoding=%q; self-monitoring must remain uncompressed",
+				seenPaths[i],
+				enc,
+			)
+		}
 	}
 }

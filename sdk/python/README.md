@@ -54,8 +54,11 @@ degraded instance.
 | `lo.shutdown()` / diagnostics | drains bounded queues, flushes OTel, returns last failure |
 
 All signals are opt-in switches (`metrics`/`logs`/`traces` follow the Go matrix:
-all three false means all enabled). `Diagnostics().dropped_telemetry` exposes
-bounded-delivery losses; `lazy_observe_sdk_dropped_telemetry` is exported as a
+all three false means all enabled). Optional `compression` (`""` / `"none"` / `"gzip"`,
+default `"none"`) controls OTLP/HTTP payload compression and honors
+`OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` and `OTEL_EXPORTER_OTLP_COMPRESSION` when
+empty (explicit config takes precedence over env vars). `Diagnostics().dropped_telemetry`
+exposes bounded-delivery losses; `lazy_observe_sdk_dropped_telemetry` is exported as a
 low-cardinality metric.
 
 See the `examples/django/` project for a runnable Django + DRF app, and

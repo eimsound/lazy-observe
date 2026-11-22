@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -277,6 +278,91 @@ func TestUnifiedIngestByteRateLimitRejectsBeforeUpstream(t *testing.T) {
 	}
 	if upstreamHits.Load() != 1 {
 		t.Fatalf("upstreamHits=%d want 1", upstreamHits.Load())
+	}
+}
+
+func TestUnifiedIngestByteRateLimitCountsDecodedBytesOnGzipPassthrough(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		name := "loopback_decode"
+		if passthrough {
+			name = "passthrough"
+		}
+		t.Run(name, func(t *testing.T) {
+			var upstreamHits atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHits.Add(1)
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+
+			now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+			limiter := ingestlimit.New(ingestlimit.Config{
+				Enabled:           true,
+				RequestsPerSecond: 100,
+				Burst:             100,
+				BytesPerSecond:    1000,
+				ByteBurst:         1000,
+				Now:               func() time.Time { return now },
+			})
+			gw := newTestGateway(Config{
+				Tokens:              &fakeTokens{project: meta.ProjectInfo{ID: 7, Slug: "alpha"}},
+				Logs:                upstream.URL,
+				IngestLimiter:       limiter,
+				OTLPGzipPassthrough: &passthrough,
+			})
+			t.Cleanup(func() { _ = gw.Shutdown() })
+			app := gw.App()
+
+			plain := bytes.Repeat([]byte("a"), 800)
+			var compressed bytes.Buffer
+			zw := gzip.NewWriter(&compressed)
+			if _, err := zw.Write(plain); err != nil {
+				t.Fatal(err)
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			gz := compressed.Bytes()
+			if len(gz) >= 200 {
+				t.Fatalf("expected compressed payload < 200B, got %d", len(gz))
+			}
+
+			// First 800B (decoded) succeeds even though compressed size is < 100B.
+			req1 := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(gz))
+			req1.Header.Set("Authorization", "Bearer lo_valid")
+			req1.Header.Set("Content-Type", "application/x-protobuf")
+			req1.Header.Set("Content-Encoding", "gzip")
+			resp1, err := app.Test(req1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp1.Body.Close()
+			if resp1.StatusCode != http.StatusNoContent {
+				t.Fatalf("first gzip request status=%d want 204", resp1.StatusCode)
+			}
+
+			// Second 800B (decoded) exceeds remaining 200B budget -> 429 before upstream.
+			req2 := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(gz))
+			req2.Header.Set("Authorization", "Bearer lo_valid")
+			req2.Header.Set("Content-Type", "application/x-protobuf")
+			req2.Header.Set("Content-Encoding", "gzip")
+			resp2, err := app.Test(req2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp2.Body.Close()
+			if resp2.StatusCode != http.StatusTooManyRequests || resp2.Header.Get("Retry-After") != "1" {
+				t.Fatalf(
+					"second gzip request status=%d retry-after=%q want 429/1",
+					resp2.StatusCode,
+					resp2.Header.Get("Retry-After"),
+				)
+			}
+			if upstreamHits.Load() != 1 {
+				t.Fatalf("upstreamHits=%d want 1", upstreamHits.Load())
+			}
+		})
 	}
 }
 

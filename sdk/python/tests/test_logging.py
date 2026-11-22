@@ -250,3 +250,90 @@ def test_log_handler_explicit_client_binding_overrides_global_registry():
         lazy_observe._set_active(None)
         bound_client.shutdown(timeout=1.0)
         active_client.shutdown(timeout=1.0)
+
+
+def test_otlp_log_export_preserves_resource_trace_context_and_zero_warnings():
+    import threading
+    import warnings
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
+        ExportLogsServiceRequest,
+    )
+
+    log_bodies = []
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            if self.path == "/v1/logs":
+                with lock:
+                    log_bodies.append(body)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            lo = lazy_observe.init(
+                dsn=f"{endpoint}/p/proj@lo_tok",
+                service_name="log-compat-svc",
+                metrics=False,
+                traces=True,
+                logs=True,
+                tee_to_stderr=False,
+            )
+            assert not lo.degraded, lo.err()
+            try:
+                with lo.tracer().start_as_current_span("log-span") as span:
+                    span_ctx = span.get_span_context()
+                    lo.logger_factory().info("inside span")
+                lo.logger_factory().info("outside span")
+            finally:
+                lo.shutdown(timeout=3.0)
+
+        deprecation_warnings = [
+            f"{w.filename}:{w.lineno}: {w.category.__name__}: {w.message}"
+            for w in caught
+            if issubclass(w.category, (DeprecationWarning, PendingDeprecationWarning))
+            and ("lazy_observe" in (w.filename or "") or "opentelemetry" in (w.filename or ""))
+        ]
+        assert deprecation_warnings == []
+
+        assert len(log_bodies) > 0
+        records_by_body = {}
+        for raw in log_bodies:
+            req = ExportLogsServiceRequest()
+            req.ParseFromString(raw)
+            for rl in req.resource_logs:
+                res_attrs = {a.key: a.value.string_value for a in rl.resource.attributes}
+                assert res_attrs["service.name"] == "log-compat-svc"
+                assert res_attrs["lazy_observe.project"] == "proj"
+                for sl in rl.scope_logs:
+                    for lr in sl.log_records:
+                        records_by_body[lr.body.string_value] = lr
+
+        assert "inside span" in records_by_body
+        inside = records_by_body["inside span"]
+        assert inside.trace_id == span_ctx.trace_id.to_bytes(16, "big")
+        assert inside.span_id == span_ctx.span_id.to_bytes(8, "big")
+        assert inside.flags == int(span_ctx.trace_flags)
+
+        assert "outside span" in records_by_body
+        outside = records_by_body["outside span"]
+        assert outside.trace_id == b""
+        assert outside.span_id == b""
+        assert outside.flags == 0
+    finally:
+        server.shutdown()
+        server.server_close()

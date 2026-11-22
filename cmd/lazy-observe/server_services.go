@@ -42,6 +42,7 @@ func startSelfMonitoring(
 	client := lo.Init(lo.Config{
 		DSN:            loopbackURL + "/p/" + project.Slug + "@" + token,
 		ServiceName:    "lazy-observe",
+		Compression:    lo.CompressionNone,
 		ExportInterval: 5 * time.Second,
 		Profiling:      &profiling,
 		TeeToStderr:    boolPointer(true),
