@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir=${BASH_SOURCE[0]%/*}
-root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+root=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 timeout_seconds=${LO_RELEASE_SMOKE_TIMEOUT:-120}
 shutdown_timeout_seconds=${LO_RELEASE_SMOKE_SHUTDOWN_TIMEOUT:-45}
 max_rss_bytes=${LO_RELEASE_MAX_RSS_BYTES:-524288000}
@@ -56,7 +56,7 @@ esac
 binary_dir=${binary_candidate%/*}
 binary_name=${binary_candidate##*/}
 [[ -d $binary_dir ]] || skip "release binary directory does not exist: $binary_dir"
-binary_dir=$(CDPATH= cd -- "$binary_dir" && pwd -P)
+binary_dir=$(CDPATH='' cd -- "$binary_dir" && pwd -P)
 binary=$binary_dir/$binary_name
 [[ -f $binary ]] || skip "release binary does not exist: $binary (run mise run dist)"
 [[ -x $binary ]] || fail "release artifact is not executable: $binary"
@@ -436,8 +436,9 @@ PY
 blocked_status=$(curl --silent --show-error --max-time 5 -b "$work/cookies" \
   --output "$work/blocked.json" --write-out '%{http_code}' \
   http://127.0.0.1:3100/api/auth/tokens) || fail "password-change gate request failed"
-[[ $blocked_status == 403 ]] && grep -Fq '"password_change_required"' "$work/blocked.json" || \
+if [[ $blocked_status != 403 ]] || ! grep -Fq '"password_change_required"' "$work/blocked.json"; then
   fail "flagged bootstrap admin reached /api/auth/tokens (HTTP $blocked_status)"
+fi
 "$python_command" - "$work/login.json" "$work/password-change.json" <<'PY' || fail "could not prepare the password change"
 import json
 import pathlib
@@ -731,9 +732,19 @@ payload = {
 }
 if output:
     pathlib.Path(output).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+breakdown = ", ".join(
+    f"{item['component']}={item['rss_bytes'] / (1024 * 1024):.1f} MiB ({item['rss_bytes']} B)"
+    for item in measurements
+)
 if total >= maximum:
-    raise SystemExit(f"aggregate idle RSS {total} bytes is not below {maximum} bytes")
-print(f"PASS: aggregate idle RSS {total} bytes (< {maximum}) across gateway and four managed components")
+    raise SystemExit(
+        f"aggregate idle RSS {total} bytes ({total / (1024 * 1024):.1f} MiB) is not below "
+        f"{maximum} bytes ({maximum / (1024 * 1024):.1f} MiB) [{breakdown}]"
+    )
+print(
+    f"PASS: aggregate idle RSS {total} bytes ({total / (1024 * 1024):.1f} MiB, < {maximum}) "
+    f"across gateway and four managed components [{breakdown}]"
+)
 PY
 then
   fail "aggregate idle RSS gate failed"

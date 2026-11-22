@@ -26,6 +26,8 @@ var requiredBinaries = []string{
 	"vmagent-prod",
 }
 
+var releasePlatformAssets = releaseEmbeddedReadOnlyPages
+
 // Extract verifies and expands embedded gzip payloads into dir. Existing
 // binaries with the expected size and digest are reused.
 func Extract(dir string) (string, error) {
@@ -40,7 +42,16 @@ func ExtractOnly(dir string, names ...string) (string, error) {
 			"storage binaries are not embedded for this platform; use --storage-bin-dir or mise run dist",
 		)
 	}
-	return extract(platformAssets, dir, names...)
+	absDir, extracted, err := extractWithCount(platformAssets, dir, names...)
+	if err != nil {
+		return "", err
+	}
+	if extracted > 0 && releasePlatformAssets != nil {
+		// Reclaiming the read-only embedded asset pages from gateway RSS is
+		// best-effort; extraction has already succeeded and files remain intact.
+		_ = releasePlatformAssets()
+	}
+	return absDir, nil
 }
 
 type manifestEntry struct {
@@ -50,13 +61,21 @@ type manifestEntry struct {
 }
 
 func extract(assets fs.FS, dir string, names ...string) (string, error) {
+	absDir, _, err := extractWithCount(assets, dir, names...)
+	return absDir, err
+}
+
+func extractWithCount(assets fs.FS, dir string, names ...string) (string, int, error) {
 	data, err := fs.ReadFile(assets, manifestName)
 	if err != nil {
-		return "", fmt.Errorf("read embedded storage manifest: %w (use --storage-bin-dir or mise run dist)", err)
+		return "", 0, fmt.Errorf(
+			"read embedded storage manifest: %w (use --storage-bin-dir or mise run dist)",
+			err,
+		)
 	}
 	entries, err := parseManifest(data)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	selected := make(map[string]bool, len(names))
 	for _, name := range names {
@@ -69,17 +88,18 @@ func extract(assets fs.FS, dir string, names ...string) (string, error) {
 		}
 		for name := range selected {
 			if !known[name] {
-				return "", fmt.Errorf("requested embedded storage binary %q is not in manifest", name)
+				return "", 0, fmt.Errorf("requested embedded storage binary %q is not in manifest", name)
 			}
 		}
 	}
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		return "", fmt.Errorf("resolve embedded binary directory: %w", err)
+		return "", 0, fmt.Errorf("resolve embedded binary directory: %w", err)
 	}
 	if err := os.MkdirAll(absDir, 0o755); err != nil {
-		return "", fmt.Errorf("create embedded binary directory: %w", err)
+		return "", 0, fmt.Errorf("create embedded binary directory: %w", err)
 	}
+	extracted := 0
 	for _, entry := range entries {
 		if len(selected) > 0 && !selected[entry.name] {
 			continue
@@ -87,15 +107,16 @@ func extract(assets fs.FS, dir string, names ...string) (string, error) {
 		dst := filepath.Join(absDir, entry.name)
 		if matches(dst, entry) {
 			if err := os.Chmod(dst, 0o755); err != nil {
-				return "", fmt.Errorf("make %s executable: %w", entry.name, err)
+				return "", extracted, fmt.Errorf("make %s executable: %w", entry.name, err)
 			}
 			continue
 		}
 		if err := extractOne(assets, dst, entry); err != nil {
-			return "", err
+			return "", extracted, err
 		}
+		extracted++
 	}
-	return absDir, nil
+	return absDir, extracted, nil
 }
 
 func parseManifest(data []byte) ([]manifestEntry, error) {
