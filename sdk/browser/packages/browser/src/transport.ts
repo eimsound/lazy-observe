@@ -56,9 +56,10 @@ export interface DiagnosticMeasurement {
 }
 
 export const DEFAULT_TRANSPORT_TIMEOUT_MS: number = DEFAULT_REQUEST_TIMEOUT_MS;
+const utf8Encoder = new TextEncoder();
 
 function bodyByteLength(body: BodyInit): number {
-  if (typeof body === "string") return new TextEncoder().encode(body).byteLength;
+  if (typeof body === "string") return utf8Encoder.encode(body).byteLength;
   if (typeof Blob !== "undefined" && body instanceof Blob) return body.size;
   if (ArrayBuffer.isView(body)) return body.byteLength;
   if (body instanceof ArrayBuffer) return body.byteLength;
@@ -161,12 +162,16 @@ export class Transport {
     keepalive = false,
     signal?: AbortSignal,
   ): Promise<void> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-LO-Replay-Session": sessionId,
+      "X-LO-Replay-Seq": String(seq),
+    };
     if (compressed) headers["Content-Encoding"] = "gzip";
     else headers["X-LO-Replay-Compression"] = "identity";
     if (error) headers["X-LO-Replay-Error"] = "1";
     return this.post(
-      `/api/replay/segments?session_id=${encodeURIComponent(sessionId)}&seq=${seq}`,
+      "/api/replay/segments",
       body,
       headers,
       keepalive,

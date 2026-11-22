@@ -33,7 +33,7 @@
 | 私有 ingest | `POST /api/events/vitals` | Web Vitals 上报；未知指标名跳过并计数（§5），响应含 `rejected`；支持可选低基数设备与地理维度字段（见下方说明） |
 | 私有查询 | `GET /api/v1/performance/vitals` | 项目隔离的 Web Vitals 聚合与维度分解查询（`by_page`、`by_device`、`by_browser`、`by_os`、`by_country`），支持 `page`/`device_type`/`browser_family`/`os_family`/`country` 筛选 |
 | 私有 ingest | `POST /api/events/diagnostics` | SDK 诊断信息上报；未知 `signal` / `reason` 跳过并计数（§5），响应含 `rejected` |
-| 私有 ingest | `POST /api/replay/segments` | 会话回放分段上报 |
+| 私有 ingest | `POST /api/replay/segments` | 会话回放分段上报；采用固定路径并通过 `X-LO-Replay-Session` 与 `X-LO-Replay-Seq` 请求头传递元数据（保留 `session_id` / `seq` query 兼容回退，同时存在且不一致时返回 `400`，CORS 放行这两个请求头）；对单层单 member 且无尾随数据的 `Content-Encoding: gzip`（`x-gzip`）负载强制 5 MiB 解压上限并在 `len(rawGzip) < len(decoded)` 且 `<= 5 MiB` 时跳过二次重压缩直接透传保存原始 gzip，同时保留基于解码明文字节的 `sha256` 去重与 `ingest_rate_limit` 计数 |
 | 私有 ingest | `POST /api/profiles` | 持续剖析（pprof）上报 |
 | 私有上传 | `POST /api/releases/:release/sourcemaps` | Source Map 制品上传；只接受 Source Map 上传 Token（`los_...`，§2.2），项目 API Token 与用户 API Token 返回 `403` `source_map_upload_token_required` |
 | 自身运维指标 | `GET /metrics` | Prometheus 文本格式 0.0.4（`text/plain; version=0.0.4; charset=utf-8`）；通过 `metrics_endpoint.enabled` 显式开启（默认关闭），默认需管理员鉴权，可选静态 scrape Bearer Token 或显式 `allow_unauthenticated`（§2.2） |

@@ -844,3 +844,70 @@ func BenchmarkGzipValidatePassthrough(b *testing.B) {
 		}
 	}
 }
+
+func TestDecodeGzipSinglePass(t *testing.T) {
+	part1 := []byte(`[{"type":4,"timestamp":1000}]`)
+	part2 := []byte(`[{"type":3,"timestamp":2000}]`)
+	gz1 := gzipBytes(t, part1)
+	gz2 := gzipBytes(t, part2)
+
+	// Single clean gzip member.
+	pb, decoded, single, err := decodeGzipSinglePass(gz1, maxReplaySegment)
+	if err != nil {
+		t.Fatalf("single member err=%v", err)
+	}
+	if !single || !bytes.Equal(decoded, part1) {
+		pb.release()
+		t.Fatalf("single=%v decoded=%q want true / %q", single, decoded, part1)
+	}
+	pb.release()
+
+	// Pooled decoder reuse after Multistream(false) must still handle multi-member streams.
+	multi := append(append([]byte(nil), gz1...), gz2...)
+	pbMulti, decodedMulti, singleMulti, err := decodeGzipSinglePass(multi, maxReplaySegment)
+	if err != nil {
+		t.Fatalf("multi member err=%v", err)
+	}
+	wantMulti := append(append([]byte(nil), part1...), part2...)
+	if singleMulti || !bytes.Equal(decodedMulti, wantMulti) {
+		pbMulti.release()
+		t.Fatalf("multi single=%v decoded=%q want false / %q", singleMulti, decodedMulti, wantMulti)
+	}
+	pbMulti.release()
+
+	// Trailing garbage bytes after a valid single member must fail.
+	for _, trailing := range [][]byte{[]byte("garbage"), {0x00}, gz2[:len(gz2)-4]} {
+		bad := append(append([]byte(nil), gz1...), trailing...)
+		if pbBad, _, _, err := decodeGzipSinglePass(bad, maxReplaySegment); err == nil {
+			pbBad.release()
+			t.Fatalf("expected error for trailing bytes %x", trailing)
+		}
+	}
+
+	// Exact limit vs limit+1 enforcement across single and multi-member streams.
+	exact := gzipOfZeros(t, 4096)
+	pbExact, decodedExact, singleExact, err := decodeGzipSinglePass(exact, 4096)
+	if err != nil || !singleExact || len(decodedExact) != 4096 {
+		if pbExact != nil {
+			pbExact.release()
+		}
+		t.Fatalf("exact limit failed: single=%v len=%d err=%v", singleExact, len(decodedExact), err)
+	}
+	pbExact.release()
+
+	over := gzipOfZeros(t, 4097)
+	if pbOver, _, _, err := decodeGzipSinglePass(over, 4096); !errors.Is(err, errDecodedBodyTooLarge) {
+		if pbOver != nil {
+			pbOver.release()
+		}
+		t.Fatalf("over limit err=%v want errDecodedBodyTooLarge", err)
+	}
+
+	multiOver := append(gzipOfZeros(t, 2048), gzipOfZeros(t, 2049)...)
+	if pbMultiOver, _, _, err := decodeGzipSinglePass(multiOver, 4096); !errors.Is(err, errDecodedBodyTooLarge) {
+		if pbMultiOver != nil {
+			pbMultiOver.release()
+		}
+		t.Fatalf("multi-member over limit err=%v want errDecodedBodyTooLarge", err)
+	}
+}

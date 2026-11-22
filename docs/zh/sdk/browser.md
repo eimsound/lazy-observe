@@ -124,7 +124,7 @@ init({
 });
 ```
 
-设置 `onErrorOnly: true` 可将普通采样率设为 0，同时保留错误回溯；设置 `replay: false` 可关闭录制。`rrweb` 是 `@lazy-observe/browser` 的可选 peer dependency，启用会话回放时请安装 `rrweb`。如果未安装 `rrweb`，回放模块仅记录一次警告并静默降级，不影响错误和链路采集。`rrweb` 默认遮蔽所有输入框并屏蔽 `[data-lo-block]` 元素；自定义 `blockSelector` 会替换该默认选择器。回放模块异步加载 `rrweb`，并在浏览器支持 `CompressionStream` 时启用 gzip 压缩。
+设置 `onErrorOnly: true` 可将普通采样率设为 0，同时保留错误回溯；设置 `replay: false` 可关闭录制。`rrweb` 是 `@lazy-observe/browser` 的可选 peer dependency，启用会话回放时请安装 `rrweb`。如果未安装 `rrweb`，回放模块仅记录一次警告并静默降级，不影响错误和链路采集。`rrweb` 默认遮蔽所有输入框并屏蔽 `[data-lo-block]` 元素；自定义 `blockSelector` 会替换该默认选择器。回放模块异步加载 `rrweb`，通过固定路径 `/api/replay/segments` 配合 `X-LO-Replay-Session` 与 `X-LO-Replay-Seq` 请求头上报分段以保持跨域预检可缓存，并在浏览器支持 `CompressionStream` 时启用 gzip 压缩。
 
 ## React
 

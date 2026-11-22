@@ -43,7 +43,7 @@ Importing either package has no global side effects. `init()` installs the confi
 
 Replay defaults to `{sampleRate: 0.1, onErrorFullCapture: true}`. Sampled sessions upload throughout the session every 10 seconds or 500 KB. Unsampled sessions retain a local 60-second ring only; an error uploads that look-back with `X-LO-Replay-Error: 1`. `onErrorOnly: true` disables normal sampling but keeps error look-back. `replay: false` disables all recording.
 
-rrweb is loaded asynchronously only after `init()`. All input values are masked (`maskAllInputs`), and `[data-lo-block]` subtrees are blocked by default. Set `blockSelector` to a stricter application selector. Replay uses `CompressionStream('gzip')` when available; identity fallback is marked by `X-LO-Replay-Compression: identity`.
+rrweb is loaded asynchronously only after `init()`. All input values are masked (`maskAllInputs`), and `[data-lo-block]` subtrees are blocked by default. Set `blockSelector` to a stricter application selector. Replay uploads segments to the fixed `/api/replay/segments` path with `X-LO-Replay-Session` and `X-LO-Replay-Seq` headers (keeping cross-origin CORS preflights cacheable) and uses `CompressionStream('gzip')` when available; identity fallback is marked by `X-LO-Replay-Compression: identity`.
 
 Replay also adds structured timeline markers for captured errors, instrumented fetch/XHR requests, and Web Vitals. Request markers contain only method, URL path, status, and duration; origins, credentials, query strings, fragments, request bodies, and response bodies are never recorded. Vital markers contain only `name`, `value`, and the `web-vitals` rating. Markers observed while rrweb is loading are queued until recording starts.
 

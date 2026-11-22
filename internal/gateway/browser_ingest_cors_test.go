@@ -16,7 +16,7 @@ func TestBrowserIngestCORSIsLimitedToBrowserWriteEndpoints(t *testing.T) {
 		"/api/events/errors",
 		"/api/events/vitals",
 		"/api/events/diagnostics",
-		"/api/replay/segments?session_id=session-1&seq=0",
+		"/api/replay/segments",
 	} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()
@@ -26,7 +26,7 @@ func TestBrowserIngestCORSIsLimitedToBrowserWriteEndpoints(t *testing.T) {
 			request.Header.Set("Access-Control-Request-Method", http.MethodPost)
 			request.Header.Set(
 				"Access-Control-Request-Headers",
-				"authorization,content-type,x-lo-replay-error",
+				"authorization,content-type,x-lo-replay-session,x-lo-replay-seq,x-lo-replay-error",
 			)
 			response, err := app.Test(request)
 			if err != nil {
@@ -45,11 +45,16 @@ func TestBrowserIngestCORSIsLimitedToBrowserWriteEndpoints(t *testing.T) {
 			if got := response.Header.Get("Access-Control-Expose-Headers"); got != "Retry-After" {
 				t.Fatalf("expose headers=%q want Retry-After", got)
 			}
+			if got := response.Header.Get("Access-Control-Max-Age"); got != "600" {
+				t.Fatalf("max age=%q want=%q", got, "600")
+			}
 			allowed := strings.ToLower(response.Header.Get("Access-Control-Allow-Headers"))
 			for _, header := range []string{
 				"authorization",
 				"content-type",
 				"content-encoding",
+				"x-lo-replay-session",
+				"x-lo-replay-seq",
 				"x-lo-replay-compression",
 				"x-lo-replay-error",
 			} {

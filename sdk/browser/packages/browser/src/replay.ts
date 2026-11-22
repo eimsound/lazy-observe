@@ -29,6 +29,7 @@ export interface ReplayHTTPMarkerPayload {
 export type ReplayVitalMarkerPayload = ReplayVitalSample;
 
 const MAX_PENDING_CUSTOM_EVENTS = 200;
+const utf8Encoder = new TextEncoder();
 
 interface ReplayTransport {
   replay(
@@ -346,11 +347,11 @@ export class ReplayController {
 }
 
 function encodeReplayEventsSync(events: TimedReplayEvent[]): { body: BodyInit; compressed: boolean } {
-  return { body: new TextEncoder().encode(JSON.stringify(events)), compressed: false };
+  return { body: utf8Encoder.encode(JSON.stringify(events)), compressed: false };
 }
 
 async function encodeReplayEvents(events: TimedReplayEvent[]): Promise<{ body: BodyInit; compressed: boolean }> {
-  const bytes = new TextEncoder().encode(JSON.stringify(events));
+  const bytes = utf8Encoder.encode(JSON.stringify(events));
   if (typeof CompressionStream === "undefined") return { body: bytes, compressed: false };
   const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
   return { body: await new Response(stream).blob(), compressed: true };
