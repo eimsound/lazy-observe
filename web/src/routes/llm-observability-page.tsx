@@ -28,12 +28,15 @@ import { ApiError } from "@/lib/api/client";
 import { IS_MOCK } from "@/lib/settings";
 import { useProjectQuery } from "@/lib/project/use-project-query";
 import { useTimeWindow } from "@/hooks/use-time-window";
+import { useRecentIngestNotice } from "@/hooks/use-recent-ingest-notice";
+import { timeWindowEndMs } from "@/lib/ingesting-window";
 import { formatDurationMicros } from "@/lib/format";
 import dayjs, { dayjsLocale } from "@/lib/dayjs";
 import type { TimeSeries } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "@/components/common/empty-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
+import { RecentIngestNotice } from "@/components/common/recent-ingest-notice";
 import { TimeSeriesChart } from "@/components/charts/time-series-chart";
 import { PageActions, PageContainer } from "@/components/layout/page";
 import { Badge } from "@/components/ui/badge";
@@ -53,6 +56,7 @@ export function LLMObservabilityPage() {
   const [model, setModel] = useState(ALL);
 
   const llmWindow = { start: window.start, end: window.end };
+  const isRecentlyIngesting = useRecentIngestNotice(timeWindowEndMs(llmWindow.end));
 
   const summaryQuery = useProjectQuery<LLMSummary, ApiError>({
     queryKey: ["llm-summary", llmWindow.start, llmWindow.end],
@@ -119,6 +123,13 @@ export function LLMObservabilityPage() {
         <QueryStaleNotice
           isRetrying={summaryQuery.isFetching}
           onRetry={() => void summaryQuery.refetch()}
+        />
+      )}
+
+      {isRecentlyIngesting && summaryState !== "error" && (
+        <RecentIngestNotice
+          isRefreshing={refreshing}
+          onRefresh={() => advance()}
         />
       )}
 
