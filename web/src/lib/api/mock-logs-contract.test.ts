@@ -180,3 +180,40 @@ test("a pre-aborted mock request preserves the AbortSignal reason", async () => 
     (error: unknown) => error === reason,
   );
 });
+
+test("mock stream field transient errors fail once, recover on retry, and preserve failure when aborted", async () => {
+  const fieldsParams = {
+    ...RANGE,
+    query: "__stream_fields_error_once mock-contract-test",
+  };
+  const abortedFields = new AbortController();
+  abortedFields.abort();
+  await assert.rejects(
+    mockStreamFieldNames(fieldsParams, abortedFields.signal),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  );
+  await assert.rejects(
+    mockStreamFieldNames(fieldsParams),
+    /Mock stream field names error/,
+  );
+  const recoveredFields = await mockStreamFieldNames(fieldsParams);
+  assert.ok(recoveredFields.values.some((item) => item.value === "app"));
+
+  const valuesParams = {
+    ...RANGE,
+    query: "__field_values_error_once mock-contract-test",
+    field: "app",
+  };
+  const abortedValues = new AbortController();
+  abortedValues.abort();
+  await assert.rejects(
+    mockStreamFieldValues(valuesParams, abortedValues.signal),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  );
+  await assert.rejects(
+    mockStreamFieldValues(valuesParams),
+    /Mock stream field values error for app/,
+  );
+  const recoveredValues = await mockStreamFieldValues(valuesParams);
+  assert.ok(recoveredValues.values.some((item) => item.value === "api-gateway"));
+});

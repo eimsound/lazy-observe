@@ -337,6 +337,7 @@ export function LogsPage() {
               fieldValuesLoading={metadata.fieldValuesLoading}
               fieldValuesErrors={metadata.fieldValuesErrors}
               filters={streamFilters}
+              onRetryFields={metadata.retryStreamFields}
               onRequestFieldValues={metadata.requestFieldValues}
               onUpsertFilter={(filter) => addFilter(
                 filter.field,

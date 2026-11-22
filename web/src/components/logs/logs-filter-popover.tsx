@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
 import {
   ArrowDownUp,
@@ -6,6 +6,7 @@ import {
   Filter,
   LoaderCircle,
   Minus,
+  RotateCcw,
   Search,
   X,
 } from "lucide-react";
@@ -24,6 +25,7 @@ import {
   getFieldFilterSummary,
   mergeFilterFields,
   resolveActiveField,
+  resolveNextFieldIndex,
   sortFieldValues,
   type FilterSortDirection,
 } from "./logs-filter-model";
@@ -39,6 +41,7 @@ export interface LogsFilterPopoverProps {
   fieldValuesLoading?: Readonly<Record<string, boolean | undefined>>;
   fieldValuesErrors?: Readonly<Record<string, string | null | undefined>>;
   filters: LogsExtraFilter[];
+  onRetryFields?: () => void;
   onRequestFieldValues: (field: string) => void;
   onUpsertFilter: (filter: LogsExtraFilter) => void;
   onRemoveFilter: (field: string, value: string) => void;
@@ -173,6 +176,7 @@ export function LogsFilterPopover({
   fieldValuesLoading = {},
   fieldValuesErrors = {},
   filters,
+  onRetryFields,
   onRequestFieldValues,
   onUpsertFilter,
   onRemoveFilter,
@@ -184,6 +188,7 @@ export function LogsFilterPopover({
   const [sortDirection, setSortDirection] = useState<FilterSortDirection>("desc");
   const [selectedField, setSelectedField] = useState<string | null>(null);
   const requestedFields = useRef(new Set<string>());
+  const fieldOptionRefs = useRef(new Map<string, HTMLButtonElement>());
 
   const numberFormatter = useMemo(
     () => new Intl.NumberFormat(i18n.language, { notation: "compact", maximumFractionDigits: 1 }),
@@ -253,6 +258,58 @@ export function LogsFilterPopover({
     ),
     [activeSummary, activeValues, i18n.language, sortDirection],
   );
+
+  const handleRetryFields = () => {
+    if (!onRetryFields || fieldsLoading) return;
+    onRetryFields();
+  };
+
+  const handleRetryFieldValues = () => {
+    if (!activeField || activeValuesLoading) return;
+    requestedFields.current.add(activeField);
+    onRequestFieldValues(activeField);
+  };
+
+  const focusFieldOption = (field: string) => {
+    setSelectedField(field);
+    const button = fieldOptionRefs.current.get(field);
+    if (!button) return;
+    button.focus();
+    button.scrollIntoView({ block: "nearest" });
+  };
+
+  const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (
+      event.nativeEvent.isComposing
+      || event.altKey
+      || event.ctrlKey
+      || event.metaKey
+      || event.key !== "ArrowDown"
+      || visibleFields.length === 0
+    ) {
+      return;
+    }
+    event.preventDefault();
+    focusFieldOption(activeField ?? visibleFields[0].value);
+  };
+
+  const handleFieldOptionKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    if (
+      event.nativeEvent.isComposing
+      || event.altKey
+      || event.ctrlKey
+      || event.metaKey
+    ) {
+      return;
+    }
+    const nextIndex = resolveNextFieldIndex(index, visibleFields.length, event.key);
+    if (nextIndex === null) return;
+    event.preventDefault();
+    focusFieldOption(visibleFields[nextIndex].value);
+  };
 
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
@@ -325,6 +382,7 @@ export function LogsFilterPopover({
                   placeholder={t("logs.searchFields")}
                   aria-label={t("logs.searchFields")}
                   onChange={(event) => setSearch(event.target.value)}
+                  onKeyDown={handleSearchKeyDown}
                 />
                 {search && (
                   <button
@@ -363,6 +421,19 @@ export function LogsFilterPopover({
                 <div className="mb-2 rounded-md bg-destructive/10 p-2.5 text-xs text-destructive" role="alert">
                   <span className="font-medium">{t("logs.filterFieldsLoadError")}</span>
                   <span className="mt-0.5 block break-words">{fieldsError}</span>
+                  {onRetryFields && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-2 h-7 gap-1.5 px-2 text-xs text-foreground [&_svg]:size-3.5"
+                      disabled={fieldsLoading}
+                      onClick={handleRetryFields}
+                    >
+                      <RotateCcw aria-hidden="true" />
+                      {t("common.retry")}
+                    </Button>
+                  )}
                 </div>
               )}
               {fieldsLoading && fields.length === 0 && (
@@ -380,8 +451,8 @@ export function LogsFilterPopover({
                 </p>
               )}
               {visibleFields.length > 0 && (
-                <div role="listbox" aria-label={t("logs.filters")} className="space-y-0.5 text-xs">
-                  {visibleFields.map((field) => {
+                <div role="listbox" aria-label={t("logs.filterFields")} className="space-y-0.5 text-xs">
+                  {visibleFields.map((field, index) => {
                     const isActive = field.value === activeField;
                     const summary = getFieldFilterSummary(
                       field.value,
@@ -402,9 +473,14 @@ export function LogsFilterPopover({
                     return (
                       <button
                         key={field.value}
+                        ref={(node) => {
+                          if (node) fieldOptionRefs.current.set(field.value, node);
+                          else fieldOptionRefs.current.delete(field.value);
+                        }}
                         type="button"
                         role="option"
                         aria-selected={isActive}
+                        tabIndex={isActive ? 0 : -1}
                         className={cn(
                           "flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                           isActive
@@ -415,6 +491,7 @@ export function LogsFilterPopover({
                           field.hits === 0 && "opacity-80",
                         )}
                         onClick={() => setSelectedField(field.value)}
+                        onKeyDown={(event) => handleFieldOptionKeyDown(event, index)}
                       >
                         <span className="min-w-0 flex-1 truncate font-mono" title={field.value}>
                           {field.value}
@@ -511,6 +588,17 @@ export function LogsFilterPopover({
                     >
                       <span className="font-medium">{t("logs.fieldValuesLoadError")}</span>
                       <span className="mt-0.5 block break-words">{activeValuesError}</span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="mt-2 h-7 gap-1.5 px-2 text-xs text-foreground [&_svg]:size-3.5"
+                        disabled={activeValuesLoading}
+                        onClick={handleRetryFieldValues}
+                      >
+                        <RotateCcw aria-hidden="true" />
+                        {t("common.retry")}
+                      </Button>
                     </div>
                   )}
                   {!activeValuesLoading

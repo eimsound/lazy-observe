@@ -6,6 +6,7 @@ import {
   getFieldFilterSummary,
   mergeFilterFields,
   resolveActiveField,
+  resolveNextFieldIndex,
   sortFieldValues,
 } from "./logs-filter-model";
 
@@ -153,4 +154,25 @@ test("resolveActiveField keeps visible selection and falls back to first visible
   assert.equal(resolveActiveField(null, visible), "app");
   assert.equal(resolveActiveField("pod", visible), "app");
   assert.equal(resolveActiveField("app", []), null);
+});
+
+test("resolveNextFieldIndex handles ArrowDown, ArrowUp, Home, End, clamping, and unrelated keys", () => {
+  assert.equal(resolveNextFieldIndex(-1, 3, "ArrowDown"), 0);
+  assert.equal(resolveNextFieldIndex(0, 3, "ArrowDown"), 1);
+  assert.equal(resolveNextFieldIndex(2, 3, "ArrowDown"), 2);
+
+  assert.equal(resolveNextFieldIndex(-1, 3, "ArrowUp"), 2);
+  assert.equal(resolveNextFieldIndex(2, 3, "ArrowUp"), 1);
+  assert.equal(resolveNextFieldIndex(0, 3, "ArrowUp"), 0);
+
+  assert.equal(resolveNextFieldIndex(2, 3, "Home"), 0);
+  assert.equal(resolveNextFieldIndex(0, 3, "End"), 2);
+
+  assert.equal(resolveNextFieldIndex(0, 0, "ArrowDown"), null);
+  assert.equal(resolveNextFieldIndex(0, 0, "Home"), null);
+  assert.equal(resolveNextFieldIndex(1, 3, "Enter"), null);
+  assert.equal(resolveNextFieldIndex(1, 3, "Escape"), null);
+  assert.equal(resolveNextFieldIndex(1, 3, "Tab"), null);
+  assert.equal(resolveNextFieldIndex(1, 3, "ArrowLeft"), null);
+  assert.equal(resolveNextFieldIndex(1, 3, "a"), null);
 });

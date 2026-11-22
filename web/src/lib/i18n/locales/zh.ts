@@ -568,6 +568,7 @@ export const zh = {
     fieldSuggestion: "日志字段",
     valueHits: "{{count}} 次命中",
     filters: "筛选",
+    filterFields: "筛选字段",
     closeFilters: "关闭筛选",
     searchFields: "搜索字段",
     clearFieldSearch: "清除字段搜索",

@@ -797,10 +797,39 @@ export function mockLogFieldValues(
   ), 90, signal);
 }
 
-export function mockStreamFieldNames(
+const consumedTransientErrors = new Set<string>();
+
+async function rejectOnceAfterDelay(
+  key: string,
+  message: string,
+  ms: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (consumedTransientErrors.has(key)) return;
+  await delay(undefined, ms, signal);
+  if (consumedTransientErrors.has(key)) return;
+  consumedTransientErrors.add(key);
+  throw new Error(message);
+}
+
+export async function mockStreamFieldNames(
   params: LogsMetadataParams,
   signal?: AbortSignal,
 ): Promise<LogsFieldValuesResponse> {
+  if (params.query?.includes("__stream_fields_error_once")) {
+    await rejectOnceAfterDelay(
+      JSON.stringify([
+        "stream_fields",
+        params.project ?? "",
+        params.query,
+        params.start,
+        params.end,
+      ]),
+      `Mock stream field names error near: ${params.query}`,
+      90,
+      signal,
+    );
+  }
   return delay(
     metadataValues(fieldNamesForRows(STREAM_FIELD_NAMES, metadataRows(params)), params),
     90,
@@ -808,10 +837,25 @@ export function mockStreamFieldNames(
   );
 }
 
-export function mockStreamFieldValues(
+export async function mockStreamFieldValues(
   params: LogsFieldValuesParams,
   signal?: AbortSignal,
 ): Promise<LogsFieldValuesResponse> {
+  if (params.query?.includes("__field_values_error_once")) {
+    await rejectOnceAfterDelay(
+      JSON.stringify([
+        "stream_field_values",
+        params.project ?? "",
+        params.query,
+        params.start,
+        params.end,
+        params.field,
+      ]),
+      `Mock stream field values error for ${params.field}`,
+      90,
+      signal,
+    );
+  }
   const values = fieldValuesForRows(params.field, metadataRows(params));
   return delay(metadataValues(
     values.length || hasRequestFilters(params) ? values : valuesForField(params.field),

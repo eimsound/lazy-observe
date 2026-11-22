@@ -37,11 +37,78 @@ const EMPTY_FIELD_VALUES: Record<string, LogsFieldValue[]> = {};
 const EMPTY_FIELD_LOADING: Record<string, boolean> = {};
 const EMPTY_FIELD_ERRORS: Record<string, string | null> = {};
 
-interface FieldMetadataCache {
+export interface FieldMetadataCache {
   identity: string;
   values: Record<string, LogsFieldValue[]>;
   loading: Record<string, boolean>;
   errors: Record<string, string | null>;
+}
+
+export function createEmptyFieldMetadataCache(identity: string): FieldMetadataCache {
+  return {
+    identity,
+    values: EMPTY_FIELD_VALUES,
+    loading: EMPTY_FIELD_LOADING,
+    errors: EMPTY_FIELD_ERRORS,
+  };
+}
+
+function ensureFieldMetadataCache(
+  current: FieldMetadataCache,
+  identity: string,
+): FieldMetadataCache {
+  return current.identity === identity ? current : createEmptyFieldMetadataCache(identity);
+}
+
+export function beginFieldValueRequest(
+  current: FieldMetadataCache,
+  identity: string,
+  field: string,
+): FieldMetadataCache {
+  const base = ensureFieldMetadataCache(current, identity);
+  return {
+    ...base,
+    loading: { ...base.loading, [field]: true },
+    errors: { ...base.errors, [field]: null },
+  };
+}
+
+export function succeedFieldValueRequest(
+  current: FieldMetadataCache,
+  identity: string,
+  field: string,
+  values: LogsFieldValue[],
+): FieldMetadataCache {
+  const base = ensureFieldMetadataCache(current, identity);
+  return {
+    ...base,
+    values: { ...base.values, [field]: values },
+  };
+}
+
+export function failFieldValueRequest(
+  current: FieldMetadataCache,
+  identity: string,
+  field: string,
+  error: string,
+): FieldMetadataCache {
+  const base = ensureFieldMetadataCache(current, identity);
+  return {
+    ...base,
+    errors: { ...base.errors, [field]: error },
+  };
+}
+
+export function finishFieldValueRequest(
+  current: FieldMetadataCache,
+  identity: string,
+  field: string,
+): FieldMetadataCache {
+  const base = ensureFieldMetadataCache(current, identity);
+  return {
+    ...base,
+    loading: { ...base.loading, [field]: false },
+  };
 }
 
 interface FieldValueRequestToken {
@@ -84,12 +151,9 @@ export function useLogsFieldMetadata({
     project,
   ]);
 
-  const [cache, setCache] = useState<FieldMetadataCache>({
-    identity: metadataIdentity,
-    values: EMPTY_FIELD_VALUES,
-    loading: EMPTY_FIELD_LOADING,
-    errors: EMPTY_FIELD_ERRORS,
-  });
+  const [cache, setCache] = useState<FieldMetadataCache>(() => (
+    createEmptyFieldMetadataCache(metadataIdentity)
+  ));
 
   useEffect(() => {
     for (const [field, token] of Object.entries(fieldValueRequests.current)) {
@@ -145,6 +209,11 @@ export function useLogsFieldMetadata({
       ...metadataFilters,
     }, signal),
   });
+  const { refetch: refetchStreamFields } = streamFieldsResult;
+
+  const retryStreamFields = useCallback(() => {
+    void refetchStreamFields();
+  }, [refetchStreamFields]);
 
   const allFields = useMemo(() => {
     const fields = new Set<string>(["_time", "_msg", "_stream"]);
@@ -164,24 +233,7 @@ export function useLogsFieldMetadata({
     };
     fieldValueRequests.current[field] = requestToken;
     const isCurrentRequest = () => fieldValueRequests.current[field] === requestToken;
-    const updateCache = (mutate: (base: FieldMetadataCache) => FieldMetadataCache) => {
-      setCache((current) => {
-        const base = current.identity === metadataIdentity
-          ? current
-          : {
-            identity: metadataIdentity,
-            values: EMPTY_FIELD_VALUES,
-            loading: EMPTY_FIELD_LOADING,
-            errors: EMPTY_FIELD_ERRORS,
-          };
-        return mutate(base);
-      });
-    };
-    updateCache((base) => ({
-      ...base,
-      loading: { ...base.loading, [field]: true },
-      errors: { ...base.errors, [field]: null },
-    }));
+    setCache((current) => beginFieldValueRequest(current, metadataIdentity, field));
     void queryClient.fetchQuery({
       queryKey: [
         "logs-explorer",
@@ -193,6 +245,7 @@ export function useLogsFieldMetadata({
         field,
       ],
       staleTime: 30_000,
+      retry: false,
       queryFn: ({ signal }) => queryLogStreamFieldValues({
         field,
         query: metadataQuery,
@@ -204,22 +257,17 @@ export function useLogsFieldMetadata({
       }, signal),
     }).then((response) => {
       if (!isCurrentRequest()) return;
-      updateCache((base) => ({
-        ...base,
-        values: { ...base.values, [field]: response.values },
-      }));
+      setCache((current) => (
+        succeedFieldValueRequest(current, metadataIdentity, field, response.values)
+      ));
     }).catch((error: unknown) => {
       if (!isCurrentRequest()) return;
-      updateCache((base) => ({
-        ...base,
-        errors: { ...base.errors, [field]: errorMessage(error) },
-      }));
+      setCache((current) => (
+        failFieldValueRequest(current, metadataIdentity, field, errorMessage(error))
+      ));
     }).finally(() => {
       if (!isCurrentRequest()) return;
-      updateCache((base) => ({
-        ...base,
-        loading: { ...base.loading, [field]: false },
-      }));
+      setCache((current) => finishFieldValueRequest(current, metadataIdentity, field));
     });
   }, [
     executedFilters,
@@ -291,6 +339,7 @@ export function useLogsFieldMetadata({
     streamFields: streamFieldsResult.data?.values ?? [],
     streamFieldsLoading: streamFieldsResult.isFetching,
     streamFieldsError: streamFieldsResult.error ? errorMessage(streamFieldsResult.error) : null,
+    retryStreamFields,
     fieldValues,
     fieldValuesLoading,
     fieldValuesErrors,

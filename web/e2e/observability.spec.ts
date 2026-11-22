@@ -599,3 +599,94 @@ test("日志筛选：移动端 390px 视口双栏弹层无横向溢出", async (
   await popover.getByRole("button", { name: "关闭筛选" }).click();
   await expect(popover).toHaveCount(0);
 });
+
+test("日志筛选：字段列表支持独立无障碍名称与键盘导航", async ({ page }) => {
+  await openFeature(page, "/logs?q=*&run=1&view=table&hide_chart=1");
+  await expect(page.getByRole("button", { name: "查看日志详情" }).first()).toBeVisible();
+
+  await page.getByRole("button", { name: /^筛选/ }).click();
+  const popover = page.getByRole("dialog", { name: "筛选" });
+  await expect(popover).toBeVisible();
+
+  const fieldListbox = popover.getByRole("listbox", { name: "筛选字段" });
+  await expect(fieldListbox).toBeVisible();
+
+  const appOption = fieldListbox.getByRole("option", { name: /^app\b/ });
+  const envOption = fieldListbox.getByRole("option", { name: /^env\b/ });
+  const podOption = fieldListbox.getByRole("option", { name: /^pod\b/ });
+
+  const searchInput = popover.getByLabel("搜索字段");
+  await searchInput.focus();
+  await searchInput.press("ArrowDown");
+  await expect(appOption).toBeFocused();
+  await expect(appOption).toHaveAttribute("aria-selected", "true");
+  await expect(popover.getByRole("list", { name: "字段 app 的可选值" })).toBeVisible();
+
+  await appOption.press("ArrowDown");
+  await expect(envOption).toBeFocused();
+  await expect(envOption).toHaveAttribute("aria-selected", "true");
+  await expect(popover.getByRole("list", { name: "字段 env 的可选值" })).toBeVisible();
+
+  await envOption.press("End");
+  await expect(podOption).toBeFocused();
+  await expect(podOption).toHaveAttribute("aria-selected", "true");
+  await expect(popover.getByRole("list", { name: "字段 pod 的可选值" })).toBeVisible();
+
+  await podOption.press("ArrowDown");
+  await expect(podOption).toBeFocused();
+  await expect(podOption).toHaveAttribute("aria-selected", "true");
+
+  await podOption.press("ArrowUp");
+  await expect(envOption).toBeFocused();
+  await expect(envOption).toHaveAttribute("aria-selected", "true");
+
+  await envOption.press("Home");
+  await expect(appOption).toBeFocused();
+  await expect(appOption).toHaveAttribute("aria-selected", "true");
+
+  await appOption.press("ArrowUp");
+  await expect(appOption).toBeFocused();
+  await expect(appOption).toHaveAttribute("aria-selected", "true");
+
+  await appOption.press("ArrowDown");
+  await expect(envOption).toHaveAttribute("aria-selected", "true");
+  await searchInput.focus();
+  await searchInput.press("ArrowDown");
+  await expect(envOption).toBeFocused();
+
+  await popover.getByRole("button", { name: "包含 prod" }).click();
+  await expect(page.getByLabel("当前附加过滤条件")).toContainText('{env="prod"}');
+});
+
+test("日志筛选：字段列表与字段值加载失败后支持点击重试恢复", async ({ page }) => {
+  await openFeature(
+    page,
+    "/logs?q=__stream_fields_error_once%20__field_values_error_once&run=1&view=table&hide_chart=1",
+  );
+  await expect(page.getByRole("button", { name: "查看日志详情" }).first()).toBeVisible();
+
+  await page.getByRole("button", { name: /^筛选/ }).click();
+  const popover = page.getByRole("dialog", { name: "筛选" });
+  await expect(popover).toBeVisible();
+
+  const fieldsAlert = popover.getByRole("alert").filter({ hasText: "筛选字段加载失败" });
+  await expect(fieldsAlert).toBeVisible();
+  await fieldsAlert.getByRole("button", { name: "重试" }).click();
+
+  await expect(fieldsAlert).toHaveCount(0);
+  const fieldListbox = popover.getByRole("listbox", { name: "筛选字段" });
+  await expect(fieldListbox.getByRole("option", { name: /^app\b/ })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+
+  const valuesAlert = popover.getByRole("alert").filter({ hasText: "字段值加载失败" });
+  await expect(valuesAlert).toBeVisible();
+  await valuesAlert.getByRole("button", { name: "重试" }).click();
+
+  await expect(valuesAlert).toHaveCount(0);
+  const includeApiGateway = popover.getByRole("button", { name: "包含 api-gateway" });
+  await expect(includeApiGateway).toBeVisible();
+  await includeApiGateway.click();
+  await expect(page.getByLabel("当前附加过滤条件")).toContainText('{app="api-gateway"}');
+});
