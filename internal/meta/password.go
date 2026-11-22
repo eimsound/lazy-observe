@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,8 @@ const (
 	maxArgonMemory             = uint32(512 * 1024)
 	defaultArgonConcurrency    = 4
 	defaultArgonAcquireTimeout = 2 * time.Second
+	argonReclaimMinMemoryKB    = uint32(8 * 1024)
+	argonReclaimMinInterval    = 250 * time.Millisecond
 )
 
 // ErrPasswordVerificationBusy reports that all bounded Argon2id verification
@@ -99,12 +102,12 @@ func HashPasswordContext(ctx context.Context, password string) (string, error) {
 }
 
 func hashPasswordWithRelease(password string, release func()) (string, error) {
-	defer release()
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
+		release()
 		return "", fmt.Errorf("generate password salt: %w", err)
 	}
-	key := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	key := runArgon2IDKey(release, []byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
 	b64 := base64.RawStdEncoding
 	return fmt.Sprintf(
 		"$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s",
@@ -123,8 +126,7 @@ func VerifyPassword(encoded, password string) bool {
 		return false
 	}
 	release := acquireArgonSlotBlocking()
-	defer release()
-	got := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(want)))
+	got := runArgon2IDKey(release, []byte(password), salt, iterations, memory, threads, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
@@ -139,8 +141,7 @@ func VerifyPasswordContext(ctx context.Context, encoded, password string) (bool,
 	if err != nil {
 		return false, err
 	}
-	defer release()
-	got := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(want)))
+	got := runArgon2IDKey(release, []byte(password), salt, iterations, memory, threads, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }
 
@@ -185,8 +186,8 @@ func argon2DummyContext(ctx context.Context, password string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	return argon2.IDKey(
+	return runArgon2IDKey(
+		release,
 		[]byte(password),
 		[]byte("lazy-observe-dummy"),
 		argonTime,
@@ -194,4 +195,166 @@ func argon2DummyContext(ctx context.Context, password string) ([]byte, error) {
 		argonThreads,
 		argonKeyLen,
 	), nil
+}
+
+// runArgon2IDKey executes argon2.IDKey while coordinating OS heap reclamation
+// for large transient Argon2id memory blocks. Defer order ensures the
+// concurrency slot is released before any synchronous FreeOSMemory run.
+func runArgon2IDKey(
+	release func(),
+	password, salt []byte,
+	iterations, memory uint32,
+	threads uint8,
+	keyLen uint32,
+) []byte {
+	if defaultArgonReclaimer.enter(memory) {
+		defer defaultArgonReclaimer.leave()
+	}
+	if release != nil {
+		defer release()
+	}
+	return argon2.IDKey(password, salt, iterations, memory, threads, keyLen)
+}
+
+type argonMemoryReclaimer struct {
+	mu          sync.Mutex
+	inFlight    int
+	running     bool
+	pending     bool
+	lastReclaim time.Time
+	timer       *time.Timer
+	minInterval time.Duration
+	now         func() time.Time
+	reclaimFn   func()
+	afterFunc   func(time.Duration, func()) *time.Timer
+}
+
+var defaultArgonReclaimer = newArgonMemoryReclaimer(
+	argonReclaimMinInterval,
+	time.Now,
+	debug.FreeOSMemory,
+	time.AfterFunc,
+)
+
+func newArgonMemoryReclaimer(
+	minInterval time.Duration,
+	now func() time.Time,
+	reclaimFn func(),
+	afterFunc func(time.Duration, func()) *time.Timer,
+) *argonMemoryReclaimer {
+	return &argonMemoryReclaimer{
+		minInterval: minInterval,
+		now:         now,
+		reclaimFn:   reclaimFn,
+		afterFunc:   afterFunc,
+	}
+}
+
+func (r *argonMemoryReclaimer) enter(memoryKB uint32) bool {
+	if memoryKB < argonReclaimMinMemoryKB {
+		return false
+	}
+	r.mu.Lock()
+	r.inFlight++
+	r.mu.Unlock()
+	return true
+}
+
+func (r *argonMemoryReclaimer) leave() {
+	r.mu.Lock()
+	if r.inFlight > 0 {
+		r.inFlight--
+	}
+	if r.inFlight > 0 {
+		r.mu.Unlock()
+		return
+	}
+	if r.running {
+		r.pending = true
+		r.mu.Unlock()
+		return
+	}
+	if r.minInterval > 0 && !r.lastReclaim.IsZero() {
+		elapsed := r.now().Sub(r.lastReclaim)
+		if elapsed < r.minInterval {
+			if r.timer == nil {
+				r.timer = r.afterFunc(r.minInterval-elapsed, r.onTimer)
+			}
+			r.mu.Unlock()
+			return
+		}
+	}
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+	r.running = true
+	r.mu.Unlock()
+
+	r.runReclaim()
+}
+
+func (r *argonMemoryReclaimer) onTimer() {
+	r.mu.Lock()
+	r.timer = nil
+	if r.inFlight > 0 {
+		r.mu.Unlock()
+		return
+	}
+	if r.running {
+		r.pending = true
+		r.mu.Unlock()
+		return
+	}
+	r.running = true
+	r.mu.Unlock()
+
+	r.runReclaim()
+}
+
+func (r *argonMemoryReclaimer) runReclaim() {
+	for {
+		func() {
+			completed := false
+			defer func() {
+				if !completed {
+					r.mu.Lock()
+					r.running = false
+					r.mu.Unlock()
+				}
+			}()
+			if r.reclaimFn != nil {
+				r.reclaimFn()
+			}
+			completed = true
+		}()
+
+		r.mu.Lock()
+		r.lastReclaim = r.now()
+		pending := r.pending
+		r.pending = false
+		if !pending || r.inFlight > 0 {
+			r.running = false
+			r.mu.Unlock()
+			return
+		}
+		if r.minInterval > 0 {
+			r.running = false
+			if r.timer == nil {
+				r.timer = r.afterFunc(r.minInterval, r.onTimer)
+			}
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Unlock()
+	}
+}
+
+func (r *argonMemoryReclaimer) stop() {
+	r.mu.Lock()
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+	r.mu.Unlock()
 }
