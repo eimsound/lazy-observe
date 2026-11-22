@@ -579,6 +579,7 @@ export const en: typeof zh = {
     fieldSuggestion: "Log field",
     valueHits: "{{count}} hits",
     filters: "Filters",
+    filterFields: "Filter fields",
     closeFilters: "Close filters",
     searchFields: "Search fields",
     clearFieldSearch: "Clear field search",
