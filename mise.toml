@@ -258,18 +258,21 @@ run = "bash scripts/helm-template-test.sh"
 
 [tasks.docs-build]
 description = "Build the bilingual Zensical documentation site (English in site/, Simplified Chinese in site/zh/)"
-# 文档站构建工具由 uv 受管 Python + tools/docs/pyproject.toml 驱动，不依赖系统 python3 或 pip；
-# 先构建英文主站（--clean 清空 site/），再构建简体中文站到 site/zh/。
+# 文档站构建工具由 uv 受管 Python + docs/pyproject.toml 驱动，不依赖系统 python3 或 pip；
+# Zensical 0.1.1 要求 site_dir 位于配置目录（docs/）内，先分别构建英文主站到 docs/site/
+# 与简体中文站到 docs/site/zh/，再整体移至仓库根目录 site/，保持产物路径与 Pages 上传配置不变。
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 version=${LO_DOCS_PYTHON_VERSION:-3.13}
-venv="$PWD/tools/docs/.venv"
+venv="$PWD/docs/.venv"
 uv python install --managed-python --no-bin "$version"
 uv venv --managed-python --python "$version" --clear "$venv"
-(cd tools/docs && uv pip install --quiet --python "$venv/bin/python" -r pyproject.toml)
-"$venv/bin/zensical" build -f zensical.toml --clean --strict
-"$venv/bin/zensical" build -f zensical.zh.toml --clean --strict
+(cd docs && uv pip install --quiet --python "$venv/bin/python" -r pyproject.toml)
+"$venv/bin/zensical" build -f docs/zensical.toml --clean --strict
+"$venv/bin/zensical" build -f docs/zensical.zh.toml --clean --strict
+rm -rf "$PWD/site"
+mv "$PWD/docs/site" "$PWD/site"
 '''
 
 [tasks.docs-serve]
@@ -278,14 +281,14 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 version=${LO_DOCS_PYTHON_VERSION:-3.13}
-venv="$PWD/tools/docs/.venv"
-config=zensical.toml
+venv="$PWD/docs/.venv"
+config=docs/zensical.toml
 if [[ ${LO_DOCS_LANG:-en} == zh ]]; then
-  config=zensical.zh.toml
+  config=docs/zensical.zh.toml
 fi
 uv python install --managed-python --no-bin "$version"
 uv venv --managed-python --python "$version" --clear "$venv"
-(cd tools/docs && uv pip install --quiet --python "$venv/bin/python" -r pyproject.toml)
+(cd docs && uv pip install --quiet --python "$venv/bin/python" -r pyproject.toml)
 exec "$venv/bin/zensical" serve -f "$config"
 '''
 

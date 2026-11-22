@@ -4,7 +4,9 @@
 /data/
 /.cache/
 /site/
-tools/docs/.venv/
+docs/.venv/
+docs/.cache/
+docs/site/
 /lazy-observe
 /.pnpm-store/
 /internal/db/.ent.tmp.*/
