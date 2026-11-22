@@ -37,6 +37,8 @@ const (
 	maxReplayPage               = 10_000
 	replayPageSize              = 50
 	maxReplayTimestampMs        = 253402300799999 // 9999-12-31T23:59:59.999Z
+	replaySessionHeader         = "X-LO-Replay-Session"
+	replaySeqHeader             = "X-LO-Replay-Seq"
 )
 
 var (
@@ -122,10 +124,8 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 	if g.replays == nil || g.blobs == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "replay storage unavailable"})
 	}
-	sessionID := strings.TrimSpace(c.Query("session_id"))
-	seq, err := strconv.Atoi(c.Query("seq"))
-	if len(sessionID) == 0 || !validIngestText(sessionID, maxReplaySessionIDLen) ||
-		!replayIDPattern.MatchString(sessionID) || err != nil || seq < 0 {
+	sessionID, seq, ok := parseReplayIngestMetadata(c)
+	if !ok {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid session_id or seq"})
 	}
 	if seq >= maxReplaySegmentsPerSession {
@@ -141,7 +141,7 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		return err
 	}
 
-	decoded, status, errMsg := decodeReplayBody(c)
+	decoded, rawGzip, status, errMsg := decodeReplayBody(c)
 	if status != 0 {
 		return c.Status(status).JSON(fiber.Map{"error": errMsg})
 	}
@@ -169,14 +169,23 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		return fiber.NewError(http.StatusInternalServerError, "store replay segment")
 	}
 
-	var stored bytes.Buffer
-	zw := gzip.NewWriter(&stored)
-	_, writeErr := zw.Write(decoded)
-	closeErr := zw.Close()
-	if writeErr != nil || closeErr != nil {
-		return fiber.NewError(http.StatusInternalServerError, "compress replay segment")
+	var (
+		storedPayload []byte
+		storedBytes   int64
+	)
+	if len(rawGzip) > 0 {
+		storedBytes = int64(len(rawGzip))
+	} else {
+		var stored bytes.Buffer
+		zw := gzip.NewWriter(&stored)
+		_, writeErr := zw.Write(decoded)
+		closeErr := zw.Close()
+		if writeErr != nil || closeErr != nil {
+			return fiber.NewError(http.StatusInternalServerError, "compress replay segment")
+		}
+		storedPayload = stored.Bytes()
+		storedBytes = int64(len(storedPayload))
 	}
-	storedBytes := int64(stored.Len())
 
 	// Pre-check session quotas from DB metadata before writing to blob storage.
 	if existingSess, sessErr := g.replays.GetReplaySession(c.Context(), p.ID, sessionID); sessErr == nil {
@@ -192,8 +201,14 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		return fiber.NewError(http.StatusInternalServerError, "store replay segment")
 	}
 
+	if storedPayload == nil {
+		// Detach from fasthttp's pooled request buffer before passing the reader to
+		// storage backends (such as S3 net/http transport).
+		storedPayload = bytes.Clone(rawGzip)
+	}
+
 	key := fmt.Sprintf("%s%d.json.gz", replayPrefix(p.Slug, sessionID), seq)
-	if err := g.blobs.Put(c.Context(), key, bytes.NewReader(stored.Bytes())); err != nil {
+	if err := g.blobs.Put(c.Context(), key, bytes.NewReader(storedPayload)); err != nil {
 		if errors.Is(err, blob.ErrInvalidKey) {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid replay key"})
 		}
@@ -208,7 +223,7 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		}
 	}
 
-	_, err = g.replays.UpsertReplaySegment(c.Context(), meta.ReplaySegmentInput{
+	_, err := g.replays.UpsertReplaySegment(c.Context(), meta.ReplaySegmentInput{
 		ProjectID:     p.ID,
 		SessionID:     sessionID,
 		Seq:           seq,
@@ -240,7 +255,101 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 	return c.Status(http.StatusAccepted).JSON(fiber.Map{"accepted": true, "seq": seq})
 }
 
-func decodeReplayBody(c fiber.Ctx) ([]byte, int, string) {
+func singleTrimmedHeader(c fiber.Ctx, name string) (string, bool) {
+	vals := c.Request().Header.PeekAll(name)
+	switch len(vals) {
+	case 0:
+		return "", true
+	case 1:
+		return strings.TrimSpace(string(vals[0])), true
+	default:
+		return "", false
+	}
+}
+
+func singleTrimmedQuery(c fiber.Ctx, key string) (string, bool) {
+	vals := c.Request().URI().QueryArgs().PeekMulti(key)
+	switch len(vals) {
+	case 0:
+		return "", true
+	case 1:
+		return strings.TrimSpace(string(vals[0])), true
+	default:
+		return "", false
+	}
+}
+
+func parseReplayIngestMetadata(c fiber.Ctx) (string, int, bool) {
+	headerSession, ok := singleTrimmedHeader(c, replaySessionHeader)
+	if !ok {
+		return "", 0, false
+	}
+	querySession, ok := singleTrimmedQuery(c, "session_id")
+	if !ok {
+		return "", 0, false
+	}
+	if headerSession != "" && querySession != "" && headerSession != querySession {
+		return "", 0, false
+	}
+	sessionID := headerSession
+	if sessionID == "" {
+		sessionID = querySession
+	}
+	if len(sessionID) == 0 || !validIngestText(sessionID, maxReplaySessionIDLen) ||
+		!replayIDPattern.MatchString(sessionID) {
+		return "", 0, false
+	}
+
+	headerSeqRaw, ok := singleTrimmedHeader(c, replaySeqHeader)
+	if !ok {
+		return "", 0, false
+	}
+	querySeqRaw, ok := singleTrimmedQuery(c, "seq")
+	if !ok {
+		return "", 0, false
+	}
+	if headerSeqRaw == "" && querySeqRaw == "" {
+		return "", 0, false
+	}
+
+	var seq int
+	if headerSeqRaw != "" {
+		parsed, err := strconv.Atoi(headerSeqRaw)
+		if err != nil || parsed < 0 {
+			return "", 0, false
+		}
+		seq = parsed
+	}
+	if querySeqRaw != "" {
+		parsed, err := strconv.Atoi(querySeqRaw)
+		if err != nil || parsed < 0 {
+			return "", 0, false
+		}
+		if headerSeqRaw != "" {
+			if parsed != seq || headerSeqRaw != querySeqRaw {
+				return "", 0, false
+			}
+		} else {
+			seq = parsed
+		}
+	}
+	return sessionID, seq, true
+}
+
+func isGzipContentEncoding(encoding string) bool {
+	if encoding == "" {
+		return false
+	}
+	for _, part := range strings.Split(encoding, ",") {
+		coding := strings.TrimSpace(part)
+		if coding != "gzip" && coding != "x-gzip" {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeReplayBody(c fiber.Ctx) ([]byte, []byte, int, string) {
 	body := requestBody(c)
 	compression := strings.ToLower(strings.TrimSpace(c.Get("X-LO-Replay-Compression")))
 	encoding, _ := c.Locals(decodedContentEncodingLocal).(string)
@@ -248,29 +357,35 @@ func decodeReplayBody(c fiber.Ctx) ([]byte, int, string) {
 	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
 		decoded, err := gunzipBounded(body, maxReplaySegment)
 		if errors.Is(err, errDecodedBodyTooLarge) {
-			return nil, http.StatusRequestEntityTooLarge, "segment exceeds 5MB"
+			return nil, nil, http.StatusRequestEntityTooLarge, "segment exceeds 5MB"
 		}
 		if err != nil {
-			return nil, http.StatusUnprocessableEntity, "invalid gzip segment"
+			return nil, nil, http.StatusUnprocessableEntity, "invalid gzip segment"
 		}
-		return decoded, 0, ""
+		return decoded, nil, 0, ""
 	}
-	if encoding == "gzip" || encoding == "x-gzip" {
+	if isGzipContentEncoding(encoding) {
 		if len(body) > maxReplaySegment {
-			return nil, http.StatusRequestEntityTooLarge, "segment exceeds 5MB"
+			return nil, nil, http.StatusRequestEntityTooLarge, "segment exceeds 5MB"
 		}
-		return append([]byte(nil), body...), 0, ""
+		if passthrough, _ := c.Locals(replayRawGzipPassthroughLocal).(bool); passthrough {
+			rawGzip := c.Request().Body()
+			if len(rawGzip) > 0 && len(rawGzip) < len(body) && len(rawGzip) <= maxReplaySegment {
+				return body, rawGzip, 0, ""
+			}
+		}
+		return body, nil, 0, ""
 	}
 	if compression == "identity" {
 		if len(body) > maxReplaySegment {
-			return nil, http.StatusRequestEntityTooLarge, "segment exceeds 5MB"
+			return nil, nil, http.StatusRequestEntityTooLarge, "segment exceeds 5MB"
 		}
-		return append([]byte(nil), body...), 0, ""
+		return body, nil, 0, ""
 	}
 	if compression != "" && compression != "gzip" {
-		return nil, http.StatusUnprocessableEntity, "unsupported replay compression"
+		return nil, nil, http.StatusUnprocessableEntity, "unsupported replay compression"
 	}
-	return nil, http.StatusUnprocessableEntity, "segment body must be gzip"
+	return nil, nil, http.StatusUnprocessableEntity, "segment body must be gzip"
 }
 
 func (g *Gateway) rollbackReplaySegment(ctx context.Context, key string) {

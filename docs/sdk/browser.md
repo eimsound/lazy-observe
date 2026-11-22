@@ -124,7 +124,7 @@ init({
 });
 ```
 
-Setting `onErrorOnly: true` sets normal sampling to zero while keeping error look-back. Setting `replay: false` disables recording. `rrweb` is an optional peer dependency of `@lazy-observe/browser`. Install `rrweb` when you enable session replay. If `rrweb` is absent, replay logs one warning and degrades silently without disrupting error or trace collection. By default, `rrweb` masks all inputs and blocks `[data-lo-block]`. A custom `blockSelector` replaces that selector. Replay loads `rrweb` asynchronously and uses gzip when `CompressionStream` is available.
+Setting `onErrorOnly: true` sets normal sampling to zero while keeping error look-back. Setting `replay: false` disables recording. `rrweb` is an optional peer dependency of `@lazy-observe/browser`. Install `rrweb` when you enable session replay. If `rrweb` is absent, replay logs one warning and degrades silently without disrupting error or trace collection. By default, `rrweb` masks all inputs and blocks `[data-lo-block]`. A custom `blockSelector` replaces that selector. Replay loads `rrweb` asynchronously, uploads segments to the fixed `/api/replay/segments` endpoint with `X-LO-Replay-Session` and `X-LO-Replay-Seq` headers so cross-origin CORS preflights stay cacheable, and uses gzip when `CompressionStream` is available.
 
 ## React
 

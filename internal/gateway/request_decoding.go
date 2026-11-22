@@ -33,6 +33,11 @@ const decodedBodySizeLocal = "lazy-observe.decoded-body-size"
 // handlers or upstream proxies can retain it until their async body reader closes.
 const decodedBufLocal = "lazy-observe.decoded-buf"
 
+// replayRawGzipPassthroughLocal marks that boundedRequestDecoding verified the
+// original single-member gzip request body for POST /api/replay/segments so
+// replayIngest can store the raw gzip bytes without re-compressing.
+const replayRawGzipPassthroughLocal = "lazy-observe.replay-raw-gzip-passthrough"
+
 // maxContentEncodingLayers bounds stacked HTTP Content-Encoding transformations
 // so crafted multi-layer headers cannot amplify CPU work before auth.
 const maxContentEncodingLayers = 4
@@ -235,6 +240,10 @@ func isLoopbackUpstreamURL(rawURL string) bool {
 	return false
 }
 
+func isReplaySegmentIngest(c fiber.Ctx) bool {
+	return c.Method() == fiber.MethodPost && c.Path() == "/api/replay/segments"
+}
+
 // boundedRequestDecoding removes HTTP content codings before any handler runs.
 // Fiber's Ctx.Body, BodyParser, and fasthttp's MultipartForm otherwise
 // decompress gzip, deflate, brotli, and zstd without a size limit, so a small
@@ -306,6 +315,44 @@ func boundedRequestDecodingWithPolicy(policy gzipPassthroughPolicy) fiber.Handle
 			return c.Next()
 		}
 
+		// For single-layer gzip on POST /api/replay/segments, decode once while
+		// checking via Multistream(false) whether the payload is a clean single
+		// gzip member with zero trailing bytes. Keep the original compressed body
+		// intact on c.Request() only when passthrough conditions hold; calling
+		// SetBodyRaw would reset and recycle fasthttp's pooled request buffer.
+		if len(codings) == 1 && (codings[0] == "gzip" || codings[0] == "x-gzip") && isReplaySegmentIngest(c) {
+			pb, decoded, singleMember, err := decodeGzipSinglePass(body, maxReplaySegment)
+			if errors.Is(err, errDecodedBodyTooLarge) {
+				return c.Status(fiber.StatusRequestEntityTooLarge).
+					JSON(fiber.Map{"error": "decoded request body exceeds limit"})
+			}
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).
+					JSON(fiber.Map{"error": "invalid " + codings[0] + " request body"})
+			}
+			passthrough := singleMember && len(body) < len(decoded) && len(body) <= maxReplaySegment
+			if passthrough {
+				c.Locals(replayRawGzipPassthroughLocal, true)
+			} else {
+				c.Request().SetBodyRaw(decoded)
+			}
+			c.Request().Header.Del(fiber.HeaderContentEncoding)
+			c.Locals(decodedContentEncodingLocal, codings[0])
+			c.Locals(decodedBodyLocal, decoded)
+			c.Locals(decodedBodySizeLocal, int64(len(decoded)))
+			c.Locals(decodedBufLocal, pb)
+			defer func() {
+				if !passthrough {
+					c.Request().SetBodyRaw(nil)
+				}
+				c.Locals(decodedBodyLocal, nil)
+				c.Locals(decodedBufLocal, nil)
+				c.Locals(replayRawGzipPassthroughLocal, nil)
+				pb.release()
+			}()
+			return c.Next()
+		}
+
 		var curBuf *pooledDecodeBuf
 		releaseCurBuf := func() {
 			if curBuf != nil {
@@ -371,6 +418,63 @@ func validateGzipBounded(body []byte, limit int) (int64, error) {
 		return 0, closeErr
 	}
 	return n, nil
+}
+
+func decodeGzipSinglePass(body []byte, limit int) (*pooledDecodeBuf, []byte, bool, error) {
+	dec, err := acquireGzipDecoder(body)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	defer releaseGzipDecoder(dec)
+
+	dec.zr.Multistream(false)
+
+	hint := len(body)
+	if hint < limit/2 {
+		hint *= 2
+	} else {
+		hint = limit
+	}
+
+	pb := acquireDecodeBuf(limit, hint)
+	_, copyErr := io.CopyBuffer(pb, dec.zr, dec.scratch[:])
+	if pb.exceeded {
+		pb.release()
+		return nil, nil, false, errDecodedBodyTooLarge
+	}
+	if copyErr != nil {
+		pb.release()
+		return nil, nil, false, copyErr
+	}
+	if closeErr := dec.zr.Close(); closeErr != nil {
+		pb.release()
+		return nil, nil, false, closeErr
+	}
+
+	if dec.br.Len() == 0 {
+		return pb, pb.buf.Bytes(), true, nil
+	}
+
+	// Trailing bytes exist after the first gzip member: re-enable multistream to
+	// either reject trailing garbage or decode valid subsequent members into pb.
+	if resetErr := dec.zr.Reset(&dec.br); resetErr != nil {
+		pb.release()
+		return nil, nil, false, resetErr
+	}
+	_, copyErr = io.CopyBuffer(pb, dec.zr, dec.scratch[:])
+	if pb.exceeded {
+		pb.release()
+		return nil, nil, false, errDecodedBodyTooLarge
+	}
+	if copyErr != nil {
+		pb.release()
+		return nil, nil, false, copyErr
+	}
+	if closeErr := dec.zr.Close(); closeErr != nil {
+		pb.release()
+		return nil, nil, false, closeErr
+	}
+	return pb, pb.buf.Bytes(), false, nil
 }
 
 func decodeBoundedPooled(coding string, body []byte, limit int) (*pooledDecodeBuf, []byte, error) {

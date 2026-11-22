@@ -59,7 +59,7 @@ type publicIngestPolicy struct {
 // and per-IP rate limits backed by g.limits before a handler parses payloads.
 func (g *Gateway) publicIngestAdmission(policy publicIngestPolicy) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		if policy.MaxBodyBytes > 0 && len(c.Request().Body()) > policy.MaxBodyBytes {
+		if policy.MaxBodyBytes > 0 && ingestPayloadBytes(c) > int64(policy.MaxBodyBytes) {
 			msg := policy.BodyTooLargeMessage
 			if msg == "" {
 				msg = "request body exceeds limit"

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,12 +17,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/eimsound/lazy-observe/internal/blob"
 	"github.com/eimsound/lazy-observe/internal/errortrack"
+	"github.com/eimsound/lazy-observe/internal/ingestlimit"
 	"github.com/eimsound/lazy-observe/internal/meta"
 )
 
@@ -862,4 +866,653 @@ func TestReplayIngestAndReadDecoupledFromBlobListAndGuardLimits(t *testing.T) {
 		Limits: &keyMatchLimiter{errPrefix: "replay:ingest:project:"},
 	}).App()
 	uploadReplay(t, errApp, token, "rl-err", 0, seg0, false, http.StatusServiceUnavailable)
+}
+
+func gzipWithComment(t *testing.T, data []byte, comment string, level int) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&out, level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw.Comment = comment
+	if _, err := zw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func readReplayBlobBytes(t *testing.T, blobs blob.Store, key string) []byte {
+	t.Helper()
+	r, err := blobs.Get(context.Background(), key)
+	if err != nil {
+		t.Fatalf("get blob %s: %v", key, err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read blob %s: %v", key, err)
+	}
+	return data
+}
+
+func gunzipSingleMember(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	br := bytes.NewReader(raw)
+	zr, err := gzip.NewReader(br)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	zr.Multistream(false)
+	decoded, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read single gzip member: %v", err)
+	}
+	if err := zr.Close(); err != nil {
+		t.Fatalf("close gzip reader: %v", err)
+	}
+	if br.Len() != 0 {
+		t.Fatalf("stored blob had %d trailing bytes after single gzip member", br.Len())
+	}
+	return decoded
+}
+
+func TestReplayMetadataHeaderAndQueryContract(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: blobs,
+		Now: func() time.Time { return fixedNow },
+	}).App()
+
+	payload := []byte(fmt.Sprintf(`[{"type":4,"data":{"href":"https://example.test/m"},"timestamp":%d}]`,
+		fixedNow.UnixMilli()))
+	gz := gzipBytes(t, payload)
+
+	cases := []struct {
+		name          string
+		target        string
+		headerSession []string
+		headerSeq     []string
+		wantStatus    int
+		wantSeq       int
+	}{
+		{
+			name:          "header_only",
+			target:        "/api/replay/segments",
+			headerSession: []string{"hdr-only"},
+			headerSeq:     []string{"0"},
+			wantStatus:    http.StatusAccepted,
+			wantSeq:       0,
+		},
+		{
+			name:       "query_fallback_only",
+			target:     "/api/replay/segments?session_id=qry-only&seq=1",
+			wantStatus: http.StatusAccepted,
+			wantSeq:    1,
+		},
+		{
+			name:          "mixed_header_session_and_query_seq",
+			target:        "/api/replay/segments?seq=2",
+			headerSession: []string{"mixed-1"},
+			wantStatus:    http.StatusAccepted,
+			wantSeq:       2,
+		},
+		{
+			name:       "mixed_query_session_and_header_seq",
+			target:     "/api/replay/segments?session_id=mixed-2",
+			headerSeq:  []string{"3"},
+			wantStatus: http.StatusAccepted,
+			wantSeq:    3,
+		},
+		{
+			name:          "matching_header_and_query_with_whitespace",
+			target:        "/api/replay/segments?session_id=%20agree-sess%20&seq=%204%20",
+			headerSession: []string{" agree-sess "},
+			headerSeq:     []string{" 4 "},
+			wantStatus:    http.StatusAccepted,
+			wantSeq:       4,
+		},
+		{
+			name:          "mismatch_session_returns_400",
+			target:        "/api/replay/segments?session_id=sess-a&seq=0",
+			headerSession: []string{"sess-b"},
+			headerSeq:     []string{"0"},
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "mismatch_seq_returns_400",
+			target:        "/api/replay/segments?session_id=sess-m&seq=0",
+			headerSession: []string{"sess-m"},
+			headerSeq:     []string{"1"},
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "leading_zero_seq_mismatch_returns_400",
+			target:        "/api/replay/segments?session_id=sess-lz&seq=1",
+			headerSession: []string{"sess-lz"},
+			headerSeq:     []string{"01"},
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "plus_sign_seq_mismatch_returns_400",
+			target:        "/api/replay/segments?session_id=sess-plus&seq=1",
+			headerSession: []string{"sess-plus"},
+			headerSeq:     []string{"+1"},
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "invalid_header_seq_does_not_fallback_to_query",
+			target:        "/api/replay/segments?session_id=sess-inv&seq=0",
+			headerSession: []string{"sess-inv"},
+			headerSeq:     []string{"abc"},
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "duplicate_session_headers_returns_400",
+			target:        "/api/replay/segments",
+			headerSession: []string{"dup-a", "dup-b"},
+			headerSeq:     []string{"0"},
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "duplicate_seq_headers_returns_400",
+			target:        "/api/replay/segments",
+			headerSession: []string{"dup-seq"},
+			headerSeq:     []string{"0", "1"},
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "header_seq_over_quota_returns_413",
+			target:        "/api/replay/segments",
+			headerSession: []string{"quota-hdr"},
+			headerSeq:     []string{strconv.Itoa(maxReplaySegmentsPerSession)},
+			wantStatus:    http.StatusRequestEntityTooLarge,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.target, bytes.NewReader(gz))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Encoding", "gzip")
+			for _, v := range tc.headerSession {
+				req.Header.Add(replaySessionHeader, v)
+			}
+			for _, v := range tc.headerSeq {
+				req.Header.Add(replaySeqHeader, v)
+			}
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := readBody(resp)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if tc.wantStatus == http.StatusAccepted {
+				var out struct {
+					Accepted bool `json:"accepted"`
+					Seq      int  `json:"seq"`
+				}
+				if err := json.Unmarshal(body, &out); err != nil || !out.Accepted || out.Seq != tc.wantSeq {
+					t.Fatalf("unexpected 202 body=%s err=%v", body, err)
+				}
+			}
+		})
+	}
+}
+
+func TestReplaySinglePassGzipPassthroughAndFallbacks(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := userQueryToken(t, store, "replay-pass-reader")
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: blobs,
+		Now: func() time.Time { return fixedNow },
+	}).App()
+
+	project, err := store.ProjectBySlug(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a compressible segment and tag its gzip header with a distinctive comment:
+	// passthrough preserves the exact client gzip bytes (including the comment), whereas
+	// server re-compression produces fresh bytes without the comment.
+	decoded := []byte(fmt.Sprintf(
+		`[{"type":4,"data":{"href":"https://example.test/pass"},"timestamp":%d},`+
+			`{"type":3,"data":{"source":1,"text":%q},"timestamp":%d}]`,
+		fixedNow.Add(-time.Minute).UnixMilli(),
+		strings.Repeat("compressible-replay-event-", 20),
+		fixedNow.UnixMilli(),
+	))
+	digest := sha256.Sum256(decoded)
+	wantSHA := hex.EncodeToString(digest[:])
+
+	for i, enc := range []string{"gzip", "x-gzip"} {
+		sessID := "pass-" + enc
+		rawGzip := gzipWithComment(t, decoded, "client-passthrough-"+enc, gzip.BestCompression)
+		if len(rawGzip) >= len(decoded) {
+			t.Fatalf("fixture not smaller when compressed: raw=%d decoded=%d", len(rawGzip), len(decoded))
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(rawGzip))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Encoding", enc)
+		req.Header.Set(replaySessionHeader, sessID)
+		req.Header.Set(replaySeqHeader, strconv.Itoa(i))
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := readBody(resp)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("%s status=%d want=202 body=%s", enc, resp.StatusCode, body)
+		}
+
+		stored := readReplayBlobBytes(t, blobs, fmt.Sprintf("replay/default/%s/%d.json.gz", sessID, i))
+		if !bytes.Equal(stored, rawGzip) {
+			t.Fatalf("%s stored blob was re-compressed instead of passed through (stored=%d raw=%d)",
+				enc, len(stored), len(rawGzip))
+		}
+
+		segMeta, err := store.GetReplaySegment(ctx, project.ID, sessID, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if segMeta.SizeBytes != int64(len(rawGzip)) || segMeta.PayloadSha256 != wantSHA {
+			t.Fatalf("%s seg meta mismatch: size=%d want=%d sha=%s want=%s",
+				enc, segMeta.SizeBytes, len(rawGzip), segMeta.PayloadSha256, wantSHA)
+		}
+
+		// Idempotent retry with identity encoding must match sha256(decoded) and return 202.
+		idReq := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(decoded))
+		idReq.Header.Set("Authorization", "Bearer "+token)
+		idReq.Header.Set("X-LO-Replay-Compression", "identity")
+		idReq.Header.Set(replaySessionHeader, sessID)
+		idReq.Header.Set(replaySeqHeader, strconv.Itoa(i))
+		idResp, err := app.Test(idReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = idResp.Body.Close()
+		if idResp.StatusCode != http.StatusAccepted {
+			t.Fatalf("%s idempotent identity retry status=%d want=202", enc, idResp.StatusCode)
+		}
+
+		// Conflict check: same (session, seq) with different decoded payload returns 409.
+		diffReq := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader([]byte(`[]`)))
+		diffReq.Header.Set("Authorization", "Bearer "+token)
+		diffReq.Header.Set("X-LO-Replay-Compression", "identity")
+		diffReq.Header.Set(replaySessionHeader, sessID)
+		diffReq.Header.Set(replaySeqHeader, strconv.Itoa(i))
+		diffResp, err := app.Test(diffReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = diffResp.Body.Close()
+		if diffResp.StatusCode != http.StatusConflict {
+			t.Fatalf("%s conflict status=%d want=409", enc, diffResp.StatusCode)
+		}
+
+		// Round-trip GET must return gzip that decompresses to exact decoded bytes.
+		getResp := replayRequest(
+			t,
+			app,
+			reader,
+			"default",
+			fmt.Sprintf("/api/replay/sessions/%s/segments/%d", sessID, i),
+		)
+		if getResp.StatusCode != http.StatusOK || getResp.Header.Get("Content-Encoding") != "gzip" {
+			t.Fatalf(
+				"%s GET segment status=%d encoding=%q",
+				enc,
+				getResp.StatusCode,
+				getResp.Header.Get("Content-Encoding"),
+			)
+		}
+		roundTripBody := readBody(getResp)
+		if !bytes.Equal(gunzipSingleMember(t, roundTripBody), decoded) {
+			t.Fatalf("%s round-trip decoded bytes mismatch", enc)
+		}
+	}
+
+	// Fallback re-compression cases (must accept 202 and NOT store the raw upload bytes):
+	// 1. len(rawGzip) >= len(decoded) using gzip.NoCompression on small JSON.
+	incompressible := gzipWithComment(t, []byte(`[{"type":4,"timestamp":1000}]`), "no-pass-nocomp", gzip.NoCompression)
+	reqNoComp := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(incompressible))
+	reqNoComp.Header.Set("Authorization", "Bearer "+token)
+	reqNoComp.Header.Set("Content-Encoding", "gzip")
+	reqNoComp.Header.Set(replaySessionHeader, "fallback-sess")
+	reqNoComp.Header.Set(replaySeqHeader, "0")
+	respNoComp, err := app.Test(reqNoComp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respNoComp.Body.Close()
+	if respNoComp.StatusCode != http.StatusAccepted {
+		t.Fatalf("NoCompression status=%d want=202", respNoComp.StatusCode)
+	}
+	storedNoComp := readReplayBlobBytes(t, blobs, "replay/default/fallback-sess/0.json.gz")
+	if bytes.Equal(storedNoComp, incompressible) {
+		t.Fatal("stored blob passed through raw gzip even though len(rawGzip) >= len(decoded)")
+	}
+	if !bytes.Equal(gunzipSingleMember(t, storedNoComp), []byte(`[{"type":4,"timestamp":1000}]`)) {
+		t.Fatal("re-compressed NoCompression blob content mismatch")
+	}
+
+	// 2. Multi-layer Content-Encoding: gzip, gzip must decode and re-compress cleanly.
+	innerGz := gzipWithComment(t, decoded, "inner-comment", gzip.DefaultCompression)
+	doubleGz := gzipWithComment(t, innerGz, "outer-comment", gzip.DefaultCompression)
+	reqMultiEnc := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(doubleGz))
+	reqMultiEnc.Header.Set("Authorization", "Bearer "+token)
+	reqMultiEnc.Header.Set("Content-Encoding", "gzip, gzip")
+	reqMultiEnc.Header.Set(replaySessionHeader, "fallback-sess")
+	reqMultiEnc.Header.Set(replaySeqHeader, "1")
+	respMultiEnc, err := app.Test(reqMultiEnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respMultiEnc.Body.Close()
+	if respMultiEnc.StatusCode != http.StatusAccepted {
+		t.Fatalf("gzip,gzip status=%d want=202", respMultiEnc.StatusCode)
+	}
+	storedMultiEnc := readReplayBlobBytes(t, blobs, "replay/default/fallback-sess/1.json.gz")
+	if bytes.Equal(storedMultiEnc, doubleGz) || bytes.Equal(storedMultiEnc, innerGz) {
+		t.Fatal("multi-layer gzip bypassed re-compression")
+	}
+	if !bytes.Equal(gunzipSingleMember(t, storedMultiEnc), decoded) {
+		t.Fatal("re-compressed multi-layer gzip content mismatch")
+	}
+
+	// 3. Valid multi-member gzip stream must bypass passthrough and be stored as a single clean member.
+	partA := []byte(`[{"type":4,"data":{"href":"https://example.test/multi"},"timestamp":1000},`)
+	partB := []byte(fmt.Sprintf(`{"type":3,"data":{"text":%q},"timestamp":2000}]`, strings.Repeat("m", 200)))
+	multiMember := append(gzipWithComment(t, partA, "m1", gzip.BestCompression),
+		gzipWithComment(t, partB, "m2", gzip.BestCompression)...)
+	reqMultiMem := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(multiMember))
+	reqMultiMem.Header.Set("Authorization", "Bearer "+token)
+	reqMultiMem.Header.Set("Content-Encoding", "gzip")
+	reqMultiMem.Header.Set(replaySessionHeader, "fallback-sess")
+	reqMultiMem.Header.Set(replaySeqHeader, "2")
+	respMultiMem, err := app.Test(reqMultiMem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respMultiMem.Body.Close()
+	if respMultiMem.StatusCode != http.StatusAccepted {
+		t.Fatalf("multi-member gzip status=%d want=202", respMultiMem.StatusCode)
+	}
+	storedMultiMem := readReplayBlobBytes(t, blobs, "replay/default/fallback-sess/2.json.gz")
+	if bytes.Equal(storedMultiMem, multiMember) {
+		t.Fatal("multi-member gzip passed through raw bytes instead of re-compressing to single member")
+	}
+	wantCombined := append(append([]byte(nil), partA...), partB...)
+	if !bytes.Equal(gunzipSingleMember(t, storedMultiMem), wantCombined) {
+		t.Fatal("re-compressed multi-member gzip content mismatch")
+	}
+
+	// 4. Strict rejection of malformed, truncated, trailing-garbage, zip-bomb, and unsupported-encoding inputs.
+	validSingle := gzipBytes(t, decoded)
+	badCRC := append([]byte(nil), validSingle...)
+	badCRC[len(badCRC)-5] ^= 0xff
+	singleBomb := gzipOfZeros(t, maxReplaySegment+1)
+	multiBomb := append(gzipOfZeros(t, (maxReplaySegment/2)+100), gzipOfZeros(t, (maxReplaySegment/2)+100)...)
+
+	errorCases := []struct {
+		name     string
+		encoding string
+		body     []byte
+		want     int
+	}{
+		{
+			"trailing_garbage_text",
+			"gzip",
+			append(append([]byte(nil), validSingle...), []byte("garbage")...),
+			http.StatusBadRequest,
+		},
+		{"trailing_null_byte", "gzip", append(append([]byte(nil), validSingle...), 0x00), http.StatusBadRequest},
+		{
+			"multi_member_corrupt_second",
+			"gzip",
+			append(append([]byte(nil), validSingle...), validSingle[:len(validSingle)-4]...),
+			http.StatusBadRequest,
+		},
+		{"corrupt_header", "gzip", []byte("not-gzip"), http.StatusBadRequest},
+		{"truncated_stream", "gzip", validSingle[:len(validSingle)-6], http.StatusBadRequest},
+		{"bad_crc32", "gzip", badCRC, http.StatusBadRequest},
+		{"single_member_zip_bomb", "gzip", singleBomb, http.StatusRequestEntityTooLarge},
+		{"multi_member_zip_bomb", "gzip", multiBomb, http.StatusRequestEntityTooLarge},
+		{"unsupported_encoding_lz4", "lz4", []byte(`[]`), http.StatusUnsupportedMediaType},
+	}
+	for idx, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Encoding", tc.encoding)
+			req.Header.Set(replaySessionHeader, "err-sess")
+			req.Header.Set(replaySeqHeader, strconv.Itoa(idx))
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status=%d want=%d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+func TestReplayGzipPassthroughByteRateLimitAccounting(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	limiter := ingestlimit.New(ingestlimit.Config{
+		Enabled:           true,
+		RequestsPerSecond: 100,
+		Burst:             100,
+		BytesPerSecond:    1000,
+		ByteBurst:         1000,
+		Now:               func() time.Time { return fixedNow },
+	})
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: blobs,
+		IngestLimiter: limiter,
+		Now:           func() time.Time { return fixedNow },
+	}).App()
+
+	plain := []byte(fmt.Sprintf(
+		`[{"type":3,"data":{"text":%q},"timestamp":%d}]`,
+		strings.Repeat("x", 750),
+		fixedNow.UnixMilli(),
+	))
+	if len(plain) < 750 || len(plain) > 950 {
+		t.Fatalf("unexpected decoded len=%d", len(plain))
+	}
+	gz := gzipBytes(t, plain)
+	if len(gz) >= 200 {
+		t.Fatalf("expected compressed len < 200, got %d", len(gz))
+	}
+
+	req1 := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(gz))
+	req1.Header.Set("Authorization", "Bearer "+token)
+	req1.Header.Set("Content-Encoding", "gzip")
+	req1.Header.Set(replaySessionHeader, "rl-decoded")
+	req1.Header.Set(replaySeqHeader, "0")
+	resp1, err := app.Test(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first passthrough status=%d want=202", resp1.StatusCode)
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(gz))
+	req2.Header.Set("Authorization", "Bearer "+token)
+	req2.Header.Set("Content-Encoding", "gzip")
+	req2.Header.Set(replaySessionHeader, "rl-decoded")
+	req2.Header.Set(replaySeqHeader, "1")
+	resp2, err := app.Test(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests || resp2.Header.Get("Retry-After") == "" {
+		t.Fatalf("second passthrough status=%d retry-after=%q want=429 with Retry-After",
+			resp2.StatusCode, resp2.Header.Get("Retry-After"))
+	}
+}
+
+func TestReplayConcurrentPassthroughAndFallbackRace(t *testing.T) {
+	ctx := context.Background()
+	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token, err := store.Bootstrap(
+		ctx,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		meta.BootstrapAdmin{GeneratedPasswordFile: filepath.Join(t.TempDir(), meta.InitialAdminPasswordFileName)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := userQueryToken(t, store, "replay-race-reader")
+	blobs, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	app := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: blobs,
+		Now: func() time.Time { return fixedNow },
+	}).App()
+
+	const workers = 12
+	expected := make(map[string][]byte, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		sessID := fmt.Sprintf("race-sess-%d", i)
+		plain := []byte(fmt.Sprintf(
+			`[{"type":3,"data":{"text":%q},"timestamp":%d}]`,
+			fmt.Sprintf("worker-%d-%s", i, strings.Repeat("r", 120)),
+			fixedNow.UnixMilli()+int64(i),
+		))
+		expected[sessID] = plain
+		wg.Add(1)
+		go func(id int, sID string, p []byte) {
+			defer wg.Done()
+			var body []byte
+			var encHeader, compHeader string
+			switch id % 3 {
+			case 0:
+				body = gzipWithComment(t, p, "race-pass", gzip.BestCompression)
+				encHeader = "gzip"
+			case 1:
+				body = gzipWithComment(t, p, "race-nocomp", gzip.NoCompression)
+				encHeader = "gzip"
+			case 2:
+				body = p
+				compHeader = "identity"
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set(replaySessionHeader, sID)
+			req.Header.Set(replaySeqHeader, "0")
+			if encHeader != "" {
+				req.Header.Set("Content-Encoding", encHeader)
+			}
+			if compHeader != "" {
+				req.Header.Set("X-LO-Replay-Compression", compHeader)
+			}
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Errorf("worker %d request err=%v", id, err)
+				return
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusAccepted {
+				t.Errorf("worker %d status=%d want=202", id, resp.StatusCode)
+			}
+
+			// Interleave an invalid gzip upload to stress pool reset under concurrency.
+			badReq := httptest.NewRequest(http.MethodPost, "/api/replay/segments", bytes.NewReader([]byte("bad")))
+			badReq.Header.Set("Authorization", "Bearer "+token)
+			badReq.Header.Set("Content-Encoding", "gzip")
+			badReq.Header.Set(replaySessionHeader, "race-bad-"+strconv.Itoa(id))
+			badReq.Header.Set(replaySeqHeader, "0")
+			badResp, err := app.Test(badReq)
+			if err == nil {
+				_ = badResp.Body.Close()
+			}
+		}(i, sessID, plain)
+	}
+	wg.Wait()
+
+	for sessID, want := range expected {
+		resp := replayRequest(t, app, reader, "default", "/api/replay/sessions/"+sessID+"/segments/0")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s GET status=%d", sessID, resp.StatusCode)
+		}
+		got := gunzipSingleMember(t, readBody(resp))
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s round-trip mismatch", sessID)
+		}
+	}
 }

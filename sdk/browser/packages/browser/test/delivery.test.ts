@@ -268,6 +268,41 @@ describe("DeliveryQueue", () => {
     await expect(hangingTransport.diagnostics([], false)).rejects.toThrow("aborted by timeout");
   });
 
+  it("uploads replay segments to fixed /api/replay/segments with metadata headers", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(null, { status: 202 });
+    });
+    const transport = new Transport(
+      { endpoint: "https://observe.example", project: "p", token: "lo_tok" },
+      fetcher as unknown as typeof fetch,
+    );
+
+    const gzBody = new Uint8Array([0x1f, 0x8b, 0x08, 0x00]);
+    await transport.replay("sess-fixed", 3, gzBody, true, true, false);
+    expect(calls[0]?.url).toBe("https://observe.example/api/replay/segments");
+    expect(calls[0]?.init?.headers).toEqual({
+      Authorization: "Bearer lo_tok",
+      "Content-Type": "application/json",
+      "X-LO-Replay-Session": "sess-fixed",
+      "X-LO-Replay-Seq": "3",
+      "Content-Encoding": "gzip",
+      "X-LO-Replay-Error": "1",
+    });
+
+    await transport.replay("sess-fixed", 4, "[]", false, false, true);
+    expect(calls[1]?.url).toBe("https://observe.example/api/replay/segments");
+    expect(calls[1]?.init?.keepalive).toBe(true);
+    expect(calls[1]?.init?.headers).toEqual({
+      Authorization: "Bearer lo_tok",
+      "Content-Type": "application/json",
+      "X-LO-Replay-Session": "sess-fixed",
+      "X-LO-Replay-Seq": "4",
+      "X-LO-Replay-Compression": "identity",
+    });
+  });
+
   it("trims oversized >200KB error events so a single event never poisons the batch", () => {
     const trimmed = trimErrorEventToBudget({
       event_id: "11111111-1111-4111-a111-111111111111",
