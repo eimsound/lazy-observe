@@ -22,7 +22,7 @@ ROOT_URLCONF = "tests.urls"
 ALLOWED_HOSTS = ["*"]
 
 REST_FRAMEWORK = {
-    "EXCEPTION_HANDLER": "lazyobserve.drf.exception_handler",
+    "EXCEPTION_HANDLER": "lazy_observe.drf.exception_handler",
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"

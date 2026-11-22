@@ -193,7 +193,7 @@ mise exec -- go run . load --url http://127.0.0.1:3320 --duration 30s --concurre
 | Node.js | `@lazy-observe/node` | Express、Pino、Winston、运行时指标、错误上报、V8 CPU/heap 剖析 | [docs/zh/sdk/node.md](docs/zh/sdk/node.md) |
 | 浏览器 | `@lazy-observe/browser`、`@lazy-observe/react` | 错误捕获、含地理和设备维度的 Web Vitals、`fetch`/XHR 链路、Session Replay、React 错误边界与路由追踪 | [docs/zh/sdk/browser.md](docs/zh/sdk/browser.md) |
 | 浏览器构建 | `@lazy-observe/bundler-plugin` | Vite 插件与 `lazy-observe-sourcemaps` CLI（使用 `los_...` 上传令牌） | [docs/zh/sdk/browser.md#source-map](docs/zh/sdk/browser.md#source-map) |
-| Python | `lazyobserve` | Django（WSGI/ASGI 与流式响应）、DRF、`logging`、DB 查询、LLM 埋点、实验性 CPU 剖析（3.15t） | [docs/zh/sdk/python.md](docs/zh/sdk/python.md) |
+| Python | `lazy-observe` | Django（WSGI/ASGI 与流式响应）、DRF、`logging`、DB 查询、LLM 埋点、实验性 CPU 剖析（3.15t） | [docs/zh/sdk/python.md](docs/zh/sdk/python.md) |
 
 服务端与各端 SDK 的协议及版本兼容关系见 [docs/zh/version-matrix.md](docs/zh/version-matrix.md)。
 

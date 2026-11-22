@@ -2,7 +2,7 @@
 records as OTLP logs and optionally tees to stderr (Go's correlatingHandler).
 
 Use through the returned logger (`lo.logger()`) or configure it in Django's
-``LOGGING`` with ``"class": "lazyobserve.LazyObserveLogHandler"``.
+``LOGGING`` with ``"class": "lazy_observe.LazyObserveLogHandler"``.
 """
 
 from __future__ import annotations
@@ -16,17 +16,17 @@ from typing import Any, Dict, Optional, Set, Tuple
 from opentelemetry import trace as otel_trace
 from opentelemetry._logs import LogRecord, SeverityNumber
 
-_INTERNAL_LOGGER_EXACT: Set[str] = {"lazyobserve"}
+_INTERNAL_LOGGER_EXACT: Set[str] = {"lazy_observe"}
 _INTERNAL_LOGGER_PREFIXES: Tuple[str, ...] = (
     "opentelemetry",
     "urllib3",
     "requests",
     "httpx",
     "httpcore",
-    "lazyobserve.internal",
-    "lazyobserve.delivery",
-    "lazyobserve.transport",
-    "lazyobserve.profiling",
+    "lazy_observe.internal",
+    "lazy_observe.delivery",
+    "lazy_observe.transport",
+    "lazy_observe.profiling",
 )
 
 _in_emit = threading.local()
@@ -73,7 +73,7 @@ def _span_context() -> tuple[Optional[str], Optional[str]]:
 
 
 def _is_internal_logger(record: logging.LogRecord) -> bool:
-    if getattr(record, "_lazyobserve_internal", False):
+    if getattr(record, "_lazy_observe_internal", False):
         return True
     name = getattr(record, "name", "") or ""
     if name in _INTERNAL_LOGGER_EXACT:
@@ -143,10 +143,10 @@ class LazyObserveLogHandler(logging.Handler):
     """Python ``logging`` handler that exports records as OTLP logs with
     ``service.name`` and active ``trace_id``/``span_id`` injected.
 
-    By default the handler resolves the active SDK client from the lazyobserve
+    By default the handler resolves the active SDK client from the lazy_observe
     registry, so it can be declared in Django's ``LOGGING`` without a hard
     reference to the client instance. Pass ``client=...`` to bind the handler
-    explicitly to one :class:`lazyobserve.Client` instance (used by
+    explicitly to one :class:`lazy_observe.Client` instance (used by
     :class:`ClientLogger` for multi-instance isolation).
     """
 
@@ -224,7 +224,7 @@ class LazyObserveLogHandler(logging.Handler):
             attributes=attrs,
         )
         try:
-            logger = logger_provider.get_logger("lazyobserve")
+            logger = logger_provider.get_logger("lazy_observe")
             logger.emit(otel_record)
         except Exception:  # noqa: BLE001
             self.handleErrorWrapped(record)
@@ -252,10 +252,10 @@ class ClientLogger:
     def __init__(self, client: Any) -> None:
         self.client = client
         # Construct an isolated Logger instance instead of mutating the global
-        # logging manager's ``"lazyobserve.client"`` singleton so multiple clients
+        # logging manager's ``"lazy_observe.client"`` singleton so multiple clients
         # and tests never overwrite each other's handlers or cross-talk via the
         # global active client registry.
-        self.logger = logging.Logger("lazyobserve.client")
+        self.logger = logging.Logger("lazy_observe.client")
         self.logger.handlers[:] = [
             LazyObserveLogHandler(
                 tee_to_stderr=bool(client.config.tee_to_stderr),

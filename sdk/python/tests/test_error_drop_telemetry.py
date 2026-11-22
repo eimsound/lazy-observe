@@ -2,7 +2,7 @@
 
 The Go, Node and Browser SDKs feed every drop of their error-event queue into the
 ``dropped_telemetry`` count and the ``lazy_observe_sdk_dropped_telemetry`` counter with
-``signal="error"``. These tests run ``lazyobserve.init`` against a local platform that
+``signal="error"``. These tests run ``lazy_observe.init`` against a local platform that
 can answer 5xx or hold a request, and check the three reasons the queue can drop for:
 ``queue_full``, ``retry_exhausted`` and ``shutdown_budget``.
 """
@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-import lazyobserve
+import lazy_observe
 
 
 class _Platform:
@@ -70,11 +70,11 @@ def platform():
 
 
 def _init(platform, **delivery):
-    client = lazyobserve.init(
+    client = lazy_observe.init(
         dsn=platform.dsn,
         service_name="drop-svc",
         export_interval=3600.0,  # the OTel pipeline is not under test: no periodic export
-        delivery=lazyobserve.DeliveryConfig(**delivery),
+        delivery=lazy_observe.DeliveryConfig(**delivery),
     )
     assert client.error_transport is not None, client.err()
     assert client._dropped_counter is not None  # metrics are on by default
@@ -160,7 +160,7 @@ def test_the_drop_is_still_logged(platform, caplog):
         client.capture_exception(ValueError("in flight"))
         assert platform.arrived.wait(5)
         client.capture_exception(ValueError("queued"))
-        with caplog.at_level("WARNING", logger="lazyobserve"):
+        with caplog.at_level("WARNING", logger="lazy_observe"):
             client.capture_exception(ValueError("dropped"))
         assert "error telemetry dropped: reason=queue_full count=1" in caplog.text
     finally:

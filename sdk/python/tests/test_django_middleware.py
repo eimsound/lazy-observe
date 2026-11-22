@@ -10,8 +10,8 @@ from django.test import RequestFactory, override_settings
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-import lazyobserve
-from lazyobserve.django import DjangoMiddleware
+import lazy_observe
+from lazy_observe.django import DjangoMiddleware
 from tests.helpers import last_span, make_client
 
 
@@ -115,7 +115,7 @@ def test_re_raise_on_500_flag_does_not_double_report(client, monkeypatch):
 def test_process_exception_preserves_django_native_500_pipeline(client, monkeypatch):
     captured = []
     monkeypatch.setattr(client, "capture_exception", lambda *a, **k: captured.append((a, k)))
-    lazyobserve._set_active(client)
+    lazy_observe._set_active(client)
 
     signal_hits = []
 
@@ -126,13 +126,13 @@ def test_process_exception_preserves_django_native_500_pipeline(client, monkeypa
     try:
         with override_settings(
             DEBUG=False,
-            MIDDLEWARE=["lazyobserve.DjangoMiddleware"],
+            MIDDLEWARE=["lazy_observe.DjangoMiddleware"],
         ):
             django_client = DjangoTestClient(raise_request_exception=False)
             response = django_client.get("/boom")
     finally:
         got_request_exception.disconnect(on_exception)
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
     assert response.status_code == 500
     assert b"Server Error (500)" in response.content
@@ -176,19 +176,19 @@ def test_request_scheme_ignores_untrusted_x_forwarded_proto(client):
 
 
 def test_delayed_init_is_picked_up_by_django_middleware(client):
-    lazyobserve._set_active(None)
+    lazy_observe._set_active(None)
     mw = DjangoMiddleware(lambda request: JsonResponse({"ok": True}))
     try:
         assert mw(RequestFactory().get("/before")).status_code == 200
         assert last_span(client) is None
 
-        lazyobserve._set_active(client)
+        lazy_observe._set_active(client)
         assert mw(RequestFactory().get("/after", HTTP_HOST="testserver")).status_code == 200
         span = last_span(client)
         assert span is not None
         assert dict(span.attributes)["url.path"] == "/after"
     finally:
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
 
 def test_instrumentation_init_failure_degrades_silently(client):
@@ -250,7 +250,7 @@ def test_traceparent_propagation(client):
 
 
 def test_transparent_when_no_client():
-    lazyobserve._set_active(None)
+    lazy_observe._set_active(None)
 
     def get_response(request):
         return JsonResponse({"ok": True})
@@ -302,7 +302,7 @@ def test_django_async_client_integrates_with_asgi_middleware(client, monkeypatch
 
     captured = []
     monkeypatch.setattr(client, "capture_exception", lambda *a, **k: captured.append((a, k)))
-    lazyobserve._set_active(client)
+    lazy_observe._set_active(client)
 
     async def run():
         async_client = AsyncClient(raise_request_exception=False)
@@ -312,10 +312,10 @@ def test_django_async_client_integrates_with_asgi_middleware(client, monkeypatch
         assert resp_err.status_code == 500
 
     try:
-        with override_settings(DEBUG=False, MIDDLEWARE=["lazyobserve.DjangoMiddleware"]):
+        with override_settings(DEBUG=False, MIDDLEWARE=["lazy_observe.DjangoMiddleware"]):
             asyncio.run(run())
     finally:
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
     spans = client._test_span_exporter.get_finished_spans()
     names = [s.name for s in spans]

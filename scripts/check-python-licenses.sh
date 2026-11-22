@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Verify runtime (and optional django extra) dependencies installed for
-# sdk/python (lazyobserve) satisfy the permissive license allowlist.
+# sdk/python (lazy-observe) satisfy the permissive license allowlist.
 # Uses only the Python standard library inside the uv-managed venv.
 
 python_bin=${1:-sdk/python/.venv/bin/python}
@@ -113,13 +113,13 @@ def should_follow_req(req: str, root_package: bool) -> bool:
 
 
 try:
-    md.distribution("lazyobserve")
+    md.distribution("lazy-observe")
 except md.PackageNotFoundError:
-    print("FAIL: sdk/python: lazyobserve is not installed in the target environment", file=sys.stderr)
+    print("FAIL: sdk/python: lazy-observe is not installed in the target environment", file=sys.stderr)
     raise SystemExit(1)
 
 seen: set[str] = set()
-queue: list[tuple[str, bool]] = [("lazyobserve", True)]
+queue: list[tuple[str, bool]] = [("lazy-observe", True)]
 violations: list[str] = []
 checked = 0
 

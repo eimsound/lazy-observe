@@ -6,8 +6,8 @@ import logging
 
 import pytest
 
-import lazyobserve
-from lazyobserve.logging import LazyObserveLogHandler
+import lazy_observe
+from lazy_observe.logging import LazyObserveLogHandler
 
 
 class _RecordingOtelLogger:
@@ -33,9 +33,9 @@ class _RecordingLoggerProvider:
 @pytest.mark.parametrize(
     "internal_name",
     [
-        "lazyobserve",
-        "lazyobserve.internal",
-        "lazyobserve.delivery",
+        "lazy_observe",
+        "lazy_observe.internal",
+        "lazy_observe.delivery",
         "opentelemetry",
         "opentelemetry.exporter.otlp.proto.http._log_exporter",
         "urllib3.connectionpool",
@@ -49,7 +49,7 @@ def test_internal_loggers_skip_otlp_export_but_still_tee_to_stderr(
 ):
     provider = _RecordingLoggerProvider()
     client.logger_provider = provider
-    lazyobserve._set_active(client)
+    lazy_observe._set_active(client)
     handler = LazyObserveLogHandler(tee_to_stderr=True)
     record = logging.LogRecord(
         name=internal_name,
@@ -63,7 +63,7 @@ def test_internal_loggers_skip_otlp_export_but_still_tee_to_stderr(
     try:
         handler.emit(record)
     finally:
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
     assert provider.records == []
     assert "exporter warning" in capsys.readouterr().err
@@ -73,15 +73,15 @@ def test_internal_loggers_skip_otlp_export_but_still_tee_to_stderr(
     "app_logger_name",
     [
         "orders.views",
-        "lazyobserve.django",
-        "lazyobserve.example",
-        "lazyobserve.client",
+        "lazy_observe.django",
+        "lazy_observe.example",
+        "lazy_observe.client",
     ],
 )
 def test_application_and_django_loggers_export_to_otlp(client, app_logger_name):
     provider = _RecordingLoggerProvider()
     client.logger_provider = provider
-    lazyobserve._set_active(client)
+    lazy_observe._set_active(client)
     handler = LazyObserveLogHandler(tee_to_stderr=False)
     record = logging.LogRecord(
         name=app_logger_name,
@@ -95,7 +95,7 @@ def test_application_and_django_loggers_export_to_otlp(client, app_logger_name):
     try:
         handler.emit(record)
     finally:
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
     assert len(provider.records) == 1
     assert provider.records[0].body == "handled request"
@@ -121,7 +121,7 @@ def test_reentrant_emit_is_guarded_against_feedback_loops(client):
 
     provider = _RecordingLoggerProvider(on_emit=trigger_reentrant_log)
     client.logger_provider = provider
-    lazyobserve._set_active(client)
+    lazy_observe._set_active(client)
     try:
         outer = logging.LogRecord(
             name="app.outer",
@@ -134,7 +134,7 @@ def test_reentrant_emit_is_guarded_against_feedback_loops(client):
         )
         handler.emit(outer)
     finally:
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
     assert reentry_attempts == 1
     assert len(provider.records) == 1
@@ -144,7 +144,7 @@ def test_reentrant_emit_is_guarded_against_feedback_loops(client):
 def test_exc_info_and_stack_info_are_preserved_in_otlp_record(client):
     provider = _RecordingLoggerProvider()
     client.logger_provider = provider
-    lazyobserve._set_active(client)
+    lazy_observe._set_active(client)
     handler = LazyObserveLogHandler(tee_to_stderr=False)
     app_logger = logging.getLogger("test.logging.exc")
     app_logger.handlers[:] = [handler]
@@ -161,7 +161,7 @@ def test_exc_info_and_stack_info_are_preserved_in_otlp_record(client):
             app_logger.exception("processing failed", stack_info=True)
     finally:
         app_logger.handlers.clear()
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
 
     assert len(provider.records) == 1
     otel_rec = provider.records[0]
@@ -185,7 +185,7 @@ def test_client_logger_instances_are_isolated_from_each_other_and_global_registr
     c1.logger_provider = p1
     c2.logger_provider = p2
 
-    global_client_logger = logging.getLogger("lazyobserve.client")
+    global_client_logger = logging.getLogger("lazy_observe.client")
     prev_global_handlers = list(global_client_logger.handlers)
     sentinel_handler = logging.NullHandler()
     global_client_logger.handlers[:] = [sentinel_handler]
@@ -201,9 +201,9 @@ def test_client_logger_instances_are_isolated_from_each_other_and_global_registr
         assert global_client_logger.handlers == [sentinel_handler]
 
         # Even when global active client points to c2 (or None), l1 still exports to c1.
-        lazyobserve._set_active(c2)
+        lazy_observe._set_active(c2)
         l1.info("hello from alpha")
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
         l2.info("hello from beta")
 
         assert len(p1.records) == 1
@@ -215,7 +215,7 @@ def test_client_logger_instances_are_isolated_from_each_other_and_global_registr
         assert dict(p2.records[0].attributes)["service.name"] == "svc-beta"
     finally:
         global_client_logger.handlers[:] = prev_global_handlers
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
         c1.shutdown(timeout=1.0)
         c2.shutdown(timeout=1.0)
 
@@ -230,7 +230,7 @@ def test_log_handler_explicit_client_binding_overrides_global_registry():
     bound_client.logger_provider = bound_provider
     active_client.logger_provider = active_provider
 
-    lazyobserve._set_active(active_client)
+    lazy_observe._set_active(active_client)
     try:
         handler = LazyObserveLogHandler(client=bound_client)
         record = logging.LogRecord(
@@ -247,6 +247,6 @@ def test_log_handler_explicit_client_binding_overrides_global_registry():
         assert dict(bound_provider.records[0].attributes)["service.name"] == "bound-svc"
         assert active_provider.records == []
     finally:
-        lazyobserve._set_active(None)
+        lazy_observe._set_active(None)
         bound_client.shutdown(timeout=1.0)
         active_client.shutdown(timeout=1.0)

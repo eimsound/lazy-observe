@@ -12,7 +12,7 @@ set -euo pipefail
 #   sdk-node-vX.Y.Z      npm @lazy-observe/node (sdk/node/packages/node)
 #   sdk-browser-vX.Y.Z   npm @lazy-observe/browser, @lazy-observe/react,
 #                        @lazy-observe/bundler-plugin (sdk/browser/packages/*)
-#   sdk-python-vX.Y.Z    PyPI lazyobserve (sdk/python); the workflow uploads the
+#   sdk-python-vX.Y.Z    PyPI lazy-observe (sdk/python); the workflow uploads the
 #                        built dist/ with PyPI trusted publishing.
 #
 # Without --publish (the default) the script only verifies that the tag matches

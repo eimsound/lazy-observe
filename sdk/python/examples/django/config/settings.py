@@ -4,7 +4,7 @@ import logging
 import os
 from pathlib import Path
 
-import lazyobserve
+import lazy_observe
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -20,7 +20,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    "lazyobserve.DjangoMiddleware",
+    "lazy_observe.DjangoMiddleware",
     "django.middleware.common.CommonMiddleware",
 ]
 
@@ -38,7 +38,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
-    "EXCEPTION_HANDLER": "lazyobserve.drf.exception_handler",
+    "EXCEPTION_HANDLER": "lazy_observe.drf.exception_handler",
 }
 
 LOGGING = {
@@ -46,7 +46,7 @@ LOGGING = {
     "disable_existing_loggers": False,
     "handlers": {
         "lazy_observe": {
-            "class": "lazyobserve.LazyObserveLogHandler",
+            "class": "lazy_observe.LazyObserveLogHandler",
             "formatter": "verbose",
         },
     },
@@ -79,7 +79,7 @@ def _bool_env(name: str, default: bool) -> bool:
 # --- lazy-observe bootstrap -------------------------------------------------
 LO_DSN = os.environ.get("LO_DSN", "http://127.0.0.1:3100/p/default@replace-me")
 
-lazyobserve.init(
+lazy_observe.init(
     {
         "dsn": LO_DSN,
         "service_name": os.environ.get("LO_SERVICE_NAME", "lazy-observe-django-example"),
@@ -91,8 +91,8 @@ lazyobserve.init(
     }
 )
 
-_lo_client = lazyobserve.get_client()
-logging.getLogger("lazyobserve").info(
+_lo_client = lazy_observe.get_client()
+logging.getLogger("lazy_observe").info(
     "lazy-observe SDK initialized: service=%s degraded=%s",
     _lo_client.config.service_name if _lo_client else "",
     _lo_client.degraded if _lo_client else True,
@@ -101,4 +101,4 @@ logging.getLogger("lazyobserve").info(
 # Shut the SDK down cleanly on ordinary interpreters (WSGI/management commands).
 import atexit  # noqa: E402
 
-atexit.register(lambda: lazyobserve.get_client().shutdown(timeout=5.0) if lazyobserve.get_client() else None)
+atexit.register(lambda: lazy_observe.get_client().shutdown(timeout=5.0) if lazy_observe.get_client() else None)

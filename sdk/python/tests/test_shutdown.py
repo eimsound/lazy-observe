@@ -12,8 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-import lazyobserve
-import lazyobserve.client as client_module
+import lazy_observe
+import lazy_observe.client as client_module
 from tests.helpers import make_client
 
 
@@ -47,7 +47,7 @@ _COMBOS = [c for c in itertools.product([False, True], repeat=3)]
 @pytest.mark.parametrize(("metrics", "logs", "traces"), _COMBOS)
 def test_shutdown_reports_no_error_for_any_signal_combination(ok_server, metrics, logs, traces):
     port = ok_server.server_address[1]
-    lo = lazyobserve.init(
+    lo = lazy_observe.init(
         dsn=f"http://127.0.0.1:{port}/p/default@TOKEN",
         service_name="shutdown-combo",
         metrics=metrics,
@@ -60,14 +60,14 @@ def test_shutdown_reports_no_error_for_any_signal_combination(ok_server, metrics
 
 
 def test_traces_only_shutdown_has_no_noop_meter_error():
-    lo = lazyobserve.init(
+    lo = lazy_observe.init(
         dsn="http://127.0.0.1:1/p/default@TOKEN", service_name="traces-only", traces=True
     )
     assert lo.shutdown(1.0) is None
 
 
 def test_degraded_client_shutdown_has_no_error():
-    lo = lazyobserve.init({"dsn": "garbage", "service_name": "x"})
+    lo = lazy_observe.init({"dsn": "garbage", "service_name": "x"})
     assert lo.degraded
     assert lo.shutdown(timeout=1.0) is None
 
@@ -203,8 +203,8 @@ def test_a_failing_provider_does_not_stop_the_others_nor_raise():
 def test_real_error_queue_with_a_hung_sender_stays_inside_the_timeout():
     # The real queue waits out its budget and then grants itself up to 1 s more to join
     # the worker; shutdown must not pass that on to the caller.
-    from lazyobserve.delivery import default_warn_factory
-    from lazyobserve.error_event import ErrorTransport
+    from lazy_observe.delivery import default_warn_factory
+    from lazy_observe.error_event import ErrorTransport
 
     release = threading.Event()
     client = make_client()

@@ -84,7 +84,7 @@ class DeliveryQueue(Generic[T]):
 
     def _start_worker(self) -> None:
         self._thread = threading.Thread(
-            target=self._run, name=f"lazyobserve-{self._name}", daemon=True
+            target=self._run, name=f"lazy_observe-{self._name}", daemon=True
         )
         self._thread.start()
 

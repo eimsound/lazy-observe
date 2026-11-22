@@ -10,22 +10,22 @@ and changes no global OpenTelemetry providers.
 ## Three-line setup
 
 ```python
-import lazyobserve
+import lazy_observe
 
-lo = lazyobserve.init({"dsn": "http://host:3100/p/myapp@token", "service_name": "checkout-api"})
+lo = lazy_observe.init({"dsn": "http://host:3100/p/myapp@token", "service_name": "checkout-api"})
 ```
 
 Add the middleware to Django `settings.py`:
 
 ```python
-MIDDLEWARE = ["lazyobserve.DjangoMiddleware", ...]
+MIDDLEWARE = ["lazy_observe.DjangoMiddleware", ...]
 REST_FRAMEWORK = {
-    "EXCEPTION_HANDLER": "lazyobserve.drf.exception_handler",
+    "EXCEPTION_HANDLER": "lazy_observe.drf.exception_handler",
 }
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "handlers": {"lazy_observe": {"class": "lazyobserve.LazyObserveLogHandler"}},
+    "handlers": {"lazy_observe": {"class": "lazy_observe.LazyObserveLogHandler"}},
     "loggers": {"": {"handlers": ["lazy_observe"], "level": "INFO"}},
 }
 ```
@@ -43,8 +43,8 @@ degraded instance.
 
 | Integration | Parity with Go SDK |
 | --- | --- |
-| `lazyobserve.DjangoMiddleware` | `lo.Fiber()` — server span, `http.server.request.duration`, `http.server.active_requests`, traceparent extraction, unhandled-exception → HTTP 500 + error event + Issue |
-| `lazyobserve.drf.exception_handler` | Fiber 5xx capture — API exceptions resolving to 5xx are queued for Issue aggregation |
+| `lazy_observe.DjangoMiddleware` | `lo.Fiber()` — server span, `http.server.request.duration`, `http.server.active_requests`, traceparent extraction, unhandled-exception → HTTP 500 + error event + Issue |
+| `lazy_observe.drf.exception_handler` | Fiber 5xx capture — API exceptions resolving to 5xx are queued for Issue aggregation |
 | `LazyObserveLogHandler` | `lo.Slog()` — injects `service.name`, `trace_id`, `span_id`, exports OTLP logs |
 | `lo.django_db()` (context manager) | `lo.WrapDB` — explicit `connection.execute_wrapper`, DB CLIENT spans, `db.client.operation.duration`, optional SQL capture |
 | `lo.llm_transport()` (httpx transport) | `lo.LLMTransport` — OpenAI/Anthropic/Ollama spans with `gen_ai.*` attributes and usage |
@@ -66,7 +66,7 @@ See the `examples/django/` project for a runnable Django + DRF app, and
 Off by default. Opt in with `profiling=True`:
 
 ```python
-lo = lazyobserve.init({
+lo = lazy_observe.init({
     "dsn": "http://host:3100/p/myapp@token",
     "service_name": "checkout-api",
     "profiling": True,

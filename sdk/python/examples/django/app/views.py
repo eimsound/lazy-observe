@@ -12,9 +12,9 @@ from rest_framework.response import Response
 from rest_framework.serializers import Serializer, CharField
 from rest_framework.views import APIView
 
-import lazyobserve
+import lazy_observe
 
-logger = logging.getLogger("lazyobserve.example")
+logger = logging.getLogger("lazy_observe.example")
 
 
 def _body(request):
@@ -43,7 +43,7 @@ def boom(request):
 
 
 def db_query(request):
-    client = lazyobserve.get_client()
+    client = lazy_observe.get_client()
     with client.django_db():
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1 AS one, 'lazy-observe' AS who")
@@ -54,7 +54,7 @@ def db_query(request):
 def chat(request):
     """Explicitly wrap an httpx client with the LLM transport and call the
     built-in fake OpenAI-compatible endpoint on this same server."""
-    client = lazyobserve.get_client()
+    client = lazy_observe.get_client()
     base_url = "http://127.0.0.1:" + request.META.get("HTTP_HOST", "127.0.0.1").split(":")[-1]
 
     with httpx.Client(transport=client.llm_transport()) as http:

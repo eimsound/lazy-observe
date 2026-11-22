@@ -10,8 +10,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from lazyobserve.client import Client
-from lazyobserve.config import Config, DeliveryConfig, normalize_config, parsed_dsn
+from lazy_observe.client import Client
+from lazy_observe.config import Config, DeliveryConfig, normalize_config, parsed_dsn
 
 
 def make_client(service_name: str = "test-service", **overrides) -> Client:
@@ -38,7 +38,7 @@ def make_client(service_name: str = "test-service", **overrides) -> Client:
         meter=meter_provider,
         tracer_provider=tracer_provider,
         logger_provider=None,
-        logger=logging.getLogger("lazyobserve-test"),
+        logger=logging.getLogger("lazy_observe-test"),
         init_err=None,
     )
     client._test_span_exporter = exporter  # type: ignore[attr-defined]

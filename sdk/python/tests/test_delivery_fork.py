@@ -1,6 +1,6 @@
 """``os.fork`` and the error delivery queue (gunicorn ``--preload``, uwsgi).
 
-``lazyobserve.init`` starts the ``lazyobserve-error-events`` thread behind
+``lazy_observe.init`` starts the ``lazy_observe-error-events`` thread behind
 ``ErrorTransport``. A forked child inherits the queue, its locks and whatever the
 parent had queued, but not the thread, so without a fork hook the child's error
 events are never sent and ``shutdown`` waits out its whole budget. These tests use a
@@ -20,8 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-import lazyobserve
-from lazyobserve.delivery import DeliveryQueue
+import lazy_observe
+from lazy_observe.delivery import DeliveryQueue
 
 pytestmark = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 
@@ -91,11 +91,11 @@ def platform():
 
 @pytest.fixture
 def client(platform):
-    created = lazyobserve.init(
+    created = lazy_observe.init(
         dsn=platform.dsn,
         service_name="fork-svc",
         export_interval=3600.0,  # the OTel pipeline is not under test: no periodic export
-        delivery=lazyobserve.DeliveryConfig(max_attempts=1, retry_initial=0.0),
+        delivery=lazy_observe.DeliveryConfig(max_attempts=1, retry_initial=0.0),
     )
     assert created.error_transport is not None, created.err()
     yield created
@@ -289,14 +289,14 @@ def test_a_queue_that_opted_out_is_left_alone_for_its_owner(platform):
 
 
 def test_the_error_queue_is_restarted_once_and_the_profile_uploader_is_left_to_its_controller(platform, client):
-    from lazyobserve._profile_upload import ProfileUploader
+    from lazy_observe._profile_upload import ProfileUploader
 
     uploader = ProfileUploader(platform.dsn, "tok", "fork-svc")  # shares DeliveryQueue with the error transport
     errors = client.error_transport.delivery
     parent_worker = errors._thread
 
     def error_workers():
-        return sum(1 for t in threading.enumerate() if t.name == "lazyobserve-error-events")
+        return sum(1 for t in threading.enumerate() if t.name == "lazy_observe-error-events")
 
     # Compared with the parent rather than a fixed 1: a queue another test left open is
     # revived as well, and that is correct.
@@ -409,9 +409,9 @@ def test_the_fork_hook_does_not_keep_a_client_alive(platform):
     import gc
     import weakref
 
-    from lazyobserve.client import degraded_client
+    from lazy_observe.client import degraded_client
 
-    ghost = degraded_client(lazyobserve.Config(), RuntimeError("never used"))
+    ghost = degraded_client(lazy_observe.Config(), RuntimeError("never used"))
     ref = weakref.ref(ghost)
     del ghost
     gc.collect()

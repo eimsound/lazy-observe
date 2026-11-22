@@ -9,8 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
-from lazyobserve._http import InternalHTTPTransport
-from lazyobserve.error_event import (
+from lazy_observe._http import InternalHTTPTransport
+from lazy_observe.error_event import (
     _EVENT_SIZE_LIMIT,
     ErrorEvent,
     ErrorFrame,
@@ -88,7 +88,7 @@ def test_payload_shape():
         exception_value="nope",
         frames=[
             __import__(
-                "lazyobserve.error_event",
+                "lazy_observe.error_event",
                 fromlist=["ErrorFrame"],
             ).ErrorFrame(function="f", filename="x.py", lineno=3)
         ],
@@ -137,7 +137,7 @@ def test_transport_upload(capture_server):
 def test_in_app_excludes_stdlib_third_party_and_frameworks():
     stdlib_dir = sysconfig.get_path("stdlib") or os.path.dirname(os.__file__)
     assert _in_app("orders.views", "/srv/app/orders/views.py") is True
-    assert _in_app("lazyobserve.django", "/srv/app/lazyobserve/django.py") is False
+    assert _in_app("lazy_observe.django", "/srv/app/lazy_observe/django.py") is False
     assert _in_app("django.core.handlers.base", "/srv/app/django/core/handlers/base.py") is False
     assert _in_app("rest_framework.views", "/srv/app/rest_framework/views.py") is False
     assert _in_app("opentelemetry.sdk.trace", "/srv/app/otel.py") is False
@@ -344,10 +344,10 @@ def test_internal_http_transport_reuses_keepalive_connection_and_closes_cleanly(
 
 
 def test_client_shutdown_closes_shared_internal_http_transport(capture_server):
-    import lazyobserve
+    import lazy_observe
 
     port = capture_server.server_address[1]
-    lo = lazyobserve.init(
+    lo = lazy_observe.init(
         {
             "dsn": f"http://127.0.0.1:{port}/p/default@tok",
             "service_name": "shared-http-test",

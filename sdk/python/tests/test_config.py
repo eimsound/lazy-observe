@@ -1,7 +1,7 @@
 import pytest
 
-import lazyobserve
-from lazyobserve.config import (
+import lazy_observe
+from lazy_observe.config import (
     Config,
     DeliveryConfig,
     InvalidConfigError,
@@ -55,7 +55,7 @@ def test_profiling_interval_is_kept_when_positive(value):
 
 
 def test_init_accepts_profiling_keys_from_a_dict():
-    fields = lazyobserve.Config.__dataclass_fields__
+    fields = lazy_observe.Config.__dataclass_fields__
     assert "profiling" in fields
     assert "profiling_interval" in fields
 
@@ -81,7 +81,7 @@ def test_bad_retry_invalid():
 
 
 def test_init_degraded_on_bad_dsn():
-    lo = lazyobserve.init({"dsn": "garbage", "service_name": "x"})
+    lo = lazy_observe.init({"dsn": "garbage", "service_name": "x"})
     assert lo.degraded
     assert lo.err() is not None
     # Degraded instance methods never raise.
@@ -92,11 +92,11 @@ def test_init_degraded_on_bad_dsn():
 
 
 def test_init_degraded_ok_on_bad_export():
-    lo = lazyobserve.init(
+    lo = lazy_observe.init(
         {"dsn": "http://255.255.255.255:1/p/a@b", "service_name": "x"}
     )
     # Bad-token DSN still constructs; registry returns the instance.
-    assert lazyobserve.get_client() is lo
+    assert lazy_observe.get_client() is lo
     lo.shutdown(timeout=1.0)
 
 
@@ -108,7 +108,7 @@ def test_config_repr_hides_dsn_token():
 
 
 def test_init_preserves_re_raise_on_500_and_nested_delivery_dict():
-    lo = lazyobserve.init(
+    lo = lazy_observe.init(
         {
             "dsn": "http://127.0.0.1:1/p/proj@tok",
             "service_name": "cfg-test",
@@ -135,7 +135,7 @@ def test_init_preserves_re_raise_on_500_and_nested_delivery_dict():
 
 
 def test_init_degrades_cleanly_on_invalid_delivery_type():
-    lo = lazyobserve.init(
+    lo = lazy_observe.init(
         {
             "dsn": "http://127.0.0.1:1/p/proj@tok",
             "service_name": "bad-delivery",
@@ -150,12 +150,12 @@ def test_import_succeeds_without_unix_resource_module():
     import subprocess
     import sys
 
-    # Block ``resource`` before importing lazyobserve, then simulate non-Linux
+    # Block ``resource`` before importing lazy_observe, then simulate non-Linux
     # (e.g. Windows) when querying ``_memory_rss()`` so neither /proc/self/statm
     # nor ``resource`` is available.
     win_code = (
         "import sys; sys.modules['resource'] = None; "
-        "import lazyobserve; from lazyobserve.client import _memory_rss; "
+        "import lazy_observe; from lazy_observe.client import _memory_rss; "
         "sys.platform = 'win32'; "
         "assert _memory_rss() == 0; print('ok-win')"
     )
@@ -171,7 +171,7 @@ def test_import_succeeds_without_unix_resource_module():
     if sys.platform.startswith("linux"):
         linux_code = (
             "import sys; sys.modules['resource'] = None; "
-            "import lazyobserve; from lazyobserve.client import _memory_rss; "
+            "import lazy_observe; from lazy_observe.client import _memory_rss; "
             "assert _memory_rss() > 0; print('ok-linux')"
         )
         linux_proc = subprocess.run(
@@ -185,7 +185,7 @@ def test_import_succeeds_without_unix_resource_module():
 
 def test_memory_rss_prefers_proc_statm_on_linux_and_falls_back_to_rusage(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    import lazyobserve.client as client_mod
+    import lazy_observe.client as client_mod
 
     statm = tmp_path / "statm"
     statm.write_text("5000 1234 400 10 0 800 0\n", encoding="ascii")
@@ -224,7 +224,7 @@ def test_config_deep_copies_tags_against_caller_mutation():
     assert cfg.tags == {"env": "prod", "region": "us-east-1"}
 
     init_tags = {"team": "payments"}
-    lo = lazyobserve.init(
+    lo = lazy_observe.init(
         {
             "dsn": "http://127.0.0.1:1/p/proj@tok",
             "service_name": "tags-init",
@@ -240,8 +240,8 @@ def test_config_deep_copies_tags_against_caller_mutation():
 
 
 def test_init_warns_once_on_unknown_fields_and_nested_delivery_keys(caplog):
-    with caplog.at_level("WARNING", logger="lazyobserve"):
-        lo = lazyobserve.init(
+    with caplog.at_level("WARNING", logger="lazy_observe"):
+        lo = lazy_observe.init(
             {
                 "dsn": "http://127.0.0.1:1/p/proj@tok",
                 "service_name": "warn-test",
@@ -271,8 +271,8 @@ def test_init_warns_once_on_unknown_fields_and_nested_delivery_keys(caplog):
 
 
 def test_build_client_cleans_up_created_providers_on_midway_failure(monkeypatch):
-    from lazyobserve import client as client_mod
-    from lazyobserve.dsn import parse_dsn
+    from lazy_observe import client as client_mod
+    from lazy_observe.dsn import parse_dsn
 
     shutdown_calls = []
 

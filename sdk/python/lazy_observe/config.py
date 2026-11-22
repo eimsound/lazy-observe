@@ -11,7 +11,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .dsn import DSN
 
-_logger = logging.getLogger("lazyobserve")
+_logger = logging.getLogger("lazy_observe")
 
 ERROR_QUEUE_SIZE = 100
 DELIVERY_MAX_ATTEMPTS = 3
@@ -91,7 +91,7 @@ def warn_unknown_fields(
 def config_from_mapping(
     data: Mapping[str, Any],
     *,
-    source: str = "lazyobserve.init",
+    source: str = "lazy_observe.init",
 ) -> Config:
     """Construct a :class:`Config` from a mapping, deserializing nested ``delivery``
     dicts and warning once on any unknown top-level or nested keys."""
@@ -164,7 +164,7 @@ def _coerce_delivery_config(value: object) -> DeliveryConfig:
     if isinstance(value, dict):
         known = DeliveryConfig.__dataclass_fields__
         unknown = [f"delivery.{k}" for k in value if k not in known]
-        warn_unknown_fields("lazyobserve.config", unknown)
+        warn_unknown_fields("lazy_observe.config", unknown)
         try:
             return DeliveryConfig(**{k: v for k, v in value.items() if k in known})
         except TypeError as exc:

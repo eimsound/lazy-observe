@@ -143,7 +143,7 @@ expect_flag 'sdk/go/go.mod' go sdk_go build e2e ha sdk_journeys
 expect_flag 'sdk/go/client.go' go sdk_go build e2e ha sdk_journeys
 expect_flag 'sdk/node/packages/node/src/index.ts' sdk_node sdk_journeys
 expect_flag 'sdk/browser/packages/browser/src/index.ts' sdk_browser sdk_journeys
-expect_flag 'sdk/python/src/lazyobserve/__init__.py' sdk_python sdk_journeys
+expect_flag 'sdk/python/lazy_observe/__init__.py' sdk_python sdk_journeys
 expect_flag 'sdk/scripts/sdk-publish.sh' go sdk_go sdk_node sdk_browser sdk_python sdk_journeys
 expect_flag 'scripts/sdk-journeys.sh' go sdk_journeys
 
