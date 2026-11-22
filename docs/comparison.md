@@ -5,7 +5,7 @@ This document helps engineering and operations teams compare lazy-observe with S
 > **Scope and methodology**
 >
 > - This comparison covers architecture facts and engineering trade-offs only. It omits synthetic benchmarks detached from hardware and workload conditions and avoids disparaging competing projects.
-> - Every lazy-observe claim reflects the current `main` branch implementation, with links to relevant documents and ADRs. The project is in v0.x public preview. Check the [version compatibility matrix](version-matrix.md) and [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) for current compatibility details.
+> - Every lazy-observe claim reflects the current `main` branch implementation, with links to relevant documents and ADRs. The project is in v0.x public preview. Check the [version compatibility matrix](version-matrix.md) for current compatibility details.
 > - Competitor architecture details, capabilities, and licenses change across upstream releases. Verify details in each project's upstream repository and official documentation before selecting a platform.
 
 ## 1. Positioning and core differences
@@ -102,4 +102,3 @@ Do not choose lazy-observe right now if your team has any of these hard requirem
 - [Operations (backup, restore, upgrade, rollback, and incident runbooks)](operations.md)
 - [Grafana and Perses integration](grafana-perses.md)
 - [Server and client SDK version compatibility matrix](version-matrix.md)
-- [Changelog](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md)

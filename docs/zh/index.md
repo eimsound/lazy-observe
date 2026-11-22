@@ -4,7 +4,7 @@ lazy-observe 是纯 Go 静态编译（`CGO_ENABLED=0`，支持 Linux `amd64` 与
 
 默认形态下，单个二进制内嵌 VictoriaMetrics、VictoriaLogs、VictoriaTraces、`vmagent` 与 Web UI，无需外部依赖即可启动。单机容量不足或需要多副本高可用时，同一份二进制可切换到外置 Victoria 集群，并搭配 PostgreSQL、Valkey 或 Redis 以及 S3 兼容对象存储运行。
 
-> **公开预览期（v0.x）。** 当前尚未发布带版本号的正式 Release（`v0.1.0`）。发布前阶段元数据仅维护一份可变的基线（`001_baseline.sql`，见 [ADR 0003](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0003-pre-release-single-database-baseline.md)）。跨不兼容 schema 变更升级可能需要重建元数据数据库，协议面与 SDK 也可能发生不兼容调整。升级前请先查阅[版本兼容矩阵](version-matrix.md)与 [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md)。
+> **公开预览期（v0.x）。** 当前尚未发布带版本号的正式 Release（`v0.1.0`）。发布前阶段元数据仅维护一份可变的基线（`001_baseline.sql`，见 [ADR 0003](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0003-pre-release-single-database-baseline.md)）。跨不兼容 schema 变更升级可能需要重建元数据数据库，协议面与 SDK 也可能发生不兼容调整。升级前请先查阅[版本兼容矩阵](version-matrix.md)。
 
 ## 架构总览
 

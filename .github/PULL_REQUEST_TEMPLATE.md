@@ -23,7 +23,6 @@ List every command run and its real result. Do not mark a check complete if it w
 
 - [ ] Tests cover the changed behavior.
 - [ ] Public documentation and examples match the implementation.
-- [ ] `CHANGELOG.md` is updated when delivered behavior changed.
 - [ ] `config.example.yaml` is updated for configuration changes.
 - [ ] SQLite and PostgreSQL migrations share the same new version and logical change.
 - [ ] New dependencies are Apache-2.0, MIT, or BSD licensed; no AGPL/GPL dependency was added.

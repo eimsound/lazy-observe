@@ -4,7 +4,7 @@
 
 **lazy-observe** is a self-hosted, full-stack observability platform compiled into a single pure-Go binary (`CGO_ENABLED=0`) for Linux `amd64` and `arm64`. It brings metrics, logs, traces, error tracking, Web Vitals, session replay, continuous profiling, alerting, and GenAI usage and cost reporting into one project-isolated platform. By default, the binary embeds VictoriaMetrics, VictoriaLogs, VictoriaTraces, `vmagent`, and the web UI for zero-dependency startup. When a single host is no longer enough, the same binary switches to a clustered high-availability topology backed by external Victoria clusters, PostgreSQL, Valkey or Redis, and S3-compatible object storage.
 
-> **Public preview (v0.x).** No tagged release (`v0.1.0`) has been published yet. Pre-release builds use a single mutable metadata baseline (`001_baseline.sql`, [ADR 0003](.agents/docs/adr/0003-pre-release-single-database-baseline.md)). Upgrading across incompatible schema changes may require recreating the metadata database, and protocols or SDKs may change incompatibly between preview versions. Review [docs/version-matrix.md](docs/version-matrix.md) and [CHANGELOG.md](CHANGELOG.md) before upgrading.
+> **Public preview (v0.x).** No tagged release (`v0.1.0`) has been published yet. Pre-release builds use a single mutable metadata baseline (`001_baseline.sql`, [ADR 0003](.agents/docs/adr/0003-pre-release-single-database-baseline.md)). Upgrading across incompatible schema changes may require recreating the metadata database, and protocols or SDKs may change incompatibly between preview versions. Review [docs/version-matrix.md](docs/version-matrix.md) before upgrading.
 
 ## Architecture
 
@@ -215,7 +215,6 @@ Read the published bilingual documentation site at <https://eimsound.github.io/l
 | [docs/sdk/go.md](docs/sdk/go.md), [node.md](docs/sdk/node.md), [browser.md](docs/sdk/browser.md), [python.md](docs/sdk/python.md) | Per-language SDK installation, configuration, and integration guides |
 | [SECURITY.md](SECURITY.md) | Security policy, supported preview scope, and private vulnerability reporting |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contributor setup, `mise` tasks, test layers (`e2e`, `e2e-ha`, `web-e2e-real`, `sdk-journeys`), and PR rules |
-| [CHANGELOG.md](CHANGELOG.md) | Record of unreleased changes and pre-release history |
 | [.agents/docs/architecture.md](.agents/docs/architecture.md) and [.agents/docs/adr/](.agents/docs/adr/) | Deep architecture notes and Architecture Decision Records (ADRs) |
 
 ## Design trade-offs and preview status

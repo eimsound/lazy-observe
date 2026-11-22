@@ -7,7 +7,7 @@ This runbook covers All-in-one (single-node embedded) and HA (multi-replica) dep
 > Before the first supported release, SQLite and PostgreSQL each maintain one mutable `001_baseline.sql` metadata baseline. In-place upgrade and downgrade migration chains across incompatible schema changes are not supported.
 >
 > - Within the same metadata baseline version, normal and crash restarts preserve committed data, and you can replace the binary or roll container images in place.
-> - Across metadata baseline versions, an older database fails at startup with `metadata migration 1 checksum mismatch` and requires recreating the metadata database. Check [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) and [version-matrix.md](version-matrix.md) before upgrading.
+> - Across metadata baseline versions, an older database fails at startup with `metadata migration 1 checksum mismatch` and requires recreating the metadata database. Check the target release notes and [version-matrix.md](version-matrix.md) before upgrading.
 
 ## 1. Persistent state and backup inventory
 
@@ -235,7 +235,7 @@ With an administrator account, also check `GET /api/system/error-inbox` to confi
 
 ### 4.1 Pre-upgrade checklist
 
-1. Read [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) and [version-matrix.md](version-matrix.md) for the target version:
+1. Read the target release notes and [version-matrix.md](version-matrix.md):
    - Check whether `001_baseline.sql` changed. During the `v0.x` preview phase, baseline changes require recreating the metadata database and do not support in-place upgrades.
    - Check whether protocol changes require upgrading client SDKs together with the server.
 2. Complete the Section 2 backup and record the current binary version or container image `tag@sha256:<digest>`.

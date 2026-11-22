@@ -7,7 +7,7 @@
 > 首个受支持版本发布前，SQLite 与 PostgreSQL 各自只维护一份可变的 `001_baseline.sql` 元数据基线，不提供跨不兼容 Schema 变更的原地升级或降级迁移链。
 >
 > - 同一元数据基线版本内：正常与异常重启均保持已提交数据持久化，可以原地替换二进制或滚动更新镜像。
-> - 跨元数据基线版本：旧库启动时会因基线校验和不匹配直接失败退出（`metadata migration 1 checksum mismatch`），需要重建元数据数据库。升级前请先确认目标版本的 [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) 与 [version-matrix.md](version-matrix.md)。
+> - 跨元数据基线版本：旧库启动时会因基线校验和不匹配直接失败退出（`metadata migration 1 checksum mismatch`），需要重建元数据数据库。升级前请先确认目标版本发布说明与 [version-matrix.md](version-matrix.md)。
 
 ## 1. 持久化状态与备份资产清单
 
@@ -235,7 +235,7 @@ curl -fsS http://127.0.0.1:3100/api/traces/services \
 
 ### 4.1 升级前检查清单
 
-1. 阅读目标版本的 [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) 与 [version-matrix.md](version-matrix.md)：
+1. 阅读目标版本发布说明与 [version-matrix.md](version-matrix.md)：
    - 确认 `001_baseline.sql` 是否有变更（`v0.x` 预览期基线变更需重建元数据数据库，不能原地升级）；
    - 确认协议面与四端 SDK 兼容矩阵是否要求同步升级客户端 SDK。
 2. 完成第 2 节的对应备份，并记录当前二进制版本或镜像 `tag@sha256:<digest>`。

@@ -4,7 +4,7 @@ lazy-observe is a self-hosted, full-stack observability platform compiled into a
 
 By default, one binary embeds VictoriaMetrics, VictoriaLogs, VictoriaTraces, `vmagent`, and the web UI so you can start with zero external dependencies. When a single host is no longer enough, the same binary switches to an external Victoria cluster backed by PostgreSQL, Valkey or Redis, and S3-compatible object storage.
 
-> **Public preview (v0.x).** No tagged release (`v0.1.0`) has been published yet. Pre-release builds use a single mutable metadata baseline (`001_baseline.sql`, [ADR 0003](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0003-pre-release-single-database-baseline.md)). Upgrading across incompatible schema changes may require recreating the metadata database, and protocols or SDKs may change incompatibly between preview versions. Check the [version compatibility matrix](version-matrix.md) and [CHANGELOG.md](https://github.com/eimsound/lazy-observe/blob/main/CHANGELOG.md) before upgrading.
+> **Public preview (v0.x).** No tagged release (`v0.1.0`) has been published yet. Pre-release builds use a single mutable metadata baseline (`001_baseline.sql`, [ADR 0003](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0003-pre-release-single-database-baseline.md)). Upgrading across incompatible schema changes may require recreating the metadata database, and protocols or SDKs may change incompatibly between preview versions. Check the [version compatibility matrix](version-matrix.md) before upgrading.
 
 ## Architecture
 
