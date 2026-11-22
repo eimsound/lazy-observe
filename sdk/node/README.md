@@ -39,6 +39,7 @@ await lo.shutdown({ timeoutMs: 10_000 });
 | `serviceVersion` | unset | OTel `service.version` |
 | `metrics`, `logs`, `traces` | `true` each | Independent signal switches |
 | `sampleRate` | `1` | Parent-based head sampling ratio, from `0` to `1` |
+| `compression` | `"none"` | OTLP/HTTP payload compression (`""`, `"none"`, or `"gzip"`). When empty or unset, honors `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` then `OTEL_EXPORTER_OTLP_COMPRESSION`, defaulting to `"none"`; explicit config overrides env vars |
 | `teeToStdout` | `true` | Pino/Winston records are also written to stdout |
 | `exportIntervalMs` | `5000` | Metrics and logs export interval |
 | `runtimeMetricsIntervalMs` | `1000` | Explicit event-loop, heap, and active-handle collection interval |

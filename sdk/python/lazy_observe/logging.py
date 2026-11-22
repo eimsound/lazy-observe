@@ -7,14 +7,37 @@ Use through the returned logger (`lo.logger()`) or configure it in Django's
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sys
 import threading
 import traceback
 from typing import Any, Dict, Optional, Set, Tuple
 
+from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 from opentelemetry._logs import LogRecord, SeverityNumber
+
+try:
+    from opentelemetry.sdk._logs import LogRecord as _SDKLogRecord
+    from opentelemetry.sdk.resources import Resource as _SDKResource
+except ImportError:
+    _SDKLogRecord = None
+    _SDKResource = None
+
+# OTel Python SDK < 1.37 passed LogRecord straight into LogData without
+# attaching Logger.resource, and its OTLP encoder reads `.resource` and
+# `.dropped_attributes`. SDK 1.37-1.38 added LogRecord._from_api_log_record
+# (with 1.38 deprecating direct SDK LogRecord init), and SDK >= 1.39 removed
+# sdk._logs.LogRecord in favor of ReadWriteLogRecord.
+_NEEDS_SDK_LOG_RECORD = (
+    _SDKLogRecord is not None
+    and not hasattr(_SDKLogRecord, "_from_api_log_record")
+)
+_LOG_RECORD_CLS: Any = _SDKLogRecord if _NEEDS_SDK_LOG_RECORD else LogRecord
+_LOG_RECORD_ACCEPTS_CONTEXT = (
+    "context" in inspect.signature(_LOG_RECORD_CLS.__init__).parameters
+)
 
 _INTERNAL_LOGGER_EXACT: Set[str] = {"lazy_observe"}
 _INTERNAL_LOGGER_PREFIXES: Tuple[str, ...] = (
@@ -139,6 +162,41 @@ def _record_attributes(
     return attrs
 
 
+def _build_otel_log_record(
+    *,
+    logger: Any,
+    logger_provider: Any,
+    timestamp: int,
+    severity_number: SeverityNumber,
+    severity_text: str,
+    body: Any,
+    attributes: Dict[str, Any],
+) -> Any:
+    kwargs: Dict[str, Any] = {
+        "timestamp": timestamp,
+        "observed_timestamp": timestamp,
+        "severity_number": severity_number,
+        "severity_text": severity_text,
+        "body": body,
+        "attributes": attributes,
+    }
+    if _LOG_RECORD_ACCEPTS_CONTEXT:
+        kwargs["context"] = otel_context.get_current() or None
+    else:
+        span_context = otel_trace.get_current_span().get_span_context()
+        kwargs["trace_id"] = span_context.trace_id
+        kwargs["span_id"] = span_context.span_id
+        kwargs["trace_flags"] = span_context.trace_flags
+    if _NEEDS_SDK_LOG_RECORD:
+        resource = getattr(logger, "resource", None)
+        if resource is None:
+            resource = getattr(logger_provider, "resource", None)
+        if resource is None and _SDKResource is not None:
+            resource = _SDKResource.get_empty()
+        kwargs["resource"] = resource
+    return _LOG_RECORD_CLS(**kwargs)
+
+
 class LazyObserveLogHandler(logging.Handler):
     """Python ``logging`` handler that exports records as OTLP logs with
     ``service.name`` and active ``trace_id``/``span_id`` injected.
@@ -215,16 +273,17 @@ class LazyObserveLogHandler(logging.Handler):
                 body = f"{body}\n{stack_text}" if body else stack_text
         severity = _LEVEL_TO_SEVERITY.get(record.levelno, SeverityNumber.INFO)
         ts = int(record.created * 1_000_000_000)
-        otel_record = LogRecord(
-            timestamp=ts,
-            observed_timestamp=ts,
-            severity_number=severity,
-            severity_text=record.levelname,
-            body=body,
-            attributes=attrs,
-        )
         try:
             logger = logger_provider.get_logger("lazy_observe")
+            otel_record = _build_otel_log_record(
+                logger=logger,
+                logger_provider=logger_provider,
+                timestamp=ts,
+                severity_number=severity,
+                severity_text=record.levelname,
+                body=body,
+                attributes=attrs,
+            )
             logger.emit(otel_record)
         except Exception:  # noqa: BLE001
             self.handleErrorWrapped(record)

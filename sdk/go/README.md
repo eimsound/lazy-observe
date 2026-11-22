@@ -32,6 +32,7 @@ defer func() {
 | `ServiceName` | executable basename | OTel `service.name` and every `slog` record |
 | `Metrics`, `Logs`, `Traces` | all enabled | Signal matrix described below |
 | `SampleRate` | `1.0` | Parent-based head sampling ratio; zero means “unset” and resolves to `1.0`, while explicit effective values are `(0, 1]` |
+| `Compression` | `"none"` | OTLP/HTTP payload compression (`""`, `"none"`, or `"gzip"`). When empty, honors `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` then `OTEL_EXPORTER_OTLP_COMPRESSION`, defaulting to `"none"`; explicit config overrides env vars |
 | `TeeToStderr` | `nil` (enabled) | Pointer to `false` disables the stderr text-handler tee |
 | `CaptureDBStatement` | `false` | Include SQL text as `db.query.text`; bound parameter values are never captured |
 | `CaptureLLMContent` | `false` | Capture prompt/completion span attributes, truncated to 4 KiB each |

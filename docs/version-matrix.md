@@ -23,9 +23,9 @@ The current pre-release server protocol baseline is **v0** (no handshake and no 
 
 | Category | Endpoint | Details |
 | --- | --- | --- |
-| OTLP metrics (HTTP) | `POST /v1/metrics` | OpenTelemetry protocol with standard OTLP/HTTP payload |
-| OTLP logs (HTTP) | `POST /v1/logs` | Forwarded by the gateway to VictoriaLogs `insert/opentelemetry/v1/logs` |
-| OTLP traces (HTTP) | `POST /v1/traces` | Forwarded by the gateway to VictoriaTraces `insert/opentelemetry/v1/traces` |
+| OTLP metrics (HTTP) | `POST /v1/metrics` | OpenTelemetry protocol with standard OTLP/HTTP payload; accepts optional `Content-Encoding: gzip` (`x-gzip`) up to the 52 MiB decoded body limit, counts decoded bytes in `ingest_rate_limit`, streams validated gzip passthrough to remote VictoriaMetrics upstreams, and decodes to plaintext for All-in-One loopback or `kind: prometheus` upstreams |
+| OTLP logs (HTTP) | `POST /v1/logs` | Forwarded by the gateway to VictoriaLogs `insert/opentelemetry/v1/logs`; accepts optional `Content-Encoding: gzip` (`x-gzip`) up to 52 MiB decoded, counts decoded bytes in `ingest_rate_limit`, streams validated gzip passthrough to remote VictoriaLogs upstreams, and decodes to plaintext on loopback |
+| OTLP traces (HTTP) | `POST /v1/traces` | Forwarded by the gateway to VictoriaTraces `insert/opentelemetry/v1/traces`; accepts optional `Content-Encoding: gzip` (`x-gzip`) up to 52 MiB decoded, counts decoded bytes in `ingest_rate_limit`, streams validated gzip passthrough to remote VictoriaTraces upstreams, and decodes to plaintext on loopback |
 | OTLP traces (gRPC) | `opentelemetry.proto.collector.trace.v1.TraceService/Export` | Native OTLP/gRPC ingest (default `:4317`, enabled via `otlp_grpc.enabled`, supports gzip and native TLS), forwarded to VictoriaTraces `insert/opentelemetry/v1/traces` |
 | OTLP metrics (gRPC) | `opentelemetry.proto.collector.metrics.v1.MetricsService/Export` | Native OTLP/gRPC ingest (default `:4317`), forwarded to VictoriaMetrics `opentelemetry/v1/metrics` with trusted `extra_label=project_id=<slug>` injected |
 | OTLP logs (gRPC) | `opentelemetry.proto.collector.logs.v1.LogsService/Export` | Native OTLP/gRPC ingest (default `:4317`), forwarded to VictoriaLogs `insert/opentelemetry/v1/logs` |
@@ -53,6 +53,8 @@ Each item in `POST /api/events/vitals` may include these optional low-cardinalit
 `GET /api/v1/performance/vitals` requires a session cookie or a user API token, rejects project API tokens, and enforces project isolation. It returns `{ start, end, step_seconds, filters, summary, total_samples, by_page, by_device, by_browser, by_os, by_country, truncated }`. Historical series without dimension labels group under `unknown` or `other` during aggregation and filtering.
 
 Enum values unknown to the server do not reject the entire batch (Sections 2.3 and 5).
+
+Backend SDKs (Go, Node, and Python) default OTLP/HTTP payload compression to `"none"` and support opt-in `"gzip"` via explicit SDK `Compression` / `compression` configuration or standard `OTEL_EXPORTER_OTLP_COMPRESSION` and per-signal `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` environment variables (precedence: explicit SDK setting > signal-specific env var > shared env var > `"none"`). The gateway enforces the 52 MiB decoded body limit and meters `ingest_rate_limit` on decoded byte size uniformly across uncompressed, decoded, and gzip-passthrough requests.
 
 ### 2.2 DSN format and credential contracts
 

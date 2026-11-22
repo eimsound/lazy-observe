@@ -95,6 +95,7 @@ row := db.QueryRowContext(c.Context(), "SELECT status FROM orders WHERE id = $1"
 | `ServiceName` | executable basename | OpenTelemetry `service.name` and `slog` field. |
 | `Metrics`, `Logs`, `Traces` | all enabled when all are false | Once any flag is true, the three booleans form an explicit enabled set. |
 | `SampleRate` | `1` | Parent-based head sampling. Zero means "unset" and resolves to `1`. Explicit effective values are `(0, 1]`. |
+| `Compression` | `"none"` | OTLP/HTTP payload compression (`""`, `"none"`, or `"gzip"`). When empty, honors `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` then `OTEL_EXPORTER_OTLP_COMPRESSION`, defaulting to `"none"`. Explicit config overrides env vars. |
 | `TeeToStderr` | enabled | Pointer to `false` disables local text output. |
 | `CaptureDBStatement` | `false` | Include SQL statement text in database spans. |
 | `Release`, `Environment` | empty | Deployment metadata attached to error events. |

@@ -53,6 +53,7 @@ await lo.shutdown();
 | `serviceVersion` | 未设置 | OpenTelemetry 服务版本。 |
 | `metrics`、`logs`、`traces` | 各自默认 `true` | 独立控制各信号的开关。 |
 | `sampleRate` | `1` | 基于父 Span 的头部采样，范围 `0` 到 `1`。 |
+| `compression` | `"none"` | OTLP/HTTP 载荷压缩方式（`""`、`"none"` 或 `"gzip"`）。留空或未设置时依次读取 `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` 与 `OTEL_EXPORTER_OTLP_COMPRESSION`，默认 `"none"`；显式配置优先于环境变量。 |
 | `teeToStdout` | `true` | 同时在本地输出 Pino 和 Winston 日志。 |
 | `exportIntervalMs` | `5000` | 指标与日志的导出间隔（毫秒）。 |
 | `runtimeMetricsIntervalMs` | `1000` | 事件循环、堆内存与活跃句柄的采集间隔（毫秒）。 |

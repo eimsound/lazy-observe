@@ -49,6 +49,7 @@ lo.shutdown(timeout=10.0)
 | `service_name` | 可执行文件名 | OpenTelemetry `service.name` 及日志字段。 |
 | `metrics`、`logs`、`traces` | 全部启用 | 遵循下文信号矩阵规则。 |
 | `sample_rate` | `1` | 基于父 Span 的头部采样，范围 `(0, 1]`。 |
+| `compression` | `"none"` | OTLP/HTTP 载荷压缩方式（`""`、`"none"` 或 `"gzip"`）。留空时依次读取 `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` 与 `OTEL_EXPORTER_OTLP_COMPRESSION`，默认 `"none"`；显式配置优先于环境变量。 |
 | `tee_to_stderr` | `true` | 同时通过日志处理器将记录输出到本地 stderr。 |
 | `capture_db_statement` | `false` | 在数据库 Span 上附带 SQL 文本，绝不采集绑定参数。 |
 | `capture_llm_content` | `false` | 采集 `gen_ai.prompt` 与 `gen_ai.completion`，截断至 4 KiB。 |

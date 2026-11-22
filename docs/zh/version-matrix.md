@@ -23,9 +23,9 @@
 
 | 协议面 | 端点 | 说明 |
 | --- | --- | --- |
-| OTLP / metrics (HTTP) | `POST /v1/metrics` | OpenTelemetry 协议，标准 OTLP/HTTP 载荷 |
-| OTLP / logs (HTTP) | `POST /v1/logs` | 由网关转发至 VictoriaLogs `insert/opentelemetry/v1/logs` |
-| OTLP / traces (HTTP) | `POST /v1/traces` | 由网关转发至 VictoriaTraces `insert/opentelemetry/v1/traces` |
+| OTLP / metrics (HTTP) | `POST /v1/metrics` | OpenTelemetry 协议，标准 OTLP/HTTP 载荷；支持可选 `Content-Encoding: gzip`（`x-gzip`），强制 52 MiB 解压体积上限并按解压字节计入 `ingest_rate_limit`，远程 VictoriaMetrics 上游走流式校验透传，All-in-One 本地回环与 `kind: prometheus` 后端统一池化解压为明文转发 |
+| OTLP / logs (HTTP) | `POST /v1/logs` | 由网关转发至 VictoriaLogs `insert/opentelemetry/v1/logs`；支持可选 `Content-Encoding: gzip`（`x-gzip`），强制 52 MiB 解压上限并按解压字节限流，远程上游流式校验透传，本地回环池化解压为明文 |
+| OTLP / traces (HTTP) | `POST /v1/traces` | 由网关转发至 VictoriaTraces `insert/opentelemetry/v1/traces`；支持可选 `Content-Encoding: gzip`（`x-gzip`），强制 52 MiB 解压上限并按解压字节限流，远程上游流式校验透传，本地回环池化解压为明文 |
 | OTLP / traces (gRPC) | `opentelemetry.proto.collector.trace.v1.TraceService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`，通过 `otlp_grpc.enabled` 启用，支持 gzip 与原生 TLS），转发至 VictoriaTraces `insert/opentelemetry/v1/traces` |
 | OTLP / metrics (gRPC) | `opentelemetry.proto.collector.metrics.v1.MetricsService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`），转发至 VictoriaMetrics `opentelemetry/v1/metrics` 并注入受信任 `extra_label=project_id=<slug>` |
 | OTLP / logs (gRPC) | `opentelemetry.proto.collector.logs.v1.LogsService/Export` | 原生 OTLP/gRPC 摄入（默认地址 `:4317`），转发至 VictoriaLogs `insert/opentelemetry/v1/logs` |
@@ -53,6 +53,8 @@
 `GET /api/v1/performance/vitals`（需会话 Cookie 或用户 API Token，拒绝项目 API Token 并强制项目隔离）返回 `{ start, end, step_seconds, filters, summary, total_samples, by_page, by_device, by_browser, by_os, by_country, truncated }`，历史无维度标签的序列在聚合与筛选时自动归入 `unknown` / `other`。
 
 服务端不认识的新增枚举值不会导致整批拒绝，详见 §2.3 与 §5。
+
+后端三端 SDK（Go / Node / Python）的 OTLP/HTTP 载荷压缩默认保持 `"none"`，可通过显式 `Compression` / `compression` 配置或标准 `OTEL_EXPORTER_OTLP_COMPRESSION`、`OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` 环境变量按信号启用 `"gzip"`（优先级：显式配置 > 信号级环境变量 > 全局环境变量 > `"none"`）。网关对未压缩、池化解压与流式透传三种路径统一强制 52 MiB 解压体上限，并统一按解压后的明文字节数计入 `ingest_rate_limit`。
 
 ### 2.2 DSN 格式
 

@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -51,6 +52,7 @@ type result struct {
 	Concurrency          int                           `json:"concurrency"`
 	BatchSize            int                           `json:"batch_size"`
 	PayloadPoolSize      int                           `json:"payload_pool_size,omitempty"`
+	Compression          string                        `json:"compression,omitempty"`
 	MetricSamples        uint64                        `json:"metric_samples"`
 	LogRecords           uint64                        `json:"log_records"`
 	TraceSpans           uint64                        `json:"trace_spans,omitempty"`
@@ -84,7 +86,7 @@ const (
 )
 
 func main() {
-	var binary, binDir, output, baseline string
+	var binary, binDir, output, baseline, compression string
 	var duration, readbackTimeout time.Duration
 	var concurrency, batchSize, poolSize int
 	flag.StringVar(&binary, "binary", "bin/lazy-observe", "lazy-observe server binary")
@@ -93,6 +95,7 @@ func main() {
 	flag.IntVar(&concurrency, "concurrency", 4, "number of workers (each worker rotates metrics, logs, and traces)")
 	flag.IntVar(&batchSize, "batch-size", 200, "samples, log records, or spans per request")
 	flag.IntVar(&poolSize, "payload-pool-size", defaultPayloadPoolSize, "number of varied payload templates per signal")
+	flag.StringVar(&compression, "compression", "none", "OTLP/HTTP request compression: none or gzip")
 	flag.DurationVar(
 		&readbackTimeout,
 		"readback-timeout",
@@ -102,6 +105,10 @@ func main() {
 	flag.StringVar(&output, "output", "", "optional JSON output file")
 	flag.StringVar(&baseline, "baseline", "", "optional baseline JSON used for the regression gate")
 	flag.Parse()
+	normalizedCompression, err := normalizeCompression(compression)
+	if err != nil {
+		fatal(err)
+	}
 	if duration <= 0 || concurrency < 2 || batchSize <= 0 || poolSize <= 0 || readbackTimeout <= 0 {
 		fatal(
 			errors.New(
@@ -109,7 +116,7 @@ func main() {
 			),
 		)
 	}
-	r, err := run(binary, binDir, duration, concurrency, batchSize, poolSize, readbackTimeout)
+	r, err := run(binary, binDir, duration, concurrency, batchSize, poolSize, normalizedCompression, readbackTimeout)
 	if err != nil {
 		fatal(err)
 	}
@@ -164,6 +171,7 @@ func run(
 	binary, binDir string,
 	duration time.Duration,
 	concurrency, batchSize, poolSize int,
+	compression string,
 	readbackTimeout time.Duration,
 ) (result, error) {
 	runID, runSalt, err := newRunID()
@@ -295,6 +303,8 @@ func run(
 			defer workers.Done()
 			var localSeq uint64
 			var workBuf []byte
+			var gzBuf bytes.Buffer
+			var gzWriter *gzip.Writer
 			for ctx.Err() == nil {
 				sig := signalKind((localSeq + uint64(workerID)) % 3)
 				localSeq++
@@ -312,8 +322,14 @@ func run(
 					workBuf, traceID, traceService = pool.materializeTrace(workBuf, workerID, globalSeq, nowNano)
 				}
 
+				reqBody, contentEncoding, encErr := encodeOTLPBody(compression, workBuf, &gzBuf, &gzWriter)
+				if encErr != nil {
+					failures.Add(1)
+					continue
+				}
+
 				requestStart := time.Now()
-				requestErr := postOTLP(ctx, client, baseURL+sig.path(), ingestToken, workBuf, sig)
+				requestErr := postOTLP(ctx, client, baseURL+sig.path(), ingestToken, reqBody, contentEncoding, sig)
 				if ctx.Err() != nil {
 					return
 				}
@@ -405,6 +421,7 @@ func run(
 		Concurrency:          concurrency,
 		BatchSize:            batchSize,
 		PayloadPoolSize:      poolSize,
+		Compression:          compression,
 		MetricSamples:        metricCount.Load(),
 		LogRecords:           logCount.Load(),
 		TraceSpans:           spanCount.Load(),
@@ -456,12 +473,57 @@ func setupBenchMetadata(metaPath string) (string, string, string, error) {
 	return ingestToken, readToken, project.Slug, nil
 }
 
-func postOTLP(ctx context.Context, client *http.Client, target, token string, body []byte, sig signalKind) error {
+func normalizeCompression(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "none":
+		return "none", nil
+	case "gzip":
+		return "gzip", nil
+	default:
+		return "", fmt.Errorf("invalid compression %q: must be none or gzip", raw)
+	}
+}
+
+func encodeOTLPBody(
+	compression string,
+	raw []byte,
+	gzBuf *bytes.Buffer,
+	gzWriter **gzip.Writer,
+) ([]byte, string, error) {
+	if compression != "gzip" {
+		return raw, "", nil
+	}
+	gzBuf.Reset()
+	if *gzWriter == nil {
+		*gzWriter = gzip.NewWriter(gzBuf)
+	} else {
+		(*gzWriter).Reset(gzBuf)
+	}
+	if _, err := (*gzWriter).Write(raw); err != nil {
+		return nil, "", err
+	}
+	if err := (*gzWriter).Close(); err != nil {
+		return nil, "", err
+	}
+	return gzBuf.Bytes(), "gzip", nil
+}
+
+func postOTLP(
+	ctx context.Context,
+	client *http.Client,
+	target, token string,
+	body []byte,
+	contentEncoding string,
+	sig signalKind,
+) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
+	if contentEncoding != "" {
+		req.Header.Set("Content-Encoding", contentEncoding)
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := client.Do(req)
 	if err != nil {

@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -641,5 +643,93 @@ func TestValidateTraceReadbackRejectsMissingRunIDOrMissingSpans(t *testing.T) {
 	))
 	if err := validateTraceSearchBody(emptySpansSearch, service, runID); err == nil {
 		t.Fatal("trace search with empty spans must be rejected")
+	}
+}
+
+func TestNormalizeCompressionAndPostOTLP(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{"", "none", false},
+		{"none", "none", false},
+		{" NONE ", "none", false},
+		{"gzip", "gzip", false},
+		{" GZIP ", "gzip", false},
+		{"zstd", "", true},
+	} {
+		got, err := normalizeCompression(tc.raw)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("normalizeCompression(%q) err=%v wantErr=%v", tc.raw, err, tc.wantErr)
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Fatalf("normalizeCompression(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	rawResp, err := proto.Marshal(&logspb.ExportLogsServiceResponse{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotEncoding string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Content-Encoding")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(rawResp)
+	}))
+	defer srv.Close()
+
+	payload := []byte("benchmark-otlp-protobuf-payload")
+	var gzBuf bytes.Buffer
+	var gzWriter *gzip.Writer
+
+	bodyNone, encNone, err := encodeOTLPBody("none", payload, &gzBuf, &gzWriter)
+	if err != nil || encNone != "" || !bytes.Equal(bodyNone, payload) {
+		t.Fatalf("encodeOTLPBody(none) = (%q, %q, %v)", bodyNone, encNone, err)
+	}
+	if err := postOTLP(
+		context.Background(),
+		srv.Client(),
+		srv.URL,
+		"lo_tok",
+		bodyNone,
+		encNone,
+		signalLogs,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if gotEncoding != "" || !bytes.Equal(gotBody, payload) {
+		t.Fatalf("none request saw encoding=%q body=%q", gotEncoding, gotBody)
+	}
+
+	bodyGzip, encGzip, err := encodeOTLPBody("gzip", payload, &gzBuf, &gzWriter)
+	if err != nil || encGzip != "gzip" {
+		t.Fatalf("encodeOTLPBody(gzip) enc=%q err=%v", encGzip, err)
+	}
+	if err := postOTLP(
+		context.Background(),
+		srv.Client(),
+		srv.URL,
+		"lo_tok",
+		bodyGzip,
+		encGzip,
+		signalLogs,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if gotEncoding != "gzip" {
+		t.Fatalf("gzip request Content-Encoding=%q want gzip", gotEncoding)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(gotBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := io.ReadAll(zr)
+	_ = zr.Close()
+	if err != nil || !bytes.Equal(decoded, payload) {
+		t.Fatalf("gunzipped body=%q err=%v want %q", decoded, err, payload)
 	}
 }

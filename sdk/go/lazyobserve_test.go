@@ -2,6 +2,7 @@ package lazyobserve
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -576,4 +577,151 @@ func TestWrapDBLifecycleUnregistersOnCancelAndShutdown(t *testing.T) {
 	if got := client.activeDBRegistrations(); got != 0 || hasDBPoolMetrics(t, reader) {
 		t.Fatalf("post-Shutdown WrapDB leaked registration: active=%d hasMetrics=%v", got, hasDBPoolMetrics(t, reader))
 	}
+}
+
+func TestCompressionConfigEnvPrecedenceAndWireEncoding(t *testing.T) {
+	t.Run("invalid explicit config degrades cleanly", func(t *testing.T) {
+		lo := Init(Config{DSN: "http://127.0.0.1:3100/p/app@lo_tok", Compression: "zstd"})
+		if lo.Err() == nil {
+			t.Fatal("expected Init error on invalid Compression")
+		}
+	})
+
+	t.Run("invalid env var degrades cleanly unless explicit config overrides", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "zstd")
+		lo := Init(Config{DSN: "http://127.0.0.1:3100/p/app@lo_tok"})
+		if lo.Err() == nil {
+			t.Fatal("expected Init error on invalid OTEL_EXPORTER_OTLP_COMPRESSION")
+		}
+
+		// Explicit CompressionNone overrides invalid env vars.
+		disabled := false
+		override := Init(Config{
+			DSN:         "http://127.0.0.1:3100/p/app@lo_tok",
+			Compression: CompressionNone,
+			Profiling:   &disabled,
+			TeeToStderr: &disabled,
+		})
+		if override.Err() != nil {
+			t.Fatalf("explicit CompressionNone failed despite override: %v", override.Err())
+		}
+		_ = override.Shutdown(context.Background())
+	})
+
+	type wireReq struct {
+		path     string
+		encoding string
+		body     []byte
+	}
+	captureWire := func(t *testing.T, cfg Config) map[string]wireReq {
+		t.Helper()
+		var mu sync.Mutex
+		seen := make(map[string]wireReq)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			seen[r.URL.Path] = wireReq{
+				path:     r.URL.Path,
+				encoding: r.Header.Get("Content-Encoding"),
+				body:     raw,
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+
+		disabled := false
+		cfg.DSN = srv.URL + "/p/app@lo_tok"
+		cfg.Profiling = &disabled
+		cfg.TeeToStderr = &disabled
+		lo := Init(cfg)
+		if lo.Err() != nil {
+			t.Fatalf("Init failed: %v", lo.Err())
+		}
+
+		_, span := lo.TracerProvider().Tracer("test").Start(context.Background(), "op")
+		span.End()
+		lo.Slog().Info("compression wire log")
+		c, err := lo.MeterProvider().Meter("test").Int64Counter("test.counter")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Add(context.Background(), 1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := lo.Shutdown(ctx); err != nil {
+			t.Fatalf("Shutdown failed: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return seen
+	}
+
+	assertValidGzip := func(t *testing.T, req wireReq) {
+		t.Helper()
+		if req.encoding != "gzip" {
+			t.Fatalf("%s Content-Encoding=%q want gzip", req.path, req.encoding)
+		}
+		zr, err := gzip.NewReader(bytes.NewReader(req.body))
+		if err != nil {
+			t.Fatalf("%s invalid gzip header: %v", req.path, err)
+		}
+		plain, err := io.ReadAll(zr)
+		_ = zr.Close()
+		if err != nil || len(plain) == 0 {
+			t.Fatalf("%s invalid gzip payload len=%d err=%v", req.path, len(plain), err)
+		}
+	}
+
+	t.Run("default compression is none", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "")
+		seen := captureWire(t, Config{})
+		for _, path := range []string{"/v1/metrics", "/v1/logs", "/v1/traces"} {
+			req, ok := seen[path]
+			if !ok {
+				t.Fatalf("missing request for %s", path)
+			}
+			if req.encoding != "" {
+				t.Fatalf("%s Content-Encoding=%q want empty", path, req.encoding)
+			}
+		}
+	})
+
+	t.Run("explicit gzip sends valid gzip on all signals", func(t *testing.T) {
+		seen := captureWire(t, Config{Compression: " GZIP "})
+		for _, path := range []string{"/v1/metrics", "/v1/logs", "/v1/traces"} {
+			req, ok := seen[path]
+			if !ok {
+				t.Fatalf("missing request for %s", path)
+			}
+			assertValidGzip(t, req)
+		}
+	})
+
+	t.Run("env precedence and explicit none override", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
+		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "none")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "")
+		seen := captureWire(t, Config{})
+		if seen["/v1/metrics"].encoding != "" {
+			t.Fatalf("/v1/metrics encoding=%q want empty (per-signal none override)", seen["/v1/metrics"].encoding)
+		}
+		assertValidGzip(t, seen["/v1/logs"])
+		assertValidGzip(t, seen["/v1/traces"])
+
+		// Explicit CompressionNone overrides env vars on all signals.
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "gzip")
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "gzip")
+		seenOverride := captureWire(t, Config{Compression: CompressionNone})
+		for _, path := range []string{"/v1/metrics", "/v1/logs", "/v1/traces"} {
+			if seenOverride[path].encoding != "" {
+				t.Fatalf("%s encoding=%q want empty when CompressionNone set", path, seenOverride[path].encoding)
+			}
+		}
+	})
 }

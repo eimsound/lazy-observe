@@ -11,7 +11,9 @@ export type { Dispose } from "./runtime.js";
 export {
   init,
   extractTraceparent,
+  resolveCompression,
   resolveSignals,
+  type Compression,
   type Config,
   type DeliveryConfig,
   type LazyObserve,

@@ -331,3 +331,195 @@ def test_django_example_settings_do_not_log_plaintext_dsn():
     source = settings_path.read_text(encoding="utf-8")
     assert 'extra={"dsn": LO_DSN}' not in source
     assert "dsn=%s" not in source
+
+
+def test_compression_config_validation_and_env_precedence(monkeypatch):
+    from lazy_observe.config import normalize_compression, resolve_signal_compression
+
+    assert Config().compression == ""
+    assert normalize_compression("") == ""
+    assert normalize_compression(None) == ""
+    assert normalize_compression("none") == "none"
+    assert normalize_compression(" GZIP ") == "gzip"
+
+    with pytest.raises(InvalidConfigError):
+        normalize_compression("zstd")
+    with pytest.raises(InvalidConfigError):
+        normalize_compression(123)
+
+    assert resolve_signal_compression("", "TRACES", {}) == "none"
+    assert (
+        resolve_signal_compression(
+            "",
+            "LOGS",
+            {"OTEL_EXPORTER_OTLP_COMPRESSION": "gzip"},
+        )
+        == "gzip"
+    )
+    assert (
+        resolve_signal_compression(
+            "",
+            "METRICS",
+            {
+                "OTEL_EXPORTER_OTLP_COMPRESSION": "gzip",
+                "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION": "none",
+            },
+        )
+        == "none"
+    )
+    # Explicit config overrides all env vars, even invalid ones.
+    assert (
+        resolve_signal_compression(
+            "none",
+            "TRACES",
+            {
+                "OTEL_EXPORTER_OTLP_COMPRESSION": "gzip",
+                "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION": "invalid-env",
+            },
+        )
+        == "none"
+    )
+    assert (
+        resolve_signal_compression(
+            "gzip",
+            "TRACES",
+            {"OTEL_EXPORTER_OTLP_TRACES_COMPRESSION": "none"},
+        )
+        == "gzip"
+    )
+
+    lo_bad = lazy_observe.init(
+        {"dsn": "http://127.0.0.1:1/p/proj@tok", "compression": "br"}
+    )
+    assert lo_bad.degraded
+    assert isinstance(lo_bad.err(), InvalidConfigError)
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "zstd")
+    lo_bad_env = lazy_observe.init({"dsn": "http://127.0.0.1:1/p/proj@tok"})
+    assert lo_bad_env.degraded
+    assert isinstance(lo_bad_env.err(), InvalidConfigError)
+
+    lo_override = lazy_observe.init(
+        {"dsn": "http://127.0.0.1:1/p/proj@tok", "compression": "none"}
+    )
+    try:
+        assert not lo_override.degraded, lo_override.err()
+        assert lo_override.config.compression == "none"
+    finally:
+        lo_override.shutdown(timeout=1.0)
+
+
+def test_compression_wire_encoding_for_all_signals(monkeypatch):
+    import gzip
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    for key in (
+        "OTEL_EXPORTER_OTLP_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    captured = {}
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            encoding = self.headers.get("Content-Encoding", "")
+            with lock:
+                captured.setdefault(self.path, []).append((encoding, body))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        # 1. Default -> uncompressed across metrics, logs, traces
+        lo_default = lazy_observe.init(
+            dsn=f"{endpoint}/p/proj@lo_tok",
+            service_name="py-compress-default",
+            tee_to_stderr=False,
+        )
+        assert not lo_default.degraded, lo_default.err()
+        with lo_default.tracer().start_as_current_span("default-span"):
+            lo_default.logger_factory().info("default log")
+        lo_default.shutdown(timeout=3.0)
+
+        for path in ("/v1/metrics", "/v1/logs", "/v1/traces"):
+            assert path in captured
+            for encoding, _body in captured[path]:
+                assert encoding == ""
+
+        # 2. Explicit gzip -> Content-Encoding: gzip and valid gzip body
+        captured.clear()
+        lo_gzip = lazy_observe.init(
+            {
+                "dsn": f"{endpoint}/p/proj@lo_tok",
+                "service_name": "py-compress-gzip",
+                "compression": "gzip",
+                "tee_to_stderr": False,
+            }
+        )
+        assert not lo_gzip.degraded, lo_gzip.err()
+        with lo_gzip.tracer().start_as_current_span("gzip-span"):
+            lo_gzip.logger_factory().info("gzip log")
+        lo_gzip.shutdown(timeout=3.0)
+
+        for path in ("/v1/metrics", "/v1/logs", "/v1/traces"):
+            assert path in captured
+            for encoding, body in captured[path]:
+                assert encoding == "gzip"
+                assert len(gzip.decompress(body)) > 0
+
+        # 3. Env precedence + explicit "none" override
+        captured.clear()
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "none")
+        lo_env = lazy_observe.init(
+            {
+                "dsn": f"{endpoint}/p/proj@lo_tok",
+                "service_name": "py-compress-env",
+                "tee_to_stderr": False,
+            }
+        )
+        assert not lo_env.degraded, lo_env.err()
+        with lo_env.tracer().start_as_current_span("env-span"):
+            lo_env.logger_factory().info("env log")
+        lo_env.shutdown(timeout=3.0)
+
+        assert all(enc == "" for enc, _ in captured["/v1/metrics"])
+        assert all(enc == "gzip" for enc, _ in captured["/v1/logs"])
+        assert all(enc == "gzip" for enc, _ in captured["/v1/traces"])
+
+        captured.clear()
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "gzip")
+        lo_none = lazy_observe.init(
+            {
+                "dsn": f"{endpoint}/p/proj@lo_tok",
+                "service_name": "py-compress-override",
+                "compression": "none",
+                "tee_to_stderr": False,
+            }
+        )
+        assert not lo_none.degraded, lo_none.err()
+        with lo_none.tracer().start_as_current_span("none-span"):
+            lo_none.logger_factory().info("none log")
+        lo_none.shutdown(timeout=3.0)
+
+        for path in ("/v1/metrics", "/v1/logs", "/v1/traces"):
+            assert path in captured
+            for encoding, _ in captured[path]:
+                assert encoding == ""
+    finally:
+        server.shutdown()
+        server.server_close()

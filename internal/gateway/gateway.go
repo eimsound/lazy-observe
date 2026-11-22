@@ -226,6 +226,10 @@ type Config struct {
 	// names that same file (by path or file identity), which is the
 	// deployer-owned case.
 	InitialAdminPasswordFile string
+	// OTLPGzipPassthrough overrides automatic loopback detection for OTLP/HTTP
+	// gzip passthrough. Nil enables passthrough only for non-loopback Victoria
+	// upstreams; Prometheus metrics backends always decode to plaintext.
+	OTLPGzipPassthrough *bool
 }
 
 type gatewaySecurity struct {
@@ -289,6 +293,7 @@ type Gateway struct {
 	proxy                *storageProxy
 	client               *http.Client
 	storage              storagepkg.SignalBackend
+	gzipPassthrough      gzipPassthroughPolicy
 	metrics              *storagepkg.MetricsClient
 	querier              *query.StorageQuerier
 	mcpBaseURL           string
@@ -494,9 +499,10 @@ func New(cfg Config) *Gateway {
 		gatewayAI: gatewayAI{
 			llmPricing: cfg.LLMPricing,
 		},
-		proxy:   proxy,
-		client:  cfg.Client,
-		storage: cfg.Storage,
+		proxy:           proxy,
+		client:          cfg.Client,
+		storage:         cfg.Storage,
+		gzipPassthrough: newGzipPassthroughPolicy(cfg.Storage, cfg.OTLPGzipPassthrough),
 		metrics: storagepkg.NewMetricsClient(storagepkg.MetricsClientConfig{
 			Backend:        cfg.Storage,
 			HTTPClient:     cfg.Client,
@@ -729,7 +735,7 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 		},
 	}))
 	// Bound content-coding expansion before any route can read the body.
-	g.app.Use(boundedRequestDecoding)
+	g.app.Use(boundedRequestDecodingWithPolicy(g.gzipPassthrough))
 	// Register kubelet probes before optional instrumentation. In particular,
 	// /livez must not depend on telemetry middleware or any external service.
 	g.route(fiber.MethodGet, "/livez", routePolicy{auth: authPublic}, g.livez)

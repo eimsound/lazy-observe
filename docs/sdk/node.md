@@ -53,6 +53,7 @@ await lo.shutdown();
 | `serviceVersion` | unset | OpenTelemetry service version. |
 | `metrics`, `logs`, `traces` | `true` independently | Enable or disable each signal. |
 | `sampleRate` | `1` | Parent-based head sampling, from `0` through `1`. |
+| `compression` | `"none"` | OTLP/HTTP payload compression (`""`, `"none"`, or `"gzip"`). When empty or unset, honors `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` then `OTEL_EXPORTER_OTLP_COMPRESSION`, defaulting to `"none"`. Explicit config overrides env vars. |
 | `teeToStdout` | `true` | Also write Pino and Winston records locally. |
 | `exportIntervalMs` | `5000` | Metrics and log export interval in milliseconds. |
 | `runtimeMetricsIntervalMs` | `1000` | Event loop, heap, and active-handle collection interval in milliseconds. |

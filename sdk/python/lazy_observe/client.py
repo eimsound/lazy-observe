@@ -460,6 +460,7 @@ def _headers(token: str) -> Dict[str, str]:
 
 def build_client(config: Any, parsed: Any) -> Client:
     """Assemble a healthy Client. Raises on construction failure."""
+    from opentelemetry.exporter.otlp.proto.http import Compression as _OTLPCompression
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.metrics import MeterProvider
@@ -469,9 +470,23 @@ def build_client(config: Any, parsed: Any) -> Client:
     from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
     from ._http import InternalHTTPTransport
-    from .config import signal_matrix
+    from .config import COMPRESSION_GZIP, resolve_signal_compression, signal_matrix
 
     metrics_on, logs_on, traces_on = signal_matrix(config)
+    metrics_compression = (
+        resolve_signal_compression(config.compression, "METRICS") if metrics_on else "none"
+    )
+    traces_compression = (
+        resolve_signal_compression(config.compression, "TRACES") if traces_on else "none"
+    )
+    logs_compression = (
+        resolve_signal_compression(config.compression, "LOGS") if logs_on else "none"
+    )
+
+    def _otel_compression(value: str) -> _OTLPCompression:
+        if value == COMPRESSION_GZIP:
+            return _OTLPCompression.Gzip
+        return _OTLPCompression.NoCompression
 
     resource = _otel_resources.Resource.create(
         {
@@ -494,6 +509,7 @@ def build_client(config: Any, parsed: Any) -> Client:
             metric_exporter = OTLPMetricExporter(
                 endpoint=parsed.endpoint + "/v1/metrics",
                 headers=headers,
+                compression=_otel_compression(metrics_compression),
             )
             reader = PeriodicExportingMetricReader(
                 metric_exporter, export_interval_millis=int(config.export_interval * 1000)
@@ -503,7 +519,9 @@ def build_client(config: Any, parsed: Any) -> Client:
 
         if traces_on:
             trace_exporter = OTLPSpanExporter(
-                endpoint=parsed.endpoint + "/v1/traces", headers=headers
+                endpoint=parsed.endpoint + "/v1/traces",
+                headers=headers,
+                compression=_otel_compression(traces_compression),
             )
             processor = BatchSpanProcessor(
                 trace_exporter,
@@ -521,7 +539,9 @@ def build_client(config: Any, parsed: Any) -> Client:
             from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 
             log_exporter = OTLPLogExporter(
-                endpoint=parsed.endpoint + "/v1/logs", headers=headers
+                endpoint=parsed.endpoint + "/v1/logs",
+                headers=headers,
+                compression=_otel_compression(logs_compression),
             )
             log_processor = _BatchLogRecordProcessor(
                 log_exporter,
