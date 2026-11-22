@@ -25,8 +25,8 @@ import {
   unixNanoNow,
 } from "./trace";
 import type { RecordedSpan } from "./trace";
-import { isServerRejection, Transport } from "./transport";
-import type { DiagnosticMeasurement, DiagnosticReason, DiagnosticSignal } from "./transport";
+import { Transport } from "./transport";
+import type { DiagnosticMeasurement, DiagnosticReason, DiagnosticSignal, VitalPayload } from "./transport";
 import type {
   ActiveSpan,
   BrowserClient,
@@ -38,7 +38,15 @@ import type {
   TraceTarget,
 } from "./types";
 import { eventId, formatNonError, getSessionId, normalizePage, randomHex, safeSessionStorage } from "./utils";
-import { startVitals } from "./vitals";
+import {
+  DEFAULT_VITAL_BATCH_SIZE,
+  DEFAULT_VITAL_FLUSH_INTERVAL_MS,
+  DEFAULT_VITAL_QUEUE_CAPACITY,
+  MAX_VITALS_DISTINCT_PAGES_PER_BATCH,
+  startVitals,
+  vitalDedupeKey,
+  vitalPageKey,
+} from "./vitals";
 import { collectVitalDimensions, normalizeCountryCode } from "./vitals-dimensions";
 
 export { trimErrorEventToBudget };
@@ -218,6 +226,7 @@ export class Client implements BrowserClient {
   private readonly limiter: MinuteRateLimiter;
   private readonly errorDelivery: DeliveryQueue<ErrorEventPayload>;
   private readonly traceDelivery: DeliveryQueue<RecordedSpan>;
+  private readonly vitalDelivery: DeliveryQueue<VitalPayload>;
   private readonly diagnosticDelivery: DeliveryQueue<DiagnosticMeasurement>;
   private readonly traces = new TraceWindow();
   private readonly allowlist: TraceTarget[];
@@ -323,6 +332,24 @@ export class Client implements BrowserClient {
       send: (spans, options) => this.transport.traces(this.serviceName, spans, options.keepalive, options.signal),
       onDrop: (drop) => this.recordTelemetryDrop("trace", drop),
     });
+    this.vitalDelivery = new DeliveryQueue<VitalPayload>({
+      capacity: delivery.vitalQueueCapacity ?? DEFAULT_VITAL_QUEUE_CAPACITY,
+      batchSize: DEFAULT_VITAL_BATCH_SIZE,
+      flushIntervalMs: DEFAULT_VITAL_FLUSH_INTERVAL_MS,
+      maxAttempts,
+      retryInitialMs,
+      retryMaxMs,
+      requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+      maxBatchBytes: MAX_KEEPALIVE_BYTES,
+      keepaliveMaxBatchBytes: MAX_KEEPALIVE_BYTES,
+      batchOverheadBytes: 16,
+      estimateItemBytes: estimateJsonBytes,
+      dedupeKey: vitalDedupeKey,
+      batchDistinctKey: vitalPageKey,
+      maxBatchDistinctKeys: MAX_VITALS_DISTINCT_PAGES_PER_BATCH,
+      send: (vitals, options) => this.transport.vitals(vitals, options.keepalive, options.signal),
+      onDrop: (drop) => this.recordTelemetryDrop("vitals", drop),
+    });
   }
 
   start(): this {
@@ -331,12 +358,6 @@ export class Client implements BrowserClient {
     if (this.config.errors !== false) {
       this.disposers.push(startErrorListeners(window, this.onError, this.onRejection));
     }
-    this.disposers.push(startLifecycleListeners(
-      window,
-      typeof document === "undefined" ? undefined : document,
-      this.onUnload,
-      this.onVisibilityChange,
-    ));
     if (this.config.replay !== false) {
       this.replay = new ReplayController(
         replayDefaults(typeof this.config.replay === "object" ? this.config.replay : {}),
@@ -354,14 +375,21 @@ export class Client implements BrowserClient {
       void this.replay.start();
     }
     if (this.config.vitals !== false) {
+      // Register web-vitals listeners before lifecycle listeners so visibilitychange/pagehide
+      // metrics enqueue before our unload handler flushes with keepalive: true.
       this.disposers.push(startVitals(
-        this.transport,
+        (payload) => { if (!this.closed) this.vitalDelivery.enqueue(payload); },
         () => this.currentPage,
         (sample) => this.replay?.vital(sample),
-        (error) => this.recordVitalsFailure(error),
         () => collectVitalDimensions(this.currentCountry),
       ));
     }
+    this.disposers.push(startLifecycleListeners(
+      window,
+      typeof document === "undefined" ? undefined : document,
+      this.onUnload,
+      this.onVisibilityChange,
+    ));
     if (this.config.fetchTracing !== false) {
       const autoPatch = typeof this.config.fetchTracing !== "object" || this.config.fetchTracing.autoPatch !== false;
       if (autoPatch) {
@@ -504,7 +532,9 @@ export class Client implements BrowserClient {
     await Promise.all([
       this.errorDelivery.flush(keepalive),
       this.traceDelivery.flush(keepalive),
+      this.vitalDelivery.flush(keepalive),
       this.replay?.flush(keepalive),
+      ...(keepalive ? [this.diagnosticDelivery.flush(true)] : []),
     ]);
     await this.diagnosticDelivery.flush(keepalive);
   }
@@ -517,6 +547,7 @@ export class Client implements BrowserClient {
     await Promise.all([
       this.errorDelivery.close(options),
       this.traceDelivery.close(options),
+      this.vitalDelivery.close(options),
       this.replay?.close(options),
     ]);
     await this.diagnosticDelivery.close(options);
@@ -524,17 +555,6 @@ export class Client implements BrowserClient {
 
   private recordSpan(span: RecordedSpan): void {
     if (!this.closed) this.traceDelivery.enqueue(span);
-  }
-
-  private recordVitalsFailure(error: unknown): void {
-    // A 4xx is the server refusing this exact payload, so no retry can help. Everything
-    // else (network failure, 5xx, missing fetch) exhausts the single attempt a vital has,
-    // which is the same outcome the delivery queues report as retry_exhausted.
-    this.recordTelemetryDrop("vitals", {
-      reason: isServerRejection(error) ? "server_rejected" : "retry_exhausted",
-      count: 1,
-      error,
-    });
   }
 
   private recordTelemetryDrop(

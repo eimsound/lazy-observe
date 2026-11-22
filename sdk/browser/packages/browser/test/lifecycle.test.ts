@@ -232,7 +232,8 @@ describe("Browser SDK lifecycle regression matrix", () => {
     const client1Callbacks = [...webVitalCallbacks];
 
     client1Callbacks[0]({ name: "LCP", value: 1200, rating: "good" } as Metric);
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    await client1.flush();
+    expect(fetcher).toHaveBeenCalledTimes(1);
 
     await client1.close();
 
@@ -254,7 +255,8 @@ describe("Browser SDK lifecycle regression matrix", () => {
     });
     expect(webVitalCallbacks).toHaveLength(10);
     webVitalCallbacks[5]({ name: "FCP", value: 800, rating: "good" } as Metric);
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    await client2.flush();
+    expect(fetcher).toHaveBeenCalledTimes(2);
     await client2.close();
   });
 

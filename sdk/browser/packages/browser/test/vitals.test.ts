@@ -11,21 +11,19 @@ vi.mock("web-vitals", () => ({
   onTTFB: (callback: (metric: Metric) => void) => webVitalCallbacks.push(callback),
 }));
 
-import type { Transport } from "../src/transport";
 import { startVitals } from "../src/vitals";
 
 beforeEach(() => webVitalCallbacks.splice(0));
 
-it("mirrors name, value and rating into Replay before transport and includes normalized dimensions", () => {
-  const vitals = vi.fn().mockResolvedValue(undefined);
+it("mirrors name, value and rating into Replay before queuing and includes normalized dimensions", () => {
+  const enqueue = vi.fn();
   const replay = vi.fn();
   vi.spyOn(Date, "now").mockReturnValue(1_721_234_567_890);
 
   startVitals(
-    { vitals } as unknown as Transport,
+    enqueue,
     () => "/checkout",
     replay,
-    undefined,
     () => ({
       device_type: "desktop",
       browser_family: "chrome",
@@ -46,7 +44,7 @@ it("mirrors name, value and rating into Replay before transport and includes nor
     value: 2500,
     rating: "needs-improvement",
   });
-  expect(vitals).toHaveBeenCalledWith([{
+  expect(enqueue).toHaveBeenCalledWith({
     name: "LCP",
     value: 2500,
     page: "/checkout",
@@ -55,32 +53,31 @@ it("mirrors name, value and rating into Replay before transport and includes nor
     browser_family: "chrome",
     os_family: "macos",
     country: "US",
-  }]);
+  });
 });
 
-it("omits country when not explicitly provided and survives a throwing dimension reader", () => {
-  const vitals = vi.fn().mockResolvedValue(undefined);
+it("omits country when not explicitly provided and survives throwing readers or callbacks", () => {
+  const enqueue = vi.fn(() => { throw new Error("queue boom"); });
   vi.spyOn(Date, "now").mockReturnValue(1_721_234_567_890);
 
   startVitals(
-    { vitals } as unknown as Transport,
+    enqueue,
     () => "/home",
-    undefined,
-    undefined,
+    () => { throw new Error("replay boom"); },
     () => {
-      throw new Error("boom");
+      throw new Error("dims boom");
     },
   );
-  webVitalCallbacks[0]({
+  expect(() => webVitalCallbacks[0]({
     name: "CLS",
     value: 0.05,
     rating: "good",
-  } as Metric);
+  } as Metric)).not.toThrow();
 
-  expect(vitals).toHaveBeenCalledWith([{
+  expect(enqueue).toHaveBeenCalledWith({
     name: "CLS",
     value: 0.05,
     page: "/home",
     timestamp: "2024-07-17T16:42:47.890Z",
-  }]);
+  });
 });

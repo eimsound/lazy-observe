@@ -71,14 +71,14 @@ const eventId = client.captureException(error, {
 
 ## 遥测丢弃诊断
 
-错误、Span、会话回放分段和丢弃诊断均使用有界、协议感知的内存队列。遇到永久性 4xx 拒绝时，队列会立即按 `server_rejected` 丢弃；遇到 `408`、`429`、`5xx` 及临时故障时，按 `Retry-After` 或 Full Jitter 指数退避重试，强制执行单次尝试超时，并按字节预算拆分批次。批次拆分在页面卸载时遵循 64 KiB 的 `keepalive` 上限，并与 200 KiB 的单条错误事件限制对齐。
+错误、Span、Web Vitals、会话回放分段和丢弃诊断均使用有界、协议感知的内存队列。遇到永久性 4xx 拒绝时，队列会立即按 `server_rejected` 丢弃；遇到 `408`、`429`、`5xx` 及临时故障时，按 `Retry-After` 或 Full Jitter 指数退避重试，强制执行单次尝试超时，并按字节预算拆分批次（Web Vitals 还会按每次最多 32 个不同页面切分批次）。尚未发送的 Web Vitals 按 `(name, page)` 去重并保留最新值；批次拆分在页面卸载时遵循 64 KiB 的 `keepalive` 上限（`visibilitychange` / `pagehide` 即使遇到进行中的异步重试也会同步发出 `keepalive` 请求），并与 200 KiB 的单条错误事件限制对齐。
 
-错误事件入队前会经过内置的 `sanitize` 流水线，剥离 URL 凭据、查询参数与片段，并限制超大字段和堆栈帧。Web Vitals 不走这些队列，每个指标直接发送一次。任何摄取失败都不会向页面抛出异常：每次丢弃都会递增 `client.diagnostics().droppedTelemetry`，输出一次本地 `console.warn`，并上报至 `/api/events/diagnostics`。
+错误事件入队前会经过内置的 `sanitize` 流水线，剥离 URL 凭据、查询参数与片段，并限制超大字段和堆栈帧。任何摄取失败都不会向页面抛出异常：每次丢弃都会递增 `client.diagnostics().droppedTelemetry`，输出一次本地 `console.warn`，并上报至 `/api/events/diagnostics`。
 
 | `reason` | 含义 |
 | --- | --- |
 | `queue_full` | 有界队列已满，SDK 丢弃了新的遥测数据。 |
-| `retry_exhausted` | 有限投递预算耗尽。Web Vitals 仅发送一次，因此网络错误、5xx、408 或 429 都会记为此原因。 |
+| `retry_exhausted` | 在耗尽配置的重试预算后仍未投递成功。 |
 | `shutdown_budget` | 遥测数据在 `close()` 之后入队。 |
 | `server_rejected` | 摄取端点返回 4xx（不包含属于临时错误的 408 和 429）。负载按原样不会被接受，因此不再重试。 |
 

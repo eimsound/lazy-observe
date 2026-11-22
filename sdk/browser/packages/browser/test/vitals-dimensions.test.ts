@@ -135,7 +135,8 @@ describe("vitals low-cardinality dimension normalization", () => {
     client.start();
 
     webVitalCallbacks[0]({ name: "LCP", value: 1800, rating: "good" } as Metric);
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    await client.flush();
+    expect(fetcher).toHaveBeenCalledTimes(1);
     const firstBody = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
     expect(firstBody.vitals[0]).toMatchObject({
       name: "LCP",
@@ -149,14 +150,16 @@ describe("vitals low-cardinality dimension normalization", () => {
     // Invalid country update clears the explicit country so server edge headers can decide.
     client.setCountry("invalid-country");
     webVitalCallbacks[1]({ name: "CLS", value: 0.04, rating: "good" } as Metric);
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    await client.flush();
+    expect(fetcher).toHaveBeenCalledTimes(2);
     const secondBody = JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body));
     expect("country" in secondBody.vitals[0]).toBe(false);
 
     // Explicit valid update propagates to subsequent vitals.
     client.setCountry("de");
     webVitalCallbacks[2]({ name: "INP", value: 120, rating: "good" } as Metric);
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(3));
+    await client.flush();
+    expect(fetcher).toHaveBeenCalledTimes(3);
     const thirdBody = JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body));
     expect(thirdBody.vitals[0].country).toBe("DE");
 
