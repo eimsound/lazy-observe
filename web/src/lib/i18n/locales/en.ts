@@ -59,6 +59,9 @@ export const en: typeof zh = {
     forbiddenDesc: "Your current role does not have permission to view this content.",
     staleDataTitle: "Showing the last successful result",
     staleDataDesc: "Refresh failed, so these results may be stale. Current filters are unchanged.",
+    recentIngestTitle: "Data from the last 30 seconds may still be ingesting",
+    recentIngestDesc:
+      "Queries run in near-real-time mode (latencyOffset=0s). Some spans or records from the last 30 seconds may still be writing or indexing; refresh shortly for complete results.",
     moduleLoadErrorTitle: "Module failed to load",
     moduleLoadErrorDesc:
       "The page resources could not be loaded. Retry the page, and temporarily disable blocking extensions if needed.",

@@ -148,6 +148,8 @@ export function mockLLMTimeseriesResponse(
 }
 
 function buildCalls(window: LLMWindow): LLMCall[] {
+  const mockControl = globalThis as { __loMockLLMEmpty?: boolean };
+  if (mockControl.__loMockLLMEmpty) return [];
   const width = Math.max(1, window.end - window.start);
   const calls: LLMCall[] = [];
   for (let index = 0; index < CALL_COUNT; index++) {

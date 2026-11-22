@@ -13,8 +13,11 @@ import { ApiError } from "@/lib/api/client";
 import { useProject } from "@/lib/project/project-provider";
 import { useProjectQuery } from "@/lib/project/use-project-query";
 import { formatDurationMicros } from "@/lib/format";
+import { traceLatestEndMs } from "@/lib/ingesting-window";
+import { useRecentIngestNotice } from "@/hooks/use-recent-ingest-notice";
 import { PageContainer } from "@/components/layout/page";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
+import { RecentIngestNotice } from "@/components/common/recent-ingest-notice";
 import { TraceWaterfall } from "@/components/traces/trace-waterfall";
 import { SpanDetailDrawer } from "@/components/traces/span-detail-drawer";
 import { Button } from "@/components/ui/button";
@@ -103,6 +106,8 @@ export function TraceDetailPage() {
         <TraceDetailBody
           key={`${project}:${traceID}`}
           trace={traceQuery.data}
+          isRefreshing={traceQuery.isFetching}
+          onRefresh={() => void traceQuery.refetch()}
           onViewLogs={viewLogs}
           onViewProfiling={viewProfiling}
           onViewMetrics={viewMetrics}
@@ -114,11 +119,15 @@ export function TraceDetailPage() {
 
 function TraceDetailBody({
   trace,
+  isRefreshing,
+  onRefresh,
   onViewLogs,
   onViewProfiling,
   onViewMetrics,
 }: {
   trace: JaegerTrace;
+  isRefreshing: boolean;
+  onRefresh: () => void;
   onViewLogs: (trace: JaegerTrace) => void;
   onViewProfiling: (trace: JaegerTrace) => void;
   onViewMetrics: (trace: JaegerTrace) => void;
@@ -128,6 +137,8 @@ function TraceDetailBody({
   const [drawerOpen, setDrawerOpen] = useState(false);
   const summary = useMemo(() => summarizeTrace(trace), [trace]);
   const depth = useMemo(() => maxDepth(buildTree(trace)), [trace]);
+  const latestEndMs = useMemo(() => traceLatestEndMs(trace), [trace]);
+  const isRecentlyIngesting = useRecentIngestNotice(latestEndMs);
 
   function selectSpan(span: JaegerSpan) {
     setSelected(span);
@@ -136,6 +147,13 @@ function TraceDetailBody({
 
   return (
     <>
+      {isRecentlyIngesting && (
+        <RecentIngestNotice
+          isRefreshing={isRefreshing}
+          onRefresh={onRefresh}
+        />
+      )}
+
       {/* Header */}
       <div className="mb-4 space-y-2">
         <div className="flex flex-wrap items-center gap-2">

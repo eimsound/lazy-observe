@@ -265,7 +265,14 @@ export function mockGetTrace(traceID: string): Promise<JaegerTrace> {
   const trace = buildRelativeTrace(traceID);
   decorateLLMTrace(trace);
   const nowMicros = dayjs().valueOf() * 1000;
-  const jitter = (makeRng(traceID).int(0, 3600) * 1_000_000) % 3_600_000_000;
+  const mockControl = globalThis as {
+    __loMockTraceAgeMsById?: Record<string, number>;
+  };
+  const overrideAgeMs = mockControl.__loMockTraceAgeMsById?.[traceID];
+  const jitter =
+    typeof overrideAgeMs === "number" && Number.isFinite(overrideAgeMs)
+      ? Math.max(0, Math.round(overrideAgeMs * 1_000))
+      : (makeRng(traceID).int(0, 3600) * 1_000_000) % 3_600_000_000;
   const base = nowMicros - traceDuration(trace) - jitter;
   return delay(shiftTrace(trace, base), 200);
 }

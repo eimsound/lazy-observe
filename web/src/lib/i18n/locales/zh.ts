@@ -58,6 +58,9 @@ export const zh = {
     forbiddenDesc: "当前账号角色无权查看此内容。",
     staleDataTitle: "正在显示上次成功结果",
     staleDataDesc: "刷新失败，这些结果可能已过期。当前筛选条件保持不变。",
+    recentIngestTitle: "最近 30 秒数据可能仍在写入中",
+    recentIngestDesc:
+      "当前以近实时模式（latencyOffset=0s）查询，最近 30 秒内的部分 span 或调用记录可能仍在写入或建立索引，可稍后刷新获取完整结果。",
     moduleLoadErrorTitle: "模块加载失败",
     moduleLoadErrorDesc: "页面资源未能成功加载，请重试。若启用了广告拦截或脚本拦截扩展，请先暂时关闭。",
     empty: "暂无数据",
