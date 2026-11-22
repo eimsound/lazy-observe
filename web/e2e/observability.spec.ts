@@ -495,3 +495,107 @@ test("告警规则：表达式按信号使用 PromQL / LogsQL 代码编辑器", 
   await expect(dialog.getByLabel("LogsQL 表达式")).toBeVisible();
   await expect(dialog.locator(".cm-editor")).toHaveCount(1);
 });
+
+test("日志筛选：双栏弹层支持字段搜索、排序、包含/排除、任意非空与清空", async ({ page }) => {
+  await openFeature(page, "/logs?q=*&run=1&view=table&hide_chart=1");
+  await expect(page.getByRole("button", { name: "查看日志详情" }).first()).toBeVisible();
+
+  await expect(page.getByRole("button", { name: "流字段" })).toHaveCount(0);
+  await expect(page.locator('aside[aria-label="流字段"]')).toHaveCount(0);
+
+  const trigger = page.getByRole("button", { name: /^筛选/ });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+
+  const popover = page.getByRole("dialog", { name: "筛选" });
+  await expect(popover).toBeVisible();
+  await expect(popover.getByRole("option", { name: /^app\b/ })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(popover.getByRole("button", { name: "包含 api-gateway" })).toBeVisible();
+
+  await popover.getByLabel("搜索字段").fill("env");
+  await expect(popover.getByRole("option", { name: /^env\b/ })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  const envValues = popover.getByRole("list", { name: "字段 env 的可选值" });
+  await expect(envValues.getByRole("listitem").first()).toContainText("prod");
+
+  await popover.getByRole("button", { name: "按命中数升序" }).click();
+  await expect(envValues.getByRole("listitem").first()).toContainText("staging");
+  await popover.getByRole("option", { name: /^env\b/ }).click();
+  await popover.getByRole("button", { name: "清除字段搜索" }).click();
+  await expect(popover.getByRole("option", { name: /^env\b/ })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+
+  const activeFilters = page.getByLabel("当前附加过滤条件");
+  const anyButton = popover.getByRole("button", { name: "任意", exact: true });
+  await anyButton.click();
+  await expect(anyButton).toHaveAttribute("aria-pressed", "true");
+  await expect(activeFilters).toContainText('{env!=""}');
+  await expect(trigger).toContainText("1");
+
+  await popover.getByRole("option", { name: /^app\b/ }).click();
+  await popover.getByRole("button", { name: "包含 api-gateway" }).click();
+  await popover.getByRole("button", { name: "排除 worker" }).click();
+  await expect(popover.getByRole("button", { name: "包含 api-gateway" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await expect(popover.getByRole("button", { name: "排除 worker" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await expect(activeFilters).toContainText('{app="api-gateway"}');
+  await expect(activeFilters).toContainText('{app!="worker"}');
+  await expect(trigger).toContainText("3");
+
+  await popover.getByRole("option", { name: /^env\b/ }).click();
+  await popover.getByRole("button", { name: "清除字段 env 的过滤条件" }).click();
+  await expect(activeFilters).not.toContainText('{env!=""}');
+  await expect(trigger).toContainText("2");
+
+  await popover.getByRole("button", { name: "清空过滤条件" }).click();
+  await expect(activeFilters).toHaveCount(0);
+  await expect(trigger).toHaveText("筛选");
+
+  await page.keyboard.press("Escape");
+  await expect(popover).toHaveCount(0);
+
+  await trigger.click();
+  await expect(popover).toBeVisible();
+  await page.locator("main").click({ position: { x: 10, y: 10 } });
+  await expect(popover).toHaveCount(0);
+});
+
+test("日志筛选：移动端 390px 视口双栏弹层无横向溢出", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openFeature(page, "/logs?q=*&run=1&view=table&hide_chart=1");
+  await expect(page.getByRole("button", { name: "查看日志详情" }).first()).toBeVisible();
+
+  const trigger = page.getByRole("button", { name: /^筛选/ });
+  await trigger.click();
+
+  const popover = page.getByRole("dialog", { name: "筛选" });
+  await expect(popover).toBeVisible();
+  await expect(popover.getByRole("option", { name: /^app\b/ })).toBeVisible();
+  await expect(popover.getByRole("button", { name: "包含 api-gateway" })).toBeVisible();
+
+  const layout = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth: window.innerWidth,
+  }));
+  expect(layout.scrollWidth).toBeLessThanOrEqual(layout.innerWidth);
+
+  const box = await popover.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(390);
+
+  await popover.getByRole("button", { name: "关闭筛选" }).click();
+  await expect(popover).toHaveCount(0);
+});

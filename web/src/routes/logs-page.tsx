@@ -7,7 +7,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
-import { Database, Filter } from "lucide-react";
+import { Database } from "lucide-react";
 import type { LogRow } from "@/lib/api/logs";
 import {
   buildLogsExtraFilterParams,
@@ -25,11 +25,11 @@ import {
 import { IS_MOCK } from "@/lib/settings";
 import { useProject } from "@/lib/project/project-provider";
 import { useRouterLocationSync } from "@/lib/router-url-sync";
-import { PageActions, PageContainer } from "@/components/layout/page";
+import { PageContainer } from "@/components/layout/page";
 import type { LogsHitsChartSeries } from "@/components/charts/logs-histogram";
 import { LogDetailDrawer } from "@/components/logs/log-detail-drawer";
 import { LogsChartPanel } from "@/components/logs/logs-chart-panel";
-import { LogsFilterSidebar } from "@/components/logs/logs-filter-sidebar";
+import { LogsFilterPopover } from "@/components/logs/logs-filter-popover";
 import { LogsQueryPanel } from "@/components/logs/logs-query-panel";
 import { LogsResultsPanel } from "@/components/logs/logs-results-panel";
 import { LogsStreamContextDialog } from "@/components/logs/logs-stream-context";
@@ -40,7 +40,6 @@ import {
   useLogsPresentationUrlSync,
 } from "@/components/logs/use-logs-presentation";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { queryViewState } from "./query-view-state";
 import { useLogsWorkspace } from "./use-logs-workspace";
 
@@ -63,6 +62,7 @@ export function LogsPage() {
   const [selection, setSelection] = useState<LogsContextAnchor | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [contextAnchor, setContextAnchor] = useState<LogsContextAnchor | null>(null);
+  const [filterPickerOpen, setFilterPickerOpen] = useState(false);
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [requestDuration, setRequestDuration] = useState(0);
   const requestStartedAt = useRef(0);
@@ -73,10 +73,11 @@ export function LogsPage() {
     setSelection(null);
     setDrawerOpen(false);
     setContextAnchor(null);
+    setFilterPickerOpen(false);
   }, []);
 
   const presentation = useLogsPresentationState(routeLocation);
-  const { chart, hideLogs, autocomplete, sidebarOpen } = presentation;
+  const { chart, hideLogs, autocomplete } = presentation;
 
   const auxiliaryConfig = useMemo(() => ({
     rowsEnabled: !hideLogs,
@@ -139,7 +140,7 @@ export function LogsPage() {
     filters,
     filtersForRequest,
     metadataRange,
-    enabled: autocomplete || sidebarOpen || Boolean(executed && effectiveRange),
+    enabled: autocomplete || filterPickerOpen || Boolean(executed && effectiveRange),
   });
 
   useEffect(() => {
@@ -179,8 +180,13 @@ export function LogsPage() {
   }, [applyFilters, filters]);
 
   const removeFieldFilters = useCallback((field: string) => {
-    applyFilters(filters.filter((filter) => filter.field !== field));
+    applyFilters(filters.filter((filter) => !(filter.isStream && filter.field === field)));
   }, [applyFilters, filters]);
+
+  const streamFilters = useMemo(
+    () => filters.filter((filter) => filter.isStream),
+    [filters],
+  );
 
   const changeRange = useCallback((next: MetricsRange) => {
     workspace.send({ type: "rangeChanged", range: next });
@@ -271,176 +277,164 @@ export function LogsPage() {
 
   return (
     <PageContainer>
-      <PageActions>
-        <Button
-          variant={sidebarOpen ? "secondary" : "outline"}
-          size="sm"
-          onClick={() => presentation.setSidebarOpen((open) => !open)}
-        >
-          <Filter />
-          {t("logs.streamFields")}
-        </Button>
-        {IS_MOCK && (
-          <Badge variant="secondary" className="gap-1.5">
-            <Database className="size-3" />
-            {t("logs.mockBadge")}
-          </Badge>
-        )}
-      </PageActions>
-
-      <div className="flex items-start gap-4">
-        <LogsFilterSidebar
-          open={sidebarOpen}
-          fields={metadata.streamFields}
-          fieldsLoading={metadata.streamFieldsLoading}
-          fieldsError={metadata.streamFieldsError}
-          fieldValues={metadata.fieldValues}
-          fieldValuesLoading={metadata.fieldValuesLoading}
-          fieldValuesErrors={metadata.fieldValuesErrors}
-          filters={filters.filter((filter) => filter.isStream)}
-          onRequestFieldValues={metadata.requestFieldValues}
-          onUpsertFilter={(filter) => addFilter(
-            filter.field,
-            filter.value,
-            filter.operator,
-            true,
-          )}
+      <div className="min-w-0 space-y-4">
+        <LogsQueryPanel
+          queryText={queryText}
+          autocomplete={autocomplete}
+          queryFetching={queryFetching}
+          range={range}
+          localTime={presentation.localTime}
+          refreshSeconds={refreshSeconds}
+          limit={limit}
+          filters={filters}
+          history={history}
+          timeRangeData={finite.timeRange.data}
+          onQueryChange={(value) => {
+            setQueryText(value);
+            setHistoryCursor(-1);
+          }}
+          onRunOrCancel={() => queryFetching
+            ? workspace.send({ type: "cancelFinite" })
+            : execute()}
+          onComplete={metadata.completeQuery}
+          onHistoryPrevious={historyPrevious}
+          onHistoryNext={historyNext}
+          onRangeChange={changeRange}
+          onLocalTimeChange={presentation.setLocalTime}
+          onRefreshSecondsChange={(seconds) => workspace.send({
+            type: "refreshSecondsChanged",
+            refreshSeconds: seconds,
+          })}
+          onRefresh={() => workspace.send({ type: "refresh" })}
+          onAutocompleteChange={presentation.setAutocomplete}
+          onLimitChange={(nextLimit) => workspace.send({
+            type: "limitChanged",
+            limit: nextLimit,
+          })}
+          onReset={() => workspace.send({ type: "reset" })}
+          onSelectExample={setQueryText}
+          onLoadHistory={setQueryText}
+          onRunHistory={execute}
+          onFavoriteHistory={(query) => workspace.send({
+            type: "historyFavoriteToggled",
+            query,
+          })}
+          onRemoveHistory={(query) => workspace.send({
+            type: "historyRemoved",
+            query,
+          })}
+          onClearHistory={() => workspace.send({ type: "historyCleared" })}
           onRemoveFilter={removeFilter}
-          onRemoveField={removeFieldFilters}
-          onClearFilters={() => applyFilters(
-            filters.filter((filter) => !filter.isStream),
-          )}
-          onClose={() => presentation.setSidebarOpen(false)}
+          onClearFilters={() => applyFilters([])}
+          filterControl={
+            <LogsFilterPopover
+              open={filterPickerOpen}
+              onOpenChange={setFilterPickerOpen}
+              fields={metadata.streamFields}
+              fieldsLoading={metadata.streamFieldsLoading}
+              fieldsError={metadata.streamFieldsError}
+              fieldValues={metadata.fieldValues}
+              fieldValuesLoading={metadata.fieldValuesLoading}
+              fieldValuesErrors={metadata.fieldValuesErrors}
+              filters={streamFilters}
+              onRequestFieldValues={metadata.requestFieldValues}
+              onUpsertFilter={(filter) => addFilter(
+                filter.field,
+                filter.value,
+                filter.operator,
+                true,
+              )}
+              onRemoveFilter={removeFilter}
+              onRemoveField={removeFieldFilters}
+              onClearFilters={() => applyFilters(
+                filters.filter((filter) => !filter.isStream),
+              )}
+            />
+          }
+          badge={IS_MOCK ? (
+            <Badge variant="secondary" className="gap-1.5">
+              <Database className="size-3" />
+              {t("logs.mockBadge")}
+            </Badge>
+          ) : undefined}
         />
 
-        <div className="min-w-0 flex-1 space-y-4">
-          <LogsQueryPanel
-            queryText={queryText}
-            autocomplete={autocomplete}
-            queryFetching={queryFetching}
-            range={range}
-            localTime={presentation.localTime}
-            refreshSeconds={refreshSeconds}
-            limit={limit}
-            filters={filters}
-            history={history}
-            timeRangeData={finite.timeRange.data}
-            onQueryChange={(value) => {
-              setQueryText(value);
-              setHistoryCursor(-1);
-            }}
-            onRunOrCancel={() => queryFetching
-              ? workspace.send({ type: "cancelFinite" })
-              : execute()}
-            onComplete={metadata.completeQuery}
-            onHistoryPrevious={historyPrevious}
-            onHistoryNext={historyNext}
-            onRangeChange={changeRange}
-            onLocalTimeChange={presentation.setLocalTime}
-            onRefreshSecondsChange={(seconds) => workspace.send({
-              type: "refreshSecondsChanged",
-              refreshSeconds: seconds,
-            })}
-            onRefresh={() => workspace.send({ type: "refresh" })}
-            onAutocompleteChange={presentation.setAutocomplete}
-            onLimitChange={(nextLimit) => workspace.send({
-              type: "limitChanged",
-              limit: nextLimit,
-            })}
-            onReset={() => workspace.send({ type: "reset" })}
-            onSelectExample={setQueryText}
-            onLoadHistory={setQueryText}
-            onRunHistory={execute}
-            onFavoriteHistory={(query) => workspace.send({
-              type: "historyFavoriteToggled",
-              query,
-            })}
-            onRemoveHistory={(query) => workspace.send({
-              type: "historyRemoved",
-              query,
-            })}
-            onClearHistory={() => workspace.send({ type: "historyCleared" })}
-            onRemoveFilter={removeFilter}
-            onClearFilters={() => applyFilters([])}
-          />
+        <LogsChartPanel
+          chart={chart}
+          allFields={metadata.allFields}
+          chartSeries={chartSeries}
+          totalHits={totalHits}
+          requestDuration={requestDuration}
+          chartStep={chartStep}
+          hasExecuted={Boolean(executed)}
+          chartViewState={chartViewState}
+          chartFetching={chartFetching}
+          onChartChange={(patch) => presentation.setChart((current) => ({ ...current, ...patch }))}
+          onShowChart={() => presentation.setChart((current) => ({ ...current, hidden: false }))}
+          onRetry={() => workspace.send({ type: "retry", slot: chartRetrySlot })}
+          onSelectRange={selectChartRange}
+          onFilterSeries={(seriesFields) => {
+            let next = filters;
+            for (const [field, value] of Object.entries(seriesFields)) {
+              next = upsertLogsFilter(next, {
+                field,
+                value,
+                operator: "=",
+                isStream: false,
+              });
+            }
+            applyFilters(next);
+          }}
+        />
 
-          <LogsChartPanel
-            chart={chart}
-            allFields={metadata.allFields}
-            chartSeries={chartSeries}
-            totalHits={totalHits}
-            requestDuration={requestDuration}
-            chartStep={chartStep}
-            hasExecuted={Boolean(executed)}
-            chartViewState={chartViewState}
-            chartFetching={chartFetching}
-            onChartChange={(patch) => presentation.setChart((current) => ({ ...current, ...patch }))}
-            onShowChart={() => presentation.setChart((current) => ({ ...current, hidden: false }))}
-            onRetry={() => workspace.send({ type: "retry", slot: chartRetrySlot })}
-            onSelectRange={selectChartRange}
-            onFilterSeries={(seriesFields) => {
-              let next = filters;
-              for (const [field, value] of Object.entries(seriesFields)) {
-                next = upsertLogsFilter(next, {
-                  field,
-                  value,
-                  operator: "=",
-                  isStream: false,
-                });
-              }
-              applyFilters(next);
-            }}
-          />
-
-          <LogsResultsPanel
-            project={project}
-            view={view}
-            hideLogs={hideLogs}
-            hasExecuted={Boolean(executed)}
-            effectiveRange={effectiveRange}
-            downloading={downloading}
-            downloadError={downloadError}
-            rows={rows}
-            rowsViewState={rowsViewState}
-            rowsFetching={rowsFetching}
-            rowsStaleRetrying={rowsFetching || timeRangeFetching}
-            groupSettings={presentation.groupSettings}
-            tableSettings={presentation.tableSettings}
-            live={live}
-            liveFollowing={presentation.liveFollowing}
-            liveRaw={presentation.liveRaw}
-            liveOffset={intent.liveOffset}
-            liveLimit={intent.liveLimit}
-            onViewChange={(nextView) => workspace.send({ type: "viewChanged", view: nextView })}
-            onToggleHideLogs={() => presentation.setHideLogs((hidden) => !hidden)}
-            onCancelDownload={cancelDownload}
-            onDownload={(format, filename) => void download(format, filename)}
-            onRetryRows={() => workspace.send({
-              type: "retry",
-              slot: finite.timeRange.error ? "timeRange" : "rows",
-            })}
-            onGroupSettingsChange={presentation.setGroupSettings}
-            onTableSettingsChange={presentation.setTableSettings}
-            onIncludeField={(field, value) => addFilter(field, value, "=")}
-            onExcludeField={(field, value) => addFilter(field, value, "!=")}
-            onViewTrace={viewTrace}
-            onShowContext={(row) => setContextAnchor({ project, row })}
-            onOpenRow={openRowDetail}
-            onLiveStoppedChange={(stopped) => {
-              workspace.send({ type: stopped ? "liveStopped" : "liveResumed" });
-              if (!stopped) presentation.setLiveFollowing(true);
-            }}
-            onLiveFollowingChange={presentation.setLiveFollowing}
-            onLiveRawChange={presentation.setLiveRaw}
-            onLiveOffsetChange={(offset) => workspace.send({ type: "liveOffsetChanged", offset })}
-            onLiveLimitChange={(nextLimit) => workspace.send({
-              type: "liveLimitChanged",
-              limit: nextLimit,
-            })}
-            onLiveRetry={() => workspace.send({ type: "liveRetried" })}
-            onLiveClear={() => workspace.send({ type: "liveCleared" })}
-          />
-        </div>
+        <LogsResultsPanel
+          project={project}
+          view={view}
+          hideLogs={hideLogs}
+          hasExecuted={Boolean(executed)}
+          effectiveRange={effectiveRange}
+          downloading={downloading}
+          downloadError={downloadError}
+          rows={rows}
+          rowsViewState={rowsViewState}
+          rowsFetching={rowsFetching}
+          rowsStaleRetrying={rowsFetching || timeRangeFetching}
+          groupSettings={presentation.groupSettings}
+          tableSettings={presentation.tableSettings}
+          live={live}
+          liveFollowing={presentation.liveFollowing}
+          liveRaw={presentation.liveRaw}
+          liveOffset={intent.liveOffset}
+          liveLimit={intent.liveLimit}
+          onViewChange={(nextView) => workspace.send({ type: "viewChanged", view: nextView })}
+          onToggleHideLogs={() => presentation.setHideLogs((hidden) => !hidden)}
+          onCancelDownload={cancelDownload}
+          onDownload={(format, filename) => void download(format, filename)}
+          onRetryRows={() => workspace.send({
+            type: "retry",
+            slot: finite.timeRange.error ? "timeRange" : "rows",
+          })}
+          onGroupSettingsChange={presentation.setGroupSettings}
+          onTableSettingsChange={presentation.setTableSettings}
+          onIncludeField={(field, value) => addFilter(field, value, "=")}
+          onExcludeField={(field, value) => addFilter(field, value, "!=")}
+          onViewTrace={viewTrace}
+          onShowContext={(row) => setContextAnchor({ project, row })}
+          onOpenRow={openRowDetail}
+          onLiveStoppedChange={(stopped) => {
+            workspace.send({ type: stopped ? "liveStopped" : "liveResumed" });
+            if (!stopped) presentation.setLiveFollowing(true);
+          }}
+          onLiveFollowingChange={presentation.setLiveFollowing}
+          onLiveRawChange={presentation.setLiveRaw}
+          onLiveOffsetChange={(offset) => workspace.send({ type: "liveOffsetChanged", offset })}
+          onLiveLimitChange={(nextLimit) => workspace.send({
+            type: "liveLimitChanged",
+            limit: nextLimit,
+          })}
+          onLiveRetry={() => workspace.send({ type: "liveRetried" })}
+          onLiveClear={() => workspace.send({ type: "liveCleared" })}
+        />
       </div>
 
       <LogDetailDrawer

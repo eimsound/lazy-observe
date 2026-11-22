@@ -44,6 +44,11 @@ interface FieldMetadataCache {
   errors: Record<string, string | null>;
 }
 
+interface FieldValueRequestToken {
+  identity: string;
+  seq: number;
+}
+
 export function useLogsFieldMetadata({
   project,
   executedQuery,
@@ -55,7 +60,8 @@ export function useLogsFieldMetadata({
 }: UseLogsFieldMetadataOptions) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const fieldValueRequestKeys = useRef<Record<string, string>>({});
+  const fieldValueRequests = useRef<Record<string, FieldValueRequestToken>>({});
+  const nextFieldValueRequestSeq = useRef(0);
 
   const metadataQuery = executedQuery || DEFAULT_LOGS_QUERY;
   const metadataFilters = useMemo(
@@ -86,7 +92,11 @@ export function useLogsFieldMetadata({
   });
 
   useEffect(() => {
-    fieldValueRequestKeys.current = {};
+    for (const [field, token] of Object.entries(fieldValueRequests.current)) {
+      if (token.identity !== metadataIdentity) {
+        delete fieldValueRequests.current[field];
+      }
+    }
   }, [metadataIdentity]);
 
   const activeCache = cache.identity === metadataIdentity ? cache : null;
@@ -148,8 +158,12 @@ export function useLogsFieldMetadata({
     const fieldFilters = buildLogsExtraFilterParams(
       activeFilters.filter((filter) => filter.field !== field),
     );
-    const requestKey = JSON.stringify([metadataIdentity, field]);
-    fieldValueRequestKeys.current[field] = requestKey;
+    const requestToken: FieldValueRequestToken = {
+      identity: metadataIdentity,
+      seq: ++nextFieldValueRequestSeq.current,
+    };
+    fieldValueRequests.current[field] = requestToken;
+    const isCurrentRequest = () => fieldValueRequests.current[field] === requestToken;
     const updateCache = (mutate: (base: FieldMetadataCache) => FieldMetadataCache) => {
       setCache((current) => {
         const base = current.identity === metadataIdentity
@@ -189,19 +203,19 @@ export function useLogsFieldMetadata({
         ...fieldFilters,
       }, signal),
     }).then((response) => {
-      if (fieldValueRequestKeys.current[field] !== requestKey) return;
+      if (!isCurrentRequest()) return;
       updateCache((base) => ({
         ...base,
         values: { ...base.values, [field]: response.values },
       }));
     }).catch((error: unknown) => {
-      if (fieldValueRequestKeys.current[field] !== requestKey) return;
+      if (!isCurrentRequest()) return;
       updateCache((base) => ({
         ...base,
         errors: { ...base.errors, [field]: errorMessage(error) },
       }));
     }).finally(() => {
-      if (fieldValueRequestKeys.current[field] !== requestKey) return;
+      if (!isCurrentRequest()) return;
       updateCache((base) => ({
         ...base,
         loading: { ...base.loading, [field]: false },

@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Play, RotateCcw, Search, Square } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import dayjs from "@/lib/dayjs";
@@ -56,6 +57,8 @@ export interface LogsQueryPanelProps {
   onClearHistory: () => void;
   onRemoveFilter: (field: string, value: string) => void;
   onClearFilters: () => void;
+  filterControl?: ReactNode;
+  badge?: ReactNode;
 }
 
 export function LogsQueryPanel({
@@ -89,6 +92,8 @@ export function LogsQueryPanel({
   onClearHistory,
   onRemoveFilter,
   onClearFilters,
+  filterControl,
+  badge,
 }: LogsQueryPanelProps) {
   const { t } = useTranslation();
 
@@ -118,17 +123,21 @@ export function LogsQueryPanel({
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <LogsTimeControls
-            range={range}
-            localTime={localTime}
-            refreshSeconds={refreshSeconds}
-            disabled={queryFetching}
-            onRangeChange={onRangeChange}
-            onLocalTimeChange={onLocalTimeChange}
-            onRefreshSecondsChange={onRefreshSecondsChange}
-            onRefresh={onRefresh}
-          />
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {filterControl}
+            <LogsTimeControls
+              range={range}
+              localTime={localTime}
+              refreshSeconds={refreshSeconds}
+              disabled={queryFetching}
+              onRangeChange={onRangeChange}
+              onLocalTimeChange={onLocalTimeChange}
+              onRefreshSecondsChange={onRefreshSecondsChange}
+              onRefresh={onRefresh}
+            />
+          </div>
           <div className="flex flex-wrap items-center gap-2">
+            {badge}
             <Label className="flex items-center gap-2 text-xs font-normal text-muted-foreground">
               {t("logs.autocomplete")}
               <Switch checked={autocomplete} onCheckedChange={onAutocompleteChange} />

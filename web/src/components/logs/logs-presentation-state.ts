@@ -26,7 +26,6 @@ export interface InitialLogsState {
   refreshSeconds: number;
   autocomplete: boolean;
   hideLogs: boolean;
-  sidebarOpen: boolean;
   chart: LogsChartOptionsValue;
   groupSettings: LogsGroupViewSettings;
   tableSettings: LogsTableViewSettings;
@@ -129,7 +128,6 @@ export function parseLogsPresentationState(locationHref: string): InitialLogsSta
     refreshSeconds: queryNumber(params.get("refresh"), 0, 0, 3_600),
     autocomplete: !queryBoolean(params.get("autocomplete"), false),
     hideLogs: queryBoolean(params.get("hide_logs")),
-    sidebarOpen: typeof window !== "undefined" && window.innerWidth >= 1024,
     chart: {
       graphMode,
       groupBy: params.get("graph_by") ?? "",

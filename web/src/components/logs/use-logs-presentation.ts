@@ -17,7 +17,6 @@ export function useLogsPresentationState(routeLocation: string) {
   const [localTime, setLocalTime] = useState(readLocalTimePreference);
   const [autocomplete, setAutocomplete] = useState(initial.autocomplete);
   const [hideLogs, setHideLogs] = useState(initial.hideLogs);
-  const [sidebarOpen, setSidebarOpen] = useState(initial.sidebarOpen);
   const [chart, setChart] = useState<LogsChartOptionsValue>(initial.chart);
   const [groupSettings, setGroupSettings] = useState(initial.groupSettings);
   const [tableSettings, setTableSettings] = useState(initial.tableSettings);
@@ -39,8 +38,6 @@ export function useLogsPresentationState(routeLocation: string) {
     setAutocomplete,
     hideLogs,
     setHideLogs,
-    sidebarOpen,
-    setSidebarOpen,
     chart,
     setChart,
     groupSettings,
