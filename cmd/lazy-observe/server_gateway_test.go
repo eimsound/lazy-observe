@@ -18,6 +18,7 @@ import (
 	"time"
 
 	appconfig "github.com/eimsound/lazy-observe/internal/config"
+	"github.com/eimsound/lazy-observe/internal/errortrack"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/otlpgrpc"
 	storagepkg "github.com/eimsound/lazy-observe/internal/storage"
@@ -504,5 +505,14 @@ func TestOpenOTLPGRPCListenerTrimsWhitespace(t *testing.T) {
 	defer managed.Close()
 	if managed.Port() <= 0 {
 		t.Fatalf("managed.Port()=%d want > 0", managed.Port())
+	}
+}
+
+func TestErrorInboxWorkerCountRespectsClusteredMode(t *testing.T) {
+	if got := errorInboxWorkerCount(false); got != 1 {
+		t.Fatalf("non-clustered errorInboxWorkerCount=%d want 1", got)
+	}
+	if got := errorInboxWorkerCount(true); got != errortrack.DefaultClusteredWorkers || got < 2 || got > 4 {
+		t.Fatalf("clustered errorInboxWorkerCount=%d want %d (in 2..4)", got, errortrack.DefaultClusteredWorkers)
 	}
 }

@@ -74,11 +74,25 @@ func (s *Store) ApplyIssueDeltas(
 	return changes, nil
 }
 
+type issueKey struct {
+	projectID   int
+	fingerprint string
+}
+
 func (s *Store) applyIssueDeltasTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	deltas []errortrack.IssueDelta,
 ) ([]errortrack.IssueChange, error) {
+	changes, _, err := s.applyIssueDeltasWithIDsTx(ctx, tx, deltas)
+	return changes, err
+}
+
+func (s *Store) applyIssueDeltasWithIDsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	deltas []errortrack.IssueDelta,
+) ([]errortrack.IssueChange, map[issueKey]int, error) {
 	ordered := deltas
 	if len(deltas) > 1 {
 		ordered = append([]errortrack.IssueDelta(nil), deltas...)
@@ -90,16 +104,18 @@ func (s *Store) applyIssueDeltasTx(
 		})
 	}
 	changes := make([]errortrack.IssueChange, 0)
+	issueIDs := make(map[issueKey]int, len(ordered))
 	for _, delta := range ordered {
 		if delta.AcceptedAt.IsZero() || delta.AppliedAt.IsZero() {
-			return nil, errors.New("issue delta acceptance and application times are required")
+			return nil, nil, errors.New("issue delta acceptance and application times are required")
 		}
 		insert := bind(
 			s.dialect,
 			`INSERT INTO issues(fingerprint, title, level, status, count, user_count, user_bitmap, first_seen, last_seen, status_changed_at, last_event_id, project_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, fingerprint) DO NOTHING`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, fingerprint) DO NOTHING RETURNING id`,
 		)
-		result, execErr := tx.ExecContext(
+		var id int
+		insertErr := tx.QueryRowContext(
 			ctx,
 			insert,
 			delta.Fingerprint,
@@ -114,20 +130,9 @@ func (s *Store) applyIssueDeltasTx(
 			delta.AppliedAt,
 			delta.LastEventID,
 			delta.ProjectID,
-		)
-		if execErr != nil {
-			return nil, execErr
-		}
-		inserted, execErr := result.RowsAffected()
-		if execErr != nil {
-			return nil, execErr
-		}
-		if inserted == 1 {
-			var id int
-			if scanErr := tx.QueryRowContext(ctx, bind(s.dialect, `SELECT id FROM issues WHERE project_id = ? AND fingerprint = ?`), delta.ProjectID, delta.Fingerprint).
-				Scan(&id); scanErr != nil {
-				return nil, scanErr
-			}
+		).Scan(&id)
+		if insertErr == nil {
+			issueIDs[issueKey{projectID: delta.ProjectID, fingerprint: delta.Fingerprint}] = id
 			changes = append(
 				changes,
 				errortrack.IssueChange{
@@ -141,23 +146,26 @@ func (s *Store) applyIssueDeltasTx(
 			)
 			continue
 		}
+		if !errors.Is(insertErr, sql.ErrNoRows) {
+			return nil, nil, insertErr
+		}
 
 		query := `SELECT id, status, user_bitmap, first_seen, last_seen, status_changed_at, title, level, last_event_id FROM issues WHERE project_id = ? AND fingerprint = ?`
-		if s.dialect == "postgres" {
+		if s.dialect == dialect.Postgres {
 			query += " FOR UPDATE"
 		}
-		var id int
 		var status string
 		var oldBitmap int64
 		var firstSeen, lastSeen, statusChangedAt time.Time
 		var title, level, lastEventID string
 		if scanErr := tx.QueryRowContext(ctx, bind(s.dialect, query), delta.ProjectID, delta.Fingerprint).
 			Scan(&id, &status, &oldBitmap, &firstSeen, &lastSeen, &statusChangedAt, &title, &level, &lastEventID); scanErr != nil {
-			if scanErr == sql.ErrNoRows {
-				return nil, sql.ErrNoRows
+			if errors.Is(scanErr, sql.ErrNoRows) {
+				return nil, nil, sql.ErrNoRows
 			}
-			return nil, scanErr
+			return nil, nil, scanErr
 		}
+		issueIDs[issueKey{projectID: delta.ProjectID, fingerprint: delta.Fingerprint}] = id
 		bitmap := uint64(oldBitmap) | delta.SessionBits
 		if delta.FirstSeen.Before(firstSeen) {
 			firstSeen = delta.FirstSeen
@@ -193,7 +201,7 @@ func (s *Store) applyIssueDeltasTx(
 			regressedAt,
 			id,
 		); execErr != nil {
-			return nil, execErr
+			return nil, nil, execErr
 		}
 		if regression {
 			changes = append(
@@ -209,7 +217,7 @@ func (s *Store) applyIssueDeltasTx(
 			)
 		}
 	}
-	return changes, nil
+	return changes, issueIDs, nil
 }
 
 func (s *Store) ListIssues(ctx context.Context, projectID int, opts IssueListOptions) ([]IssueView, error) {
