@@ -220,6 +220,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `VITE_MOCK=1`.
 - Added a Python SDK lowest-direct dependency regression CI check using
   `uv --resolution=lowest-direct`.
+- Added a lightweight, zero-dependency virtual windowing engine
+  (`web/src/lib/use-virtual-window.ts`) for the Trace waterfall
+  (`TraceWaterfall`, fixed-height O(1) fast path with selected-span
+  `scrollToIndex`) and the structured Logs JSON view (`LogsJsonView`,
+  expandable multi-line rows measured via a shared `ResizeObserver` with
+  prefix-sum lookup and scroll anchoring, bypassing virtualization below 80
+  items) (#280).
+- Added a 30-second recent-ingest notice banner (`RecentIngestNotice`,
+  `useRecentIngestNotice`, `web/src/lib/ingesting-window.ts`) with a manual
+  refresh control on the Trace detail page (when a trace's latest span ended
+  within the last 30 seconds) and the LLM Observability page (when the active
+  time window ends within the last 30 seconds), explaining that near-real-time
+  queries (`latencyOffset=0s`) may still be receiving or indexing spans and
+  auto-dismissing once the window elapses (#316).
+- Added `SECURITY.md` documenting supported `v0.x` preview versions, private
+  vulnerability reporting via GitHub Security Advisories, credential redaction
+  guidance, and built-in security controls; updated
+  `.github/ISSUE_TEMPLATE/{config,bug_report,feature_request}.yml` with
+  Private Vulnerability Reporting contact links, `needs-triage` auto-labeling,
+  and expanded deployment/SDK options; documented the 7 repository triage
+  labels in `.agents/docs/agents/triage-labels.md`; and updated `README.md`,
+  `README.zh-CN.md`, and `SECURITY.md` with security policy links and default
+  exposed-port notes (`:3100` HTTP by default, optional `:4317` OTLP/gRPC
+  disabled by default) (#263, #282).
+- Added a bilingual Zensical static documentation site (`zensical.toml` for
+  English in `site/`, `zensical.zh.toml` for Simplified Chinese in `site/zh/`,
+  driven by `uv`-managed Python and `tools/docs/pyproject.toml` pinning
+  `zensical==0.1.1` with `exclude-newer = "7 days"` and `pathspec` under
+  MPL-2.0 restricted to the docs build toolchain), local `mise run docs-build`
+  and `mise run docs-serve` tasks, a `Docs site (Zensical)` (`docs`) CI check
+  in `.github/workflows/ci.yml` routed by `scripts/ci-changes.sh`, and GitHub
+  Pages deployment via `.github/workflows/docs.yml`. Added `docs/index.md`,
+  `docs/quickstart.md`, and complete Simplified Chinese documentation under
+  `docs/zh/` (`index.md`, `quickstart.md`, `deployment.md`, `operations.md`,
+  `grafana-perses.md`, `comparison.md`, `version-matrix.md`, and
+  `sdk/{go,node,browser,python}.md`), and rewrote the English guides and
+  `README.md` / `README.zh-CN.md` to align with the docs site (#289, #291,
+  #292, #294).
 
 ### Security
 
@@ -282,12 +320,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the scan itself does not complete: Trivy errors, anything other than exactly
   four Go binaries recognized, or a report that does not match Trivy's exit
   code. Whether a pin is behind upstream is not decided by this job: before
-  tagging a release, check the Renovate Dependency Dashboard (rerun it first)
-  for pending upgrades of the Victoria binaries and Trivy (Renovate tracks
-  these pins since #130, ADR 0015). The first version of this scan (#69)
-  blocked a release when a pin was behind the latest upstream release that
-  was at least 7 days old, or when that lookup failed; ADR 0016 replaced that
-  policy (#69, #117). The container image scan is unchanged and still blocks.
+  tagging a release, check the Mend Web Portal for pending Renovate upgrades
+  of the Victoria binaries and Trivy (Renovate tracks these pins since #130,
+  ADR 0015; the GitHub Dependency Dashboard issue was disabled in #296). The
+  first version of this scan (#69) blocked a release when a pin was behind the
+  latest upstream release that was at least 7 days old, or when that lookup
+  failed; ADR 0016 replaced that policy (#69, #117). The container image scan
+  is unchanged and still blocks.
 - Source map upload now has its own credential, the project-scoped **source map
   upload token** (`los_…`; ADR 0018). `POST /api/releases/:release/sourcemaps`
   used to accept the project API token, which sits in public pages (ADR 0010)
@@ -322,6 +361,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   redacted channel credentials, and gateway/web input boundaries (including
   declarative route authorization policies in `internal/gateway/route_policy.go`
   and sub-second cross-replica revocation invalidation in `Authenticator`).
+- Updated transitive dependencies in `sdk/node/pnpm-lock.yaml` (`body-parser`
+  `2.3.0` → `2.4.0` and `vite` `7.3.6` → `8.3.8`) to resolve Dependabot
+  security alerts (#281).
 
 ### Changed
 
@@ -488,9 +530,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   3100 API-only while Vite exclusively serves the development frontend.
 - Moved CI to GitHub Actions on GitHub-hosted amd64 and native arm64 runners.
   A `changes` job selects only the jobs whose surface a diff touches and a
-  `ci-ok` job aggregates them as the single required check, so
-  documentation-only changes run no business jobs; arm64 build and smoke run on
-  pull requests that touch the packaging chain. Container images publish to
+  `ci-ok` job aggregates them as the single required check, so plain
+  Markdown and governance changes run no business jobs (changes under `docs/`,
+  `zensical*.toml`, or `tools/docs/` run the lightweight Zensical `docs`
+  build job since #294); arm64 build and smoke run on pull requests that
+  touch the packaging chain. Container images publish to
   `ghcr.io/eimsound/lazy-observe`.
 - CI and the Dockerfile builder stage now install mise from the pinned
   `v2026.5.3` GitHub release with a sha256 check instead of piping the
@@ -540,18 +584,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `scripts/check-github-workflows.sh` fails when that value, or the pnpm and uv
   settings below, differ from `scripts/release-age.env`. The age gate therefore
   only covers PRs Renovate opens: a pin changed by hand gets no age check, and
-  the dependencies whose registry reports no release time are exempt (the Quay
-  Victoria cluster images, GCR distroless, and `govulncheck`). `seaweedfs`,
-  `postgres`, and the Dockerfile's `debian` stay on that exemption list only as
-  a fallback: the hosted Renovate does read Docker Hub release times for them
-  and waits the 7 days, and only a lookup that returns no time lets a new
-  version through at once. The `minimumReleaseAge` of
-  the `web`, `sdk/node`, and `sdk/browser` pnpm workspaces uses the same 7 days,
-  so pnpm also holds back a security patch younger than that until it is listed
-  in `minimumReleaseAgeExclude`. `web` is now a single-package pnpm workspace
-  (`pnpm-workspace.yaml`); the lockfile is unchanged. `sdk/python` follows with
-  `[tool.uv] exclude-newer = "7 days"` in its `pyproject.toml` (#70, #119,
-  #130, #138).
+  only dependencies whose registry reports no release time remain on the
+  `timestamp-optional` exemption list (the Quay Victoria cluster images, GCR
+  distroless, and `govulncheck`). Docker Hub images (`chrislusf/seaweedfs`,
+  `postgres`, and the Dockerfile's `debian`) were removed from that fallback
+  exemption in #295 and now enforce fail-closed `timestamp-required` so
+  transient Hub timestamp lookup failures cannot bypass the 7-day window. The
+  `minimumReleaseAge` of the `web`, `sdk/node`, and `sdk/browser` pnpm
+  workspaces uses the same 7 days, so pnpm also holds back a security patch
+  younger than that until it is listed in `minimumReleaseAgeExclude`. `web`
+  is now a single-package pnpm workspace (`pnpm-workspace.yaml`); the
+  lockfile is unchanged. `sdk/python` and `tools/docs` follow with
+  `[tool.uv] exclude-newer = "7 days"` in their `pyproject.toml` files (#70,
+  #119, #130, #138, #294, #295).
 - `mise run sdk-journeys` runs the Go, Node, Python, and browser SDK journeys
   (`sdk/*/e2e.sh`) against a freshly started local platform, and changes that
   touch server, SDK, web, or storage-download paths now run it as the
@@ -629,12 +674,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `scripts/release-age.env`. Without a lockfile the window is relative to the
   current time, so resolution moves forward as time passes. The PyPI release
   path (`sdk-release.yml`, `sdk-python-v*` tags) no longer uses `setup-python`
-  or pip: it installs only uv through mise and runs `mise run
-  sdk-python-release`, which builds the sdist and wheel with `uv build
-  --managed-python --python 3.13`; the artifacts are the same as before. The
-  upload step and its trusted-publishing permission are unchanged. The new
-  release path has not run through a real `workflow_dispatch` dry run or tag
-  push yet, so run a dry run before the first release (#119).
+  or pip: it installs only uv through mise and runs `mise run --skip-tools
+  sdk-python-release` (#308), which builds the sdist and wheel with `uv build
+  --managed-python --python 3.13` (excluding `tests/` from the sdist and
+  using PEP 639 license metadata since #303). The upload step and its
+  trusted-publishing permission are unchanged. The new release path has not
+  run through a real `workflow_dispatch` dry run or tag push yet, so run a
+  dry run before the first release (#119, #303, #308).
 - CI runs `sdk-node` on Node 22.23.5, 24.22.3, and 26.13.1, and `sdk-browser`
   on 26.13.1 for the full suite plus a bundler-plugin load smoke test on
   22.23.5 and 24.22.3 (`mise run sdk-browser-smoke`); `LO_SDK_NODE_VERSION`
@@ -655,7 +701,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Actions, the Dockerfile, mise tools) and the versions pinned by hand in
   scripts (the Victoria storage binaries, Trivy, the bootstrap mise release,
   the e2e and BuildKit images). Most updates are grouped; the global schedule
-  is `at any time` (changed from Mondays after 3 am Asia/Shanghai in #139).
+  was temporarily `at any time` (#139) and restored to Mondays after 3 am
+  Asia/Shanghai in #256.
   Where a pin carries a sha256, Renovate updates the version and digest in one
   PR using `# <release tag>` markers on `scripts/mise-release.env` and
   `scripts/download-storage-bins.sh`. Trivy is the exception (#138): hosted
@@ -882,12 +929,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Docker Compose), complete documentation index, and explicit design trade-offs.
 - Hardened CI and toolchain reliability (#273): added `--retry-delay 2
   --retry-all-errors --connect-timeout 20 --max-time 120` to `mise` release
-  downloads in `scripts/ci-setup-mise.sh` and `Dockerfile`, refreshed apt
-  indices with retry/fallback during Playwright Chromium installation in
-  `sdk/browser/e2e.sh`, `scripts/e2e-web-real.sh`, and `mise.toml` (`tasks.web`),
-  switched `actionlint` to `aqua:rhysd/actionlint` (`1.7.12`), and enabled a
-  weekly Sunday 17:00 UTC schedule with concurrency control on
+  downloads in `scripts/ci-setup-mise.sh` and `Dockerfile` (superseded in #312
+  by independent mise binary caching, two-stage authenticated downloads, and
+  exponential-backoff retries), refreshed apt indices with retry/fallback during
+  Playwright Chromium installation in `sdk/browser/e2e.sh`,
+  `scripts/e2e-web-real.sh`, and `mise.toml` (`tasks.web`), switched
+  `actionlint` to `aqua:rhysd/actionlint` (`1.7.12`), and enabled a weekly
+  Sunday 17:00 UTC schedule with concurrency control on
   `.github/workflows/bench.yml`.
+- The SQLite and PostgreSQL metadata baselines (`001_baseline.sql`) gained the
+  `source_map_upload_pins` table to protect in-flight source map uploads from
+  concurrent reconciliation sweeps, governed by the ADR 0011 millisecond
+  database-clock guard (`alertClockSQL` / `alertLeaseExpiry`); pre-release
+  development databases created before #286 must be rebuilt (single-baseline
+  policy, ADR 0003) (#286).
+- Enabled Oxlint 1.93.0's 12 native React Compiler diagnostic rules at `error`
+  level in `web/.oxlintrc.json` (`react/error-boundaries`, `globals`,
+  `immutability`, `incompatible-library`, `preserve-manual-memoization`,
+  `purity`, `refs`, `set-state-in-effect`, `set-state-in-render`,
+  `static-components`, `unsupported-syntax`, `use-memo`) with zero suppression
+  comments; refactored render-time ref reads/writes across the Logs workspace,
+  `useVirtualWindow` (switching to a stable ref callback queue with batched
+  parent layout-effect measurement), router URL sync, and shared hooks, and
+  replaced 30 synchronous `setState`-in-effect patterns with derived state,
+  event callbacks, or external subscriptions (#287).
+- Updated `.github/renovate.json` (and synced ADR 0015 and
+  `.agents/docs/plans/renovate.md`): removed Docker Hub images
+  (`chrislusf/seaweedfs`, `postgres`, `debian`) from `timestamp-optional` so
+  they enforce fail-closed `timestamp-required` under the 7-day release-age
+  gate (#295), disabled the GitHub Dependency Dashboard issue
+  (`"dependencyDashboard": { "enabled": false }`) in favor of inspecting
+  pending status in the Mend Web Portal (#296), and removed the obsolete
+  `unplugin <3.0.0` rule after `@lazy-observe/bundler-plugin` dropped unplugin
+  (#297).
+- Tightened GitHub Actions cache usage across
+  `.github/workflows/{ci,docs,release}.yml`, `scripts/ci-cache-keys.sh`,
+  `scripts/download-storage-bins.sh`, `mise.toml`, and `Dockerfile` to stay
+  well under the 10 GB repository quota: stopped `main` writers for
+  `gomod-*` and `gobuild-*` from restoring prior cache generations, removed
+  obsolete `mise-go-cross-*` fallback keys, isolated `sdk-journeys` pnpm
+  stores (`LO_PNPM_STORE_{WEB,SDK_NODE,SDK_BROWSER}`) to reuse per-workspace
+  stores instead of writing a combined cache, keyed
+  `playwright-sdk-journeys-*` strictly by the exact `playwright-core` version
+  from `sdk/browser/pnpm-lock.yaml`, and pruned stale storage archives after
+  SHA-256 verification (#307); removed BuildKit `type=gha` layer caching from
+  `.github/workflows/release.yml` (enforced by static guards in
+  `scripts/check-github-workflows.sh`), moved `ARG VERSION`, `COMMIT`, and
+  `DATE` below `COPY . .` in `Dockerfile`, and bumped the Node/Browser SDK
+  mise cache key prefix to `mise-sdk-node-v2-*` (#315).
+- Mitigated idle RSS drift toward the 500 MiB zero-config release gate: after
+  extracting embedded storage binaries (`internal/embed/bins`), Linux
+  `amd64`/`arm64` binaries now reclaim resident pages of the executable's ELF
+  `.rodata` section via `madvise(MADV_DONTNEED)` (`reclaim_linux.go`);
+  `internal/meta/password.go` coordinates throttled `debug.FreeOSMemory`
+  reclamation (for Argon2id allocations `>= 8 MiB`, after in-flight calls drain
+  and concurrency slots are released, with a 250 ms minimum interval) so
+  transient Argon2id blocks do not linger in idle gateway memory (reducing
+  measured 5-process smoke idle RSS from ~435–448 MiB to ~191–212 MiB, with
+  gateway RSS dropping from ~295–299 MiB to ~58–59 MiB); and
+  `scripts/check-release-smoke.sh` now prints per-process RSS breakdowns
+  (`gateway`, `metrics`, `logs`, `traces`, `vmagent`) in both pass and failure
+  output (#318).
+- Streamlined contributor workflow docs in `AGENTS.md` and `.agents/skills/`
+  by removing the redundant `main` skill and tightening the `pitfalls` review
+  and maintenance loop (#314).
 
 ### Removed
 
@@ -1086,6 +1191,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   route cardinality, logging recursion, and cross-platform concurrency.
 - Fixed Helm security context and PDB template issues, SDK release validation,
   CI path routing, and performance/license gate defects.
+- Closed the TOCTOU race between source map retention/reconciliation
+  (`internal/janitor/tasks.go`) and concurrent uploads
+  (`internal/gateway/source_map_api.go`): uploads now record TTL-bounded
+  `source_map_upload_pins` rows (default 15-minute TTL) before writing blobs,
+  atomically consume pins on commit (`CommitPinnedSourceMapArtifacts`,
+  returning `503` if a pin expired), and release pins on failure; janitor
+  cleanup deletes expired releases conditionally
+  (`DeleteExpiredSourceMapRelease`), sweeps unreferenced revisions in bounded
+  batches under a per-project lock (`WithSourceMapSweepLock`) that re-checks
+  referenced and pinned digests before deleting blobs, and prunes expired pins
+  (`PruneExpiredSourceMapUploadPins`), covered by concurrent race regression
+  tests (`internal/gateway/source_map_gc_race_test.go`) (#286).
+- Cleaned up Python SDK packaging and pytest configuration
+  (`sdk/python/pyproject.toml`, `sdk/python/MANIFEST.in`): removed the unused
+  `DJANGO_SETTINGS_MODULE` entry under `[tool.pytest.ini_options]` and turned
+  `pytest.PytestConfigWarning` into an error, excluded `tests/` from sdist
+  archives via `prune tests`, and migrated license metadata to PEP 639
+  (`license = "MIT"`, `license-files = ["LICENSE"]`, `setuptools>=77.0.3`)
+  (#303).
+- Fixed `release.yml`'s `container-check` job loading BuildKit `type=oci`
+  archives by extending `scripts/merge-oci-layouts.sh inspect`
+  (`--docker-tar-out`, `--repo-tag`) to emit a Docker-save-compatible tarball
+  for `docker load` while preserving the verified immutable OCI archive for
+  downstream merge and push, and added 5-attempt exponential-backoff retries
+  to `gh release upload` and `gh release edit --draft=false` (#304).
+- Fixed CI and release workflows accidentally installing unrelated tools from
+  `mise.toml` by naming required tools explicitly in `mise exec <tool...> --`
+  calls across `.github/workflows/{release,sdk-release}.yml` and
+  `scripts/ci-setup-mise.sh`, passing `--skip-tools` to `mise run
+  sdk-python-release` in `.github/workflows/sdk-release.yml`, and enforcing
+  these rules in `scripts/check-github-workflows.sh` (#308).
+- Hardened CI and Docker bootstrap/asset downloads against GitHub rate limits
+  and transient errors: added an independent `mise-bin-*` cache for
+  `~/.local/bin/mise` (keyed on `scripts/mise-release.env`, saved by
+  `go-cross` on `main`, and SHA-256-verified before reuse), switched
+  `scripts/ci-setup-mise.sh` and `Dockerfile` (via BuildKit `github_token`
+  secret) to two-stage authenticated GitHub Release API downloads that strip
+  `Authorization` before following the CDN redirect (falling back to direct
+  release URLs), and standardized `--proto '=https' --tlsv1.2 --proto-redir
+  '=https' --retry 5 --retry-all-errors --retry-max-time 90 --connect-timeout
+  20 --max-time 120` across `scripts/ci-setup-mise.sh`, `Dockerfile`,
+  `scripts/download-storage-bins.sh`, and `scripts/install-trivy.sh` (#282,
+  #312).
+- Hardened the HA weak-scaling performance gate (`cmd/perf-gate/scale.go`,
+  `bench/performance-gates.json`, `scripts/e2e-multi-replica.sh`,
+  `scripts/e2e-otlp-sink/main.go`, `.github/workflows/{bench,release}.yml`):
+  sampled upstream control headroom before round 1, after even intermediate
+  rounds, and after the final round using median ratios, paired passing-round
+  majority, and a conservative min/max floor (result schema v7) while
+  unpinning `GOMAXPROCS` on the test `e2e-otlp-sink` process (#305); raised HA
+  scaling `batch_size` from `20` to `100`, replaced shared latency mutex
+  locking with per-worker shards in `measureScalePhase` and pooled body
+  buffers in `e2e-otlp-sink`, disabled unused `scrape` in the perf-gate
+  gateway config, enforced an aggregate median replica-efficiency guard
+  alongside paired-round majority, and expanded failure diagnostics (per-round
+  latencies, per-target rates, baseline summaries, gateway/sink log tails, and
+  7-day `perf-gate-results-failure` workflow artifacts) (#313).
 
 ## Pre-release history - 2026-07-16 to 2026-07-17
 
