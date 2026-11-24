@@ -41,7 +41,7 @@
   `postgres:16.16-trixie@sha256:...`、`valkey/valkey:8.1.11-trixie@sha256:...` 这种
   **tag + digest 同时写**的形态（PR #4 的钉法）。
 - 工具面：`mise.toml` 没有 `yq`，仓库里也没有 `yq` 用法；chart 侧只需要 helm 自身。
-- 提交纪律：`.agents/skills/do/SKILL.md`「AFK 契约」禁止直接向 `main` 推送。
+- 提交纪律：`.agents/skills/do/SKILL.md`「执行契约」禁止直接向 `main` 推送。
 
 ## 实施策略
 
@@ -68,7 +68,7 @@
 
 - 形态：`docker` job 生成 `values.yaml` 补丁，开 PR 或直推 `main`（提交里写 `image.digest`），
   下一个 chart 版本默认就带上一个镜像的 digest。
-- 否决理由：① 直推 `main` 违反 AFK 契约；开 PR 需要人工合并，发版流程会把「发布完成」卡在
+- 否决理由：① 直推 `main` 违反执行契约；开 PR 需要人工合并，发版流程会把「发布完成」卡在
   一次评审上，而且 `main` 的 chart 会指向**上一个**版本的镜像（每次发版都滞后一版），
   等于把一个不变量写成「回填」的假象；② digest 随每次重建变化，提交回仓库会产生纯噪声 diff；
   ③ 需要在发版 runner 上配写仓库的 token，扩大凭据面。

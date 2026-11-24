@@ -22,5 +22,6 @@
 ## 工作流
 
 - 改代码、改配置、发版、写文档或排查代码问题前，先读 `.agents/skills/do/SKILL.md` 按情境选流程（单行改错字/纯闲聊除外），不要只凭 skill description 选。
+- 路线图与待办看板：https://github.com/orgs/eimsound/projects/4
 - issue tracker、triage labels、domain docs（`.agents/docs/GLOSSARY.md`、`.agents/docs/adr/`）的配置在 `.agents/docs/agents/`。
 - 审查代码，或修改后端、Web、SDK、部署/CI 的逻辑与配置时，按改动面查阅 `.agents/skills/pitfalls/SKILL.md`（仅改错字/注释/纯文档可跳过）。
