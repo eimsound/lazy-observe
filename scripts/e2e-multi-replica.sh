@@ -13,7 +13,7 @@ BIN_DIR=${LO_E2E_STORAGE_BIN_DIR:-"$ROOT/.cache/storage-bin"}
 # They are pulled from quay.io, VictoriaMetrics' second official registry, whose
 # -cluster digests are identical to Docker Hub's.
 VMSTORAGE_IMAGE=${LO_E2E_VMSTORAGE_IMAGE:-quay.io/victoriametrics/vmstorage:v1.157.0-cluster-scratch@sha256:6e43af80162367bd54526e988fe7c1d03891cef1f93aec36ba19e22f4ac6c422}
-VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-quay.io/victoriametrics/vminsert:v1.156.0-cluster-scratch@sha256:41fbf25df0ab77a12cae8ed0d2e8d76cd8d922e4e2fb824818f1087641a80e5e}
+VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-quay.io/victoriametrics/vminsert:v1.157.0-cluster-scratch@sha256:72c0b0041ca31f67c99083f127d2cba2e1cb9f26a942981c3d60e637230dea00}
 VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-quay.io/victoriametrics/vmselect:v1.157.0-cluster-scratch@sha256:c2bab3ad0ac24b0d8ddfa19b34e140143e792cee3fd226d36fed9856f7ca640d}
 # SeaweedFS is Apache-2.0 and provides a real S3-compatible API without adding
 # a copyleft test dependency. Upstream only publishes Alpine-based images, so
