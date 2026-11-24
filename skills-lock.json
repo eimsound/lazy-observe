@@ -43,6 +43,13 @@
       "skillPath": "skills/productivity/grilling/SKILL.md",
       "computedHash": "485451958784497cd4c4dbea13cb5bbb579da58fac0d0e45f3bcb310fab68ac7"
     },
+    "impeccable": {
+      "source": "pbakaus/impeccable",
+      "commit": "b49177d32788f2dc585c42831d845dacf1ebed2c",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/impeccable/SKILL.md",
+      "computedHash": "08bd5bf141cb507f46bd8347890cd985865606f15adf88295ed3a73bc9ad5d96"
+    },
     "implement": {
       "source": "mattpocock/skills",
       "sourceType": "github",

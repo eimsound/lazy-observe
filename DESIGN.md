@@ -172,7 +172,7 @@ components:
 
 本文件按 [Google `DESIGN.md` 格式](https://github.com/google-labs-code/design.md)（`version: alpha`）编写：
 front matter 是给工具和 agent 读的 token，正文说明这些值为什么存在、怎么用。
-改 `web/` 下的页面、UI 组件或样式前先读本文件；改本文件后运行 `npx @google/design.md@0.4.0 lint DESIGN.md`，
+改 `web/` 下的页面、UI 组件或样式前先读本文件；改本文件后运行 `mise run design-lint`（CI 的 design job 同一条命令），
 要求 0 error。
 
 事实源分工：

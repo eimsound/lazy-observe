@@ -5,7 +5,7 @@
 - PoC/spike 放本地 `poc/<topic>/`（git 忽略，不提交）；要保留的结论写进 `.agents/docs/research/<topic>.md`。
 - 协议面（端点、字段、DSN、鉴权）改动与 `docs/version-matrix.md` 在同一个 PR 里改。
 - 改 `sdk/` 下的代码或文档前先读 `sdk/AGENTS.md`。
-- 改 `web/` 下的页面、UI 组件或样式前先读根目录 `DESIGN.md`（Google DESIGN.md 格式，改后跑 `npx @google/design.md@0.4.0 lint DESIGN.md`）；审查通用交互与可访问性用 `web-design-guidelines` 技能。
+- 改 `web/` 下的页面、UI 组件或样式前先读根目录 `DESIGN.md`（改它后跑 `mise run design-lint`）；设计审查与精修用 `impeccable`、`web-design-guidelines` 技能，量渲染后的控件尺寸与对齐用 Playwright MCP。增删、升级或配置这些设计工具前先读 `.agents/docs/agents/design-tooling.md`。
 - 禁止引入 AGPL/GPL 的生产或运行时依赖。白名单以 `scripts/check-go-licenses.sh`（Apache-2.0、MIT、BSD-2/3-Clause）和
   `scripts/check-js-licenses.sh`（另加 ISC、0BSD、Unlicense）为准；白名单外的许可证先改本条和脚本，再引入依赖。仅有两项开发期例外：
   - Air（GPL-3.0）：本地开发 CLI，不得链接进 Go 代码或打包进产物。

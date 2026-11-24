@@ -18,7 +18,7 @@ set -euo pipefail
 # 本地测试：`printf '%s\n' a.go b.md | bash scripts/ci-changes.sh --stdin`，
 # 标志写到 stdout（以及 $GITHUB_OUTPUT，若设置）。见 scripts/ci-changes-test.sh。
 
-flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys trivy_pin docs)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys trivy_pin docs design)
 
 # ha：多副本 HA 功能门禁（mise run e2e-ha → scripts/e2e-multi-replica.sh，只做功能断言，
 # 不含 perf-ha 的性能部分）。它跑的是 build-binary 产出的服务端二进制、外置的 storage-bins
@@ -154,8 +154,12 @@ classify() {
   docs/*)
     set_flags docs
     ;;
-  # 纯文档与 agent 流程：不跑业务 job。
-  *.md | LICENSE | NOTICE | .agents/* | .claude/* | skills-lock.json | .air.toml | .github/ISSUE_TEMPLATE/*)
+  # 根目录 DESIGN.md 的 token 结构由 design job 的 design-lint 校验：必须在 *.md 之前命中，避免被纯文档规则悄悄跳过。
+  DESIGN.md)
+    set_flags design
+    ;;
+  # 纯文档与 agent 流程（含 agent 用的 MCP 配置 .mcp.json 与 impeccable 项目配置）：不跑业务 job。
+  *.md | LICENSE | NOTICE | .agents/* | .claude/* | .mcp.json | .impeccable/* | skills-lock.json | .air.toml | .github/ISSUE_TEMPLATE/*)
     return
     ;;
   # Renovate 配置只被 Mend 的 Renovate App 读取，不改变任何 job 的行为；.trivyignore.yaml 只在

@@ -25,6 +25,8 @@ crane = { version = "0.22.1", lazy = true }
 "go:github.com/google/go-licenses/v2" = { version = "2.0.1", lazy = true, lazy_bins = ["go-licenses"] }
 # 版本按 7 天冷却挑选；go 后端经 go install 安装，模块校验和由 sum.golang.org 校验。
 "go:golang.org/x/vuln/cmd/govulncheck" = { version = "1.10.0", lazy = true, lazy_bins = ["govulncheck"] }
+# DESIGN.md 格式的官方 lint（Apache-2.0，google-labs-code/design.md）；npm 后端经 mise 管理的 node 安装，只给 design-lint 与 CI 的 design job 用。
+"npm:@google/design.md" = { version = "0.4.0", lazy = true, lazy_bins = ["designmd"] }
 
 [tasks.ent-generate]
 description = "Regenerate the tracked Ent client in internal/db/ent from internal/db/schema"
@@ -307,6 +309,10 @@ run = [
 [tasks.ci-changes-test]
 description = "Test that the CI change detector falls back to a full run for CI, toolchain, unclassified paths and missing base"
 run = "bash scripts/ci-changes-test.sh"
+
+[tasks.design-lint]
+description = "Lint the root DESIGN.md (Google DESIGN.md format): broken token refs, section order, contrast; fails on errors only"
+run = "designmd lint DESIGN.md"
 
 [tasks.sdk-go]
 description = "Verify the Go SDK nested module (sdk/go) is tidy, then build, vet, lint, and test it"

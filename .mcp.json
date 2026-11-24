@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "@playwright/mcp@0.0.85",
+        "--browser",
+        "chromium",
+        "--headless",
+        "--isolated",
+        "--snapshot-boxes"
+      ]
+    }
+  }
+}
