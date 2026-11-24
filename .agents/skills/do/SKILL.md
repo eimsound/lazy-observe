@@ -1,12 +1,12 @@
 ---
 name: do
-description: lazy-observe 的单一工作入口。改代码、改配置、发版、写文档或排查代码问题前使用（单行改错字/纯闲聊除外）：把一句目标路由到一条流程（feature / feature-multi / bug-fix / investigate / refactor / release / docs / afk-run），给出该流程要调用的 skill、产物路径、必跑门禁和提交纪律。用户提到"走流程""选 skill""AFK""无人值守""该跑哪些检查"时也用它。
+description: lazy-observe 的单一工作入口。改代码、改配置、发版、写文档或排查代码问题前使用（单行改错字/纯闲聊除外）：把一句目标路由到一条流程（feature / feature-multi / bug-fix / investigate / refactor / release / docs），给出该流程要调用的 skill、产物路径、必跑门禁和提交纪律。用户提到"走流程""选 skill""该跑哪些检查"时也用它。
 ---
 
 # do
 
 本仓库的工作流路由入口，按情境选定一条流程并串联所需 skill。
-`.agents/skills/` 下分两类 skill：未设 `disable-model-invocation` 的可由模型自动发现调用（出现在 `<skills>` 列表中）；带 `disable-model-invocation: true` 的（如 `implement`、`to-spec`、`to-tickets`、`implement-spec`、`chief-of-staff`、`grill-with-docs`、`wayfinder`、`triage`、`retro`）不会注入 `<skills>` 列表，路由命中时由用户触发或由 agent 直接读取 `.agents/skills/<name>/SKILL.md` 执行。
+`.agents/skills/` 下分两类 skill：未设 `disable-model-invocation` 的可由模型自动发现调用（出现在 `<skills>` 列表中）；带 `disable-model-invocation: true` 的（如 `implement`、`to-spec`、`to-tickets`、`implement-spec`、`grill-with-docs`、`triage`、`retro`）不会注入 `<skills>` 列表，路由命中时由用户触发或由 agent 直接读取 `.agents/skills/<name>/SKILL.md` 执行。
 先读 `AGENTS.md`，再读本文件；两者冲突时以 `AGENTS.md` 为准。
 
 ## 入口契约
@@ -40,9 +40,7 @@ description: lazy-observe 的单一工作入口。改代码、改配置、发版
 | 不改外部行为的结构重构 | refactor | `/skill:tdd` 保护接缝 | 全绿 diff |
 | 发版、打 tag、容器镜像与 Release 资产 | release | `/skill:wizard` 处理凭据 | `docs/version-matrix.md` + tag + GitHub Release |
 | 文档、README、调研归档 | docs | 直接改 | 按读者选目录：用户文档放 `docs/`，AI/规划放 `.agents/docs/`（见 `AGENTS.md`） |
-| 长时间无人值守 | afk-run | `/skill:chief-of-staff` + `/skill:implement-spec` | `.agents/docs/afk/<goal>/` |
-| 方向没定、要拍板 | 先 `/skill:grill-with-docs`，再回本文件 | ADR | `.agents/docs/adr/` |
-| 范围过大、边界和依赖还不清楚 | `/skill:wayfinder`，厘清范围后再回本文件 | 决策票 | GitHub issue |
+| 方向没定、范围不清、要拍板 | 先 `/skill:grill-with-docs`，再回本文件 | ADR | `.agents/docs/adr/` |
 
 `/skill:to-spec` 和 `/skill:to-tickets` 产出的票已经带 `ready-for-agent`，不要再 triage。
 外部来的 bug 报告或功能请求才走 `/skill:triage`。
@@ -77,10 +75,6 @@ description: lazy-observe 的单一工作入口。改代码、改配置、发版
 2. 更新 `docs/version-matrix.md`（先矩阵、后发布），确认该提交的 CI 为绿；Release Notes 由 `.goreleaser.yaml` 从 `git log` 自动生成（首个正式版发布前不维护 `CHANGELOG.md`）。
 3. 打 tag 属于「必须停下来等人」的动作：由负责人确认后再打。`release.yml` 的 `storage-bin-scan` 命中只警告，
    发版后看 run 的 step summary 里的警告表即可；扫描失败才会挡住出包。
-
-### afk-run
-
-见下一节。afk-run 是 feature/feature-multi 的无人值守版本，步骤相同，只多了暂停条件和决策日志。
 
 ## 验证矩阵
 
@@ -181,13 +175,13 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 
 触发：`gh workflow run bench.yml --ref <branch>`，再用 `gh run list --workflow bench.yml --event workflow_dispatch --limit 1` 取 run id，`gh run watch <id>`。`gh` 未登录时，请负责人在 GitHub 网页 Actions → 对应 workflow → Run workflow 手动触发。
 
-## AFK 契约
+## 执行契约
 
-无人值守只在同时满足三条时开始：
+开始执行前同时满足三条：
 
 1. **可判定的退出谓词**：一条命令，例如 `mise run test` 或 `mise run e2e`。它现在要么红（bug-fix），要么绿（feature 的基线），不能是"看起来差不多"。
 2. **有界范围**：一个 plan 文件或一张票，写清 in scope / out of scope。
-3. **可审计的记忆**：长任务用 `/skill:chief-of-staff`，记忆放 `.agents/docs/afk/<goal>/`（`index.md` + 每页一件事）。每条结论带日期；涉及代码的结论带 commit。短任务把执行日志追加到 `.agents/docs/plans/<topic>.md` 的 `## 执行日志`，每条一行：`<时间> <命令> → <结论>`。不进日志的动作视为没发生。
+3. **可审计的记忆**：执行日志追加到 `.agents/docs/plans/<topic>.md` 的 `## 执行日志`，每条一行：`<时间> <命令> → <结论>`；涉及代码的结论带 commit。不进日志的动作视为没发生。
 
 必须停下来等人的情况：
 

@@ -12,13 +12,13 @@ BIN_DIR=${LO_E2E_STORAGE_BIN_DIR:-"$ROOT/.cache/storage-bin"}
 # static binary and CA bundle (same entrypoint and ports as the Alpine default).
 # They are pulled from quay.io, VictoriaMetrics' second official registry, whose
 # -cluster digests are identical to Docker Hub's.
-VMSTORAGE_IMAGE=${LO_E2E_VMSTORAGE_IMAGE:-quay.io/victoriametrics/vmstorage:v1.156.0-cluster-scratch@sha256:af5ff1687fbdce82ad4efa77b83cff78ff42b866aa7ef8628ee6c7166268adec}
-VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-quay.io/victoriametrics/vminsert:v1.156.0-cluster-scratch@sha256:41fbf25df0ab77a12cae8ed0d2e8d76cd8d922e4e2fb824818f1087641a80e5e}
-VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-quay.io/victoriametrics/vmselect:v1.156.0-cluster-scratch@sha256:310ba425872897a618e60b884dc943772767d8ef0bad37a71c8e01678c232009}
+VMSTORAGE_IMAGE=${LO_E2E_VMSTORAGE_IMAGE:-quay.io/victoriametrics/vmstorage:v1.157.0-cluster-scratch@sha256:6e43af80162367bd54526e988fe7c1d03891cef1f93aec36ba19e22f4ac6c422}
+VMINSERT_IMAGE=${LO_E2E_VMINSERT_IMAGE:-quay.io/victoriametrics/vminsert:v1.157.0-cluster-scratch@sha256:72c0b0041ca31f67c99083f127d2cba2e1cb9f26a942981c3d60e637230dea00}
+VMSELECT_IMAGE=${LO_E2E_VMSELECT_IMAGE:-quay.io/victoriametrics/vmselect:v1.157.0-cluster-scratch@sha256:c2bab3ad0ac24b0d8ddfa19b34e140143e792cee3fd226d36fed9856f7ca640d}
 # SeaweedFS is Apache-2.0 and provides a real S3-compatible API without adding
 # a copyleft test dependency. Upstream only publishes Alpine-based images, so
 # this one stays Alpine; the digest pin keeps the gate repeatable.
-SEAWEED_IMAGE=${LO_E2E_SEAWEED_IMAGE:-chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0}
+SEAWEED_IMAGE=${LO_E2E_SEAWEED_IMAGE:-chrislusf/seaweedfs:4.54@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15}
 # Valkey is Redis-protocol compatible and BSD-3-Clause. Keep both the version
 # and multi-platform manifest digest fixed so this gate cannot drift to a
 # differently licensed Redis release through a floating image tag.
