@@ -25,5 +25,5 @@
 
 - 两份配置参数保持一致：Claude Code 读根目录 `.mcp.json`，agy 读仓库内插件 `.agents/plugins/playwright/`（`plugin.json` + `mcp_config.json`，会话里工具名前缀为 `playwright_playwright`）。升级时两处版本一起改，版本发布满 7 天。
 - 参数：`--browser chromium --headless --isolated --snapshot-boxes`。chromium 用 Playwright 自带浏览器（缓存在 `~/.cache/ms-playwright`，本机没有时先 `npx playwright install chromium`）；`--snapshot-boxes` 让快照带每个元素的 `[box=x,y,宽,高]`，可以直接比较同一栏控件高度。快照输出在 `.playwright-mcp/`（已 git 忽略）。
-- Claude Code 对 `.mcp.json` 的批准来自 `.claude/settings.json` 的 `enabledMcpjsonServers`，只在接受过工作区信任的目录里生效；新 worktree 里先运行一次 `claude` 接受信任。
+- Claude Code 对 `.mcp.json` 的批准来自 `.claude/settings.json` 的 `enabledMcpjsonServers`，只在受信任的仓库里生效。信任记录按主仓库路径存放，所有 git worktree 共用：在主仓库目录运行一次 `claude` 接受信任即可，不用每个 worktree 各接受一次；只信任 worktree 的上级目录不算数。
 - 被测页面：`mise run dev-web`（或 `VITE_MOCK=1` 离线 mock）起本地前端，再让 MCP 打开对应地址。
