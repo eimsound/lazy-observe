@@ -47,3 +47,25 @@ sdk/python/examples/django/db.sqlite3
 
 # Claude Code 本机设置（个人权限放行规则等），不进仓库；共享设置用 .claude/settings.json
 .claude/settings.local.json
+
+# Playwright MCP 的快照与截图输出（.mcp.json、.agents/plugins/playwright）
+.playwright-mcp/
+
+# impeccable：只跟踪共享配置（.impeccable/config.json 等），运行时状态与缓存不进仓库
+**/.impeccable/config.local.json
+**/.impeccable/hook.cache.json
+**/.impeccable/hook.pending.json
+**/.impeccable/*.png
+**/.impeccable/review/
+**/.impeccable/questions/
+**/.impeccable/live/server.json
+**/.impeccable/live/sessions/
+**/.impeccable/live/previews/
+**/.impeccable/live/annotations/
+**/.impeccable/live/cache/
+**/.impeccable/live/manual-edit-apply-transaction.json
+**/.impeccable/live/manual-edit-events.jsonl
+**/.impeccable/live/manual-edit-evidence/
+**/.impeccable/live/pending-manual-edits.json
+**/.impeccable/live/deferred-svelte-component-accepts.json
+**/.impeccable/live/*.png

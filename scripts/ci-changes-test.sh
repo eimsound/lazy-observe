@@ -8,7 +8,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 script="$root/scripts/ci-changes.sh"
-flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys trivy_pin docs)
+flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python sdk_journeys trivy_pin docs design)
 failures=0
 
 changes_for() {
@@ -154,6 +154,13 @@ expect_only_flags 'docs/zensical.toml' docs
 expect_only_flags 'docs/zensical.zh.toml' docs
 expect_only_flags 'docs/pyproject.toml' go docs
 expect_only_flags 'README.md'
+
+# --- 5.6 DESIGN.md（只跑 design-lint；web/DESIGN.md 等其它 *.md 不触发）与 agent 工具配置（不跑业务 job） ---
+expect_only_flags 'DESIGN.md' design
+expect_only_flags 'web/DESIGN.md'
+expect_only_flags '.mcp.json'
+expect_only_flags '.impeccable/config.json'
+expect_only_flags '.agents/plugins/playwright/mcp_config.json'
 
 # --- 6. --all 与无可用 base 事件兜底 ---
 got=$(GITHUB_OUTPUT='' bash "$script" --all 2>/dev/null)

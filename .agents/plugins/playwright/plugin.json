@@ -1,0 +1,6 @@
+{
+  "name": "playwright",
+  "displayName": "Playwright MCP",
+  "version": "0.0.85",
+  "description": "Headless Chromium via @playwright/mcp for checking rendered web UI (snapshots include element bounding boxes). Keep args in sync with the repo-root .mcp.json used by Claude Code."
+}
