@@ -34,6 +34,8 @@ const (
 	defaultEvaluatorStormThreshold    = 10
 	defaultEvaluatorMaxConcurrency    = 4
 	minLeaseRenewalInterval           = 50 * time.Millisecond
+	maxEvaluationDueSlack             = 250 * time.Millisecond
+	maxWarnedInvalidIntervals         = 1024
 )
 
 type SignalBackend interface {
@@ -126,12 +128,14 @@ type RuleEvaluator struct {
 	wakeOutbox        func()
 	now               func() time.Time
 
-	mu           sync.Mutex
-	leases       map[int]meta.AlertRuleLease
-	next         map[int]time.Time
-	ruleStatuses map[int]RuleEvaluationStatus
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	mu              sync.Mutex
+	leases          map[int]meta.AlertRuleLease
+	lastDue         map[int]time.Time
+	wakeAt          map[int]time.Time
+	warnedIntervals map[int]string
+	ruleStatuses    map[int]RuleEvaluationStatus
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 
 	evaluationsTotal          atomic.Uint64
 	evaluationErrorsTotal     atomic.Uint64
@@ -201,10 +205,12 @@ func NewRuleEvaluator(cfg RuleEvaluatorConfig) *RuleEvaluator {
 		queryTimeout: cfg.QueryTimeout, now: cfg.Now,
 		groupWait: cfg.GroupWait, repeatInterval: cfg.RepeatInterval,
 		stormThreshold: cfg.StormThreshold, maxConcurrency: cfg.MaxConcurrency,
-		wakeOutbox:   cfg.WakeOutbox,
-		leases:       make(map[int]meta.AlertRuleLease),
-		next:         make(map[int]time.Time),
-		ruleStatuses: make(map[int]RuleEvaluationStatus),
+		wakeOutbox:      cfg.WakeOutbox,
+		leases:          make(map[int]meta.AlertRuleLease),
+		lastDue:         make(map[int]time.Time),
+		wakeAt:          make(map[int]time.Time),
+		warnedIntervals: make(map[int]string),
+		ruleStatuses:    make(map[int]RuleEvaluationStatus),
 	}
 }
 
@@ -266,6 +272,7 @@ func (e *RuleEvaluator) ClearRuleStatus(ruleID int) {
 	}
 	e.mu.Lock()
 	delete(e.ruleStatuses, ruleID)
+	delete(e.warnedIntervals, ruleID)
 	e.mu.Unlock()
 }
 
@@ -422,6 +429,8 @@ func (e *RuleEvaluator) renewLeases(ctx context.Context) {
 	for _, lost := range stale {
 		if current, ok := e.leases[lost.RuleID]; ok && current.Epoch == lost.Epoch {
 			delete(e.leases, lost.RuleID)
+			delete(e.lastDue, lost.RuleID)
+			delete(e.wakeAt, lost.RuleID)
 		}
 	}
 	e.mu.Unlock()
@@ -456,6 +465,7 @@ func (e *RuleEvaluator) evaluateCycle(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	cycleNow := e.now().UTC()
 	cycleStart := time.Now()
 	defer func() {
 		e.lastCycleDuration.Store(time.Since(cycleStart).Nanoseconds())
@@ -484,14 +494,20 @@ func (e *RuleEvaluator) evaluateCycle(ctx context.Context) {
 		}
 		return
 	}
-	e.evaluateRules(ctx, rules, memberIDs)
+	e.evaluateRules(ctx, rules, memberIDs, cycleNow)
 }
 
 func (e *RuleEvaluator) evaluateRules(
 	ctx context.Context,
 	rules []meta.AlertRuleView,
 	memberIDs []ownership.MemberID,
+	cycleNow time.Time,
 ) {
+	if cycleNow.IsZero() {
+		cycleNow = e.now().UTC()
+	} else {
+		cycleNow = cycleNow.UTC()
+	}
 	type evaluationTask struct {
 		rule    *meta.AlertRuleView
 		project *meta.ProjectInfo
@@ -518,7 +534,8 @@ func (e *RuleEvaluator) evaluateRules(
 			e.mu.Lock()
 			knownEpoch := e.leases[rule.ID].Epoch
 			delete(e.leases, rule.ID)
-			delete(e.next, rule.ID)
+			delete(e.lastDue, rule.ID)
+			delete(e.wakeAt, rule.ID)
 			e.mu.Unlock()
 			slog.Warn("skip alert rule evaluation after lease rejection", "rule_id", rule.ID,
 				"member_id", e.memberID, "lease_epoch", knownEpoch, "error", leaseErr)
@@ -557,20 +574,35 @@ func (e *RuleEvaluator) evaluateRules(
 			continue
 		}
 		owned[fresh.ID] = struct{}{}
+		interval := e.ruleInterval(&fresh)
+		slack := e.dueSlack()
 		e.mu.Lock()
 		e.leases[fresh.ID] = lease
-		due := e.next[fresh.ID]
-		now := e.now().UTC()
-		if due.IsZero() || !now.Before(due) {
-			e.next[fresh.ID] = now.Add(e.ruleInterval(&fresh))
+		last, hasLast := e.lastDue[fresh.ID]
+		var evalNow time.Time
+		if !hasLast || last.IsZero() {
+			evalNow = cycleNow
 		} else {
-			now = time.Time{}
+			dueAt := last.Add(interval)
+			if wake, hasWake := e.wakeAt[fresh.ID]; hasWake && !wake.IsZero() && wake.Before(dueAt) {
+				dueAt = wake
+			}
+			if !cycleNow.Add(slack).Before(dueAt) {
+				evalNow = cycleNow
+				if evalNow.Before(dueAt) {
+					evalNow = dueAt
+				}
+			}
+		}
+		if !evalNow.IsZero() {
+			e.lastDue[fresh.ID] = evalNow
+			delete(e.wakeAt, fresh.ID)
 		}
 		e.mu.Unlock()
-		if !now.IsZero() {
+		if !evalNow.IsZero() {
 			freshCopy := fresh
 			dueTasks = append(dueTasks, evaluationTask{
-				rule: &freshCopy, project: &freshCopy.Project, lease: lease, now: now,
+				rule: &freshCopy, project: &freshCopy.Project, lease: lease, now: evalNow,
 			})
 		}
 	}
@@ -626,7 +658,8 @@ func (e *RuleEvaluator) evaluateRuleSafe(
 func (e *RuleEvaluator) discardAcquiredLease(ctx context.Context, lease meta.AlertRuleLease, reason string) {
 	e.mu.Lock()
 	delete(e.leases, lease.RuleID)
-	delete(e.next, lease.RuleID)
+	delete(e.lastDue, lease.RuleID)
+	delete(e.wakeAt, lease.RuleID)
 	e.mu.Unlock()
 	released, err := e.store.ReleaseAlertRuleLease(ctx, lease.RuleID, e.memberID, lease.Epoch)
 	if err != nil {
@@ -696,6 +729,8 @@ func (e *RuleEvaluator) evaluateRule(
 			e.mu.Lock()
 			if current, ok := e.leases[rule.ID]; ok && current.Epoch == lease.Epoch {
 				delete(e.leases, rule.ID)
+				delete(e.lastDue, rule.ID)
+				delete(e.wakeAt, rule.ID)
 			}
 			e.mu.Unlock()
 			slog.Warn("discard native alert evaluation after losing rule lease", "rule_id", rule.ID,
@@ -706,17 +741,113 @@ func (e *RuleEvaluator) evaluateRule(
 		}
 		return
 	}
+	if wake := earliestGroupWaitWake(states, e.groupWait, now); !wake.IsZero() {
+		e.mu.Lock()
+		if current, ok := e.leases[rule.ID]; ok && current.Epoch == lease.Epoch {
+			e.wakeAt[rule.ID] = wake
+		}
+		e.mu.Unlock()
+	}
 	e.recordRuleOutcome(rule.ID, now, time.Since(start), nil)
 	if len(notifications) != 0 && e.wakeOutbox != nil {
 		e.wakeOutbox()
 	}
 }
 
-func (e *RuleEvaluator) ruleInterval(rule *meta.AlertRuleView) time.Duration {
-	if rule.Signal == "logs" {
-		return e.logsInterval
+func (e *RuleEvaluator) dueSlack() time.Duration {
+	if e == nil || e.tickInterval <= 0 {
+		return 0
 	}
-	return e.metricsInterval
+	slack := e.tickInterval / 10
+	if slack > maxEvaluationDueSlack {
+		return maxEvaluationDueSlack
+	}
+	return slack
+}
+
+func (e *RuleEvaluator) defaultIntervalForSignal(signal string) time.Duration {
+	if signal == "logs" {
+		if e != nil && e.logsInterval > 0 {
+			return e.logsInterval
+		}
+		return defaultEvaluatorLogsInterval
+	}
+	if e != nil && e.metricsInterval > 0 {
+		return e.metricsInterval
+	}
+	return defaultEvaluatorMetricsInterval
+}
+
+func (e *RuleEvaluator) ruleInterval(rule *meta.AlertRuleView) time.Duration {
+	signal := ""
+	if rule != nil {
+		signal = rule.Signal
+		if raw := strings.TrimSpace(rule.EvaluationInterval); raw != "" {
+			d, err := prommodel.ParseDuration(raw)
+			if err == nil && time.Duration(d) > 0 {
+				e.clearInvalidIntervalWarning(rule.ID)
+				return time.Duration(d)
+			}
+			if e.shouldWarnInvalidInterval(rule.ID, rule.EvaluationInterval) {
+				slog.Warn(
+					"invalid alert rule evaluation_interval; falling back to signal default",
+					"rule_id", rule.ID,
+					"value", rule.EvaluationInterval,
+				)
+			}
+		} else {
+			e.clearInvalidIntervalWarning(rule.ID)
+		}
+	}
+	return e.defaultIntervalForSignal(signal)
+}
+
+func (e *RuleEvaluator) shouldWarnInvalidInterval(ruleID int, raw string) bool {
+	if e == nil {
+		return true
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.warnedIntervals == nil {
+		e.warnedIntervals = make(map[int]string)
+	}
+	if prev, ok := e.warnedIntervals[ruleID]; ok && prev == raw {
+		return false
+	}
+	if len(e.warnedIntervals) >= maxWarnedInvalidIntervals {
+		clear(e.warnedIntervals)
+	}
+	e.warnedIntervals[ruleID] = raw
+	return true
+}
+
+func (e *RuleEvaluator) clearInvalidIntervalWarning(ruleID int) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	delete(e.warnedIntervals, ruleID)
+	e.mu.Unlock()
+}
+
+func earliestGroupWaitWake(states []meta.AlertRuleState, groupWait time.Duration, now time.Time) time.Time {
+	if groupWait <= 0 {
+		return time.Time{}
+	}
+	var earliest time.Time
+	for _, st := range states {
+		if st.Status != "firing" || st.FiringSince == nil || st.LastNotifiedAt != nil {
+			continue
+		}
+		readyAt := st.FiringSince.Add(groupWait)
+		if !now.Before(readyAt) {
+			continue
+		}
+		if earliest.IsZero() || readyAt.Before(earliest) {
+			earliest = readyAt
+		}
+	}
+	return earliest
 }
 
 func (e *RuleEvaluator) releaseUnowned(ctx context.Context, owned map[int]struct{}) {
@@ -726,7 +857,9 @@ func (e *RuleEvaluator) releaseUnowned(ctx context.Context, owned map[int]struct
 		if _, ok := owned[ruleID]; !ok {
 			release = append(release, lease)
 			delete(e.leases, ruleID)
-			delete(e.next, ruleID)
+			delete(e.lastDue, ruleID)
+			delete(e.wakeAt, ruleID)
+			delete(e.warnedIntervals, ruleID)
 			delete(e.ruleStatuses, ruleID)
 		}
 	}
@@ -753,6 +886,9 @@ func (e *RuleEvaluator) releaseAll(ctx context.Context) {
 		leases = append(leases, lease)
 	}
 	e.leases = make(map[int]meta.AlertRuleLease)
+	e.lastDue = make(map[int]time.Time)
+	e.wakeAt = make(map[int]time.Time)
+	e.warnedIntervals = make(map[int]string)
 	e.mu.Unlock()
 	for _, lease := range leases {
 		released, err := e.store.ReleaseAlertRuleLease(ctx, lease.RuleID, e.memberID, lease.Epoch)

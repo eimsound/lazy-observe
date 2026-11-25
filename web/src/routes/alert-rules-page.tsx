@@ -9,7 +9,10 @@ import {
   deleteRule,
   listChannels,
   ALERT_SIGNALS,
+  DEFAULT_EVALUATION_INTERVAL,
+  EVALUATION_INTERVAL_BOUNDS,
   SEVERITIES,
+  evaluationIntervalProblem,
   type AlertSignal,
   type AlertRule,
   type AlertRuleInput,
@@ -55,6 +58,7 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { queryViewState } from "./query-view-state";
 
 export function AlertRulesPage() {
@@ -86,6 +90,7 @@ export function AlertRulesPage() {
         signal: rule.signal,
         expr: rule.expr,
         for: rule.for,
+        evaluation_interval: rule.evaluation_interval,
         severity: rule.severity,
         labels: rule.labels,
         annotations: rule.annotations,
@@ -185,6 +190,9 @@ export function AlertRulesPage() {
                     <th className="px-4 py-2.5 font-medium">{t("common.name")}</th>
                     <th className="px-4 py-2.5 font-medium">{t("alerts.colSeverity")}</th>
                     <th className="hidden px-4 py-2.5 font-medium md:table-cell">
+                      {t("alerts.colInterval")}
+                    </th>
+                    <th className="hidden px-4 py-2.5 font-medium md:table-cell">
                       {t("alerts.colFor")}
                     </th>
                     <th className="hidden px-4 py-2.5 font-medium lg:table-cell">
@@ -210,6 +218,20 @@ export function AlertRulesPage() {
                       </td>
                       <td className="px-4 py-3">
                         <SeverityBadge severity={r.severity} />
+                      </td>
+                      <td className="hidden whitespace-nowrap px-4 py-3 font-mono text-xs md:table-cell">
+                        {r.evaluation_interval ? (
+                          r.effective_evaluation_interval
+                        ) : (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="text-muted-foreground">
+                                {r.effective_evaluation_interval}
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>{t("alerts.intervalDefaultTooltip")}</TooltipContent>
+                          </Tooltip>
+                        )}
                       </td>
                       <td className="hidden px-4 py-3 font-mono text-xs text-muted-foreground md:table-cell">
                         {r.for}
@@ -310,6 +332,8 @@ function RuleFormDialog({
   const [signal, setSignal] = useState<AlertSignal>(editing?.signal ?? "metrics");
   const [expr, setExpr] = useState(editing?.expr ?? "");
   const [forDur, setForDur] = useState(editing?.for ?? "5m");
+  // "" keeps the signal default; the server returns the effective value separately.
+  const [evalInterval, setEvalInterval] = useState(editing?.evaluation_interval ?? "");
   const [severity, setSeverity] = useState<Severity>(editing?.severity ?? "warning");
   const [labels, setLabels] = useState<Pair[]>(recordToPairs(editing?.labels ?? {}));
   const [annotations, setAnnotations] = useState<Pair[]>(
@@ -329,13 +353,14 @@ function RuleFormDialog({
       signal,
       expr: expr.trim(),
       for: forDur.trim() || "0m",
+      evaluation_interval: evalInterval.trim(),
       severity,
       labels: pairsToRecord(labels),
       annotations: pairsToRecord(annotations),
       enabled,
       channel_ids: channelIds,
     }),
-    [name, signal, expr, forDur, severity, labels, annotations, enabled, channelIds],
+    [name, signal, expr, forDur, evalInterval, severity, labels, annotations, enabled, channelIds],
   );
 
   const mutation = useMutation({
@@ -351,6 +376,11 @@ function RuleFormDialog({
   function submit() {
     if (!input.name) return setError(t("alerts.nameRequired"));
     if (!input.expr) return setError(t("alerts.exprRequired"));
+    const intervalProblem = evaluationIntervalProblem(input.signal, input.evaluation_interval);
+    if (intervalProblem === "format") return setError(t("alerts.evaluationIntervalFormat"));
+    if (intervalProblem === "range") {
+      return setError(t("alerts.evaluationIntervalInvalid", EVALUATION_INTERVAL_BOUNDS[input.signal]));
+    }
     setError(null);
     mutation.mutate();
   }
@@ -371,8 +401,9 @@ function RuleFormDialog({
         </DialogHeader>
 
         <div className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1.5">
+          {/* Row 1: identity and severity; row 2: how the rule is evaluated. */}
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div className="space-y-1.5 sm:col-span-2">
               <Label htmlFor="r-name">{t("alerts.ruleName")}</Label>
               <Input
                 id="r-name"
@@ -382,49 +413,65 @@ function RuleFormDialog({
                 autoFocus
               />
             </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-1.5">
-                <Label htmlFor="r-for">{t("alerts.forDuration")}</Label>
-                <Input
-                  id="r-for"
-                  value={forDur}
-                  onChange={(e) => setForDur(e.target.value)}
-                  placeholder={t("alerts.forPlaceholder")}
-                  className="font-mono text-sm"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label>{t("alerts.severity")}</Label>
-                <Select value={severity} onValueChange={(v) => setSeverity(v as Severity)}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {SEVERITIES.map((s) => (
-                      <SelectItem key={s} value={s}>
-                        {t(`alerts.sev${s.charAt(0).toUpperCase()}${s.slice(1)}`)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+            <div className="space-y-1.5">
+              <Label>{t("alerts.severity")}</Label>
+              <Select value={severity} onValueChange={(v) => setSeverity(v as Severity)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {SEVERITIES.map((s) => (
+                    <SelectItem key={s} value={s}>
+                      {t(`alerts.sev${s.charAt(0).toUpperCase()}${s.slice(1)}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <Label>{t("alerts.signal")}</Label>
-            <Select value={signal} onValueChange={(value) => setSignal(value as AlertSignal)}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {ALERT_SIGNALS.map((value) => (
-                  <SelectItem key={value} value={value}>
-                    {t(value === "logs" ? "alerts.signalLogs" : "alerts.signalMetrics")}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div className="space-y-1.5">
+              <Label>{t("alerts.signal")}</Label>
+              <Select value={signal} onValueChange={(value) => setSignal(value as AlertSignal)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ALERT_SIGNALS.map((value) => (
+                    <SelectItem key={value} value={value}>
+                      {t(value === "logs" ? "alerts.signalLogs" : "alerts.signalMetrics")}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="r-interval">{t("alerts.evaluationInterval")}</Label>
+              <Input
+                id="r-interval"
+                value={evalInterval}
+                onChange={(e) => setEvalInterval(e.target.value)}
+                placeholder={t("alerts.evaluationIntervalDefault", {
+                  value: DEFAULT_EVALUATION_INTERVAL[signal],
+                })}
+                spellCheck={false}
+                autoComplete="off"
+                className="font-mono text-sm"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="r-for">{t("alerts.forDuration")}</Label>
+              <Input
+                id="r-for"
+                value={forDur}
+                onChange={(e) => setForDur(e.target.value)}
+                placeholder={t("alerts.forPlaceholder")}
+                spellCheck={false}
+                autoComplete="off"
+                className="font-mono text-sm"
+              />
+            </div>
           </div>
 
           <div className="space-y-1.5">

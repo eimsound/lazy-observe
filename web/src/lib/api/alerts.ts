@@ -2,6 +2,9 @@ import { apiGet, apiSend, IS_MOCK, API_ROOT } from "./client";
 import {
   ALERT_SIGNALS,
   CHANNEL_TYPES,
+  DEFAULT_EVALUATION_INTERVAL,
+  EVALUATION_INTERVAL_BOUNDS,
+  evaluationIntervalProblem,
   SEVERITIES,
   normalizeAlertEventList,
   normalizeAlertRule,
@@ -34,7 +37,14 @@ import {
 // Mock data is only for VITE_MOCK builds; load it lazily so it never ships with real chunks.
 const loadMockAlerts = () => import("./mock-alerts");
 
-export { ALERT_SIGNALS, CHANNEL_TYPES, SEVERITIES };
+export {
+  ALERT_SIGNALS,
+  CHANNEL_TYPES,
+  DEFAULT_EVALUATION_INTERVAL,
+  EVALUATION_INTERVAL_BOUNDS,
+  SEVERITIES,
+  evaluationIntervalProblem,
+};
 export type {
   AlertEvent,
   AlertRule,

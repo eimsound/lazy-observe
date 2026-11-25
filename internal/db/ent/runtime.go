@@ -102,28 +102,32 @@ func init() {
 	alertruleDescFor := alertruleFields[4].Descriptor()
 	// alertrule.DefaultFor holds the default value on creation for the for field.
 	alertrule.DefaultFor = alertruleDescFor.Default.(string)
+	// alertruleDescEvaluationInterval is the schema descriptor for evaluation_interval field.
+	alertruleDescEvaluationInterval := alertruleFields[5].Descriptor()
+	// alertrule.DefaultEvaluationInterval holds the default value on creation for the evaluation_interval field.
+	alertrule.DefaultEvaluationInterval = alertruleDescEvaluationInterval.Default.(string)
 	// alertruleDescSeverity is the schema descriptor for severity field.
-	alertruleDescSeverity := alertruleFields[5].Descriptor()
+	alertruleDescSeverity := alertruleFields[6].Descriptor()
 	// alertrule.DefaultSeverity holds the default value on creation for the severity field.
 	alertrule.DefaultSeverity = alertruleDescSeverity.Default.(string)
 	// alertruleDescLabels is the schema descriptor for labels field.
-	alertruleDescLabels := alertruleFields[6].Descriptor()
+	alertruleDescLabels := alertruleFields[7].Descriptor()
 	// alertrule.DefaultLabels holds the default value on creation for the labels field.
 	alertrule.DefaultLabels = alertruleDescLabels.Default.(map[string]string)
 	// alertruleDescAnnotations is the schema descriptor for annotations field.
-	alertruleDescAnnotations := alertruleFields[7].Descriptor()
+	alertruleDescAnnotations := alertruleFields[8].Descriptor()
 	// alertrule.DefaultAnnotations holds the default value on creation for the annotations field.
 	alertrule.DefaultAnnotations = alertruleDescAnnotations.Default.(map[string]string)
 	// alertruleDescEnabled is the schema descriptor for enabled field.
-	alertruleDescEnabled := alertruleFields[8].Descriptor()
+	alertruleDescEnabled := alertruleFields[9].Descriptor()
 	// alertrule.DefaultEnabled holds the default value on creation for the enabled field.
 	alertrule.DefaultEnabled = alertruleDescEnabled.Default.(bool)
 	// alertruleDescCreatedAt is the schema descriptor for created_at field.
-	alertruleDescCreatedAt := alertruleFields[9].Descriptor()
+	alertruleDescCreatedAt := alertruleFields[10].Descriptor()
 	// alertrule.DefaultCreatedAt holds the default value on creation for the created_at field.
 	alertrule.DefaultCreatedAt = alertruleDescCreatedAt.Default.(func() time.Time)
 	// alertruleDescUpdatedAt is the schema descriptor for updated_at field.
-	alertruleDescUpdatedAt := alertruleFields[10].Descriptor()
+	alertruleDescUpdatedAt := alertruleFields[11].Descriptor()
 	// alertrule.DefaultUpdatedAt holds the default value on creation for the updated_at field.
 	alertrule.DefaultUpdatedAt = alertruleDescUpdatedAt.Default.(func() time.Time)
 	// alertrule.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.

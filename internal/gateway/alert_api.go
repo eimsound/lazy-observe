@@ -16,20 +16,50 @@ import (
 )
 
 type alertRuleResponse struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	Signal           string            `json:"signal"`
-	EvaluationEngine string            `json:"evaluation_engine"`
-	Expr             string            `json:"expr"`
-	For              string            `json:"for"`
-	Severity         string            `json:"severity"`
-	Labels           map[string]string `json:"labels"`
-	Annotations      map[string]string `json:"annotations"`
-	Enabled          bool              `json:"enabled"`
-	ChannelIDs       []string          `json:"channel_ids"`
-	LastError        string            `json:"last_error,omitempty"`
-	CreatedAt        string            `json:"created_at"`
-	UpdatedAt        string            `json:"updated_at"`
+	ID                          string            `json:"id"`
+	Name                        string            `json:"name"`
+	Signal                      string            `json:"signal"`
+	EvaluationEngine            string            `json:"evaluation_engine"`
+	Expr                        string            `json:"expr"`
+	For                         string            `json:"for"`
+	EvaluationInterval          string            `json:"evaluation_interval"`
+	EffectiveEvaluationInterval string            `json:"effective_evaluation_interval"`
+	Severity                    string            `json:"severity"`
+	Labels                      map[string]string `json:"labels"`
+	Annotations                 map[string]string `json:"annotations"`
+	Enabled                     bool              `json:"enabled"`
+	ChannelIDs                  []string          `json:"channel_ids"`
+	LastError                   string            `json:"last_error,omitempty"`
+	CreatedAt                   string            `json:"created_at"`
+	UpdatedAt                   string            `json:"updated_at"`
+}
+
+type optionalString struct {
+	set   bool
+	value string
+}
+
+func (o *optionalString) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "null" {
+		o.set = true
+		o.value = ""
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	o.set = true
+	o.value = value
+	return nil
+}
+
+func (o optionalString) pointer() *string {
+	if !o.set {
+		return nil
+	}
+	value := o.value
+	return &value
 }
 
 type apiID int
@@ -57,16 +87,17 @@ func (id *apiID) UnmarshalJSON(data []byte) error {
 }
 
 type alertRuleRequest struct {
-	Name             string            `json:"name"`
-	Signal           string            `json:"signal"`
-	EvaluationEngine string            `json:"evaluation_engine"`
-	Expr             string            `json:"expr"`
-	For              string            `json:"for"`
-	Severity         string            `json:"severity"`
-	Labels           map[string]string `json:"labels"`
-	Annotations      map[string]string `json:"annotations"`
-	Enabled          *bool             `json:"enabled"`
-	ChannelIDs       []apiID           `json:"channel_ids"`
+	Name               string            `json:"name"`
+	Signal             string            `json:"signal"`
+	EvaluationEngine   string            `json:"evaluation_engine"`
+	Expr               string            `json:"expr"`
+	For                string            `json:"for"`
+	EvaluationInterval optionalString    `json:"evaluation_interval"`
+	Severity           string            `json:"severity"`
+	Labels             map[string]string `json:"labels"`
+	Annotations        map[string]string `json:"annotations"`
+	Enabled            *bool             `json:"enabled"`
+	ChannelIDs         []apiID           `json:"channel_ids"`
 }
 
 func (request alertRuleRequest) input(project string) alert.RuleInput {
@@ -78,17 +109,18 @@ func (request alertRuleRequest) input(project string) alert.RuleInput {
 		}
 	}
 	return alert.RuleInput{
-		Project:          project,
-		Name:             request.Name,
-		Signal:           request.Signal,
-		EvaluationEngine: request.EvaluationEngine,
-		Expr:             request.Expr,
-		For:              request.For,
-		Severity:         request.Severity,
-		Labels:           request.Labels,
-		Annotations:      request.Annotations,
-		Enabled:          request.Enabled,
-		ChannelIDs:       channelIDs,
+		Project:            project,
+		Name:               request.Name,
+		Signal:             request.Signal,
+		EvaluationEngine:   request.EvaluationEngine,
+		Expr:               request.Expr,
+		For:                request.For,
+		EvaluationInterval: request.EvaluationInterval.pointer(),
+		Severity:           request.Severity,
+		Labels:             request.Labels,
+		Annotations:        request.Annotations,
+		Enabled:            request.Enabled,
+		ChannelIDs:         channelIDs,
 	}
 }
 
@@ -161,7 +193,7 @@ func anyMap(value map[string]any) map[string]any {
 	return value
 }
 
-func toAlertRuleResponse(value meta.AlertRuleView, lastError string) alertRuleResponse {
+func toAlertRuleResponse(value meta.AlertRuleView, lastError, effectiveInterval string) alertRuleResponse {
 	numericChannelIDs := append([]int(nil), value.ChannelIDs...)
 	sort.Ints(numericChannelIDs)
 	channelIDs := make([]string, 0, len(numericChannelIDs))
@@ -172,30 +204,37 @@ func toAlertRuleResponse(value meta.AlertRuleView, lastError string) alertRuleRe
 		ID: strconv.Itoa(
 			value.ID,
 		),
-		Name:             value.Name,
-		Signal:           value.Signal,
-		EvaluationEngine: value.EvaluationEngine,
-		Expr:             value.Expression,
-		For:              value.For,
-		Severity:         value.Severity,
-		Labels:           stringMap(value.Labels),
-		Annotations:      stringMap(value.Annotations),
-		Enabled:          value.Enabled,
-		ChannelIDs:       channelIDs,
-		LastError:        lastError,
-		CreatedAt:        apiTime(value.CreatedAt),
-		UpdatedAt:        apiTime(value.UpdatedAt),
+		Name:                        value.Name,
+		Signal:                      value.Signal,
+		EvaluationEngine:            value.EvaluationEngine,
+		Expr:                        value.Expression,
+		For:                         value.For,
+		EvaluationInterval:          value.EvaluationInterval,
+		EffectiveEvaluationInterval: effectiveInterval,
+		Severity:                    value.Severity,
+		Labels:                      stringMap(value.Labels),
+		Annotations:                 stringMap(value.Annotations),
+		Enabled:                     value.Enabled,
+		ChannelIDs:                  channelIDs,
+		LastError:                   lastError,
+		CreatedAt:                   apiTime(value.CreatedAt),
+		UpdatedAt:                   apiTime(value.UpdatedAt),
 	}
+}
+
+func (g *Gateway) toAlertRuleResponse(value meta.AlertRuleView) alertRuleResponse {
+	var lastErr, effectiveInterval string
+	if g.alerts != nil {
+		lastErr = g.alerts.RuleLastError(value.ID)
+		effectiveInterval = g.alerts.EffectiveEvaluationInterval(value)
+	}
+	return toAlertRuleResponse(value, lastErr, effectiveInterval)
 }
 
 func (g *Gateway) toAlertRuleResponses(values []meta.AlertRuleView) []alertRuleResponse {
 	out := make([]alertRuleResponse, 0, len(values))
 	for _, value := range values {
-		var lastErr string
-		if g.alerts != nil {
-			lastErr = g.alerts.RuleLastError(value.ID)
-		}
-		out = append(out, toAlertRuleResponse(value, lastErr))
+		out = append(out, g.toAlertRuleResponse(value))
 	}
 	return out
 }
@@ -374,7 +413,7 @@ func (g *Gateway) createAlertRule(c fiber.Ctx) error {
 	audit.TargetID = v.ID
 	audit.TargetName = v.Name
 	audit.Success = true
-	return c.Status(fiber.StatusCreated).JSON(toAlertRuleResponse(v, g.alerts.RuleLastError(v.ID)))
+	return c.Status(fiber.StatusCreated).JSON(g.toAlertRuleResponse(v))
 }
 
 func (g *Gateway) updateAlertRule(c fiber.Ctx) error {
@@ -417,7 +456,7 @@ func (g *Gateway) updateAlertRule(c fiber.Ctx) error {
 	audit.TargetID = v.ID
 	audit.TargetName = v.Name
 	audit.Success = true
-	return c.JSON(toAlertRuleResponse(v, g.alerts.RuleLastError(v.ID)))
+	return c.JSON(g.toAlertRuleResponse(v))
 }
 
 func (g *Gateway) deleteAlertRule(c fiber.Ctx) error {

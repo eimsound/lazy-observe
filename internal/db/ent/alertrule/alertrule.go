@@ -25,6 +25,8 @@ const (
 	FieldExpr = "expr"
 	// FieldFor holds the string denoting the for field in the database.
 	FieldFor = "for"
+	// FieldEvaluationInterval holds the string denoting the evaluation_interval field in the database.
+	FieldEvaluationInterval = "evaluation_interval"
 	// FieldSeverity holds the string denoting the severity field in the database.
 	FieldSeverity = "severity"
 	// FieldLabels holds the string denoting the labels field in the database.
@@ -76,6 +78,7 @@ var Columns = []string{
 	FieldEvaluationEngine,
 	FieldExpr,
 	FieldFor,
+	FieldEvaluationInterval,
 	FieldSeverity,
 	FieldLabels,
 	FieldAnnotations,
@@ -108,6 +111,8 @@ var (
 	ExprValidator func(string) error
 	// DefaultFor holds the default value on creation for the "for" field.
 	DefaultFor string
+	// DefaultEvaluationInterval holds the default value on creation for the "evaluation_interval" field.
+	DefaultEvaluationInterval string
 	// DefaultSeverity holds the default value on creation for the "severity" field.
 	DefaultSeverity string
 	// DefaultLabels holds the default value on creation for the "labels" field.
@@ -207,6 +212,11 @@ func ByExpr(opts ...sql.OrderTermOption) OrderOption {
 // ByFor orders the results by the for field.
 func ByFor(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldFor, opts...).ToFunc()
+}
+
+// ByEvaluationInterval orders the results by the evaluation_interval field.
+func ByEvaluationInterval(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldEvaluationInterval, opts...).ToFunc()
 }
 
 // BySeverity orders the results by the severity field.

@@ -70,6 +70,11 @@ func For(v string) predicate.AlertRule {
 	return predicate.AlertRule(sql.FieldEQ(FieldFor, v))
 }
 
+// EvaluationInterval applies equality check predicate on the "evaluation_interval" field. It's identical to EvaluationIntervalEQ.
+func EvaluationInterval(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldEQ(FieldEvaluationInterval, v))
+}
+
 // Severity applies equality check predicate on the "severity" field. It's identical to SeverityEQ.
 func Severity(v string) predicate.AlertRule {
 	return predicate.AlertRule(sql.FieldEQ(FieldSeverity, v))
@@ -328,6 +333,71 @@ func ForEqualFold(v string) predicate.AlertRule {
 // ForContainsFold applies the ContainsFold predicate on the "for" field.
 func ForContainsFold(v string) predicate.AlertRule {
 	return predicate.AlertRule(sql.FieldContainsFold(FieldFor, v))
+}
+
+// EvaluationIntervalEQ applies the EQ predicate on the "evaluation_interval" field.
+func EvaluationIntervalEQ(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldEQ(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalNEQ applies the NEQ predicate on the "evaluation_interval" field.
+func EvaluationIntervalNEQ(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldNEQ(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalIn applies the In predicate on the "evaluation_interval" field.
+func EvaluationIntervalIn(vs ...string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldIn(FieldEvaluationInterval, vs...))
+}
+
+// EvaluationIntervalNotIn applies the NotIn predicate on the "evaluation_interval" field.
+func EvaluationIntervalNotIn(vs ...string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldNotIn(FieldEvaluationInterval, vs...))
+}
+
+// EvaluationIntervalGT applies the GT predicate on the "evaluation_interval" field.
+func EvaluationIntervalGT(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldGT(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalGTE applies the GTE predicate on the "evaluation_interval" field.
+func EvaluationIntervalGTE(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldGTE(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalLT applies the LT predicate on the "evaluation_interval" field.
+func EvaluationIntervalLT(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldLT(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalLTE applies the LTE predicate on the "evaluation_interval" field.
+func EvaluationIntervalLTE(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldLTE(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalContains applies the Contains predicate on the "evaluation_interval" field.
+func EvaluationIntervalContains(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldContains(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalHasPrefix applies the HasPrefix predicate on the "evaluation_interval" field.
+func EvaluationIntervalHasPrefix(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldHasPrefix(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalHasSuffix applies the HasSuffix predicate on the "evaluation_interval" field.
+func EvaluationIntervalHasSuffix(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldHasSuffix(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalEqualFold applies the EqualFold predicate on the "evaluation_interval" field.
+func EvaluationIntervalEqualFold(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldEqualFold(FieldEvaluationInterval, v))
+}
+
+// EvaluationIntervalContainsFold applies the ContainsFold predicate on the "evaluation_interval" field.
+func EvaluationIntervalContainsFold(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldContainsFold(FieldEvaluationInterval, v))
 }
 
 // SeverityEQ applies the EQ predicate on the "severity" field.

@@ -140,6 +140,13 @@ func TestAlertAPIUsesStableWireContract(t *testing.T) {
 	if rule["signal"] != "logs" {
 		t.Fatalf("rule signal=%#v want logs", rule["signal"])
 	}
+	if rule["evaluation_interval"] != "" || rule["effective_evaluation_interval"] != "1m" {
+		t.Fatalf(
+			"rule evaluation_interval=%#v effective=%#v want \"\" / \"1m\"",
+			rule["evaluation_interval"],
+			rule["effective_evaluation_interval"],
+		)
+	}
 	assertStringIDs(t, rule["channel_ids"], webhookID)
 	assertNoEntFields(t, rule, "edges", "project_id", "channels", "events", "project")
 
@@ -155,12 +162,26 @@ func TestAlertAPIUsesStableWireContract(t *testing.T) {
 	if rule["severity"] != "critical" {
 		t.Fatalf("updated rule=%#v", rule)
 	}
+	if rule["evaluation_interval"] != "" || rule["effective_evaluation_interval"] != "1m" {
+		t.Fatalf(
+			"patched rule evaluation_interval=%#v effective=%#v",
+			rule["evaluation_interval"],
+			rule["effective_evaluation_interval"],
+		)
+	}
 
 	rules := arrayValue(t, request(http.MethodGet, "/api/alert-rules", nil, http.StatusOK))
 	if len(rules) != 1 {
 		t.Fatalf("rules=%#v", rules)
 	}
 	listedRule := objectValue(t, rules[0])
+	if listedRule["evaluation_interval"] != "" || listedRule["effective_evaluation_interval"] != "1m" {
+		t.Fatalf(
+			"listed rule evaluation_interval=%#v effective=%#v",
+			listedRule["evaluation_interval"],
+			listedRule["effective_evaluation_interval"],
+		)
+	}
 	assertStringIDs(t, listedRule["channel_ids"], smtpID)
 	assertNoEntFields(t, listedRule, "edges", "project_id")
 	request(http.MethodPost, "/api/alert-rules", map[string]any{
@@ -1176,4 +1197,173 @@ func (q failingTestRuleQuery) Evaluate(
 	_ time.Time,
 ) ([]alertpkg.RuleSample, error) {
 	return nil, q.err
+}
+
+func TestAlertRuleEvaluationIntervalAPIContract(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	if _, err := store.CreateProject(ctx, "EvalAPI", "eval-api"); err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "eval-api-admin", "password", "admin")
+	alerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		GroupWait:      time.Millisecond,
+		RepeatInterval: time.Hour,
+	})
+	t.Cleanup(alerts.Close)
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	doRaw := func(method, path string, rawBody []byte) (*http.Response, []byte) {
+		t.Helper()
+		var reader io.Reader
+		if rawBody != nil {
+			reader = bytes.NewReader(rawBody)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		req.AddCookie(admin)
+		req.Header.Set("X-LO-Project", "eval-api")
+		if rawBody != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := gw.App().Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return resp, out
+	}
+
+	// POST without evaluation_interval -> default "" and signal-specific effective interval.
+	resp, body := doRaw(http.MethodPost, "/api/alert-rules", []byte(`{"name":"MetricsDefault","expr":"up == 0"}`))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST metrics default status=%d body=%s", resp.StatusCode, body)
+	}
+	var metricsRule alertRuleResponse
+	if err := json.Unmarshal(body, &metricsRule); err != nil {
+		t.Fatal(err)
+	}
+	if metricsRule.EvaluationInterval != "" || metricsRule.EffectiveEvaluationInterval != "5s" {
+		t.Fatalf("metricsRule=%+v want \"\" / \"5s\"", metricsRule)
+	}
+	if !bytes.Contains(body, []byte(`"evaluation_interval":""`)) {
+		t.Fatalf("expected explicit evaluation_interval field in JSON: %s", body)
+	}
+
+	resp, body = doRaw(
+		http.MethodPost,
+		"/api/alert-rules",
+		[]byte(`{"name":"LogsDefault","signal":"logs","expr":"* | stats count() as c"}`),
+	)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST logs default status=%d body=%s", resp.StatusCode, body)
+	}
+	var logsRule alertRuleResponse
+	if err := json.Unmarshal(body, &logsRule); err != nil {
+		t.Fatal(err)
+	}
+	if logsRule.EvaluationInterval != "" || logsRule.EffectiveEvaluationInterval != "1m" {
+		t.Fatalf("logsRule=%+v want \"\" / \"1m\"", logsRule)
+	}
+
+	// POST with canonicalizable duration ("60s" -> "1m").
+	resp, body = doRaw(
+		http.MethodPost,
+		"/api/alert-rules",
+		[]byte(`{"name":"CustomInterval","expr":"up == 0","evaluation_interval":"60s"}`),
+	)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST custom interval status=%d body=%s", resp.StatusCode, body)
+	}
+	var custom alertRuleResponse
+	if err := json.Unmarshal(body, &custom); err != nil {
+		t.Fatal(err)
+	}
+	if custom.EvaluationInterval != "1m" || custom.EffectiveEvaluationInterval != "1m" {
+		t.Fatalf("custom=%+v want 1m / 1m", custom)
+	}
+
+	// PATCH omitting evaluation_interval keeps existing override.
+	resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(`{"severity":"critical"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH omit evaluation_interval status=%d body=%s", resp.StatusCode, body)
+	}
+	if err := json.Unmarshal(body, &custom); err != nil {
+		t.Fatal(err)
+	}
+	if custom.EvaluationInterval != "1m" || custom.EffectiveEvaluationInterval != "1m" {
+		t.Fatalf("patched omit custom=%+v want 1m / 1m", custom)
+	}
+
+	// PATCH with "" resets to default.
+	resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(`{"evaluation_interval":""}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH empty reset status=%d body=%s", resp.StatusCode, body)
+	}
+	if err := json.Unmarshal(body, &custom); err != nil {
+		t.Fatal(err)
+	}
+	if custom.EvaluationInterval != "" || custom.EffectiveEvaluationInterval != "5s" {
+		t.Fatalf("patched empty reset custom=%+v want \"\" / \"5s\"", custom)
+	}
+
+	// PATCH to "10s", then PATCH with null resets to default.
+	resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(`{"evaluation_interval":"10s"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH set 10s status=%d body=%s", resp.StatusCode, body)
+	}
+	// Switching metrics(10s) -> logs without resetting evaluation_interval fails with 400.
+	resp, body = doRaw(
+		http.MethodPatch,
+		"/api/alert-rules/"+custom.ID,
+		[]byte(`{"signal":"logs","expr":"* | stats count() as c"}`),
+	)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH signal switch with 10s override status=%d want 400 body=%s", resp.StatusCode, body)
+	}
+
+	resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(`{"evaluation_interval":null}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH null reset status=%d body=%s", resp.StatusCode, body)
+	}
+	if err := json.Unmarshal(body, &custom); err != nil {
+		t.Fatal(err)
+	}
+	if custom.EvaluationInterval != "" || custom.EffectiveEvaluationInterval != "5s" {
+		t.Fatalf("patched null reset custom=%+v want \"\" / \"5s\"", custom)
+	}
+
+	// Invalid payloads on POST and PATCH must return 400.
+	badPayloads := []string{
+		`{"name":"BadTypeNum","expr":"up == 0","evaluation_interval":30}`,
+		`{"name":"BadTypeBool","expr":"up == 0","evaluation_interval":true}`,
+		`{"name":"BadTypeObj","expr":"up == 0","evaluation_interval":{}}`,
+		`{"name":"BadDur","expr":"up == 0","evaluation_interval":"abc"}`,
+		`{"name":"BadZero","expr":"up == 0","evaluation_interval":"0s"}`,
+		`{"name":"BadStep","expr":"up == 0","evaluation_interval":"7s"}`,
+		`{"name":"BadMinMetrics","expr":"up == 0","evaluation_interval":"4s"}`,
+		`{"name":"BadMax","expr":"up == 0","evaluation_interval":"1h5s"}`,
+		`{"name":"BadMinLogs","signal":"logs","expr":"* | stats count() as c","evaluation_interval":"25s"}`,
+	}
+	for _, raw := range badPayloads {
+		resp, body = doRaw(http.MethodPost, "/api/alert-rules", []byte(raw))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST invalid %s status=%d want 400 body=%s", raw, resp.StatusCode, body)
+		}
+	}
+	for _, raw := range []string{
+		`{"evaluation_interval":30}`,
+		`{"evaluation_interval":"7s"}`,
+		`{"evaluation_interval":"4s"}`,
+	} {
+		resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(raw))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("PATCH invalid %s status=%d want 400 body=%s", raw, resp.StatusCode, body)
+		}
+	}
 }

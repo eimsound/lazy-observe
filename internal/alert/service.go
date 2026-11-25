@@ -32,6 +32,11 @@ const (
 	platformConfigCacheTTL        = 5 * time.Second
 	platformRecoveryCheckInterval = 5 * time.Second
 	maxRuleExprLength             = 8192
+
+	MinMetricsEvaluationInterval = 5 * time.Second
+	MinLogsEvaluationInterval    = 30 * time.Second
+	MaxEvaluationInterval        = time.Hour
+	EvaluationIntervalStep       = 5 * time.Second
 )
 
 type cachedPlatformConfig struct {
@@ -224,17 +229,63 @@ func (s *Service) Diagnostics(ctx context.Context) (AlertDiagnostics, error) {
 }
 
 type RuleInput struct {
-	Project          string            `json:"project"`
-	Name             string            `json:"name"`
-	Signal           string            `json:"signal"`
-	EvaluationEngine string            `json:"evaluation_engine"`
-	Expr             string            `json:"expr"`
-	For              string            `json:"for"`
-	Severity         string            `json:"severity"`
-	Labels           map[string]string `json:"labels"`
-	Annotations      map[string]string `json:"annotations"`
-	Enabled          *bool             `json:"enabled"`
-	ChannelIDs       []int             `json:"channel_ids"`
+	Project            string            `json:"project"`
+	Name               string            `json:"name"`
+	Signal             string            `json:"signal"`
+	EvaluationEngine   string            `json:"evaluation_engine"`
+	Expr               string            `json:"expr"`
+	For                string            `json:"for"`
+	EvaluationInterval *string           `json:"evaluation_interval"`
+	Severity           string            `json:"severity"`
+	Labels             map[string]string `json:"labels"`
+	Annotations        map[string]string `json:"annotations"`
+	Enabled            *bool             `json:"enabled"`
+	ChannelIDs         []int             `json:"channel_ids"`
+}
+
+// NormalizeRuleEvaluationInterval validates and canonicalizes a per-rule
+// evaluation interval for signal. Empty/whitespace input returns "" to indicate
+// the signal default.
+func NormalizeRuleEvaluationInterval(signal, raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	effectiveSignal := strings.TrimSpace(signal)
+	if effectiveSignal == "" {
+		effectiveSignal = "metrics"
+	}
+	var minInterval time.Duration
+	switch effectiveSignal {
+	case "metrics":
+		minInterval = MinMetricsEvaluationInterval
+	case "logs":
+		minInterval = MinLogsEvaluationInterval
+	default:
+		return "", fmt.Errorf("%w: unsupported alert signal %q", ErrInvalidInput, signal)
+	}
+	parsed, err := prommodel.ParseDuration(trimmed)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%w: invalid alert evaluation_interval %q: must be a duration such as 30s or 1m",
+			ErrInvalidInput,
+			trimmed,
+		)
+	}
+	d := time.Duration(parsed)
+	if d <= 0 || d < minInterval || d > MaxEvaluationInterval {
+		return "", fmt.Errorf(
+			"%w: alert evaluation_interval for %s rules must be between %s and %s",
+			ErrInvalidInput,
+			effectiveSignal,
+			prommodel.Duration(minInterval).String(),
+			prommodel.Duration(MaxEvaluationInterval).String(),
+		)
+	}
+	if d%EvaluationIntervalStep != 0 {
+		return "", fmt.Errorf("%w: alert evaluation_interval %q must be a multiple of 5s", ErrInvalidInput, trimmed)
+	}
+	return prommodel.Duration(d).String(), nil
 }
 
 // ValidateRuleFor validates a Prometheus-style duration string for a rule's
@@ -337,6 +388,17 @@ func NormalizeChannelConfig(kind string, config map[string]any) map[string]any {
 	return out
 }
 
+// EffectiveEvaluationInterval returns the Prometheus duration string used by
+// the native rule evaluator for rule, falling back to the signal default when
+// no per-rule override is configured.
+func (s *Service) EffectiveEvaluationInterval(rule meta.AlertRuleView) string {
+	var eval *RuleEvaluator
+	if s != nil {
+		eval = s.evaluator
+	}
+	return prommodel.Duration(eval.ruleInterval(&rule)).String()
+}
+
 func (s *Service) ListRules(ctx context.Context, slug string) ([]meta.AlertRuleView, error) {
 	return s.store.ListAlertRules(ctx, slug)
 }
@@ -365,20 +427,29 @@ func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleV
 	if err := ValidateRuleFor(forDuration); err != nil {
 		return meta.AlertRuleView{}, err
 	}
+	evaluationInterval := ""
+	if in.EvaluationInterval != nil {
+		var normErr error
+		evaluationInterval, normErr = NormalizeRuleEvaluationInterval(signal, *in.EvaluationInterval)
+		if normErr != nil {
+			return meta.AlertRuleView{}, normErr
+		}
+	}
 	if err := ValidateRuleLabels(in.Labels); err != nil {
 		return meta.AlertRuleView{}, err
 	}
 	return s.store.CreateAlertRule(ctx, meta.AlertRuleCreate{
-		ProjectSlug: in.Project,
-		Name:        name,
-		Signal:      signal,
-		Expression:  expr,
-		For:         forDuration,
-		Severity:    defaultString(strings.TrimSpace(in.Severity), "warning"),
-		Labels:      nonNilMap(in.Labels),
-		Annotations: nonNilMap(in.Annotations),
-		Enabled:     in.Enabled,
-		ChannelIDs:  in.ChannelIDs,
+		ProjectSlug:        in.Project,
+		Name:               name,
+		Signal:             signal,
+		Expression:         expr,
+		For:                forDuration,
+		EvaluationInterval: evaluationInterval,
+		Severity:           defaultString(strings.TrimSpace(in.Severity), "warning"),
+		Labels:             nonNilMap(in.Labels),
+		Annotations:        nonNilMap(in.Annotations),
+		Enabled:            in.Enabled,
+		ChannelIDs:         in.ChannelIDs,
 	})
 }
 
@@ -422,6 +493,18 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 	if in.Expr != "" || trimmedSignal != "" {
 		if err := ValidateRuleExpr(effectiveSignal, effectiveExpr); err != nil {
 			return meta.AlertRuleView{}, err
+		}
+	}
+	var normalizedEvalInterval *string
+	if in.EvaluationInterval != nil {
+		norm, normErr := NormalizeRuleEvaluationInterval(effectiveSignal, *in.EvaluationInterval)
+		if normErr != nil {
+			return meta.AlertRuleView{}, normErr
+		}
+		normalizedEvalInterval = &norm
+	} else if trimmedSignal != "" && trimmedSignal != old.Signal && old.EvaluationInterval != "" {
+		if _, normErr := NormalizeRuleEvaluationInterval(effectiveSignal, old.EvaluationInterval); normErr != nil {
+			return meta.AlertRuleView{}, normErr
 		}
 	}
 	resolveFiring := (in.Expr != "" && effectiveExpr != old.Expression) ||
@@ -493,6 +576,9 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 	if in.For != "" {
 		trimmedFor := strings.TrimSpace(in.For)
 		update.For = &trimmedFor
+	}
+	if normalizedEvalInterval != nil {
+		update.EvaluationInterval = normalizedEvalInterval
 	}
 	if in.Severity != "" {
 		trimmedSeverity := strings.TrimSpace(in.Severity)

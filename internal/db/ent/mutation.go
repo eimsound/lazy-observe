@@ -1732,32 +1732,33 @@ func (m *AlertEventMutation) ResetEdge(name string) error {
 // AlertRuleMutation represents an operation that mutates the AlertRule nodes in the graph.
 type AlertRuleMutation struct {
 	config
-	op                Op
-	typ               string
-	id                *int
-	name              *string
-	signal            *alertrule.Signal
-	evaluation_engine *alertrule.EvaluationEngine
-	expr              *string
-	_for              *string
-	severity          *string
-	labels            *map[string]string
-	annotations       *map[string]string
-	enabled           *bool
-	created_at        *time.Time
-	updated_at        *time.Time
-	clearedFields     map[string]struct{}
-	project           *int
-	clearedproject    bool
-	channels          map[int]struct{}
-	removedchannels   map[int]struct{}
-	clearedchannels   bool
-	events            map[int]struct{}
-	removedevents     map[int]struct{}
-	clearedevents     bool
-	done              bool
-	oldValue          func(context.Context) (*AlertRule, error)
-	predicates        []predicate.AlertRule
+	op                  Op
+	typ                 string
+	id                  *int
+	name                *string
+	signal              *alertrule.Signal
+	evaluation_engine   *alertrule.EvaluationEngine
+	expr                *string
+	_for                *string
+	evaluation_interval *string
+	severity            *string
+	labels              *map[string]string
+	annotations         *map[string]string
+	enabled             *bool
+	created_at          *time.Time
+	updated_at          *time.Time
+	clearedFields       map[string]struct{}
+	project             *int
+	clearedproject      bool
+	channels            map[int]struct{}
+	removedchannels     map[int]struct{}
+	clearedchannels     bool
+	events              map[int]struct{}
+	removedevents       map[int]struct{}
+	clearedevents       bool
+	done                bool
+	oldValue            func(context.Context) (*AlertRule, error)
+	predicates          []predicate.AlertRule
 }
 
 var _ ent.Mutation = (*AlertRuleMutation)(nil)
@@ -2036,6 +2037,42 @@ func (m *AlertRuleMutation) OldFor(ctx context.Context) (v string, err error) {
 // ResetFor resets all changes to the "for" field.
 func (m *AlertRuleMutation) ResetFor() {
 	m._for = nil
+}
+
+// SetEvaluationInterval sets the "evaluation_interval" field.
+func (m *AlertRuleMutation) SetEvaluationInterval(s string) {
+	m.evaluation_interval = &s
+}
+
+// EvaluationInterval returns the value of the "evaluation_interval" field in the mutation.
+func (m *AlertRuleMutation) EvaluationInterval() (r string, exists bool) {
+	v := m.evaluation_interval
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldEvaluationInterval returns the old "evaluation_interval" field's value of the AlertRule entity.
+// If the AlertRule object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *AlertRuleMutation) OldEvaluationInterval(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldEvaluationInterval is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldEvaluationInterval requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldEvaluationInterval: %w", err)
+	}
+	return oldValue.EvaluationInterval, nil
+}
+
+// ResetEvaluationInterval resets all changes to the "evaluation_interval" field.
+func (m *AlertRuleMutation) ResetEvaluationInterval() {
+	m.evaluation_interval = nil
 }
 
 // SetSeverity sets the "severity" field.
@@ -2459,7 +2496,7 @@ func (m *AlertRuleMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *AlertRuleMutation) Fields() []string {
-	fields := make([]string, 0, 12)
+	fields := make([]string, 0, 13)
 	if m.name != nil {
 		fields = append(fields, alertrule.FieldName)
 	}
@@ -2474,6 +2511,9 @@ func (m *AlertRuleMutation) Fields() []string {
 	}
 	if m._for != nil {
 		fields = append(fields, alertrule.FieldFor)
+	}
+	if m.evaluation_interval != nil {
+		fields = append(fields, alertrule.FieldEvaluationInterval)
 	}
 	if m.severity != nil {
 		fields = append(fields, alertrule.FieldSeverity)
@@ -2514,6 +2554,8 @@ func (m *AlertRuleMutation) Field(name string) (ent.Value, bool) {
 		return m.Expr()
 	case alertrule.FieldFor:
 		return m.For()
+	case alertrule.FieldEvaluationInterval:
+		return m.EvaluationInterval()
 	case alertrule.FieldSeverity:
 		return m.Severity()
 	case alertrule.FieldLabels:
@@ -2547,6 +2589,8 @@ func (m *AlertRuleMutation) OldField(ctx context.Context, name string) (ent.Valu
 		return m.OldExpr(ctx)
 	case alertrule.FieldFor:
 		return m.OldFor(ctx)
+	case alertrule.FieldEvaluationInterval:
+		return m.OldEvaluationInterval(ctx)
 	case alertrule.FieldSeverity:
 		return m.OldSeverity(ctx)
 	case alertrule.FieldLabels:
@@ -2604,6 +2648,13 @@ func (m *AlertRuleMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetFor(v)
+		return nil
+	case alertrule.FieldEvaluationInterval:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetEvaluationInterval(v)
 		return nil
 	case alertrule.FieldSeverity:
 		v, ok := value.(string)
@@ -2720,6 +2771,9 @@ func (m *AlertRuleMutation) ResetField(name string) error {
 		return nil
 	case alertrule.FieldFor:
 		m.ResetFor()
+		return nil
+	case alertrule.FieldEvaluationInterval:
+		m.ResetEvaluationInterval()
 		return nil
 	case alertrule.FieldSeverity:
 		m.ResetSeverity()

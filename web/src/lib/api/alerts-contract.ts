@@ -33,6 +33,10 @@ export interface AlertRule {
   expr: string;
   /** Duration the condition must hold before firing, e.g. "5m". */
   for: string;
+  /** Per-rule evaluation interval override; "" means the signal default. */
+  evaluation_interval: string;
+  /** Interval the evaluator actually uses (server-derived, read-only). */
+  effective_evaluation_interval: string;
   severity: Severity;
   labels: Record<string, string>;
   annotations: Record<string, string>;
@@ -42,11 +46,79 @@ export interface AlertRule {
   updated_at: string;
 }
 
-/** Payload for create/update (server assigns identity and timestamps). */
+/**
+ * Payload for create/update (server assigns identity and timestamps).
+ * `evaluation_interval: ""` resets the rule to the signal default.
+ */
 export type AlertRuleInput = Pick<
   AlertRule,
-  "name" | "signal" | "expr" | "for" | "severity" | "labels" | "annotations" | "enabled" | "channel_ids"
+  | "name"
+  | "signal"
+  | "expr"
+  | "for"
+  | "evaluation_interval"
+  | "severity"
+  | "labels"
+  | "annotations"
+  | "enabled"
+  | "channel_ids"
 > & { evaluation_engine?: "native" };
+
+/**
+ * Mirrors the evaluation interval defaults and bounds in `internal/alert`
+ * (`defaultEvaluator*Interval`, `Min*EvaluationInterval`, `MaxEvaluationInterval`,
+ * `EvaluationIntervalStep`). The server stays authoritative; these only drive the
+ * form placeholder and the localized pre-submit check.
+ */
+export const DEFAULT_EVALUATION_INTERVAL: Record<AlertSignal, string> = {
+  metrics: "5s",
+  logs: "1m",
+};
+export const EVALUATION_INTERVAL_BOUNDS: Record<AlertSignal, { min: string; max: string }> = {
+  metrics: { min: "5s", max: "1h" },
+  logs: { min: "30s", max: "1h" },
+};
+const EVALUATION_INTERVAL_STEP_MS = 5_000;
+
+const DURATION_UNITS: Array<[string, number]> = [
+  ["y", 365 * 24 * 3_600_000],
+  ["w", 7 * 24 * 3_600_000],
+  ["d", 24 * 3_600_000],
+  ["h", 3_600_000],
+  ["m", 60_000],
+  ["s", 1_000],
+  ["ms", 1],
+];
+const DURATION_PATTERN =
+  /^(?:(\d+)y)?(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?(?:(\d+)ms)?$/;
+
+/** Parses a Prometheus duration such as "1m30s" into milliseconds; null when malformed. */
+export function parsePromDurationMs(raw: string): number | null {
+  const trimmed = raw.trim();
+  const match = trimmed === "" ? null : DURATION_PATTERN.exec(trimmed);
+  if (!match) return null;
+  return DURATION_UNITS.reduce(
+    (total, [, unitMs], idx) => total + (match[idx + 1] === undefined ? 0 : Number(match[idx + 1]) * unitMs),
+    0,
+  );
+}
+
+/**
+ * Pre-submit check for an evaluation interval override. Empty means the signal
+ * default. Returns "format" for an unparsable duration, "range" when it is not a
+ * multiple of 5s or falls outside the signal's bounds, otherwise null.
+ */
+export function evaluationIntervalProblem(
+  signal: AlertSignal,
+  raw: string,
+): "format" | "range" | null {
+  if (raw.trim() === "") return null;
+  const ms = parsePromDurationMs(raw);
+  if (ms === null) return "format";
+  const { min, max } = EVALUATION_INTERVAL_BOUNDS[signal];
+  const inBounds = ms >= (parsePromDurationMs(min) ?? 0) && ms <= (parsePromDurationMs(max) ?? Infinity);
+  return ms > 0 && ms % EVALUATION_INTERVAL_STEP_MS === 0 && inBounds ? null : "range";
+}
 
 export interface NotificationChannel {
   id: string;
@@ -239,14 +311,21 @@ export function normalizeAlertRule(value: unknown): AlertRule {
       : (() => {
         throw new TypeError("alert rule.channel_ids must be an array");
       })();
+  const signal: AlertSignal = raw.signal === "logs" ? "logs" : "metrics";
+  const evaluationInterval = optionalString(raw.evaluation_interval, "alert rule.evaluation_interval");
 
   return {
     id: normalizeId(raw.id, "alert rule.id"),
     name: assertString(raw.name, "alert rule.name"),
-    signal: raw.signal === "logs" ? "logs" : "metrics",
+    signal,
     evaluation_engine: raw.evaluation_engine === "paused" ? "paused" : "native",
     expr: assertString(raw.expr, "alert rule.expr"),
     for: optionalString(raw.for, "alert rule.for"),
+    evaluation_interval: evaluationInterval,
+    effective_evaluation_interval:
+      optionalString(raw.effective_evaluation_interval, "alert rule.effective_evaluation_interval") ||
+      evaluationInterval ||
+      DEFAULT_EVALUATION_INTERVAL[signal],
     severity: severityRaw as Severity,
     labels: normalizeStringRecord(raw.labels, "alert rule.labels"),
     annotations: normalizeStringRecord(raw.annotations, "alert rule.annotations"),

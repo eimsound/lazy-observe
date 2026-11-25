@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { afterEach, test, vi } from "vitest";
 
 import {
+  evaluationIntervalProblem,
   normalizeAlertEventList,
   normalizeAlertRuleList,
+  parsePromDurationMs,
   normalizeChannel,
   normalizeChannelList,
   normalizeChannelTestResult,
@@ -189,6 +191,8 @@ test("alert rules and alert events match Go gateway alertRuleResponse & alertEve
       evaluation_engine: "native",
       expr: "up == 0",
       for: "5m",
+      evaluation_interval: "30s",
+      effective_evaluation_interval: "30s",
       severity: "critical",
       labels: { team: "sre" },
       annotations: { summary: "down" },
@@ -197,9 +201,32 @@ test("alert rules and alert events match Go gateway alertRuleResponse & alertEve
       created_at: "2026-11-21T00:00:00Z",
       updated_at: "2026-11-21T00:00:00Z",
     },
+    {
+      id: "8",
+      name: "ErrorLogs",
+      signal: "logs",
+      evaluation_engine: "native",
+      expr: "error | stats count() as n | filter n:>0",
+      for: "0s",
+      evaluation_interval: "",
+      effective_evaluation_interval: "1m",
+      severity: "warning",
+      labels: {},
+      annotations: {},
+      enabled: true,
+      channel_ids: [],
+    },
   ]);
-  assert.equal(rules.length, 1);
+  assert.equal(rules.length, 2);
   assert.deepEqual(rules[0].channel_ids, ["1", "2"]);
+  assert.equal(rules[0].evaluation_interval, "30s");
+  assert.equal(rules[0].effective_evaluation_interval, "30s");
+  assert.equal(rules[1].evaluation_interval, "");
+  assert.equal(rules[1].effective_evaluation_interval, "1m");
+  assert.throws(
+    () => normalizeAlertRuleList([{ ...rules[0], evaluation_interval: 30 }]),
+    /alert rule\.evaluation_interval/,
+  );
 
   const events = normalizeAlertEventList([
     {
@@ -400,4 +427,30 @@ test("inhibition rules API client uses /api/inhibition-rules with project scope,
       (err: unknown) => err instanceof ApiError && err.status === status && err.message === message,
     );
   }
+});
+
+test("evaluation interval pre-check mirrors the server bounds in internal/alert", () => {
+  assert.equal(parsePromDurationMs("1m30s"), 90_000);
+  assert.equal(parsePromDurationMs("1h"), 3_600_000);
+  assert.equal(parsePromDurationMs("abc"), null);
+  assert.equal(parsePromDurationMs(""), null);
+  assert.equal(parsePromDurationMs("60"), null);
+
+  // Empty means "use the signal default".
+  assert.equal(evaluationIntervalProblem("metrics", ""), null);
+  assert.equal(evaluationIntervalProblem("logs", "  "), null);
+
+  assert.equal(evaluationIntervalProblem("metrics", "5s"), null);
+  assert.equal(evaluationIntervalProblem("metrics", "1h"), null);
+  assert.equal(evaluationIntervalProblem("metrics", "4s"), "range");
+  assert.equal(evaluationIntervalProblem("metrics", "7s"), "range");
+  assert.equal(evaluationIntervalProblem("metrics", "1h5s"), "range");
+  assert.equal(evaluationIntervalProblem("metrics", "2500ms"), "range");
+  assert.equal(evaluationIntervalProblem("metrics", "0s"), "range");
+  assert.equal(evaluationIntervalProblem("metrics", "fast"), "format");
+  assert.equal(evaluationIntervalProblem("metrics", "60"), "format");
+
+  assert.equal(evaluationIntervalProblem("logs", "25s"), "range");
+  assert.equal(evaluationIntervalProblem("logs", "30s"), null);
+  assert.equal(evaluationIntervalProblem("logs", "1m30s"), null);
 });
