@@ -10,15 +10,8 @@
 
 ## impeccable 技能
 
-- 位置：`.agents/skills/impeccable/`，Claude Code 经 `.claude/skills` 软链读到，agy 直接读 `.agents/skills/`。许可证见 `.agents/skills/LICENSE-impeccable`。
-- 安装与升级只用 `npx --yes skills add pbakaus/impeccable --skill impeccable -a antigravity -y`，它写 `skills-lock.json` 并保留软链。
-  官方 `npx impeccable install` 会把 `.claude/skills` 软链换成实体目录，还会往 `.claude/settings.local.json` 与 `.agents/hooks.json` 写编辑钩子；本仓库不用它，也没装钩子。
-- 技能脚本 `scripts/impeccable` 首次运行时把引擎二进制下载到 `~/.impeccable/bin/`，按 `scripts/engine-checksums.txt` 校验 sha256。
-- 遥测三层关闭，任何一层为关即关：
-  1. 仓库 `.impeccable/config.json` 的 `"telemetry": false`：只在 cwd 是仓库根目录时被读到（在 `web/src` 等子目录运行时读不到），所以 impeccable 命令一律在仓库根目录运行；
-  2. `.claude/settings.json` 的 `IMPECCABLE_NO_TELEMETRY=1`：Claude Code 会话里任何目录都生效；
-  3. 每台机器的用户级 `impeccable telemetry off`（写 `~/.impeccable/config.json`）：agy 没有项目级环境变量设置，靠这一层兜底。
-  核对：`.agents/skills/impeccable/scripts/impeccable telemetry status`。
+- 位置：`.agents/skills/impeccable/`，Claude Code 经 `.claude/skills` 软链读到，agy 直接读 `.agents/skills/`。
+- impeccable 命令一律在仓库根目录运行：关闭遥测的 `.impeccable/config.json` 只在 cwd 是仓库根目录时被读到。
 - 产品上下文：`PRODUCT.md` 由 `/impeccable init` 生成；`DESIGN.md` 已手写，不要用 `/impeccable document` 覆盖，改它按 `DESIGN.md` 自身约定手改。
 
 ## Playwright MCP
