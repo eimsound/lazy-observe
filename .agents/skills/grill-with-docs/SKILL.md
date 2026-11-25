@@ -1,6 +1,6 @@
 ---
 name: grill-with-docs
-description: A relentless interview to sharpen a plan or design, which also creates docs (ADRs and glossary) as we go.
+description: Grill a plan or design relentlessly while writing its glossary and ADRs. Use when the user wants to stress-test a plan or decision or says 'grill', when sharpening domain terminology, or when writing or editing .agents/docs/GLOSSARY.md or an ADR.
 ---
 
 # Grill with Docs
@@ -45,7 +45,7 @@ The session is done when the frontier is empty: every branch of the design tree 
 │       └── adr/
 │           ├── 0001-event-sourced-orders.md
 │           └── 0002-postgres-for-write-model.md
-└── src/
+└── cmd/, internal/
 ```
 
 Create files lazily: only when you have something to write. If no `.agents/docs/GLOSSARY.md` exists, create one when the first term is resolved. If no `.agents/docs/adr/` exists, create it when the first ADR is needed.
