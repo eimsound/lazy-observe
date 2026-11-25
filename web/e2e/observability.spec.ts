@@ -496,6 +496,30 @@ test("告警规则：表达式按信号使用 PromQL / LogsQL 代码编辑器", 
   await expect(dialog.locator(".cm-editor")).toHaveCount(1);
 });
 
+test("告警规则：评估间隔留空用信号默认值，越界值本地拦截", async ({ page }) => {
+  await openFeature(page, "/alerts/rules");
+  await expect(page.getByRole("columnheader", { name: "间隔" })).toBeVisible();
+  await page.getByRole("button", { name: "新建规则" }).click();
+  const dialog = page.getByRole("dialog");
+  const interval = dialog.getByLabel("评估间隔");
+  await expect(interval).toHaveAttribute("placeholder", "默认 5s");
+
+  await dialog.getByRole("combobox").filter({ hasText: "指标" }).click();
+  await page.getByRole("option", { name: "日志" }).click();
+  await expect(interval).toHaveAttribute("placeholder", "默认 1m");
+
+  await dialog.getByLabel("规则名称").fill("ErrorLogs");
+  const logsql = dialog.getByLabel("LogsQL 表达式");
+  await logsql.click();
+  await logsql.pressSequentially("error | stats count() as n | filter n:>0");
+  await interval.fill("10s");
+  await dialog.getByRole("button", { name: "创建" }).click();
+  await expect(dialog.getByRole("alert")).toHaveText("评估间隔须在 30s–1h 之间，且为 5s 的整数倍");
+  await interval.fill("60");
+  await dialog.getByRole("button", { name: "创建" }).click();
+  await expect(dialog.getByRole("alert")).toHaveText("评估间隔格式无效，例如 30s、1m");
+});
+
 test("日志筛选：双栏弹层支持字段搜索、排序、包含/排除、任意非空与清空", async ({ page }) => {
   await openFeature(page, "/logs?q=*&run=1&view=table&hide_chart=1");
   await expect(page.getByRole("button", { name: "查看日志详情" }).first()).toBeVisible();

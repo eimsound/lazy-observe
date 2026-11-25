@@ -20,34 +20,36 @@ import (
 // AlertRuleView is the metadata-owned rule representation used by callers.
 // Ent edges and generated enums stay inside this package.
 type AlertRuleView struct {
-	ID                int
-	Project           ProjectInfo
-	Name              string
-	Signal            string
-	EvaluationEngine  string
-	Expression        string
-	For               string
-	Severity          string
-	Labels            map[string]string
-	Annotations       map[string]string
-	Enabled           bool
-	ChannelIDs        []int
-	EnabledChannelIDs []int
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                 int
+	Project            ProjectInfo
+	Name               string
+	Signal             string
+	EvaluationEngine   string
+	Expression         string
+	For                string
+	EvaluationInterval string
+	Severity           string
+	Labels             map[string]string
+	Annotations        map[string]string
+	Enabled            bool
+	ChannelIDs         []int
+	EnabledChannelIDs  []int
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type AlertRuleCreate struct {
-	ProjectSlug string
-	Name        string
-	Signal      string
-	Expression  string
-	For         string
-	Severity    string
-	Labels      map[string]string
-	Annotations map[string]string
-	Enabled     *bool
-	ChannelIDs  []int
+	ProjectSlug        string
+	Name               string
+	Signal             string
+	Expression         string
+	For                string
+	EvaluationInterval string
+	Severity           string
+	Labels             map[string]string
+	Annotations        map[string]string
+	Enabled            *bool
+	ChannelIDs         []int
 }
 
 type AlertRuleUpdate struct {
@@ -56,6 +58,7 @@ type AlertRuleUpdate struct {
 	EvaluationEngine          *string
 	Expression                *string
 	For                       *string
+	EvaluationInterval        *string
 	Severity                  *string
 	Labels                    map[string]string
 	Annotations               map[string]string
@@ -200,6 +203,7 @@ func (s *Store) CreateAlertRule(ctx context.Context, input AlertRuleCreate) (Ale
 		SetEvaluationEngine(alertrule.EvaluationEngineNative).
 		SetExpr(input.Expression).
 		SetFor(input.For).
+		SetEvaluationInterval(input.EvaluationInterval).
 		SetSeverity(input.Severity).
 		SetLabels(nonNilStringMap(input.Labels)).
 		SetAnnotations(nonNilStringMap(input.Annotations)).
@@ -257,7 +261,7 @@ func (s *Store) UpdateAlertRule(
 	}
 	defer tx.Rollback()
 
-	selectQuery := `SELECT r.name, r.signal, r.evaluation_engine, r.expr, r."for", r.severity,
+	selectQuery := `SELECT r.name, r.signal, r.evaluation_engine, r.expr, r."for", r.evaluation_interval, r.severity,
 		r.labels, r.annotations, r.enabled
 		FROM alert_rules AS r
 		JOIN projects AS p ON p.id = r.project_id
@@ -266,12 +270,12 @@ func (s *Store) UpdateAlertRule(
 		selectQuery += ` FOR UPDATE OF r`
 	}
 	var (
-		name, signal, evalEngine, expr, forDur, severity string
-		labelsRaw, annotationsRaw                        []byte
-		enabled                                          bool
+		name, signal, evalEngine, expr, forDur, evalInterval, severity string
+		labelsRaw, annotationsRaw                                      []byte
+		enabled                                                        bool
 	)
 	if err := tx.QueryRowContext(ctx, bind(s.dialect, selectQuery), id, projectSlug).Scan(
-		&name, &signal, &evalEngine, &expr, &forDur, &severity, &labelsRaw, &annotationsRaw, &enabled,
+		&name, &signal, &evalEngine, &expr, &forDur, &evalInterval, &severity, &labelsRaw, &annotationsRaw, &enabled,
 	); errors.Is(err, sql.ErrNoRows) {
 		return AlertRuleView{}, &NotFoundError{Label: alertrule.Label}
 	} else if err != nil {
@@ -290,6 +294,9 @@ func (s *Store) UpdateAlertRule(
 	}
 	if input.For != nil {
 		forDur = *input.For
+	}
+	if input.EvaluationInterval != nil {
+		evalInterval = *input.EvaluationInterval
 	}
 	if input.Severity != nil {
 		severity = *input.Severity
@@ -324,10 +331,12 @@ func (s *Store) UpdateAlertRule(
 		bind(
 			s.dialect,
 			`UPDATE alert_rules SET name = ?, signal = ?, evaluation_engine = ?, expr = ?, "for" = ?,
-				severity = ?, labels = ?, annotations = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+				evaluation_interval = ?, severity = ?, labels = ?, annotations = ?, enabled = ?,
+				updated_at = CURRENT_TIMESTAMP
 			 WHERE id = ?`,
 		),
-		name, signal, evalEngine, expr, forDur, severity, string(labelsRaw), string(annotationsRaw), enabled, id,
+		name, signal, evalEngine, expr, forDur, evalInterval, severity,
+		string(labelsRaw), string(annotationsRaw), enabled, id,
 	); err != nil {
 		return AlertRuleView{}, fmt.Errorf("update alert rule: %w", err)
 	}
@@ -558,20 +567,21 @@ func alertRuleView(row *dbent.AlertRule) (AlertRuleView, error) {
 		}
 	}
 	return AlertRuleView{
-		ID:                row.ID,
-		Project:           ProjectInfo{ID: projectRow.ID, Name: projectRow.Name, Slug: projectRow.Slug},
-		Name:              row.Name,
-		Signal:            string(row.Signal),
-		EvaluationEngine:  string(row.EvaluationEngine),
-		Expression:        row.Expr,
-		For:               row.For,
-		Severity:          row.Severity,
-		Labels:            row.Labels,
-		Annotations:       row.Annotations,
-		Enabled:           row.Enabled,
-		ChannelIDs:        channelIDs,
-		EnabledChannelIDs: enabledChannelIDs,
-		CreatedAt:         row.CreatedAt,
-		UpdatedAt:         row.UpdatedAt,
+		ID:                 row.ID,
+		Project:            ProjectInfo{ID: projectRow.ID, Name: projectRow.Name, Slug: projectRow.Slug},
+		Name:               row.Name,
+		Signal:             string(row.Signal),
+		EvaluationEngine:   string(row.EvaluationEngine),
+		Expression:         row.Expr,
+		For:                row.For,
+		EvaluationInterval: row.EvaluationInterval,
+		Severity:           row.Severity,
+		Labels:             row.Labels,
+		Annotations:        row.Annotations,
+		Enabled:            row.Enabled,
+		ChannelIDs:         channelIDs,
+		EnabledChannelIDs:  enabledChannelIDs,
+		CreatedAt:          row.CreatedAt,
+		UpdatedAt:          row.UpdatedAt,
 	}, nil
 }

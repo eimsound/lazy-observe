@@ -1071,7 +1071,7 @@ func TestNativeEvaluatorRefreshesRuleAfterLeaseAcquisition(t *testing.T) {
 		// Now run evaluateRules with the stale snapshot after the interval is due:
 		// AcquireAlertRuleLease obtains a fresh epoch, then must reload the new rule.
 		curTime.Store(now.Add(4 * time.Second).UnixNano())
-		evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{memberID})
+		evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{memberID}, evaluator.now().UTC())
 
 		if seen := query.Expressions(); !slices.Equal(seen, []string{newExpr}) {
 			t.Fatalf("evaluator queried stale expression after lease acquire: got=%v want=[%q]", seen, newExpr)
@@ -1168,7 +1168,7 @@ func TestNativeEvaluatorRefreshesRuleAfterLeaseAcquisition(t *testing.T) {
 					Store: store, Query: query, MemberID: memberID,
 					MetricsInterval: time.Second, LeaseTTL: time.Minute, MemberTTL: time.Minute,
 				})
-				evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{memberID})
+				evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{memberID}, evaluator.now().UTC())
 				if seen := query.Expressions(); len(seen) != 0 {
 					t.Fatalf("ineligible rule after %s should not be queried, got=%v", action, seen)
 				}
@@ -1244,7 +1244,12 @@ func TestNativeEvaluatorRefreshesRuleAfterLeaseAcquisition(t *testing.T) {
 			Store: store, Query: query, MemberID: string(metricsOwner),
 			MetricsInterval: time.Second, LogsInterval: time.Second, LeaseTTL: time.Minute, MemberTTL: time.Minute,
 		})
-		evaluator.evaluateRules(ctx, staleRules, []ownership.MemberID{metricsOwner, logsOwner})
+		evaluator.evaluateRules(
+			ctx,
+			staleRules,
+			[]ownership.MemberID{metricsOwner, logsOwner},
+			evaluator.now().UTC(),
+		)
 
 		if seen := query.Expressions(); len(seen) != 0 {
 			t.Fatalf("previous owner queried rule after signal ownership transfer: %v", seen)
@@ -1421,4 +1426,403 @@ func waitNotificationStatus(t *testing.T, notifications <-chan Notification, sta
 			return Notification{}
 		}
 	}
+}
+
+func TestNativeEvaluatorRuleEvaluationInterval(t *testing.T) {
+	t.Run("override respected", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "EvalOverride", "eval-override")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "Override30s",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "30s",
+			Severity:           "warning",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var cur atomic.Int64
+		t0 := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+		cur.Store(t0.UnixNano())
+		query := &countingRuleQuery{}
+		eval := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           query,
+			MemberID:        "override-member",
+			TickInterval:    5 * time.Second,
+			MetricsInterval: 5 * time.Second,
+			LeaseTTL:        time.Minute,
+			MemberTTL:       time.Minute,
+			Now:             func() time.Time { return time.Unix(0, cur.Load()).UTC() },
+		})
+
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 1 {
+			t.Fatalf("initial calls=%d want 1", got)
+		}
+		for _, offset := range []time.Duration{5 * time.Second, 15 * time.Second, 29 * time.Second} {
+			cur.Store(t0.Add(offset).UnixNano())
+			eval.evaluateCycle(ctx)
+			if got := query.calls.Load(); got != 1 {
+				t.Fatalf("at +%s calls=%d want 1 (before 30s interval)", offset, got)
+			}
+		}
+		cur.Store(t0.Add(30 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 2 {
+			t.Fatalf("at +30s calls=%d want 2", got)
+		}
+	})
+
+	t.Run("cross-replica edit via store shortens and lengthens interval", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "ReplicaEdit", "replica-edit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "ReplicaEditRule",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "1h",
+			Severity:           "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cur atomic.Int64
+		t0 := time.Date(2026, 11, 25, 11, 0, 0, 0, time.UTC)
+		cur.Store(t0.UnixNano())
+		query := &countingRuleQuery{}
+		eval := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           query,
+			MemberID:        "replica-edit-member",
+			TickInterval:    5 * time.Second,
+			MetricsInterval: 5 * time.Second,
+			LeaseTTL:        2 * time.Hour,
+			MemberTTL:       2 * time.Hour,
+			Now:             func() time.Time { return time.Unix(0, cur.Load()).UTC() },
+		})
+
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 1 {
+			t.Fatalf("initial calls=%d want 1", got)
+		}
+
+		// Simulate another replica shortening 1h -> 10s: next tick at +10s evaluates immediately.
+		tenSec := "10s"
+		if _, err := store.UpdateAlertRule(ctx, project.Slug, rule.ID, meta.AlertRuleUpdate{
+			EvaluationInterval: &tenSec,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		cur.Store(t0.Add(10 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 2 {
+			t.Fatalf("after shortening 1h->10s calls=%d want 2", got)
+		}
+
+		// Simulate another replica lengthening 10s -> 1h: +20s defers, +10s+1h evaluates.
+		oneHour := "1h"
+		if _, err := store.UpdateAlertRule(ctx, project.Slug, rule.ID, meta.AlertRuleUpdate{
+			EvaluationInterval: &oneHour,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		cur.Store(t0.Add(20 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 2 {
+			t.Fatalf("after lengthening 10s->1h at +20s calls=%d want 2", got)
+		}
+		cur.Store(t0.Add(10*time.Second + time.Hour).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 3 {
+			t.Fatalf("after lengthening at +10s+1h calls=%d want 3", got)
+		}
+	})
+
+	t.Run("due slack with 5s tick", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "Slack", "slack-eval")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "SlackRule",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "30s",
+			Severity:           "warning",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var cur atomic.Int64
+		t0 := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		cur.Store(t0.UnixNano())
+		query := &countingRuleQuery{}
+		eval := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           query,
+			MemberID:        "slack-member",
+			TickInterval:    5 * time.Second,
+			MetricsInterval: 5 * time.Second,
+			LeaseTTL:        time.Minute,
+			MemberTTL:       time.Minute,
+			Now:             func() time.Time { return time.Unix(0, cur.Load()).UTC() },
+		})
+
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 1 {
+			t.Fatalf("initial calls=%d want 1", got)
+		}
+		// 300ms before due exceeds 250ms slack -> not due.
+		cur.Store(t0.Add(30*time.Second - 300*time.Millisecond).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 1 {
+			t.Fatalf("at -300ms calls=%d want 1", got)
+		}
+		// 100ms before due is within 250ms slack -> due.
+		cur.Store(t0.Add(30*time.Second - 100*time.Millisecond).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 2 {
+			t.Fatalf("at -100ms calls=%d want 2", got)
+		}
+	})
+
+	t.Run("group_wait follow-up triggers once before long interval", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "GroupWake", "group-wake")
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
+			Type: "webhook", Name: "wake-hook", Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "LongIntervalRule",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "10m",
+			Severity:           "critical",
+			ChannelIDs:         []int{channel.ID},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var cur atomic.Int64
+		t0 := time.Date(2026, 11, 25, 13, 0, 0, 0, time.UTC)
+		cur.Store(t0.UnixNano())
+		query := &countingRuleQuery{
+			samples: []RuleSample{{
+				Fingerprint: "wake-fp",
+				Labels:      map[string]string{"project_id": project.Slug, "alertname": "LongIntervalRule"},
+				Annotations: map[string]string{},
+				Value:       1,
+			}},
+		}
+		eval := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           query,
+			MemberID:        "wake-member",
+			TickInterval:    5 * time.Second,
+			MetricsInterval: 5 * time.Second,
+			GroupWait:       30 * time.Second,
+			RepeatInterval:  4 * time.Hour,
+			LeaseTTL:        time.Hour,
+			MemberTTL:       time.Hour,
+			Now:             func() time.Time { return time.Unix(0, cur.Load()).UTC() },
+		})
+
+		// T0: initial evaluation enters firing, within group_wait (30s) -> no outbox entry yet, wakeAt=T0+30s.
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 1 {
+			t.Fatalf("T0 calls=%d want 1", got)
+		}
+		outbox, err := store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+		if err != nil || len(outbox) != 0 {
+			t.Fatalf("T0 outbox=%#v err=%v want empty", outbox, err)
+		}
+
+		// T0+5s, T0+25s: not due yet.
+		for _, offset := range []time.Duration{5 * time.Second, 25 * time.Second} {
+			cur.Store(t0.Add(offset).UnixNano())
+			eval.evaluateCycle(ctx)
+			if got := query.calls.Load(); got != 1 {
+				t.Fatalf("at +%s calls=%d want 1", offset, got)
+			}
+		}
+
+		// T0+30s: group_wait wake-up triggers single follow-up evaluation and enqueues notification.
+		cur.Store(t0.Add(30 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 2 {
+			t.Fatalf("at +30s calls=%d want 2", got)
+		}
+		outbox, err = store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+		if err != nil || len(outbox) != 1 {
+			t.Fatalf("at +30s outbox len=%d err=%v want 1", len(outbox), err)
+		}
+
+		// After wake-up notification, no extra evaluation runs until T0+30s+10m.
+		for _, offset := range []time.Duration{35 * time.Second, 5 * time.Minute, 10 * time.Minute} {
+			cur.Store(t0.Add(offset).UnixNano())
+			eval.evaluateCycle(ctx)
+			if got := query.calls.Load(); got != 2 {
+				t.Fatalf("at +%s calls=%d want 2 (no extra evals before next regular interval)", offset, got)
+			}
+		}
+		cur.Store(t0.Add(30*time.Second + 10*time.Minute).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 3 {
+			t.Fatalf("at +10m30s calls=%d want 3", got)
+		}
+	})
+
+	t.Run("corrupted stored evaluation_interval falls back to signal default", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "CorruptInterval", "corrupt-interval")
+		if err != nil {
+			t.Fatal(err)
+		}
+		badRule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "CorruptMetrics",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "not-a-duration",
+			Severity:           "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		zeroLogsRule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "ZeroLogs",
+			Signal:             "logs",
+			Expression:         "* | stats count() as c",
+			For:                "0s",
+			EvaluationInterval: "0s",
+			Severity:           "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var buf bytes.Buffer
+		prevLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prevLogger)
+
+		var cur atomic.Int64
+		t0 := time.Date(2026, 11, 25, 14, 0, 0, 0, time.UTC)
+		cur.Store(t0.UnixNano())
+		perRule := &countingPerRuleQuery{}
+		eval := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           perRule,
+			MemberID:        "corrupt-member",
+			TickInterval:    5 * time.Second,
+			MetricsInterval: 15 * time.Second,
+			LogsInterval:    45 * time.Second,
+			LeaseTTL:        2 * time.Minute,
+			MemberTTL:       2 * time.Minute,
+			Now:             func() time.Time { return time.Unix(0, cur.Load()).UTC() },
+		})
+
+		eval.evaluateCycle(ctx)
+		if perRule.count(badRule.ID) != 1 || perRule.count(zeroLogsRule.ID) != 1 {
+			t.Fatalf("T0 counts bad=%d zero=%d", perRule.count(badRule.ID), perRule.count(zeroLogsRule.ID))
+		}
+		logsOut := buf.String()
+		if !strings.Contains(logsOut, fmt.Sprintf("rule_id=%d", badRule.ID)) ||
+			!strings.Contains(logsOut, "value=not-a-duration") ||
+			!strings.Contains(logsOut, fmt.Sprintf("rule_id=%d", zeroLogsRule.ID)) ||
+			!strings.Contains(logsOut, "value=0s") {
+			t.Fatalf("expected slog.Warn with rule_id and corrupted value, got:\n%s", logsOut)
+		}
+
+		// Before 15s: neither re-evaluates. At +15s: metrics falls back to 15s, logs waits until 45s.
+		cur.Store(t0.Add(10 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if perRule.count(badRule.ID) != 1 || perRule.count(zeroLogsRule.ID) != 1 {
+			t.Fatalf("+10s counts bad=%d zero=%d want 1/1", perRule.count(badRule.ID), perRule.count(zeroLogsRule.ID))
+		}
+		cur.Store(t0.Add(15 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if perRule.count(badRule.ID) != 2 || perRule.count(zeroLogsRule.ID) != 1 {
+			t.Fatalf("+15s counts bad=%d zero=%d want 2/1", perRule.count(badRule.ID), perRule.count(zeroLogsRule.ID))
+		}
+		cur.Store(t0.Add(45 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if perRule.count(zeroLogsRule.ID) != 2 {
+			t.Fatalf("+45s logs count=%d want 2", perRule.count(zeroLogsRule.ID))
+		}
+	})
+}
+
+type countingPerRuleQuery struct {
+	mu     sync.Mutex
+	counts map[int]int
+}
+
+func (q *countingPerRuleQuery) Evaluate(
+	_ context.Context,
+	rule *meta.AlertRuleView,
+	_ *meta.ProjectInfo,
+	_ time.Time,
+) ([]RuleSample, error) {
+	q.mu.Lock()
+	if q.counts == nil {
+		q.counts = make(map[int]int)
+	}
+	q.counts[rule.ID]++
+	q.mu.Unlock()
+	return nil, nil
+}
+
+func (q *countingPerRuleQuery) count(ruleID int) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.counts[ruleID]
 }

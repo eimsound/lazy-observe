@@ -10,6 +10,7 @@ import type {
   Silence,
   SilenceInput,
 } from "./alerts";
+import { DEFAULT_EVALUATION_INTERVAL } from "./alerts-contract";
 import { hexId } from "./mock-random";
 import dayjs from "../dayjs.ts";
 
@@ -67,6 +68,8 @@ export const mockRules: AlertRule[] = [
     evaluation_engine: "native",
     expr: 'sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05',
     for: "5m",
+    evaluation_interval: "",
+    effective_evaluation_interval: "5s",
     severity: "critical",
     labels: { team: "platform" },
     annotations: {
@@ -85,6 +88,8 @@ export const mockRules: AlertRule[] = [
     evaluation_engine: "native",
     expr: "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 0.5",
     for: "10m",
+    evaluation_interval: "30s",
+    effective_evaluation_interval: "30s",
     severity: "warning",
     labels: { team: "platform" },
     annotations: { summary: "P95 时延超过 500ms" },
@@ -100,6 +105,8 @@ export const mockRules: AlertRule[] = [
     evaluation_engine: "native",
     expr: 'node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.1',
     for: "15m",
+    evaluation_interval: "1m",
+    effective_evaluation_interval: "1m",
     severity: "warning",
     labels: { team: "infra" },
     annotations: { summary: "磁盘可用空间低于 10%" },
@@ -115,6 +122,8 @@ export const mockRules: AlertRule[] = [
     evaluation_engine: "native",
     expr: "up == 0",
     for: "2m",
+    evaluation_interval: "",
+    effective_evaluation_interval: "5s",
     severity: "critical",
     labels: { team: "infra" },
     annotations: { summary: "监控目标不可达" },
@@ -174,9 +183,19 @@ export const mockInhibitionRules: InhibitionRule[] = [
 
 // ── rule ops ─────────────────────────────────────────────────────────────────
 
+const effectiveInterval = (input: AlertRuleInput) =>
+  input.evaluation_interval || DEFAULT_EVALUATION_INTERVAL[input.signal];
+
 export function createMockRule(input: AlertRuleInput): AlertRule {
   const now = dayjs().toISOString();
-  const rule: AlertRule = { id: nextId("rule"), ...input, evaluation_engine: input.evaluation_engine ?? "native", created_at: now, updated_at: now };
+  const rule: AlertRule = {
+    id: nextId("rule"),
+    ...input,
+    effective_evaluation_interval: effectiveInterval(input),
+    evaluation_engine: input.evaluation_engine ?? "native",
+    created_at: now,
+    updated_at: now,
+  };
   mockRules.unshift(rule);
   return rule;
 }
@@ -187,6 +206,7 @@ export function updateMockRule(id: string, input: AlertRuleInput): AlertRule {
   mockRules[idx] = {
     id,
     ...input,
+    effective_evaluation_interval: effectiveInterval(input),
     evaluation_engine: input.evaluation_engine ?? mockRules[idx].evaluation_engine,
     created_at: mockRules[idx].created_at,
     updated_at: dayjs().toISOString(),

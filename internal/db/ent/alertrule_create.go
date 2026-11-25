@@ -77,6 +77,20 @@ func (_c *AlertRuleCreate) SetNillableFor(v *string) *AlertRuleCreate {
 	return _c
 }
 
+// SetEvaluationInterval sets the "evaluation_interval" field.
+func (_c *AlertRuleCreate) SetEvaluationInterval(v string) *AlertRuleCreate {
+	_c.mutation.SetEvaluationInterval(v)
+	return _c
+}
+
+// SetNillableEvaluationInterval sets the "evaluation_interval" field if the given value is not nil.
+func (_c *AlertRuleCreate) SetNillableEvaluationInterval(v *string) *AlertRuleCreate {
+	if v != nil {
+		_c.SetEvaluationInterval(*v)
+	}
+	return _c
+}
+
 // SetSeverity sets the "severity" field.
 func (_c *AlertRuleCreate) SetSeverity(v string) *AlertRuleCreate {
 	_c.mutation.SetSeverity(v)
@@ -233,6 +247,10 @@ func (_c *AlertRuleCreate) defaults() {
 		v := alertrule.DefaultFor
 		_c.mutation.SetFor(v)
 	}
+	if _, ok := _c.mutation.EvaluationInterval(); !ok {
+		v := alertrule.DefaultEvaluationInterval
+		_c.mutation.SetEvaluationInterval(v)
+	}
 	if _, ok := _c.mutation.Severity(); !ok {
 		v := alertrule.DefaultSeverity
 		_c.mutation.SetSeverity(v)
@@ -295,6 +313,9 @@ func (_c *AlertRuleCreate) check() error {
 	}
 	if _, ok := _c.mutation.For(); !ok {
 		return &ValidationError{Name: "for", err: errors.New(`ent: missing required field "AlertRule.for"`)}
+	}
+	if _, ok := _c.mutation.EvaluationInterval(); !ok {
+		return &ValidationError{Name: "evaluation_interval", err: errors.New(`ent: missing required field "AlertRule.evaluation_interval"`)}
 	}
 	if _, ok := _c.mutation.Severity(); !ok {
 		return &ValidationError{Name: "severity", err: errors.New(`ent: missing required field "AlertRule.severity"`)}
@@ -365,6 +386,10 @@ func (_c *AlertRuleCreate) createSpec() (*AlertRule, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.For(); ok {
 		_spec.SetField(alertrule.FieldFor, field.TypeString, value)
 		_node.For = value
+	}
+	if value, ok := _c.mutation.EvaluationInterval(); ok {
+		_spec.SetField(alertrule.FieldEvaluationInterval, field.TypeString, value)
+		_node.EvaluationInterval = value
 	}
 	if value, ok := _c.mutation.Severity(); ok {
 		_spec.SetField(alertrule.FieldSeverity, field.TypeString, value)

@@ -37,6 +37,7 @@
 | 私有 ingest | `POST /api/profiles` | 持续剖析（pprof）上报 |
 | 私有上传 | `POST /api/releases/:release/sourcemaps` | Source Map 制品上传；只接受 Source Map 上传 Token（`los_...`，§2.2），项目 API Token 与用户 API Token 返回 `403` `source_map_upload_token_required` |
 | 自身运维指标 | `GET /metrics` | Prometheus 文本格式 0.0.4（`text/plain; version=0.0.4; charset=utf-8`）；通过 `metrics_endpoint.enabled` 显式开启（默认关闭），默认需管理员鉴权，可选静态 scrape Bearer Token 或显式 `allow_unauthenticated`（§2.2） |
+| 控制台管理 | `GET`/`POST /api/alert-rules`、`PATCH`/`PUT /api/alert-rules/:id` | 项目隔离的原生告警规则增删改查（需会话 Cookie 或用户 API Token，拒绝项目 API Token）；规则可选携带按规则覆盖的 `evaluation_interval`（见下方说明） |
 
 `POST /api/events/diagnostics` 的枚举值当前为：
 
@@ -51,6 +52,12 @@
 - `country`：2 位大写 ASCII ISO 3166-1 alpha-2 国家码（如 `US`/`CN`，排除 `XX`/`T1`/`ZZ`/`A1`/`A2`/`O1` 等未知占位码，非法值归一为 `unknown`）。仅当请求来自 `security.trusted_proxies` 信任的代理时，优先提取标准边缘头（`CF-IPCountry`、`CloudFront-Viewer-Country`、`X-Vercel-IP-Country`、`X-Country-Code`）；无受信任边缘头时才采纳 SDK 显式传入的合法 2 位国家码，否则一律记为 `unknown`。服务端绝不将客户端真实 IP、原始 `User-Agent` 或自由文本写入指标标签。
 
 `GET /api/v1/performance/vitals`（需会话 Cookie 或用户 API Token，拒绝项目 API Token 并强制项目隔离）返回 `{ start, end, step_seconds, filters, summary, total_samples, by_page, by_device, by_browser, by_os, by_country, truncated }`，历史无维度标签的序列在聚合与筛选时自动归入 `unknown` / `other`。
+
+告警规则的 `evaluation_interval`（可选字段，缺省完全向后兼容，协议版本仍为 **v0**）：
+
+- 请求：Prometheus 时长字符串，如 `30s`、`1m30s`。`PATCH`/`PUT` 省略该键保持原值，传 `""` 或 `null` 恢复为信号默认值；服务端按规范形式存储（`60s` 存为 `1m`）。
+- 取值范围：须为 `5s`（评估主循环 tick）的整数倍，`metrics` 规则 `5s`–`1h`，`logs` 规则 `30s`–`1h`；越界值，以及切换信号后已存覆盖值超出新信号范围的更新，返回 `400`。
+- 响应：`evaluation_interval` 为已存的覆盖值（`""` 表示信号默认），只读的 `effective_evaluation_interval` 为评估器实际使用的间隔（未覆盖时 `metrics` 为 `5s`，`logs` 为 `1m`）。
 
 服务端不认识的新增枚举值不会导致整批拒绝，详见 §2.3 与 §5。
 

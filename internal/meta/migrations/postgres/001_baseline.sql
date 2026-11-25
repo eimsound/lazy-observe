@@ -88,6 +88,7 @@ CREATE TABLE alert_rules (
     evaluation_engine TEXT NOT NULL DEFAULT 'native' CHECK (evaluation_engine IN ('paused', 'native')),
     expr TEXT NOT NULL,
     "for" TEXT NOT NULL DEFAULT '0s',
+    evaluation_interval TEXT NOT NULL DEFAULT '',
     severity TEXT NOT NULL DEFAULT 'warning',
     labels JSONB NOT NULL,
     annotations JSONB NOT NULL,

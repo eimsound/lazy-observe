@@ -17,6 +17,7 @@ func (AlertRule) Fields() []ent.Field {
 		field.Enum("evaluation_engine").Values("paused", "native").Default("native"),
 		field.String("expr").NotEmpty(),
 		field.String("for").Default("0s"),
+		field.String("evaluation_interval").Default(""),
 		field.String("severity").Default("warning"),
 		field.JSON("labels", map[string]string{}).Default(map[string]string{}),
 		field.JSON("annotations", map[string]string{}).Default(map[string]string{}),

@@ -645,3 +645,125 @@ func TestPlatformErrorRateDurableSpikeRecoveryAndNextCycle(t *testing.T) {
 		}
 	})
 }
+
+func TestAlertRuleEvaluationIntervalPersistenceAndNoReset(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "EvalInterval", "eval-interval")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defaultRule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug: project.Slug,
+			Name:        "DefaultInterval",
+			Signal:      "metrics",
+			Expression:  "up == 0",
+			For:         "0s",
+			Severity:    "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if defaultRule.EvaluationInterval != "" {
+			t.Fatalf("default EvaluationInterval=%q want empty", defaultRule.EvaluationInterval)
+		}
+
+		customRule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "CustomInterval",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "30s",
+			Severity:           "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if customRule.EvaluationInterval != "30s" {
+			t.Fatalf("created EvaluationInterval=%q want 30s", customRule.EvaluationInterval)
+		}
+
+		if _, err := store.HeartbeatAlertEngine(ctx, "engine-eval", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireAlertRuleLease(ctx, customRule.ID, "engine-eval", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		firingState := AlertRuleState{
+			RuleID:          customRule.ID,
+			Fingerprint:     "fp-eval-1",
+			Status:          "firing",
+			FiringSince:     &now,
+			LastEvaluatedAt: now,
+			Labels:          map[string]string{"alertname": "CustomInterval"},
+			Annotations:     map[string]string{},
+		}
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID:     customRule.ID,
+			MemberID:   "engine-eval",
+			LeaseEpoch: lease.Epoch,
+			States:     []AlertRuleState{firingState},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Update with EvaluationInterval=nil keeps existing value.
+		sev := "critical"
+		kept, err := store.UpdateAlertRule(ctx, project.Slug, customRule.ID, AlertRuleUpdate{
+			Severity: &sev,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kept.EvaluationInterval != "30s" || kept.Severity != "critical" {
+			t.Fatalf("update nil EvaluationInterval=%+v", kept)
+		}
+
+		// Interval-only change must update value without resetting rule state, resolving events, or bumping lease epoch.
+		oneMin := "1m"
+		updated, err := store.UpdateAlertRule(ctx, project.Slug, customRule.ID, AlertRuleUpdate{
+			EvaluationInterval: &oneMin,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.EvaluationInterval != "1m" {
+			t.Fatalf("updated EvaluationInterval=%q want 1m", updated.EvaluationInterval)
+		}
+		states, err := store.AlertRuleStates(ctx, customRule.ID)
+		if err != nil || len(states) != 1 || states[0].Status != "firing" {
+			t.Fatalf("states after interval-only update=%#v err=%v", states, err)
+		}
+		events, err := store.ListAlertEvents(ctx, project.Slug, "", nil)
+		if err != nil || len(events) != 1 || events[0].Status != "firing" || events[0].EndsAt != nil {
+			t.Fatalf("events after interval-only update=%#v err=%v", events, err)
+		}
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID:     customRule.ID,
+			MemberID:   "engine-eval",
+			LeaseEpoch: lease.Epoch,
+			States:     []AlertRuleState{firingState},
+		}); err != nil {
+			t.Fatalf("commit with original lease epoch after interval-only update failed: %v", err)
+		}
+
+		// Explicit empty string resets back to default "" without resetting rule state.
+		reset := ""
+		cleared, err := store.UpdateAlertRule(ctx, project.Slug, customRule.ID, AlertRuleUpdate{
+			EvaluationInterval: &reset,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cleared.EvaluationInterval != "" {
+			t.Fatalf("reset EvaluationInterval=%q want empty", cleared.EvaluationInterval)
+		}
+		states, err = store.AlertRuleStates(ctx, customRule.ID)
+		if err != nil || len(states) != 1 || states[0].Status != "firing" {
+			t.Fatalf("states after interval reset=%#v err=%v", states, err)
+		}
+	})
+}

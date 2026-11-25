@@ -37,6 +37,7 @@ The current pre-release server protocol baseline is **v0** (no handshake and no 
 | Private ingest | `POST /api/profiles` | Continuous profiling (pprof) ingestion |
 | Private upload | `POST /api/releases/:release/sourcemaps` | Source Map artifact upload; accepts only Source Map upload tokens (`los_...`, Section 2.2); project API tokens and user API tokens return `403` `source_map_upload_token_required` |
 | Self-monitoring metrics | `GET /metrics` | Prometheus text format 0.0.4 (`text/plain; version=0.0.4; charset=utf-8`); enabled explicitly via `metrics_endpoint.enabled` (off by default); requires admin auth by default, or an optional static scrape bearer token, or explicit `allow_unauthenticated` (Section 2.2) |
+| Console management | `GET`/`POST /api/alert-rules`, `PATCH`/`PUT /api/alert-rules/:id` | Project-scoped native alert rule CRUD (session cookie or user API token; project API tokens are rejected). Rules carry an optional per-rule `evaluation_interval` (details below) |
 
 Current enum values for `POST /api/events/diagnostics`:
 
@@ -51,6 +52,12 @@ Each item in `POST /api/events/vitals` may include these optional low-cardinalit
 - `country` accepts a two-character uppercase ASCII ISO 3166-1 alpha-2 country code (such as `US` or `CN`), excluding unknown placeholders (`XX`, `T1`, `ZZ`, `A1`, `A2`, `O1`). Invalid values normalize to `unknown`. Only when a request arrives from a proxy listed in `security.trusted_proxies` does the server extract standard edge headers first (`CF-IPCountry`, `CloudFront-Viewer-Country`, `X-Vercel-IP-Country`, `X-Country-Code`). When no trusted edge header is present, the server accepts a valid two-letter country code passed explicitly by the SDK; otherwise it records `unknown`. The server never writes real client IP addresses, raw `User-Agent` strings, or free text into metric labels.
 
 `GET /api/v1/performance/vitals` requires a session cookie or a user API token, rejects project API tokens, and enforces project isolation. It returns `{ start, end, step_seconds, filters, summary, total_samples, by_page, by_device, by_browser, by_os, by_country, truncated }`. Historical series without dimension labels group under `unknown` or `other` during aggregation and filtering.
+
+Alert rule `evaluation_interval` (optional; omitting it stays backward-compatible and the protocol version remains **v0**):
+
+- Request: a Prometheus duration such as `30s` or `1m30s`. On `PATCH`/`PUT`, omitting the key keeps the stored value; `""` or `null` resets the rule to its signal default. The server stores the canonical form (`60s` becomes `1m`).
+- Bounds: a multiple of `5s` (the evaluator tick), `5s`–`1h` for `metrics` rules and `30s`–`1h` for `logs` rules. Values outside the bounds, and signal changes that would leave a stored override outside the new signal's bounds, return `400`.
+- Response: `evaluation_interval` is the stored override (`""` means the signal default) and the read-only `effective_evaluation_interval` is the interval the evaluator uses (`5s` for `metrics`, `1m` for `logs` unless overridden).
 
 Enum values unknown to the server do not reject the entire batch (Sections 2.3 and 5).
 
