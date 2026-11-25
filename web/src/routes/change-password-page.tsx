@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Navigate } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
+import { Navigate, useRouter } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { Activity, Loader2, LogOut, ShieldAlert } from "lucide-react";
 import { useAuth } from "@/lib/auth/auth-provider";
@@ -22,9 +22,18 @@ export function ChangePasswordPage() {
   const { redirect } = changePasswordRoute.useSearch();
   const [signingOut, setSigningOut] = useState(false);
   const [signOutFailed, setSignOutFailed] = useState(false);
+  const router = useRouter();
   const target = safeRedirect(redirect, {
     disallowPrefixes: ["/login", "/change-password"],
   });
+  const done = status === "authed" && !user?.must_change_password;
+
+  // `target` is a full in-app URL (path + query + hash). `<Navigate to>` takes
+  // only a route path: it would template-interpolate `$` and path-normalize the
+  // query (`//`, trailing `/`). Replace the history entry verbatim instead (#361).
+  useEffect(() => {
+    if (done) router.history.replace(target);
+  }, [done, router, target]);
 
   if (status === "loading") {
     return (
@@ -39,8 +48,8 @@ export function ChangePasswordPage() {
   if (status === "anon") {
     return <Navigate to="/login" search={{ redirect: target }} replace />;
   }
-  if (!user?.must_change_password) {
-    return <Navigate to={target} replace />;
+  if (done) {
+    return null;
   }
 
   return (
