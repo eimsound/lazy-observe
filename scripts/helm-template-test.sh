@@ -83,6 +83,7 @@ assert_render_fails() {
   --set 'topologySpreadConstraints[0].maxSkew=1' \
   --set 'topologySpreadConstraints[0].topologyKey=kubernetes.io/hostname' \
   --set 'topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule' >"$WORK/hard-anti-affinity.yaml"
+"$HELM" template test "$CHART" --set externalURL=https://observe.example.com >"$WORK/external-url.yaml"
 
 extract_kind() {
   kind=$1
@@ -180,11 +181,15 @@ extract_kind Deployment "$WORK/key-existing.yaml" "$WORK/deploy-no-secret.yaml"
 assert_not_contains "$WORK/deploy-no-secret.yaml" '^[[:space:]]*checksum/secret:' \
   'Deployment must not include checksum/secret when secret.create=false'
 
-# security.session_secure_cookie 透传到 ConfigMap。
+# security.session_secure_cookie 与 externalURL 透传到 ConfigMap。
 assert_contains "$WORK/standalone.yaml" '^[[:space:]]*session_secure_cookie: false$' \
   'default ConfigMap must render session_secure_cookie: false'
 assert_contains "$WORK/secure-cookie.yaml" '^[[:space:]]*session_secure_cookie: true$' \
   'security.sessionSecureCookie=true must render session_secure_cookie: true'
+assert_contains "$WORK/standalone.yaml" '^[[:space:]]*external_url: ""$' \
+  'default ConfigMap must render external_url: ""'
+assert_contains "$WORK/external-url.yaml" '^[[:space:]]*external_url: "https://observe\.example\.com"$' \
+  'externalURL must render external_url in ConfigMap'
 
 # 集群 profile 与显式配置的 podAntiAffinity / topologySpreadConstraints 按 release 的 selectorLabels 隔离。
 extract_kind Deployment "$WORK/cluster.yaml" "$WORK/deploy-cluster.yaml"
@@ -292,7 +297,8 @@ fi
     "$WORK/hard-anti-affinity.yaml" \
     "$WORK/image-digest.yaml" \
     "$WORK/image-tag-digest.yaml" \
-    "$WORK/image-release-values.yaml"
+    "$WORK/image-release-values.yaml" \
+    "$WORK/external-url.yaml"
 )
 
 echo "PASS: Helm chart satisfies values.schema.json, security guards, image.digest, and Go config.Load contracts"

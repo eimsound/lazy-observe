@@ -9,6 +9,7 @@ import { lazyRouteComponent } from "@/components/router/lazy-route";
 import { parseTraceSearchURL } from "@/routes/traces-search";
 import { parseMetricsSearch } from "@/routes/metrics-search";
 import { parseProfilingEvidenceSearch } from "@/routes/trace-evidence-links";
+import { parseAlertEventsSearch } from "@/routes/alert-events-search";
 
 const LoginPage = lazyRouteComponent(() => import("@/routes/login-page"), "LoginPage");
 const ChangePasswordPage = lazyRouteComponent(
@@ -284,6 +285,7 @@ const scrapeTargetsRoute = createRoute({
 const alertEventsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/alerts",
+  validateSearch: parseAlertEventsSearch,
   component: AlertEventsPage,
 });
 

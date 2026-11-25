@@ -56,6 +56,14 @@
 
 后端三端 SDK（Go / Node / Python）的 OTLP/HTTP 载荷压缩默认保持 `"none"`，可通过显式 `Compression` / `compression` 配置或标准 `OTEL_EXPORTER_OTLP_COMPRESSION`、`OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` 环境变量按信号启用 `"gzip"`（优先级：显式配置 > 信号级环境变量 > 全局环境变量 > `"none"`）。网关对未压缩、池化解压与流式透传三种路径统一强制 52 MiB 解压体上限，并统一按解压后的明文字节数计入 `ingest_rate_limit`。
 
+#### 告警通知载荷
+
+当服务端配置了 `external_url`（`LO_EXTERNAL_URL`）时，出站告警通知会在发送阶段派生绝对控制台链接（未配置 `external_url` 时省略所有链接字段，载荷与既有 **v0** 完全一致；新增可选字段向后兼容，协议版本保持 **v0**）：
+
+- **Webhook JSON**：顶层可选字符串字段 `url` 与每条告警可选字符串字段 `alerts[].url`（未配置 `external_url` 时省略；风暴与渠道测试通知不填 `alerts[].url`）。Issue 告警既有的相对路径字段 `annotations.link` 与 `annotations.issue` 保持不变。
+- **Email（`smtp`）**：邮件正文为缩进 JSON 载荷，编码时不做 HTML 转义（`&`、`<`、`>` 保持原样）。存在顶层 `url` 时，正文首行为 `View in lazy-observe: <url>`，随后接 `\r\n\r\n` 与 JSON。
+- **控制台深链查询参数**：控制台链接基于 `<external_url>` 构造，任意控制台路由均支持 `project=<slug>`，`/alerts` 页面还支持 `fingerprint`、`rule` 与 `status` 查询参数（例如 `/alerts?fingerprint=<fp>&project=<slug>`、`/alerts?project=<slug>&rule=<rule>`、`/alerts?project=<slug>&status=firing`、`/issues/<id>?project=<slug>`、`/issues?project=<slug>` 与 `/alerts/channels`）。当前登录用户无法打开链接中的 `project`（已删除、已改名或无权限）时，控制台显示错误页，不会回落到其他项目。
+
 ### 2.2 DSN 格式
 
 用户 DSN 格式为：

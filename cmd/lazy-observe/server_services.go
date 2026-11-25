@@ -103,10 +103,15 @@ func startServerServices(
 		shutdownTimeout: cfg.Process.ShutdownTimeout.Value(),
 		logger:          logger,
 	}
+	externalURL, _ := appconfig.NormalizeExternalURL(cfg.ExternalURL)
+	if externalURL == "" {
+		logger.Info("alert notification console links disabled: external_url is not set")
+	}
 	services.alerts = alert.NewService(
 		alert.Config{
 			Store:          metadata.store,
 			OutboundPolicy: essentials.outboundPolicy,
+			ExternalURL:    externalURL,
 			StormThreshold: cfg.Alert.StormThreshold,
 			GroupWait:      cfg.Alert.GroupWait.Value(),
 			RepeatInterval: cfg.Alert.RepeatInterval.Value(),

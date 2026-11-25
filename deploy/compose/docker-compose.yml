@@ -41,6 +41,7 @@ services:
     environment:
       LO_LISTEN: ":3100"
       LO_DATA_DIR: "/data"
+      LO_EXTERNAL_URL: "${LO_EXTERNAL_URL:-}"
       LO_TOPOLOGY: "all-in-one"
       LO_RETENTION_METRICS: "${LO_RETENTION_METRICS:-90d}"
       LO_RETENTION_LOGS: "${LO_RETENTION_LOGS:-14d}"
@@ -107,6 +108,7 @@ services:
     environment:
       LO_LISTEN: ":3100"
       LO_DATA_DIR: "/data"
+      LO_EXTERNAL_URL: "${LO_EXTERNAL_URL:-}"
       LO_TOPOLOGY: "ha"
       LO_STANDALONE: "true"
       LO_META_DB_URL: "postgres://${LO_PG_USER:-lazy_observe}:${LO_PG_PASSWORD:?set LO_PG_PASSWORD in .env}@postgres:5432/${LO_PG_DB:-lazy_observe}?sslmode=disable"

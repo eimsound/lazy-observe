@@ -5,7 +5,9 @@ import { QueryClient } from "@tanstack/react-query";
 import {
   createProjectScope,
   projectQueryKey,
+  readProjectLinkParam,
   resolveProjectSelection,
+  stripProjectLinkParam,
   switchProjectQueries,
   type SlugStorage,
 } from "./project-scope.ts";
@@ -94,4 +96,39 @@ test("projectQueryKey preserves domain root at index 0 and isolates cache entrie
   client.setQueryData(betaKey, ["beta-only"]);
   assert.deepEqual(client.getQueryData(alphaKey), ["alpha-only"]);
   assert.deepEqual(client.getQueryData(betaKey), ["beta-only"]);
+});
+
+test("console links select the linked project before children mount", () => {
+  const projects = [{ slug: "alpha" }, { slug: "beta" }];
+  // Linked project differs from this tab's project: switch first.
+  assert.deepEqual(resolveProjectSelection(projects, "alpha", "beta"), {
+    ready: false,
+    resolvedSlug: "beta",
+    changed: true,
+  });
+  // Already on the linked project.
+  assert.deepEqual(resolveProjectSelection(projects, "beta", "beta"), {
+    ready: true,
+    resolvedSlug: "beta",
+    changed: false,
+  });
+});
+
+test("an unknown linked project never falls back to another project", () => {
+  const projects = [{ slug: "alpha" }];
+  assert.deepEqual(resolveProjectSelection(projects, "alpha", "gone"), {
+    ready: false,
+    resolvedSlug: "alpha",
+    changed: false,
+    linkUnavailable: true,
+  });
+  assert.equal(resolveProjectSelection([], "", "gone").linkUnavailable, true);
+});
+
+test("project link param is read and stripped without touching other params", () => {
+  assert.equal(readProjectLinkParam("?fingerprint=abc&project=beta"), "beta");
+  assert.equal(readProjectLinkParam("?fingerprint=abc"), "");
+  assert.equal(readProjectLinkParam(""), "");
+  assert.equal(stripProjectLinkParam("?fingerprint=abc&project=beta&rule=High%20Errors"), "?fingerprint=abc&rule=High%20Errors");
+  assert.equal(stripProjectLinkParam("?project=beta"), "");
 });

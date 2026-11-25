@@ -416,3 +416,106 @@ func waitOutboxStatus(
 	t.Fatalf("outbox item status=%q want=%q err=%v", item.Status, want, err)
 	return meta.NotificationOutboxItem{}
 }
+
+func TestServiceExternalURLDerivesLinksAtSendTimeAndTestChannel(t *testing.T) {
+	ctx := context.Background()
+	store := openOutboxTestStore(t)
+	project, err := store.CreateProject(ctx, "Links", "links")
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan Notification, 4)
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var n Notification
+		if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		received <- n
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer endpoint.Close()
+
+	// Verify caller-provided Sender with empty ExternalURL inherits cfg.ExternalURL,
+	// and default Sender receives it too.
+	svc := NewService(Config{
+		Store:          store,
+		OutboundPolicy: outbound.Policy{AllowPrivate: true},
+		ExternalURL:    "https://observe.example.com",
+		Sender:         &Sender{Client: endpoint.Client(), Sleep: func(time.Duration) {}},
+		Outbox:         OutboxWorkerConfig{WorkerID: "links-worker", PollInterval: 5 * time.Millisecond},
+	})
+	defer svc.Close()
+
+	if svc.sender.ExternalURL != "https://observe.example.com" {
+		t.Fatalf("sender.ExternalURL = %q, want %q", svc.sender.ExternalURL, "https://observe.example.com")
+	}
+
+	defaultSvc := NewService(Config{Store: store, ExternalURL: "https://default.example.com"})
+	defer defaultSvc.Close()
+	if defaultSvc.sender.ExternalURL != "https://default.example.com" {
+		t.Fatalf(
+			"default sender.ExternalURL = %q, want %q",
+			defaultSvc.sender.ExternalURL,
+			"https://default.example.com",
+		)
+	}
+
+	ch, err := svc.CreateChannel(ctx, ChannelInput{
+		Type: "webhook", Name: "links-hook", Config: map[string]any{"url": endpoint.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. TestChannel delivers /alerts/channels with no alert URLs.
+	if err := svc.TestChannel(ctx, ch.ID); err != nil {
+		t.Fatalf("TestChannel failed: %v", err)
+	}
+	select {
+	case got := <-received:
+		if got.URL != "https://observe.example.com/alerts/channels" {
+			t.Fatalf("TestChannel URL = %q, want %q", got.URL, "https://observe.example.com/alerts/channels")
+		}
+		if len(got.Alerts) != 1 || got.Alerts[0].URL != "" {
+			t.Fatalf("TestChannel alert URLs should be empty: %+v", got.Alerts)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TestChannel notification was not received")
+	}
+
+	// 2. Outbox stores payload without URLs and fills them only at send time.
+	entries := BuildOutboxEntries(project.ID, nil, []int{ch.ID}, []Notification{{
+		Project: project.Slug,
+		Rule:    "DiskFull",
+		Status:  "firing",
+		Alerts: []Alert{{
+			Status:      "firing",
+			Fingerprint: "fp-send-time",
+			Labels:      map[string]string{"alertname": "DiskFull"},
+			StartsAt:    time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+		}},
+	}}, time.Now().UTC(), time.Hour)
+	if len(entries) != 1 {
+		t.Fatalf("entries len = %d, want 1", len(entries))
+	}
+	if strings.Contains(string(entries[0].Payload), `"url"`) {
+		t.Fatalf("outbox payload must not persist url: %s", entries[0].Payload)
+	}
+	id, inserted, err := store.EnqueueNotification(ctx, entries[0])
+	if err != nil || !inserted {
+		t.Fatalf("enqueue failed: inserted=%v err=%v", inserted, err)
+	}
+	svc.WakeOutbox()
+	waitOutboxStatus(t, store, id, "delivered", 2*time.Second)
+
+	select {
+	case got := <-received:
+		wantURL := "https://observe.example.com/alerts?fingerprint=fp-send-time&project=links"
+		if got.URL != wantURL || len(got.Alerts) != 1 || got.Alerts[0].URL != wantURL {
+			t.Fatalf("delivered notification URL mismatch: got=%+v want=%q", got, wantURL)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("outbox notification was not delivered")
+	}
+}

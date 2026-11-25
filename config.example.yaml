@@ -31,6 +31,9 @@ data_dir: "./data"
 # Production defaults to serving the embedded UI. The repository development
 # launcher overrides this to false because Vite owns the development UI.
 serve_web_ui: true
+# Public console base URL used for clickable links in alert notifications
+# (e.g. "https://observe.example.com"). Empty disables links.
+external_url: ""
 
 # Metadata defaults to SQLite at data_dir/meta/lazy-observe.db when empty.
 # Use sqlite://path/to/meta.db to choose another SQLite file, or a PostgreSQL URL
@@ -186,7 +189,7 @@ ai:
   pricing_file: ""
 
 # Environment names use LO_ and upper-case field paths. Common examples:
-# LO_LISTEN, LO_OTLP_GRPC_ENABLED, LO_OTLP_GRPC_LISTEN, LO_OTLP_GRPC_MAX_RECV_BYTES,
+# LO_LISTEN, LO_EXTERNAL_URL, LO_OTLP_GRPC_ENABLED, LO_OTLP_GRPC_LISTEN, LO_OTLP_GRPC_MAX_RECV_BYTES,
 # LO_INGEST_RATE_LIMIT_ENABLED, LO_INGEST_RATE_LIMIT_REQUESTS_PER_SECOND,
 # LO_INGEST_RATE_LIMIT_BURST, LO_INGEST_RATE_LIMIT_BYTES_PER_SECOND,
 # LO_INGEST_RATE_LIMIT_MAX_TRACKED_PROJECTS,

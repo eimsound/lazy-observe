@@ -167,6 +167,91 @@ func TestPlanNotificationsUnifiesSilenceInhibitionStormAndRepeat(t *testing.T) {
 	})
 }
 
+func TestBuildOutboxEntriesUnchangedWithEmptyURLFields(t *testing.T) {
+	now := time.Date(2026, 7, 17, 1, 2, 3, 0, time.UTC)
+	ruleID := 7
+	repeatInterval := time.Hour
+
+	native := Notification{
+		Project: "alpha",
+		Rule:    "DiskFull",
+		Status:  "firing",
+		Alerts: []Alert{{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": "DiskFull", "instance": "node-1", "project_id": "alpha"},
+			Annotations: map[string]string{"summary": "disk full"},
+			StartsAt:    now,
+			Fingerprint: "abc",
+		}},
+	}
+	wantNativePayload := `{"project":"alpha","rule":"DiskFull","status":"firing","alerts":[{"status":"firing","labels":{"alertname":"DiskFull","instance":"node-1","project_id":"alpha"},"annotations":{"summary":"disk full"},"startsAt":"2026-07-17T01:02:03Z","endsAt":"0001-01-01T00:00:00Z","fingerprint":"abc"}]}`
+	entries := BuildOutboxEntries(1, &ruleID, []int{4}, []Notification{native}, now, repeatInterval)
+	if len(entries) != 1 {
+		t.Fatalf("native entries = %d, want 1", len(entries))
+	}
+	if string(entries[0].Payload) != wantNativePayload {
+		t.Fatalf("native payload changed:\ngot:  %s\nwant: %s", entries[0].Payload, wantNativePayload)
+	}
+	if strings.Contains(string(entries[0].Payload), `"url"`) {
+		t.Fatalf("native payload unexpectedly contains url key: %s", entries[0].Payload)
+	}
+	wantNativeKey := notificationOutboxKey(4, append([]byte(wantNativePayload), []byte("\x007\x000")...))
+	if entries[0].IdempotencyKey != wantNativeKey {
+		t.Fatalf("native idempotency key = %q, want %q", entries[0].IdempotencyKey, wantNativeKey)
+	}
+
+	issue := Notification{
+		Project: "alpha",
+		Rule:    "new_issue",
+		Status:  "firing",
+		Alerts: []Alert{
+			{
+				Status: "firing",
+				Labels: map[string]string{
+					"issue_id":   "42",
+					"kind":       "new_issue",
+					"project_id": "alpha",
+					"source":     "platform",
+				},
+				Annotations: map[string]string{"issue": "/issues/42", "link": "/issues/42", "summary": "boom"},
+				StartsAt:    now,
+				Fingerprint: "issue-fp",
+			},
+		},
+	}
+	wantIssuePayload := `{"project":"alpha","rule":"new_issue","status":"firing","alerts":[{"status":"firing","labels":{"issue_id":"42","kind":"new_issue","project_id":"alpha","source":"platform"},"annotations":{"issue":"/issues/42","link":"/issues/42","summary":"boom"},"startsAt":"2026-07-17T01:02:03Z","endsAt":"0001-01-01T00:00:00Z","fingerprint":"issue-fp"}]}`
+	issueEntries := BuildOutboxEntriesWithLifecycle(1, nil, 99, []int{4}, []Notification{issue}, now, repeatInterval)
+	if len(issueEntries) != 1 {
+		t.Fatalf("issue entries = %d, want 1", len(issueEntries))
+	}
+	if string(issueEntries[0].Payload) != wantIssuePayload {
+		t.Fatalf("issue payload changed:\ngot:  %s\nwant: %s", issueEntries[0].Payload, wantIssuePayload)
+	}
+	wantIssueKey := notificationOutboxKey(4, []byte("issue-lifecycle\x0099\x00new_issue\x00firing"))
+	if issueEntries[0].IdempotencyKey != wantIssueKey {
+		t.Fatalf("issue idempotency key = %q, want %q", issueEntries[0].IdempotencyKey, wantIssueKey)
+	}
+
+	storm := Notification{
+		Project: "alpha",
+		Rule:    "alert_storm",
+		Status:  "firing",
+		Storm: &StormSummary{
+			GroupCount: 12,
+			Severities: []Count{{Name: "critical", Count: 8}},
+			Rules:      []Count{{Name: "HostDown", Count: 5}},
+		},
+	}
+	wantStormPayload := `{"project":"alpha","rule":"alert_storm","status":"firing","alerts":null,"storm":{"group_count":12,"severities":[{"name":"critical","count":8}],"rules":[{"name":"HostDown","count":5}]}}`
+	stormEntries := BuildOutboxEntries(1, nil, []int{4}, []Notification{storm}, now, repeatInterval)
+	if len(stormEntries) != 1 {
+		t.Fatalf("storm entries = %d, want 1", len(stormEntries))
+	}
+	if string(stormEntries[0].Payload) != wantStormPayload {
+		t.Fatalf("storm payload changed:\ngot:  %s\nwant: %s", stormEntries[0].Payload, wantStormPayload)
+	}
+}
+
 func TestCrossTrackNativeRuleInhibitsPlatformAlertAndUnblocksOnDelete(t *testing.T) {
 	ctx := context.Background()
 	store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))

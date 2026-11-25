@@ -43,6 +43,7 @@ func sanitizedDeliveryError(err error) error {
 type Sender struct {
 	Client      *http.Client
 	Outbound    outbound.Policy
+	ExternalURL string
 	Timeout     time.Duration
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	Sleep       func(time.Duration)
@@ -89,6 +90,7 @@ func (s *Sender) Send(ctx context.Context, ch Channel, n Notification) (int, err
 }
 
 func (s *Sender) sendOnce(ctx context.Context, ch Channel, n Notification) error {
+	n = NotificationLinks(s.ExternalURL, n)
 	if ch.Type == "smtp" {
 		return s.sendSMTP(ctx, ch.Config, n)
 	}
@@ -174,8 +176,34 @@ func checkChannelResponse(kind string, body []byte) error {
 	return nil
 }
 
-func ChannelPayload(kind string, n Notification) ([]byte, error) {
-	title := fmt.Sprintf("[%s] %s / %s", strings.ToUpper(n.Status), n.Project, n.Rule)
+const (
+	consoleLinkCTA   = "View in lazy-observe"
+	perAlertLinkText = "View"
+)
+
+var (
+	mdURLReplacer = strings.NewReplacer("(", "%28", ")", "%29", " ", "%20")
+	slackReplacer = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+)
+
+func mdURL(raw string) string {
+	return mdURLReplacer.Replace(raw)
+}
+
+func slackEscape(s string) string {
+	return slackReplacer.Replace(s)
+}
+
+func slackLink(rawURL, text string) string {
+	return "<" + slackEscape(rawURL) + "|" + slackEscape(text) + ">"
+}
+
+func buildNotificationText(
+	title string,
+	n Notification,
+	formatAlertLink func(string) string,
+	doubleNewlineBeforeAlertLink bool,
+) string {
 	lines := []string{title}
 	if n.Storm != nil {
 		lines = append(lines,
@@ -184,6 +212,7 @@ func ChannelPayload(kind string, n Notification) ([]byte, error) {
 			"Top rules: "+formatCounts(n.Storm.Rules),
 		)
 	}
+	showPerAlert := len(n.Alerts) > 1
 	for _, a := range n.Alerts {
 		lines = append(lines, formatLabels(a.Labels))
 		for _, field := range []struct{ key, label string }{
@@ -195,27 +224,87 @@ func ChannelPayload(kind string, n Notification) ([]byte, error) {
 				lines = append(lines, field.label+": "+value)
 			}
 		}
+		if showPerAlert && a.URL != "" && formatAlertLink != nil {
+			link := formatAlertLink(a.URL)
+			if doubleNewlineBeforeAlertLink {
+				lines = append(lines, "\n"+link)
+			} else {
+				lines = append(lines, link)
+			}
+		}
 	}
-	text := strings.Join(lines, "\n")
+	return strings.Join(lines, "\n")
+}
+
+func buildMarkdownNotificationText(title string, n Notification) string {
+	text := buildNotificationText(
+		title,
+		n,
+		func(u string) string { return "[" + perAlertLinkText + "](" + mdURL(u) + ")" },
+		true,
+	)
+	if n.URL != "" {
+		text += "\n\n[" + consoleLinkCTA + "](" + mdURL(n.URL) + ")"
+	}
+	return text
+}
+
+func ChannelPayload(kind string, n Notification) ([]byte, error) {
+	title := fmt.Sprintf("[%s] %s / %s", strings.ToUpper(n.Status), n.Project, n.Rule)
 	var payload any
 	switch kind {
 	case "webhook":
 		payload = n
 	case "feishu":
+		text := buildNotificationText(
+			title,
+			n,
+			func(u string) string { return "[" + perAlertLinkText + "](" + mdURL(u) + ")" },
+			false,
+		)
+		elements := []any{
+			map[string]any{"tag": "div", "text": map[string]string{"tag": "lark_md", "content": text}},
+		}
+		if n.URL != "" {
+			elements = append(elements, map[string]any{
+				"tag": "action",
+				"actions": []any{
+					map[string]any{
+						"tag":  "button",
+						"text": map[string]string{"tag": "plain_text", "content": consoleLinkCTA},
+						"type": "primary",
+						"url":  n.URL,
+					},
+				},
+			})
+		}
 		payload = map[string]any{
 			"msg_type": "interactive",
 			"card": map[string]any{
-				"header": map[string]any{"title": map[string]string{"tag": "plain_text", "content": title}},
-				"elements": []any{
-					map[string]any{"tag": "div", "text": map[string]string{"tag": "lark_md", "content": text}},
-				},
+				"header":   map[string]any{"title": map[string]string{"tag": "plain_text", "content": title}},
+				"elements": elements,
 			},
 		}
 	case "dingtalk":
-		payload = map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": title, "text": text}}
+		payload = map[string]any{
+			"msgtype":  "markdown",
+			"markdown": map[string]string{"title": title, "text": buildMarkdownNotificationText(title, n)},
+		}
 	case "wecom":
-		payload = map[string]any{"msgtype": "markdown", "markdown": map[string]string{"content": text}}
+		payload = map[string]any{
+			"msgtype":  "markdown",
+			"markdown": map[string]string{"content": buildMarkdownNotificationText(title, n)},
+		}
 	case "slack":
+		text := buildNotificationText(
+			title,
+			n,
+			func(u string) string { return slackLink(u, perAlertLinkText) },
+			false,
+		)
+		if n.URL != "" {
+			text += "\n\n" + slackLink(n.URL, consoleLinkCTA)
+		}
 		payload = map[string]any{"text": title, "blocks": []any{
 			map[string]any{
 				"type": "section",
@@ -372,14 +461,20 @@ func EmailPayload(from string, to []string, n Notification) []byte {
 		safeTo = append(safeTo, sanitizeEmailHeader(recipient))
 	}
 	title := sanitizeEmailHeader(fmt.Sprintf("[%s] %s / %s", strings.ToUpper(n.Status), n.Project, n.Rule))
-	body, _ := json.MarshalIndent(n, "", "  ")
+	var jsonBuf bytes.Buffer
+	enc := json.NewEncoder(&jsonBuf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(n)
+	body := string(bytes.TrimSuffix(jsonBuf.Bytes(), []byte("\n")))
+	if safeURL := sanitizeEmailHeader(n.URL); safeURL != "" {
+		body = consoleLinkCTA + ": " + safeURL + "\r\n\r\n" + body
+	}
 	return []byte(
 		"From: " + safeFrom + "\r\nTo: " + strings.Join(
 			safeTo,
 			",",
-		) + "\r\nSubject: " + title + "\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + string(
-			body,
-		),
+		) + "\r\nSubject: " + title + "\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body,
 	)
 }
 

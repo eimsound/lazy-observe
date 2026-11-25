@@ -84,7 +84,7 @@ docker compose --profile standalone up -d lazy-observe-standalone
     - `GET http://127.0.0.1:3100/livez`（进程存活）
     - `GET http://127.0.0.1:3100/readyz`（初始化、迁移与全部依赖就绪，关停时立刻变 `503`）
     - `GET http://127.0.0.1:3100/healthz`（各组件聚合健康报告）
-- **仅暴露 3100 端口**：默认绑定 `127.0.0.1:3100`，建议由前置 TLS 反向代理终止 HTTPS，并在 `.env` 中开启 `LO_SECURITY_SESSION_SECURE_COOKIE=true` 与配置 `LO_SECURITY_TRUSTED_PROXIES`。切勿暴露内嵌存储回环端口（`18428`/`19428`/`20428`/`22428`）。
+- **仅暴露 3100 端口**：默认绑定 `127.0.0.1:3100`，建议由前置 TLS 反向代理终止 HTTPS，并在 `.env` 中开启 `LO_SECURITY_SESSION_SECURE_COOKIE=true`、配置 `LO_SECURITY_TRUSTED_PROXIES`，以及按需设置 `LO_EXTERNAL_URL`（让告警通知附带可点击的控制台链接）。切勿暴露内嵌存储回环端口（`18428`/`19428`/`20428`/`22428`）。
 - **优雅关停**：`stop_signal: SIGTERM` 与 `stop_grace_period: 45s` 覆盖了默认的 `drain_timeout`（`20s`）与 `shutdown_timeout`（`15s`）。
 
 ---

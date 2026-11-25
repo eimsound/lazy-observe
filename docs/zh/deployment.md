@@ -89,6 +89,7 @@ cp config.example.yaml config.yaml
 | `metrics_endpoint.allow_unauthenticated` | `false` | 允许在内网免鉴权抓取 `/metrics`；配置 `bearer_token` 时禁止开启 |
 | `data_dir` | `./data` | 元数据、本地 Blob、生成文件与内嵌存储二进制根目录 |
 | `serve_web_ui` | `true` | 由网关直接提供内嵌 Web UI |
+| `external_url` | 空 | 控制台对外访问根地址（`http(s)://host[:port]`，不含路径、查询串或锚点）。配置后告警通知将附带可点击的控制台绝对链接；留空时不附带链接 |
 | `topology` | 空 | 显式声明拓扑：`""`、`all-in-one`、`standalone` 或 `ha`。设为 `ha` 时若缺少 PostgreSQL、Redis、S3、共享密钥文件或外部信号端点，启动直接失败 |
 | `standalone` | `false` | 使用外部信号存储 |
 | `storage_bin_dir` | 空 | 可选开发或离线覆写目录；留空则使用校验后的内嵌 Victoria 二进制 |
@@ -257,6 +258,30 @@ Helm Chart 会将单一 Secret 以只读方式挂载到 `/etc/lazy-observe-key/s
 AI 功能默认关闭，仅管理员可在 **Settings > AI** 中配置 Provider（`openai`、`anthropic`、`deepseek` 或 `ollama`）、可选 `base_url`、模型与 API Key。Provider 配置和 API Key 存于元数据数据库，API Key 由 `security.secret_key_file` 加密且绝不返回浏览器。服务端 YAML 与 `LO_AI_*` 环境变量不提供 Provider 或 API Key 配置项，仅支持通过 `ai.pricing_file`（`LO_AI_PRICING_FILE`）配置静态 LLM Token 定价覆写。
 
 启用后，网关提供管理员连通性测试、自然语言生成与解释 MetricsQL/LogsQL，以及新 Issue 的异步分析。AI 生成的查询仍经过按项目隔离的网关执行，并受响应大小与耗时上限约束。Issue 分析采用有界的跨信号证据，不会阻塞错误上报；除非 SDK 显式开启，否则不采集 Prompt 与 Completion 原文。
+
+### 告警通知中的控制台链接
+
+配置 `external_url`（环境变量 `LO_EXTERNAL_URL`、参数 `--external-url` 或 Helm 值 `externalURL`）为控制台对外访问根地址（例如 `https://observe.example.com`，不含路径、查询串或锚点）后，出站告警通知将自动附带可点击的绝对链接。留空时不附带任何控制台链接。
+
+各通知类型对应的链接目标如下：
+
+- **Issue 告警**（`new_issue`、`regression`）：`<external_url>/issues/<id>?project=<slug>`
+- **规则告警**：单条告警指向 `<external_url>/alerts?fingerprint=<fp>&project=<slug>`；聚合多条告警指向 `<external_url>/alerts?project=<slug>&rule=<rule>`
+- **告警风暴**：`<external_url>/alerts?project=<slug>&status=firing`
+- **错误率突增**（`error_rate_spike`）：`<external_url>/issues?project=<slug>`
+- **通知渠道测试**：`<external_url>/alerts/channels`
+
+各渠道渲染形式：
+
+- **飞书（Feishu）**：卡片底部主按钮（`View in lazy-observe`），多条告警聚合时每条附带 `lark_md` 链接（`View`）。
+- **钉钉（DingTalk）与企业微信（WeCom）**：Markdown 链接（`[View in lazy-observe](...)`，多条聚合时每条附带 `[View](...)`）。
+- **Slack**：`mrkdwn` 链接（`<url|View in lazy-observe>`，多条聚合时每条附带 `<url|View>`）。
+- **邮件（`smtp`）**：正文首行显示 `View in lazy-observe: <url>`，随后附 JSON 载荷。
+- **Webhook**：JSON 载荷附带可选字段 `url` 与 `alerts[].url`。
+
+打开链接时，浏览器标签页会切换到链接所指项目；项目不存在或无权访问时，控制台显示错误页，不会展示其他项目的数据。
+
+链接在通知发送阶段动态生成（而非入队时固化），修改 `external_url` 后对已入队或重试中的通知同样生效。
 
 ## 独立部署（Standalone）
 
@@ -442,7 +467,7 @@ PR CI 的 `go` 任务会在改动涉及服务端、Chart 或脚本时自动执�
 
 多副本高可用门禁在独立的 `e2e-ha` 任务中执行，由同一分类脚本的 `ha` 标记触发。该标记覆盖服务端代码（`cmd/**`、`internal/**`、`go.mod`、`go.sum`、`sdk/go/**`）、HA 门禁脚本及其编译辅助程序、`scripts/download-storage-bins.sh`、`bench/performance-gates.json`、Ent 生成链路（`entc.*`、`tools/entgen/**`、`scripts/generate-ent.sh`），以及全量触发路径（`.github/**`、`mise.toml`、`scripts/ci-*`、`Dockerfile*`）。仅修改 `deploy/**` 下的 Chart 文件不会触发 `ha` 标记；如果 Chart 改动涉及多副本行为，请在本地执行 `mise run e2e-ha`。该门禁全部针对真实组件运行，而非 Mock：包含带副本的 VictoriaMetrics 集群（并演练单个 `vmstorage` 宕机）、分拆角色的 VictoriaLogs/VictoriaTraces 与双向租户隔离、基于 Apache-2.0 SeaweedFS 的 S3 跨副本会话回放读写、共享 PostgreSQL 告警状态与通知 Outbox、Redis 会话与限流、带栅栏的告警主权切换、就绪探针以及优雅摘流。运行需要 Docker；缺少 Docker 前置条件会返回 `77`（`SKIP`），CI 视其为失败，绝不算通过。
 
-Chart 核心配置入口包括：`mode`、`replicaCount`、`image.{repository,tag,digest,pullPolicy}`、`external.{postgres,redis,s3,metrics,logs,traces}`、`secret.*`、`resources`、`hpa.*`、`podDisruptionBudget.*`、`persistence.*`、`ingress.*`、`process.*`、`encryptionKey.*`（对应 `security.secret_key_file`）和 `adminPassword.*`（对应 `security.admin_password_file`）。
+Chart 核心配置入口包括：`mode`、`replicaCount`、`image.{repository,tag,digest,pullPolicy}`、`externalURL`、`external.{postgres,redis,s3,metrics,logs,traces}`、`secret.*`、`resources`、`hpa.*`、`podDisruptionBudget.*`、`persistence.*`、`ingress.*`、`process.*`、`encryptionKey.*`（对应 `security.secret_key_file`）和 `adminPassword.*`（对应 `security.admin_password_file`）。
 
 ## PostgreSQL 元数据
 
