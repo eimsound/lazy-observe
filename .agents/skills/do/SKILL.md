@@ -161,9 +161,9 @@ CI 跑在 GitHub 托管 runner 上（`ubuntu-24.04`、原生 arm64 `ubuntu-24.04
 | --- | --- | --- |
 | PR、push 到 `main`、`integration/**` | `ci.yml` | 上表按改动面挑出的 job，由 `ci-ok` 汇总 |
 | `v*` tag、手动 release | `release.yml` | 双架构容器冒烟、镜像漏洞扫描（Trivy，有修复的 CRITICAL/HIGH 即失败）、`storage-bin-scan`（对下载并校验过 sha256 的嵌入 Victoria 上游二进制做 Trivy 扫描，参数与镜像扫描一致；ADR 0016：有命中只 `::warning::` 并写 step summary、不阻塞，扫描没跑成才失败）、性能门禁，全过才出包 |
-| 手动 | `bench.yml` | 依次跑 `bench`（30 秒摄入基准 + 基线门禁）、`perf-release`（双架构产物门禁 + 零配置 release smoke）、`perf-ha`（`e2e-ha` 全部 HA 断言 + 查询 P95 与弱扩展门禁）、`perf-results-check` |
+| 手动、每周定时（`main`） | `bench.yml` | 依次跑 `bench`（30 秒摄入基准 + 基线门禁）、`perf-release`（双架构产物门禁 + 零配置 release smoke）、`perf-ha`（`e2e-ha` 全部 HA 断言 + 查询 P95 与弱扩展门禁）、`perf-results-check` |
 
-切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。`mise run ci-changes-test` 只守「CI 自身、工具链、未分类路径、取不到 base 一律全量」这几条兜底；具体分组改了不用同步改测试。
+切片分支没有 push 触发的 run，PR run 是唯一一遍。性能门禁在共享 runner 上噪声大，只在手动、每周定时和发版前跑，不挡普通 PR：改了性能敏感路径就本地跑「性能」那行。`mise run ci-changes-test` 只守「CI 自身、工具链、未分类路径、取不到 base 一律全量」这几条兜底；具体分组改了不用同步改测试。
 
 只补验证、不改代码时（确认基线、补跑门禁、发版前复核），上面「本地必须跑」不适用：重门禁优先走 CI 手动入口，只有 CI 没有对应入口时才在本地跑。
 

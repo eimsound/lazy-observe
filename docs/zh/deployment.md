@@ -519,7 +519,7 @@ Helm 的 `startupProbe` 总时长必须大于 `meta.migration_lock_timeout` 与�
 
 `mise run snapshot` 在生成本地不发布归档前会先跑 `perf-release`。`mise run release` 在调用 GoReleaser 前会执行迁移校验与 `perf-release`，且仅当 `HEAD` 存在精确 `v*` 标签时才会继续。内嵌制品与零配置冒烟检查在两条打包路径中都是硬前置条件，而非可选项。
 
-推送 `v*` 标签会触发 `.github/workflows/release.yml`，在 GitHub Releases 发布 Linux `amd64`/`arm64` 归档与校验和，并把多架构容器镜像推至 `ghcr.io/eimsound/lazy-observe`。镜像推送完成后，工作流会用 `scripts/render-helm-release-values.sh` 按刚推送的镜像 digest 生成 `helm-values-lazy-observe-<version>.yaml` 并附到同一 Release 下，让 Helm 部署无需手工拷贝 digest。在构建归档之前，工作流要求双架构容器冒烟（含容器镜像与内嵌 Victoria 二进制的 Trivy 漏洞扫描）以及全套性能门禁（`bench`、`perf-release`、`perf-ha`、`perf-results-check`）全部通过；维护者也可手动触发该工作流重跑门禁而不发布。PR CI 不跑性能门禁（共享 Runner 抖动大），性能门禁只在手动触发 `bench.yml` 与正式发版前执行。
+推送 `v*` 标签会触发 `.github/workflows/release.yml`，在 GitHub Releases 发布 Linux `amd64`/`arm64` 归档与校验和，并把多架构容器镜像推至 `ghcr.io/eimsound/lazy-observe`。镜像推送完成后，工作流会用 `scripts/render-helm-release-values.sh` 按刚推送的镜像 digest 生成 `helm-values-lazy-observe-<version>.yaml` 并附到同一 Release 下，让 Helm 部署无需手工拷贝 digest。在构建归档之前，工作流要求双架构容器冒烟（含容器镜像与内嵌 Victoria 二进制的 Trivy 漏洞扫描）以及全套性能门禁（`bench`、`perf-release`、`perf-ha`、`perf-results-check`）全部通过；维护者也可手动触发该工作流重跑门禁而不发布。PR CI 不跑性能门禁（共享 Runner 抖动大），性能门禁只在手动触发 `bench.yml`、其每周定时运行与正式发版前执行。
 
 PR CI 采用增量执行：`changes` 任务按 diff 分类，只跑受影响的任务。`ci-ok` 汇总所有任务（跳过计为通过），是 `main` 分支规则集里唯一的必过检查。纯文档改动（`*.md`、`docs/**`、`.agents/**`、`LICENSE`）不触发业务任务；服务端改动会加跑 `e2e-ha`，`internal/**` 或 `cmd/**` 改动会触发单副本 `e2e` 与 `e2e-restart`。分类器的全量回退规则由 `mise run ci-changes-test` 验证。
 

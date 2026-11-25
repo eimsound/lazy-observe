@@ -145,7 +145,7 @@ jobs:
         run: bash scripts/check-storage-bin-vulns.sh
 
   # 性能门禁不跟 PR 跑，改为挡在发版链路上：tag 发布和手动 snapshot 都必须先过这一关。
-  # 步骤与 bench.yml（手动入口）一致，由 scripts/check-e2e-contract.sh 校验。
+  # 步骤与 bench.yml（手动触发与每周定时）一致，由 scripts/check-e2e-contract.sh 校验。
   performance-gates:
     name: Ingest, release, query, and HA gates
     runs-on: ubuntu-24.04
