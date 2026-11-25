@@ -34,15 +34,6 @@ Do not report accessibility findings in a review.
 The file contains all the rules and output format instructions.
 Where it says `$ARGUMENTS`, use the files or pattern the user asked to review.
 
-## Updating the Guidelines
-
-To update the snapshot to a newer upstream version:
-
-1. Get the latest commit SHA: `gh api repos/vercel-labs/web-interface-guidelines/commits/main --jq .sha`
-2. Download it: `curl -fsSL https://raw.githubusercontent.com/vercel-labs/web-interface-guidelines/<SHA>/command.md -o references/command.md`
-3. Remove the accessibility rules again
-4. Review the changes, then update the Source URL and upstream SHA-256 above (hash the downloaded file before editing it)
-
 ## Usage
 
 When a user provides a file or pattern argument:
