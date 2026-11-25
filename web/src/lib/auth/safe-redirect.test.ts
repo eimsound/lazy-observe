@@ -17,6 +17,19 @@ test("safeRedirect preserves valid same-origin paths with query and hash", () =>
   );
 });
 
+test("safeRedirect keeps raw query values and hash byte-for-byte for href navigation", () => {
+  // The change-password page hands this to `<Navigate href>` (#361): `$`, `//`
+  // and trailing `/` inside query values must survive untouched.
+  assert.equal(
+    safeRedirect("/alerts?project=staging&rule=foo/$bar//baz/#events", { origin: ORIGIN }),
+    "/alerts?project=staging&rule=foo/$bar//baz/#events",
+  );
+  assert.equal(
+    safeRedirect("/issues/42?project=staging&event=$evt/", { origin: ORIGIN }),
+    "/issues/42?project=staging&event=$evt/",
+  );
+});
+
 test("safeRedirect blocks open redirects via protocol-relative, backslash, scheme, and control chars", () => {
   const malicious = [
     "//evil.example",

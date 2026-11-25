@@ -18,9 +18,11 @@ const AuthenticatedAppLayout = lazyRouteComponent(
 export function AppLayout() {
   const { t } = useTranslation();
   const { status, user } = useAuth();
-  const { pathname, searchStr } = useRouterState({
-    select: (s) => ({ pathname: s.location.pathname, searchStr: s.location.searchStr }),
+  const { pathname, searchStr, hash } = useRouterState({
+    select: (s) => ({ pathname: s.location.pathname, searchStr: s.location.searchStr, hash: s.location.hash }),
   });
+  // Full in-app URL the guard returns to after sign-in / password change.
+  const redirect = pathname + (searchStr ?? "") + (hash ? `#${hash}` : "");
 
   if (status === "loading") {
     return (
@@ -37,7 +39,6 @@ export function AppLayout() {
     // Guard against the login route itself (defensive — it lives outside this
     // layout) so a transient match can't build a self-referential redirect.
     if (pathname === "/login") return null;
-    const redirect = pathname + (searchStr ?? "");
     return <Navigate to="/login" search={{ redirect }} replace />;
   }
 
@@ -46,7 +47,6 @@ export function AppLayout() {
     // until the generated initial password is replaced. Same transient-match
     // guard as the login redirect above.
     if (pathname === "/change-password") return null;
-    const redirect = pathname + (searchStr ?? "");
     return <Navigate to="/change-password" search={{ redirect }} replace />;
   }
 
