@@ -25,8 +25,8 @@ lazy-observe 面向单一团队，不是多团队共用的租户平台。项目�
 账号角色有三种，界面按 `member` 设计：
 
 - `member`：日常排障的开发者，默认角色。除只读外，可以写告警规则、改 Issue 状态、管理抓取目标、手工触发 AI 分析。
-- `admin`：负责部署和维护这套平台的一两个人。另外管理用户、项目、AI 设置和审计。
-- `viewer`：团队里只需要看的人，例如测试、产品、临时协作者。看到的是同一套界面去掉写操作，不为它单独设计页面。
+- `admin`：负责部署和维护这套平台的一两个人。另外管理用户、项目、通知渠道、AI 设置、审计和诊断。
+- `viewer`：团队里只需要看的人，例如测试、产品、临时协作者。只读访问观测数据、项目、抓取目标、Issue 和告警事件，看不到告警配置（规则、静默、抑制规则、通知历史）与管理员页面，复用同一套界面去掉写操作与无权限入口，不为它单独设计页面。
 
 部署场景：All-in-One（没有现成监控体系的团队、内网或私有化交付）、Standalone（已自己运维 Victoria 系存储的团队）、Clustered-HA（流量超出单机、需要高可用的单一团队）。
 
@@ -55,14 +55,14 @@ lazy-observe 是自托管的一体化可观测性平台：一个纯 Go 二进制
 ## Operating Context
 
 - 用户在排障时使用控制台，走错误调查旅程或性能调查旅程，在日志、指标、链路、会话回放和持续剖析之间取证。
-- 查询语言是日常工具：PromQL/MetricsQL 和 LogsQL，既有 CodeMirror 编辑器，也有面向不会写查询的用户的可视化构建器，两者双向同步。
+- 查询语言是日常工具：PromQL/MetricsQL 有 CodeMirror 编辑器和与之双向同步的可视化构建器；LogsQL 用 CodeMirror 编辑器加结构化过滤和字段统计。
 - 自由编排的监控视图不在控制台里做，用户把 lazy-observe 接成 Grafana 或 Perses 的数据源，即外部仪表盘。
 - 外部 AI 助手通过只读 MCP 端点查询项目遥测。
 - 内网和离线部署是常见环境。
 
 ## Capabilities and Constraints
 
-控制台现有的固定诊断界面：Overview、Logs、Metrics、Traces、Issues、应用性能（Web Vitals 与后端端点）、Replays、Profiling、Hosts、LLM 可观测性、告警（规则、事件、静默、抑制规则、通知渠道、通知历史），以及设置（项目、用户、抓取目标、AI、审计、诊断）。
+控制台现有的固定诊断界面：Overview、Logs、Metrics、Traces、Issues、应用性能（Web Vitals 与后端端点）、Replays、Profiling、LLM 可观测性、基础设施（Hosts、抓取目标）、告警（规则、事件、静默、抑制规则、通知渠道、通知历史），以及设置（项目、用户、AI、审计、诊断）。
 
 约束：
 
