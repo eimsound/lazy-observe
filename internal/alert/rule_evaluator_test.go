@@ -1614,6 +1614,114 @@ func TestNativeEvaluatorRuleEvaluationInterval(t *testing.T) {
 		}
 	})
 
+	t.Run("due slack aligns for transition when for equals interval", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "SlackForAlign", "slack-for-align")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule30s, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "For30sInterval30s",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "30s",
+			EvaluationInterval: "30s",
+			Severity:           "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule1m, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "For1mInterval30s",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "1m",
+			EvaluationInterval: "30s",
+			Severity:           "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var cur atomic.Int64
+		t0 := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		cur.Store(t0.UnixNano())
+		query := &perRuleQuery{
+			byRule: map[int][]RuleSample{
+				rule30s.ID: {{
+					Fingerprint: "fp-30s",
+					Labels:      map[string]string{"project_id": project.Slug, "alertname": "For30sInterval30s"},
+					Annotations: map[string]string{},
+					Value:       1,
+				}},
+				rule1m.ID: {{
+					Fingerprint: "fp-1m",
+					Labels:      map[string]string{"project_id": project.Slug, "alertname": "For1mInterval30s"},
+					Annotations: map[string]string{},
+					Value:       1,
+				}},
+			},
+		}
+		eval := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           query,
+			MemberID:        "slack-for-member",
+			TickInterval:    5 * time.Second,
+			MetricsInterval: 5 * time.Second,
+			LeaseTTL:        2 * time.Minute,
+			MemberTTL:       2 * time.Minute,
+			Now:             func() time.Time { return time.Unix(0, cur.Load()).UTC() },
+		})
+
+		eval.evaluateCycle(ctx)
+		states30s, err := store.AlertRuleStates(ctx, rule30s.ID)
+		if err != nil || len(states30s) != 1 || states30s[0].Status != "pending" ||
+			states30s[0].PendingSince == nil || !states30s[0].PendingSince.Equal(t0) {
+			t.Fatalf("t0 rule30s states=%#v err=%v", states30s, err)
+		}
+
+		// 300ms before due exceeds 250ms slack -> skipped.
+		cur.Store(t0.Add(30*time.Second - 300*time.Millisecond).UnixNano())
+		eval.evaluateCycle(ctx)
+		states30s, err = store.AlertRuleStates(ctx, rule30s.ID)
+		if err != nil || len(states30s) != 1 || !states30s[0].LastEvaluatedAt.Equal(t0) {
+			t.Fatalf("at +30s-300ms rule30s should not evaluate, states=%#v err=%v", states30s, err)
+		}
+
+		// 100ms before due is within 250ms slack -> rule30s transitions to firing at anchor t0+30s.
+		cur.Store(t0.Add(30*time.Second - 100*time.Millisecond).UnixNano())
+		eval.evaluateCycle(ctx)
+		states30s, err = store.AlertRuleStates(ctx, rule30s.ID)
+		if err != nil || len(states30s) != 1 || states30s[0].Status != "firing" ||
+			states30s[0].FiringSince == nil || !states30s[0].FiringSince.Equal(t0.Add(30*time.Second)) ||
+			!states30s[0].LastEvaluatedAt.Equal(t0.Add(30*time.Second)) {
+			t.Fatalf("at +30s-100ms rule30s states=%#v err=%v want firing at +30s", states30s, err)
+		}
+		// rule1m (for=2*interval) stays pending at +30s anchor.
+		states1m, err := store.AlertRuleStates(ctx, rule1m.ID)
+		if err != nil || len(states1m) != 1 || states1m[0].Status != "pending" ||
+			!states1m[0].LastEvaluatedAt.Equal(t0.Add(30*time.Second)) {
+			t.Fatalf("at +30s-100ms rule1m states=%#v err=%v want pending at +30s", states1m, err)
+		}
+
+		// Consecutive -100ms early tick at +60s-100ms transitions rule1m to firing without cumulative drift.
+		cur.Store(t0.Add(60*time.Second - 100*time.Millisecond).UnixNano())
+		eval.evaluateCycle(ctx)
+		states1m, err = store.AlertRuleStates(ctx, rule1m.ID)
+		if err != nil || len(states1m) != 1 || states1m[0].Status != "firing" ||
+			states1m[0].FiringSince == nil || !states1m[0].FiringSince.Equal(t0.Add(60*time.Second)) ||
+			!states1m[0].LastEvaluatedAt.Equal(t0.Add(60*time.Second)) {
+			t.Fatalf("at +60s-100ms rule1m states=%#v err=%v want firing at +60s", states1m, err)
+		}
+	})
+
 	t.Run("group_wait follow-up triggers once before long interval", func(t *testing.T) {
 		ctx := context.Background()
 		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
@@ -1713,6 +1821,106 @@ func TestNativeEvaluatorRuleEvaluationInterval(t *testing.T) {
 		}
 	})
 
+	t.Run("group_wait follow-up within due slack notifies without extra cycle", func(t *testing.T) {
+		ctx := context.Background()
+		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		project, err := store.CreateProject(ctx, "GroupWakeSlack", "group-wake-slack")
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := store.CreateNotificationChannel(ctx, meta.NotificationChannelCreate{
+			Type: "webhook", Name: "wake-slack-hook", Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := store.CreateAlertRule(ctx, meta.AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "LongIntervalSlackRule",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "10m",
+			Severity:           "critical",
+			ChannelIDs:         []int{channel.ID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var cur atomic.Int64
+		t0 := time.Date(2026, 11, 25, 13, 30, 0, 0, time.UTC)
+		cur.Store(t0.UnixNano())
+		query := &countingRuleQuery{
+			samples: []RuleSample{{
+				Fingerprint: "wake-slack-fp",
+				Labels:      map[string]string{"project_id": project.Slug, "alertname": "LongIntervalSlackRule"},
+				Annotations: map[string]string{},
+				Value:       1,
+			}},
+		}
+		eval := NewRuleEvaluator(RuleEvaluatorConfig{
+			Store:           store,
+			Query:           query,
+			MemberID:        "wake-slack-member",
+			TickInterval:    5 * time.Second,
+			MetricsInterval: 5 * time.Second,
+			GroupWait:       30 * time.Second,
+			RepeatInterval:  4 * time.Hour,
+			LeaseTTL:        time.Hour,
+			MemberTTL:       time.Hour,
+			Now:             func() time.Time { return time.Unix(0, cur.Load()).UTC() },
+		})
+
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 1 {
+			t.Fatalf("T0 calls=%d want 1", got)
+		}
+		outbox, err := store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+		if err != nil || len(outbox) != 0 {
+			t.Fatalf("T0 outbox=%#v err=%v want empty", outbox, err)
+		}
+
+		// 300ms before wakeAt exceeds 250ms slack -> skipped.
+		cur.Store(t0.Add(30*time.Second - 300*time.Millisecond).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 1 {
+			t.Fatalf("at +30s-300ms calls=%d want 1", got)
+		}
+
+		// 100ms before wakeAt is within 250ms slack -> notifies immediately at anchor t0+30s.
+		cur.Store(t0.Add(30*time.Second - 100*time.Millisecond).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 2 {
+			t.Fatalf("at +30s-100ms calls=%d want 2", got)
+		}
+		outbox, err = store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+		if err != nil || len(outbox) != 1 {
+			t.Fatalf("at +30s-100ms outbox len=%d err=%v want 1", len(outbox), err)
+		}
+		states, err := store.AlertRuleStates(ctx, rule.ID)
+		if err != nil || len(states) != 1 || states[0].LastNotifiedAt == nil ||
+			!states[0].LastNotifiedAt.Equal(t0.Add(30*time.Second)) {
+			t.Fatalf("at +30s-100ms states=%#v err=%v want LastNotifiedAt=+30s", states, err)
+		}
+
+		// No extra evaluation at +35s; next regular evaluation occurs at +30s+10m.
+		cur.Store(t0.Add(35 * time.Second).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 2 {
+			t.Fatalf("at +35s calls=%d want 2", got)
+		}
+		cur.Store(t0.Add(30*time.Second + 10*time.Minute).UnixNano())
+		eval.evaluateCycle(ctx)
+		if got := query.calls.Load(); got != 3 {
+			t.Fatalf("at +10m30s calls=%d want 3", got)
+		}
+	})
+
 	t.Run("corrupted stored evaluation_interval falls back to signal default", func(t *testing.T) {
 		ctx := context.Background()
 		store, err := meta.OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
@@ -1797,6 +2005,32 @@ func TestNativeEvaluatorRuleEvaluationInterval(t *testing.T) {
 		eval.evaluateCycle(ctx)
 		if perRule.count(zeroLogsRule.ID) != 2 {
 			t.Fatalf("+45s logs count=%d want 2", perRule.count(zeroLogsRule.ID))
+		}
+
+		// Repeated cycles and list-API EffectiveEvaluationInterval calls must deduplicate warnings.
+		_ = eval.ruleInterval(&badRule)
+		logsOut = buf.String()
+		if got := strings.Count(logsOut, fmt.Sprintf("rule_id=%d", badRule.ID)); got != 1 {
+			t.Fatalf("badRule warn count=%d want 1, logs:\n%s", got, logsOut)
+		}
+		if got := strings.Count(logsOut, fmt.Sprintf("rule_id=%d", zeroLogsRule.ID)); got != 1 {
+			t.Fatalf("zeroLogsRule warn count=%d want 1, logs:\n%s", got, logsOut)
+		}
+
+		// Clearing to a valid interval re-arms warning if the rule is later corrupted again,
+		// and a distinct corrupted value also logs once.
+		cleanRule := badRule
+		cleanRule.EvaluationInterval = ""
+		_ = eval.ruleInterval(&cleanRule)
+		_ = eval.ruleInterval(&badRule)
+		if got := strings.Count(buf.String(), fmt.Sprintf("rule_id=%d", badRule.ID)); got != 2 {
+			t.Fatalf("after reset+recorrupt warn count=%d want 2, logs:\n%s", got, buf.String())
+		}
+		otherBad := badRule
+		otherBad.EvaluationInterval = "still-bad"
+		_ = eval.ruleInterval(&otherBad)
+		if got := strings.Count(buf.String(), fmt.Sprintf("rule_id=%d", badRule.ID)); got != 3 {
+			t.Fatalf("after distinct corrupt value warn count=%d want 3, logs:\n%s", got, buf.String())
 		}
 	})
 }
