@@ -432,3 +432,154 @@ func TestAdminResetKeyFingerprintFirstRecordSkipsRotationWarning(t *testing.T) {
 		t.Fatalf("recorded fingerprint = %q, want %q", recorded.Fingerprint, box.Fingerprint())
 	}
 }
+
+func TestOpenServerMetadataWebSelfMonitoringToken(t *testing.T) {
+	t.Run("enabled-creates-separate-idempotent-token", func(t *testing.T) {
+		cfg, keyFile := platformKeyTestConfig(t)
+		cfg.SelfMonitoring = appconfig.Defaults().SelfMonitoring
+		logger, logs := platformKeyTestLogger()
+		box, err := loadSecretBox(cfg)
+		if err != nil {
+			t.Fatalf("load platform key: %v", err)
+		}
+
+		first, err := openServerMetadata(context.Background(), cfg, logger, box)
+		if err != nil {
+			t.Fatalf("first start: %v", err)
+		}
+		if first.selfWebToken == "" || !strings.HasPrefix(first.selfWebToken, "lo_") {
+			t.Fatalf("expected derived lo_ selfWebToken, got %q", first.selfWebToken)
+		}
+		if first.selfWebToken == first.selfToken {
+			t.Fatal("web self-monitoring token must be distinct from backend self-monitoring token")
+		}
+		firstWebToken := first.selfWebToken
+		firstProjectID := first.selfProject.ID
+		first.Close()
+
+		second, err := openServerMetadata(context.Background(), cfg, logger, box)
+		if err != nil {
+			t.Fatalf("second start: %v", err)
+		}
+		if second.selfWebToken != firstWebToken {
+			t.Fatalf("selfWebToken changed across restarts: %q != %q", second.selfWebToken, firstWebToken)
+		}
+		tokens, err := second.store.ListProjectAPITokens(context.Background(), firstProjectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second.Close()
+
+		var hasBackend, hasWeb bool
+		for _, tok := range tokens {
+			if tok.Name == meta.SelfMonitoringTokenName {
+				hasBackend = true
+			}
+			if tok.Name == meta.SelfMonitoringWebTokenName {
+				hasWeb = true
+			}
+		}
+		if !hasBackend || !hasWeb || len(tokens) != 2 {
+			t.Fatalf("unexpected self-monitoring tokens: %#v", tokens)
+		}
+		output := logs()
+		if strings.Contains(output, firstWebToken) {
+			t.Fatal("startup logs leaked web self-monitoring token")
+		}
+		assertNoPlatformKeyMaterial(t, output, readPlatformKeyFile(t, keyFile))
+	})
+
+	t.Run("disabling-revokes-existing-web-token-and-reenabling-reactivates", func(t *testing.T) {
+		cfg, _ := platformKeyTestConfig(t)
+		cfg.SelfMonitoring = appconfig.Defaults().SelfMonitoring
+		logger, _ := platformKeyTestLogger()
+		box, err := loadSecretBox(cfg)
+		if err != nil {
+			t.Fatalf("load platform key: %v", err)
+		}
+
+		enabledMeta, err := openServerMetadata(context.Background(), cfg, logger, box)
+		if err != nil {
+			t.Fatalf("enabled start: %v", err)
+		}
+		webToken := enabledMeta.selfWebToken
+		if webToken == "" {
+			t.Fatal("expected non-empty selfWebToken")
+		}
+		enabledMeta.Close()
+
+		cfg.SelfMonitoring.Web = false
+		disabledMeta, err := openServerMetadata(context.Background(), cfg, logger, box)
+		if err != nil {
+			t.Fatalf("disabled start: %v", err)
+		}
+		if disabledMeta.selfWebToken != "" {
+			t.Fatalf("expected empty selfWebToken when web=false, got %q", disabledMeta.selfWebToken)
+		}
+		if _, err := disabledMeta.store.AuthenticateProjectAPIToken(context.Background(), webToken); err == nil {
+			t.Fatal("expected previously issued web self-monitoring token to be revoked on disable")
+		}
+		if _, err := disabledMeta.store.AuthenticateProjectAPIToken(
+			context.Background(),
+			disabledMeta.selfToken,
+		); err != nil {
+			t.Fatalf("backend self-monitoring token must remain active when only web=false: %v", err)
+		}
+		disabledMeta.Close()
+
+		cfg.SelfMonitoring.Web = true
+		reenabledMeta, err := openServerMetadata(context.Background(), cfg, logger, box)
+		if err != nil {
+			t.Fatalf("reenabled start: %v", err)
+		}
+		defer reenabledMeta.Close()
+		if reenabledMeta.selfWebToken != webToken {
+			t.Fatalf("expected reactivated selfWebToken=%q, got %q", webToken, reenabledMeta.selfWebToken)
+		}
+		if _, err := reenabledMeta.store.AuthenticateProjectAPIToken(context.Background(), webToken); err != nil {
+			t.Fatalf("expected reactivated web self-monitoring token to authenticate: %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name           string
+		selfMonitoring appconfig.SelfMonitoring
+	}{
+		{
+			name:           "web-disabled",
+			selfMonitoring: appconfig.SelfMonitoring{Enabled: true, Web: false},
+		},
+		{
+			name:           "all-disabled",
+			selfMonitoring: appconfig.SelfMonitoring{Enabled: false, Web: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _ := platformKeyTestConfig(t)
+			cfg.SelfMonitoring = tc.selfMonitoring
+			logger, _ := platformKeyTestLogger()
+			box, err := loadSecretBox(cfg)
+			if err != nil {
+				t.Fatalf("load platform key: %v", err)
+			}
+
+			metadata, err := openServerMetadata(context.Background(), cfg, logger, box)
+			if err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			if metadata.selfWebToken != "" {
+				t.Fatalf("expected empty selfWebToken when disabled, got %q", metadata.selfWebToken)
+			}
+			tokens, err := metadata.store.ListProjectAPITokens(context.Background(), metadata.selfProject.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata.Close()
+			for _, tok := range tokens {
+				if tok.Name == meta.SelfMonitoringWebTokenName {
+					t.Fatalf("did not expect %s token to be created: %#v", meta.SelfMonitoringWebTokenName, tok)
+				}
+			}
+		})
+	}
+}

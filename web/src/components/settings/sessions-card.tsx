@@ -35,7 +35,7 @@ export function SessionsCard() {
   });
 
   return (
-    <Card>
+    <Card data-lo-block>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <ShieldCheck className="size-4" />

@@ -180,8 +180,15 @@ func TestRetentionDefaults(t *testing.T) {
 	if cfg.Process.RestartInitial.Value() != time.Second || cfg.Process.RestartMax.Value() != time.Minute {
 		t.Fatalf("restart defaults: %#v", cfg.Process)
 	}
-	if !cfg.SelfMonitoring.Enabled || cfg.SelfMonitoring.Profiling {
+	if !cfg.SelfMonitoring.Enabled || !cfg.SelfMonitoring.Web || cfg.SelfMonitoring.WebReplay ||
+		cfg.SelfMonitoring.Profiling {
 		t.Fatalf("self-monitoring defaults: %#v", cfg.SelfMonitoring)
+	}
+	if !cfg.SelfMonitoring.WebEnabled() {
+		t.Fatalf("expected WebEnabled() true by default: %#v", cfg.SelfMonitoring)
+	}
+	if cfg.SelfMonitoring.WebReplayEnabled() {
+		t.Fatalf("expected WebReplayEnabled() false by default: %#v", cfg.SelfMonitoring)
 	}
 	if cfg.Retention.Metrics.Value() != 90*24*time.Hour || cfg.Retention.Logs.Value() != 14*24*time.Hour ||
 		cfg.Retention.Traces.Value() != 7*24*time.Hour {
@@ -308,13 +315,72 @@ func TestRedisDefaultsAndEnvironment(t *testing.T) {
 }
 
 func TestSelfMonitoringEnvironment(t *testing.T) {
-	env := map[string]string{"LO_SELF_MONITORING_ENABLED": "false", "LO_SELF_MONITORING_PROFILING": "true"}
+	env := map[string]string{
+		"LO_SELF_MONITORING_ENABLED":    "false",
+		"LO_SELF_MONITORING_WEB":        "false",
+		"LO_SELF_MONITORING_WEB_REPLAY": "true",
+		"LO_SELF_MONITORING_PROFILING":  "true",
+	}
 	cfg, _, err := Load(nil, func(key string) (string, bool) { value, ok := env[key]; return value, ok })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SelfMonitoring.Enabled || !cfg.SelfMonitoring.Profiling {
+	if cfg.SelfMonitoring.Enabled || cfg.SelfMonitoring.Web || !cfg.SelfMonitoring.WebReplay ||
+		!cfg.SelfMonitoring.Profiling {
 		t.Fatalf("self-monitoring environment: %#v", cfg.SelfMonitoring)
+	}
+	if cfg.SelfMonitoring.WebEnabled() || cfg.SelfMonitoring.WebReplayEnabled() {
+		t.Fatalf("expected WebEnabled()/WebReplayEnabled() false when disabled: %#v", cfg.SelfMonitoring)
+	}
+
+	envOnlyWebDisabled := map[string]string{
+		"LO_SELF_MONITORING_WEB":        "false",
+		"LO_SELF_MONITORING_WEB_REPLAY": "true",
+	}
+	cfgWebOff, _, err := Load(
+		nil,
+		func(key string) (string, bool) { value, ok := envOnlyWebDisabled[key]; return value, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfgWebOff.SelfMonitoring.Enabled || cfgWebOff.SelfMonitoring.Web || cfgWebOff.SelfMonitoring.WebEnabled() ||
+		cfgWebOff.SelfMonitoring.WebReplayEnabled() {
+		t.Fatalf("web self-monitoring toggle: %#v", cfgWebOff.SelfMonitoring)
+	}
+
+	envParentOff := map[string]string{
+		"LO_SELF_MONITORING_ENABLED":    "false",
+		"LO_SELF_MONITORING_WEB":        "true",
+		"LO_SELF_MONITORING_WEB_REPLAY": "true",
+	}
+	cfgParentOff, _, err := Load(
+		nil,
+		func(key string) (string, bool) { value, ok := envParentOff[key]; return value, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfgParentOff.SelfMonitoring.WebEnabled() || cfgParentOff.SelfMonitoring.WebReplayEnabled() {
+		t.Fatalf(
+			"expected WebEnabled()/WebReplayEnabled() false when parent self_monitoring.enabled=false: %#v",
+			cfgParentOff.SelfMonitoring,
+		)
+	}
+
+	envReplayOn := map[string]string{"LO_SELF_MONITORING_WEB_REPLAY": "true"}
+	cfgReplayOn, _, err := Load(
+		nil,
+		func(key string) (string, bool) { value, ok := envReplayOn[key]; return value, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfgReplayOn.SelfMonitoring.WebEnabled() || !cfgReplayOn.SelfMonitoring.WebReplayEnabled() {
+		t.Fatalf(
+			"expected WebReplayEnabled() true when enabled & web & web_replay are true: %#v",
+			cfgReplayOn.SelfMonitoring,
+		)
 	}
 }
 

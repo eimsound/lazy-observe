@@ -159,3 +159,4 @@ through lazy-observe's project-scoped gateway routes.
 | `use-sidecar` | 1.1.3 | MIT |
 | `use-sync-external-store` | 1.7.0 | MIT |
 | `w3c-keyname` | 2.2.8 | MIT |
+| `web-vitals` | 6.2.3 | Apache-2.0 |

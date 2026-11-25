@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -71,6 +72,31 @@ const (
 	defaultProxyResponseHeaderTimeout     = 60 * time.Second
 	proxyDrainBodyLimitBytes              = 64 << 10
 )
+
+// WebSelfMonitoringConfig configures browser self-monitoring for the embedded web UI.
+type WebSelfMonitoringConfig struct {
+	Enabled       bool
+	ReplayEnabled bool
+	ProjectSlug   string
+	Token         string
+	ServiceName   string
+	Release       string
+}
+
+func (c WebSelfMonitoringConfig) active() bool {
+	return c.Enabled && strings.TrimSpace(c.ProjectSlug) != "" && strings.TrimSpace(c.Token) != ""
+}
+
+func (c WebSelfMonitoringConfig) normalized() WebSelfMonitoringConfig {
+	c.ProjectSlug = strings.TrimSpace(c.ProjectSlug)
+	c.Token = strings.TrimSpace(c.Token)
+	c.ServiceName = strings.TrimSpace(c.ServiceName)
+	if c.ServiceName == "" {
+		c.ServiceName = "lazy-observe-web"
+	}
+	c.Release = strings.TrimSpace(c.Release)
+	return c
+}
 
 type TokenStore interface {
 	AuthenticateProjectAPIToken(context.Context, string) (meta.ProjectInfo, error)
@@ -184,6 +210,7 @@ type Config struct {
 	DisableWebUI        bool
 	Instrumentation     fiber.Handler
 	SelfMonitoringToken string
+	WebSelfMonitoring   WebSelfMonitoringConfig
 	Logger              *slog.Logger
 	// MeterProvider receives the gateway's own operational metrics. Nil uses a
 	// no-op provider.
@@ -244,6 +271,7 @@ type gatewaySecurity struct {
 	secureSessionCookie      bool
 	initialAdminPasswordFile string
 	selfMonitoringToken      string
+	webSelfMonitoring        WebSelfMonitoringConfig
 }
 
 type gatewayLifecycle struct {
@@ -475,6 +503,7 @@ func New(cfg Config) *Gateway {
 			secureSessionCookie:      cfg.SecureSessionCookie,
 			initialAdminPasswordFile: cfg.InitialAdminPasswordFile,
 			selfMonitoringToken:      cfg.SelfMonitoringToken,
+			webSelfMonitoring:        cfg.WebSelfMonitoring.normalized(),
 		},
 		gatewayLifecycle: gatewayLifecycle{
 			health:         cfg.Health,
@@ -743,14 +772,38 @@ func (g *Gateway) registerMiddlewareAndProbes() {
 	if g.instrumentation != nil {
 		g.app.Use(func(c fiber.Ctx) error {
 			// OTLP exports are never observed, and the private token is a second
-			// marker for any future internal endpoint. Either condition prevents
-			// self-generated telemetry from recursively producing more telemetry.
-			if strings.HasPrefix(c.Path(), "/v1/") ||
-				(g.selfMonitoringToken != "" && bearerCredential(c) == g.selfMonitoringToken) {
+			// marker for any future internal endpoint. Browser self-monitoring
+			// ingest calls are exempted only on the four browser ingest paths so
+			// a public browser token can never suppress gateway telemetry on
+			// unrelated routes.
+			reqPath := c.Path()
+			if strings.HasPrefix(reqPath, "/v1/") {
+				return c.Next()
+			}
+			bearer := bearerCredential(c)
+			if subtleConstantTimeEqual(bearer, g.selfMonitoringToken) {
+				return c.Next()
+			}
+			if g.webSelfMonitoring.active() &&
+				isBrowserSelfMonitoringIngestPath(reqPath) &&
+				subtleConstantTimeEqual(bearer, g.webSelfMonitoring.Token) {
 				return c.Next()
 			}
 			return g.instrumentation(c)
 		})
+	}
+}
+
+func subtleConstantTimeEqual(a, b string) bool {
+	return b != "" && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func isBrowserSelfMonitoringIngestPath(requestPath string) bool {
+	switch requestPath {
+	case "/api/events/errors", "/api/events/vitals", "/api/events/diagnostics", "/api/replay/segments":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -761,6 +814,12 @@ func (g *Gateway) registerPlatformRoutes() {
 	if g.metricsEndpoint.enabled {
 		g.route(fiber.MethodGet, "/metrics", g.metricsEndpoint.routePolicy(), g.prometheusMetrics)
 	}
+	g.route(
+		fiber.MethodGet,
+		"/api/system/self-monitoring",
+		routePolicy{auth: authSessionOnly},
+		g.webSelfMonitoringConfig,
+	)
 	g.route(fiber.MethodGet, "/api/system/info", routePolicy{auth: authUser, projectScope: true}, g.systemInfo)
 	g.route(
 		fiber.MethodGet,

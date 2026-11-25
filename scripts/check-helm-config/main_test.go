@@ -52,6 +52,8 @@ data:
       admin_password_file: "/etc/lazy-observe-admin/admin-password"
     self_monitoring:
       enabled: true
+      web: true
+      web_replay: false
       profiling: false
 ---
 apiVersion: apps/v1
@@ -115,6 +117,8 @@ data:
       session_secure_cookie: false
     self_monitoring:
       enabled: true
+      web: true
+      web_replay: false
       profiling: false
 ---
 apiVersion: apps/v1

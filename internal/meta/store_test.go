@@ -177,6 +177,120 @@ func TestBootstrapSelfMonitoringIsIdempotentAndSecret(t *testing.T) {
 	}
 }
 
+func TestBootstrapSelfMonitoringWebTokenLifecycle(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	selfProject, backendToken, err := store.BootstrapSelfMonitoring(
+		ctx,
+		"lo_test-self-monitoring-derived-backend-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const derivedWeb = "lo_test-self-monitoring-derived-web-token"
+	webToken1, err := store.BootstrapSelfMonitoringWebToken(ctx, selfProject.ID, derivedWeb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webToken2, err := store.BootstrapSelfMonitoringWebToken(ctx, selfProject.ID, derivedWeb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if webToken1 != derivedWeb || webToken2 != derivedWeb || webToken1 == backendToken {
+		t.Fatalf("web tokens=(%q, %q) backend=%q", webToken1, webToken2, backendToken)
+	}
+
+	tokens, err := store.ListProjectAPITokens(ctx, selfProject.ID)
+	if err != nil || len(tokens) != 2 {
+		t.Fatalf("tokens=%#v err=%v", tokens, err)
+	}
+	var webMeta ProjectAPITokenInfo
+	var foundWeb bool
+	for _, tok := range tokens {
+		if tok.Name == SelfMonitoringWebTokenName {
+			webMeta = tok
+			foundWeb = true
+		}
+	}
+	if !foundWeb || webMeta.Revoked {
+		t.Fatalf("missing active web self-monitoring token metadata: %#v", tokens)
+	}
+	if strings.Contains(fmt.Sprint(tokens), webToken1) {
+		t.Fatal("web self-monitoring token leaked through metadata")
+	}
+
+	// Revoking and re-bootstrapping reactivates the derived web token.
+	if err := store.RevokeProjectAPITokenByID(ctx, selfProject.ID, webMeta.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthenticateProjectAPIToken(ctx, derivedWeb); err == nil {
+		t.Fatal("revoked web self-monitoring token unexpectedly authenticated")
+	}
+	if _, err := store.BootstrapSelfMonitoringWebToken(ctx, selfProject.ID, derivedWeb); err != nil {
+		t.Fatal(err)
+	}
+	authedProject, err := store.AuthenticateProjectAPIToken(ctx, derivedWeb)
+	if err != nil || authedProject.ID != selfProject.ID {
+		t.Fatalf("reactivated web token auth=(%#v, %v)", authedProject, err)
+	}
+
+	// Bootstrapping with a rotated derived token activates the new one and revokes previous self-monitoring-web tokens
+	// while keeping the backend self-monitoring token untouched.
+	const rotatedWeb = "lo_test-self-monitoring-rotated-web-token"
+	if _, err := store.BootstrapSelfMonitoringWebToken(ctx, selfProject.ID, rotatedWeb); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthenticateProjectAPIToken(ctx, derivedWeb); err == nil {
+		t.Fatal("stale web self-monitoring token unexpectedly authenticated after key rotation")
+	}
+	if authedProject, err := store.AuthenticateProjectAPIToken(
+		ctx,
+		rotatedWeb,
+	); err != nil ||
+		authedProject.ID != selfProject.ID {
+		t.Fatalf("rotated web token auth=(%#v, %v)", authedProject, err)
+	}
+	if authedBackend, err := store.AuthenticateProjectAPIToken(
+		ctx,
+		backendToken,
+	); err != nil ||
+		authedBackend.ID != selfProject.ID {
+		t.Fatalf("backend self-monitoring token must stay active=(%#v, %v)", authedBackend, err)
+	}
+
+	// RevokeSelfMonitoringWebTokens revokes active browser tokens without touching the backend token.
+	if err := store.RevokeSelfMonitoringWebTokens(ctx, selfProject.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthenticateProjectAPIToken(ctx, rotatedWeb); err == nil {
+		t.Fatal("revoked web self-monitoring token unexpectedly authenticated")
+	}
+	if authedBackend, err := store.AuthenticateProjectAPIToken(
+		ctx,
+		backendToken,
+	); err != nil ||
+		authedBackend.ID != selfProject.ID {
+		t.Fatalf("backend self-monitoring token must stay active after web revoke=(%#v, %v)", authedBackend, err)
+	}
+
+	// Cross-project token collision and malformed derived token must fail closed.
+	other, err := store.CreateProject(ctx, "Other", "other-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BootstrapSelfMonitoringWebToken(ctx, other.ID, derivedWeb); err == nil {
+		t.Fatal("expected cross-project web self-monitoring token collision to fail")
+	}
+	if _, err := store.BootstrapSelfMonitoringWebToken(ctx, selfProject.ID, "lo_short"); err == nil {
+		t.Fatal("expected short derived web self-monitoring token to fail")
+	}
+}
+
 func TestSQLiteDSNEnforcesConnectionPragmasAndUTCTime(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))

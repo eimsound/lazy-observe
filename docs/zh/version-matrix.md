@@ -37,6 +37,7 @@
 | 私有 ingest | `POST /api/profiles` | 持续剖析（pprof）上报 |
 | 私有上传 | `POST /api/releases/:release/sourcemaps` | Source Map 制品上传；只接受 Source Map 上传 Token（`los_...`，§2.2），项目 API Token 与用户 API Token 返回 `403` `source_map_upload_token_required` |
 | 自身运维指标 | `GET /metrics` | Prometheus 文本格式 0.0.4（`text/plain; version=0.0.4; charset=utf-8`）；通过 `metrics_endpoint.enabled` 显式开启（默认关闭），默认需管理员鉴权，可选静态 scrape Bearer Token 或显式 `allow_unauthenticated`（§2.2） |
+| 前端自监控配置 | `GET /api/system/self-monitoring` | 会话鉴权只读接口（`authSessionOnly`，`Cache-Control: no-store`；拒绝未认证与 `lou_...` 用户 API Token 并返回 `401`，拒绝处于 `must_change_password` 的会话并返回 `403 password_change_required`）。受 `self_monitoring.enabled`、`self_monitoring.web` 与 `self_monitoring.web_replay` 控制；禁用时返回 `{ enabled: false }`，启用时返回 `{ enabled: true, project_slug, token, service_name, release, replay_enabled? }` 与派生自平台密钥的 `self-monitoring-web` 项目摄取 Token（`lo_...`）（向后兼容新增端点，协议版本仍为 **v0**） |
 | 控制台管理 | `GET`/`POST /api/alert-rules`、`PATCH`/`PUT /api/alert-rules/:id` | 项目隔离的原生告警规则增删改查（需会话 Cookie 或用户 API Token，拒绝项目 API Token）；规则可选携带按规则覆盖的 `evaluation_interval`（见下方说明） |
 
 `POST /api/events/diagnostics` 的枚举值当前为：

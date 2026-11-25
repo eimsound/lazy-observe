@@ -181,8 +181,9 @@ classify() {
     set_flags sdk_node
     set_journeys node browser
     ;;
+  # 嵌入前端直接打包 sdk/browser 源码（前端自监控链路），类似 sdk/go/*。
   sdk/browser/*)
-    set_flags sdk_browser
+    set_flags sdk_browser web build
     set_journeys browser
     ;;
   sdk/python/*)

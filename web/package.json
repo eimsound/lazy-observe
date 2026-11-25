@@ -47,7 +47,8 @@
     "rrweb": "2.2.2",
     "tailwind-merge": "^3.7.0",
     "tw-animate-css": "^1.2.0",
-    "uplot": "^1.6.32"
+    "uplot": "^1.6.32",
+    "web-vitals": "^6.2.3"
   },
   "devDependencies": {
     "@playwright/test": "^1.65.0",

@@ -20,7 +20,13 @@
     "noUncheckedSideEffectImports": true,
 
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@lazy-observe/browser": ["../sdk/browser/packages/browser/src/index.ts"],
+      "@lazy-observe/react": ["../sdk/browser/packages/react/src/index.ts"],
+      "react": ["./node_modules/@types/react/index.d.ts"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime.d.ts"],
+      "rrweb": ["./node_modules/rrweb"],
+      "web-vitals": ["./node_modules/web-vitals"]
     }
   },
   "include": ["src", "vite.config.ts"]

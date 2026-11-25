@@ -54,4 +54,6 @@ data:
       {{- end }}
     self_monitoring:
       enabled: true
+      web: true
+      web_replay: false
       profiling: false

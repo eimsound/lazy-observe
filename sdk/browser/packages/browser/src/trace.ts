@@ -13,7 +13,7 @@ export interface RecordedSpan {
   startTimeUnixNano: string;
   endTimeUnixNano: string;
   attributes?: Record<string, SpanAttribute>;
-  status: { code: 1 | 2; message?: string };
+  status: { code: 0 | 1 | 2; message?: string };
 }
 
 export function unixNanoNow(): string {

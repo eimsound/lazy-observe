@@ -112,6 +112,8 @@ cp config.example.yaml config.yaml
 | `redis.db` | `0` | Redis 逻辑库编号 |
 | `redis.key_prefix` | `lazy-observe` | 全部网关副本共享的键前缀 |
 | `self_monitoring.enabled` | `true` | 通过内置 Go SDK 与自监控项目观测 lazy-observe 自身 |
+| `self_monitoring.web` | `true` | 在 `self_monitoring.enabled` 为 `true` 时，为已登录的 Web 控制台会话启用浏览器端自监控（JS/React 错误、Web Vitals 与同源 Fetch 链路追踪） |
+| `self_monitoring.web_replay` | `false` | 在 `self_monitoring.enabled` 与 `self_monitoring.web` 均启用时，为 Web 控制台自监控开启仅报错时录制的 Session Replay（`onErrorOnly`） |
 | `self_monitoring.profiling` | `false` | 为常驻网关进程开启持续性能剖析 |
 
 ### 保留策略、对象存储、告警与进程配置

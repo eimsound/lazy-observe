@@ -65,6 +65,9 @@ export const en: typeof zh = {
     moduleLoadErrorTitle: "Module failed to load",
     moduleLoadErrorDesc:
       "The page resources could not be loaded. Retry the page, and temporarily disable blocking extensions if needed.",
+    appCrashTitle: "Something went wrong",
+    appCrashDesc: "The console hit an unexpected rendering error. Reload the page to continue.",
+    reload: "Reload page",
     empty: "No data",
     comingSoon: "This module is under construction",
     comingSoonDesc:

@@ -288,10 +288,11 @@ func (state *serverSharedState) Close() {
 }
 
 type serverMetadata struct {
-	store       *meta.Store
-	blobs       blob.Store
-	selfProject meta.ProjectInfo
-	selfToken   string
+	store        *meta.Store
+	blobs        blob.Store
+	selfProject  meta.ProjectInfo
+	selfToken    string
+	selfWebToken string
 }
 
 func openServerMetadata(
@@ -333,12 +334,26 @@ func openServerMetadata(
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap self-monitoring metadata: %w", err)
 	}
+	var selfWebToken string
+	if cfg.SelfMonitoring.WebEnabled() {
+		selfWebToken, err = store.BootstrapSelfMonitoringWebToken(
+			ctx,
+			selfProject.ID,
+			"lo_"+secretBox.Derive("self-monitoring-web-token"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("bootstrap web self-monitoring token: %w", err)
+		}
+	} else if revokeErr := store.RevokeSelfMonitoringWebTokens(ctx, selfProject.ID); revokeErr != nil {
+		return nil, fmt.Errorf("revoke web self-monitoring tokens: %w", revokeErr)
+	}
 	initialized = true
 	return &serverMetadata{
-		store:       store,
-		blobs:       blobs,
-		selfProject: selfProject,
-		selfToken:   selfToken,
+		store:        store,
+		blobs:        blobs,
+		selfProject:  selfProject,
+		selfToken:    selfToken,
+		selfWebToken: selfWebToken,
 	}, nil
 }
 

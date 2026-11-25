@@ -78,7 +78,7 @@ export function UserAPITokensCard() {
   });
 
   return (
-    <Card>
+    <Card data-lo-block>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <KeyRound className="size-4" />
@@ -88,7 +88,7 @@ export function UserAPITokensCard() {
       </CardHeader>
       <CardContent className="space-y-4">
         {created && (
-          <div className="space-y-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
+          <div data-lo-block className="space-y-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
             <div className="flex items-center gap-2 text-sm font-medium">
               <Check className="size-4 text-primary" />
               {t("userTokens.createdTitle")}

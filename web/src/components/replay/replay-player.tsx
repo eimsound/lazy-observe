@@ -235,7 +235,7 @@ export function ReplayPlayer({
   return (
     <div className="space-y-3">
       {/* Replay surface */}
-      <div className="overflow-hidden rounded-md border border-border bg-muted/30">
+      <div data-lo-block className="overflow-hidden rounded-md border border-border bg-muted/30">
         <div ref={hostRef} className="lo-rrweb w-full overflow-hidden" />
       </div>
 
