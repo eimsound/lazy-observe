@@ -61,9 +61,9 @@ Do NOT propose interfaces yet. After the file is written, ask the user: "Which o
 
 ### 3. Grilling loop
 
-Once the user picks a candidate, call the Skill tool with "grilling" to walk the decision tree with them: constraints, dependencies, the shape of the deepened module, what sits behind the seam, what tests survive.
+Once the user picks a candidate, call the Skill tool with "grill-with-docs" to walk the decision tree with them (constraints, dependencies, the shape of the deepened module, what sits behind the seam, what tests survive) and keep the domain model current as decisions crystallize.
 
-Side effects happen inline as decisions crystallize; call the Skill tool with "domain-modeling" to keep the domain model current as you go:
+Side effects happen inline as decisions crystallize:
 
 - **Naming a deepened module after a concept not in `.agents/docs/GLOSSARY.md`?** Add the term to `.agents/docs/GLOSSARY.md`. Create the file lazily if it doesn't exist.
 - **Sharpening a fuzzy term during the conversation?** Update `.agents/docs/GLOSSARY.md` right there.

@@ -6,7 +6,7 @@ description: lazy-observe 的单一工作入口。改代码、改配置、发版
 # do
 
 本仓库的工作流路由入口，按情境选定一条流程并串联所需 skill。
-`.agents/skills/` 下分两类 skill：未设 `disable-model-invocation` 的可由模型自动发现调用（出现在 `<skills>` 列表中）；带 `disable-model-invocation: true` 的（如 `implement`、`to-spec`、`to-tickets`、`implement-spec`、`grill-with-docs`、`triage`、`retro`）不会注入 `<skills>` 列表，路由命中时由用户触发或由 agent 直接读取 `.agents/skills/<name>/SKILL.md` 执行。
+`.agents/skills/` 下分两类 skill：未设 `disable-model-invocation` 的可由模型自动发现调用（出现在 `<skills>` 列表中）；带 `disable-model-invocation: true` 的（如 `implement`、`to-spec`、`to-tickets`、`implement-spec`、`triage`、`retro`）不会注入 `<skills>` 列表，路由命中时由用户触发或由 agent 直接读取 `.agents/skills/<name>/SKILL.md` 执行。
 先读 `AGENTS.md`，再读本文件；两者冲突时以 `AGENTS.md` 为准。
 
 ## 入口契约
