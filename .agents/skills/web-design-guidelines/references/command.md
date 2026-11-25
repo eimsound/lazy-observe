@@ -11,29 +11,6 @@ Read files, check against rules below. Output concise but comprehensive—sacrif
 
 ## Rules
 
-### Accessibility
-
-- Icon-only buttons need `aria-label`
-- Form controls need `<label>` or `aria-label`
-- Interactive elements need keyboard handlers (`onKeyDown`/`onKeyUp`)
-- `<button>` for actions, `<a>`/`<Link>` for navigation (not `<div onClick>`)
-- Images need `alt` (or `alt=""` if decorative)
-- Decorative icons need `aria-hidden="true"`
-- Async updates (toasts, validation) need `aria-live="polite"`
-- Use semantic HTML (`<button>`, `<a>`, `<label>`, `<table>`) before ARIA
-- Headings hierarchical `<h1>`–`<h6>`; include skip link for main content
-- `scroll-margin-top` on heading anchors
-- Meaningful media needs captions, transcripts, or descriptions as applicable
-- Media controls need keyboard support; decorative media needs assistive-tech hiding
-
-### Focus States
-
-- Interactive elements need visible focus: `focus-visible:ring-*` or equivalent
-- Never `outline-none` / `outline: none` without focus replacement
-- Use `:focus-visible` over `:focus` (avoid focus ring on click)
-- Group focus with `:focus-within` for compound controls
-- Sticky headers/footers/overlays must not cover the focused element
-
 ### Forms
 
 - Inputs need `autocomplete` and meaningful `name`
@@ -50,14 +27,12 @@ Read files, check against rules below. Output concise but comprehensive—sacrif
 
 ### Animation
 
-- Honor `prefers-reduced-motion` (provide reduced variant or disable)
 - Animate `transform`/`opacity` only (compositor-friendly)
 - Never `transition: all`—list properties explicitly
 - Set correct `transform-origin`
 - SVG: transforms on `<g>` wrapper with `transform-box: fill-box; transform-origin: center`
 - Animations interruptible—respond to user input mid-animation
 - Autoplay motion >5 seconds alongside other content needs pause, stop, or hide controls
-- Muted decorative loops must stop under `prefers-reduced-motion`
 
 ### Typography
 
@@ -90,7 +65,7 @@ Read files, check against rules below. Output concise but comprehensive—sacrif
 - Add `<link rel="preconnect">` for CDN/asset domains
 - Critical fonts: `<link rel="preload" as="font">` with `font-display: swap`
 - Prefer `<video autoplay muted loop playsinline>` over animated GIF; provide a still alternative
-- Short non-essential loops: Safari H.264 MP4 `<picture>` source, `prefers-reduced-motion` media condition, and still fallback
+- Short non-essential loops: Safari H.264 MP4 `<picture>` source and still fallback
 
 ### Navigation & State
 
@@ -106,7 +81,7 @@ Read files, check against rules below. Output concise but comprehensive—sacrif
 - `overscroll-behavior: contain` in modals/drawers/sheets
 - Page rubber-band suppression: `overscroll-behavior: none` on `<html>` inside `@media (pointer: fine)`; keep coarse-pointer page defaults for pull-to-refresh. Test hybrid touch devices: `pointer` describes the primary input, and `none` also disables scroll chaining and native swipe navigation
 - During drag: disable text selection, `inert` on dragged elements
-- Drag/swipe/pinch/path gestures need tap/click and keyboard alternatives unless essential
+- Drag/swipe/pinch/path gestures need tap/click alternatives unless essential
 - `autoFocus` sparingly—desktop only, single primary input; avoid on mobile
 
 ### Safe Areas & Layout
@@ -151,20 +126,15 @@ Read files, check against rules below. Output concise but comprehensive—sacrif
 
 ### Anti-patterns (flag these)
 
-- `user-scalable=no` or `maximum-scale=1` disabling zoom
 - `onPaste` with `preventDefault`
 - `transition: all`
-- `outline-none` without focus-visible replacement
 - Inline `onClick` navigation without `<a>`
-- `<div>` or `<span>` with click handlers (should be `<button>`)
 - Images without dimensions
 - Large arrays `.map()` without virtualization
-- Form inputs without labels
-- Icon buttons without `aria-label`
 - Hardcoded date/number formats (use `Intl.*`)
 - `autoFocus` without clear justification
 - Animated GIF when compressed video is suitable
-- Gesture-only action without tap/click and keyboard alternative
+- Gesture-only action without tap/click alternative
 
 ## Output Format
 
@@ -173,9 +143,8 @@ Group by file. Use `file:line` format (VS Code clickable). Terse findings.
 ```text
 ## src/Button.tsx
 
-src/Button.tsx:42 - icon button missing aria-label
-src/Button.tsx:18 - input lacks label
-src/Button.tsx:55 - animation missing prefers-reduced-motion
+src/Button.tsx:42 - input missing autocomplete
+src/Button.tsx:18 - button label "Continue" → name the action
 src/Button.tsx:67 - transition: all → list properties
 
 ## src/Modal.tsx

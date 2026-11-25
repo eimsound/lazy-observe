@@ -1,6 +1,6 @@
 ---
 name: web-design-guidelines
-description: Review UI code for Web Interface Guidelines compliance. Use when asked to "review my UI", "check accessibility", "audit design", "review UX", or "check my site against best practices".
+description: Review UI code for Web Interface Guidelines compliance. Use when asked to "review my UI", "audit design", "review UX", or "check my site against best practices".
 metadata:
   author: vercel
   version: "1.1.0"
@@ -22,11 +22,21 @@ Review files for compliance with Web Interface Guidelines.
 
 The rules are bundled with this skill in the [references/command.md](references/command.md) file. Read that file before each review. Do not fetch rules from the network.
 
-The snapshot is pinned to a specific upstream commit:
+The snapshot is based on a specific upstream commit:
 
 Source: https://github.com/vercel-labs/web-interface-guidelines/blob/434b7f91364665f2f733b310ec54809bf8f37937/command.md
 
-SHA-256: `d246b026f4f29b5823a9cc857f9edf3d2507002e055e32040cadeaf3b38e0234`
+Upstream SHA-256: `d246b026f4f29b5823a9cc857f9edf3d2507002e055e32040cadeaf3b38e0234`
+
+The bundled file is a local modification of that snapshot, so its hash no longer matches. This project has no
+accessibility requirement (see `PRODUCT.md`), so these rules were removed:
+
+- the `Accessibility` and `Focus States` sections;
+- the `prefers-reduced-motion` rules under `Animation` and `Performance`;
+- the keyboard-alternative clause for gestures under `Touch & Interaction`;
+- the matching entries under `Anti-patterns` and in the output example.
+
+Do not report accessibility findings (ARIA, keyboard access, focus visibility, contrast, reduced motion) in a review.
 
 The file contains all the rules and output format instructions.
 Where it says `$ARGUMENTS`, use the files or pattern the user asked to review.
@@ -37,8 +47,8 @@ To update the snapshot to a newer upstream version:
 
 1. Get the latest commit SHA: `gh api repos/vercel-labs/web-interface-guidelines/commits/main --jq .sha`
 2. Download it: `curl -fsSL https://raw.githubusercontent.com/vercel-labs/web-interface-guidelines/<SHA>/command.md -o references/command.md`
-3. Review the changes, then update the Source URL and SHA-256 above (`shasum -a 256 references/command.md`)
-4. Regenerate `skills/web-design-guidelines.zip` so it matches the updated folder
+3. Remove the accessibility rules listed above again
+4. Review the changes, then update the Source URL and upstream SHA-256 above (hash the downloaded file before editing it)
 
 ## Usage
 

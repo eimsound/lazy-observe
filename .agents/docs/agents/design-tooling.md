@@ -21,6 +21,13 @@
   核对：`.agents/skills/impeccable/scripts/impeccable telemetry status`。
 - 产品上下文：`PRODUCT.md` 由 `/impeccable init` 生成；`DESIGN.md` 已手写，不要用 `/impeccable document` 覆盖，改它按 `DESIGN.md` 自身约定手改。
 
+## web-design-guidelines 技能
+
+- 位置：`.agents/skills/web-design-guidelines/`，来自 `vercel-labs/agent-skills`，许可证见 `.agents/skills/LICENSE-vercel-agent-skills`。
+- 规则文件 `references/command.md` 是上游快照的本地修改版：本项目不设无障碍要求（见 `PRODUCT.md` 非目标），删掉了无障碍相关规则，
+  清单见该技能 `SKILL.md` 的 Guidelines Source 一节。
+- 升级会把删掉的规则覆盖回来：升级后按 `SKILL.md` 的 Updating 步骤重新删除。`skills-lock.json` 里的 `computedHash` 没有随本地修改更新。
+
 ## Playwright MCP
 
 - 两份配置参数保持一致：Claude Code 读根目录 `.mcp.json`，agy 读仓库内插件 `.agents/plugins/playwright/`（`plugin.json` + `mcp_config.json`，会话里工具名前缀为 `playwright_playwright`）。升级时两处版本一起改，版本发布满 7 天。
