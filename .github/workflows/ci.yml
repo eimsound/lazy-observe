@@ -5,7 +5,7 @@ name: CI
 # 纯文档改动所有业务 job 跳过。动到打包链路时 arm64 构建与冒烟进入 build 矩阵，
 # 发版前 release.yml 再对两个架构兜底。服务端改动另跑多副本 HA 功能门禁（e2e-ha）；
 # SDK、服务端与前端改动另跑 SDK journeys（真实平台 + Go/Node/Python/Browser 四个 SDK 的端到端 journey）；
-# 性能门禁（perf-ha、perf-release、bench）不进 PR，只在 bench.yml 手动和 release.yml 发版前跑。
+# 性能门禁（perf-ha、perf-release、bench）不进 PR，只在 bench.yml（手动触发与每周定时）和 release.yml 发版前跑。
 #
 # 所有 job 直接跑在 GitHub 托管 runner 上，工具由 scripts/ci-setup-mise.sh 安装，mise 目录按工具集缓存。
 #

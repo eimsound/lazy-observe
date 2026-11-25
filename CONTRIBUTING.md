@@ -177,12 +177,12 @@ business job.
 | --- | --- | --- |
 | Pull request, push to `main` or `integration/**` | `ci.yml` | Change-scoped jobs above, aggregated by `ci-ok` |
 | `v*` tag or manual release dispatch | `release.yml` | amd64/arm64 container smoke, a Trivy image scan, a Trivy scan of the embedded Victoria binaries (`mise run storage-bin-vulns`), and the performance gates, all before archives are built. Fixable CRITICAL/HIGH findings fail the image scan; findings in the embedded upstream binaries only warn (ADR 0016: we embed the official upstream binaries and never rebuild them), and that scan fails only when it could not run (Trivy error, not exactly four Go binaries analyzed, report and exit code disagree) |
-| Manual dispatch | `bench.yml` | Performance gates on demand |
+| Manual dispatch, weekly schedule on `main` | `bench.yml` | Performance gates on demand and weekly |
 
 Performance gates are noisy on shared runners, so they run only on manual
-dispatch and before a release; the PR job runs only the functional HA
-assertions of `e2e-ha`, never `perf-ha`. Run them locally when your change is
-performance-sensitive.
+dispatch, on the weekly `bench.yml` schedule, and before a release; the PR job
+runs only the functional HA assertions of `e2e-ha`, never `perf-ha`. Run them
+locally when your change is performance-sensitive.
 
 The embedded-binary scan never blocks a release because of a CVE: findings show up as `::warning::` annotations and
 in the job's step summary, and upstream decides when they go away. The scan does not check whether the pins are

@@ -150,10 +150,10 @@ for consumer in scripts/sdk-journeys.sh scripts/e2e-multi-replica.sh scripts/che
     fail "$consumer no longer parses the default project token from the \"$token_log_msg\" log ($token_log_key=)"
 done
 
-# 性能门禁不跟 PR 跑：必须挡在发版链路上（archive 之前），bench.yml 只留手动入口。
+# 性能门禁不跟 PR 跑：必须挡在发版链路上（archive 之前），bench.yml 只留手动触发与每周定时运行。
 for task in 'mise run bench' 'mise run perf-release' 'mise run perf-ha' 'mise run perf-results-check'; do
   rg -Fq "$task" "$release" || fail "release workflow lacks performance gate: $task"
-  rg -Fq "$task" "$bench" || fail "manual performance workflow lacks: $task"
+  rg -Fq "$task" "$bench" || fail "bench workflow (manual + weekly schedule) lacks: $task"
 done
 archive_needs=$(sed -n '/^  archive:$/,/^    runs-on:/p' "$release")
 [[ $archive_needs == *container-check* && $archive_needs == *performance-gates* ]] || \
