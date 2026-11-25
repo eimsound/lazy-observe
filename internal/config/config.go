@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/eimsound/lazy-observe/internal/ingestlimit"
 	"github.com/eimsound/lazy-observe/internal/outbound"
@@ -60,6 +61,7 @@ type Config struct {
 	MetricsEndpoint MetricsEndpoint `yaml:"metrics_endpoint"`
 	DataDir         string          `yaml:"data_dir"`
 	ServeWebUI      bool            `yaml:"serve_web_ui"`
+	ExternalURL     string          `yaml:"external_url"`
 	Topology        string          `yaml:"topology"`
 	Standalone      bool            `yaml:"standalone"`
 	StorageBinDir   string          `yaml:"storage_bin_dir"`
@@ -457,6 +459,12 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "root data directory")
 	fs.BoolVar(&cfg.ServeWebUI, "serve-web-ui", cfg.ServeWebUI, "serve the embedded web UI from the gateway")
 	fs.StringVar(
+		&cfg.ExternalURL,
+		"external-url",
+		cfg.ExternalURL,
+		"external console base URL used for links in alert notifications",
+	)
+	fs.StringVar(
 		&cfg.Topology,
 		"topology",
 		cfg.Topology,
@@ -681,6 +689,7 @@ func configFlag(args []string) (string, error) {
 func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 	stringsMap := map[string]*string{
 		"LO_LISTEN":                        &c.Listen,
+		"LO_EXTERNAL_URL":                  &c.ExternalURL,
 		"LO_OTLP_GRPC_LISTEN":              &c.OTLPGRPC.Listen,
 		"LO_METRICS_ENDPOINT_BEARER_TOKEN": &c.MetricsEndpoint.BearerToken,
 		"LO_DATA_DIR":                      &c.DataDir,
@@ -985,6 +994,9 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Listen) == "" || strings.TrimSpace(c.DataDir) == "" {
 		return errors.New("listen and data-dir are required")
 	}
+	if _, err := NormalizeExternalURL(c.ExternalURL); err != nil {
+		return err
+	}
 	otlpGRPCListen := strings.TrimSpace(c.OTLPGRPC.Listen)
 	if c.OTLPGRPC.Enabled && otlpGRPCListen == "" {
 		return errors.New("otlp_grpc.listen is required when otlp_grpc.enabled is true")
@@ -1171,4 +1183,79 @@ func validateOptionalHTTPURL(name, raw string) error {
 		return fmt.Errorf("%s must be an absolute http(s) URL", name)
 	}
 	return nil
+}
+
+// NormalizeExternalURL validates and normalizes the public console base URL
+// used for clickable links in alert notifications. Empty input returns ("", nil).
+// Valid inputs return scheme://host[:port] with lowercase scheme/host and no
+// trailing slash.
+func NormalizeExternalURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return "", errors.New("external_url must not contain whitespace or control characters")
+		}
+	}
+	if strings.Contains(trimmed, "#") {
+		return "", errors.New("external_url must not contain a fragment")
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("external_url must be a valid URL: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("external_url must use http or https scheme")
+	}
+	if u.Opaque != "" {
+		return "", errors.New("external_url must be an absolute http(s) URL")
+	}
+	if u.User != nil {
+		return "", errors.New("external_url must not contain userinfo")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return "", errors.New("external_url must not contain a query string")
+	}
+	if u.Fragment != "" {
+		return "", errors.New("external_url must not contain a fragment")
+	}
+	if u.RawPath != "" || (u.Path != "" && u.Path != "/") {
+		return "", errors.New("external_url must not include a path")
+	}
+	hostname := u.Hostname()
+	if hostname == "" {
+		return "", errors.New("external_url must include a host")
+	}
+	lowerHost := strings.ToLower(hostname)
+	var host string
+	if rawPort := u.Port(); rawPort != "" {
+		if strings.HasPrefix(u.Host, "[") {
+			if _, err := netip.ParseAddr(hostname); err != nil {
+				return "", errors.New("external_url must have a valid host")
+			}
+			lowerHost = "[" + lowerHost + "]"
+		}
+		_, canonicalPort, err := outbound.NormalizePort(rawPort)
+		if err != nil {
+			return "", errors.New("external_url must have a valid port between 1 and 65535")
+		}
+		host = lowerHost + ":" + canonicalPort
+	} else if strings.HasPrefix(u.Host, "[") {
+		if !strings.HasSuffix(u.Host, "]") {
+			return "", errors.New("external_url must have a valid host and port")
+		}
+		if _, err := netip.ParseAddr(hostname); err != nil {
+			return "", errors.New("external_url must have a valid host")
+		}
+		host = "[" + lowerHost + "]"
+	} else {
+		if strings.Contains(u.Host, ":") {
+			return "", errors.New("external_url must have a valid port")
+		}
+		host = lowerHost
+	}
+	return scheme + "://" + host, nil
 }

@@ -8,6 +8,7 @@ data:
   config.yaml: |
     listen: ":3100"
     data_dir: /data
+    external_url: {{ .Values.externalURL | quote }}
     standalone: {{ eq .Values.mode "standalone-ha" }}
     meta:
       db_url: ""

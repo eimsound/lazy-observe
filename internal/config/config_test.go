@@ -1039,3 +1039,123 @@ metrics_endpoint:
 		})
 	}
 }
+
+func TestNormalizeExternalURL(t *testing.T) {
+	validCases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty", raw: "", want: ""},
+		{name: "whitespace only", raw: "  \t\n ", want: ""},
+		{name: "http", raw: "http://observe.example.com", want: "http://observe.example.com"},
+		{name: "https", raw: "https://observe.example.com", want: "https://observe.example.com"},
+		{name: "http with port", raw: "http://localhost:3100", want: "http://localhost:3100"},
+		{name: "https with port", raw: "https://observe.example.com:8443", want: "https://observe.example.com:8443"},
+		{name: "ipv6 with port", raw: "http://[::1]:3100/", want: "http://[::1]:3100"},
+		{name: "ipv6 without port", raw: "https://[2001:DB8::1]/", want: "https://[2001:db8::1]"},
+		{name: "trailing slash", raw: "https://observe.example.com/", want: "https://observe.example.com"},
+		{
+			name: "uppercase scheme and host",
+			raw:  "  HTTPS://Observe.Example.COM:8443/  ",
+			want: "https://observe.example.com:8443",
+		},
+	}
+	for _, tc := range validCases {
+		t.Run("valid/"+tc.name, func(t *testing.T) {
+			got, err := NormalizeExternalURL(tc.raw)
+			if err != nil {
+				t.Fatalf("NormalizeExternalURL(%q) unexpected error: %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Fatalf("NormalizeExternalURL(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+
+	invalidCases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "ftp scheme", raw: "ftp://observe.example.com"},
+		{name: "no scheme", raw: "observe.example.com"},
+		{name: "opaque", raw: "http:observe.example.com"},
+		{name: "no host", raw: "https://"},
+		{name: "no host with port", raw: "https://:8080"},
+		{name: "port zero", raw: "https://observe.example.com:0"},
+		{name: "port leading zero", raw: "https://observe.example.com:080"},
+		{name: "port overflow", raw: "https://observe.example.com:65536"},
+		{name: "non-numeric port", raw: "https://observe.example.com:abc"},
+		{name: "trailing empty port", raw: "https://observe.example.com:"},
+		{name: "userinfo", raw: "https://user:pass@observe.example.com"},
+		{name: "empty userinfo", raw: "https://@observe.example.com"},
+		{name: "query", raw: "https://observe.example.com?a=1"},
+		{name: "question mark only", raw: "https://observe.example.com?"},
+		{name: "fragment", raw: "https://observe.example.com#section"},
+		{name: "hash only", raw: "https://observe.example.com#"},
+		{name: "subpath", raw: "https://observe.example.com/sub"},
+		{name: "double slash path", raw: "https://observe.example.com//"},
+		{name: "internal space", raw: "https://obs erve.example.com"},
+		{name: "internal newline", raw: "https://observe\n.example.com"},
+		{name: "control char", raw: "https://observe.example.com\x00"},
+		{name: "bel control char", raw: "https://observe\x07.example.com"},
+	}
+	for _, tc := range invalidCases {
+		t.Run("invalid/"+tc.name, func(t *testing.T) {
+			got, err := NormalizeExternalURL(tc.raw)
+			if err == nil {
+				t.Fatalf("NormalizeExternalURL(%q) = %q, expected error", tc.raw, got)
+			}
+			if !strings.HasPrefix(err.Error(), "external_url must ") {
+				t.Fatalf(
+					"NormalizeExternalURL(%q) error = %q, want prefix %q",
+					tc.raw,
+					err.Error(),
+					"external_url must ",
+				)
+			}
+		})
+	}
+}
+
+func TestExternalURLPrecedenceAndValidation(t *testing.T) {
+	if Defaults().ExternalURL != "" {
+		t.Fatalf("default external_url = %q, want empty", Defaults().ExternalURL)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("external_url: https://yaml.example.com/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("Load YAML external_url: %v", err)
+	}
+	if cfg.ExternalURL != "https://yaml.example.com/" {
+		t.Fatalf("YAML external_url = %q", cfg.ExternalURL)
+	}
+	env := map[string]string{"LO_EXTERNAL_URL": "https://env.example.com"}
+	cfg, _, err = Load(
+		[]string{"--config", path},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatalf("Load env external_url: %v", err)
+	}
+	if cfg.ExternalURL != "https://env.example.com" {
+		t.Fatalf("env external_url = %q", cfg.ExternalURL)
+	}
+	cfg, _, err = Load(
+		[]string{"--config", path, "--external-url", "https://flag.example.com"},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatalf("Load flag external_url: %v", err)
+	}
+	if cfg.ExternalURL != "https://flag.example.com" {
+		t.Fatalf("flag external_url = %q", cfg.ExternalURL)
+	}
+
+	if _, _, err := Load([]string{"--external-url", "https://observe.example.com/sub"}, nil); err == nil {
+		t.Fatal("invalid external_url with subpath should fail validation")
+	}
+}

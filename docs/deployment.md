@@ -89,6 +89,7 @@ The example configuration lists canonical path-shaped environment variable names
 | `metrics_endpoint.allow_unauthenticated` | `false` | Allow unauthenticated `/metrics` scraping on private networks; forbidden when `bearer_token` is set |
 | `data_dir` | `./data` | Root directory for metadata, local blobs, generated files, and extracted binaries |
 | `serve_web_ui` | `true` | Serve the embedded web UI from the gateway |
+| `external_url` | empty | Public console base URL (`http(s)://host[:port]`, no path, query, or fragment). When set, alert notifications include absolute console links; when empty, notifications carry no links |
 | `topology` | empty | Explicit deployment topology: empty, `all-in-one`, `standalone`, or `ha`. Setting `ha` fails closed unless PostgreSQL, Redis, S3, a shared secret key file, and external signal endpoints are configured |
 | `standalone` | `false` | Use external signal storage |
 | `storage_bin_dir` | empty | Optional development or offline override; empty uses verified embedded Victoria binaries |
@@ -257,6 +258,30 @@ Back up the key with the same care as the metadata database, because losing it m
 AI is disabled by default. Administrators configure the provider (`openai`, `anthropic`, `deepseek`, or `ollama`), optional `base_url`, model, and API key exclusively in **Settings > AI**. The server stores provider settings and the API key in metadata, encrypts the API key with `security.secret_key_file`, and never returns the key to the browser. There is no server YAML or `LO_AI_*` interface for provider configuration or API keys. Only static LLM token pricing overrides live in server configuration under `ai.pricing_file` (`LO_AI_PRICING_FILE`).
 
 When enabled, the gateway supports admin connectivity testing, natural-language MetricsQL and LogsQL generation and explanation, and asynchronous analysis for new Issues. Generated queries run through the project-isolated gateway with response and time limits. Issue analysis gathers bounded cross-signal evidence and never delays error ingestion. Prompt and completion content is not collected unless an SDK opts in.
+
+### Console links in alert notifications
+
+Set `external_url` (`LO_EXTERNAL_URL` or `--external-url`; Helm value `externalURL`) to the public console base URL (such as `https://observe.example.com`, with no path, query, or fragment) so outbound alert notifications include clickable absolute links. Leaving `external_url` empty disables links and keeps notification payloads free of console URLs.
+
+Link targets by notification type:
+
+- **Issue alerts** (`new_issue`, `regression`): `<external_url>/issues/<id>?project=<slug>`
+- **Rule alerts**: `<external_url>/alerts?fingerprint=<fp>&project=<slug>`, or `<external_url>/alerts?project=<slug>&rule=<rule>` for grouped multi-alert notifications
+- **Alert storm**: `<external_url>/alerts?project=<slug>&status=firing`
+- **Error rate spike**: `<external_url>/issues?project=<slug>`
+- **Channel test**: `<external_url>/alerts/channels`
+
+Per-channel rendering:
+
+- **Feishu**: primary card action button (`View in lazy-observe`) plus per-alert `lark_md` links (`View`) when multiple alerts are grouped.
+- **DingTalk & WeCom**: markdown links (`[View in lazy-observe](...)`, plus per-alert `[View](...)` for multi-alert groups).
+- **Slack**: `mrkdwn` links (`<url|View in lazy-observe>`, plus per-alert `<url|View>` for multi-alert groups).
+- **Email (`smtp`)**: `View in lazy-observe: <url>` on the first line of the message body, followed by the JSON payload.
+- **Webhook**: optional `url` and `alerts[].url` JSON fields.
+
+Opening a link switches the browser tab to the linked project. If that project does not exist or the user cannot access it, the console shows an error page instead of another project's data.
+
+Links are derived at send time rather than enqueue time, so changing `external_url` applies to queued and retried notifications immediately.
 
 ## Standalone
 
@@ -442,7 +467,7 @@ Pull request CI runs both Helm checks in the `go` job whenever a diff modifies s
 
 The multi-replica HA gate runs in a separate `e2e-ha` job triggered by the `ha` flag in `scripts/ci-changes.sh`. That flag covers server code (`cmd/**`, `internal/**`, `go.mod`, `go.sum`, `sdk/go/**`), the HA gate script and its compiled helpers, `scripts/download-storage-bins.sh`, `bench/performance-gates.json`, the Ent generation chain (`entc.*`, `tools/entgen/**`, `scripts/generate-ent.sh`), and full-run paths (`.github/**`, `mise.toml`, `scripts/ci-*`, `Dockerfile*`). Chart-only edits under `deploy/**` do not set `ha`, so run `mise run e2e-ha` locally when chart changes affect multi-replica behavior. The gate runs against real components, including a replicated VictoriaMetrics cluster (with a `vmstorage` loss), split VictoriaLogs and VictoriaTraces roles with bidirectional tenant isolation, an Apache-2.0 SeaweedFS S3 endpoint for cross-replica Replay access, shared PostgreSQL alert state and notification Outbox, Redis sessions and rate limits, fenced alert ownership, readiness, and drain. Docker is required; missing Docker prerequisites exit with `77` (`SKIP`), which CI treats as a failure.
 
-The primary chart value groups are `mode`, `replicaCount`, `image.{repository,tag,digest,pullPolicy}`, `external.{postgres,redis,s3,metrics,logs,traces}`, `secret.*`, `resources`, `hpa.*`, `podDisruptionBudget.*`, `persistence.*`, `ingress.*`, `process.*`, `encryptionKey.*` (backing `security.secret_key_file`), and `adminPassword.*` (backing `security.admin_password_file`).
+The primary chart value groups are `mode`, `replicaCount`, `image.{repository,tag,digest,pullPolicy}`, `externalURL`, `external.{postgres,redis,s3,metrics,logs,traces}`, `secret.*`, `resources`, `hpa.*`, `podDisruptionBudget.*`, `persistence.*`, `ingress.*`, `process.*`, `encryptionKey.*` (backing `security.secret_key_file`), and `adminPassword.*` (backing `security.admin_password_file`).
 
 ## PostgreSQL metadata
 

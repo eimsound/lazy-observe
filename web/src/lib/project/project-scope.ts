@@ -78,6 +78,30 @@ export interface ProjectSelectionResolution {
   resolvedSlug: string;
   /** True when the stored/active slug must be updated to `resolvedSlug`. */
   changed: boolean;
+  /**
+   * True when a `?project=` link names a project that is not in the list
+   * (deleted, renamed, or not accessible). Children stay unmounted.
+   */
+  linkUnavailable?: boolean;
+}
+
+/** Search parameter carried by console links (alert notifications). */
+export const PROJECT_LINK_PARAM = "project";
+
+/** The `?project=` slug from a raw search string (`?a=b`), or "". */
+export function readProjectLinkParam(searchStr: string): string {
+  return new URLSearchParams(searchStr).get(PROJECT_LINK_PARAM)?.trim() ?? "";
+}
+
+/** The raw search string without `?project=` (keeps other params), "" when empty. */
+export function stripProjectLinkParam(searchStr: string): string {
+  // Split the raw string instead of re-serialising URLSearchParams, which
+  // would re-encode the remaining params (`%20` -> `+`).
+  const rest = searchStr
+    .replace(/^\?/, "")
+    .split("&")
+    .filter((pair) => pair !== "" && pair.split("=")[0] !== PROJECT_LINK_PARAM);
+  return rest.length ? `?${rest.join("&")}` : "";
 }
 
 /**
@@ -85,11 +109,26 @@ export interface ProjectSelectionResolution {
  * list. When a stale slug is cached in localStorage (deleted/renamed project),
  * `ready` stays false until state and storage switch to `resolvedSlug` so
  * child routes never fire data queries with an invalid `X-LO-Project` header.
+ *
+ * A `linkSlug` (from `?project=`) takes precedence. An unknown link slug never
+ * falls back silently: `/issues/42?project=gone` must not open another
+ * project's Issue #42.
  */
 export function resolveProjectSelection(
   projects: readonly { slug: string }[],
   currentSlug: string,
+  linkSlug = "",
 ): ProjectSelectionResolution {
+  if (linkSlug) {
+    if (!projects.some((p) => p.slug === linkSlug)) {
+      return { ready: false, resolvedSlug: currentSlug, changed: false, linkUnavailable: true };
+    }
+    return {
+      ready: currentSlug === linkSlug,
+      resolvedSlug: linkSlug,
+      changed: currentSlug !== linkSlug,
+    };
+  }
   if (projects.length === 0) {
     return {
       ready: currentSlug === "",

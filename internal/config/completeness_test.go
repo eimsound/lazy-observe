@@ -66,6 +66,11 @@ func TestConfigReflectionCompleteness(t *testing.T) {
 
 	// Distinct valid non-default values (yaml, env, flag) for fields with semantic constraints.
 	customValues := map[string][3]string{
+		"external_url": {
+			`"https://yaml.example.com"`,
+			"https://env.example.com",
+			"https://flag.example.com",
+		},
 		"otlp_grpc.listen":                  {`":14317"`, ":24317", ":34317"},
 		"topology":                          {`"standalone"`, "standalone", "all-in-one"},
 		"standalone":                        {"true", "false", "true"},

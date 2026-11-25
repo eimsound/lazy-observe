@@ -45,6 +45,10 @@ ingress:
           pathType: Prefix
   tls: []
 
+# Public console base URL used for clickable links in alert notifications
+# (e.g. "https://observe.example.com"). Empty disables notification links.
+externalURL: ""
+
 external:
   postgres:
     url: "postgres://lazy_observe:change-me@postgresql:5432/lazy_observe?sslmode=require"

@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useNavigate, useSearch } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-import { BellRing } from "lucide-react";
+import type { TFunction } from "i18next";
+import { BellRing, X } from "lucide-react";
 import {
   listAlerts,
   eventSeverity,
@@ -25,7 +26,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { useResetOnProjectChange } from "@/hooks/use-reset-on-project-change";
 import { queryViewState } from "./query-view-state";
+import {
+  alertEventsChip,
+  filterLinkedEvents,
+  type AlertEventsChip,
+  type AlertEventsSearch,
+} from "./alert-events-search";
 
 type Filter = "all" | AlertStatus;
 
@@ -37,9 +45,44 @@ const FILTERS: { id: Filter; labelKey: string }[] = [
 
 const fmt = (iso?: string) => (iso ? formatDateTime(dayjs(iso).valueOf()) : "—");
 
+function chipLabel(chip: AlertEventsChip, t: TFunction): string {
+  switch (chip.kind) {
+    case "event":
+      return t("alerts.filterEvent", { rule: chip.rule });
+    case "fingerprint":
+      return t("alerts.filterFingerprint", { fingerprint: chip.fingerprint });
+    case "rule":
+      return t("alerts.filterRule", { rule: chip.rule });
+  }
+}
+
 export function AlertEventsPage() {
   const { t } = useTranslation();
-  const [filter, setFilter] = useState<Filter>("all");
+  const navigate = useNavigate();
+  // Status, fingerprint and rule live in the URL so alert notifications can
+  // deep-link to one alert instance (`?fingerprint=`) or one rule (`?rule=`).
+  const search = useSearch({ strict: false }) as AlertEventsSearch;
+  const filter: Filter = search.status ?? "all";
+
+  // The fingerprint/rule filter belongs to the project it came from.
+  useResetOnProjectChange(() => {
+    void navigate({ to: "/alerts", search: {}, replace: true });
+  });
+
+  const setFilter = (next: Filter) => {
+    void navigate({
+      to: "/alerts",
+      search: (prev: AlertEventsSearch) => ({ ...prev, status: next === "all" ? undefined : next }),
+      replace: true,
+    });
+  };
+  const clearLinkFilter = () => {
+    void navigate({
+      to: "/alerts",
+      search: (prev: AlertEventsSearch) => ({ status: prev.status }),
+      replace: true,
+    });
+  };
 
   const events = useProjectQuery({
     queryKey: ["alerts", "events"],
@@ -50,7 +93,9 @@ export function AlertEventsPage() {
 
   const all = events.data ?? [];
   const firingCount = all.filter((e) => e.status === "firing").length;
-  const rows = filter === "all" ? all : all.filter((e) => e.status === filter);
+  const chip = alertEventsChip(all, search);
+  const linked = filterLinkedEvents(all, search);
+  const rows = filter === "all" ? linked : linked.filter((e) => e.status === filter);
   const viewState = queryViewState({
     hasData: events.data !== undefined,
     isLoading: events.isLoading,
@@ -86,6 +131,28 @@ export function AlertEventsPage() {
         ))}
       </div>
 
+      {chip && (
+        <div className="-mt-2 mb-4 flex flex-wrap items-center gap-2">
+          <span className="inline-flex h-7 max-w-full items-center rounded-md border border-border bg-background text-xs shadow-sm">
+            <span
+              className={cn("max-w-64 truncate px-2", chip.kind === "fingerprint" && "font-mono")}
+              title={chipLabel(chip, t)}
+            >
+              {chipLabel(chip, t)}
+            </span>
+            <button
+              type="button"
+              onClick={clearLinkFilter}
+              aria-label={t("alerts.clearFilter")}
+              title={t("alerts.clearFilter")}
+              className="flex h-full items-center border-l border-border px-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <X className="size-3" aria-hidden="true" />
+            </button>
+          </span>
+        </div>
+      )}
+
       {viewState === "stale" && (
         <QueryStaleNotice
           isRetrying={events.isFetching}
@@ -108,6 +175,11 @@ export function AlertEventsPage() {
               icon={<BellRing className="size-6" />}
               title={t("alerts.noEvents")}
               desc={t("alerts.noEventsDesc")}
+              action={chip ? (
+                <Button variant="outline" size="sm" onClick={clearLinkFilter}>
+                  {t("alerts.clearFilter")}
+                </Button>
+              ) : undefined}
             />
           ) : (
             <div className="overflow-x-auto">
@@ -128,7 +200,7 @@ export function AlertEventsPage() {
                 </thead>
                 <tbody>
                   {rows.map((e: AlertEvent) => (
-                    <tr key={e.fingerprint} className="border-b border-border/60 last:border-0 align-top">
+                    <tr key={e.id} className="border-b border-border/60 last:border-0 align-top">
                       <td className="px-4 py-3">
                         <SeverityBadge severity={eventSeverity(e)} />
                       </td>
@@ -137,6 +209,13 @@ export function AlertEventsPage() {
                         {e.annotations.summary && (
                           <div className="mt-0.5 max-w-xs truncate text-xs text-muted-foreground">
                             {e.annotations.summary}
+                          </div>
+                        )}
+                        {chip && (
+                          // The labels column is hidden below lg; a linked
+                          // event still needs its labels to be identifiable.
+                          <div className="mt-1.5 lg:hidden">
+                            <LabelChips labels={e.labels} exclude={["alertname", "severity"]} max={4} />
                           </div>
                         )}
                       </td>

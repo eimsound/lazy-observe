@@ -15,6 +15,12 @@ const GLOBAL_OR_SELF_MANAGED_PREFIXES = [
   "/profiling",
 ] as const;
 
+/**
+ * Exact paths whose URL search state is project-specific and cleared by the
+ * page itself via `useResetOnProjectChange` (sub-routes still remount).
+ */
+const SELF_MANAGED_EXACT_PATHS = new Set(["/alerts"]);
+
 function normalizePath(pathname: string): string {
   if (pathname.length > 1 && pathname.endsWith("/")) {
     return pathname.slice(0, -1);
@@ -28,10 +34,14 @@ function normalizePath(pathname: string): string {
  *
  * Detail routes under `/traces/$traceID` DO remount on project change so a
  * span drawer or selection never leaks across projects, while `/traces` itself
- * clears URL search params via `useResetOnProjectChange`.
+ * clears URL search params via `useResetOnProjectChange`; `/alerts` (event list)
+ * does the same for its notification deep-link filters.
  */
 export function shouldRemountOnProjectChange(pathname: string): boolean {
   const path = normalizePath(pathname);
+  if (SELF_MANAGED_EXACT_PATHS.has(path)) {
+    return false;
+  }
   if (path.startsWith("/traces/") && path.length > "/traces/".length) {
     return true;
   }

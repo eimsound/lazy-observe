@@ -56,6 +56,14 @@ Enum values unknown to the server do not reject the entire batch (Sections 2.3 a
 
 Backend SDKs (Go, Node, and Python) default OTLP/HTTP payload compression to `"none"` and support opt-in `"gzip"` via explicit SDK `Compression` / `compression` configuration or standard `OTEL_EXPORTER_OTLP_COMPRESSION` and per-signal `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` environment variables (precedence: explicit SDK setting > signal-specific env var > shared env var > `"none"`). The gateway enforces the 52 MiB decoded body limit and meters `ingest_rate_limit` on decoded byte size uniformly across uncompressed, decoded, and gzip-passthrough requests.
 
+#### Alert notification payloads
+
+When the server configures `external_url` (`LO_EXTERNAL_URL`), outbound alert notifications derive absolute console URLs at send time (leaving `external_url` empty omits all link fields and produces byte-identical payloads to prior **v0** releases; adding these optional fields is backward-compatible and keeps the protocol at **v0**):
+
+- **Webhook JSON.** Top-level `url` (optional string, omitted when `external_url` is unset) and per-alert `alerts[].url` (optional string, omitted when `external_url` is unset or for storm/test deliveries). Existing relative `annotations.link` and `annotations.issue` fields emitted for Issue alerts remain unchanged.
+- **Email (`smtp`).** The message body is the indented JSON payload, encoded without HTML escaping (`&`, `<`, and `>` stay literal). When `url` is derived, the body starts with `View in lazy-observe: <url>` followed by `\r\n\r\n` before the JSON.
+- **Console deep-link query parameters.** Console links target `<external_url>` with `project=<slug>` supported on any console route, plus `fingerprint`, `rule`, and `status` query parameters on `/alerts` (for example `/alerts?fingerprint=<fp>&project=<slug>`, `/alerts?project=<slug>&rule=<rule>`, `/alerts?project=<slug>&status=firing`, `/issues/<id>?project=<slug>`, `/issues?project=<slug>`, and `/alerts/channels`). A `project` the signed-in user cannot open (deleted, renamed, or no access) shows an error page instead of falling back to another project.
+
 ### 2.2 DSN format and credential contracts
 
 User DSN format:

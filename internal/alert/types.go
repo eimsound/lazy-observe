@@ -21,6 +21,7 @@ type Alert struct {
 	StartsAt    time.Time         `json:"startsAt"`
 	EndsAt      time.Time         `json:"endsAt,omitempty"`
 	Fingerprint string            `json:"fingerprint,omitempty"`
+	URL         string            `json:"url,omitempty"`
 	Transient   bool              `json:"-"`
 }
 
@@ -30,6 +31,8 @@ type Notification struct {
 	Status         string        `json:"status"`
 	Alerts         []Alert       `json:"alerts"`
 	Storm          *StormSummary `json:"storm,omitempty"`
+	URL            string        `json:"url,omitempty"`
+	Test           bool          `json:"-"`
 	IdempotencyKey string        `json:"-"`
 }
 

@@ -7,12 +7,19 @@ import {
   type ReactNode,
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useRouter, useRouterState } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { AlertCircle, Loader2 } from "lucide-react";
 import { listProjects, type Project } from "@/lib/api/projects";
 import { getProjectSlug, setProjectSlug } from "@/lib/settings";
 import { Button } from "@/components/ui/button";
-import { resolveProjectSelection, switchProjectQueries } from "./project-scope";
+import {
+  readProjectLinkParam,
+  resolveProjectSelection,
+  stripProjectLinkParam,
+  switchProjectQueries,
+  type ProjectSelectionResolution,
+} from "./project-scope";
 
 /**
  * Selected-project state (session mode). Mounted inside the authed layout so it
@@ -51,12 +58,28 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data]);
   const [currentSlug, setCurrentSlug] = useState<string>(() => getProjectSlug());
 
-  const selection = useMemo(
+  // Console links (alert notifications) name their project in `?project=`.
+  // Read the raw search string: route `validateSearch` whitelists drop it.
+  const router = useRouter();
+  const location = useRouterState({
+    select: (s) => ({ pathname: s.location.pathname, searchStr: s.location.searchStr, hash: s.location.hash }),
+  });
+  const linkSlug = readProjectLinkParam(location.searchStr);
+
+  const selection = useMemo<ProjectSelectionResolution>(
     () => (projectsQuery.isSuccess
-      ? resolveProjectSelection(projects, currentSlug)
+      ? resolveProjectSelection(projects, currentSlug, linkSlug)
       : { ready: false, resolvedSlug: currentSlug, changed: false }),
-    [projectsQuery.isSuccess, projects, currentSlug],
+    [projectsQuery.isSuccess, projects, currentSlug, linkSlug],
   );
+
+  // Once the linked project is active, drop `?project=` (keep other params) so
+  // a later manual switch or reload is not pulled back to the linked project.
+  useEffect(() => {
+    if (!linkSlug || !selection.ready) return;
+    const hash = location.hash ? `#${location.hash}` : "";
+    router.history.replace(`${location.pathname}${stripProjectLinkParam(location.searchStr)}${hash}`);
+  }, [linkSlug, selection.ready, location.pathname, location.searchStr, location.hash, router]);
 
   // Auto-select a valid project once the list loads (or if the stored one vanished).
   useEffect(() => {
@@ -101,6 +124,29 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
           <p className="text-xs text-muted-foreground">{t("common.queryErrorDesc")}</p>
           <Button variant="outline" size="sm" onClick={() => void projectsQuery.refetch()}>
             {t("common.retry")}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (selection.linkUnavailable) {
+    const fallbackSlug = resolveProjectSelection(projects, currentSlug).resolvedSlug;
+    const fallback = projects.find((p) => p.slug === fallbackSlug);
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-background px-4 text-foreground">
+        <div className="flex max-w-sm flex-col items-center gap-3 text-center" role="alert">
+          <AlertCircle className="size-6 text-muted-foreground" />
+          <div className="break-all text-sm font-medium">
+            {t("topbar.linkProjectUnavailable", { slug: linkSlug })}
+          </div>
+          <p className="text-xs text-muted-foreground">{t("topbar.linkProjectUnavailableDesc")}</p>
+          {/* Go to "/" rather than dropping the param in place: staying on
+              /issues/42 would open another project's Issue #42. */}
+          <Button variant="outline" size="sm" onClick={() => void router.navigate({ to: "/", replace: true })}>
+            {fallback
+              ? t("topbar.openProject", { name: fallback.name || fallback.slug })
+              : t("topbar.returnToConsole")}
           </Button>
         </div>
       </div>

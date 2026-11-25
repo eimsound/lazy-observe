@@ -52,6 +52,7 @@ type Config struct {
 	Store           *meta.Store
 	Sender          *Sender
 	OutboundPolicy  outbound.Policy
+	ExternalURL     string
 	GroupWait       time.Duration
 	RepeatInterval  time.Duration
 	StormThreshold  int
@@ -80,10 +81,15 @@ type Service struct {
 
 func NewService(cfg Config) *Service {
 	if cfg.Sender == nil {
-		cfg.Sender = &Sender{Outbound: cfg.OutboundPolicy}
-	} else if !cfg.Sender.Outbound.AllowPrivate && len(cfg.Sender.Outbound.AllowedCIDRs) == 0 &&
-		len(cfg.Sender.Outbound.AllowedHosts) == 0 && len(cfg.Sender.Outbound.BlockedPorts) == 0 {
-		cfg.Sender.Outbound = cfg.OutboundPolicy
+		cfg.Sender = &Sender{Outbound: cfg.OutboundPolicy, ExternalURL: cfg.ExternalURL}
+	} else {
+		if !cfg.Sender.Outbound.AllowPrivate && len(cfg.Sender.Outbound.AllowedCIDRs) == 0 &&
+			len(cfg.Sender.Outbound.AllowedHosts) == 0 && len(cfg.Sender.Outbound.BlockedPorts) == 0 {
+			cfg.Sender.Outbound = cfg.OutboundPolicy
+		}
+		if cfg.Sender.ExternalURL == "" {
+			cfg.Sender.ExternalURL = cfg.ExternalURL
+		}
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -762,6 +768,7 @@ func (s *Service) TestChannel(ctx context.Context, id int) error {
 			Project: "test",
 			Rule:    "test",
 			Status:  "firing",
+			Test:    true,
 			Alerts:  []Alert{{Status: "firing", Labels: map[string]string{"test": "true"}, StartsAt: time.Now()}},
 		},
 	)
