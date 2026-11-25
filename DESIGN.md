@@ -173,14 +173,14 @@ components:
 本文件按 [Google `DESIGN.md` 格式](https://github.com/google-labs-code/design.md)（`version: alpha`）编写：
 front matter 是给工具和 agent 读的 token，正文说明这些值为什么存在、怎么用。
 改 `web/` 下的页面、UI 组件或样式前先读本文件；改本文件后运行 `mise run design-lint`（CI 的 design job 同一条命令），
-要求 0 error。
+要求 0 error。`contrast-ratio` 警告只作可读性参考，不要求清零。
 
 事实源分工：
 
 - **运行时颜色、圆角、字号缩放**：`web/src/styles/globals.css` 的 CSS 变量（用法见 `web/README.md` 主题一节）。
   front matter 里的颜色只是默认主题（中性、亮色）的快照，两者冲突时以 `globals.css` 为准，并同步改回本文件。
 - **控件尺寸、密度、对齐与组件选型**：本文件。
-- **通用交互与可访问性审查**（焦点态、表单属性、键盘、动画）：`.agents/skills/web-design-guidelines/`。
+- **通用交互审查**（表单属性、动画）：`.agents/skills/web-design-guidelines/`。
 - **Web 工程约束**（五态渲染、隐私脱敏、跨项目隔离）：`.agents/skills/pitfalls/web.md`、
   `web/src/lib/project/architecture-guards.test.ts`。
 
@@ -334,13 +334,17 @@ lazy-observe 是给开发者和运维看的自托管可观测性控制台：日�
 - Do：所有尺寸用 `rem` 工具类，让字号主题轴整体生效。
 - Do：颜色、圆角只走语义工具类或 `var(--token)`。
 - Do：单行查询编辑器与相邻按钮同高、首行文字与按钮文字同一中线。
-- Do：改完 UI 用 `web-design-guidelines` 复查可访问性与交互细节。
+- Do：改完 UI 用 `web-design-guidelines` 复查交互细节。
 - Don't：在业务页写 `className="h-9"`、`h-10` 覆写原语高度。
 - Don't：在同一行混用 `text-sm` 与 `text-xs`，或用大高度配小字大图标（`h-9` + `text-xs` + `size-4`）。
 - Don't：为单行编辑器预设多行高度（如 `min-height: 3.75rem`）。
 - Don't：硬编码 hex/oklch、`px` 字号或 `rounded-[Npx]`。
 - Don't：卡片套卡片，或一个视图放多个 Primary 按钮。
 - Don't：手写裸 `<button>` 分段条代替 `Tabs`。
+- Do：尽量仅呈现基础视觉层与核心交互组件。若脱离辅助文本后视觉层级无法自洽，重新设计布局，而不是补一段说明。
+- Don't：放常驻的辅助文本，即不属于数据、标签或操作名的解释性文字（卡片副标题、字段下方说明、引导段落）。
+  确实需要的解释放进悬停提示，或链接到文档。报错信息不算辅助文本。只有三类例外：
+  空状态（一句事实加一个动作）、不可逆操作的后果说明、一次性凭据提示。
 
 ## Known Gaps
 
@@ -349,7 +353,5 @@ lazy-observe 是给开发者和运维看的自托管可观测性控制台：日�
 - `Button` 默认 `h-9 text-sm`、`icon` 为 `size-9`；`Input`、`SelectTrigger`、`TabsList` 只有 `h-9` 一档，需先改原语。
 - `/logs` 查询栏混用 `h-10`、`h-9`、`h-8`；`LogsQLEditor` 单行时 `min-height: 3.75rem`；`PromQLEditor` 为 `2.25rem`。
 - `/metrics` 存在 `size="sm" className="h-9"` 覆写；`/issues` 等页面手写 `py-1.5` 分段按钮。
-- Tabs 未选中项文字（`muted-foreground` 落在 `muted` 底上）对比度 4.35:1，低于 WCAG AA 的 4.5:1；
-  `design.md lint` 的 `contrast-ratio` 警告即来自这里，改 `globals.css` 时一并修正。
 
 新增或修改过的页面直接满足本文件；存量页面按专项 PR 逐步对齐，届时同步删去本节对应条目。
