@@ -181,6 +181,22 @@
     "externalURL": {
       "type": "string"
     },
+    "errorInbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "receiptRetention": {
+          "anyOf": [
+            {
+              "const": ""
+            },
+            {
+              "$ref": "#/definitions/duration"
+            }
+          ]
+        }
+      }
+    },
     "external": {
       "type": "object",
       "additionalProperties": false,

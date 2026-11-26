@@ -100,6 +100,7 @@ storage:
 
 # Global retention by signal. In standalone mode metrics/logs/traces are owned by
 # external storage and these three values are ignored; platform-owned data is still cleaned.
+# Completed error receipts follow error_inbox.receipt_retention (default: retention.logs).
 retention:
   metrics: 90d
   logs: 14d
@@ -139,6 +140,11 @@ error_inbox:
   max_bytes: 1073741824 # 1 GiB
   readiness_items: 80000
   readiness_bytes: 838860800 # 800 MiB
+  # How long completed error receipts are kept to deduplicate at-least-once
+  # redelivery. Empty or 0 inherits retention.logs. In standalone/HA mode
+  # retention.logs is ignored by external VictoriaLogs, so set this to the
+  # same window as its -retentionPeriod.
+  # receipt_retention: 14d
 
 process:
   startup_timeout: 20s
@@ -207,6 +213,7 @@ ai:
 # LO_BLOB_BACKEND, LO_BLOB_S3_BUCKET,
 # LO_RETENTION_METRICS, LO_RETENTION_REPLAY, LO_RETENTION_SOURCEMAPS,
 # LO_RETENTION_ALERT_EVENTS, LO_RETENTION_PROFILES, LO_RETENTION_ISSUES_CLOSED,
+# LO_ERROR_INBOX_RECEIPT_RETENTION,
 # LO_PROCESS_RESTART_INITIAL, LO_PROCESS_RESTART_MAX, LO_PROCESS_DRAIN_TIMEOUT,
 # LO_PROCESS_COMPONENT_PORT_OFFSET, LO_ALERT_STORM_THRESHOLD.
 # Self-monitoring fields: LO_SELF_MONITORING_ENABLED and LO_SELF_MONITORING_PROFILING.

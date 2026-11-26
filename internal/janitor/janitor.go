@@ -94,6 +94,16 @@ func (j *Janitor) RegisterWithInterval(name string, retention, interval time.Dur
 	j.tasks = append(j.tasks, registration{name: name, retention: retention, interval: interval, task: task})
 }
 
+// Retention reports the retention period registered for the named task.
+func (j *Janitor) Retention(name string) (time.Duration, bool) {
+	for _, task := range j.tasks {
+		if task.name == name {
+			return task.retention, true
+		}
+	}
+	return 0, false
+}
+
 func (j *Janitor) RunOnce(ctx context.Context) []Result {
 	return j.run(ctx, true)
 }

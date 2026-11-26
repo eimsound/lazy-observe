@@ -84,6 +84,7 @@ assert_render_fails() {
   --set 'topologySpreadConstraints[0].topologyKey=kubernetes.io/hostname' \
   --set 'topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule' >"$WORK/hard-anti-affinity.yaml"
 "$HELM" template test "$CHART" --set externalURL=https://observe.example.com >"$WORK/external-url.yaml"
+"$HELM" template test "$CHART" --set errorInbox.receiptRetention=30d >"$WORK/receipt-retention.yaml"
 
 extract_kind() {
   kind=$1
@@ -191,6 +192,12 @@ assert_contains "$WORK/standalone.yaml" '^[[:space:]]*external_url: ""$' \
 assert_contains "$WORK/external-url.yaml" '^[[:space:]]*external_url: "https://observe\.example\.com"$' \
   'externalURL must render external_url in ConfigMap'
 
+# error_inbox.receipt_retention 默认不渲染（继承 retention.logs），显式设置时透传到 ConfigMap。
+assert_not_contains "$WORK/standalone.yaml" '^[[:space:]]*receipt_retention:' \
+  'default ConfigMap must omit error_inbox.receipt_retention so it inherits retention.logs'
+assert_contains "$WORK/receipt-retention.yaml" '^[[:space:]]*receipt_retention: "30d"$' \
+  'errorInbox.receiptRetention must render error_inbox.receipt_retention in ConfigMap'
+
 # 集群 profile 与显式配置的 podAntiAffinity / topologySpreadConstraints 按 release 的 selectorLabels 隔离。
 extract_kind Deployment "$WORK/cluster.yaml" "$WORK/deploy-cluster.yaml"
 assert_contains "$WORK/deploy-cluster.yaml" '^[[:space:]]*podAntiAffinity:' \
@@ -245,6 +252,8 @@ assert_render_fails 'schema must reject unknown metrics kind' '/external/metrics
   --set external.metrics.kind=influxdb
 assert_render_fails 'schema must reject invalid podAntiAffinity' '/podAntiAffinity' \
   --set podAntiAffinity=strict
+assert_render_fails 'schema must reject a malformed receipt retention' '/errorInbox/receiptRetention' \
+  --set errorInbox.receiptRetention=soon
 assert_render_fails 'schema must reject unknown top-level keys' 'unknownKey' \
   --set unknownKey=true
 
@@ -298,7 +307,8 @@ fi
     "$WORK/image-digest.yaml" \
     "$WORK/image-tag-digest.yaml" \
     "$WORK/image-release-values.yaml" \
-    "$WORK/external-url.yaml"
+    "$WORK/external-url.yaml" \
+    "$WORK/receipt-retention.yaml"
 )
 
 echo "PASS: Helm chart satisfies values.schema.json, security guards, image.digest, and Go config.Load contracts"

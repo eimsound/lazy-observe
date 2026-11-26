@@ -145,6 +145,7 @@ The example configuration lists canonical path-shaped environment variable names
 | `error_inbox.max_bytes` | `1073741824` | Durable error-inbox byte capacity (1 GiB) before rejecting with `503` and `Retry-After` |
 | `error_inbox.readiness_items` | `80000` | Error-inbox item threshold where readiness degrades |
 | `error_inbox.readiness_bytes` | `838860800` | Error-inbox byte threshold (800 MiB) where readiness degrades |
+| `error_inbox.receipt_retention` | empty (inherits `retention.logs`) | How long completed error receipts are kept to deduplicate at-least-once redelivery; must be positive when set. In standalone/HA mode, set it to the external VictoriaLogs retention |
 | `process.startup_timeout` | `20s` | Per-child health deadline |
 | `process.shutdown_timeout` | `15s` | Supervised shutdown deadline |
 | `process.restart_initial` | `1s` | Initial managed-child restart delay before equal jitter |
@@ -327,7 +328,7 @@ The gateway uses one storage interface in both modes. In standalone mode, it rou
 
 VictoriaLogs and VictoriaTraces traffic uses their documented single-node paths, and the gateway replaces incoming `AccountID` and `ProjectID` headers with the authenticated project tenant on both writes and reads.
 
-External storage owns metrics, logs, and traces retention in standalone mode. Platform retention still cleans replay, source maps, alert events, profiles, and closed Issues.
+External storage owns metrics, logs, and traces retention in standalone mode, so `retention.metrics`, `retention.logs`, and `retention.traces` only apply to embedded storage and are ignored here. Platform retention still cleans replay, source maps, alert events, profiles, and closed Issues. The gateway also prunes completed error receipts after `error_inbox.receipt_retention` (default: `retention.logs`); set it to the external VictoriaLogs `-retentionPeriod` so the error deduplication window matches how long the raw error events stay queryable. Startup logs a warning with the effective value.
 
 ## Query API, MCP, and Grafana
 
@@ -508,7 +509,7 @@ When static keys are empty, the server uses the AWS SDK default credential chain
 
 ## Retention
 
-Retention applies globally per signal, not per project. In all-in-one mode, the gateway passes the three Victoria retention values as child-process flags. A 1-hour janitor deletes expired platform-owned metadata and blobs. Closed-Issue retention is fixed at 90 days when `retention.issues_closed` is `true`.
+Retention applies globally per signal, not per project. In all-in-one mode, the gateway passes the three Victoria retention values as child-process flags. A 1-hour janitor deletes expired platform-owned metadata and blobs. Closed-Issue retention is fixed at 90 days when `retention.issues_closed` is `true`. Completed error receipts, which deduplicate at-least-once error redelivery, are deleted after `error_inbox.receipt_retention`; when unset it inherits `retention.logs`, which keeps all-in-one behavior unchanged.
 
 Lowering retention makes older data eligible for storage engine or janitor deletion. Back up data before shortening retention windows.
 

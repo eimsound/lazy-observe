@@ -49,6 +49,13 @@ ingress:
 # (e.g. "https://observe.example.com"). Empty disables notification links.
 externalURL: ""
 
+errorInbox:
+  # error_inbox.receipt_retention: how long completed error receipts are kept
+  # for at-least-once deduplication. Empty inherits retention.logs (14d). In
+  # standalone-ha, external VictoriaLogs owns log retention, so set this to the
+  # same window as its -retentionPeriod (e.g. "30d").
+  receiptRetention: ""
+
 external:
   postgres:
     url: "postgres://lazy_observe:change-me@postgresql:5432/lazy_observe?sslmode=require"

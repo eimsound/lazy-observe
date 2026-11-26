@@ -240,6 +240,7 @@ curl -fsS http://127.0.0.1:3100/api/traces/services \
    - 确认协议面与四端 SDK 兼容矩阵是否要求同步升级客户端 SDK。
 2. 完成第 2 节的对应备份，并记录当前二进制版本或镜像 `tag@sha256:<digest>`。
 3. 容器或 Helm 部署优先使用 GitHub Release 附带的 `helm-values-lazy-observe-<version>.yaml` 固定镜像不可变 digest。
+4. Standalone/HA 模式下，确认 `error_inbox.receipt_retention`（Helm `errorInbox.receiptRetention`，环境变量 `LO_ERROR_INBOX_RECEIPT_RETENTION`）与外部 VictoriaLogs 保留期一致。`retention.logs` 只作用于内嵌存储，未设置时回执会继承它。启动时关于信号保留配置被忽略的告警日志会打印实际生效的回执保留期。
 
 ### 4.2 All-in-One 升级步骤
 

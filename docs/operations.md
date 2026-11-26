@@ -240,6 +240,7 @@ With an administrator account, also check `GET /api/system/error-inbox` to confi
    - Check whether protocol changes require upgrading client SDKs together with the server.
 2. Complete the Section 2 backup and record the current binary version or container image `tag@sha256:<digest>`.
 3. For container and Helm deployments, use the `helm-values-lazy-observe-<version>.yaml` file attached to the GitHub Release to pin the immutable image digest.
+4. In standalone/HA mode, confirm `error_inbox.receipt_retention` (Helm `errorInbox.receiptRetention`, env `LO_ERROR_INBOX_RECEIPT_RETENTION`) matches the external VictoriaLogs retention. `retention.logs` only drives embedded storage, and receipts otherwise inherit it. The startup warning about ignored signal retention prints the effective receipt retention.
 
 ### 4.2 All-in-one upgrade
 
