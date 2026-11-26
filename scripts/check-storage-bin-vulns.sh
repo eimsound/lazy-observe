@@ -29,6 +29,8 @@ set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 tool_dir=${LO_TRIVY_DIR:-$root/.cache/trivy}
 scan_root=${LO_STORAGE_BIN_SCAN_DIR:-$root/.cache/storage-bin}
+# 各平台目录共用 $scan_root/.archives/<platform>，与 prepare-embedded-storage.sh 的布局一致。
+archive_root=${LO_STORAGE_ARCHIVE_DIR:-$scan_root/.archives}
 binaries=(victoria-metrics-prod victoria-logs-prod victoria-traces-prod vmagent-prod)
 downloader=$root/scripts/download-storage-bins.sh
 
@@ -95,7 +97,7 @@ for platform in "${platforms[@]}"; do
 
   printf '== %s: %s\n' "$platform" "$dir"
   # 下载、校验 sha256、解包都交给既有脚本（GOOS/GOARCH 已给定，不需要 Go 工具链）。
-  LO_STORAGE_BIN_DIR=$dir GOOS=${platform%-*} GOARCH=${platform#*-} \
+  LO_STORAGE_BIN_DIR=$dir LO_STORAGE_ARCHIVE_DIR=$archive_root GOOS=${platform%-*} GOARCH=${platform#*-} \
     bash "$downloader"
 
   # 与 check-image-vulns.sh 同一套参数；报告写 JSON 以便检查并打印清单。

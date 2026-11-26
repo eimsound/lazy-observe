@@ -6,6 +6,8 @@ goos=${GOOS:-$(go env GOOS)}
 goarch=${GOARCH:-$(go env GOARCH)}
 platform="$goos-$goarch"
 source_dir=${LO_STORAGE_BIN_DIR:-"$root/.cache/storage-bin/$platform"}
+# 两个平台与单平台 storage-bins 共用 .cache/storage-bin/.archives/<platform>，宿主平台归档只存一份（#378）。
+archive_root=${LO_STORAGE_ARCHIVE_DIR:-"$root/.cache/storage-bin/.archives"}
 target_dir="$root/internal/embed/bins/assets/$platform"
 
 case "$platform" in
@@ -13,7 +15,7 @@ case "$platform" in
   *) printf 'unsupported embedded storage platform: %s\n' "$platform" >&2; exit 1 ;;
 esac
 
-LO_STORAGE_BIN_DIR="$source_dir" GOOS="$goos" GOARCH="$goarch" \
+LO_STORAGE_BIN_DIR="$source_dir" LO_STORAGE_ARCHIVE_DIR="$archive_root" GOOS="$goos" GOARCH="$goarch" \
   bash "$root/scripts/download-storage-bins.sh"
 
 mkdir -p "$target_dir"

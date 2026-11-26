@@ -6,6 +6,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 bin_dir=${LO_STORAGE_BIN_DIR:-"$root/.cache/storage-bin"}
+# 归档根目录，归档存于 $archive_root/$platform。未设置时沿用 $bin_dir/.archives；跨平台准备
+# （bin_dir=.cache/storage-bin/<platform>）传入共享的 .cache/storage-bin/.archives，宿主平台归档只存一份，
+# bench/release 的 storage-all 缓存不再把 linux-amd64 打包两份（#378）。
+archive_root=${LO_STORAGE_ARCHIVE_DIR:-"$bin_dir/.archives"}
 goos=${GOOS:-$(go env GOOS)}
 goarch=${GOARCH:-$(go env GOARCH)}
 platform="$goos-$goarch"
@@ -68,14 +72,27 @@ else
   exit 1
 fi
 
-archive_dir="$bin_dir/.archives/$platform"
+archive_dir="$archive_root/$platform"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/lazy-observe-storage.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 mkdir -p "$archive_dir"
 
+# 旧布局：归档根目录指向别处时，$bin_dir/.archives/$platform 是改动前留下的同平台归档
+# （例如 restore-keys 恢复的旧 storage-all 缓存）。当前归档先挪进共享目录免重复下载，其余在校验通过后清掉。
+legacy_archive_dir=
+if [[ -d "$bin_dir/.archives/$platform" ]]; then
+  legacy_archive_dir=$(cd -P -- "$bin_dir/.archives/$platform" && pwd)
+  [[ $legacy_archive_dir != "$(cd -P -- "$archive_dir" && pwd)" ]] || legacy_archive_dir=
+fi
+
 fetch() {
-  local asset=$1 expected=$2 url=$3 archive actual
+  local asset=$1 expected=$2 url=$3 archive actual legacy
   archive="$archive_dir/$asset"
+  legacy="$legacy_archive_dir/$asset"
+  if [[ -n $legacy_archive_dir && ! -e $archive && -f $legacy && ! -L $legacy ]]; then
+    mv -- "$legacy" "$archive"
+    printf 'moved legacy archive %s to %s\n' "$legacy" "$archive_dir"
+  fi
   if [[ ! -f $archive ]]; then
     printf 'downloading %s\n' "$url"
     curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
@@ -116,6 +133,20 @@ prune_stale_archives() {
   done < <(find "$archive_dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -print0)
 }
 prune_stale_archives
+
+# 同样只在 4 个当前归档校验通过后清空旧布局目录（仅顶层文件与符号链接），再删掉变空的目录，
+# 下次保存的 storage-all 缓存里 .cache/storage-bin/*/.archives 不再带归档。
+retire_legacy_archives() {
+  [[ -n $legacy_archive_dir ]] || return 0
+  local entry
+  while IFS= read -r -d '' entry; do
+    rm -f -- "$entry"
+    printf 'removed legacy archive %s\n' "$entry"
+  done < <(find "$legacy_archive_dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -print0)
+  rmdir -- "$legacy_archive_dir" 2>/dev/null || true
+  rmdir -- "${legacy_archive_dir%/*}" 2>/dev/null || true
+}
+retire_legacy_archives
 
 manifest="$bin_dir/.manifest"
 expected_manifest="$tmp_dir/manifest"

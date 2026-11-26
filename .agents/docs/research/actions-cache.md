@@ -233,3 +233,25 @@ GitHub Actions 单仓缓存配额上限为 **10 GB**（超出后按 LRU 淘汰�
   5. `pnpm-sdk-journeys-*` 彻底归零；`playwright-sdk-journeys-Linux-X64-<ver>` 仅按 `playwright-core` 版本存在单条（~113.4 MiB）。
   6. `storage-native-Linux-X64-*` 单条回落至 **~180 MiB**；`storage-all-*` 在 `performance-gates`（`bench.yml` / `release.yml`）下次于 `main` 成功运行后刷新，同步清理历史归档。
   7. 仓库 `active_caches_size_in_bytes` 稳定低于 **10 GB**（预期日常峰值 ~5.15 GB，含发版演练 ~5.7–6.0 GB），且无意外 LRU 淘汰 `embedded-pg-*`、`storage-native-*`、`mise-base-*`、`gobuild-*`。
+
+## 8. 中期复查：`storage-all` 双份打包 `linux-amd64` 归档（2026-11-26 / Issue #378）
+
+### 8.1 复查发现
+
+- 2026-11-26 复查时，单平台 `storage-native` 已按 #300 / #315 预期从 `345.50 MiB` 回落至 `180.15 MiB`；但 `release.yml`（Run `44961079915`）与 `bench.yml`（Run `45077372880`）在 `main` 上重新保存的 `storage-all-Linux-X64-1f194e...` 仍为 **`523.77 MiB`**，没有收敛到 §4 预期的 ~344–360 MiB。
+- 根因是两套归档布局并存：
+  - `mise run storage-bins` 以 `LO_STORAGE_BIN_DIR=.cache/storage-bin` 调用 `scripts/download-storage-bins.sh`，宿主平台归档落在 `.cache/storage-bin/.archives/linux-amd64`（~180 MiB）；
+  - `dist-cross` → `embedded-storage` → `scripts/prepare-embedded-storage.sh` 以 `LO_STORAGE_BIN_DIR=.cache/storage-bin/<platform>` 调用同一脚本，归档落在 `.cache/storage-bin/linux-amd64/.archives/linux-amd64`（~180 MiB）与 `.cache/storage-bin/linux-arm64/.archives/linux-arm64`（~164 MiB）；
+  - `bench.yml` / `release.yml` 的 `storage-all` 同时缓存 `.cache/storage-bin/.archives` 与 `.cache/storage-bin/*/.archives`，于是 `linux-amd64` 同一组 4 个归档被打包两份（`180 + 180 + 164 ≈ 524 MiB`）。
+
+### 8.2 治理改动（不改 workflow）
+
+- `scripts/download-storage-bins.sh` 新增可选 `LO_STORAGE_ARCHIVE_DIR`（归档根目录，归档存于 `$LO_STORAGE_ARCHIVE_DIR/<platform>`）；未设置时仍是 `$bin_dir/.archives`，单目录调用行为不变。二进制与 `.manifest` 仍装在 `$bin_dir`。
+- `scripts/prepare-embedded-storage.sh`、`mise.toml` `tasks.dev-storage` 与 `scripts/check-storage-bin-vulns.sh` 把它指向 `.cache/storage-bin/.archives`（漏洞扫描为 `$scan_root/.archives`），与 `storage-bins` 共用 `.cache/storage-bin/.archives/<platform>`：`linux-amd64` 只存一份，`linux-arm64` 存在同级目录。
+- 旧缓存迁移：`storage-all` 的 `restore-keys` 仍可能恢复带 `.cache/storage-bin/<platform>/.archives/<platform>` 的旧条目。脚本在归档根目录指向别处时把旧布局里的当前归档挪进共享目录（不重复下载），4 个当前归档 SHA-256 全部通过后清掉旧布局目录的顶层文件与符号链接并删除空目录；校验失败时 fail-closed，旧布局原样保留。这样下次保存的 `storage-all` 中 `.cache/storage-bin/*/.archives` 不再含归档，workflow 的缓存路径无需改动。
+- `scripts/download-storage-bins-test.sh` 新增 3 个用例：共享目录 + 旧布局迁移（只下载缺失归档、旧布局删除、其它平台不动）、单平台布局零下载复用与跨平台已安装快路径清理、共享目录校验失败 fail-closed。
+- `scripts/ci-cache-keys.sh` 的 `storage` 哈希覆盖上述两个脚本，本次改动换新 `storage-all-*` / `storage-native-*` key。
+
+### 8.3 复查点
+
+- [ ] 合入后下一次 `main` 上成功运行的 `bench.yml` 或 `release.yml` 保存的 `storage-all-Linux-X64-*` 回落至 **~344–360 MiB**（`linux-amd64` ~180 MiB + `linux-arm64` ~164 MiB），旧 `523.77 MiB` 条目 7 天内自然过期。
