@@ -1,1 +1,1 @@
-{"blocks":[{"text":{"text":"*[FIRING] alpha / DiskFull*\n[FIRING] alpha / DiskFull\n{\"alertname\":\"DiskFull\",\"instance\":\"node-1\",\"project_id\":\"alpha\"}","type":"mrkdwn"},"type":"section"}],"text":"[FIRING] alpha / DiskFull"}
+{"blocks":[{"text":{"text":"*[FIRING][CRITICAL] alpha / node-1 磁盘使用率 95% (+2 more)*","type":"mrkdwn"},"type":"section"}],"text":"[FIRING][CRITICAL] alpha / node-1 磁盘使用率 95% (+2 more)"}

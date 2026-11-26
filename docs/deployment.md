@@ -278,11 +278,18 @@ Link targets by notification type:
 
 Per-channel rendering:
 
-- **Feishu**: primary card action button (`View in lazy-observe`) plus per-alert `lark_md` links (`View`) when multiple alerts are grouped.
-- **DingTalk & WeCom**: markdown links (`[View in lazy-observe](...)`, plus per-alert `[View](...)` for multi-alert groups).
-- **Slack**: `mrkdwn` links (`<url|View in lazy-observe>`, plus per-alert `<url|View>` for multi-alert groups).
+- **Feishu**: primary card action button (`View in lazy-observe`).
+- **DingTalk & WeCom**: markdown link `[View in lazy-observe](...)`.
+- **Slack**: `mrkdwn` link `<url|View in lazy-observe>`.
 - **Email (`smtp`)**: `View in lazy-observe: <url>` on the first line of the message body, followed by the JSON payload.
 - **Webhook**: optional `url` and `alerts[].url` JSON fields.
+
+IM messages (Feishu, DingTalk, WeCom, Slack) stay short. A grouped notification shows one representative alert plus `(+N more)`. The representative is the highest severity (`critical`/`fatal` > `error` > `warning` > `info`), then the longest-running alert, then the smallest fingerprint; the console link lists the rest.
+
+- When the rule sets `annotations.summary`, the rendered summary is the title, for example `[FIRING][CRITICAL] prod / node-1 disk usage 95% (+11 more)` or `[RESOLVED] prod / node-1 disk usage 95%`, and the body lists no labels.
+- Without a summary, the title falls back to the rule name, for example `[FIRING][WARNING] prod / DiskFull (+11 more)`, followed by one `k=v` line of the representative alert's labels. Labels already shown in the title (`alertname`, `project`, `project_id`, `source`, `kind`, and the severity) are omitted.
+- Issue alerts are titled `new_issue: <issue title>` or `regression: <issue title>`. New-issue alerts add one `AI analysis:` line when automatic Issue AI analysis has already finished.
+- Feishu card headers are colored by state: green for resolved, red for critical, error, and alert storms, orange for warning, and blue for info.
 
 Opening a link switches the browser tab to the linked project. If that project does not exist or the user cannot access it, the console shows an error page instead of another project's data.
 

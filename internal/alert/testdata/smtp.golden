@@ -1,6 +1,7 @@
 From: alerts@example.com
 To: ops@example.com
-Subject: [FIRING] alpha / DiskFull
+Subject: =?utf-8?q?[FIRING][CRITICAL]_alpha_/_node-1_=E7=A3=81=E7=9B=98=E4=BD=BF?=
+ =?utf-8?q?=E7=94=A8=E7=8E=87_95%_(+2_more)?=
 Content-Type: text/plain; charset=UTF-8
 
 {
@@ -12,15 +13,46 @@ Content-Type: text/plain; charset=UTF-8
       "status": "firing",
       "labels": {
         "alertname": "DiskFull",
-        "instance": "node-1",
-        "project_id": "alpha"
+        "instance": "node-2",
+        "project_id": "alpha",
+        "severity": "warning"
       },
       "annotations": {
-        "summary": "disk full"
+        "summary": "node-2 磁盘使用率 81%"
       },
       "startsAt": "2026-07-17T01:02:03Z",
       "endsAt": "0001-01-01T00:00:00Z",
-      "fingerprint": "abc"
+      "fingerprint": "b"
+    },
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "DiskFull",
+        "instance": "node-1",
+        "project_id": "alpha",
+        "severity": "critical"
+      },
+      "annotations": {
+        "summary": "node-1 磁盘使用率 95%"
+      },
+      "startsAt": "2026-07-17T01:03:03Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "c"
+    },
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "DiskFull",
+        "instance": "node-3",
+        "project_id": "alpha",
+        "severity": "critical"
+      },
+      "annotations": {
+        "summary": "node-3 磁盘使用率 97%"
+      },
+      "startsAt": "2026-07-17T01:04:03Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "a"
     }
   ]
 }

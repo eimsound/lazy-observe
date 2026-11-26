@@ -60,6 +60,11 @@ Alert rule `evaluation_interval` (optional; omitting it stays backward-compatibl
 - Bounds: a multiple of `5s` (the evaluator tick), `5s`–`1h` for `metrics` rules and `30s`–`1h` for `logs` rules. Values outside the bounds, and signal changes that would leave a stored override outside the new signal's bounds, return `400`.
 - Response: `evaluation_interval` is the stored override (`""` means the signal default) and the read-only `effective_evaluation_interval` is the interval the evaluator uses (`5s` for `metrics`, `1m` for `logs` unless overridden).
 
+Alert rule `severity` and `annotations` (tightened validation; the protocol version remains **v0**):
+
+- `severity` accepts only `critical`, `warning`, or `info`. On `POST` an empty value defaults to `warning`; on `PATCH`/`PUT` an empty value keeps the stored severity. Any other value returns `400`. Rules stored before this check keep their severity until it is next changed.
+- Every `annotations` value is a Go `text/template` with `$labels` (the alert's label map, for example `{{$labels.instance}}`) and `$value` (the sample value as a float, for example `{{printf "%.0f" $value}}`) predeclared; missing labels render as empty strings. `POST`/`PATCH`/`PUT` return `400` on template syntax errors. Values without `{{` are stored and shown verbatim. `annotations.summary` is the alert title template; `name` stays the stable rule identifier for `alertname` matching and `/alerts?rule=<name>`.
+
 Enum values unknown to the server do not reject the entire batch (Sections 2.3 and 5).
 
 Backend SDKs (Go, Node, and Python) default OTLP/HTTP payload compression to `"none"` and support opt-in `"gzip"` via explicit SDK `Compression` / `compression` configuration or standard `OTEL_EXPORTER_OTLP_COMPRESSION` and per-signal `OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` environment variables (precedence: explicit SDK setting > signal-specific env var > shared env var > `"none"`). The gateway enforces the 52 MiB decoded body limit and meters `ingest_rate_limit` on decoded byte size uniformly across uncompressed, decoded, and gzip-passthrough requests.
@@ -70,6 +75,9 @@ When the server configures `external_url` (`LO_EXTERNAL_URL`), outbound alert no
 
 - **Webhook JSON.** Top-level `url` (optional string, omitted when `external_url` is unset) and per-alert `alerts[].url` (optional string, omitted when `external_url` is unset or for storm/test deliveries). Existing relative `annotations.link` and `annotations.issue` fields emitted for Issue alerts remain unchanged.
 - **Email (`smtp`).** The message body is the indented JSON payload, encoded without HTML escaping (`&`, `<`, and `>` stay literal). When `url` is derived, the body starts with `View in lazy-observe: <url>` followed by `\r\n\r\n` before the JSON.
+- **Rendered annotations.** Native rule alerts carry annotations rendered at evaluation time (the raw template text when rendering fails), identical across Webhook `alerts[].annotations`, the SMTP JSON body, IM channels, and the console alert events. A `resolved` alert reuses the annotations rendered during its last firing evaluation.
+- **Issue AI analysis.** `new_issue` alerts may carry `annotations.ai_summary` (one line, at most 500 characters) when automatic Issue AI analysis already finished. `ai_probable_causes` and `ai_suggested_actions` are no longer emitted, and `regression` alerts carry no AI annotation. The full analysis stays on the Issue in the console.
+- **Email subject.** The `Subject` header uses the same title as IM channels (for example `[FIRING][CRITICAL] <project> / <summary> (+2 more)`), RFC 2047 encoded when it contains non-ASCII text.
 - **Console deep-link query parameters.** Console links target `<external_url>` with `project=<slug>` supported on any console route, plus `fingerprint`, `rule`, and `status` query parameters on `/alerts` (for example `/alerts?fingerprint=<fp>&project=<slug>`, `/alerts?project=<slug>&rule=<rule>`, `/alerts?project=<slug>&status=firing`, `/issues/<id>?project=<slug>`, `/issues?project=<slug>`, and `/alerts/channels`). A `project` the signed-in user cannot open (deleted, renamed, or no access) shows an error page instead of falling back to another project.
 
 ### 2.2 DSN format and credential contracts

@@ -920,6 +920,11 @@ func advanceRuleStates(
 	for _, state := range previous {
 		prior[state.Fingerprint] = state
 	}
+	// Render annotation templates at evaluation time so alert_rule_states,
+	// alert_events and every notification channel share one rendered copy. A
+	// recovered state below keeps its last firing-time annotations, so the
+	// resolved notification reuses the firing title instead of re-rendering.
+	renderer := newAnnotationRenderer(rule.ID)
 	states := make([]meta.AlertRuleState, 0, len(previous)+len(samples))
 	seen := make(map[string]struct{}, len(samples))
 	for _, sample := range samples {
@@ -932,7 +937,7 @@ func advanceRuleStates(
 		seen[sample.Fingerprint] = struct{}{}
 		state := meta.AlertRuleState{
 			RuleID: rule.ID, Fingerprint: sample.Fingerprint, Status: "pending",
-			LastEvaluatedAt: now, Labels: cloneStrings(sample.Labels), Annotations: cloneStrings(sample.Annotations),
+			LastEvaluatedAt: now, Labels: cloneStrings(sample.Labels), Annotations: renderer.Render(sample),
 		}
 		value := sample.Value
 		state.Value = &value

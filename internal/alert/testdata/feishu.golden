@@ -1,1 +1,1 @@
-{"card":{"elements":[{"tag":"div","text":{"content":"[FIRING] alpha / DiskFull\n{\"alertname\":\"DiskFull\",\"instance\":\"node-1\",\"project_id\":\"alpha\"}","tag":"lark_md"}}],"header":{"title":{"content":"[FIRING] alpha / DiskFull","tag":"plain_text"}}},"msg_type":"interactive"}
+{"card":{"elements":[{"tag":"div","text":{"content":"DiskFull","tag":"plain_text"}}],"header":{"template":"red","title":{"content":"[FIRING][CRITICAL] alpha / node-1 磁盘使用率 95% (+2 more)","tag":"plain_text"}}},"msg_type":"interactive"}
