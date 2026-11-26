@@ -503,16 +503,20 @@ export class Client implements BrowserClient {
         throw error;
       } finally {
         if (requestSpan) {
+          const aborted = isAbortError(requestError);
           this.recordSpan({
             ...requestSpan,
             endTimeUnixNano: unixNanoAfter(requestSpan.startTimeUnixNano),
             attributes: {
               ...requestSpan.attributes,
               ...(status > 0 ? { "http.response.status_code": status } : {}),
+              ...(aborted ? { "http.aborted": true } : {}),
             },
-            status: requestError !== undefined || status === 0 || status >= 500
-              ? { code: 2, ...(requestError === undefined ? {} : { message: errorMessage(requestError) }) }
-              : { code: 1 },
+            status: aborted
+              ? { code: 0 }
+              : requestError !== undefined || status === 0 || status >= 500
+                ? { code: 2, ...(requestError === undefined ? {} : { message: errorMessage(requestError) }) }
+                : { code: 1 },
           });
         }
         this.replay?.http(method, input, status, monotonicNow() - started);
@@ -587,6 +591,10 @@ function requestPath(input: RequestInfo | URL | string): string {
   } catch {
     return "/";
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error != null && typeof error === "object" && (error as { name?: unknown }).name === "AbortError";
 }
 
 function errorMessage(error: unknown): string {

@@ -18,6 +18,12 @@ const runId = randomHex(4);
 const initialPasswordFile = requiredEnv("LO_REAL_E2E_ADMIN_PASSWORD_FILE");
 const initialAdminPassword = readInitialAdminPassword();
 const updatedAdminPassword = `RealE2E!${runId}Pass`;
+const selfMonitoringEnabled =
+  process.env.LO_REAL_E2E_SELF_MONITORING === "true" ||
+  process.env.LO_REAL_E2E_SELF_MONITORING === "1";
+const selfMonitoringWebDisabled =
+  process.env.LO_REAL_E2E_SELF_MONITORING_WEB === "false" ||
+  process.env.LO_REAL_E2E_SELF_MONITORING_WEB === "0";
 
 const projectName = `Real E2E ${runId}`;
 const projectSlug = `real-e2e-${runId}`;
@@ -410,3 +416,235 @@ test("5. 告警抑制规则（/alerts/inhibitions）真实 CRUD 与持久化闭�
   await page.goto("/alerts/inhibitions");
   await expect(page).toHaveURL(/\/login\?redirect=%2Falerts%2Finhibitions$/);
 });
+
+if (selfMonitoringEnabled) {
+  test("6. 真实后端 Web 自观测闭环（登录后激活、三信号回读、登出清理与禁用开关）", async ({ page, request }) => {
+    const ingestPaths = new Set([
+      "/v1/traces",
+      "/api/events/vitals",
+      "/api/events/errors",
+      "/api/events/diagnostics",
+      "/api/replay/segments",
+    ]);
+    const isIngestPath = (rawURL: string): string | null => {
+      try {
+        const pathname = new URL(rawURL).pathname;
+        if (pathname.startsWith("/p/") || ingestPaths.has(pathname)) {
+          return pathname;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    };
+
+    interface BootstrapEvent {
+      status: number;
+      body: {
+        enabled?: boolean;
+        project_slug?: string;
+        token?: string;
+        service_name?: string;
+        replay_enabled?: boolean;
+      } | null;
+    }
+    interface IngestEvent {
+      phase: string;
+      pathname: string;
+      status?: number;
+      postData: string;
+    }
+
+    let phase = "unauth";
+    const bootstrapEvents: BootstrapEvent[] = [];
+    const ingestRequests: IngestEvent[] = [];
+    const ingestResponses: IngestEvent[] = [];
+
+    page.on("pageerror", () => {
+      // Expected unhandled errors are triggered deliberately to verify capture.
+    });
+    page.on("request", (req) => {
+      if (req.method() !== "POST") return;
+      const pathname = isIngestPath(req.url());
+      if (!pathname) return;
+      ingestRequests.push({
+        phase,
+        pathname,
+        postData: req.postData() ?? "",
+      });
+    });
+    page.on("response", async (resp) => {
+      const req = resp.request();
+      let pathname: string;
+      try {
+        pathname = new URL(resp.url()).pathname;
+      } catch {
+        return;
+      }
+      if (req.method() === "GET" && pathname === "/api/system/self-monitoring") {
+        let body: BootstrapEvent["body"];
+        try {
+          body = (await resp.json()) as BootstrapEvent["body"];
+        } catch {
+          body = null;
+        }
+        bootstrapEvents.push({ status: resp.status(), body });
+        return;
+      }
+      if (req.method() === "POST" && isIngestPath(resp.url())) {
+        ingestResponses.push({
+          phase,
+          pathname,
+          status: resp.status(),
+          postData: req.postData() ?? "",
+        });
+      }
+    });
+
+    await ensureChineseLocale(page);
+    await page.goto("/login");
+    await expect(page.locator("#username")).toBeVisible();
+    const loginHtml = await page.content();
+    expect(/\blo_[A-Za-z0-9_-]{16,}\b/.test(loginHtml)).toBe(false);
+
+    const unauthStatus = await page.evaluate(async () => {
+      const resp = await fetch("/api/system/self-monitoring", { credentials: "same-origin" });
+      return resp.status;
+    });
+    expect(unauthStatus).toBe(401);
+
+    phase = "authed";
+    await loginViaUI(page, "admin", updatedAdminPassword);
+    await expect(page.getByRole("button", { name: "用户菜单" })).toBeVisible();
+
+    await expect.poll(() => bootstrapEvents.some((item) => item.status === 200)).toBe(true);
+    const activeBootstrap = bootstrapEvents.find((item) => item.status === 200);
+    expect(activeBootstrap).toBeDefined();
+
+    if (selfMonitoringWebDisabled) {
+      expect(activeBootstrap?.body).toEqual({ enabled: false });
+      await page.waitForTimeout(1_000);
+      expect(
+        await page.evaluate(() => window.sessionStorage.getItem("lazy-observe:session-id")),
+      ).toBeNull();
+
+      await page.locator('a[href="/logs"]').first().click();
+      await expect(page).toHaveURL(/\/logs/);
+      await page.evaluate(async (marker) => {
+        await fetch("/api/projects", { credentials: "same-origin" });
+        setTimeout(() => {
+          throw new Error(marker);
+        }, 0);
+      }, `real-e2e-web-self-mon-disabled-${runId}`);
+
+      await page.waitForTimeout(6_500);
+      expect(ingestRequests).toEqual([]);
+      return;
+    }
+
+    expect(activeBootstrap?.body?.enabled).toBe(true);
+    expect(activeBootstrap?.body?.project_slug).toBe("lazy-observe");
+    expect(activeBootstrap?.body?.service_name).toBe("lazy-observe-web");
+    expect(activeBootstrap?.body?.token).toMatch(/^lo_/);
+    expect(loginHtml).not.toContain(activeBootstrap?.body?.token ?? "");
+
+    await expect.poll(() =>
+      page.evaluate(() => window.sessionStorage.getItem("lazy-observe:session-id")),
+    ).not.toBeNull();
+
+    await page.locator('a[href="/logs"]').first().click();
+    await expect(page).toHaveURL(/\/logs/);
+    const selfMonErrorMarker = `real-e2e-web-self-mon-${runId}`;
+    await page.evaluate(async (marker) => {
+      await fetch("/api/projects", { credentials: "same-origin" });
+      setTimeout(() => {
+        throw new Error(marker);
+      }, 0);
+    }, selfMonErrorMarker);
+
+    await expect.poll(() => {
+      const okResponses = ingestResponses.filter(
+        (item) => item.phase === "authed" && (item.status ?? 0) >= 200 && (item.status ?? 0) < 300,
+      );
+      return {
+        trace: okResponses.some(
+          (item) => item.pathname === "/v1/traces" && item.postData.includes("lazy-observe-web"),
+        ),
+        vital: okResponses.some(
+          (item) => item.pathname === "/api/events/vitals" && /"(TTFB|FCP|LCP|CLS|INP)"/.test(item.postData),
+        ),
+        error: okResponses.some(
+          (item) => item.pathname === "/api/events/errors" && item.postData.includes(selfMonErrorMarker),
+        ),
+      };
+    }, { timeout: 30_000, intervals: [300, 500] }).toEqual({
+      trace: true,
+      vital: true,
+      error: true,
+    });
+
+    const loginRes = await request.post("/api/auth/login", {
+      data: { username: "admin", password: updatedAdminPassword },
+    });
+    expect(loginRes.ok()).toBeTruthy();
+
+    await expect.poll(async () => {
+      const headers = { "X-LO-Project": "lazy-observe" };
+      const [svcRes, searchRes, vitalRes, issueRes] = await Promise.all([
+        request.get("/api/traces/services", { headers }),
+        request.get("/api/traces/search", {
+          headers,
+          params: { service: "lazy-observe-web", limit: "20" },
+        }),
+        request.get("/api/v1/query", {
+          headers,
+          params: { query: `{__name__=~"web_vitals_(lcp|inp|cls|ttfb|fcp)"}` },
+        }),
+        request.get("/api/issues", {
+          headers,
+          params: { q: selfMonErrorMarker },
+        }),
+      ]);
+      const svcJson = svcRes.ok() ? ((await svcRes.json()) as { data?: string[] | null }) : null;
+      const searchJson = searchRes.ok() ? ((await searchRes.json()) as { data?: unknown[] | null }) : null;
+      const vitalJson = vitalRes.ok()
+        ? ((await vitalRes.json()) as { data?: { result?: unknown[] } })
+        : null;
+      const issueJson = issueRes.ok()
+        ? ((await issueRes.json()) as { issues?: Array<{ title?: string }> })
+        : null;
+      return {
+        traceService: (svcJson?.data ?? []).includes("lazy-observe-web"),
+        traces: (searchJson?.data?.length ?? 0) > 0,
+        vitals: (vitalJson?.data?.result?.length ?? 0) > 0,
+        issues: (issueJson?.issues ?? []).some((item) => item.title?.includes(selfMonErrorMarker)),
+      };
+    }, { timeout: 45_000, intervals: [500, 1_000] }).toEqual({
+      traceService: true,
+      traces: true,
+      vitals: true,
+      issues: true,
+    });
+
+    await page.evaluate(() => {
+      window.sessionStorage.setItem("lazy-observe:replay-seq:real-e2e", "1");
+    });
+    await signOutViaTopbar(page);
+    const remainingKeys = await page.evaluate(() => Object.keys(window.sessionStorage));
+    expect(remainingKeys).not.toContain("lazy-observe:session-id");
+    expect(remainingKeys.some((key) => key.startsWith("lazy-observe:replay-seq:"))).toBe(false);
+
+    await page.waitForTimeout(1_000);
+    phase = "post-logout";
+    const postLogoutErrorMarker = `real-e2e-web-self-mon-after-logout-${runId}`;
+    await page.evaluate(async (marker) => {
+      await fetch("/healthz", { credentials: "same-origin" });
+      setTimeout(() => {
+        throw new Error(marker);
+      }, 0);
+    }, postLogoutErrorMarker);
+
+    await page.waitForTimeout(6_500);
+    expect(ingestRequests.filter((item) => item.phase === "post-logout")).toEqual([]);
+  });
+}

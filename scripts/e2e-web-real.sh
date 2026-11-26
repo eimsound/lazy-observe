@@ -9,6 +9,8 @@ set -euo pipefail
 #   BINARY                        平台二进制路径，默认 bin/lazy-observe（不存在时兼容检查 dist/lazy-observe）
 #   STORAGE_BIN_DIR               Victoria 存储二进制目录，默认 .cache/storage-bin
 #   LO_WEB_REAL_E2E_READY_TIMEOUT 等 /readyz 就绪的秒数，默认 120
+#   LO_REAL_E2E_SELF_MONITORING   设为 true/1 时开启自观测并运行 Web 自观测真实后端回归用例（默认 false）
+#   LO_REAL_E2E_SELF_MONITORING_WEB 搭配 LO_REAL_E2E_SELF_MONITORING=true 使用，默认 true；设为 false 可测 web=false 禁用行为
 #   LO_E2E_KEEP=1                 保留临时目录（含 server.log）
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -181,12 +183,22 @@ printf 'preparing web Playwright dependencies...\n'
 )
 
 printf 'starting lazy-observe at %s (component port offset %s)...\n' "$platform_url" "$port_offset"
+self_mon_enabled=false
+self_mon_web=true
+if [[ ${LO_REAL_E2E_SELF_MONITORING:-false} == true || ${LO_REAL_E2E_SELF_MONITORING:-false} == 1 ]]; then
+  self_mon_enabled=true
+  if [[ ${LO_REAL_E2E_SELF_MONITORING_WEB:-true} == false || ${LO_REAL_E2E_SELF_MONITORING_WEB:-true} == 0 ]]; then
+    self_mon_web=false
+  fi
+fi
 # 不设置 LO_SECURITY_ADMIN_PASSWORD_FILE，使平台首次启动自动生成 initial-admin-password 并开启强制改密。
 set -m
 (
   cd "$work/cwd"
   exec env -i HOME="$work/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C.UTF-8}" \
-    LO_SELF_MONITORING_ENABLED=false \
+    LO_SELF_MONITORING_ENABLED="$self_mon_enabled" \
+    LO_SELF_MONITORING_WEB="$self_mon_web" \
+    LO_SELF_MONITORING_WEB_REPLAY=false \
     "$binary" server --listen "127.0.0.1:$gateway_port" --data-dir "$work/data" \
     --storage-bin-dir "$storage" --component-port-offset "$port_offset"
 ) >"$log" 2>&1 </dev/null &
@@ -216,6 +228,8 @@ set -m
   exec env \
     LO_REAL_E2E_BASE_URL="$platform_url" \
     LO_REAL_E2E_ADMIN_PASSWORD_FILE="$admin_password_file" \
+    LO_REAL_E2E_SELF_MONITORING="${LO_REAL_E2E_SELF_MONITORING:-false}" \
+    LO_REAL_E2E_SELF_MONITORING_WEB="${LO_REAL_E2E_SELF_MONITORING_WEB:-true}" \
     pnpm test:e2e:real "$@"
 ) </dev/null &
 runner_pid=$!

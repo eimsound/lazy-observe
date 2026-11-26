@@ -70,14 +70,17 @@ function LazyAssistantPanel() {
  * its history survives navigation, while the panel module loads only when it
  * is opened.
  */
-export function AppShell({ children }: { children: ReactNode }) {
+export function AppShell({ children, blockReplay = false }: { children: ReactNode; blockReplay?: boolean }) {
   return (
     <AssistantProvider>
       <div className="flex h-screen w-full overflow-hidden bg-sidebar text-foreground">
         <Sidebar />
         <div className="flex min-w-0 flex-1 flex-col bg-sidebar">
           <Topbar />
-          <main className="min-h-0 flex-1 overflow-auto rounded-tl-xl border-l border-t border-sidebar-border bg-background">
+          <main
+            data-lo-block={blockReplay ? "" : undefined}
+            className="min-h-0 flex-1 overflow-auto rounded-tl-xl border-l border-t border-sidebar-border bg-background"
+          >
             {children}
           </main>
         </div>

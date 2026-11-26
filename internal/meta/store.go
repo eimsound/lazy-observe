@@ -158,7 +158,11 @@ type UserAPITokenInfo struct {
 	LastUsedAt *time.Time `json:"last_used_at"`
 }
 
-const SelfMonitoringProjectSlug = "lazy-observe"
+const (
+	SelfMonitoringProjectSlug  = "lazy-observe"
+	SelfMonitoringTokenName    = "self-monitoring"
+	SelfMonitoringWebTokenName = "self-monitoring-web"
+)
 
 // ErrInvalidProjectAPIToken distinguishes an unknown or revoked credential from a
 // transient metadata-store failure so gateways can return 401 vs 503 safely.
@@ -1596,6 +1600,10 @@ func (s *Store) Bootstrap(
 	return "", nil
 }
 
+func isValidDerivedSelfMonitoringToken(derived string) bool {
+	return strings.HasPrefix(derived, "lo_") && len(derived) >= 32
+}
+
 // BootstrapSelfMonitoring idempotently creates the built-in project and makes
 // sure the caller-derived internal project API token is active. The caller
 // derives the token from the platform key (secret.Box.Derive), so replicas and
@@ -1605,7 +1613,7 @@ func (s *Store) BootstrapSelfMonitoring(
 	ctx context.Context,
 	derived string,
 ) (info ProjectInfo, value string, err error) {
-	if !strings.HasPrefix(derived, "lo_") || len(derived) < 32 {
+	if !isValidDerivedSelfMonitoringToken(derived) {
 		return ProjectInfo{}, "", errors.New("self-monitoring token must be a derived lo_ token")
 	}
 	release, err := s.acquireBootstrapCoordination(ctx)
@@ -1623,28 +1631,111 @@ func (s *Store) BootstrapSelfMonitoring(
 	} else if err != nil {
 		return ProjectInfo{}, "", fmt.Errorf("ensure self-monitoring project: %w", err)
 	}
+	value, err = s.ensureSelfMonitoringTokenLocked(ctx, info.ID, SelfMonitoringTokenName, derived)
+	if err != nil {
+		return ProjectInfo{}, "", err
+	}
+	return info, value, nil
+}
+
+// BootstrapSelfMonitoringWebToken idempotently ensures the browser
+// self-monitoring project API token derived from the current platform key is
+// active on the built-in self-monitoring project, and revokes any older
+// self-monitoring-web tokens (e.g. from previous platform keys).
+func (s *Store) BootstrapSelfMonitoringWebToken(
+	ctx context.Context,
+	projectID int,
+	derived string,
+) (value string, err error) {
+	if projectID <= 0 {
+		return "", errors.New("self-monitoring project ID must be positive")
+	}
+	if !isValidDerivedSelfMonitoringToken(derived) {
+		return "", errors.New("self-monitoring token must be a derived lo_ token")
+	}
+	release, err := s.acquireBootstrapCoordination(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { err = errors.Join(err, release()) }()
+	value, err = s.ensureSelfMonitoringTokenLocked(ctx, projectID, SelfMonitoringWebTokenName, derived)
+	if err != nil {
+		return "", err
+	}
+	n, revokeErr := s.client.ProjectAPIToken.Update().
+		Where(
+			projectapitoken.ProjectIDEQ(projectID),
+			projectapitoken.NameEQ(SelfMonitoringWebTokenName),
+			projectapitoken.RevokedEQ(false),
+			projectapitoken.TokenNEQ(storedCredential(derived)),
+		).
+		SetRevoked(true).
+		Save(ctx)
+	if revokeErr != nil {
+		return "", fmt.Errorf("revoke stale web self-monitoring tokens: %w", revokeErr)
+	}
+	if n > 0 {
+		s.revision.Add(1)
+	}
+	return value, nil
+}
+
+// RevokeSelfMonitoringWebTokens revokes all active browser self-monitoring
+// project API tokens on the built-in self-monitoring project when web
+// self-monitoring is disabled.
+func (s *Store) RevokeSelfMonitoringWebTokens(ctx context.Context, projectID int) (err error) {
+	if projectID <= 0 {
+		return errors.New("self-monitoring project ID must be positive")
+	}
+	release, err := s.acquireBootstrapCoordination(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, release()) }()
+	n, revokeErr := s.client.ProjectAPIToken.Update().
+		Where(
+			projectapitoken.ProjectIDEQ(projectID),
+			projectapitoken.NameEQ(SelfMonitoringWebTokenName),
+			projectapitoken.RevokedEQ(false),
+		).
+		SetRevoked(true).
+		Save(ctx)
+	if revokeErr != nil {
+		return fmt.Errorf("revoke web self-monitoring tokens: %w", revokeErr)
+	}
+	if n > 0 {
+		s.revision.Add(1)
+	}
+	return nil
+}
+
+func (s *Store) ensureSelfMonitoringTokenLocked(
+	ctx context.Context,
+	projectID int,
+	name, derived string,
+) (string, error) {
 	existing, err := s.client.ProjectAPIToken.Query().
 		Where(projectapitoken.TokenEQ(storedCredential(derived))).
 		Only(ctx)
 	switch {
 	case err == nil:
-		if existing.ProjectID != info.ID {
-			return ProjectInfo{}, "", errors.New("self-monitoring token belongs to another project")
+		if existing.ProjectID != projectID {
+			return "", errors.New("self-monitoring token belongs to another project")
 		}
 		if existing.Revoked {
 			if err := existing.Update().SetRevoked(false).Exec(ctx); err != nil {
-				return ProjectInfo{}, "", fmt.Errorf("reactivate self-monitoring project API token: %w", err)
+				return "", fmt.Errorf("reactivate self-monitoring project API token: %w", err)
 			}
 			s.revision.Add(1)
 		}
-		return info, derived, nil
+		return derived, nil
 	case !IsNotFound(err):
-		return ProjectInfo{}, "", fmt.Errorf("find self-monitoring project API token: %w", err)
+		return "", fmt.Errorf("find self-monitoring project API token: %w", err)
 	}
-	if _, err := s.createProjectAPITokenValue(ctx, info.ID, "self-monitoring", derived); err != nil {
-		return ProjectInfo{}, "", fmt.Errorf("create self-monitoring project API token: %w", err)
+	if _, err := s.createProjectAPITokenValue(ctx, projectID, name, derived); err != nil {
+		return "", fmt.Errorf("create self-monitoring project API token: %w", err)
 	}
-	return info, derived, nil
+	return derived, nil
 }
 
 func (s *Store) ensureBootstrapAdmin(ctx context.Context, logger *slog.Logger, admin BootstrapAdmin) error {

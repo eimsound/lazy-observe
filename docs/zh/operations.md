@@ -263,6 +263,8 @@ curl -fsS http://127.0.0.1:3100/api/traces/services \
 3. 预检全部 `PASS` 后滚动更新副本：
    - Kubernetes / Helm：默认启用 `RollingUpdate` 与 `PodDisruptionBudget`，配合 `pre-stop` 钩子先发 `SIGUSR1` 让 `/readyz` 返回 `503`，等端点摘流窗口结束后再发 `SIGTERM` 优雅关闭；
    - 非 Kubernetes 多副本主机：逐台滚动升级。先发 `SIGUSR1` 等待前置负载均衡摘流，再发 `SIGTERM` 停机，替换二进制或镜像后启动并等待 `/readyz` 返回 `200`，随后再升级下一台。
+
+   > 滚动升级期间，全部 HA 副本必须保持 `self_monitoring.enabled`、`self_monitoring.web` 与 `self_monitoring.web_replay` 配置一致。若任意副本以 `self_monitoring.web: false`（或 `self_monitoring.enabled: false`）启动，都会吊销其他在线副本正在下发给已登录浏览器的共享 `self-monitoring-web` Token。
 4. 全部副本就绪后，在日志与 `/healthz` 中确认告警规则评估、通知投递与 `vmagent` 选主切换正常。
 
 ### 4.4 回滚步骤
@@ -316,7 +318,7 @@ lazy-observe 启动时会计算 `security.secret_key_file`（默认 `<data_dir>/
 4. 重新启动所有应用副本（HA 模式建议先跑一次 `lazy-observe doctor --ha`）。
 5. 完成轮换后收尾操作：
    - 登录 Web UI 进入 **Settings > AI** 重新输入并保存 AI Provider API Key，用新密钥重新加密入库；
-   - 新密钥在下次启动时会派生新的自监控项目 Token，但旧派生 Token 不会自动吊销，仍可向自监控项目上报遥测。若旧密钥已泄露，请到自监控项目的令牌列表手动吊销旧 Token。
+   - 新密钥在下次启动时会派生新的自监控项目 Token（后端 `self-monitoring` 与启用 `self_monitoring.web` 时的前端 `self-monitoring-web`）。其中旧的 `self-monitoring-web` Token 会在新密钥启动或关闭 `self_monitoring.web` 时由启动引导自动吊销；后端 `self-monitoring` Token 会保留，且因内置自监控项目受 `protected_project` 保护，无法通过管理界面或管理 API 手动吊销。
 
 ### 5.2 密码应急重置与登录锁定解除（`admin reset-password`）
 

@@ -112,7 +112,11 @@ The example configuration lists canonical path-shaped environment variable names
 | `redis.db` | `0` | Redis logical database number |
 | `redis.key_prefix` | `lazy-observe` | Key prefix shared by all gateway replicas |
 | `self_monitoring.enabled` | `true` | Observe lazy-observe through its own Go SDK and built-in project |
+| `self_monitoring.web` | `true` | Enable session-authenticated browser self-monitoring for signed-in web UI users (errors, Web Vitals, and same-origin fetch tracing) when `self_monitoring.enabled` is `true` |
+| `self_monitoring.web_replay` | `false` | Enable error-only Session Replay (`onErrorOnly`) for web self-monitoring when `self_monitoring.enabled` and `self_monitoring.web` are `true` |
 | `self_monitoring.profiling` | `false` | Enable continuous profiling for the long-running gateway process |
+
+> In multi-replica HA deployments (including during rolling upgrades), configure `self_monitoring.enabled`, `self_monitoring.web`, and `self_monitoring.web_replay` identically across every replica sharing the same metadata database. Starting any replica with `self_monitoring.web: false` (or `self_monitoring.enabled: false`) revokes the shared `self-monitoring-web` token that other running replicas serve to signed-in browsers.
 
 ### Retention, blob, alert, and process fields
 

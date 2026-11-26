@@ -149,10 +149,12 @@ process:
   # Non-zero only for local multi-process isolation tests.
   component_port_offset: 0
 
-# Observe the platform through its own Go SDK. Profiling stays off by default
-# because lazy-observe is a long-running platform process.
+# Observe the platform through its own Go SDK and browser SDK. Profiling stays
+# off by default because lazy-observe is a long-running platform process.
 self_monitoring:
   enabled: true
+  web: true
+  web_replay: false
   profiling: false
 
 # Platform encryption key file. Seals sensitive values in the metadata database

@@ -5,9 +5,8 @@ bin
 dist
 data
 **/node_modules
-# Only the Go SDK module is part of the server build (go.mod replace ./sdk/go).
+# Go SDK (go.mod replace ./sdk/go) and Browser SDK (web Vite alias) are part of the server build.
 sdk/node
-sdk/browser
 sdk/python
 sdk/scripts
 **/dist

@@ -93,8 +93,8 @@ expect_flag 'web/pnpm-workspace.yaml' go web build sdk_journeys
 expect_flag 'web/pnpm-lock.yaml' go web build sdk_journeys
 expect_flag 'sdk/node/pnpm-workspace.yaml' go sdk_node sdk_journeys
 expect_flag 'sdk/node/pnpm-lock.yaml' go sdk_node sdk_journeys
-expect_flag 'sdk/browser/pnpm-workspace.yaml' go sdk_browser sdk_journeys
-expect_flag 'sdk/browser/pnpm-lock.yaml' go sdk_browser sdk_journeys
+expect_flag 'sdk/browser/pnpm-workspace.yaml' go sdk_browser web build sdk_journeys
+expect_flag 'sdk/browser/pnpm-lock.yaml' go sdk_browser web build sdk_journeys
 expect_flag 'sdk/python/pyproject.toml' go sdk_python sdk_journeys
 # 打包链路与原生 arm64 冒烟真实输入
 expect_flag '.dockerignore' go build arm64
@@ -142,10 +142,11 @@ expect_flag 'bench/performance-gates.json' go ha
 expect_flag 'sdk/go/go.mod' go sdk_go build e2e ha sdk_journeys
 expect_flag 'sdk/go/client.go' go sdk_go build e2e ha sdk_journeys
 expect_flag 'sdk/node/packages/node/src/index.ts' sdk_node sdk_journeys
-expect_flag 'sdk/browser/packages/browser/src/index.ts' sdk_browser sdk_journeys
+expect_flag 'sdk/browser/packages/browser/src/index.ts' sdk_browser web build sdk_journeys
 expect_flag 'sdk/python/lazy_observe/__init__.py' sdk_python sdk_journeys
 expect_flag 'sdk/scripts/sdk-publish.sh' go sdk_go sdk_node sdk_browser sdk_python sdk_journeys
 expect_flag 'scripts/sdk-journeys.sh' go sdk_journeys
+expect_flag 'scripts/e2e-web-self-monitoring.mjs' go sdk_journeys
 
 # --- 5.5 Zensical 文档站变更面（纯文档站不触发重型业务 job；docs/pyproject.toml 同时触发 go 的 7 天发布年龄校验） ---
 expect_only_flags 'docs/index.md' docs

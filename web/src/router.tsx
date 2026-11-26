@@ -2,10 +2,10 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
-  Outlet,
 } from "@tanstack/react-router";
 import { AppLayout } from "@/components/layout/app-layout";
 import { lazyRouteComponent } from "@/components/router/lazy-route";
+import { RootLayout } from "@/components/router/root-layout";
 import { parseTraceSearchURL } from "@/routes/traces-search";
 import { parseMetricsSearch } from "@/routes/metrics-search";
 import { parseProfilingEvidenceSearch } from "@/routes/trace-evidence-links";
@@ -155,7 +155,7 @@ function parseLogsSearch(search: Record<string, unknown>): LogsSearch {
  */
 
 const rootRoute = createRootRoute({
-  component: () => <Outlet />,
+  component: RootLayout,
 });
 
 export const loginRoute = createRoute({

@@ -1,6 +1,7 @@
-import { Component, type ReactNode } from "react";
+import { Component, type ErrorInfo, type ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { captureSelfMonitoringException } from "@/lib/self-monitoring";
 
 class RouteModuleErrorBoundary extends Component<
   {
@@ -15,6 +16,15 @@ class RouteModuleErrorBoundary extends Component<
 
   static getDerivedStateFromError(): { failed: boolean } {
     return { failed: true };
+  }
+
+  override componentDidCatch(error: Error, info: ErrorInfo): void {
+    captureSelfMonitoringException(error, {
+      tags: {
+        "react.boundary": "route-module",
+        "react.component_stack": info.componentStack ?? "",
+      },
+    });
   }
 
   override render() {

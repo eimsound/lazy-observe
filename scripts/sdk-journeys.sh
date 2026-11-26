@@ -81,7 +81,7 @@ if [[ " ${journeys[*]} " == *" python "* ]]; then
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/lazy-observe-sdk-journeys.XXXXXX")
-mkdir "$work/cwd" "$work/home" "$work/journeys"
+mkdir "$work/cwd" "$work/home" "$work/journeys" "$work/data"
 log=$work/server.log
 server_pid=
 journey_pid=
@@ -171,56 +171,74 @@ port_busy() {
 # 以及组件默认端口 18428–22428）都不在这个区间里。
 gateway_port=
 port_offset=
-for _ in $(seq 50); do
-  candidate_gateway=$((14000 + RANDOM % 1000))
-  candidate_offset=$((1000 + RANDOM % 9000))
-  busy=0
-  for port in "$candidate_gateway" $((18428 + candidate_offset)) $((19428 + candidate_offset)) \
-    $((20428 + candidate_offset)) $((22428 + candidate_offset)); do
-    if port_busy "$port"; then
-      busy=1
+platform_url=
+
+pick_free_ports() {
+  gateway_port=
+  port_offset=
+  local _attempt candidate_gateway candidate_offset busy port
+  for _attempt in $(seq 50); do
+    candidate_gateway=$((14000 + RANDOM % 1000))
+    candidate_offset=$((1000 + RANDOM % 9000))
+    busy=0
+    for port in "$candidate_gateway" $((18428 + candidate_offset)) $((19428 + candidate_offset)) \
+      $((20428 + candidate_offset)) $((22428 + candidate_offset)); do
+      if port_busy "$port"; then
+        busy=1
+        break
+      fi
+    done
+    if ((busy == 0)); then
+      gateway_port=$candidate_gateway
+      port_offset=$candidate_offset
       break
     fi
   done
-  if ((busy == 0)); then
-    gateway_port=$candidate_gateway
-    port_offset=$candidate_offset
-    break
-  fi
-done
-[[ -n $gateway_port ]] || fail "could not find free gateway and component ports after 50 attempts"
-platform_url=http://127.0.0.1:$gateway_port
+  [[ -n $gateway_port ]] || fail "could not find free gateway and component ports after 50 attempts"
+  platform_url=http://127.0.0.1:$gateway_port
+}
+
+# start_platform DATA_DIR LOG_FILE ENV_KV...
+start_platform() {
+  local data_dir=$1 log_file=$2
+  shift 2
+  local ready=0 deadline
+  log=$log_file
+  log_dumped=0
+  pick_free_ports
+  mkdir -p "$data_dir"
+  printf 'starting lazy-observe at %s (component port offset %s)...\n' "$platform_url" "$port_offset"
+  # 平台独占一个进程组（set -m 只包住这一次 fork，组 ID = server_pid），cleanup 按组停掉它和受管的 Victoria 组件。
+  set -m
+  (
+    cd "$work/cwd"
+    # 空 cwd + 白名单环境：宿主机上的 LO_* 配置、云凭据都不会流进平台。
+    exec env -i HOME="$work/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C.UTF-8}" \
+      LO_SECURITY_ADMIN_PASSWORD_FILE="$work/admin-password" \
+      "$@" \
+      "$binary" server --listen "127.0.0.1:$gateway_port" --data-dir "$data_dir" \
+      --storage-bin-dir "$storage" --component-port-offset "$port_offset"
+  ) >"$log" 2>&1 </dev/null &
+  server_pid=$!
+  set +m
+
+  deadline=$((SECONDS + ready_timeout))
+  while ((SECONDS < deadline)); do
+    kill -0 "$server_pid" 2>/dev/null || fail "platform exited before /readyz became ready"
+    if curl --fail --silent --show-error --max-time 2 "$platform_url/readyz" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.2
+  done
+  ((ready == 1)) || fail "timed out after ${ready_timeout}s waiting for $platform_url/readyz"
+}
 
 # 32 个十六进制字符，满足密码最短长度；od 自己读够 16 字节就结束，不会因管道提前关闭而 SIGPIPE。
 admin_password=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
 (umask 077 && printf '%s\n' "$admin_password" >"$work/admin-password")
 
-printf 'starting lazy-observe at %s (component port offset %s)...\n' "$platform_url" "$port_offset"
-# 平台独占一个进程组（set -m 只包住这一次 fork，组 ID = server_pid），cleanup 按组停掉它和受管的 Victoria 组件。
-set -m
-(
-  cd "$work/cwd"
-  # 空 cwd + 白名单环境：宿主机上的 LO_* 配置、云凭据都不会流进平台。
-  exec env -i HOME="$work/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C.UTF-8}" \
-    LO_SECURITY_ADMIN_PASSWORD_FILE="$work/admin-password" \
-    LO_SELF_MONITORING_ENABLED=false \
-    "$binary" server --listen "127.0.0.1:$gateway_port" --data-dir "$work/data" \
-    --storage-bin-dir "$storage" --component-port-offset "$port_offset"
-) >"$log" 2>&1 </dev/null &
-server_pid=$!
-set +m
-
-ready=0
-deadline=$((SECONDS + ready_timeout))
-while ((SECONDS < deadline)); do
-  kill -0 "$server_pid" 2>/dev/null || fail "platform exited before /readyz became ready"
-  if curl --fail --silent --show-error --max-time 2 "$platform_url/readyz" >/dev/null 2>&1; then
-    ready=1
-    break
-  fi
-  sleep 0.2
-done
-((ready == 1)) || fail "timed out after ${ready_timeout}s waiting for $platform_url/readyz"
+start_platform "$work/data/main" "$work/server.log" LO_SELF_MONITORING_ENABLED=false
 
 # 默认项目的 token 只在首次创建时打一次日志。
 tokens=$(sed -n 's/.*created default project.*project_api_token=\([^ ]*\).*/\1/p' "$log")
@@ -279,4 +297,43 @@ printf '\nSDK journeys passed: %s\n' "${passed[*]:-none}"
 if ((${#failed[@]} > 0)); then
   fail "SDK journeys failed: ${failed[*]}"
 fi
+
+run_web_self_monitoring_e2e() {
+  local mode=$1 data_dir=$2 log_file=$3 web_flag=$4 started status elapsed
+  start_platform "$data_dir" "$log_file" \
+    LO_SELF_MONITORING_ENABLED=true \
+    "LO_SELF_MONITORING_WEB=$web_flag" \
+    LO_SELF_MONITORING_WEB_REPLAY=false
+  printf '\n=== Web self-monitoring E2E (%s) ===\n' "$mode"
+  started=$SECONDS
+  set -m
+  LO_SELF_MON_MODE=$mode \
+    LO_SELF_MON_URL=$platform_url \
+    LO_SELF_MON_ADMIN_PASSWORD=$admin_password \
+    node "$root/scripts/e2e-web-self-monitoring.mjs" </dev/null &
+  journey_pid=$!
+  set +m
+  status=0
+  wait "$journey_pid" || status=$?
+  if group_alive "$journey_pid"; then
+    printf 'sdk-journeys: web self-monitoring (%s) left processes behind, stopping its process group\n' "$mode" >&2
+    stop_group "$journey_pid" "$journey_stop_timeout" "web self-monitoring ($mode) leftovers"
+  fi
+  journey_pid=
+  elapsed=$((SECONDS - started))
+  if ((status != 0)); then
+    fail "web self-monitoring E2E ($mode) failed (exit $status, ${elapsed}s)"
+  fi
+  printf '=== PASS Web self-monitoring E2E: %s (%ss) ===\n' "$mode" "$elapsed"
+  stop_group "$server_pid" "$shutdown_timeout" "platform (web self-monitoring $mode)"
+  server_pid=
+}
+
+if [[ " ${journeys[*]} " == *" browser "* ]]; then
+  stop_group "$server_pid" "$shutdown_timeout" "platform"
+  server_pid=
+  run_web_self_monitoring_e2e enabled "$work/data/self-mon-enabled" "$work/self-mon-enabled.log" true
+  run_web_self_monitoring_e2e disabled "$work/data/self-mon-disabled" "$work/self-mon-disabled.log" false
+fi
+
 printf 'PASS: all SDK journeys (%s)\n' "${journeys[*]}"

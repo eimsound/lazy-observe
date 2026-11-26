@@ -152,10 +152,22 @@ type Security struct {
 	OutboundAllowlist []string `yaml:"outbound_allowlist"`
 }
 
-// SelfMonitoring controls the platform's use of its own Go SDK.
+// SelfMonitoring controls the platform's use of its own Go and browser SDKs.
 type SelfMonitoring struct {
 	Enabled   bool `yaml:"enabled"`
+	Web       bool `yaml:"web"`
+	WebReplay bool `yaml:"web_replay"`
 	Profiling bool `yaml:"profiling"`
+}
+
+// WebEnabled reports whether browser self-monitoring for the web UI is active.
+func (s SelfMonitoring) WebEnabled() bool {
+	return s.Enabled && s.Web
+}
+
+// WebReplayEnabled reports whether error-only Session Replay is enabled for web self-monitoring.
+func (s SelfMonitoring) WebReplayEnabled() bool {
+	return s.WebEnabled() && s.WebReplay
 }
 
 type Meta struct {
@@ -313,7 +325,7 @@ func Defaults() Config {
 			RestartMax:      Duration(time.Minute),
 			DrainTimeout:    Duration(20 * time.Second),
 		},
-		SelfMonitoring: SelfMonitoring{Enabled: true},
+		SelfMonitoring: SelfMonitoring{Enabled: true, Web: true},
 		Security: Security{
 			CSRF:           true,
 			AuditRetention: Duration(90 * 24 * time.Hour),
@@ -550,6 +562,18 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 		"self-monitoring",
 		cfg.SelfMonitoring.Enabled,
 		"observe lazy-observe with its own SDK",
+	)
+	fs.BoolVar(
+		&cfg.SelfMonitoring.Web,
+		"self-monitoring-web",
+		cfg.SelfMonitoring.Web,
+		"enable browser self-monitoring for the web UI when self-monitoring is enabled",
+	)
+	fs.BoolVar(
+		&cfg.SelfMonitoring.WebReplay,
+		"self-monitoring-web-replay",
+		cfg.SelfMonitoring.WebReplay,
+		"enable error-only Session Replay for web self-monitoring when web self-monitoring is enabled",
 	)
 	fs.BoolVar(
 		&cfg.SelfMonitoring.Profiling,
@@ -839,8 +863,10 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		}
 	}
 	for name, dst := range map[string]*bool{
-		"LO_SELF_MONITORING_ENABLED":   &c.SelfMonitoring.Enabled,
-		"LO_SELF_MONITORING_PROFILING": &c.SelfMonitoring.Profiling,
+		"LO_SELF_MONITORING_ENABLED":    &c.SelfMonitoring.Enabled,
+		"LO_SELF_MONITORING_WEB":        &c.SelfMonitoring.Web,
+		"LO_SELF_MONITORING_WEB_REPLAY": &c.SelfMonitoring.WebReplay,
+		"LO_SELF_MONITORING_PROFILING":  &c.SelfMonitoring.Profiling,
 	} {
 		if v, ok := lookup(name); ok {
 			parsed, err := strconv.ParseBool(v)

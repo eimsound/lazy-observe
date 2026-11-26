@@ -15,6 +15,16 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
+      "@lazy-observe/browser": fileURLToPath(
+        new URL("../sdk/browser/packages/browser/src/index.ts", import.meta.url),
+      ),
+      "@lazy-observe/react": fileURLToPath(
+        new URL("../sdk/browser/packages/react/src/index.ts", import.meta.url),
+      ),
+      react: fileURLToPath(new URL("./node_modules/react", import.meta.url)),
+      "react-dom": fileURLToPath(new URL("./node_modules/react-dom", import.meta.url)),
+      rrweb: fileURLToPath(new URL("./node_modules/rrweb", import.meta.url)),
+      "web-vitals": fileURLToPath(new URL("./node_modules/web-vitals", import.meta.url)),
     },
   },
   build: {
@@ -68,10 +78,17 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 5173,
     strictPort: true,
+    fs: {
+      allow: [fileURLToPath(new URL("..", import.meta.url))],
+    },
     proxy: {
       // Dev proxy: browser calls /api/* -> Fiber gateway. Keeps same-origin in prod
       // (frontend is go:embed'd behind the same gateway), so no code path changes.
       "/api": {
+        target: API_TARGET,
+        changeOrigin: true,
+      },
+      "/v1": {
         target: API_TARGET,
         changeOrigin: true,
       },

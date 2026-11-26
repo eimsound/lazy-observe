@@ -257,4 +257,58 @@ describe("active spans", () => {
     await client.close();
     vi.unstubAllGlobals();
   });
+
+  it("marks aborted fetch spans as UNSET with http.aborted while failing network errors remain ERROR", async () => {
+    const fetcherMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      if (String(input) === "/api/aborted") {
+        const abortErr = new Error("The operation was aborted.");
+        abortErr.name = "AbortError";
+        throw abortErr;
+      }
+      if (String(input) === "/api/network-fail") {
+        throw new TypeError("Failed to fetch");
+      }
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal("fetch", fetcherMock);
+    const client = init({
+      dsn: "https://observe.example/p/project@token",
+      errors: false,
+      fetchTracing: false,
+      replay: false,
+      vitals: false,
+      serviceName: "abort-browser",
+    });
+
+    await expect(client.wrapFetch(fetcherMock as unknown as typeof fetch)("/api/aborted")).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await expect(client.wrapFetch(fetcherMock as unknown as typeof fetch)("/api/network-fail")).rejects.toThrow(
+      "Failed to fetch",
+    );
+    await client.flush();
+
+    const traceCall = fetcherMock.mock.calls.find(([input]) => String(input).endsWith("/v1/traces"));
+    expect(traceCall).toBeDefined();
+    const payload = JSON.parse(String(traceCall?.[1]?.body)) as {
+      resourceSpans: Array<{
+        scopeSpans: Array<{
+          spans: Array<{
+            name: string;
+            status: { code: number; message?: string };
+            attributes: Array<{ key: string; value: { boolValue?: boolean } }>;
+          }>;
+        }>;
+      }>;
+    };
+    const spans = payload.resourceSpans[0].scopeSpans[0].spans;
+    const abortedSpan = spans.find((span) => span.name === "GET /api/aborted");
+    const failedSpan = spans.find((span) => span.name === "GET /api/network-fail");
+    expect(abortedSpan?.status).toEqual({ code: 0 });
+    expect(abortedSpan?.attributes).toContainEqual({ key: "http.aborted", value: { boolValue: true } });
+    expect(failedSpan?.status).toEqual({ code: 2, message: "Failed to fetch" });
+
+    await client.close();
+    vi.unstubAllGlobals();
+  });
 });
