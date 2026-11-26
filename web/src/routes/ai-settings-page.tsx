@@ -418,7 +418,7 @@ export function AiSettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Mock-only note (acceptance testing of the disabled guidance) */}
+      {/* Mock-only note */}
       {IS_MOCK && (
         <Card>
           <CardHeader>

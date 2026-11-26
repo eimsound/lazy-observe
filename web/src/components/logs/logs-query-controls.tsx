@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import {
   BarChart3,
   Check,
@@ -262,6 +262,7 @@ export function LogsChartOptions({
   onChange: (patch: Partial<LogsChartOptionsValue>) => void;
 }) {
   const { t } = useTranslation();
+  const chartModeId = useId();
   const stepInvalid = Boolean(value.step && parsePrometheusDuration(value.step) === null);
   return (
     <Popover>
@@ -277,12 +278,16 @@ export function LogsChartOptions({
           <span className="text-sm font-semibold">{t("logs.chartSettings")}</span>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <ControlLabel label={t("logs.chartMode")} hint={t("logs.statsModeHint")}>
+          <ControlLabel
+            label={t("logs.chartMode")}
+            hint={t("logs.statsModeHint")}
+            htmlFor={chartModeId}
+          >
             <Select
               value={value.graphMode}
               onValueChange={(graphMode) => onChange({ graphMode: graphMode as LogsGraphMode })}
             >
-              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectTrigger id={chartModeId}><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="hits">{t("logs.hitsMode")}</SelectItem>
                 <SelectItem value="stats">{t("logs.statsMode")}</SelectItem>
@@ -356,17 +361,21 @@ export function LogsChartOptions({
 function ControlLabel({
   label,
   hint,
+  htmlFor,
   children,
 }: {
   label: string;
   hint?: string;
+  htmlFor?: string;
   children: React.ReactNode;
 }) {
   if (hint) {
     return (
       <div className="space-y-1.5">
         <div className="flex items-center gap-1">
-          <span className="text-xs font-normal text-muted-foreground">{label}</span>
+          <Label htmlFor={htmlFor} className="text-xs font-normal text-muted-foreground">
+            {label}
+          </Label>
           <HelpTip content={hint} />
         </div>
         {children}

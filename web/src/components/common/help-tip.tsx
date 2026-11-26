@@ -24,7 +24,7 @@ type HelpTipProps =
       side?: "top" | "right" | "bottom" | "left";
     };
 
-/** Compact hover/focus help icon that moves explanatory copy out of permanent layout. */
+/** Compact hover-triggered help icon (`tabIndex={-1}`) that moves explanatory copy out of permanent layout. */
 export function HelpTip(props: HelpTipProps) {
   const ariaLabel =
     props.scope !== undefined
