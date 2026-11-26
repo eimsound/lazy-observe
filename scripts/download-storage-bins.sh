@@ -75,13 +75,16 @@ fi
 archive_dir="$archive_root/$platform"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/lazy-observe-storage.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
-mkdir -p "$archive_dir"
+mkdir -p "$bin_dir" "$archive_dir"
 
 # 旧布局：归档根目录指向别处时，$bin_dir/.archives/$platform 是改动前留下的同平台归档
-# （例如 restore-keys 恢复的旧 storage-all 缓存）。当前归档先挪进共享目录免重复下载，其余在校验通过后清掉。
+# （例如 restore-keys 恢复的旧 storage-all 缓存）。当前归档先挪进共享目录免重复下载，其余在校验通过后清掉；
+# 若 .archives 或 .archives/$platform 本身是符号链接则跳过，避免跨符号链接挪动或删除外部目录。
+legacy_archive_root="$bin_dir/.archives"
+legacy_archive_candidate="$legacy_archive_root/$platform"
 legacy_archive_dir=
-if [[ -d "$bin_dir/.archives/$platform" ]]; then
-  legacy_archive_dir=$(cd -P -- "$bin_dir/.archives/$platform" && pwd)
+if [[ -d "$legacy_archive_candidate" && ! -L "$legacy_archive_root" && ! -L "$legacy_archive_candidate" ]]; then
+  legacy_archive_dir=$(cd -P -- "$legacy_archive_candidate" && pwd)
   [[ $legacy_archive_dir != "$(cd -P -- "$archive_dir" && pwd)" ]] || legacy_archive_dir=
 fi
 
