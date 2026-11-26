@@ -56,6 +56,10 @@ type Store struct {
 	projectMu          sync.Mutex
 	revision           atomic.Uint64
 	secretBox          atomic.Pointer[secret.Box]
+	// platformErrorRateTxs counts write transactions opened by
+	// RecordPlatformErrorRates so tests can assert batch accounting stays at
+	// one transaction per inbox batch (issue #375).
+	platformErrorRateTxs atomic.Uint64
 }
 
 type ProjectInfo struct {

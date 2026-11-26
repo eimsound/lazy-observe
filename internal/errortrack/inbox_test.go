@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -996,8 +997,8 @@ func TestInboxBatchPartialClaimLostLogsWarnAndCompletesValid(t *testing.T) {
 		Now:          func() time.Time { return fixedNow },
 		ClaimTTL:     time.Minute,
 		PollInterval: time.Hour,
-		OnEvent: func(context.Context, errortrack.ErrorOccurrence) error {
-			onEventCalls.Add(1)
+		OnEvents: func(_ context.Context, occurrences []errortrack.ErrorOccurrence) error {
+			onEventCalls.Add(int64(len(occurrences)))
 			return nil
 		},
 	})
@@ -1228,8 +1229,10 @@ func BenchmarkInbox(b *testing.B) {
 	writer := errortrack.NewVictoriaLogsWriter(&testLogsBackend{baseURL: srv.URL}, srv.Client())
 	inbox, err := errortrack.NewInbox(store, writer, errortrack.InboxOptions{
 		PollInterval: 10 * time.Millisecond,
-		OnEvent: func(context.Context, errortrack.ErrorOccurrence) error {
-			doneCh <- struct{}{}
+		OnEvents: func(_ context.Context, occurrences []errortrack.ErrorOccurrence) error {
+			for range occurrences {
+				doneCh <- struct{}{}
+			}
 			return nil
 		},
 	})
@@ -1278,4 +1281,87 @@ func BenchmarkInbox(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+}
+
+// perItemInboxStore hides BatchInboxStore so completeBatch takes the
+// per-item CompleteErrorEvent path.
+type perItemInboxStore struct {
+	errortrack.InboxStore
+}
+
+// Issue #375: error-rate accounting receives each completed batch in one
+// callback (so the metadata store can apply it in one write transaction) and a
+// callback failure is logged with the batch context instead of discarded.
+func TestInboxRecordsErrorOccurrencesOncePerBatchAndLogsFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		store func(*meta.Store) errortrack.InboxStore
+	}{
+		{name: "batch store", store: func(s *meta.Store) errortrack.InboxStore { return s }},
+		{name: "per-item store", store: func(s *meta.Store) errortrack.InboxStore { return perItemInboxStore{s} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, project := newInboxTestStore(t, "occurrence-batch")
+			var logBuf bytes.Buffer
+			var logMu sync.Mutex
+			logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, buf: &logBuf}, nil))
+			var (
+				mu    sync.Mutex
+				calls [][]errortrack.ErrorOccurrence
+			)
+			inbox, err := errortrack.NewInbox(tc.store(store), &inboxTestWriter{}, errortrack.InboxOptions{
+				Owner:        "replica-a",
+				Logger:       logger,
+				PollInterval: time.Hour,
+				OnEvents: func(_ context.Context, occurrences []errortrack.ErrorOccurrence) error {
+					mu.Lock()
+					calls = append(calls, slices.Clone(occurrences))
+					mu.Unlock()
+					return errors.New("metadata busy")
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = inbox.Close(context.Background()) }()
+			if err := inbox.Accept(context.Background(), project, []errortrack.AcceptedEvent{
+				inboxEvent("occ-1"), inboxEvent("occ-2"), inboxEvent("occ-3"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			waitInbox(t, inbox, func(d errortrack.InboxDiagnostics) bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return d.ActiveItems == 0 && len(calls) > 0
+			})
+			if err := inbox.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(calls) != 1 || len(calls[0]) != 3 {
+				t.Fatalf("OnEvents calls=%#v want one call with 3 occurrences", calls)
+			}
+			for _, occ := range calls[0] {
+				if occ.ProjectID != project.ID || occ.OccurredAt.IsZero() || occ.AcceptedAt.IsZero() {
+					t.Fatalf("occurrence=%#v", occ)
+				}
+			}
+			logMu.Lock()
+			logged := logBuf.String()
+			logMu.Unlock()
+			for _, want := range []string{
+				"level=WARN",
+				"record error rate accounting for completed error Inbox batch",
+				"owner=replica-a",
+				"events=3",
+				fmt.Sprintf("project_ids=[%d]", project.ID),
+				`error="metadata busy"`,
+			} {
+				if !strings.Contains(logged, want) {
+					t.Fatalf("log missing %q:\n%s", want, logged)
+				}
+			}
+		})
+	}
 }

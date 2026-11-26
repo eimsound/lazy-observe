@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -264,7 +265,7 @@ type InboxOptions struct {
 	MeterProvider  metric.MeterProvider
 	Symbolicator   EventSymbolicator
 	OnChange       IssueChangeFunc
-	OnEvent        ErrorOccurrenceFunc
+	OnEvents       ErrorOccurrencesFunc
 }
 
 type Inbox struct {
@@ -287,7 +288,7 @@ type Inbox struct {
 	jitterSample   func() float64
 	symbolicator   EventSymbolicator
 	onChange       IssueChangeFunc
-	onEvent        ErrorOccurrenceFunc
+	onEvents       ErrorOccurrencesFunc
 	metrics        *inboxMetrics
 	owner          string
 
@@ -401,7 +402,7 @@ func NewInbox(store InboxStore, writer EventWriter, options InboxOptions) (*Inbo
 		retryInitial: options.RetryInitial, retryCap: options.RetryCap,
 		pollInterval: options.PollInterval, attemptTimeout: options.AttemptTimeout,
 		jitterSample: options.JitterSample,
-		symbolicator: options.Symbolicator, onChange: options.OnChange, onEvent: options.OnEvent,
+		symbolicator: options.Symbolicator, onChange: options.OnChange, onEvents: options.OnEvents,
 		owner: owner,
 		ctx:   ctx, cancel: cancel, wake: make(chan struct{}, workers), done: make(chan struct{}),
 	}
@@ -951,24 +952,23 @@ func (i *Inbox) completeBatch(workerOwner string, written []preparedInboxItem) {
 		for _, id := range res.CompletedIDs {
 			completedSet[id] = struct{}{}
 		}
+		occurrences := make([]ErrorOccurrence, 0, len(res.CompletedIDs))
 		for _, entry := range written {
 			if _, lost := lostSet[entry.item.ID]; lost {
 				i.logFenceOrError(workerOwner, entry.item, "complete_projection", ErrClaimLost)
 				continue
 			}
-			if _, ok := completedSet[entry.item.ID]; ok && i.onEvent != nil {
-				_ = i.onEvent(completeCtx, ErrorOccurrence{
-					ProjectID:  entry.item.ProjectID,
-					OccurredAt: entry.item.OccurredAt,
-					AcceptedAt: entry.item.AcceptedAt,
-				})
+			if _, ok := completedSet[entry.item.ID]; ok {
+				occurrences = append(occurrences, errorOccurrence(entry.item))
 			}
 		}
+		i.recordOccurrences(completeCtx, workerOwner, occurrences)
 		i.dispatchChangesAtBatchEnd(completeCtx, workerOwner, res.Changes)
 		return
 	}
 
 	allChanges := make([]IssueChange, 0)
+	occurrences := make([]ErrorOccurrence, 0, len(written))
 	for _, entry := range written {
 		delta := entry.delta
 		delta.AppliedAt = i.now().UTC()
@@ -988,16 +988,44 @@ func (i *Inbox) completeBatch(workerOwner string, written []preparedInboxItem) {
 			i.retry(workerOwner, entry.item, "complete_projection", err)
 			continue
 		}
-		if i.onEvent != nil {
-			_ = i.onEvent(completeCtx, ErrorOccurrence{
-				ProjectID:  entry.item.ProjectID,
-				OccurredAt: entry.item.OccurredAt,
-				AcceptedAt: entry.item.AcceptedAt,
-			})
-		}
+		occurrences = append(occurrences, errorOccurrence(entry.item))
 		allChanges = append(allChanges, changes...)
 	}
+	i.recordOccurrences(completeCtx, workerOwner, occurrences)
 	i.dispatchChangesAtBatchEnd(completeCtx, workerOwner, allChanges)
+}
+
+func errorOccurrence(item InboxItem) ErrorOccurrence {
+	return ErrorOccurrence{ProjectID: item.ProjectID, OccurredAt: item.OccurredAt, AcceptedAt: item.AcceptedAt}
+}
+
+// recordOccurrences hands every error event a batch committed to the
+// error-rate accounting callback in one call, so the metadata store can apply
+// the whole batch in a single write transaction (issue #375). Accounting runs
+// after the projection commit and is not retried, so a failure is logged with
+// the batch context instead of being discarded.
+func (i *Inbox) recordOccurrences(ctx context.Context, workerOwner string, occurrences []ErrorOccurrence) {
+	if i.onEvents == nil || len(occurrences) == 0 {
+		return
+	}
+	err := i.onEvents(ctx, occurrences)
+	if err == nil {
+		return
+	}
+	projectIDs := make([]int, 0, 1)
+	for _, occurrence := range occurrences {
+		if !slices.Contains(projectIDs, occurrence.ProjectID) {
+			projectIDs = append(projectIDs, occurrence.ProjectID)
+		}
+	}
+	slices.Sort(projectIDs)
+	i.logger.Warn(
+		"record error rate accounting for completed error Inbox batch",
+		"owner", workerOwner,
+		"events", len(occurrences),
+		"project_ids", projectIDs,
+		"error", err,
+	)
 }
 
 func (i *Inbox) dispatchChangesAtBatchEnd(ctx context.Context, workerOwner string, changes []IssueChange) {

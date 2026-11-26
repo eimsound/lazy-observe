@@ -144,7 +144,7 @@ func newMetadataTestGateway(store *meta.Store, cfg Config) *Gateway {
 			errortrack.NewVictoriaLogsWriter(gw.storage, gw.client),
 			errortrack.InboxOptions{
 				Now: gw.now, Symbolicator: symbolicate.New(cfg.Blobs, 128), OnChange: gw.HandleIssueChange,
-				OnEvent: gw.HandleErrorEvent,
+				OnEvents: gw.HandleErrorEvents,
 			},
 		)
 		if err != nil {

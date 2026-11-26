@@ -94,11 +94,13 @@ func (g *Gateway) HandleIssueChange(ctx context.Context, change errortrack.Issue
 	return nil
 }
 
-func (g *Gateway) HandleErrorEvent(ctx context.Context, occurrence errortrack.ErrorOccurrence) error {
+// HandleErrorEvents records one completed error Inbox batch into the durable
+// error_rate_spike window with a single metadata write transaction.
+func (g *Gateway) HandleErrorEvents(ctx context.Context, occurrences []errortrack.ErrorOccurrence) error {
 	if g.alerts == nil {
 		return nil
 	}
-	return g.alerts.RecordErrorEvent(ctx, occurrence.ProjectID, occurrence.OccurredAt)
+	return g.alerts.RecordErrorEvents(ctx, occurrences)
 }
 
 type projectAIConfigWire struct {
