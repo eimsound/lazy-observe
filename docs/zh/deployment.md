@@ -253,7 +253,7 @@ Helm Chart 会将单一 Secret 以只读方式挂载到 `/etc/lazy-observe-key/s
 
    使用 `kubectl run` 配合相同的 `--env` 与 `--overrides` 卷挂载同样可行，只要该 Pod 能访问元数据数据库并读取密钥文件。
 
-轮换不是透明重加密，旧密文不会被重新封装，原有加密数据保持不可读。实操中需重新进入 **Settings > AI** 输入并保存 AI Provider API Key，用新密钥重新加密入库。换用新密钥后，下次启动也会派生新的自监控项目 Token；旧的派生凭据不会自动吊销，仍可作为自监控项目的上报凭据使用，若旧密钥已泄露，请到自监控项目的 Token 列表中手动吊销。
+轮换不是透明重加密，旧密文不会被重新封装，原有加密数据保持不可读。实操中需重新进入 **Settings > AI** 输入并保存 AI Provider API Key，用新密钥重新加密入库。换用新密钥后，下次启动也会派生新的自监控项目 Token，并由启动引导自动吊销旧密钥派生的 `self-monitoring` Token，旧凭据随即无法再用于上报。
 
 请像备份数据库一样妥善备份该密钥，密钥丢失后旧密文不可找回。`platform_key_fingerprints` 表已并入元数据基线，若元数据数据库（SQLite 文件或 PostgreSQL 库）由更早提交创建，启动会在指纹校验之前先因 `metadata migration 1 checksum mismatch` 失败。请按 [ADR 0003](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0003-pre-release-single-database-baseline.md) 重建该开发库并保留原密钥文件，首次启动即会记下当前密钥指纹。
 

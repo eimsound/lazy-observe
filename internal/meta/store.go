@@ -29,6 +29,7 @@ import (
 	"github.com/eimsound/lazy-observe/internal/backoff"
 	dbent "github.com/eimsound/lazy-observe/internal/db/ent"
 	"github.com/eimsound/lazy-observe/internal/db/ent/auditevent"
+	"github.com/eimsound/lazy-observe/internal/db/ent/predicate"
 	"github.com/eimsound/lazy-observe/internal/db/ent/project"
 	"github.com/eimsound/lazy-observe/internal/db/ent/projectapitoken"
 	"github.com/eimsound/lazy-observe/internal/db/ent/session"
@@ -1608,7 +1609,8 @@ func isValidDerivedSelfMonitoringToken(derived string) bool {
 // sure the caller-derived internal project API token is active. The caller
 // derives the token from the platform key (secret.Box.Derive), so replicas and
 // restarts converge on the same credential without ever reading it back from
-// the database. The token is deliberately never logged.
+// the database. Older self-monitoring tokens (e.g. derived from a previous
+// platform key) are revoked. The token is deliberately never logged.
 func (s *Store) BootstrapSelfMonitoring(
 	ctx context.Context,
 	derived string,
@@ -1634,6 +1636,9 @@ func (s *Store) BootstrapSelfMonitoring(
 	value, err = s.ensureSelfMonitoringTokenLocked(ctx, info.ID, SelfMonitoringTokenName, derived)
 	if err != nil {
 		return ProjectInfo{}, "", err
+	}
+	if err := s.revokeSelfMonitoringTokensLocked(ctx, info.ID, SelfMonitoringTokenName, derived); err != nil {
+		return ProjectInfo{}, "", fmt.Errorf("revoke stale self-monitoring tokens: %w", err)
 	}
 	return info, value, nil
 }
@@ -1662,20 +1667,8 @@ func (s *Store) BootstrapSelfMonitoringWebToken(
 	if err != nil {
 		return "", err
 	}
-	n, revokeErr := s.client.ProjectAPIToken.Update().
-		Where(
-			projectapitoken.ProjectIDEQ(projectID),
-			projectapitoken.NameEQ(SelfMonitoringWebTokenName),
-			projectapitoken.RevokedEQ(false),
-			projectapitoken.TokenNEQ(storedCredential(derived)),
-		).
-		SetRevoked(true).
-		Save(ctx)
-	if revokeErr != nil {
-		return "", fmt.Errorf("revoke stale web self-monitoring tokens: %w", revokeErr)
-	}
-	if n > 0 {
-		s.revision.Add(1)
+	if err := s.revokeSelfMonitoringTokensLocked(ctx, projectID, SelfMonitoringWebTokenName, derived); err != nil {
+		return "", fmt.Errorf("revoke stale web self-monitoring tokens: %w", err)
 	}
 	return value, nil
 }
@@ -1692,16 +1685,36 @@ func (s *Store) RevokeSelfMonitoringWebTokens(ctx context.Context, projectID int
 		return err
 	}
 	defer func() { err = errors.Join(err, release()) }()
-	n, revokeErr := s.client.ProjectAPIToken.Update().
-		Where(
-			projectapitoken.ProjectIDEQ(projectID),
-			projectapitoken.NameEQ(SelfMonitoringWebTokenName),
-			projectapitoken.RevokedEQ(false),
-		).
+	if err := s.revokeSelfMonitoringTokensLocked(ctx, projectID, SelfMonitoringWebTokenName, ""); err != nil {
+		return fmt.Errorf("revoke web self-monitoring tokens: %w", err)
+	}
+	return nil
+}
+
+// revokeSelfMonitoringTokensLocked revokes every active token called name on
+// the self-monitoring project, except the one matching keepDerived (when
+// non-empty). It bumps the auth-cache revision whenever a token was revoked,
+// so stale credentials stop authenticating immediately. Callers must hold the
+// bootstrap coordination lock.
+func (s *Store) revokeSelfMonitoringTokensLocked(
+	ctx context.Context,
+	projectID int,
+	name, keepDerived string,
+) error {
+	predicates := []predicate.ProjectAPIToken{
+		projectapitoken.ProjectIDEQ(projectID),
+		projectapitoken.NameEQ(name),
+		projectapitoken.RevokedEQ(false),
+	}
+	if keepDerived != "" {
+		predicates = append(predicates, projectapitoken.TokenNEQ(storedCredential(keepDerived)))
+	}
+	n, err := s.client.ProjectAPIToken.Update().
+		Where(predicates...).
 		SetRevoked(true).
 		Save(ctx)
-	if revokeErr != nil {
-		return fmt.Errorf("revoke web self-monitoring tokens: %w", revokeErr)
+	if err != nil {
+		return err
 	}
 	if n > 0 {
 		s.revision.Add(1)
