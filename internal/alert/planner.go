@@ -472,25 +472,63 @@ func BuildOutboxEntriesWithLifecycle(
 	now time.Time,
 	repeatInterval time.Duration,
 ) []meta.NotificationOutboxEnqueue {
+	now = now.UTC()
+	return buildOutboxEntries(
+		projectID,
+		ruleID,
+		channelIDs,
+		notifications,
+		func(n Notification, payload []byte) []byte {
+			return outboxIdempotencyPayload(projectID, ruleID, lifecycleID, n, payload, now, repeatInterval)
+		},
+	)
+}
+
+// PlatformStateRef identifies one durable platform_alert_states transition:
+// project, kind, active_cycle, and the firing or resolved status.
+type PlatformStateRef struct {
+	ProjectID int
+	Kind      string
+	Cycle     int64
+	Status    string
+}
+
+// BuildPlatformStateOutboxEntries constructs notification_outbox rows for a
+// durable platform_alert_states transition. The idempotency key is pinned to
+// `platform-state\x00<project_id>\x00<kind>\x00<cycle>\x00<status>`
+// per channel and deliberately excludes the payload, so the replica that
+// committed the transition and any replica replaying it after a crash produce
+// the same key even though their rendered rate annotations differ.
+func BuildPlatformStateOutboxEntries(
+	ref PlatformStateRef,
+	channelIDs []int,
+	notifications []Notification,
+) []meta.NotificationOutboxEnqueue {
+	keyPayload := []byte(
+		fmt.Sprintf("platform-state\x00%d\x00%s\x00%d\x00%s", ref.ProjectID, ref.Kind, ref.Cycle, ref.Status),
+	)
+	return buildOutboxEntries(ref.ProjectID, nil, channelIDs, notifications, func(Notification, []byte) []byte {
+		return keyPayload
+	})
+}
+
+func buildOutboxEntries(
+	projectID int,
+	ruleID *int,
+	channelIDs []int,
+	notifications []Notification,
+	keyPayloadFor func(Notification, []byte) []byte,
+) []meta.NotificationOutboxEnqueue {
 	if len(notifications) == 0 || len(channelIDs) == 0 {
 		return nil
 	}
-	now = now.UTC()
 	out := make([]meta.NotificationOutboxEnqueue, 0, len(notifications)*len(channelIDs))
 	for _, notification := range notifications {
 		payload, err := json.Marshal(notification)
 		if err != nil {
 			continue
 		}
-		keyPayload := outboxIdempotencyPayload(
-			projectID,
-			ruleID,
-			lifecycleID,
-			notification,
-			payload,
-			now,
-			repeatInterval,
-		)
+		keyPayload := keyPayloadFor(notification, payload)
 		priority := 0
 		if notification.Status == "resolved" {
 			priority = 100

@@ -138,7 +138,7 @@ The example configuration lists canonical path-shaped environment variable names
 | `blob.s3.access_key` | empty | Optional static credential; must be paired with `blob.s3.secret_key` |
 | `blob.s3.secret_key` | empty | Optional static credential; must be paired with `blob.s3.access_key` |
 | `alert.storm_threshold` | `10` | Alerts in a group before storm handling triggers |
-| `alert.group_wait` | `30s` | Initial group collection delay |
+| `alert.group_wait` | `30s` | Initial group collection delay for native alert rules; platform alerts (`new_issue`, `regression`, `error_rate_spike`) enqueue on their durable transition without it |
 | `alert.repeat_interval` | `4h` | Repeat-notification interval |
 | `scrape.mode` | `auto` | Embedded `vmagent` scraping mode: `auto` (active on single node, PostgreSQL leader-elected in HA) or `disabled` |
 | `error_inbox.max_items` | `100000` | Durable error-inbox item capacity before rejecting with `503` and `Retry-After` |

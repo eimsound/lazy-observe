@@ -72,7 +72,6 @@ type Config struct {
 type Service struct {
 	store          *meta.Store
 	sender         *Sender
-	engine         *Engine
 	now            func() time.Time
 	repeatInterval time.Duration
 	stormThreshold int
@@ -114,18 +113,6 @@ func NewService(cfg Config) *Service {
 		stormThreshold: stormThreshold,
 		cfgCache:       make(map[int]cachedPlatformConfig),
 	}
-	s.engine = NewEngine(
-		EngineConfig{
-			GroupWait:       cfg.GroupWait,
-			RepeatInterval:  cfg.RepeatInterval,
-			StormThreshold:  cfg.StormThreshold,
-			Now:             cfg.Now,
-			Silences:        s.activeSilences,
-			InhibitionRules: s.activeInhibitionRules,
-			Policy:          s.platformPolicy,
-			Notify:          s.notify,
-		},
-	)
 	cfg.Outbox.Store = cfg.Store
 	cfg.Outbox.Sender = cfg.Sender
 	if cfg.RateLimitWindow > 0 {
@@ -172,7 +159,6 @@ func (s *Service) Close() {
 		s.monitorCancel()
 		s.monitorWG.Wait()
 	}
-	s.engine.Close()
 	s.evaluator.Close()
 	s.outbox.Close()
 }
@@ -931,11 +917,21 @@ func (s *Service) UpdateSilence(ctx context.Context, id int, in SilenceInput) (m
 	if in.Comment != nil {
 		update.Comment = in.Comment
 	}
-	return s.store.UpdateSilence(ctx, in.Project, id, update)
+	silence, err := s.store.UpdateSilence(ctx, in.Project, id, update)
+	if err == nil {
+		s.replayProjectPlatformAlertStates(ctx, silence.ProjectID)
+	}
+	return silence, err
 }
 
 func (s *Service) DeleteSilence(ctx context.Context, projectSlug string, id int) error {
-	return s.store.DeleteSilence(ctx, projectSlug, id)
+	if err := s.store.DeleteSilence(ctx, projectSlug, id); err != nil {
+		return err
+	}
+	if p, err := s.store.ProjectBySlug(ctx, projectSlug); err == nil {
+		s.replayProjectPlatformAlertStates(ctx, p.ID)
+	}
+	return nil
 }
 
 func (s *Service) ListEvents(
@@ -944,22 +940,6 @@ func (s *Service) ListEvents(
 	inhibited *bool,
 ) ([]meta.AlertEventView, error) {
 	return s.store.ListAlertEvents(ctx, slug, status, inhibited)
-}
-
-func (s *Service) activeSilences(ctx context.Context, slug string, now time.Time) ([][]Matcher, error) {
-	projectInfo, err := s.store.ProjectBySlug(ctx, slug)
-	if err != nil {
-		return nil, err
-	}
-	policy, err := s.store.AlertPolicySnapshot(ctx, projectInfo.ID, now)
-	if err != nil {
-		return nil, err
-	}
-	out := make([][]Matcher, 0, len(policy.Silences))
-	for _, matchers := range policy.Silences {
-		out = append(out, mapsToMatchers(matchers))
-	}
-	return out, nil
 }
 
 func (s *Service) platformPolicy(
@@ -1027,7 +1007,7 @@ func (s *Service) CreateInhibitionRule(ctx context.Context, in InhibitionRuleInp
 	})
 	if err == nil {
 		err = s.recomputeInhibited(ctx, in.Project)
-		s.engine.Reevaluate(in.Project)
+		s.replayProjectPlatformAlertStates(ctx, rule.ProjectID)
 	}
 	return rule, err
 }
@@ -1078,7 +1058,7 @@ func (s *Service) UpdateInhibitionRule(
 	rule, err := s.store.UpdateInhibitionRule(ctx, in.Project, id, update)
 	if err == nil {
 		err = s.recomputeInhibited(ctx, rule.ProjectSlug)
-		s.engine.Reevaluate(rule.ProjectSlug)
+		s.replayProjectPlatformAlertStates(ctx, rule.ProjectID)
 	}
 	return rule, err
 }
@@ -1091,28 +1071,8 @@ func (s *Service) DeleteInhibitionRule(ctx context.Context, projectSlug string, 
 	if err := s.recomputeInhibited(ctx, projectInfo.Slug); err != nil {
 		return err
 	}
-	s.engine.Reevaluate(projectInfo.Slug)
+	s.replayProjectPlatformAlertStates(ctx, projectInfo.ID)
 	return nil
-}
-
-func (s *Service) activeInhibitionRules(ctx context.Context, slug string) ([]InhibitionRule, error) {
-	projectInfo, err := s.store.ProjectBySlug(ctx, slug)
-	if err != nil {
-		return nil, err
-	}
-	policy, err := s.store.AlertPolicySnapshot(ctx, projectInfo.ID, s.now())
-	if err != nil {
-		return nil, err
-	}
-	out := make([]InhibitionRule, 0, len(policy.InhibitionRules))
-	for _, item := range policy.InhibitionRules {
-		out = append(out, InhibitionRule{
-			SourceMatchers: mapsToMatchers(item.SourceMatchers),
-			TargetMatchers: mapsToMatchers(item.TargetMatchers),
-			EqualLabels:    item.EqualLabels,
-		})
-	}
-	return out, nil
 }
 
 func (s *Service) recomputeInhibited(ctx context.Context, slug string) error {
@@ -1141,16 +1101,6 @@ func (s *Service) recomputeInhibited(ctx context.Context, slug string) error {
 		}
 	}
 	return s.store.SetAlertEventInhibition(ctx, updates)
-}
-
-func (s *Service) notify(ctx context.Context, n Notification) error {
-	if n.Storm != nil {
-		return s.notifyStorm(ctx, n)
-	}
-	if len(n.Alerts) > 0 && n.Alerts[0].Labels["source"] == "platform" {
-		return s.notifyPlatform(ctx, n)
-	}
-	return nil
 }
 
 func (s *Service) enqueueOutboxEntries(ctx context.Context, entries []meta.NotificationOutboxEnqueue) error {
@@ -1227,11 +1177,18 @@ func (s *Service) PutProjectAlertConfig(
 		return ProjectAlertConfigView{}, err
 	}
 	s.invalidatePlatformConfigCache(projectID)
-	if _, clearErr := s.store.ClearPlatformErrorRateState(ctx, projectID, s.now().UTC()); clearErr != nil {
+	transition, clearErr := s.store.ClearPlatformErrorRateState(ctx, projectID, s.now().UTC())
+	if clearErr != nil {
 		slog.Warn("clear platform error rate state after config update", "project_id", projectID, "error", clearErr)
-	}
-	if _, p, pErr := s.platformConfig(ctx, projectID); pErr == nil {
-		s.engine.Remove(p.Slug, "error_rate_spike")
+	} else if transition.Transition == "resolved" {
+		// Close the open cycle durably so receivers are not left with a dangling
+		// firing incident; a disabled threshold suppresses it in
+		// enqueuePlatformNotification. Failures are replayed by the recovery loop.
+		_ = s.notifyErrorRateTransition(ctx, projectID, "", transition, errorRateAnnotations(
+			"Error rate spike state reset after alert configuration change",
+			cfg.ErrorRateThresholdPerMinute,
+			transition.Cycle,
+		))
 	}
 	return cfg, nil
 }
@@ -1303,6 +1260,13 @@ func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.Issue
 // when the observed count divided by five minutes is strictly greater than the
 // configured absolute per-minute threshold, and resolves when it falls back to
 // or below the threshold. Threshold zero disables this event type.
+//
+// A committed firing or resolved transition on platform_alert_states is planned
+// and written to notification_outbox before returning, keyed by
+// project_id + error_rate_spike + cycle + status (ADR 0001). There is no
+// in-process group_wait timer: the five-minute window already debounces the
+// signal, and a transition whose enqueue was lost to a crash or a failed write
+// is replayed by CheckErrorRateRecoveries on any replica.
 func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredAt time.Time) error {
 	cfg, p, err := s.cachedPlatformConfig(ctx, projectID)
 	if err != nil {
@@ -1323,74 +1287,232 @@ func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredA
 	if err != nil {
 		return err
 	}
+	rate := float64(transition.Count) / errorRateWindow.Minutes()
 	switch transition.Transition {
 	case "firing":
-		rate := float64(transition.Count) / errorRateWindow.Minutes()
-		s.engine.Add(
-			ctx,
-			p.Slug,
-			"error_rate_spike",
-			Alert{Status: "firing", Labels: platformLabels(p.Slug, "error_rate_spike"), Annotations: map[string]string{
-				"summary":           fmt.Sprintf("Error rate spike: %.1f events/min", rate),
-				"window":            "5m",
-				"threshold_per_min": strconv.Itoa(cfg.ErrorRateThresholdPerMinute),
-				"cycle":             strconv.FormatInt(transition.Cycle, 10),
-			}, StartsAt: transition.StartsAt},
-		)
+		return s.notifyErrorRateTransition(ctx, projectID, p.Slug, transition, errorRateAnnotations(
+			fmt.Sprintf("Error rate spike: %.1f events/min", rate),
+			cfg.ErrorRateThresholdPerMinute,
+			transition.Cycle,
+		))
 	case "resolved":
-		rate := float64(transition.Count) / errorRateWindow.Minutes()
-		s.engine.Add(
-			ctx,
-			p.Slug,
-			"error_rate_spike",
-			Alert{
-				Status: "resolved",
-				Labels: platformLabels(p.Slug, "error_rate_spike"),
-				Annotations: map[string]string{
-					"summary":           fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
-					"window":            "5m",
-					"threshold_per_min": strconv.Itoa(cfg.ErrorRateThresholdPerMinute),
-					"cycle":             strconv.FormatInt(transition.Cycle, 10),
-				},
-				StartsAt: transition.StartsAt,
-				EndsAt:   transition.EndsAt,
-			},
-		)
+		return s.notifyErrorRateTransition(ctx, projectID, p.Slug, transition, errorRateAnnotations(
+			fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
+			cfg.ErrorRateThresholdPerMinute,
+			transition.Cycle,
+		))
 	}
 	return nil
 }
 
-// CheckErrorRateRecoveries evaluates durable firing error_rate_spike states and
-// emits resolved alerts once their 5-minute window drops back within threshold.
+// CheckErrorRateRecoveries first replays every firing (and recently resolved)
+// durable error_rate_spike state into notification_outbox, then resolves
+// states whose 5-minute window dropped back within threshold and enqueues their
+// resolved notifications. Replaying before resolving keeps a firing transition
+// that was committed by a crashed replica ahead of its own resolution, and the
+// deterministic idempotency keys make the replay a no-op once enqueued.
 func (s *Service) CheckErrorRateRecoveries(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
+	var errs []error
+	if err := s.replayPlatformAlertStates(ctx, 0); err != nil {
+		errs = append(errs, err)
+	}
 	recoveries, err := s.store.CheckPlatformErrorRateRecoveries(ctx, s.now().UTC(), errorRateWindow)
 	if err != nil {
-		return err
+		return errors.Join(append(errs, err)...)
 	}
 	for _, rec := range recoveries {
 		rate := float64(rec.Count) / errorRateWindow.Minutes()
-		s.engine.Add(
+		transition := meta.PlatformErrorSpikeTransition{
+			Transition: "resolved",
+			Cycle:      rec.Cycle,
+			StartsAt:   rec.StartsAt,
+			EndsAt:     rec.EndsAt,
+			Count:      rec.Count,
+		}
+		if notifyErr := s.notifyErrorRateTransition(ctx, rec.ProjectID, rec.ProjectSlug, transition,
+			errorRateAnnotations(
+				fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
+				rec.Threshold,
+				rec.Cycle,
+			)); notifyErr != nil {
+			errs = append(errs, notifyErr)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// platformResolvedReplayHorizon bounds how long after a resolved transition
+// the recovery loop keeps replaying it, covering a replica that committed the
+// resolution and crashed before its outbox write.
+const platformResolvedReplayHorizon = 2 * errorRateWindow
+
+// replayPlatformAlertStates idempotently re-plans durable error_rate_spike
+// states into notification_outbox. Firing states are always replayed, which
+// also delivers a spike once a silence or inhibition stops suppressing it (the
+// role Engine.Reevaluate used to play); each cycle notifies firing at most once,
+// matching the removed Engine, which never repeated a still-firing spike.
+// Resolved states are replayed within platformResolvedReplayHorizon.
+// onlyProjectID > 0 limits the pass to one project.
+func (s *Service) replayPlatformAlertStates(ctx context.Context, onlyProjectID int) error {
+	now := s.now().UTC()
+	states, err := s.store.RecentPlatformAlertStates(
+		ctx,
+		platformErrorRateKind,
+		now.Add(-platformResolvedReplayHorizon),
+	)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, st := range states {
+		if onlyProjectID > 0 && st.ProjectID != onlyProjectID {
+			continue
+		}
+		transition := meta.PlatformErrorSpikeTransition{
+			Transition: st.Status,
+			Cycle:      st.ActiveCycle,
+			StartsAt:   st.StartsAt,
+		}
+		summary := "Error rate spike above threshold"
+		if st.Status == "resolved" {
+			summary = "Error rate spike recovered"
+			if st.EndsAt != nil {
+				transition.EndsAt = *st.EndsAt
+			}
+		}
+		threshold := 0
+		if cfg, _, cfgErr := s.cachedPlatformConfig(ctx, st.ProjectID); cfgErr == nil {
+			threshold = cfg.ErrorRateThresholdPerMinute
+		}
+		if notifyErr := s.notifyErrorRateTransition(
 			ctx,
-			rec.ProjectSlug,
-			"error_rate_spike",
-			Alert{
-				Status: "resolved",
-				Labels: platformLabels(rec.ProjectSlug, "error_rate_spike"),
-				Annotations: map[string]string{
-					"summary":           fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
-					"window":            "5m",
-					"threshold_per_min": strconv.Itoa(rec.Threshold),
-					"cycle":             strconv.FormatInt(rec.Cycle, 10),
-				},
-				StartsAt: rec.StartsAt,
-				EndsAt:   rec.EndsAt,
-			},
+			st.ProjectID,
+			st.ProjectSlug,
+			transition,
+			errorRateAnnotations(summary, threshold, st.ActiveCycle),
+		); notifyErr != nil {
+			errs = append(errs, notifyErr)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// replayProjectPlatformAlertStates re-plans one project's platform alert states
+// after its silence or inhibition policy changes, so a spike held back by that
+// policy is delivered as soon as it is lifted rather than on the next recovery
+// tick.
+func (s *Service) replayProjectPlatformAlertStates(ctx context.Context, projectID int) {
+	if s.store == nil || projectID <= 0 {
+		return
+	}
+	if err := s.replayPlatformAlertStates(ctx, projectID); err != nil {
+		slog.Warn("replay platform alert states after policy change", "project_id", projectID, "error", err)
+	}
+}
+
+const platformErrorRateKind = "error_rate_spike"
+
+func errorRateAnnotations(summary string, threshold int, cycle int64) map[string]string {
+	return map[string]string{
+		"summary":           summary,
+		"window":            "5m",
+		"threshold_per_min": strconv.Itoa(threshold),
+		"cycle":             strconv.FormatInt(cycle, 10),
+	}
+}
+
+// notifyErrorRateTransition plans one committed error_rate_spike transition
+// through the shared policy planner (silence, inhibition, storm) and writes the
+// result to notification_outbox. Enqueue failures are logged here because the
+// error-inbox caller discards the returned error; the recovery loop replays
+// the transition.
+func (s *Service) notifyErrorRateTransition(
+	ctx context.Context,
+	projectID int,
+	projectSlug string,
+	transition meta.PlatformErrorSpikeTransition,
+	annotations map[string]string,
+) error {
+	if transition.Transition != "firing" && transition.Transition != "resolved" {
+		return nil
+	}
+	err := s.notifyPlatformState(ctx, projectID, projectSlug, platformErrorRateKind, transition, annotations)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		slog.Warn(
+			"enqueue error_rate_spike notification",
+			"project_id", projectID,
+			"status", transition.Transition,
+			"cycle", transition.Cycle,
+			"error", err,
 		)
 	}
-	return nil
+	return err
+}
+
+func (s *Service) notifyPlatformState(
+	ctx context.Context,
+	projectID int,
+	projectSlug string,
+	kind string,
+	transition meta.PlatformErrorSpikeTransition,
+	annotations map[string]string,
+) error {
+	if projectSlug == "" {
+		_, p, err := s.cachedPlatformConfig(ctx, projectID)
+		if err != nil {
+			return err
+		}
+		projectSlug = p.Slug
+	}
+	now := s.now().UTC()
+	labels := platformLabels(projectSlug, kind)
+	alertItem := Alert{
+		Status:      transition.Transition,
+		Labels:      labels,
+		Annotations: annotations,
+		StartsAt:    transition.StartsAt,
+		Fingerprint: Fingerprint(labels),
+	}
+	if transition.Transition == "resolved" {
+		alertItem.EndsAt = transition.EndsAt
+	}
+	groupKey := platformGroupKey(kind)
+	compiledPolicy, err := s.platformPolicy(ctx, projectSlug, now, nil, nil, groupKey)
+	if err != nil {
+		return err
+	}
+	plan := PlanNotifications(PlanConfig{
+		ProjectSlug:    projectSlug,
+		ProjectID:      projectID,
+		RuleName:       kind,
+		GroupKey:       groupKey,
+		RepeatInterval: s.repeatInterval,
+		StormThreshold: s.stormThreshold,
+		Now:            now,
+	}, compiledPolicy, []AlertCandidate{{Alert: alertItem, DueOverride: true}})
+	ref := PlatformStateRef{ProjectID: projectID, Kind: kind, Cycle: transition.Cycle, Status: transition.Transition}
+	var errs []error
+	for _, notification := range plan.Notifications {
+		if notification.Storm != nil {
+			if stormErr := s.notifyStorm(ctx, notification); stormErr != nil {
+				errs = append(errs, stormErr)
+			}
+			continue
+		}
+		if notifyErr := s.enqueuePlatformNotification(
+			ctx,
+			notification,
+			func(_ int, channelIDs []int, n Notification) []meta.NotificationOutboxEnqueue {
+				return BuildPlatformStateOutboxEntries(ref, channelIDs, []Notification{n})
+			},
+		); notifyErr != nil {
+			errs = append(errs, notifyErr)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Service) runPlatformErrorRateMonitor(ctx context.Context) {
@@ -1458,18 +1580,39 @@ func platformLabels(slug, kind string) map[string]string {
 	return map[string]string{"source": "platform", "project": slug, "project_id": slug, "kind": kind, "alertname": kind}
 }
 
-func (s *Service) notifyPlatform(ctx context.Context, n Notification) error {
-	return s.notifyPlatformLifecycle(ctx, n, 0)
+func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, lifecycleID int64) error {
+	return s.enqueuePlatformNotification(
+		ctx,
+		n,
+		func(projectID int, channelIDs []int, n Notification) []meta.NotificationOutboxEnqueue {
+			return BuildOutboxEntriesWithLifecycle(
+				projectID,
+				nil,
+				lifecycleID,
+				channelIDs,
+				[]Notification{n},
+				s.now().UTC(),
+				s.repeatInterval,
+			)
+		},
+	)
 }
 
-func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, lifecycleID int64) error {
+// enqueuePlatformNotification re-reads the project's platform alert config,
+// drops kinds that are disabled, attaches optional Issue AI analysis, and
+// writes the outbox rows produced by buildEntries for every enabled channel.
+func (s *Service) enqueuePlatformNotification(
+	ctx context.Context,
+	n Notification,
+	buildEntries func(projectID int, channelIDs []int, n Notification) []meta.NotificationOutboxEnqueue,
+) error {
 	cfg, _, err := s.store.ProjectAlertPolicyBySlug(ctx, n.Project)
 	if err != nil {
 		return err
 	}
 	kind := n.Rule
 	if (kind == "new_issue" && !cfg.NewIssue) || (kind == "regression" && !cfg.Regression) ||
-		(kind == "error_rate_spike" && cfg.ErrorRateThresholdPerMinute == 0) {
+		(kind == platformErrorRateKind && cfg.ErrorRateThresholdPerMinute == 0) {
 		return nil
 	}
 	n = s.attachIssueAIAnalysis(ctx, n)
@@ -1479,16 +1622,7 @@ func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, l
 			channelIDs = append(channelIDs, ch.ID)
 		}
 	}
-	entries := BuildOutboxEntriesWithLifecycle(
-		cfg.ProjectID,
-		nil,
-		lifecycleID,
-		channelIDs,
-		[]Notification{n},
-		s.now().UTC(),
-		s.repeatInterval,
-	)
-	return s.enqueueOutboxEntries(ctx, entries)
+	return s.enqueueOutboxEntries(ctx, buildEntries(cfg.ProjectID, channelIDs, n))
 }
 
 // attachIssueAIAnalysis is intentionally read-only and best-effort. Automatic
@@ -1565,9 +1699,6 @@ func defaultString(v, d string) string {
 }
 func matchersToMaps(ms []Matcher) []map[string]string {
 	return matcher.SpecsToMaps(ms)
-}
-func mapsToMatchers(ms []map[string]string) []Matcher {
-	return matcher.SpecsFromMaps(ms)
 }
 func nonNilStrings(values []string) []string {
 	if values == nil {

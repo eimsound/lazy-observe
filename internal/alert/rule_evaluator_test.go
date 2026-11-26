@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eimsound/lazy-observe/internal/alert/matcher"
 	"github.com/eimsound/lazy-observe/internal/alert/ownership"
 	"github.com/eimsound/lazy-observe/internal/meta"
 	"github.com/eimsound/lazy-observe/internal/outbound"
@@ -399,12 +400,10 @@ func TestNativeEvaluatorCommitsFiringAndResolvedNotifications(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy, err := store.AlertPolicySnapshot(ctx, project.ID, time.Now())
-	activeSilences := make([][]Matcher, 0, len(policy.Silences))
-	for _, matchers := range policy.Silences {
-		activeSilences = append(activeSilences, mapsToMatchers(matchers))
-	}
-	if err != nil || !matchesAny(map[string]string{"project_id": "native", "alertname": "Always"}, activeSilences) {
-		t.Fatalf("native active silences=%#v err=%v", activeSilences, err)
+	activeSilences := matcher.CompileSetsFromMapsLenient(policy.Silences)
+	if err != nil ||
+		!matcher.MatchesAny(map[string]string{"project_id": "native", "alertname": "Always"}, activeSilences) {
+		t.Fatalf("native active silences=%#v err=%v", policy.Silences, err)
 	}
 	query.Set(
 		[]RuleSample{

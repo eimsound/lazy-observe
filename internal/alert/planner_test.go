@@ -346,7 +346,7 @@ func TestCrossTrackNativeRuleInhibitsPlatformAlertAndUnblocksOnDelete(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// 2. Persistent error_rate_spike (via Engine) is also inhibited by the native rule.
+	// 2. Durable error_rate_spike (direct outbox planning) is also inhibited by the native rule.
 	for i := range 6 {
 		if err := svc.RecordErrorEvent(ctx, project.ID, now.Add(-time.Duration(6-i)*time.Second)); err != nil {
 			t.Fatal(err)
@@ -358,7 +358,7 @@ func TestCrossTrackNativeRuleInhibitsPlatformAlertAndUnblocksOnDelete(t *testing
 	case <-time.After(80 * time.Millisecond):
 	}
 
-	// Deleting the inhibition rule unblocks pending error_rate_spike via Engine.Reevaluate.
+	// Deleting the inhibition rule replays the still-firing error_rate_spike state into the outbox.
 	if err := svc.DeleteInhibitionRule(ctx, project.Slug, inhib.ID); err != nil {
 		t.Fatal(err)
 	}
