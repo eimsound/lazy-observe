@@ -10,29 +10,32 @@ export interface HelpTipScopeItem {
   children?: string[];
 }
 
-type HelpTipProps =
+type HelpTipProps = (
   | {
       content: string;
       scope?: undefined;
       scopeTitle?: undefined;
-      side?: "top" | "right" | "bottom" | "left";
     }
   | {
       content?: undefined;
       scope: HelpTipScopeItem[];
       scopeTitle: string;
-      side?: "top" | "right" | "bottom" | "left";
-    };
+    }
+) & {
+  side?: "top" | "right" | "bottom" | "left";
+  /** Literal syntax samples rendered in monospace below the explanation. */
+  examples?: string[];
+};
 
 /** Compact hover-triggered help icon (`tabIndex={-1}`) that moves explanatory copy out of permanent layout. */
 export function HelpTip(props: HelpTipProps) {
-  const ariaLabel =
-    props.scope !== undefined
-      ? [
-          props.scopeTitle,
-          ...props.scope.flatMap((item) => [item.text, ...(item.children ?? [])]),
-        ].join(" ")
-      : props.content;
+  const examples = props.examples ?? [];
+  const ariaLabel = [
+    ...(props.scope !== undefined
+      ? [props.scopeTitle, ...props.scope.flatMap((item) => [item.text, ...(item.children ?? [])])]
+      : [props.content]),
+    ...examples,
+  ].join(" ");
 
   return (
     <Tooltip>
@@ -71,6 +74,15 @@ export function HelpTip(props: HelpTipProps) {
           </div>
         ) : (
           props.content
+        )}
+        {examples.length > 0 && (
+          <ul className="mt-1.5 space-y-0.5 border-t border-primary-foreground/20 pt-1.5">
+            {examples.map((example) => (
+              <li key={example} className="break-words font-mono">
+                {example}
+              </li>
+            ))}
+          </ul>
         )}
       </TooltipContent>
     </Tooltip>

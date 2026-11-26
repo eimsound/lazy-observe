@@ -38,7 +38,7 @@ The current pre-release server protocol baseline is **v0** (no handshake and no 
 | Private upload | `POST /api/releases/:release/sourcemaps` | Source Map artifact upload; accepts only Source Map upload tokens (`los_...`, Section 2.2); project API tokens and user API tokens return `403` `source_map_upload_token_required` |
 | Self-monitoring metrics | `GET /metrics` | Prometheus text format 0.0.4 (`text/plain; version=0.0.4; charset=utf-8`); enabled explicitly via `metrics_endpoint.enabled` (off by default); requires admin auth by default, or an optional static scrape bearer token, or explicit `allow_unauthenticated` (Section 2.2) |
 | Self-monitoring browser config | `GET /api/system/self-monitoring` | Session-authenticated read-only endpoint (`authSessionOnly`, `Cache-Control: no-store`; rejects unauthenticated requests and `lou_...` user API tokens with `401`, and `must_change_password` sessions with `403 password_change_required`). Controlled by `self_monitoring.enabled`, `self_monitoring.web`, and `self_monitoring.web_replay`; returns `{ enabled: false }` when disabled, or `{ enabled: true, project_slug, token, service_name, release, replay_enabled? }` carrying the derived `self-monitoring-web` project ingest token (`lo_...`) when active (backward-compatible addition; protocol remains **v0**) |
-| Console management | `GET`/`POST /api/alert-rules`, `PATCH`/`PUT /api/alert-rules/:id` | Project-scoped native alert rule CRUD (session cookie or user API token; project API tokens are rejected). Rules carry an optional per-rule `evaluation_interval` (details below) |
+| Console management | `GET`/`POST /api/alert-rules`, `PATCH`/`PUT /api/alert-rules/:id` | Project-scoped native alert rule CRUD (session cookie or user API token; project API tokens are rejected). Rules carry an optional per-rule `evaluation_interval` and `repeat_interval` (details below) |
 
 Current enum values for `POST /api/events/diagnostics`:
 
@@ -59,6 +59,13 @@ Alert rule `evaluation_interval` (optional; omitting it stays backward-compatibl
 - Request: a Prometheus duration such as `30s` or `1m30s`. On `PATCH`/`PUT`, omitting the key keeps the stored value; `""` or `null` resets the rule to its signal default. The server stores the canonical form (`60s` becomes `1m`).
 - Bounds: a multiple of `5s` (the evaluator tick), `5s`–`1h` for `metrics` rules and `30s`–`1h` for `logs` rules. Values outside the bounds, and signal changes that would leave a stored override outside the new signal's bounds, return `400`.
 - Response: `evaluation_interval` is the stored override (`""` means the signal default) and the read-only `effective_evaluation_interval` is the interval the evaluator uses (`5s` for `metrics`, `1m` for `logs` unless overridden).
+
+Alert rule `repeat_interval` (optional; omitting it stays backward-compatible and the protocol version remains **v0**):
+
+- Request: a whole-second Prometheus duration such as `30m`, `1h`, or `1d`. On `PATCH`/`PUT`, omitting the key keeps the stored value; `""` or `null` resets the rule to the global `alert.repeat_interval` (default `1h`). The server stores the canonical form using `d`/`h`/`m`/`s` units (`60m` becomes `1h`, `168h` becomes `7d`).
+- Bounds: `1m`–`7d`. Unparsable values and values outside the bounds return `400`. There is no "never repeat" value and no maximum send count.
+- Effect: changing it does not reset firing state or alert events; a rule that is already firing applies the new interval on its next evaluation. Repeats are checked on each evaluation, so the effective cadence is never shorter than the rule's `evaluation_interval`. Only native rules carry the field; platform alerts (`new_issue`, `regression`, `error_rate_spike`) are unaffected.
+- Response: `repeat_interval` is the stored override (`""` means the global default) and the read-only `effective_repeat_interval` is the interval the evaluator uses.
 
 Alert rule `severity` and `annotations` (tightened validation; the protocol version remains **v0**):
 

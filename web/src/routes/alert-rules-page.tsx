@@ -11,8 +11,10 @@ import {
   ALERT_SIGNALS,
   DEFAULT_EVALUATION_INTERVAL,
   EVALUATION_INTERVAL_BOUNDS,
+  REPEAT_INTERVAL_BOUNDS,
   SEVERITIES,
   evaluationIntervalProblem,
+  repeatIntervalProblem,
   type AlertSignal,
   type AlertRule,
   type AlertRuleInput,
@@ -59,6 +61,15 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  ANNOTATION_EXAMPLES,
+  LABEL_EXAMPLES,
+  TEMPLATE_EXAMPLES,
+  inheritedRepeatInterval,
+  initialRepeatInterval,
+  joinRuleAnnotations,
+  splitRuleAnnotations,
+} from "./alert-rule-form";
 import { queryViewState } from "./query-view-state";
 
 export function AlertRulesPage() {
@@ -91,6 +102,7 @@ export function AlertRulesPage() {
         expr: rule.expr,
         for: rule.for,
         evaluation_interval: rule.evaluation_interval,
+        repeat_interval: rule.repeat_interval,
         severity: rule.severity,
         labels: rule.labels,
         annotations: rule.annotations,
@@ -196,6 +208,9 @@ export function AlertRulesPage() {
                       {t("alerts.colFor")}
                     </th>
                     <th className="hidden px-4 py-2.5 font-medium lg:table-cell">
+                      {t("alerts.colRepeat")}
+                    </th>
+                    <th className="hidden px-4 py-2.5 font-medium lg:table-cell">
                       {t("alerts.colChannels")}
                     </th>
                     <th className="px-4 py-2.5 font-medium">{t("common.status")}</th>
@@ -235,6 +250,20 @@ export function AlertRulesPage() {
                       </td>
                       <td className="hidden px-4 py-3 font-mono text-xs text-muted-foreground md:table-cell">
                         {r.for}
+                      </td>
+                      <td className="hidden whitespace-nowrap px-4 py-3 font-mono text-xs lg:table-cell">
+                        {r.repeat_interval ? (
+                          r.effective_repeat_interval
+                        ) : (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="text-muted-foreground">
+                                {r.effective_repeat_interval}
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>{t("alerts.repeatDefaultTooltip")}</TooltipContent>
+                          </Tooltip>
+                        )}
                       </td>
                       <td className="hidden px-4 py-3 text-xs text-muted-foreground lg:table-cell">
                         {r.channel_ids.length}
@@ -336,9 +365,13 @@ function RuleFormDialog({
   const [evalInterval, setEvalInterval] = useState(editing?.evaluation_interval ?? "");
   const [severity, setSeverity] = useState<Severity>(editing?.severity ?? "warning");
   const [labels, setLabels] = useState<Pair[]>(recordToPairs(editing?.labels ?? {}));
-  const [annotations, setAnnotations] = useState<Pair[]>(
-    recordToPairs(editing?.annotations ?? {}),
-  );
+  // annotations.summary is edited as the title template; the KV editor holds the rest.
+  const [initialAnnotations] = useState(() => splitRuleAnnotations(editing?.annotations ?? {}));
+  const [titleTemplate, setTitleTemplate] = useState(initialAnnotations.title);
+  const [annotations, setAnnotations] = useState<Pair[]>(initialAnnotations.pairs);
+  // New rules prefill the default; "" inherits the server's global repeat_interval.
+  const [repeatInterval, setRepeatInterval] = useState(() => initialRepeatInterval(editing));
+  const inheritedRepeat = inheritedRepeatInterval(editing);
   const [channelIds, setChannelIds] = useState<string[]>(editing?.channel_ids ?? []);
   const [enabled, setEnabled] = useState<boolean>(editing?.enabled ?? true);
   const [error, setError] = useState<string | null>(null);
@@ -354,13 +387,27 @@ function RuleFormDialog({
       expr: expr.trim(),
       for: forDur.trim() || "0m",
       evaluation_interval: evalInterval.trim(),
+      repeat_interval: repeatInterval.trim(),
       severity,
       labels: pairsToRecord(labels),
-      annotations: pairsToRecord(annotations),
+      annotations: joinRuleAnnotations(titleTemplate, annotations),
       enabled,
       channel_ids: channelIds,
     }),
-    [name, signal, expr, forDur, evalInterval, severity, labels, annotations, enabled, channelIds],
+    [
+      name,
+      signal,
+      expr,
+      forDur,
+      evalInterval,
+      repeatInterval,
+      severity,
+      labels,
+      titleTemplate,
+      annotations,
+      enabled,
+      channelIds,
+    ],
   );
 
   const mutation = useMutation({
@@ -381,6 +428,9 @@ function RuleFormDialog({
     if (intervalProblem === "range") {
       return setError(t("alerts.evaluationIntervalInvalid", EVALUATION_INTERVAL_BOUNDS[input.signal]));
     }
+    const repeatProblem = repeatIntervalProblem(input.repeat_interval);
+    if (repeatProblem === "format") return setError(t("alerts.repeatIntervalFormat"));
+    if (repeatProblem === "range") return setError(t("alerts.repeatIntervalInvalid", REPEAT_INTERVAL_BOUNDS));
     setError(null);
     mutation.mutate();
   }
@@ -507,13 +557,80 @@ function RuleFormDialog({
             )}
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
+          {/* Notification: rendered title and how often a still-firing alert re-notifies. */}
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div className="space-y-1.5 sm:col-span-2">
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="r-title">{t("alerts.titleTemplate")}</Label>
+                <HelpTip
+                  scopeTitle={t("alerts.titleTemplateHelpTitle")}
+                  scope={[
+                    { text: t("alerts.titleTemplateHelpLabels") },
+                    { text: t("alerts.titleTemplateHelpValue") },
+                    { text: t("alerts.titleTemplateHelpEmpty") },
+                  ]}
+                  examples={[TEMPLATE_EXAMPLES.instance, TEMPLATE_EXAMPLES.value]}
+                />
+              </div>
+              <Input
+                id="r-title"
+                value={titleTemplate}
+                onChange={(e) => setTitleTemplate(e.target.value)}
+                placeholder={t("alerts.titleTemplatePlaceholder", TEMPLATE_EXAMPLES)}
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </div>
             <div className="space-y-1.5">
-              <Label>{t("alerts.labelsField")}</Label>
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="r-repeat">{t("alerts.repeatInterval")}</Label>
+                <HelpTip content={t("alerts.repeatIntervalHelp")} />
+              </div>
+              <Input
+                id="r-repeat"
+                value={repeatInterval}
+                onChange={(e) => setRepeatInterval(e.target.value)}
+                placeholder={
+                  inheritedRepeat
+                    ? t("alerts.repeatIntervalInherited", { value: inheritedRepeat })
+                    : t("alerts.repeatIntervalInherit")
+                }
+                spellCheck={false}
+                autoComplete="off"
+                className="font-mono"
+              />
+            </div>
+          </div>
+
+          {/* Full-width rows: annotation values are templates and URLs that need room. */}
+          <div className="space-y-4">
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <Label>{t("alerts.labelsField")}</Label>
+                <HelpTip
+                  scopeTitle={t("alerts.labelsHelpTitle")}
+                  scope={[
+                    { text: t("alerts.labelsHelpMatch") },
+                    { text: t("alerts.labelsHelpLiteral") },
+                    { text: t("alerts.labelsHelpTemplate") },
+                  ]}
+                  examples={[...LABEL_EXAMPLES]}
+                />
+              </div>
               <KvEditor pairs={labels} onChange={setLabels} />
             </div>
             <div className="space-y-1.5">
-              <Label>{t("alerts.annotationsField")}</Label>
+              <div className="flex items-center gap-1.5">
+                <Label>{t("alerts.annotationsField")}</Label>
+                <HelpTip
+                  scopeTitle={t("alerts.annotationsHelpTitle")}
+                  scope={[
+                    { text: t("alerts.annotationsHelpTemplate") },
+                    { text: t("alerts.annotationsHelpKeys") },
+                  ]}
+                  examples={[...ANNOTATION_EXAMPLES]}
+                />
+              </div>
               <KvEditor pairs={annotations} onChange={setAnnotations} />
             </div>
           </div>

@@ -1377,3 +1377,174 @@ func TestAlertRuleEvaluationIntervalAPIContract(t *testing.T) {
 		}
 	}
 }
+
+func TestAlertRuleRepeatIntervalAPIContract(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	if _, err := store.CreateProject(ctx, "RepeatAPI", "repeat-api"); err != nil {
+		t.Fatal(err)
+	}
+	admin := sessionCookie(t, store, "repeat-api-admin", "password", "admin")
+	alerts := alertpkg.NewService(alertpkg.Config{
+		Store:          store,
+		GroupWait:      time.Millisecond,
+		RepeatInterval: 2 * time.Hour,
+	})
+	t.Cleanup(alerts.Close)
+	gw := newMetadataTestGateway(store, Config{Tokens: store, Store: store, Alerts: alerts})
+	t.Cleanup(func() { _ = gw.Shutdown() })
+
+	doRaw := func(method, path string, rawBody []byte) (*http.Response, []byte) {
+		t.Helper()
+		var reader io.Reader
+		if rawBody != nil {
+			reader = bytes.NewReader(rawBody)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		req.AddCookie(admin)
+		req.Header.Set("X-LO-Project", "repeat-api")
+		if rawBody != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := gw.App().Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return resp, out
+	}
+	decode := func(body []byte) alertRuleResponse {
+		t.Helper()
+		var rule alertRuleResponse
+		if err := json.Unmarshal(body, &rule); err != nil {
+			t.Fatal(err)
+		}
+		return rule
+	}
+
+	// POST without repeat_interval inherits the configured global default.
+	resp, body := doRaw(http.MethodPost, "/api/alert-rules", []byte(`{"name":"Inherited","expr":"up == 0"}`))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST inherited status=%d body=%s", resp.StatusCode, body)
+	}
+	if rule := decode(body); rule.RepeatInterval != "" || rule.EffectiveRepeatInterval != "2h" {
+		t.Fatalf("inherited=%+v want \"\" / \"2h\"", rule)
+	}
+	if !bytes.Contains(body, []byte(`"repeat_interval":""`)) ||
+		!bytes.Contains(body, []byte(`"effective_repeat_interval":"2h"`)) {
+		t.Fatalf("expected explicit repeat_interval fields in JSON: %s", body)
+	}
+
+	// POST canonicalizes "60m" -> "1h".
+	resp, body = doRaw(
+		http.MethodPost,
+		"/api/alert-rules",
+		[]byte(`{"name":"Custom","expr":"up == 0","repeat_interval":"60m","evaluation_interval":"30s"}`),
+	)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST custom status=%d body=%s", resp.StatusCode, body)
+	}
+	custom := decode(body)
+	if custom.RepeatInterval != "1h" || custom.EffectiveRepeatInterval != "1h" || custom.EvaluationInterval != "30s" {
+		t.Fatalf("custom=%+v want 1h / 1h / eval 30s", custom)
+	}
+
+	// PATCH omitting repeat_interval keeps the stored override.
+	resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(`{"severity":"critical"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH omit status=%d body=%s", resp.StatusCode, body)
+	}
+	if rule := decode(body); rule.RepeatInterval != "1h" || rule.EvaluationInterval != "30s" {
+		t.Fatalf("PATCH omit rule=%+v want 1h kept", rule)
+	}
+
+	// PUT omitting repeat_interval keeps it too.
+	resp, body = doRaw(
+		http.MethodPut,
+		"/api/alert-rules/"+custom.ID,
+		[]byte(`{"name":"Custom","expr":"up == 1","severity":"info"}`),
+	)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT omit status=%d body=%s", resp.StatusCode, body)
+	}
+	if rule := decode(body); rule.RepeatInterval != "1h" || rule.Expr != "up == 1" {
+		t.Fatalf("PUT omit rule=%+v want 1h kept", rule)
+	}
+
+	// PATCH sets a new value; "" and null reset to the global default.
+	resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(`{"repeat_interval":"168h"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH 168h status=%d body=%s", resp.StatusCode, body)
+	}
+	if rule := decode(body); rule.RepeatInterval != "7d" || rule.EffectiveRepeatInterval != "7d" {
+		t.Fatalf("PATCH 168h rule=%+v want 7d", rule)
+	}
+	resp, body = doRaw(http.MethodPatch, "/api/alert-rules/"+custom.ID, []byte(`{"repeat_interval":""}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH empty status=%d body=%s", resp.StatusCode, body)
+	}
+	if rule := decode(body); rule.RepeatInterval != "" || rule.EffectiveRepeatInterval != "2h" {
+		t.Fatalf("PATCH empty rule=%+v want \"\" / 2h", rule)
+	}
+	resp, body = doRaw(http.MethodPut, "/api/alert-rules/"+custom.ID, []byte(`{"repeat_interval":"15m"}`))
+	if resp.StatusCode != http.StatusOK || decode(body).RepeatInterval != "15m" {
+		t.Fatalf("PUT 15m status=%d body=%s", resp.StatusCode, body)
+	}
+	resp, body = doRaw(http.MethodPut, "/api/alert-rules/"+custom.ID, []byte(`{"repeat_interval":null}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT null status=%d body=%s", resp.StatusCode, body)
+	}
+	if rule := decode(body); rule.RepeatInterval != "" || rule.EffectiveRepeatInterval != "2h" {
+		t.Fatalf("PUT null rule=%+v want \"\" / 2h", rule)
+	}
+
+	// GET lists both fields.
+	resp, body = doRaw(http.MethodGet, "/api/alert-rules", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status=%d body=%s", resp.StatusCode, body)
+	}
+	var listed []alertRuleResponse
+	if err := json.Unmarshal(body, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("listed=%+v want 2 rules", listed)
+	}
+	for _, rule := range listed {
+		if rule.RepeatInterval != "" || rule.EffectiveRepeatInterval != "2h" {
+			t.Fatalf("listed rule=%+v want \"\" / 2h", rule)
+		}
+	}
+
+	// Invalid type, duration, or range returns 400 on POST, PATCH, and PUT.
+	for _, raw := range []string{
+		`{"name":"BadNum","expr":"up == 0","repeat_interval":60}`,
+		`{"name":"BadBool","expr":"up == 0","repeat_interval":true}`,
+		`{"name":"BadDur","expr":"up == 0","repeat_interval":"hourly"}`,
+		`{"name":"BadZero","expr":"up == 0","repeat_interval":"0s"}`,
+		`{"name":"BadMin","expr":"up == 0","repeat_interval":"59s"}`,
+		`{"name":"BadMax","expr":"up == 0","repeat_interval":"7d1m"}`,
+		`{"name":"BadFraction","expr":"up == 0","repeat_interval":"90500ms"}`,
+	} {
+		resp, body = doRaw(http.MethodPost, "/api/alert-rules", []byte(raw))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST invalid %s status=%d want 400 body=%s", raw, resp.StatusCode, body)
+		}
+	}
+	for _, method := range []string{http.MethodPatch, http.MethodPut} {
+		for _, raw := range []string{
+			`{"repeat_interval":30}`,
+			`{"repeat_interval":"30s"}`,
+			`{"repeat_interval":"8d"}`,
+		} {
+			resp, body = doRaw(method, "/api/alert-rules/"+custom.ID, []byte(raw))
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("%s invalid %s status=%d want 400 body=%s", method, raw, resp.StatusCode, body)
+			}
+		}
+	}
+}

@@ -75,6 +75,11 @@ func EvaluationInterval(v string) predicate.AlertRule {
 	return predicate.AlertRule(sql.FieldEQ(FieldEvaluationInterval, v))
 }
 
+// RepeatInterval applies equality check predicate on the "repeat_interval" field. It's identical to RepeatIntervalEQ.
+func RepeatInterval(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldEQ(FieldRepeatInterval, v))
+}
+
 // Severity applies equality check predicate on the "severity" field. It's identical to SeverityEQ.
 func Severity(v string) predicate.AlertRule {
 	return predicate.AlertRule(sql.FieldEQ(FieldSeverity, v))
@@ -398,6 +403,71 @@ func EvaluationIntervalEqualFold(v string) predicate.AlertRule {
 // EvaluationIntervalContainsFold applies the ContainsFold predicate on the "evaluation_interval" field.
 func EvaluationIntervalContainsFold(v string) predicate.AlertRule {
 	return predicate.AlertRule(sql.FieldContainsFold(FieldEvaluationInterval, v))
+}
+
+// RepeatIntervalEQ applies the EQ predicate on the "repeat_interval" field.
+func RepeatIntervalEQ(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldEQ(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalNEQ applies the NEQ predicate on the "repeat_interval" field.
+func RepeatIntervalNEQ(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldNEQ(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalIn applies the In predicate on the "repeat_interval" field.
+func RepeatIntervalIn(vs ...string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldIn(FieldRepeatInterval, vs...))
+}
+
+// RepeatIntervalNotIn applies the NotIn predicate on the "repeat_interval" field.
+func RepeatIntervalNotIn(vs ...string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldNotIn(FieldRepeatInterval, vs...))
+}
+
+// RepeatIntervalGT applies the GT predicate on the "repeat_interval" field.
+func RepeatIntervalGT(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldGT(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalGTE applies the GTE predicate on the "repeat_interval" field.
+func RepeatIntervalGTE(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldGTE(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalLT applies the LT predicate on the "repeat_interval" field.
+func RepeatIntervalLT(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldLT(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalLTE applies the LTE predicate on the "repeat_interval" field.
+func RepeatIntervalLTE(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldLTE(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalContains applies the Contains predicate on the "repeat_interval" field.
+func RepeatIntervalContains(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldContains(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalHasPrefix applies the HasPrefix predicate on the "repeat_interval" field.
+func RepeatIntervalHasPrefix(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldHasPrefix(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalHasSuffix applies the HasSuffix predicate on the "repeat_interval" field.
+func RepeatIntervalHasSuffix(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldHasSuffix(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalEqualFold applies the EqualFold predicate on the "repeat_interval" field.
+func RepeatIntervalEqualFold(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldEqualFold(FieldRepeatInterval, v))
+}
+
+// RepeatIntervalContainsFold applies the ContainsFold predicate on the "repeat_interval" field.
+func RepeatIntervalContainsFold(v string) predicate.AlertRule {
+	return predicate.AlertRule(sql.FieldContainsFold(FieldRepeatInterval, v))
 }
 
 // SeverityEQ applies the EQ predicate on the "severity" field.

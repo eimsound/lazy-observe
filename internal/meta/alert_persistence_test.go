@@ -767,3 +767,138 @@ func TestAlertRuleEvaluationIntervalPersistenceAndNoReset(t *testing.T) {
 		}
 	})
 }
+
+func TestAlertRuleRepeatIntervalPersistenceAndNoReset(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, err := store.CreateProject(ctx, "RepeatInterval", "repeat-interval")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defaultRule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug: project.Slug,
+			Name:        "DefaultRepeat",
+			Signal:      "metrics",
+			Expression:  "up == 0",
+			For:         "0s",
+			Severity:    "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if defaultRule.RepeatInterval != "" {
+			t.Fatalf("default RepeatInterval=%q want empty", defaultRule.RepeatInterval)
+		}
+		var rawDefault string
+		if err := store.db.QueryRowContext(
+			ctx,
+			bind(store.dialect, `SELECT repeat_interval FROM alert_rules WHERE id = ?`),
+			defaultRule.ID,
+		).Scan(&rawDefault); err != nil || rawDefault != "" {
+			t.Fatalf("baseline repeat_interval default=%q err=%v want empty", rawDefault, err)
+		}
+
+		customRule, err := store.CreateAlertRule(ctx, AlertRuleCreate{
+			ProjectSlug:        project.Slug,
+			Name:               "CustomRepeat",
+			Signal:             "metrics",
+			Expression:         "up == 0",
+			For:                "0s",
+			EvaluationInterval: "30s",
+			RepeatInterval:     "15m",
+			Severity:           "warning",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if customRule.RepeatInterval != "15m" || customRule.EvaluationInterval != "30s" {
+			t.Fatalf("created rule=%+v want repeat 15m eval 30s", customRule)
+		}
+		reloaded, err := store.AlertRuleByID(ctx, customRule.ID)
+		if err != nil || reloaded.RepeatInterval != "15m" {
+			t.Fatalf("reloaded RepeatInterval=%q err=%v want 15m", reloaded.RepeatInterval, err)
+		}
+
+		if _, err := store.HeartbeatAlertEngine(ctx, "engine-repeat", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.AcquireAlertRuleLease(ctx, customRule.ID, "engine-repeat", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		firingState := AlertRuleState{
+			RuleID:          customRule.ID,
+			Fingerprint:     "fp-repeat-1",
+			Status:          "firing",
+			FiringSince:     &now,
+			LastEvaluatedAt: now,
+			LastNotifiedAt:  &now,
+			Labels:          map[string]string{"alertname": "CustomRepeat"},
+			Annotations:     map[string]string{},
+		}
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID:     customRule.ID,
+			MemberID:   "engine-repeat",
+			LeaseEpoch: lease.Epoch,
+			States:     []AlertRuleState{firingState},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Omitting RepeatInterval keeps the stored value.
+		sev := "critical"
+		kept, err := store.UpdateAlertRule(ctx, project.Slug, customRule.ID, AlertRuleUpdate{Severity: &sev})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kept.RepeatInterval != "15m" || kept.EvaluationInterval != "30s" {
+			t.Fatalf("update nil RepeatInterval=%+v", kept)
+		}
+
+		// A repeat-only change persists without resetting firing state, events,
+		// LastNotifiedAt, or the lease epoch.
+		twoHours := "2h"
+		updated, err := store.UpdateAlertRule(ctx, project.Slug, customRule.ID, AlertRuleUpdate{
+			RepeatInterval: &twoHours,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.RepeatInterval != "2h" || updated.EvaluationInterval != "30s" {
+			t.Fatalf("updated rule=%+v want repeat 2h eval 30s", updated)
+		}
+		states, err := store.AlertRuleStates(ctx, customRule.ID)
+		if err != nil || len(states) != 1 || states[0].Status != "firing" || states[0].LastNotifiedAt == nil {
+			t.Fatalf("states after repeat-only update=%#v err=%v", states, err)
+		}
+		events, err := store.ListAlertEvents(ctx, project.Slug, "", nil)
+		if err != nil || len(events) != 1 || events[0].Status != "firing" || events[0].EndsAt != nil {
+			t.Fatalf("events after repeat-only update=%#v err=%v", events, err)
+		}
+		if err := store.CommitNativeAlertEvaluation(ctx, NativeAlertEvaluation{
+			RuleID:     customRule.ID,
+			MemberID:   "engine-repeat",
+			LeaseEpoch: lease.Epoch,
+			States:     []AlertRuleState{firingState},
+		}); err != nil {
+			t.Fatalf("commit with original lease epoch after repeat-only update failed: %v", err)
+		}
+
+		// Explicit empty string resets to the global default without touching state.
+		reset := ""
+		cleared, err := store.UpdateAlertRule(ctx, project.Slug, customRule.ID, AlertRuleUpdate{
+			RepeatInterval: &reset,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cleared.RepeatInterval != "" || cleared.EvaluationInterval != "30s" {
+			t.Fatalf("reset rule=%+v want empty repeat, eval 30s", cleared)
+		}
+		states, err = store.AlertRuleStates(ctx, customRule.ID)
+		if err != nil || len(states) != 1 || states[0].Status != "firing" {
+			t.Fatalf("states after repeat reset=%#v err=%v", states, err)
+		}
+	})
+}

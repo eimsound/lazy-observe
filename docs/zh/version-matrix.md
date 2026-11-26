@@ -38,7 +38,7 @@
 | 私有上传 | `POST /api/releases/:release/sourcemaps` | Source Map 制品上传；只接受 Source Map 上传 Token（`los_...`，§2.2），项目 API Token 与用户 API Token 返回 `403` `source_map_upload_token_required` |
 | 自身运维指标 | `GET /metrics` | Prometheus 文本格式 0.0.4（`text/plain; version=0.0.4; charset=utf-8`）；通过 `metrics_endpoint.enabled` 显式开启（默认关闭），默认需管理员鉴权，可选静态 scrape Bearer Token 或显式 `allow_unauthenticated`（§2.2） |
 | 前端自监控配置 | `GET /api/system/self-monitoring` | 会话鉴权只读接口（`authSessionOnly`，`Cache-Control: no-store`；拒绝未认证与 `lou_...` 用户 API Token 并返回 `401`，拒绝处于 `must_change_password` 的会话并返回 `403 password_change_required`）。受 `self_monitoring.enabled`、`self_monitoring.web` 与 `self_monitoring.web_replay` 控制；禁用时返回 `{ enabled: false }`，启用时返回 `{ enabled: true, project_slug, token, service_name, release, replay_enabled? }` 与派生自平台密钥的 `self-monitoring-web` 项目摄取 Token（`lo_...`）（向后兼容新增端点，协议版本仍为 **v0**） |
-| 控制台管理 | `GET`/`POST /api/alert-rules`、`PATCH`/`PUT /api/alert-rules/:id` | 项目隔离的原生告警规则增删改查（需会话 Cookie 或用户 API Token，拒绝项目 API Token）；规则可选携带按规则覆盖的 `evaluation_interval`（见下方说明） |
+| 控制台管理 | `GET`/`POST /api/alert-rules`、`PATCH`/`PUT /api/alert-rules/:id` | 项目隔离的原生告警规则增删改查（需会话 Cookie 或用户 API Token，拒绝项目 API Token）；规则可选携带按规则覆盖的 `evaluation_interval` 与 `repeat_interval`（见下方说明） |
 
 `POST /api/events/diagnostics` 的枚举值当前为：
 
@@ -59,6 +59,13 @@
 - 请求：Prometheus 时长字符串，如 `30s`、`1m30s`。`PATCH`/`PUT` 省略该键保持原值，传 `""` 或 `null` 恢复为信号默认值；服务端按规范形式存储（`60s` 存为 `1m`）。
 - 取值范围：须为 `5s`（评估主循环 tick）的整数倍，`metrics` 规则 `5s`–`1h`，`logs` 规则 `30s`–`1h`；越界值，以及切换信号后已存覆盖值超出新信号范围的更新，返回 `400`。
 - 响应：`evaluation_interval` 为已存的覆盖值（`""` 表示信号默认），只读的 `effective_evaluation_interval` 为评估器实际使用的间隔（未覆盖时 `metrics` 为 `5s`，`logs` 为 `1m`）。
+
+告警规则的 `repeat_interval`（可选字段，缺省完全向后兼容，协议版本仍为 **v0**）：
+
+- 请求：整秒的 Prometheus 时长字符串，如 `30m`、`1h`、`1d`。`PATCH`/`PUT` 省略该键保持原值，传 `""` 或 `null` 恢复为全局 `alert.repeat_interval`（默认 `1h`）；服务端按 `d`/`h`/`m`/`s` 单位的规范形式存储（`60m` 存为 `1h`，`168h` 存为 `7d`）。
+- 取值范围：`1m`–`7d`；无法解析或越界的值返回 `400`。没有「不再重复」取值，也没有最大发送次数。
+- 生效方式：修改不会重置触发状态或告警事件，已在触发中的规则在下一次评估时即按新间隔判断。重复通知在每次评估时判断，实际间隔不会短于规则的 `evaluation_interval`。仅原生规则带此字段，平台告警（`new_issue`、`regression`、`error_rate_spike`）不受影响。
+- 响应：`repeat_interval` 为已存的覆盖值（`""` 表示继承全局默认），只读的 `effective_repeat_interval` 为评估器实际使用的间隔。
 
 告警规则的 `severity` 与 `annotations`（收紧校验，协议版本仍为 **v0**）：
 

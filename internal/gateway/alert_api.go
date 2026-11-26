@@ -24,6 +24,8 @@ type alertRuleResponse struct {
 	For                         string            `json:"for"`
 	EvaluationInterval          string            `json:"evaluation_interval"`
 	EffectiveEvaluationInterval string            `json:"effective_evaluation_interval"`
+	RepeatInterval              string            `json:"repeat_interval"`
+	EffectiveRepeatInterval     string            `json:"effective_repeat_interval"`
 	Severity                    string            `json:"severity"`
 	Labels                      map[string]string `json:"labels"`
 	Annotations                 map[string]string `json:"annotations"`
@@ -93,6 +95,7 @@ type alertRuleRequest struct {
 	Expr               string            `json:"expr"`
 	For                string            `json:"for"`
 	EvaluationInterval optionalString    `json:"evaluation_interval"`
+	RepeatInterval     optionalString    `json:"repeat_interval"`
 	Severity           string            `json:"severity"`
 	Labels             map[string]string `json:"labels"`
 	Annotations        map[string]string `json:"annotations"`
@@ -116,6 +119,7 @@ func (request alertRuleRequest) input(project string) alert.RuleInput {
 		Expr:               request.Expr,
 		For:                request.For,
 		EvaluationInterval: request.EvaluationInterval.pointer(),
+		RepeatInterval:     request.RepeatInterval.pointer(),
 		Severity:           request.Severity,
 		Labels:             request.Labels,
 		Annotations:        request.Annotations,
@@ -193,7 +197,10 @@ func anyMap(value map[string]any) map[string]any {
 	return value
 }
 
-func toAlertRuleResponse(value meta.AlertRuleView, lastError, effectiveInterval string) alertRuleResponse {
+func toAlertRuleResponse(
+	value meta.AlertRuleView,
+	lastError, effectiveInterval, effectiveRepeatInterval string,
+) alertRuleResponse {
 	numericChannelIDs := append([]int(nil), value.ChannelIDs...)
 	sort.Ints(numericChannelIDs)
 	channelIDs := make([]string, 0, len(numericChannelIDs))
@@ -211,6 +218,8 @@ func toAlertRuleResponse(value meta.AlertRuleView, lastError, effectiveInterval 
 		For:                         value.For,
 		EvaluationInterval:          value.EvaluationInterval,
 		EffectiveEvaluationInterval: effectiveInterval,
+		RepeatInterval:              value.RepeatInterval,
+		EffectiveRepeatInterval:     effectiveRepeatInterval,
 		Severity:                    value.Severity,
 		Labels:                      stringMap(value.Labels),
 		Annotations:                 stringMap(value.Annotations),
@@ -228,7 +237,9 @@ func (g *Gateway) toAlertRuleResponse(value meta.AlertRuleView) alertRuleRespons
 		lastErr = g.alerts.RuleLastError(value.ID)
 		effectiveInterval = g.alerts.EffectiveEvaluationInterval(value)
 	}
-	return toAlertRuleResponse(value, lastErr, effectiveInterval)
+	// EffectiveRepeatInterval is nil-safe and falls back to the built-in global
+	// default, so the response always reports the cadence a rule would use.
+	return toAlertRuleResponse(value, lastErr, effectiveInterval, g.alerts.EffectiveRepeatInterval(value))
 }
 
 func (g *Gateway) toAlertRuleResponses(values []meta.AlertRuleView) []alertRuleResponse {

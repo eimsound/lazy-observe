@@ -28,6 +28,7 @@ type AlertRuleView struct {
 	Expression         string
 	For                string
 	EvaluationInterval string
+	RepeatInterval     string
 	Severity           string
 	Labels             map[string]string
 	Annotations        map[string]string
@@ -45,6 +46,7 @@ type AlertRuleCreate struct {
 	Expression         string
 	For                string
 	EvaluationInterval string
+	RepeatInterval     string
 	Severity           string
 	Labels             map[string]string
 	Annotations        map[string]string
@@ -59,6 +61,7 @@ type AlertRuleUpdate struct {
 	Expression                *string
 	For                       *string
 	EvaluationInterval        *string
+	RepeatInterval            *string
 	Severity                  *string
 	Labels                    map[string]string
 	Annotations               map[string]string
@@ -204,6 +207,7 @@ func (s *Store) CreateAlertRule(ctx context.Context, input AlertRuleCreate) (Ale
 		SetExpr(input.Expression).
 		SetFor(input.For).
 		SetEvaluationInterval(input.EvaluationInterval).
+		SetRepeatInterval(input.RepeatInterval).
 		SetSeverity(input.Severity).
 		SetLabels(nonNilStringMap(input.Labels)).
 		SetAnnotations(nonNilStringMap(input.Annotations)).
@@ -261,8 +265,8 @@ func (s *Store) UpdateAlertRule(
 	}
 	defer tx.Rollback()
 
-	selectQuery := `SELECT r.name, r.signal, r.evaluation_engine, r.expr, r."for", r.evaluation_interval, r.severity,
-		r.labels, r.annotations, r.enabled
+	selectQuery := `SELECT r.name, r.signal, r.evaluation_engine, r.expr, r."for", r.evaluation_interval, r.repeat_interval,
+		r.severity, r.labels, r.annotations, r.enabled
 		FROM alert_rules AS r
 		JOIN projects AS p ON p.id = r.project_id
 		WHERE r.id = ? AND p.slug = ?`
@@ -270,12 +274,13 @@ func (s *Store) UpdateAlertRule(
 		selectQuery += ` FOR UPDATE OF r`
 	}
 	var (
-		name, signal, evalEngine, expr, forDur, evalInterval, severity string
-		labelsRaw, annotationsRaw                                      []byte
-		enabled                                                        bool
+		name, signal, evalEngine, expr, forDur, evalInterval, repeatInterval, severity string
+		labelsRaw, annotationsRaw                                                      []byte
+		enabled                                                                        bool
 	)
 	if err := tx.QueryRowContext(ctx, bind(s.dialect, selectQuery), id, projectSlug).Scan(
-		&name, &signal, &evalEngine, &expr, &forDur, &evalInterval, &severity, &labelsRaw, &annotationsRaw, &enabled,
+		&name, &signal, &evalEngine, &expr, &forDur, &evalInterval, &repeatInterval, &severity, &labelsRaw, &annotationsRaw,
+		&enabled,
 	); errors.Is(err, sql.ErrNoRows) {
 		return AlertRuleView{}, &NotFoundError{Label: alertrule.Label}
 	} else if err != nil {
@@ -297,6 +302,9 @@ func (s *Store) UpdateAlertRule(
 	}
 	if input.EvaluationInterval != nil {
 		evalInterval = *input.EvaluationInterval
+	}
+	if input.RepeatInterval != nil {
+		repeatInterval = *input.RepeatInterval
 	}
 	if input.Severity != nil {
 		severity = *input.Severity
@@ -331,11 +339,11 @@ func (s *Store) UpdateAlertRule(
 		bind(
 			s.dialect,
 			`UPDATE alert_rules SET name = ?, signal = ?, evaluation_engine = ?, expr = ?, "for" = ?,
-				evaluation_interval = ?, severity = ?, labels = ?, annotations = ?, enabled = ?,
+				evaluation_interval = ?, repeat_interval = ?, severity = ?, labels = ?, annotations = ?, enabled = ?,
 				updated_at = CURRENT_TIMESTAMP
 			 WHERE id = ?`,
 		),
-		name, signal, evalEngine, expr, forDur, evalInterval, severity,
+		name, signal, evalEngine, expr, forDur, evalInterval, repeatInterval, severity,
 		string(labelsRaw), string(annotationsRaw), enabled, id,
 	); err != nil {
 		return AlertRuleView{}, fmt.Errorf("update alert rule: %w", err)
@@ -575,6 +583,7 @@ func alertRuleView(row *dbent.AlertRule) (AlertRuleView, error) {
 		Expression:         row.Expr,
 		For:                row.For,
 		EvaluationInterval: row.EvaluationInterval,
+		RepeatInterval:     row.RepeatInterval,
 		Severity:           row.Severity,
 		Labels:             row.Labels,
 		Annotations:        row.Annotations,

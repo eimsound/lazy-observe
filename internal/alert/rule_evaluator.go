@@ -133,6 +133,7 @@ type RuleEvaluator struct {
 	lastDue         map[int]time.Time
 	wakeAt          map[int]time.Time
 	warnedIntervals map[int]string
+	warnedRepeats   map[int]string
 	ruleStatuses    map[int]RuleEvaluationStatus
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -186,7 +187,7 @@ func NewRuleEvaluator(cfg RuleEvaluatorConfig) *RuleEvaluator {
 		cfg.GroupWait = 30 * time.Second
 	}
 	if cfg.RepeatInterval <= 0 {
-		cfg.RepeatInterval = 4 * time.Hour
+		cfg.RepeatInterval = DefaultRepeatInterval
 	}
 	if cfg.StormThreshold <= 0 {
 		cfg.StormThreshold = defaultEvaluatorStormThreshold
@@ -210,6 +211,7 @@ func NewRuleEvaluator(cfg RuleEvaluatorConfig) *RuleEvaluator {
 		lastDue:         make(map[int]time.Time),
 		wakeAt:          make(map[int]time.Time),
 		warnedIntervals: make(map[int]string),
+		warnedRepeats:   make(map[int]string),
 		ruleStatuses:    make(map[int]RuleEvaluationStatus),
 	}
 }
@@ -273,6 +275,7 @@ func (e *RuleEvaluator) ClearRuleStatus(ruleID int) {
 	e.mu.Lock()
 	delete(e.ruleStatuses, ruleID)
 	delete(e.warnedIntervals, ruleID)
+	delete(e.warnedRepeats, ruleID)
 	e.mu.Unlock()
 }
 
@@ -802,22 +805,64 @@ func (e *RuleEvaluator) ruleInterval(rule *meta.AlertRuleView) time.Duration {
 	return e.defaultIntervalForSignal(signal)
 }
 
+// ruleRepeatInterval returns the repeat_interval applied to rule's firing
+// notifications: its per-rule override, or the global alert.repeat_interval.
+// The rule definition is reloaded every evaluation, so an override edited while
+// the rule is firing takes effect on the next pass without resetting state.
+func (e *RuleEvaluator) ruleRepeatInterval(rule *meta.AlertRuleView) time.Duration {
+	fallback := DefaultRepeatInterval
+	if e != nil && e.repeatInterval > 0 {
+		fallback = e.repeatInterval
+	}
+	if rule == nil {
+		return fallback
+	}
+	d, invalid := effectiveRuleRepeatInterval(rule.RepeatInterval, fallback)
+	if !invalid {
+		e.clearInvalidRepeatWarning(rule.ID)
+		return d
+	}
+	if e.shouldWarnInvalidRepeat(rule.ID, rule.RepeatInterval) {
+		slog.Warn(
+			"invalid alert rule repeat_interval; falling back to global default",
+			"rule_id", rule.ID,
+			"value", rule.RepeatInterval,
+		)
+	}
+	return d
+}
+
 func (e *RuleEvaluator) shouldWarnInvalidInterval(ruleID int, raw string) bool {
 	if e == nil {
 		return true
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.warnedIntervals == nil {
-		e.warnedIntervals = make(map[int]string)
+	return warnOnce(&e.warnedIntervals, ruleID, raw)
+}
+
+func (e *RuleEvaluator) shouldWarnInvalidRepeat(ruleID int, raw string) bool {
+	if e == nil {
+		return true
 	}
-	if prev, ok := e.warnedIntervals[ruleID]; ok && prev == raw {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return warnOnce(&e.warnedRepeats, ruleID, raw)
+}
+
+// warnOnce records raw as the last warned value for ruleID in *set and reports
+// whether it changed. Callers hold e.mu.
+func warnOnce(set *map[int]string, ruleID int, raw string) bool {
+	if *set == nil {
+		*set = make(map[int]string)
+	}
+	if prev, ok := (*set)[ruleID]; ok && prev == raw {
 		return false
 	}
-	if len(e.warnedIntervals) >= maxWarnedInvalidIntervals {
-		clear(e.warnedIntervals)
+	if len(*set) >= maxWarnedInvalidIntervals {
+		clear(*set)
 	}
-	e.warnedIntervals[ruleID] = raw
+	(*set)[ruleID] = raw
 	return true
 }
 
@@ -827,6 +872,15 @@ func (e *RuleEvaluator) clearInvalidIntervalWarning(ruleID int) {
 	}
 	e.mu.Lock()
 	delete(e.warnedIntervals, ruleID)
+	e.mu.Unlock()
+}
+
+func (e *RuleEvaluator) clearInvalidRepeatWarning(ruleID int) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	delete(e.warnedRepeats, ruleID)
 	e.mu.Unlock()
 }
 
@@ -860,6 +914,7 @@ func (e *RuleEvaluator) releaseUnowned(ctx context.Context, owned map[int]struct
 			delete(e.lastDue, ruleID)
 			delete(e.wakeAt, ruleID)
 			delete(e.warnedIntervals, ruleID)
+			delete(e.warnedRepeats, ruleID)
 			delete(e.ruleStatuses, ruleID)
 		}
 	}
@@ -889,6 +944,7 @@ func (e *RuleEvaluator) releaseAll(ctx context.Context) {
 	e.lastDue = make(map[int]time.Time)
 	e.wakeAt = make(map[int]time.Time)
 	e.warnedIntervals = make(map[int]string)
+	e.warnedRepeats = make(map[int]string)
 	e.mu.Unlock()
 	for _, lease := range leases {
 		released, err := e.store.ReleaseAlertRuleLease(ctx, lease.RuleID, e.memberID, lease.Epoch)
@@ -1023,6 +1079,7 @@ func (e *RuleEvaluator) planNativeNotifications(
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	repeatInterval := e.ruleRepeatInterval(rule)
 	ruleID := rule.ID
 	compiledPolicy := CompilePolicyFromMeta(
 		policySnap,
@@ -1040,7 +1097,7 @@ func (e *RuleEvaluator) planNativeNotifications(
 		GroupKey:       nativeGroupKey(rule.ID),
 		Severity:       rule.Severity,
 		GroupWait:      e.groupWait,
-		RepeatInterval: e.repeatInterval,
+		RepeatInterval: repeatInterval,
 		StormThreshold: e.stormThreshold,
 		Now:            now,
 	}, compiledPolicy, candidates)
@@ -1051,7 +1108,15 @@ func (e *RuleEvaluator) planNativeNotifications(
 			states[i].LastNotifiedAt = &marked
 		}
 	}
-	outbox := BuildOutboxEntries(p.ID, &ruleID, rule.EnabledChannelIDs, plan.Notifications, now, e.repeatInterval)
+	outbox := BuildRuleOutboxEntries(
+		p.ID,
+		ruleID,
+		rule.EnabledChannelIDs,
+		plan.Notifications,
+		now,
+		e.repeatInterval,
+		repeatInterval,
+	)
 	return states, outbox, plan.InhibitedFingerprints, nil
 }
 

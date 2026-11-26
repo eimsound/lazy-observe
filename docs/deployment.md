@@ -139,7 +139,7 @@ The example configuration lists canonical path-shaped environment variable names
 | `blob.s3.secret_key` | empty | Optional static credential; must be paired with `blob.s3.access_key` |
 | `alert.storm_threshold` | `10` | Alerts in a group before storm handling triggers |
 | `alert.group_wait` | `30s` | Initial group collection delay for native alert rules; platform alerts (`new_issue`, `regression`, `error_rate_spike`) enqueue on their durable transition without it |
-| `alert.repeat_interval` | `4h` | Repeat-notification interval |
+| `alert.repeat_interval` | `1h` | Default interval before a still-firing native alert rule notifies again, and the bucket size for alert-storm summaries; each native rule may override it with its own [`repeat_interval`](version-matrix.md) (`1m`–`7d`). Repeats are checked on each evaluation, so a rule never repeats faster than its evaluation interval |
 | `scrape.mode` | `auto` | Embedded `vmagent` scraping mode: `auto` (active on single node, PostgreSQL leader-elected in HA) or `disabled` |
 | `error_inbox.max_items` | `100000` | Durable error-inbox item capacity before rejecting with `503` and `Retry-After` |
 | `error_inbox.max_bytes` | `1073741824` | Durable error-inbox byte capacity (1 GiB) before rejecting with `503` and `Retry-After` |

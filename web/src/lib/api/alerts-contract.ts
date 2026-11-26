@@ -37,6 +37,10 @@ export interface AlertRule {
   evaluation_interval: string;
   /** Interval the evaluator actually uses (server-derived, read-only). */
   effective_evaluation_interval: string;
+  /** Per-rule repeat-notification interval override; "" inherits the global `alert.repeat_interval`. */
+  repeat_interval: string;
+  /** Repeat interval the evaluator actually uses (server-derived, read-only). */
+  effective_repeat_interval: string;
   severity: Severity;
   labels: Record<string, string>;
   annotations: Record<string, string>;
@@ -49,6 +53,7 @@ export interface AlertRule {
 /**
  * Payload for create/update (server assigns identity and timestamps).
  * `evaluation_interval: ""` resets the rule to the signal default.
+ * `repeat_interval: ""` resets the rule to the global repeat interval.
  */
 export type AlertRuleInput = Pick<
   AlertRule,
@@ -57,6 +62,7 @@ export type AlertRuleInput = Pick<
   | "expr"
   | "for"
   | "evaluation_interval"
+  | "repeat_interval"
   | "severity"
   | "labels"
   | "annotations"
@@ -118,6 +124,28 @@ export function evaluationIntervalProblem(
   const { min, max } = EVALUATION_INTERVAL_BOUNDS[signal];
   const inBounds = ms >= (parsePromDurationMs(min) ?? 0) && ms <= (parsePromDurationMs(max) ?? Infinity);
   return ms > 0 && ms % EVALUATION_INTERVAL_STEP_MS === 0 && inBounds ? null : "range";
+}
+
+/**
+ * Mirrors `DefaultRepeatInterval` / `MinRepeatInterval` / `MaxRepeatInterval` in
+ * `internal/alert`. New rules prefill `DEFAULT_REPEAT_INTERVAL`; clearing the field
+ * inherits the server's configured `alert.repeat_interval` instead.
+ */
+export const DEFAULT_REPEAT_INTERVAL = "1h";
+export const REPEAT_INTERVAL_BOUNDS = { min: "1m", max: "7d" } as const;
+
+/**
+ * Pre-submit check for a repeat interval override. Empty inherits the global
+ * default. Returns "format" for an unparsable duration, "range" when it is not a
+ * whole number of seconds or falls outside 1m–7d, otherwise null.
+ */
+export function repeatIntervalProblem(raw: string): "format" | "range" | null {
+  if (raw.trim() === "") return null;
+  const ms = parsePromDurationMs(raw);
+  if (ms === null) return "format";
+  const min = parsePromDurationMs(REPEAT_INTERVAL_BOUNDS.min) ?? 0;
+  const max = parsePromDurationMs(REPEAT_INTERVAL_BOUNDS.max) ?? Infinity;
+  return ms % 1_000 === 0 && ms >= min && ms <= max ? null : "range";
 }
 
 export interface NotificationChannel {
@@ -313,6 +341,7 @@ export function normalizeAlertRule(value: unknown): AlertRule {
       })();
   const signal: AlertSignal = raw.signal === "logs" ? "logs" : "metrics";
   const evaluationInterval = optionalString(raw.evaluation_interval, "alert rule.evaluation_interval");
+  const repeatInterval = optionalString(raw.repeat_interval, "alert rule.repeat_interval");
 
   return {
     id: normalizeId(raw.id, "alert rule.id"),
@@ -326,6 +355,11 @@ export function normalizeAlertRule(value: unknown): AlertRule {
       optionalString(raw.effective_evaluation_interval, "alert rule.effective_evaluation_interval") ||
       evaluationInterval ||
       DEFAULT_EVALUATION_INTERVAL[signal],
+    repeat_interval: repeatInterval,
+    effective_repeat_interval:
+      optionalString(raw.effective_repeat_interval, "alert rule.effective_repeat_interval") ||
+      repeatInterval ||
+      DEFAULT_REPEAT_INTERVAL,
     severity: severityRaw as Severity,
     labels: normalizeStringRecord(raw.labels, "alert rule.labels"),
     annotations: normalizeStringRecord(raw.annotations, "alert rule.annotations"),

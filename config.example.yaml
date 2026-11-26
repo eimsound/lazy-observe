@@ -125,7 +125,7 @@ blob:
 alert:
   storm_threshold: 10
   group_wait: 30s
-  repeat_interval: 4h
+  repeat_interval: 1h # Global default; native alert rules may override it per rule (1m-7d).
 
 # Embedded vmagent scraping: "auto" (active in single-node, PostgreSQL leader-
 # elected in clustered/HA mode) or "disabled" (never extract or run vmagent).
