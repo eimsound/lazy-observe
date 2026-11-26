@@ -172,6 +172,11 @@ export const en: typeof zh = {
     signedInAs: "Signed in",
     account: "Account",
   },
+  palette: {
+    placeholder: "Search pages, projects, or trace IDs…",
+    empty: "No matching results",
+    jumpTrace: "Go to trace {{id}}",
+  },
   theme: {
     title: "Theme",
     appearance: "Appearance",
@@ -198,8 +203,6 @@ export const en: typeof zh = {
   metrics: {
     queryLabel: "PromQL expression",
     timeRange: "Time range",
-    minDuration: "Minimum duration",
-    minDurationPlaceholder: "e.g. 250ms",
     range15m: "Last 15 minutes",
     range1h: "Last 1 hour",
     range6h: "Last 6 hours",
@@ -717,6 +720,8 @@ export const en: typeof zh = {
     operation: "Operation",
     allOperations: "All operations",
     timeRange: "Time range",
+    minDuration: "Minimum duration",
+    minDurationPlaceholder: "e.g. 250ms",
     limit: "Result limit",
     tags: "Tag filter",
     tagsPlaceholder: "e.g. error=true http.status_code=500",

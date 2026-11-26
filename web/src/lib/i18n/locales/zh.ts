@@ -168,6 +168,11 @@ export const zh = {
     signedInAs: "已登录",
     account: "账户",
   },
+  palette: {
+    placeholder: "搜索页面、项目或 Trace ID…",
+    empty: "没有匹配的结果",
+    jumpTrace: "跳转到链路 {{id}}",
+  },
   theme: {
     title: "主题",
     appearance: "外观",
@@ -194,8 +199,6 @@ export const zh = {
   metrics: {
     queryLabel: "PromQL 表达式",
     timeRange: "时间范围",
-    minDuration: "最小时延",
-    minDurationPlaceholder: "例如 250ms",
     range15m: "近 15 分钟",
     range1h: "近 1 小时",
     range6h: "近 6 小时",
@@ -712,6 +715,8 @@ export const zh = {
     operation: "操作",
     allOperations: "全部操作",
     timeRange: "时间范围",
+    minDuration: "最小时延",
+    minDurationPlaceholder: "例如 250ms",
     limit: "结果上限",
     tags: "标签过滤",
     tagsPlaceholder: '例如：error=true http.status_code=500',
