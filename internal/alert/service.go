@@ -928,9 +928,17 @@ func (s *Service) DeleteSilence(ctx context.Context, projectSlug string, id int)
 	if err := s.store.DeleteSilence(ctx, projectSlug, id); err != nil {
 		return err
 	}
-	if p, err := s.store.ProjectBySlug(ctx, projectSlug); err == nil {
-		s.replayProjectPlatformAlertStates(ctx, p.ID)
+	p, err := s.store.ProjectBySlug(ctx, projectSlug)
+	if err != nil {
+		slog.Warn(
+			"lookup project for platform alert replay after silence delete",
+			"project", projectSlug,
+			"silence_id", id,
+			"error", err,
+		)
+		return nil
 	}
+	s.replayProjectPlatformAlertStates(ctx, p.ID)
 	return nil
 }
 
@@ -1354,23 +1362,34 @@ const platformResolvedReplayHorizon = 2 * errorRateWindow
 // also delivers a spike once a silence or inhibition stops suppressing it (the
 // role Engine.Reevaluate used to play); each cycle notifies firing at most once,
 // matching the removed Engine, which never repeated a still-firing spike.
-// Resolved states are replayed within platformResolvedReplayHorizon.
-// onlyProjectID > 0 limits the pass to one project.
+// Per-cycle firing deduplication relies on the delivered or dead outbox row
+// remaining in notification_outbox until janitor pruning (retention.alert_events,
+// default 30d); a spike continuously firing past that retention window is
+// re-enqueued once after its row is pruned.
+//
+// If a firing spike is folded into a storm summary (keyed by
+// storm\x00<project>\x00<bucket>), its own platform-state firing key is not
+// written; replays emit at most one storm summary per repeat_interval bucket
+// while the storm persists, and deliver an individual firing notification once
+// the project drops below the storm threshold if the spike is still active.
+//
+// Resolved states are replayed within platformResolvedReplayHorizon only for
+// channels whose same-cycle firing key already exists in notification_outbox,
+// preventing orphan recovery notifications after a silence or inhibition lifts.
+// onlyProjectID > 0 filters the query to one project in SQL.
 func (s *Service) replayPlatformAlertStates(ctx context.Context, onlyProjectID int) error {
 	now := s.now().UTC()
 	states, err := s.store.RecentPlatformAlertStates(
 		ctx,
 		platformErrorRateKind,
 		now.Add(-platformResolvedReplayHorizon),
+		onlyProjectID,
 	)
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, st := range states {
-		if onlyProjectID > 0 && st.ProjectID != onlyProjectID {
-			continue
-		}
 		transition := meta.PlatformErrorSpikeTransition{
 			Transition: st.Status,
 			Cycle:      st.ActiveCycle,
@@ -1505,14 +1524,56 @@ func (s *Service) notifyPlatformState(
 		if notifyErr := s.enqueuePlatformNotification(
 			ctx,
 			notification,
-			func(_ int, channelIDs []int, n Notification) []meta.NotificationOutboxEnqueue {
-				return BuildPlatformStateOutboxEntries(ref, channelIDs, []Notification{n})
+			func(_ int, channelIDs []int, n Notification) ([]meta.NotificationOutboxEnqueue, error) {
+				targetChannels := channelIDs
+				if ref.Status == "resolved" {
+					var filterErr error
+					targetChannels, filterErr = s.channelsWithPriorFiring(ctx, ref, channelIDs)
+					if filterErr != nil {
+						return nil, filterErr
+					}
+				}
+				return BuildPlatformStateOutboxEntries(ref, targetChannels, []Notification{n}), nil
 			},
 		); notifyErr != nil {
 			errs = append(errs, notifyErr)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// channelsWithPriorFiring filters channelIDs to channels whose notification_outbox
+// already contains the firing entry for ref's cycle, so resolved notifications
+// are not emitted for incidents whose firing was suppressed or never enqueued.
+func (s *Service) channelsWithPriorFiring(
+	ctx context.Context,
+	ref PlatformStateRef,
+	channelIDs []int,
+) ([]int, error) {
+	if len(channelIDs) == 0 {
+		return nil, nil
+	}
+	firingRef := PlatformStateRef{
+		ProjectID: ref.ProjectID,
+		Kind:      ref.Kind,
+		Cycle:     ref.Cycle,
+		Status:    "firing",
+	}
+	keys := make([]string, len(channelIDs))
+	for i, chID := range channelIDs {
+		keys[i] = PlatformStateOutboxKey(firingRef, chID)
+	}
+	existing, err := s.store.NotificationOutboxExistingKeys(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	matched := make([]int, 0, len(channelIDs))
+	for i, chID := range channelIDs {
+		if _, ok := existing[keys[i]]; ok {
+			matched = append(matched, chID)
+		}
+	}
+	return matched, nil
 }
 
 func (s *Service) runPlatformErrorRateMonitor(ctx context.Context) {
@@ -1584,7 +1645,7 @@ func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, l
 	return s.enqueuePlatformNotification(
 		ctx,
 		n,
-		func(projectID int, channelIDs []int, n Notification) []meta.NotificationOutboxEnqueue {
+		func(projectID int, channelIDs []int, n Notification) ([]meta.NotificationOutboxEnqueue, error) {
 			return BuildOutboxEntriesWithLifecycle(
 				projectID,
 				nil,
@@ -1593,7 +1654,7 @@ func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, l
 				[]Notification{n},
 				s.now().UTC(),
 				s.repeatInterval,
-			)
+			), nil
 		},
 	)
 }
@@ -1604,7 +1665,7 @@ func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, l
 func (s *Service) enqueuePlatformNotification(
 	ctx context.Context,
 	n Notification,
-	buildEntries func(projectID int, channelIDs []int, n Notification) []meta.NotificationOutboxEnqueue,
+	buildEntries func(projectID int, channelIDs []int, n Notification) ([]meta.NotificationOutboxEnqueue, error),
 ) error {
 	cfg, _, err := s.store.ProjectAlertPolicyBySlug(ctx, n.Project)
 	if err != nil {
@@ -1622,7 +1683,11 @@ func (s *Service) enqueuePlatformNotification(
 			channelIDs = append(channelIDs, ch.ID)
 		}
 	}
-	return s.enqueueOutboxEntries(ctx, buildEntries(cfg.ProjectID, channelIDs, n))
+	entries, err := buildEntries(cfg.ProjectID, channelIDs, n)
+	if err != nil {
+		return err
+	}
+	return s.enqueueOutboxEntries(ctx, entries)
 }
 
 // attachIssueAIAnalysis is intentionally read-only and best-effort. Automatic

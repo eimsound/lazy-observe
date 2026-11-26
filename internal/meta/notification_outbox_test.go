@@ -328,3 +328,182 @@ func TestNotificationOutboxDepthAndFiringPlatformStates(t *testing.T) {
 		}
 	})
 }
+
+func TestRecentPlatformAlertStates(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		pFiring, _, _ := createOutboxFixture(t, store, "recent-firing")
+		pResolvedBoundary, _, _ := createOutboxFixture(t, store, "recent-boundary")
+		pResolvedOld, _, _ := createOutboxFixture(t, store, "recent-old")
+
+		now := time.Now().UTC().Truncate(time.Second)
+		resolvedBoundary := now.Add(6 * time.Minute)
+
+		seedSpike := func(projectID int) {
+			for i := range 6 {
+				ts := now.Add(time.Duration(i) * time.Second)
+				if _, err := store.RecordPlatformErrorRate(ctx, projectID, ts, ts, 5*time.Minute, 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+
+		seedSpike(pFiring.ID)
+		seedSpike(pResolvedBoundary.ID)
+		if tr, err := store.ClearPlatformErrorRateState(ctx, pResolvedBoundary.ID, resolvedBoundary); err != nil ||
+			tr.Transition != "resolved" {
+			t.Fatalf("clear boundary project transition=%+v err=%v", tr, err)
+		}
+		seedSpike(pResolvedOld.ID)
+		if tr, err := store.ClearPlatformErrorRateState(
+			ctx,
+			pResolvedOld.ID,
+			resolvedBoundary.Add(-time.Second),
+		); err != nil || tr.Transition != "resolved" {
+			t.Fatalf("clear old project transition=%+v err=%v", tr, err)
+		}
+		if _, err := store.db.ExecContext(
+			ctx,
+			bind(
+				store.dialect,
+				`INSERT INTO platform_alert_states(project_id, kind, status, active_cycle, starts_at, ends_at, updated_at)
+				 VALUES (?, 'other_kind', 'firing', 1, ?, NULL, ?)`,
+			),
+			pFiring.ID,
+			now,
+			now,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := store.RecentPlatformAlertStates(ctx, platformAlertKindErrorRateSpike, resolvedBoundary, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("recent states len=%d want 2: %#v", len(got), got)
+		}
+		if got[0].ProjectID != pFiring.ID || got[0].Status != "firing" || got[0].EndsAt != nil ||
+			got[0].ProjectSlug != pFiring.Slug {
+			t.Fatalf("got[0]=%#v want firing for project %d", got[0], pFiring.ID)
+		}
+		if got[1].ProjectID != pResolvedBoundary.ID || got[1].Status != "resolved" ||
+			got[1].EndsAt == nil || !got[1].EndsAt.Equal(resolvedBoundary) {
+			t.Fatalf(
+				"got[1]=%#v want resolved at boundary %v for project %d",
+				got[1],
+				resolvedBoundary,
+				pResolvedBoundary.ID,
+			)
+		}
+
+		onlyFiring, err := store.RecentPlatformAlertStates(
+			ctx,
+			platformAlertKindErrorRateSpike,
+			resolvedBoundary,
+			pFiring.ID,
+		)
+		if err != nil || len(onlyFiring) != 1 || onlyFiring[0].ProjectID != pFiring.ID {
+			t.Fatalf("project-filtered firing=%#v err=%v", onlyFiring, err)
+		}
+		onlyBoundary, err := store.RecentPlatformAlertStates(
+			ctx,
+			platformAlertKindErrorRateSpike,
+			resolvedBoundary,
+			pResolvedBoundary.ID,
+		)
+		if err != nil || len(onlyBoundary) != 1 || onlyBoundary[0].ProjectID != pResolvedBoundary.ID {
+			t.Fatalf("project-filtered boundary=%#v err=%v", onlyBoundary, err)
+		}
+		onlyOld, err := store.RecentPlatformAlertStates(
+			ctx,
+			platformAlertKindErrorRateSpike,
+			resolvedBoundary,
+			pResolvedOld.ID,
+		)
+		if err != nil || len(onlyOld) != 0 {
+			t.Fatalf("project-filtered old=%#v err=%v want empty", onlyOld, err)
+		}
+		otherKind, err := store.RecentPlatformAlertStates(ctx, "other_kind", resolvedBoundary, 0)
+		if err != nil || len(otherKind) != 1 || otherKind[0].Kind != "other_kind" ||
+			otherKind[0].ProjectID != pFiring.ID {
+			t.Fatalf("other_kind states=%#v err=%v", otherKind, err)
+		}
+	})
+}
+
+func TestNotificationOutboxExistingKeys(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		project, _, channel := createOutboxFixture(t, store, "existing-keys")
+
+		if _, _, err := store.EnqueueNotification(ctx, NotificationOutboxEnqueue{
+			IdempotencyKey: "exist-pending",
+			ProjectID:      project.ID,
+			ChannelID:      channel.ID,
+			Payload:        json.RawMessage(`{"status":"firing"}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		deliveredID, _, err := store.EnqueueNotification(ctx, NotificationOutboxEnqueue{
+			IdempotencyKey: "exist-delivered",
+			ProjectID:      project.ID,
+			ChannelID:      channel.ID,
+			Payload:        json.RawMessage(`{"status":"firing"}`),
+			Priority:       10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		deadID, _, err := store.EnqueueNotification(ctx, NotificationOutboxEnqueue{
+			IdempotencyKey: "exist-dead",
+			ProjectID:      project.ID,
+			ChannelID:      channel.ID,
+			Payload:        json.RawMessage(`{"status":"firing"}`),
+			Priority:       20,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		claimed, err := store.ClaimNotifications(ctx, "exist-worker", 2, time.Minute)
+		if err != nil || len(claimed) != 2 || claimed[0].ID != deadID || claimed[1].ID != deliveredID {
+			t.Fatalf("claimed=%#v err=%v", claimed, err)
+		}
+		if status, err := store.RetryNotification(ctx, deadID, "exist-worker", "boom", time.Minute, 1); err != nil ||
+			status != "dead" {
+			t.Fatalf("mark dead status=%q err=%v", status, err)
+		}
+		if err := store.CompleteNotification(ctx, deliveredID, "exist-worker"); err != nil {
+			t.Fatal(err)
+		}
+
+		empty, err := store.NotificationOutboxExistingKeys(ctx, nil)
+		if err != nil || len(empty) != 0 {
+			t.Fatalf("nil keys=%#v err=%v", empty, err)
+		}
+		blankOnly, err := store.NotificationOutboxExistingKeys(ctx, []string{""})
+		if err != nil || len(blankOnly) != 0 {
+			t.Fatalf("blank keys=%#v err=%v", blankOnly, err)
+		}
+
+		got, err := store.NotificationOutboxExistingKeys(
+			ctx,
+			[]string{"exist-pending", "exist-delivered", "exist-dead", "exist-missing", "exist-pending", ""},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("existing keys len=%d want 3: %#v", len(got), got)
+		}
+		for _, want := range []string{"exist-pending", "exist-delivered", "exist-dead"} {
+			if _, ok := got[want]; !ok {
+				t.Fatalf("missing expected key %q in %#v", want, got)
+			}
+		}
+		if _, ok := got["exist-missing"]; ok {
+			t.Fatalf("unexpected key exist-missing in %#v", got)
+		}
+	})
+}

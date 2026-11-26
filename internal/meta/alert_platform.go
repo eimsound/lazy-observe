@@ -70,7 +70,8 @@ func (s *Store) ProjectFiringPlatformAlertStates(ctx context.Context, projectID 
 }
 
 // RecentPlatformAlertStates lists every firing platform alert state of kind
-// plus resolved ones whose ends_at is at or after resolvedSince. Platform alert
+// plus resolved ones whose ends_at is at or after resolvedSince. When
+// projectID > 0, results are filtered to that project in SQL. Platform alert
 // notifiers replay these durable transitions into notification_outbox with
 // deterministic idempotency keys, so a transition committed by a replica that
 // crashed before enqueueing is still delivered by any surviving replica.
@@ -78,20 +79,19 @@ func (s *Store) RecentPlatformAlertStates(
 	ctx context.Context,
 	kind string,
 	resolvedSince time.Time,
+	projectID int,
 ) ([]PlatformAlertState, error) {
-	rows, err := s.db.QueryContext(
-		ctx,
-		bind(
-			s.dialect,
-			`SELECT `+platformAlertStateColumns+`
-			 FROM platform_alert_states AS st
-			 JOIN projects AS p ON p.id = st.project_id
-			 WHERE st.kind = ? AND (st.status = 'firing' OR (st.status = 'resolved' AND st.ends_at >= ?))
-			 ORDER BY st.project_id`,
-		),
-		kind,
-		resolvedSince.UTC(),
-	)
+	query := `SELECT ` + platformAlertStateColumns + `
+		 FROM platform_alert_states AS st
+		 JOIN projects AS p ON p.id = st.project_id
+		 WHERE st.kind = ? AND (st.status = 'firing' OR (st.status = 'resolved' AND st.ends_at >= ?))`
+	args := []any{kind, resolvedSince.UTC()}
+	if projectID > 0 {
+		query += ` AND st.project_id = ?`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY st.project_id`
+	rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list recent platform alert states: %w", err)
 	}

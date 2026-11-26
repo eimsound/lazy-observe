@@ -493,6 +493,19 @@ type PlatformStateRef struct {
 	Status    string
 }
 
+func platformStateKeyPayload(ref PlatformStateRef) []byte {
+	return []byte(
+		fmt.Sprintf("platform-state\x00%d\x00%s\x00%d\x00%s", ref.ProjectID, ref.Kind, ref.Cycle, ref.Status),
+	)
+}
+
+// PlatformStateOutboxKey returns the deterministic notification_outbox
+// idempotency key for one channel on a durable platform_alert_states
+// transition.
+func PlatformStateOutboxKey(ref PlatformStateRef, channelID int) string {
+	return notificationOutboxKey(channelID, platformStateKeyPayload(ref))
+}
+
 // BuildPlatformStateOutboxEntries constructs notification_outbox rows for a
 // durable platform_alert_states transition. The idempotency key is pinned to
 // `platform-state\x00<project_id>\x00<kind>\x00<cycle>\x00<status>`
@@ -504,9 +517,7 @@ func BuildPlatformStateOutboxEntries(
 	channelIDs []int,
 	notifications []Notification,
 ) []meta.NotificationOutboxEnqueue {
-	keyPayload := []byte(
-		fmt.Sprintf("platform-state\x00%d\x00%s\x00%d\x00%s", ref.ProjectID, ref.Kind, ref.Cycle, ref.Status),
-	)
+	keyPayload := platformStateKeyPayload(ref)
 	return buildOutboxEntries(ref.ProjectID, nil, channelIDs, notifications, func(Notification, []byte) []byte {
 		return keyPayload
 	})

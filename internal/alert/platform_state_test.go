@@ -396,3 +396,293 @@ func TestErrorRateSpikeDeleteSilenceReplaysImmediately(t *testing.T) {
 	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
 	h.waitDelivered("firing", "1")
 }
+
+// A full cycle that fired and resolved while silenced never notified firing, so
+// deleting the silence within the resolved replay horizon must not emit an
+// orphan resolved notification.
+func TestErrorRateSpikeSilencedFullCycleNoOrphanResolvedOnDeleteSilence(t *testing.T) {
+	h := newSpikeHarness(t, "spike-silenced-del")
+	svc := h.service("silenced-del")
+	ctx := context.Background()
+	silence, err := svc.CreateSilence(ctx, SilenceInput{
+		Project:  h.project.Slug,
+		Matchers: []Matcher{{Name: "alertname", Op: "=", Value: "error_rate_spike"}},
+		StartsAt: h.base.Add(-time.Minute),
+		EndsAt:   h.base.Add(time.Hour),
+		Creator:  "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.spike(svc, h.base)
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("silenced spike enqueued: %#v", rows)
+	}
+	h.set(h.base.Add(6 * time.Minute))
+	if err := svc.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("silenced resolved enqueued: %#v", rows)
+	}
+	h.set(h.base.Add(8 * time.Minute))
+	if err := svc.DeleteSilence(ctx, h.project.Slug, silence.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("orphan resolved enqueued after DeleteSilence: %#v", rows)
+	}
+	h.set(h.base.Add(8*time.Minute + 5*time.Second))
+	if err := svc.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("orphan resolved enqueued on recovery tick after DeleteSilence: %#v", rows)
+	}
+}
+
+// A full cycle that fired and resolved while silenced must not emit an orphan
+// resolved notification once the silence expires within the replay horizon.
+func TestErrorRateSpikeSilencedFullCycleNoOrphanResolvedOnSilenceExpiry(t *testing.T) {
+	h := newSpikeHarness(t, "spike-silenced-exp")
+	svc := h.service("silenced-exp")
+	ctx := context.Background()
+	if _, err := svc.CreateSilence(ctx, SilenceInput{
+		Project:  h.project.Slug,
+		Matchers: []Matcher{{Name: "alertname", Op: "=", Value: "error_rate_spike"}},
+		StartsAt: h.base.Add(-time.Minute),
+		EndsAt:   h.base.Add(8 * time.Minute),
+		Creator:  "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.spike(svc, h.base)
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("silenced spike enqueued: %#v", rows)
+	}
+	h.set(h.base.Add(6 * time.Minute))
+	if err := svc.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("silenced resolved enqueued: %#v", rows)
+	}
+	h.set(h.base.Add(9 * time.Minute))
+	if err := svc.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("orphan resolved enqueued after silence expired: %#v", rows)
+	}
+}
+
+// When firing was already enqueued for a cycle and a subsequent silence held
+// back its resolved notification, lifting the silence within the horizon must
+// still replay the resolved notification.
+func TestErrorRateSpikeResolvedReplayedWhenPriorFiringWasEnqueued(t *testing.T) {
+	h := newSpikeHarness(t, "spike-resolved-replay")
+	svc := h.service("resolved-replay")
+	ctx := context.Background()
+	h.spike(svc, h.base)
+	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
+	h.waitDelivered("firing", "1")
+
+	silence, err := svc.CreateSilence(ctx, SilenceInput{
+		Project:  h.project.Slug,
+		Matchers: []Matcher{{Name: "alertname", Op: "=", Value: "error_rate_spike"}},
+		StartsAt: h.base.Add(5 * time.Minute),
+		EndsAt:   h.base.Add(time.Hour),
+		Creator:  "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.set(h.base.Add(6 * time.Minute))
+	if err := svc.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
+
+	h.set(h.base.Add(8 * time.Minute))
+	if err := svc.DeleteSilence(ctx, h.project.Slug, silence.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+	h.waitDelivered("resolved", "1")
+}
+
+// When firing was committed to the store before a crash (no outbox row yet),
+// a single CheckErrorRateRecoveries call after the window expires must replay
+// firing before enqueueing resolved so firing outbox id < resolved id.
+func TestErrorRateSpikeCrashBeforeRecoveryTickReplaysFiringBeforeResolved(t *testing.T) {
+	h := newSpikeHarness(t, "spike-crash-order")
+	ctx := context.Background()
+	for i := range 6 {
+		ts := h.base.Add(time.Duration(i) * time.Second)
+		if _, err := h.store.RecordPlatformErrorRate(ctx, h.project.ID, ts, ts, errorRateWindow, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("precondition: outbox rows=%#v", rows)
+	}
+
+	h.set(h.base.Add(6 * time.Minute))
+	restarted := h.service("restarted-order")
+	if err := restarted.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows := h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+	if rows[0].ID >= rows[1].ID {
+		t.Fatalf("replayed firing outbox id %d not before resolved id %d", rows[0].ID, rows[1].ID)
+	}
+}
+
+// Updating a silence so it ends before now must immediately replay a held-back
+// firing spike into notification_outbox.
+func TestErrorRateSpikeUpdateSilenceReplaysImmediately(t *testing.T) {
+	h := newSpikeHarness(t, "spike-update-silence")
+	svc := h.service("update-silence")
+	ctx := context.Background()
+	silence, err := svc.CreateSilence(ctx, SilenceInput{
+		Project:  h.project.Slug,
+		Matchers: []Matcher{{Name: "kind", Op: "=", Value: "error_rate_spike"}},
+		StartsAt: h.base.Add(-time.Minute),
+		EndsAt:   h.base.Add(time.Hour),
+		Creator:  "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.spike(svc, h.base)
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("silenced spike enqueued: %#v", rows)
+	}
+
+	h.set(h.base.Add(2 * time.Minute))
+	if _, err := svc.UpdateSilence(ctx, silence.ID, SilenceInput{
+		Project: h.project.Slug,
+		EndsAt:  h.base.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
+	h.waitDelivered("firing", "1")
+}
+
+// CreateInhibitionRule, UpdateInhibitionRule, and DeleteInhibitionRule all
+// trigger immediate project-scoped replay of durable error_rate_spike states.
+func TestErrorRateSpikeInhibitionRuleHooksReplayImmediately(t *testing.T) {
+	hCreate := newSpikeHarness(t, "spike-inhib-create")
+	ctx := context.Background()
+	for i := range 6 {
+		ts := hCreate.base.Add(time.Duration(i) * time.Second)
+		if _, err := hCreate.store.RecordPlatformErrorRate(
+			ctx,
+			hCreate.project.ID,
+			ts,
+			ts,
+			errorRateWindow,
+			1,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows := hCreate.rows(); len(rows) != 0 {
+		t.Fatalf("precondition: outbox rows=%#v", rows)
+	}
+	svcCreate := hCreate.service("inhib-create")
+	if _, err := svcCreate.CreateInhibitionRule(ctx, InhibitionRuleInput{
+		Project:        hCreate.project.Slug,
+		SourceMatchers: []Matcher{{Name: "alertname", Op: "=", Value: "OtherSource"}},
+		TargetMatchers: []Matcher{{Name: "alertname", Op: "=", Value: "OtherRule"}},
+		EqualLabels:    []string{"project_id"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hCreate.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
+	hCreate.waitDelivered("firing", "1")
+
+	hInhib := newSpikeHarness(t, "spike-inhib-hooks")
+	svc := hInhib.service("inhib-hooks")
+	nativeRule, err := svc.CreateRule(ctx, RuleInput{
+		Project:  hInhib.project.Slug,
+		Name:     "OutageDown",
+		Expr:     "up == 0",
+		For:      "0s",
+		Severity: "critical",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hInhib.store.HeartbeatAlertEngine(ctx, "seed-member", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := hInhib.store.AcquireAlertRuleLease(ctx, nativeRule.ID, "seed-member", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := hInhib.now()
+	if err := hInhib.store.PutAlertRuleState(ctx, meta.AlertRuleState{
+		RuleID:          nativeRule.ID,
+		Fingerprint:     "native-outage-fp",
+		Status:          "firing",
+		FiringSince:     &now,
+		LastEvaluatedAt: now,
+		Labels:          map[string]string{"alertname": "OutageDown", "project_id": hInhib.project.Slug},
+		Annotations:     map[string]string{},
+	}, "seed-member", lease.Epoch); err != nil {
+		t.Fatal(err)
+	}
+
+	inhib, err := svc.CreateInhibitionRule(ctx, InhibitionRuleInput{
+		Project:        hInhib.project.Slug,
+		SourceMatchers: []Matcher{{Name: "alertname", Op: "=", Value: "OutageDown"}},
+		TargetMatchers: []Matcher{{Name: "kind", Op: "=", Value: "error_rate_spike"}},
+		EqualLabels:    []string{"project_id"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hInhib.spike(svc, hInhib.base)
+	if rows := hInhib.rows(); len(rows) != 0 {
+		t.Fatalf("inhibited cycle 1 spike enqueued: %#v", rows)
+	}
+	disabled := false
+	if _, err := svc.UpdateInhibitionRule(ctx, inhib.ID, InhibitionRuleInput{
+		Project: hInhib.project.Slug,
+		Enabled: &disabled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hInhib.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
+	hInhib.waitDelivered("firing", "1")
+
+	hInhib.set(hInhib.base.Add(6 * time.Minute))
+	if err := svc.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	hInhib.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+	hInhib.waitDelivered("resolved", "1")
+
+	enabled := true
+	if _, err := svc.UpdateInhibitionRule(ctx, inhib.ID, InhibitionRuleInput{
+		Project: hInhib.project.Slug,
+		Enabled: &enabled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hInhib.spike(svc, hInhib.base.Add(10*time.Minute))
+	hInhib.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+
+	if err := svc.DeleteInhibitionRule(ctx, hInhib.project.Slug, inhib.ID); err != nil {
+		t.Fatal(err)
+	}
+	hInhib.expectRows(
+		PlatformStateRef{Cycle: 1, Status: "firing"},
+		PlatformStateRef{Cycle: 1, Status: "resolved"},
+		PlatformStateRef{Cycle: 2, Status: "firing"},
+	)
+	hInhib.waitDelivered("firing", "2")
+}
