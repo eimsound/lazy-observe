@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -773,6 +776,122 @@ func TestSenderSendPopulatesLinksForWebhookAndSMTP(t *testing.T) {
 			}
 		case <-time.After(time.Second):
 			t.Fatal("mock SMTP server did not receive DATA")
+		}
+	})
+}
+
+func TestEmailPayloadFoldsLongEncodedSubject(t *testing.T) {
+	ts := time.Date(2026, 7, 17, 1, 2, 3, 0, time.UTC)
+	makeNotification := func(summary string) Notification {
+		alerts := make([]Alert, 12)
+		alerts[0] = Alert{
+			Status:      "firing",
+			Labels:      map[string]string{"severity": "critical"},
+			Annotations: map[string]string{"summary": summary},
+			StartsAt:    ts,
+			Fingerprint: "fp-0",
+		}
+		for i := 1; i < len(alerts); i++ {
+			alerts[i] = Alert{
+				Status:      "firing",
+				Labels:      map[string]string{"severity": "warning"},
+				StartsAt:    ts.Add(time.Duration(i) * time.Minute),
+				Fingerprint: "fp-" + strconv.Itoa(i),
+			}
+		}
+		return Notification{
+			Project: "prod",
+			Rule:    "DiskFull",
+			Status:  "firing",
+			Alerts:  alerts,
+		}
+	}
+
+	splitHeaders := func(t *testing.T, raw []byte) []string {
+		t.Helper()
+		headerEnd := bytes.Index(raw, []byte("\r\n\r\n"))
+		if headerEnd < 0 {
+			t.Fatalf("missing header terminator: %q", raw)
+		}
+		return strings.Split(string(raw[:headerEnd]), "\r\n")
+	}
+
+	t.Run("200-rune Chinese summary folds within RFC 5322 and RFC 2047 limits", func(t *testing.T) {
+		summary := strings.Repeat("磁", 200)
+		n := makeNotification(summary)
+		wantTitle := "[FIRING][CRITICAL] prod / " + summary + " (+11 more)"
+		if gotTitle := sanitizeEmailHeader(buildNotificationView(n).Title); gotTitle != wantTitle {
+			t.Fatalf("rendered title = %q, want %q", gotTitle, wantTitle)
+		}
+
+		raw := EmailPayload("alerts@example.com", []string{"ops@example.com"}, n)
+		lines := splitHeaders(t, raw)
+
+		var foundSubject bool
+		var continuations int
+		for i, line := range lines {
+			if len(line) > 998 {
+				t.Errorf("header line %d exceeds RFC 5322 998-byte limit: len=%d", i, len(line))
+			}
+			if !strings.HasPrefix(line, "Subject: ") {
+				continue
+			}
+			foundSubject = true
+			if len(line) > 84 {
+				t.Errorf("Subject first line exceeds 84 bytes: len=%d line=%q", len(line), line)
+			}
+			for j := i + 1; j < len(lines) && strings.HasPrefix(lines[j], " "); j++ {
+				continuations++
+				if !strings.HasPrefix(lines[j], " =?") {
+					t.Errorf("continuation line %d missing encoded-word prefix: %q", j, lines[j])
+				}
+				if len(lines[j]) > 78 {
+					t.Errorf("continuation line %d exceeds 78 bytes: len=%d line=%q", j, len(lines[j]), lines[j])
+				}
+			}
+		}
+		if !foundSubject {
+			t.Fatal("missing Subject header line")
+		}
+		if continuations == 0 {
+			t.Fatal("expected folded Subject continuation lines for 200-rune Chinese summary")
+		}
+
+		msg, err := mail.ReadMessage(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("mail.ReadMessage failed: %v", err)
+		}
+		decoded, err := (&mime.WordDecoder{}).DecodeHeader(msg.Header.Get("Subject"))
+		if err != nil {
+			t.Fatalf("DecodeHeader failed: %v", err)
+		}
+		if decoded != wantTitle {
+			t.Fatalf("decoded Subject = %q, want %q", decoded, wantTitle)
+		}
+	})
+
+	t.Run("200-rune ASCII summary stays under 998 bytes and round-trips", func(t *testing.T) {
+		summary := strings.Repeat("a", 200)
+		n := makeNotification(summary)
+		wantTitle := "[FIRING][CRITICAL] prod / " + summary + " (+11 more)"
+
+		raw := EmailPayload("alerts@example.com", []string{"ops@example.com"}, n)
+		for i, line := range splitHeaders(t, raw) {
+			if len(line) > 998 {
+				t.Errorf("header line %d exceeds RFC 5322 998-byte limit: len=%d", i, len(line))
+			}
+		}
+
+		msg, err := mail.ReadMessage(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("mail.ReadMessage failed: %v", err)
+		}
+		decoded, err := (&mime.WordDecoder{}).DecodeHeader(msg.Header.Get("Subject"))
+		if err != nil {
+			t.Fatalf("DecodeHeader failed: %v", err)
+		}
+		if decoded != wantTitle {
+			t.Fatalf("decoded Subject = %q, want %q", decoded, wantTitle)
 		}
 	})
 }

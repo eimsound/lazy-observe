@@ -1,6 +1,7 @@
 From: alerts@example.com
 To: ops@example.com
-Subject: =?utf-8?q?[FIRING][CRITICAL]_alpha_/_node-1_=E7=A3=81=E7=9B=98=E4=BD=BF?= =?utf-8?q?=E7=94=A8=E7=8E=87_95%_(+2_more)?=
+Subject: =?utf-8?q?[FIRING][CRITICAL]_alpha_/_node-1_=E7=A3=81=E7=9B=98=E4=BD=BF?=
+ =?utf-8?q?=E7=94=A8=E7=8E=87_95%_(+2_more)?=
 Content-Type: text/plain; charset=UTF-8
 
 {

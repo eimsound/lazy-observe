@@ -426,8 +426,11 @@ func EmailPayload(from string, to []string, n Notification) []byte {
 		safeTo = append(safeTo, sanitizeEmailHeader(recipient))
 	}
 	// Rendered titles are often non-ASCII; RFC 2047 encode them (a no-op for
-	// plain ASCII) so 7-bit MTAs do not mangle the Subject header.
-	title := mime.QEncoding.Encode("utf-8", sanitizeEmailHeader(buildNotificationView(n).Title))
+	// plain ASCII) so 7-bit MTAs do not mangle the Subject header. Fold
+	// multi-word encodings with CRLF+SP (RFC 2047 §2) so long UTF-8 subjects
+	// stay within RFC 5322 §2.1.1's 998-byte line limit.
+	encoded := mime.QEncoding.Encode("utf-8", sanitizeEmailHeader(buildNotificationView(n).Title))
+	title := strings.ReplaceAll(encoded, "?= =?", "?=\r\n =?")
 	var jsonBuf bytes.Buffer
 	enc := json.NewEncoder(&jsonBuf)
 	enc.SetEscapeHTML(false)
