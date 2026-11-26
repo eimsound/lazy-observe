@@ -96,9 +96,19 @@ func newProjectIngestWindow(perMinute int, now func() time.Time) *ingestlimit.Wi
 	})
 }
 
-// publicIngestAdmission enforces the single-request byte quota plus per-project
-// and per-IP local rate limits before a handler parses payloads.
-func publicIngestAdmission(guard *publicIngestGuard) fiber.Handler {
+// publicIngestCheck is an endpoint-specific admission step (for example the
+// replay per-session quota) that publicIngestAdmission runs after the per-IP
+// quota and before the shared per-project quota. It reports true when
+// admitted; otherwise it has already written the response and the caller must
+// stop the handler chain by returning the accompanying error.
+type publicIngestCheck func(c fiber.Ctx) (bool, error)
+
+// publicIngestAdmission enforces the single-request byte quota plus local rate
+// limits before a handler parses payloads. Quotas run from the narrowest key to
+// the broadest (client IP, endpoint-specific checks, then project), so a
+// request rejected by a narrower quota never consumes the shared project quota
+// and one flooding client or session cannot starve the rest of the project.
+func publicIngestAdmission(guard *publicIngestGuard, checks ...publicIngestCheck) fiber.Handler {
 	policy := guard.policy
 	return func(c fiber.Ctx) error {
 		if policy.MaxBodyBytes > 0 && ingestPayloadBytes(c) > int64(policy.MaxBodyBytes) {
@@ -108,13 +118,18 @@ func publicIngestAdmission(guard *publicIngestGuard) fiber.Handler {
 			}
 			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": msg})
 		}
-		if project := currentProject(c); project.ID > 0 {
-			if ok, err := admitLocalIngest(c, guard.project, strconv.Itoa(project.ID), policy.RateLimitMessage); !ok {
+		if ip := strings.TrimSpace(c.IP()); ip != "" {
+			if ok, err := admitLocalIngest(c, guard.ip, ip, policy.RateLimitMessage); !ok {
 				return err
 			}
 		}
-		if ip := strings.TrimSpace(c.IP()); ip != "" {
-			if ok, err := admitLocalIngest(c, guard.ip, ip, policy.RateLimitMessage); !ok {
+		for _, check := range checks {
+			if ok, err := check(c); !ok {
+				return err
+			}
+		}
+		if project := currentProject(c); project.ID > 0 {
+			if ok, err := admitLocalIngest(c, guard.project, strconv.Itoa(project.ID), policy.RateLimitMessage); !ok {
 				return err
 			}
 		}

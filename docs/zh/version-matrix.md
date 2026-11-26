@@ -113,6 +113,8 @@ MCP（`lazy-observe mcp --dsn`）的 DSN 形状与上面相同，但 `<token>` �
 
 被拒请求返回 `429 Too Many Requests`、`Retry-After: <正整数秒>`（距当前窗口重置的秒数，下限 `1` 秒；Remote Write 并发超限固定为 `1`）与 JSON 响应体 `{"error":"<原因>"}`。客户端 IP 按 `security.trusted_proxies` 解析。
 
+Replay 与 Profile 在请求体上限之后按从细到粗的顺序检查配额：先每客户端 IP，再每 session（仅 Replay，先校验 `session_id` 与 `seq` 元数据），最后每项目。被更细维度拒绝、或 Replay 元数据无效的请求不计入项目共享配额，单个洪泛的客户端 IP 或 session 无法耗尽同项目其他客户端的配额。
+
 #### 自身 `/metrics` 端点鉴权与低基数契约
 
 `GET /metrics` 通过 `metrics_endpoint.enabled` 控制（默认 `false`，关闭时返回 `404` 且不落入前端 SPA 回退）。启用时按 fail-closed 策略鉴权：

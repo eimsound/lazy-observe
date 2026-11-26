@@ -926,7 +926,7 @@ func (g *Gateway) registerTelemetryRoutes() {
 		fiber.MethodPost,
 		"/api/replay/segments",
 		browserIngestPolicy(selfmetrics.SignalReplay),
-		publicIngestAdmission(g.replayGuard),
+		publicIngestAdmission(g.replayGuard, g.admitReplaySession),
 		g.replayIngest,
 	)
 	g.route(

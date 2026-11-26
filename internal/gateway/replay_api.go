@@ -120,26 +120,50 @@ type parsedReplaySegment struct {
 	markers    []replayMarkerDTO
 }
 
-func (g *Gateway) replayIngest(c fiber.Ctx) error {
+// replayIngestTargetLocal carries the session and sequence that
+// admitReplaySession validated and charged to replayIngest.
+const replayIngestTargetLocal = "lazy-observe.replay-ingest-target"
+
+type replayIngestTarget struct {
+	sessionID string
+	seq       int
+}
+
+// admitReplaySession is the replay-specific publicIngestCheck. It validates the
+// header/query metadata (never the body) and charges the per-session quota
+// after the per-IP quota and before the shared per-project quota, so invalid
+// requests and a single flooding session cannot exhaust the project quota.
+func (g *Gateway) admitReplaySession(c fiber.Ctx) (bool, error) {
 	if g.replays == nil || g.blobs == nil {
-		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "replay storage unavailable"})
+		return false, c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "replay storage unavailable"})
 	}
 	sessionID, seq, ok := parseReplayIngestMetadata(c)
 	if !ok {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid session_id or seq"})
+		return false, c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid session_id or seq"})
 	}
 	if seq >= maxReplaySegmentsPerSession {
-		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "replay session quota exceeded"})
+		return false, c.Status(http.StatusRequestEntityTooLarge).
+			JSON(fiber.Map{"error": "replay session quota exceeded"})
 	}
-	p := currentProject(c)
 	if ok, err := admitLocalIngest(
 		c,
 		g.replaySessionLimit,
-		strconv.Itoa(p.ID)+":"+sessionID,
+		strconv.Itoa(currentProject(c).ID)+":"+sessionID,
 		"replay session rate limit exceeded",
 	); !ok {
-		return err
+		return false, err
 	}
+	c.Locals(replayIngestTargetLocal, replayIngestTarget{sessionID: sessionID, seq: seq})
+	return true, nil
+}
+
+func (g *Gateway) replayIngest(c fiber.Ctx) error {
+	target, ok := c.Locals(replayIngestTargetLocal).(replayIngestTarget)
+	if !ok {
+		return fiber.NewError(http.StatusInternalServerError, "replay admission missing")
+	}
+	sessionID, seq := target.sessionID, target.seq
+	p := currentProject(c)
 
 	decoded, rawGzip, status, errMsg := decodeReplayBody(c)
 	if status != 0 {

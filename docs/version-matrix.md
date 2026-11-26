@@ -113,6 +113,8 @@ Independently of `ingest_rate_limit`, the gateway always enforces built-in anti-
 
 Rejected requests return `429 Too Many Requests` with `Retry-After: <positive integer seconds>` (the time until the window resets, at least `1` second; `1` for the Remote Write concurrency limit) and a JSON body `{"error":"<reason>"}`. Client IPs follow `security.trusted_proxies`.
 
+Replay and Profile check quotas from the narrowest key to the broadest after the body limit: per client IP, then per session (Replay only, after validating `session_id` and `seq` metadata), then per project. A request rejected by a narrower quota, or with invalid Replay metadata, does not count against the shared per-project quota, so one flooding client IP or session cannot exhaust it for the rest of the project.
+
 #### Self-monitoring `/metrics` authentication and low-cardinality contract
 
 `GET /metrics` is gated by `metrics_endpoint.enabled` (default `false`; returns `404` when disabled and never falls through to the frontend SPA fallback). When enabled, authentication fails closed:
