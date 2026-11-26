@@ -1,6 +1,7 @@
 package ingestlimit
 
 import (
+	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -122,5 +123,35 @@ func TestWindowConcurrentAdmissionIsExact(t *testing.T) {
 	wg.Wait()
 	if got := admitted.Load(); got != 100 {
 		t.Fatalf("admitted=%d want exactly 100", got)
+	}
+}
+
+func TestRetryAfterWindow(t *testing.T) {
+	maxTruncated := time.Duration(math.MaxInt64).Truncate(time.Second)
+	cases := []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+	}{
+		{name: "min_int64", remaining: math.MinInt64, want: time.Second},
+		{name: "negative", remaining: -5 * time.Second, want: time.Second},
+		{name: "zero", remaining: 0, want: time.Second},
+		{name: "one_ns", remaining: time.Nanosecond, want: time.Second},
+		{name: "half_second", remaining: 500 * time.Millisecond, want: time.Second},
+		{name: "just_under_1s", remaining: time.Second - 1, want: time.Second},
+		{name: "exact_1s", remaining: time.Second, want: time.Second},
+		{name: "just_over_1s", remaining: time.Second + 1, want: 2 * time.Second},
+		{name: "fractional_39_7s", remaining: 39*time.Second + 700*time.Millisecond, want: 40 * time.Second},
+		{name: "exact_40s", remaining: 40 * time.Second, want: 40 * time.Second},
+		{name: "just_under_max_whole_sec", remaining: maxTruncated - 1, want: maxTruncated},
+		{name: "exact_max_whole_sec", remaining: maxTruncated, want: maxTruncated},
+		{name: "max_int64_saturates", remaining: math.MaxInt64, want: maxTruncated},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryAfterWindow(tc.remaining); got != tc.want {
+				t.Fatalf("retryAfterWindow(%s)=%s want %s", tc.remaining, got, tc.want)
+			}
+		})
 	}
 }

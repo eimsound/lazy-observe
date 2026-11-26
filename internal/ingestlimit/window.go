@@ -1,6 +1,7 @@
 package ingestlimit
 
 import (
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -136,11 +137,11 @@ func retryAfterWindow(remaining time.Duration) time.Duration {
 	if remaining <= time.Second {
 		return time.Second
 	}
-	secs := remaining / time.Second
-	if remaining%time.Second != 0 {
-		secs++
+	truncated := remaining.Truncate(time.Second)
+	if truncated == remaining || truncated > math.MaxInt64-time.Second {
+		return truncated
 	}
-	return secs * time.Second
+	return truncated + time.Second
 }
 
 func (w *Window) sweepExpiredLocked(now time.Time) {
