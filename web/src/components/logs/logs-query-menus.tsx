@@ -19,7 +19,6 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -250,13 +249,20 @@ export function LogsDownloadMenu({
           {t("logs.download")}
         </Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>{t("logs.downloadDialogTitle")}</DialogTitle>
-          <DialogDescription>
-            {t("logs.downloadScope", { project, period })}
-          </DialogDescription>
         </DialogHeader>
+        <dl className="grid gap-y-2 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-sm sm:grid-cols-[auto_minmax(0,1fr)] sm:gap-x-4">
+          <dt className="text-muted-foreground">{t("topbar.projectSwitcher")}</dt>
+          <dd className="min-w-0 truncate font-mono text-foreground" title={project}>
+            {project}
+          </dd>
+          <dt className="text-muted-foreground">{t("logs.timeRange")}</dt>
+          <dd className="min-w-0 break-words font-mono tabular-nums text-foreground">
+            {period}
+          </dd>
+        </dl>
         <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_10rem]">
           <Label className="space-y-1.5 text-sm">
             <span>{t("logs.downloadFilename")}</span>

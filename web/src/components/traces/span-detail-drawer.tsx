@@ -122,9 +122,6 @@ export function SpanDetailDrawer({
                       <summary className="cursor-pointer text-xs font-medium text-vital-ni">
                         {t("traces.genAiCapturedContent")}
                       </summary>
-                      <p className="mt-2 text-xs text-muted-foreground">
-                        {t("traces.genAiPrivacyHint")}
-                      </p>
                       <div className="mt-3 space-y-3">
                         {genAI.inputContent && (
                           <CapturedContent label={t("traces.genAiInput")} value={genAI.inputContent} />

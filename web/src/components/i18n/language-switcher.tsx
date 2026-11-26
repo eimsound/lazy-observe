@@ -27,7 +27,7 @@ export function LanguageSwitcher() {
             key={lang.code}
             onClick={() => void i18n.changeLanguage(lang.code)}
           >
-            <span className="flex-1">{lang.label}</span>
+            <span className="optical-center flex-1">{lang.label}</span>
             {current === lang.code && <Check className="size-4" />}
           </DropdownMenuItem>
         ))}

@@ -1,7 +1,6 @@
 import {
   AlertCircle,
   Braces,
-  Database,
   Eye,
   EyeOff,
   ListTree,
@@ -9,6 +8,7 @@ import {
   Pause,
   Radio,
   Search,
+  SearchX,
   Table2,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -202,8 +202,7 @@ export function LogsResultsPanel({
         ) : !hasExecuted ? (
           <ExplorerMessage
             icon={<Search />}
-            title={t("logs.initialTitle")}
-            description={t("logs.initialDesc")}
+            title={t("common.waitingForQuery")}
           />
         ) : rowsViewState === "pending" ? (
           <div className="space-y-2">
@@ -224,9 +223,8 @@ export function LogsResultsPanel({
           />
         ) : rowsViewState === "empty" ? (
           <ExplorerMessage
-            icon={<Database />}
-            title={t("logs.emptyTitle")}
-            description={t("logs.emptyDesc")}
+            icon={<SearchX />}
+            title={t("common.noData")}
           />
         ) : (
           <>

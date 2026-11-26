@@ -9,7 +9,7 @@ import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { queryViewState } from "@/routes/query-view-state";
 
@@ -41,7 +41,6 @@ export function SessionsCard() {
           <ShieldCheck className="size-4" />
           {t("sessions.title")}
         </CardTitle>
-        <CardDescription>{t("sessions.description")}</CardDescription>
       </CardHeader>
       <CardContent>
         {viewState === "stale" && (

@@ -119,7 +119,7 @@ export function ExtraFiltersBar({
           ) : (
             <Copy className="size-3.5" aria-hidden="true" />
           )}
-          <span className="hidden sm:inline">
+          <span className="optical-center hidden sm:inline">
             {copied ? t("logs.filtersCopied") : t("logs.copyFilters")}
           </span>
         </Button>

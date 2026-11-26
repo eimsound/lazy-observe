@@ -76,7 +76,7 @@ function renderBuilderView(options: {
 }
 
 describe("PromQLBuilderView component rendering & interaction states", () => {
-  test("renders empty synced builder with metric input, add-filter CTA, and empty filters hint", () => {
+  test("renders empty synced builder with metric input, add-filter CTA, and no filter rows", () => {
     const ctrl = createBuilderController("");
     const html = renderBuilderView({ draft: ctrl.draft, status: ctrl.status });
 
@@ -85,7 +85,8 @@ describe("PromQLBuilderView component rendering & interaction states", () => {
     assert.match(html, /aria-label="展开指标候选"/);
     assert.match(html, /搜索或手动输入指标名/);
     assert.match(html, /添加筛选/);
-    assert.match(html, /未添加标签筛选条件/);
+    assert.doesNotMatch(html, /data-promql-filter-row/);
+    assert.doesNotMatch(html, /未添加标签筛选条件/);
   });
 
   test("renders populated filters, range interval, aggregation badges, and quantile after builder interactions", () => {

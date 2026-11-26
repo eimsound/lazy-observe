@@ -13,6 +13,7 @@ import {
   Play,
   Plus,
   Search,
+  SearchX,
   Settings2,
   SlidersHorizontal,
   Table2,
@@ -66,7 +67,6 @@ import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -463,11 +463,6 @@ function QueryCard({
               {t("metrics.modeCode")}
             </Button>
           </div>
-          {panel.editorMode === "builder" && (
-            <span className="text-xs text-muted-foreground">
-              {t("metrics.builder.liveSyncHint")}
-            </span>
-          )}
         </div>
 
         {panel.editorMode === "builder" && (
@@ -670,13 +665,13 @@ function QueryResult({ project, panel, executed, localTime, onRetry }: {
   });
 
   if (!executed || !range) {
-    return <ResultMessage icon={<Search />} title={t("metrics.initialTitle")} desc={t("metrics.initialDesc")} />;
+    return <ResultMessage icon={<Search />} title={t("common.waitingForQuery")} />;
   }
   if (viewState === "pending") return <div className="space-y-2"><Skeleton className="h-8 w-full" /><Skeleton className="h-[320px] w-full" /></div>;
   if (viewState === "error") {
     return <ResultMessage icon={<AlertCircle className="text-destructive" />} title={t("metrics.errorTitle")} desc={t("common.queryErrorDesc")} action={<Button variant="outline" size="sm" onClick={onRetry}>{t("common.retry")}</Button>} />;
   }
-  if (!result.data) return <ResultMessage icon={<Database />} title={t("metrics.emptyTitle")} desc={t("metrics.emptyDesc")} />;
+  if (!result.data) return <ResultMessage icon={<SearchX />} title={t("common.noData")} />;
 
   return (
     <>
@@ -698,7 +693,7 @@ function QueryResult({ project, panel, executed, localTime, onRetry }: {
               timeFormat={panel.timeFormat}
             />
           )
-          : <ResultMessage icon={<Database />} title={t("metrics.emptyTitle")} desc={t("metrics.emptyDesc")} />
+          : <ResultMessage icon={<SearchX />} title={t("common.noData")} />
         : graph.data!.data.length > 0
           ? (
             <TimeSeriesChart
@@ -714,7 +709,7 @@ function QueryResult({ project, panel, executed, localTime, onRetry }: {
               height={520}
             />
           )
-          : <ResultMessage icon={<Database />} title={t("metrics.emptyTitle")} desc={t("metrics.emptyDesc")} />}
+          : <ResultMessage icon={<SearchX />} title={t("common.noData")} />}
     </>
   );
 }
@@ -969,8 +964,8 @@ function QueryHistoryDialog({ open, history, localTime, onOpenChange, onPick, on
   const { t } = useTranslation();
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader><DialogTitle>{t("metrics.history")}</DialogTitle><DialogDescription>{t("metrics.historyProjectScoped")}</DialogDescription></DialogHeader>
+      <DialogContent className="max-w-2xl" aria-describedby={undefined}>
+        <DialogHeader><DialogTitle>{t("metrics.history")}</DialogTitle></DialogHeader>
         <div className="flex justify-end">{history.length > 0 && <Button variant="ghost" size="sm" onClick={onClear}><Trash2 />{t("metrics.clearHistory")}</Button>}</div>
         {history.length === 0 ? <p className="py-12 text-center text-sm text-muted-foreground">{t("metrics.historyEmpty")}</p> : (
           <div className="max-h-[60vh] overflow-auto rounded-md border border-border">
@@ -985,12 +980,12 @@ function QueryHistoryDialog({ open, history, localTime, onOpenChange, onPick, on
   );
 }
 
-function ResultMessage({ icon, title, desc, action }: { icon: React.ReactNode; title: string; desc: string; action?: React.ReactNode }) {
+function ResultMessage({ icon, title, desc, action }: { icon: React.ReactNode; title: string; desc?: string; action?: React.ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center gap-2 py-14 text-center">
       <div className={cn("flex size-10 items-center justify-center rounded-full bg-muted text-muted-foreground [&>svg]:size-5")}>{icon}</div>
       <div className="text-sm font-medium">{title}</div>
-      <p className="max-w-lg break-words text-xs text-muted-foreground">{desc}</p>
+      {desc && <p className="max-w-lg break-words text-xs text-muted-foreground">{desc}</p>}
       {action}
     </div>
   );

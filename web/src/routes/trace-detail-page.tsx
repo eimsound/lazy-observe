@@ -16,6 +16,7 @@ import { formatDurationMicros } from "@/lib/format";
 import { traceLatestEndMs } from "@/lib/ingesting-window";
 import { useRecentIngestNotice } from "@/hooks/use-recent-ingest-notice";
 import { PageContainer } from "@/components/layout/page";
+import { HelpTip } from "@/components/common/help-tip";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { RecentIngestNotice } from "@/components/common/recent-ingest-notice";
 import { TraceWaterfall } from "@/components/traces/trace-waterfall";
@@ -165,7 +166,10 @@ function TraceDetailBody({
             </Badge>
           )}
           <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Badge variant="secondary">{t("traces.contextualEvidence")}</Badge>
+            <span className="inline-flex items-center gap-1">
+              <Badge variant="secondary">{t("traces.contextualEvidence")}</Badge>
+              <HelpTip content={t("traces.contextualEvidenceHint")} />
+            </span>
             <Button variant="outline" size="sm" onClick={() => onViewProfiling(trace)}>
               <Flame className="size-4" />
               {t("traces.viewProfiling")}
@@ -176,7 +180,6 @@ function TraceDetailBody({
             </Button>
           </div>
         </div>
-        <p className="text-xs text-muted-foreground">{t("traces.contextualEvidenceHint")}</p>
         <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
           <Stat label={t("traces.traceId")} value={trace.traceID} mono />
           <Stat label={t("traces.totalDuration")} value={formatDurationMicros(summary.duration)} />

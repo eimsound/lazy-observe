@@ -9,7 +9,6 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -80,10 +79,9 @@ export function MetricsExplorer({ open, range, onOpenChange, onInsert }: Metrics
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl">
+      <DialogContent className="max-w-5xl" aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>{t("metrics.exploreMetrics")}</DialogTitle>
-          <DialogDescription>{t("metrics.exploreMetricsDesc")}</DialogDescription>
         </DialogHeader>
 
         {!selectedMetric ? (

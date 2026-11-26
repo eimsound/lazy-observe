@@ -230,10 +230,7 @@ function LLMContent({
       <Card>
         <CardContent className="p-4">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <div className="text-sm font-medium">{t("llm.trendTitle")}</div>
-              <div className="text-xs text-muted-foreground">{t("llm.trendHint")}</div>
-            </div>
+            <div className="text-sm font-medium">{t("llm.trendTitle")}</div>
             <Select value={trendMetric} onValueChange={(value) => setTrendMetric(value as LLMTrendMetric)}>
               <SelectTrigger className="w-40" aria-label={t("llm.trendMetric")}>
                 <SelectValue />
@@ -372,10 +369,7 @@ function CallsTable({
     <Card>
       <CardContent className="p-0">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
-          <div>
-            <div className="text-sm font-medium">{t("llm.recentCalls")}</div>
-            <div className="text-xs text-muted-foreground">{t("llm.recentCallsHint")}</div>
-          </div>
+          <div className="text-sm font-medium">{t("llm.recentCalls")}</div>
           <div className="flex flex-wrap gap-2">
             <Select value={service} onValueChange={setService}>
               <SelectTrigger className="w-44" aria-label={t("llm.service")}><SelectValue /></SelectTrigger>

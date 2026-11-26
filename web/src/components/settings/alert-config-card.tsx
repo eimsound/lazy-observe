@@ -12,20 +12,26 @@ import { useAuth } from "@/lib/auth/auth-provider";
 import { hasCapability } from "@/lib/auth/permissions";
 import { useProject } from "@/lib/project/project-provider";
 import { isForbiddenError } from "@/lib/api/errors";
+import { HelpTip } from "@/components/common/help-tip";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { queryViewState } from "@/routes/query-view-state";
 
@@ -45,12 +51,12 @@ export function AlertConfigCard() {
         <CardTitle className="flex items-center gap-2">
           <BellRing className="size-4" />
           {t("alertConfig.title")}
+          {current && (
+            <Badge variant="secondary" className="font-normal">
+              {current.name}
+            </Badge>
+          )}
         </CardTitle>
-        <CardDescription>
-          {current
-            ? t("alertConfig.subtitle", { project: current.name })
-            : t("alertConfig.noProject")}
-        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         {!projectId ? (
@@ -188,12 +194,9 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
       )}
 
       <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
-        <div>
-          <Label htmlFor="ac-new-issue" className={canManage ? "cursor-pointer" : undefined}>
-            {t("alertConfig.newIssue")}
-          </Label>
-          <p className="text-xs text-muted-foreground">{t("alertConfig.newIssueHint")}</p>
-        </div>
+        <Label htmlFor="ac-new-issue" className={canManage ? "cursor-pointer" : undefined}>
+          {t("alertConfig.newIssue")}
+        </Label>
         <Switch
           id="ac-new-issue"
           checked={draft.new_issue}
@@ -203,11 +206,11 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
       </div>
 
       <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
-        <div>
+        <div className="flex items-center gap-1.5">
           <Label htmlFor="ac-regression" className={canManage ? "cursor-pointer" : undefined}>
             {t("alertConfig.regression")}
           </Label>
-          <p className="text-xs text-muted-foreground">{t("alertConfig.regressionHint")}</p>
+          <HelpTip content={t("alertConfig.regressionHint")} />
         </div>
         <Switch
           id="ac-regression"
@@ -319,7 +322,14 @@ function AlertConfigForm({ projectId }: { projectId: string }) {
           {saved ? t("common.saved") : t("common.save")}
         </Button>
       ) : (
-        <p className="text-xs text-muted-foreground">{t("alertConfig.readOnlyHint")}</p>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex cursor-not-allowed">
+              <Button disabled>{t("common.save")}</Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{t("alertConfig.readOnlyHint")}</TooltipContent>
+        </Tooltip>
       )}
     </>
   );

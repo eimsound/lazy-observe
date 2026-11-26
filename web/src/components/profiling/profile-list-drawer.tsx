@@ -13,7 +13,6 @@ import { formatErrorMessage } from "@/lib/api/errors";
 import {
   Sheet,
   SheetContent,
-  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
@@ -73,10 +72,9 @@ export function ProfileListDrawer({
         onOpenChange(nextOpen);
       }}
     >
-      <SheetContent side="right" className="w-full sm:max-w-lg">
+      <SheetContent side="right" className="w-full sm:max-w-lg" aria-describedby={undefined}>
         <SheetHeader>
           <SheetTitle>{t("profiling.profileListTitle")}</SheetTitle>
-          <SheetDescription>{t("profiling.profileListDesc")}</SheetDescription>
         </SheetHeader>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">

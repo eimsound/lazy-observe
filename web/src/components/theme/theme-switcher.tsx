@@ -10,7 +10,6 @@ import {
   SheetContent,
   SheetHeader,
   SheetTitle,
-  SheetDescription,
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { Separator } from "@/components/ui/separator";
@@ -49,10 +48,9 @@ export function ThemeSwitcher() {
           <Palette className="size-4" />
         </Button>
       </SheetTrigger>
-      <SheetContent side="right" className="w-full sm:max-w-sm">
+      <SheetContent side="right" className="w-full sm:max-w-sm" aria-describedby={undefined}>
         <SheetHeader>
           <SheetTitle>{t("theme.title")}</SheetTitle>
-          <SheetDescription>{t("theme.panelSubtitle")}</SheetDescription>
         </SheetHeader>
 
         <div className="flex-1 overflow-y-auto p-4">

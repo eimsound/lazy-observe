@@ -617,10 +617,7 @@ function VitalsBreakdownCard({
     <Card>
       <CardContent className="p-0">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2.5">
-          <div>
-            <div className="text-sm font-medium">{t("performance.breakdownTitle")}</div>
-            <p className="text-xs text-muted-foreground">{t("performance.breakdownHint")}</p>
-          </div>
+          <div className="text-sm font-medium">{t("performance.breakdownTitle")}</div>
           <div className="flex flex-wrap items-center gap-1" role="tablist" aria-label={t("performance.breakdownTitle")}>
             {BREAKDOWN_TABS.map((tab) => (
               <Button
@@ -936,7 +933,6 @@ function EndpointsTab({ getWindow }: { getWindow: () => PerfWindow }) {
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-muted-foreground">{t("performance.endpointsHint")}</p>
       {query.data?.truncated && (
         <p className="text-xs text-vital-ni" role="status">
           {t("performance.endpointsTruncated")}

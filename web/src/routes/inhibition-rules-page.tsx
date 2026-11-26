@@ -33,6 +33,7 @@ import { EmptyState } from "@/components/common/empty-state";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { HelpTip } from "@/components/common/help-tip";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -51,7 +52,6 @@ import {
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -445,9 +445,9 @@ function MatcherListEditor({
 
   return (
     <div className="space-y-2">
-      <div>
+      <div className="flex items-center gap-1.5">
         <Label>{label}</Label>
-        <p className="mt-0.5 text-xs text-muted-foreground">{hint}</p>
+        <HelpTip content={hint} />
       </div>
       {matchers.map((m, i) => {
         const regexState =
@@ -587,12 +587,12 @@ function InhibitionFormDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
+      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto" aria-describedby={undefined}>
         <DialogHeader>
-          <DialogTitle>
+          <DialogTitle className="flex items-center gap-1.5 pr-6">
             {editing ? t("alerts.editInhibition") : t("alerts.newInhibition")}
+            <HelpTip content={t("alerts.inhibitionsSubtitle")} />
           </DialogTitle>
-          <DialogDescription>{t("alerts.inhibitionsSubtitle")}</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-5">
@@ -615,11 +615,9 @@ function InhibitionFormDialog({
           />
 
           <div className="space-y-2">
-            <div>
+            <div className="flex items-center gap-1.5">
               <Label htmlFor="inh-equal-label">{t("alerts.equalLabels")}</Label>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                {t("alerts.equalLabelsHint")}
-              </p>
+              <HelpTip content={t("alerts.equalLabelsHint")} />
             </div>
             {draft.equalLabels.length > 0 && (
               <div className="flex flex-wrap gap-1.5">

@@ -33,7 +33,9 @@ test("项目 Token 签发后才出现仅摄取说明与 DSN 片段", async ({ pa
   const origin = originOf(page);
 
   await page.getByRole("button", { name: "管理令牌" }).first().click();
-  await expect(page.getByText("仅摄取（ingest only）")).toBeVisible();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: /项目 API Token/ })).toBeVisible();
+  await expect(page.getByRole("tooltip")).toHaveCount(0);
   // The DSN requires a token value, so it must not exist before issuance.
   await expect(page.getByText(new RegExp(`/p/production@lo_`))).toHaveCount(0);
 
@@ -41,7 +43,10 @@ test("项目 Token 签发后才出现仅摄取说明与 DSN 片段", async ({ pa
   await page.getByRole("button", { name: "创建 API Token" }).click();
 
   await expect(page.getByText(new RegExp(`${escapeRegExp(origin)}/p/production@lo_`))).toBeVisible();
-  await expect(page.getByText(/查询、MCP 或 Grafana/)).toBeVisible();
+  await dialog.getByRole("button", { name: /遥测数据上报/ }).hover();
+  const tooltip = page.getByRole("tooltip").first();
+  await expect(tooltip).toContainText(/可用范围/);
+  await expect(tooltip).toContainText(/lazy-observe SDK（DSN）/);
 });
 
 test("个人 Token 签发后给出 MCP 命令与带 X-LO-Project 的 Grafana 片段", async ({ page }) => {
@@ -65,9 +70,13 @@ test("Source Map 上传 Token：创建后只显示一次并给出 los_ DSN，吊
   const origin = originOf(page);
 
   await page.getByRole("button", { name: "管理令牌" }).first().click();
-  // The ingest-only note points to the upload token for source maps.
-  await expect(page.getByText(/上传 Source Map 请改用 Source Map 上传 Token/)).toBeVisible();
-  await expect(page.getByText("Source Map 上传 Token", { exact: true })).toBeVisible();
+  const dialog = page.getByRole("dialog");
+  // The ingest-only note lists the telemetry write endpoints.
+  await dialog.getByRole("button", { name: /Source Map 上传/ }).hover();
+  const smTooltip = page.getByRole("tooltip").first();
+  await expect(smTooltip).toContainText(/可用范围/);
+  await expect(smTooltip).toContainText(/Source Map 上传/);
+  await expect(dialog.getByText("Source Map 上传 Token", { exact: true })).toBeVisible();
   await expect(page.getByText(/\/p\/production@los_/)).toHaveCount(0);
 
   await page.locator("#sm-upload-name").fill("github-actions-2");
@@ -93,6 +102,6 @@ test("非管理员看不到 Source Map 上传 Token 管理", async ({ page }) =>
   });
   await page.goto("/settings/projects");
   await page.getByRole("button", { name: "管理令牌" }).first().click();
-  await expect(page.getByText("仅摄取（ingest only）")).toBeVisible();
+  await expect(page.getByRole("heading", { name: /项目 API Token/ })).toBeVisible();
   await expect(page.locator("#sm-upload-name")).toHaveCount(0);
 });

@@ -2,6 +2,7 @@ import * as React from "react";
 import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
 import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { withOpticalText, withOpticalSlotText } from "./optical-text";
 
 const DropdownMenu = DropdownMenuPrimitive.Root;
 const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger;
@@ -30,16 +31,19 @@ const DropdownMenuItem = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & {
     inset?: boolean;
   }
->(({ className, inset, ...props }, ref) => (
+>(({ className, inset, asChild, children, ...props }, ref) => (
   <DropdownMenuPrimitive.Item
     ref={ref}
+    asChild={asChild}
     className={cn(
       "relative flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:size-4",
       inset && "pl-8",
       className,
     )}
     {...props}
-  />
+  >
+    {asChild ? withOpticalSlotText(children) : withOpticalText(children)}
+  </DropdownMenuPrimitive.Item>
 ));
 DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName;
 
@@ -61,7 +65,7 @@ const DropdownMenuCheckboxItem = React.forwardRef<
         <Check className="size-4" />
       </DropdownMenuPrimitive.ItemIndicator>
     </span>
-    {children}
+    {withOpticalText(children)}
   </DropdownMenuPrimitive.CheckboxItem>
 ));
 DropdownMenuCheckboxItem.displayName =
