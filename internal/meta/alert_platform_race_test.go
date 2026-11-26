@@ -256,19 +256,27 @@ func TestRecordPlatformErrorRateLosesFirstStateInsert(t *testing.T) {
 // if the record under test returned before it got there.
 func waitForBlockedStateInsert[T any](t *testing.T, store *Store, done <-chan T) {
 	t.Helper()
+	waitForBlockedQuery(t, store, done, `INSERT INTO platform_alert_states%`)
+}
+
+// waitForBlockedQuery waits until a backend of the test database is blocked
+// on a lock while running a statement matching the SQL LIKE pattern, failing
+// fast if the call under test returned before it got there.
+func waitForBlockedQuery[T any](t *testing.T, store *Store, done <-chan T, pattern string) {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case out := <-done:
-			t.Fatalf("record returned before blocking on the state insert: %#v", out)
+			t.Fatalf("call returned before blocking on %q: %#v", pattern, out)
 		default:
 		}
 		var blocked int
 		if err := store.db.QueryRowContext(
 			context.Background(),
 			`SELECT count(*) FROM pg_stat_activity
-			 WHERE datname = current_database() AND wait_event_type = 'Lock'
-			   AND query LIKE 'INSERT INTO platform_alert_states%'`,
+			 WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1`,
+			pattern,
 		).Scan(&blocked); err != nil {
 			t.Fatal(err)
 		}
@@ -277,5 +285,263 @@ func waitForBlockedStateInsert[T any](t *testing.T, store *Store, done <-chan T)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("record never blocked on the platform_alert_states insert")
+	t.Fatalf("call never blocked on a lock running %q", pattern)
+}
+
+// seedPlatformErrorSpike commits a project's error_rate_spike state row and,
+// when count > 0, one in-window bucket holding count occurrences.
+func seedPlatformErrorSpike(
+	t *testing.T,
+	store *Store,
+	projectID int,
+	status string,
+	cycle int64,
+	startsAt time.Time,
+	bucket time.Time,
+	count int,
+) {
+	t.Helper()
+	ctx := context.Background()
+	var endsAt any
+	if status == platformAlertStatusResolved {
+		endsAt = startsAt.Add(30 * time.Second)
+	}
+	if _, err := store.db.ExecContext(
+		ctx,
+		bind(
+			store.dialect,
+			`INSERT INTO platform_alert_states(project_id, kind, status, active_cycle, starts_at, ends_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		),
+		projectID, platformAlertKindErrorRateSpike, status, cycle, startsAt, endsAt, startsAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if count > 0 {
+		if _, err := store.db.ExecContext(
+			ctx,
+			bind(
+				store.dialect,
+				`INSERT INTO platform_error_rate_buckets(project_id, bucket_epoch, count) VALUES (?, ?, ?)`,
+			),
+			projectID,
+			alignPlatformErrorBucket(bucket),
+			count,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A recovery check must re-read the candidate's state under the row lock
+// before it sums the window (issue #392): a candidate whose row resolved,
+// moved to another cycle or vanished after it was listed is left alone, a
+// still-spiking window keeps it firing, and only a count at or below the
+// limit resolves the listed cycle.
+func TestRecoverPlatformErrorSpikeRereadsLockedState(t *testing.T) {
+	window := 5 * time.Minute
+	now := time.Date(2026, 8, 1, 12, 5, 0, 0, time.UTC)
+	startsAt := now.Add(-2 * time.Minute)
+	cases := []struct {
+		name        string
+		seedStatus  string // empty: no state row
+		seedCycle   int64
+		count       int
+		wantResolve bool
+	}{
+		{
+			name:        "count at limit resolves",
+			seedStatus:  platformAlertStatusFiring,
+			seedCycle:   1,
+			count:       5,
+			wantResolve: true,
+		},
+		{name: "still spiking", seedStatus: platformAlertStatusFiring, seedCycle: 1, count: 6},
+		{name: "resolved meanwhile", seedStatus: platformAlertStatusResolved, seedCycle: 1, count: 0},
+		{name: "next cycle meanwhile", seedStatus: platformAlertStatusFiring, seedCycle: 2, count: 0},
+		{name: "row gone meanwhile", count: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			forEachDialect(t, func(t *testing.T, store *Store) {
+				ctx := context.Background()
+				project, err := store.CreateProject(ctx, "Recovery Reread", "recovery-reread")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.seedStatus != "" {
+					seedPlatformErrorSpike(
+						t,
+						store,
+						project.ID,
+						tc.seedStatus,
+						tc.seedCycle,
+						startsAt,
+						now.Add(-time.Minute),
+						tc.count,
+					)
+				}
+				before := platformSpikeStateRow(t, store, project.ID)
+				// The candidate as listed before the state moved: firing cycle 1.
+				candidate := platformErrorSpikeCandidate{
+					projectID:   project.ID,
+					projectSlug: project.Slug,
+					cycle:       1,
+					startsAt:    startsAt,
+					threshold:   1, // per minute: limit is 5 over the 5-minute window
+				}
+				got, resolved, err := store.recoverPlatformErrorSpike(
+					ctx,
+					candidate,
+					alignPlatformErrorBucket(now.Add(-window)),
+					now,
+					window,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				after := platformSpikeStateRow(t, store, project.ID)
+				if !tc.wantResolve {
+					if resolved || !reflect.DeepEqual(after, before) {
+						t.Fatalf("resolved=%v recovery=%#v state=%#v want untouched %#v", resolved, got, after, before)
+					}
+					return
+				}
+				want := PlatformErrorSpikeRecovery{
+					ProjectID:   project.ID,
+					ProjectSlug: project.Slug,
+					Cycle:       1,
+					StartsAt:    startsAt,
+					EndsAt:      now,
+					Count:       tc.count,
+					Threshold:   1,
+				}
+				if !resolved || !reflect.DeepEqual(got, want) {
+					t.Fatalf("resolved=%v recovery=%#v want %#v", resolved, got, want)
+				}
+				if after == nil || after.Status != platformAlertStatusResolved || after.Cycle != 1 ||
+					after.EndsAt == nil || !after.EndsAt.Equal(now) {
+					t.Fatalf("state=%#v want resolved cycle 1 ending at %v", after, now)
+				}
+			})
+		})
+	}
+}
+
+// A recovery check racing an uncommitted writer that holds the firing state
+// row must wait for that writer and sum the window it committed (issue #392):
+// a writer that pushed the window back over the limit keeps the spike firing,
+// while one that rolled back leaves the stale count, which resolves it.
+// PostgreSQL only: SQLite serializes the whole write transaction.
+func TestCheckPlatformErrorRateRecoveriesWaitsForStateLock(t *testing.T) {
+	window := 5 * time.Minute
+	now := time.Date(2026, 8, 1, 12, 5, 0, 0, time.UTC)
+	startsAt := now.Add(-2 * time.Minute)
+	cases := []struct {
+		name        string
+		commit      bool
+		wantResolve bool
+	}{
+		{name: "writer commits spike", commit: true},
+		{name: "writer rolls back", commit: false, wantResolve: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			forEachDialect(t, func(t *testing.T, store *Store) {
+				if store.dialect != dialect.Postgres {
+					t.Skip("only PostgreSQL runs concurrent metadata write transactions")
+				}
+				ctx := context.Background()
+				project, err := store.CreateProject(ctx, "Recovery Lock", "recovery-lock")
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Committed: firing cycle 1 with 3 occurrences, below the limit of 5.
+				seedPlatformErrorSpike(
+					t,
+					store,
+					project.ID,
+					platformAlertStatusFiring,
+					1,
+					startsAt,
+					now.Add(-time.Minute),
+					3,
+				)
+				// threshold 1/min: the limit is 5 over the 5-minute window.
+				if _, err := store.PutProjectAlertConfig(ctx, project.ID, ProjectAlertConfigUpdate{
+					ErrorRateThresholdPerMinute: 1,
+				}); err != nil {
+					t.Fatal(err)
+				}
+
+				// The writer adds 3 more occurrences in a newer bucket and holds the
+				// state row lock, as recordProjectErrorRate does before it commits.
+				writer, err := store.db.BeginTx(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer writer.Rollback()
+				if _, err := writer.ExecContext(
+					ctx,
+					`INSERT INTO platform_error_rate_buckets(project_id, bucket_epoch, count) VALUES ($1, $2, 3)`,
+					project.ID, alignPlatformErrorBucket(now.Add(-30*time.Second)),
+				); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := writer.ExecContext(
+					ctx,
+					`SELECT status FROM platform_alert_states WHERE project_id = $1 AND kind = $2 FOR UPDATE`,
+					project.ID, platformAlertKindErrorRateSpike,
+				); err != nil {
+					t.Fatal(err)
+				}
+
+				type outcome struct {
+					recoveries []PlatformErrorSpikeRecovery
+					err        error
+				}
+				done := make(chan outcome, 1)
+				go func() {
+					recoveries, err := store.CheckPlatformErrorRateRecoveries(ctx, now, window)
+					done <- outcome{recoveries: recoveries, err: err}
+				}()
+
+				waitForBlockedQuery(
+					t,
+					store,
+					done,
+					`SELECT status, active_cycle, starts_at FROM platform_alert_states%FOR UPDATE`,
+				)
+				if tc.commit {
+					err = writer.Commit()
+				} else {
+					err = writer.Rollback()
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := <-done
+				if got.err != nil {
+					t.Fatalf("recovery check failed: %v", got.err)
+				}
+				state := platformSpikeStateRow(t, store, project.ID)
+				if !tc.wantResolve {
+					if len(got.recoveries) != 0 {
+						t.Fatalf("recoveries=%#v want none: the committed window is still spiking", got.recoveries)
+					}
+					if state == nil || state.Status != platformAlertStatusFiring || state.Cycle != 1 ||
+						state.EndsAt != nil {
+						t.Fatalf("state=%#v want still firing cycle 1", state)
+					}
+					return
+				}
+				if len(got.recoveries) != 1 || got.recoveries[0].Cycle != 1 || got.recoveries[0].Count != 3 {
+					t.Fatalf("recoveries=%#v want cycle 1 resolved at count 3", got.recoveries)
+				}
+				if state == nil || state.Status != platformAlertStatusResolved || state.Cycle != 1 {
+					t.Fatalf("state=%#v want resolved cycle 1", state)
+				}
+			})
+		})
+	}
 }

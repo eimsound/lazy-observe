@@ -602,72 +602,100 @@ func (s *Store) CheckPlatformErrorRateRecoveries(
 
 	var recoveries []PlatformErrorSpikeRecovery
 	for _, c := range candidates {
-		tx, err := s.db.BeginTx(ctx, nil)
+		recovery, resolved, err := s.recoverPlatformErrorSpike(ctx, c, cutoffBucket, now, window)
 		if err != nil {
-			return nil, fmt.Errorf("begin platform spike recovery tx: %w", err)
+			return nil, err
 		}
-		if _, err := tx.ExecContext(
-			ctx,
-			bind(s.dialect, `DELETE FROM platform_error_rate_buckets WHERE project_id = ? AND bucket_epoch < ?`),
-			c.projectID,
-			cutoffBucket,
-		); err != nil {
-			_ = tx.Rollback()
-			return nil, fmt.Errorf("prune expired platform buckets on recovery: %w", err)
-		}
-		var totalCount int
-		if err := tx.QueryRowContext(
-			ctx,
-			bind(
-				s.dialect,
-				`SELECT COALESCE(SUM(count), 0) FROM platform_error_rate_buckets WHERE project_id = ? AND bucket_epoch >= ?`,
-			),
-			c.projectID,
-			cutoffBucket,
-		).Scan(&totalCount); err != nil {
-			_ = tx.Rollback()
-			return nil, fmt.Errorf("sum platform buckets on recovery: %w", err)
-		}
-		limit := c.threshold * int(window/time.Minute)
-		stillSpiking := c.threshold > 0 && totalCount > limit
-		if stillSpiking {
-			_ = tx.Rollback()
-			continue
-		}
-		res, err := tx.ExecContext(
-			ctx,
-			bind(
-				s.dialect,
-				`UPDATE platform_alert_states SET status = 'resolved', ends_at = ?, updated_at = ?
-				 WHERE project_id = ? AND kind = ? AND status = 'firing' AND active_cycle = ?`,
-			),
-			now, now, c.projectID, platformAlertKindErrorRateSpike, c.cycle,
-		)
-		if err != nil {
-			_ = tx.Rollback()
-			return nil, fmt.Errorf("resolve platform spike state: %w", err)
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			_ = tx.Rollback()
-			return nil, fmt.Errorf("read platform spike recovery result: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, fmt.Errorf("commit platform spike recovery: %w", err)
-		}
-		if affected > 0 {
-			recoveries = append(recoveries, PlatformErrorSpikeRecovery{
-				ProjectID:   c.projectID,
-				ProjectSlug: c.projectSlug,
-				Cycle:       c.cycle,
-				StartsAt:    c.startsAt,
-				EndsAt:      now,
-				Count:       totalCount,
-				Threshold:   c.threshold,
-			})
+		if resolved {
+			recoveries = append(recoveries, recovery)
 		}
 	}
 	return recoveries, nil
+}
+
+// recoverPlatformErrorSpike resolves one listed firing candidate if its
+// window count is at or below threshold. The state row is locked after the
+// expired buckets are pruned and before the window is summed, keeping the
+// buckets-then-state lock order of recordProjectErrorRate, so on PostgreSQL
+// the sum includes every writer that committed ahead of this one on the row
+// and a stale count cannot resolve a spike a concurrent writer just kept
+// firing (issue #392). A candidate whose row is gone, no longer firing or on
+// another cycle by the time the lock is taken is left untouched.
+func (s *Store) recoverPlatformErrorSpike(
+	ctx context.Context,
+	c platformErrorSpikeCandidate,
+	cutoffBucket int64,
+	now time.Time,
+	window time.Duration,
+) (PlatformErrorSpikeRecovery, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PlatformErrorSpikeRecovery{}, false, fmt.Errorf("begin platform spike recovery tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(
+		ctx,
+		bind(s.dialect, `DELETE FROM platform_error_rate_buckets WHERE project_id = ? AND bucket_epoch < ?`),
+		c.projectID,
+		cutoffBucket,
+	); err != nil {
+		return PlatformErrorSpikeRecovery{}, false, fmt.Errorf("prune expired platform buckets on recovery: %w", err)
+	}
+	state, err := s.lockPlatformErrorSpikeState(ctx, tx, c.projectID)
+	if err != nil {
+		return PlatformErrorSpikeRecovery{}, false, err
+	}
+	if !state.exists || state.status != platformAlertStatusFiring || state.cycle != c.cycle {
+		return PlatformErrorSpikeRecovery{}, false, nil
+	}
+	var totalCount int
+	if err := tx.QueryRowContext(
+		ctx,
+		bind(
+			s.dialect,
+			`SELECT COALESCE(SUM(count), 0) FROM platform_error_rate_buckets WHERE project_id = ? AND bucket_epoch >= ?`,
+		),
+		c.projectID,
+		cutoffBucket,
+	).Scan(&totalCount); err != nil {
+		return PlatformErrorSpikeRecovery{}, false, fmt.Errorf("sum platform buckets on recovery: %w", err)
+	}
+	limit := c.threshold * int(window/time.Minute)
+	if c.threshold > 0 && totalCount > limit {
+		return PlatformErrorSpikeRecovery{}, false, nil
+	}
+	res, err := tx.ExecContext(
+		ctx,
+		bind(
+			s.dialect,
+			`UPDATE platform_alert_states SET status = 'resolved', ends_at = ?, updated_at = ?
+			 WHERE project_id = ? AND kind = ? AND status = 'firing' AND active_cycle = ?`,
+		),
+		now, now, c.projectID, platformAlertKindErrorRateSpike, c.cycle,
+	)
+	if err != nil {
+		return PlatformErrorSpikeRecovery{}, false, fmt.Errorf("resolve platform spike state: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return PlatformErrorSpikeRecovery{}, false, fmt.Errorf("read platform spike recovery result: %w", err)
+	}
+	if affected == 0 {
+		return PlatformErrorSpikeRecovery{}, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return PlatformErrorSpikeRecovery{}, false, fmt.Errorf("commit platform spike recovery: %w", err)
+	}
+	return PlatformErrorSpikeRecovery{
+		ProjectID:   c.projectID,
+		ProjectSlug: c.projectSlug,
+		Cycle:       c.cycle,
+		StartsAt:    state.startsAt,
+		EndsAt:      now,
+		Count:       totalCount,
+		Threshold:   c.threshold,
+	}, true, nil
 }
 
 // ClearPlatformErrorRateState resets a project's error-rate buckets and, if an
