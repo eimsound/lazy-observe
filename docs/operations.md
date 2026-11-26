@@ -263,6 +263,8 @@ With an administrator account, also check `GET /api/system/error-inbox` to confi
 3. After every preflight check prints `PASS`, roll the replicas:
    - **Kubernetes and Helm.** The chart uses `RollingUpdate` and `PodDisruptionBudget`. The `pre-stop` hook sends `SIGUSR1` so `/readyz` returns `503`, waits through the endpoint-removal window, and then sends `SIGTERM` for graceful shutdown.
    - **Non-Kubernetes multi-replica hosts.** Upgrade one host at a time. Send `SIGUSR1` and wait for the front-end load balancer to drain traffic, send `SIGTERM`, replace the binary or image, start the instance, wait until `/readyz` returns `200`, and then proceed to the next host.
+
+   > Keep `self_monitoring.enabled`, `self_monitoring.web`, and `self_monitoring.web_replay` identical across all HA replicas during rolling upgrades. Starting any replica with `self_monitoring.web: false` (or `self_monitoring.enabled: false`) revokes the shared `self-monitoring-web` token that other running replicas serve to signed-in browsers.
 4. Once all replicas are ready, confirm alert rule evaluation, notification delivery, and `vmagent` leader handover in logs and `/healthz`.
 
 ### 4.4 Rollback

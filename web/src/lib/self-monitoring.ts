@@ -165,19 +165,25 @@ function activateClient(
   }
 }
 
-async function fetchSelfMonitoringConfig(fetchImpl: typeof fetch): Promise<WebSelfMonitoringConfig | null> {
+type ConfigFetchResult =
+  | { kind: "enabled"; config: WebSelfMonitoringConfig }
+  | { kind: "disabled" }
+  | { kind: "transient_error" };
+
+async function fetchSelfMonitoringConfig(fetchImpl: typeof fetch): Promise<ConfigFetchResult> {
   try {
     const response = await fetchImpl(SELF_MONITORING_CONFIG_PATH, {
       credentials: "same-origin",
       cache: "no-store",
     });
     if (!response.ok) {
-      return null;
+      return { kind: "transient_error" };
     }
     const payload: unknown = await response.json();
-    return parseWebSelfMonitoringConfig(payload);
+    const config = parseWebSelfMonitoringConfig(payload);
+    return config ? { kind: "enabled", config } : { kind: "disabled" };
   } catch {
-    return null;
+    return { kind: "transient_error" };
   }
 }
 
@@ -216,18 +222,23 @@ export function clearSelfMonitoringSessionStorage(
   }
 }
 
-export function bootstrapWebSelfMonitoring(
+interface BootstrapOutcome {
+  client: BrowserClient | null;
+  retryable: boolean;
+}
+
+function bootstrapWithOutcome(
   deps: SelfMonitoringBootstrapDeps = {},
   state?: SelfMonitoringState,
-): Promise<BrowserClient | null> {
+): Promise<BootstrapOutcome> {
   const isMock = deps.isMock ?? IS_MOCK;
   if (isMock) {
-    return Promise.resolve(null);
+    return Promise.resolve({ client: null, retryable: false });
   }
   const origin =
     deps.origin ?? (typeof window !== "undefined" ? window.location.origin : "");
   if (!origin) {
-    return Promise.resolve(null);
+    return Promise.resolve({ client: null, retryable: false });
   }
   const initClient = deps.initClient ?? init;
   const fetchImpl =
@@ -236,28 +247,51 @@ export function bootstrapWebSelfMonitoring(
       ? window.fetch.bind(window)
       : undefined);
   if (!fetchImpl) {
-    return Promise.resolve(null);
+    return Promise.resolve({ client: null, retryable: false });
   }
   const startGeneration = state?.generation ?? 0;
-  return fetchSelfMonitoringConfig(fetchImpl).then((cfg) => {
-    if (!cfg) {
-      return null;
-    }
+  return fetchSelfMonitoringConfig(fetchImpl).then((result) => {
     if (state && state.generation !== startGeneration) {
-      return null;
+      return { client: null, retryable: false };
     }
-    return activateClient(origin, cfg, initClient, state);
+    if (result.kind === "transient_error") {
+      return { client: null, retryable: true };
+    }
+    if (result.kind === "disabled") {
+      return { client: null, retryable: false };
+    }
+    return {
+      client: activateClient(origin, result.config, initClient, state),
+      retryable: false,
+    };
   });
 }
 
-export function initWebSelfMonitoring(): Promise<BrowserClient | null> {
-  if (typeof window === "undefined") {
+export function bootstrapWebSelfMonitoring(
+  deps: SelfMonitoringBootstrapDeps = {},
+  state?: SelfMonitoringState,
+): Promise<BrowserClient | null> {
+  return bootstrapWithOutcome(deps, state).then((outcome) => outcome.client);
+}
+
+export function initWebSelfMonitoring(
+  deps: SelfMonitoringBootstrapDeps = {},
+  state: SelfMonitoringState = defaultState,
+): Promise<BrowserClient | null> {
+  if (deps.origin === undefined && typeof window === "undefined") {
     return Promise.resolve(null);
   }
-  if (!defaultState.promise) {
-    defaultState.promise = bootstrapWebSelfMonitoring({}, defaultState);
+  if (!state.promise) {
+    const startGeneration = state.generation;
+    const pending = bootstrapWithOutcome(deps, state).then((outcome) => {
+      if (outcome.retryable && state.generation === startGeneration && state.promise === pending) {
+        state.promise = null;
+      }
+      return outcome.client;
+    });
+    state.promise = pending;
   }
-  return defaultState.promise;
+  return state.promise;
 }
 
 export function teardownWebSelfMonitoring(

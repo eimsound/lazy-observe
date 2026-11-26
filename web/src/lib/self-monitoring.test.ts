@@ -6,6 +6,7 @@ import {
   buildSelfMonitoringDsn,
   clearSelfMonitoringSessionStorage,
   filterSelfMonitoringError,
+  initWebSelfMonitoring,
   normalizeSelfMonitoringRoutePage,
   parseWebSelfMonitoringConfig,
   SELF_MONITORING_CONFIG_PATH,
@@ -243,6 +244,142 @@ test("bootstrapWebSelfMonitoring skips initialization in mock mode, 401/network 
     }) as typeof fetch,
   });
   assert.equal(failedClient, null);
+});
+
+test("initWebSelfMonitoring retries after transient failures, caches explicit disabled, and guards generation races", async () => {
+  // 1) Transient 503 clears state.promise so a subsequent call retries and activates.
+  let calls503 = 0;
+  const state503: SelfMonitoringState = {
+    promise: null,
+    client: null,
+    pendingPage: "/logs",
+    generation: 0,
+  };
+  const deps503 = {
+    origin: "http://127.0.0.1:3100",
+    isMock: false,
+    fetchImpl: (async () => {
+      calls503 += 1;
+      if (calls503 === 1) {
+        return new Response("unavailable", { status: 503 });
+      }
+      return new Response(
+        JSON.stringify({
+          enabled: true,
+          project_slug: "lazy-observe",
+          token: "lo_retry_after_503",
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch,
+    initClient: () => fakeClient([]),
+  };
+  assert.equal(await initWebSelfMonitoring(deps503, state503), null);
+  assert.equal(state503.promise, null);
+  const recovered503 = await initWebSelfMonitoring(deps503, state503);
+  assert.ok(recovered503);
+  assert.equal(calls503, 2);
+
+  // 2) Network rejection also clears state.promise so a subsequent call retries.
+  let callsNet = 0;
+  const stateNet: SelfMonitoringState = {
+    promise: null,
+    client: null,
+    pendingPage: null,
+    generation: 0,
+  };
+  const depsNet = {
+    origin: "http://127.0.0.1:3100",
+    isMock: false,
+    fetchImpl: (async () => {
+      callsNet += 1;
+      if (callsNet === 1) {
+        throw new Error("temporary network error");
+      }
+      return new Response(
+        JSON.stringify({
+          enabled: true,
+          project_slug: "lazy-observe",
+          token: "lo_retry_after_network",
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch,
+    initClient: () => fakeClient([]),
+  };
+  assert.equal(await initWebSelfMonitoring(depsNet, stateNet), null);
+  assert.equal(stateNet.promise, null);
+  const recoveredNet = await initWebSelfMonitoring(depsNet, stateNet);
+  assert.ok(recoveredNet);
+  assert.equal(callsNet, 2);
+
+  // 3) Explicit { enabled: false } stays settled/cached without re-fetching.
+  let callsDisabled = 0;
+  const stateDisabled: SelfMonitoringState = {
+    promise: null,
+    client: null,
+    pendingPage: null,
+    generation: 0,
+  };
+  const depsDisabled = {
+    origin: "http://127.0.0.1:3100",
+    isMock: false,
+    fetchImpl: (async () => {
+      callsDisabled += 1;
+      return new Response(JSON.stringify({ enabled: false }), { status: 200 });
+    }) as typeof fetch,
+    initClient: () => fakeClient([]),
+  };
+  assert.equal(await initWebSelfMonitoring(depsDisabled, stateDisabled), null);
+  assert.notEqual(stateDisabled.promise, null);
+  assert.equal(await initWebSelfMonitoring(depsDisabled, stateDisabled), null);
+  assert.equal(callsDisabled, 1);
+
+  // 4) Stale transient failure from an earlier generation must not clear the newer generation's promise.
+  const stateRace: SelfMonitoringState = {
+    promise: null,
+    client: null,
+    pendingPage: null,
+    generation: 0,
+  };
+  let resolveFirst!: (resp: Response) => void;
+  const firstCall = initWebSelfMonitoring(
+    {
+      origin: "http://127.0.0.1:3100",
+      isMock: false,
+      fetchImpl: (() =>
+        new Promise<Response>((resolve) => {
+          resolveFirst = resolve;
+        })) as typeof fetch,
+      initClient: () => fakeClient([]),
+    },
+    stateRace,
+  );
+  teardownWebSelfMonitoring(stateRace, new MemoryStorage());
+  let resolveSecond!: (resp: Response) => void;
+  const secondCall = initWebSelfMonitoring(
+    {
+      origin: "http://127.0.0.1:3100",
+      isMock: false,
+      fetchImpl: (() =>
+        new Promise<Response>((resolve) => {
+          resolveSecond = resolve;
+        })) as typeof fetch,
+      initClient: () => fakeClient([]),
+    },
+    stateRace,
+  );
+  const secondPromiseRef = stateRace.promise;
+  resolveFirst(new Response("unavailable", { status: 503 }));
+  assert.equal(await firstCall, null);
+  assert.equal(stateRace.promise, secondPromiseRef);
+  resolveSecond(
+    new Response(
+      JSON.stringify({ enabled: true, project_slug: "lazy-observe", token: "lo_gen2_token" }),
+      { status: 200 },
+    ),
+  );
+  assert.ok(await secondCall);
 });
 
 test("teardownWebSelfMonitoring closes client, cancels in-flight bootstrap, and clears SDK sessionStorage keys", async () => {

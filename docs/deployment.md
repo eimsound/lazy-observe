@@ -116,6 +116,8 @@ The example configuration lists canonical path-shaped environment variable names
 | `self_monitoring.web_replay` | `false` | Enable error-only Session Replay (`onErrorOnly`) for web self-monitoring when `self_monitoring.enabled` and `self_monitoring.web` are `true` |
 | `self_monitoring.profiling` | `false` | Enable continuous profiling for the long-running gateway process |
 
+> In multi-replica HA deployments (including during rolling upgrades), configure `self_monitoring.enabled`, `self_monitoring.web`, and `self_monitoring.web_replay` identically across every replica sharing the same metadata database. Starting any replica with `self_monitoring.web: false` (or `self_monitoring.enabled: false`) revokes the shared `self-monitoring-web` token that other running replicas serve to signed-in browsers.
+
 ### Retention, blob, alert, and process fields
 
 | YAML field | Default | Meaning |

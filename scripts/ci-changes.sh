@@ -53,6 +53,7 @@ flags=(go build e2e ha web meta_pg arm64 sdk_go sdk_node sdk_browser sdk_python 
 #   - sdk/python/**  → python
 #   - sdk/browser/** → browser
 #   - web/**         → browser       （只有 browser journey 登录嵌入的前端）
+#   - scripts/e2e-web-self-monitoring.mjs → browser （Web 控制台自观测真实 Chromium 门禁）
 # sdk_journeys 为 false 时它也是空，ci.yml 里没有 job 会读它。
 
 # 打包链路：动到这些路径时额外跑 arm64 构建与冒烟（以及 amd64 构建与冒烟）。
@@ -221,6 +222,11 @@ classify() {
     ;;
   scripts/download-storage-bins.sh)
     set_flags go e2e ha sdk_journeys
+    ;;
+  # Web 控制台自观测真实 Chromium 门禁由 sdk-journeys.sh（browser 阶段）执行。
+  scripts/e2e-web-self-monitoring.mjs)
+    set_flags go
+    set_journeys browser
     ;;
   scripts/e2e*)
     set_flags go e2e

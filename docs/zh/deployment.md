@@ -116,6 +116,8 @@ cp config.example.yaml config.yaml
 | `self_monitoring.web_replay` | `false` | 在 `self_monitoring.enabled` 与 `self_monitoring.web` 均启用时，为 Web 控制台自监控开启仅报错时录制的 Session Replay（`onErrorOnly`） |
 | `self_monitoring.profiling` | `false` | 为常驻网关进程开启持续性能剖析 |
 
+> 在多副本 HA 部署（含滚动升级期间）中，共享同一元数据数据库的全部副本必须保持 `self_monitoring.enabled`、`self_monitoring.web` 与 `self_monitoring.web_replay` 配置一致。任意副本若以 `self_monitoring.web: false`（或 `self_monitoring.enabled: false`）启动，都会在启动引导阶段吊销其他在线副本正在下发给已登录浏览器的共享 `self-monitoring-web` Token。
+
 ### 保留策略、对象存储、告警与进程配置
 
 | YAML 字段 | 默认值 | 说明 |

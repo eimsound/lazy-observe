@@ -263,6 +263,8 @@ curl -fsS http://127.0.0.1:3100/api/traces/services \
 3. 预检全部 `PASS` 后滚动更新副本：
    - Kubernetes / Helm：默认启用 `RollingUpdate` 与 `PodDisruptionBudget`，配合 `pre-stop` 钩子先发 `SIGUSR1` 让 `/readyz` 返回 `503`，等端点摘流窗口结束后再发 `SIGTERM` 优雅关闭；
    - 非 Kubernetes 多副本主机：逐台滚动升级。先发 `SIGUSR1` 等待前置负载均衡摘流，再发 `SIGTERM` 停机，替换二进制或镜像后启动并等待 `/readyz` 返回 `200`，随后再升级下一台。
+
+   > 滚动升级期间，全部 HA 副本必须保持 `self_monitoring.enabled`、`self_monitoring.web` 与 `self_monitoring.web_replay` 配置一致。若任意副本以 `self_monitoring.web: false`（或 `self_monitoring.enabled: false`）启动，都会吊销其他在线副本正在下发给已登录浏览器的共享 `self-monitoring-web` Token。
 4. 全部副本就绪后，在日志与 `/healthz` 中确认告警规则评估、通知投递与 `vmagent` 选主切换正常。
 
 ### 4.4 回滚步骤

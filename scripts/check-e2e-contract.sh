@@ -131,7 +131,8 @@ rg -Fq 'sdk_journeys_only: ${{ steps.detect.outputs.sdk_journeys_only }}' "$ci" 
 rg -Fq 'kill -TERM -- "-$pgid"' "$journeys_script" && rg -Fq 'kill -KILL -- "-$pgid"' "$journeys_script" ||
   fail 'sdk-journeys.sh cleanup must TERM and then KILL the whole process group of the platform and each journey'
 for path in sdk/go/e2e.sh sdk/node/e2e.sh sdk/python/e2e.sh sdk/browser/e2e/performance-journey.spec.ts \
-  cmd/lazy-observe/main.go internal/gateway/router.go web/src/App.tsx go.mod scripts/sdk-journeys.sh; do
+  cmd/lazy-observe/main.go internal/gateway/router.go web/src/App.tsx go.mod scripts/sdk-journeys.sh \
+  scripts/e2e-web-self-monitoring.mjs; do
   flags_out=$(printf '%s\n' "$path" | bash "$changes_script" --stdin 2>/dev/null)
   [[ $'\n'$flags_out$'\n' == *$'\n'sdk_journeys=true$'\n'* ]] || fail "SDK journeys do not trigger on $path"
 done

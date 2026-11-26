@@ -146,6 +146,7 @@ expect_flag 'sdk/browser/packages/browser/src/index.ts' sdk_browser web build sd
 expect_flag 'sdk/python/lazy_observe/__init__.py' sdk_python sdk_journeys
 expect_flag 'sdk/scripts/sdk-publish.sh' go sdk_go sdk_node sdk_browser sdk_python sdk_journeys
 expect_flag 'scripts/sdk-journeys.sh' go sdk_journeys
+expect_flag 'scripts/e2e-web-self-monitoring.mjs' go sdk_journeys
 
 # --- 5.5 Zensical 文档站变更面（纯文档站不触发重型业务 job；docs/pyproject.toml 同时触发 go 的 7 天发布年龄校验） ---
 expect_only_flags 'docs/index.md' docs
