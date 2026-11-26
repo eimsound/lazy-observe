@@ -99,6 +99,19 @@ MCP（`lazy-observe mcp --dsn`）的 DSN 形状与上面相同，但 `<token>` �
 - **HTTP 摄入路由**：超限时在转发至上游存储前拒绝，返回 `429 Too Many Requests`、`Retry-After: <正整数秒>`（下限 `1` 秒、上限 `300` 秒）与脱敏 JSON 响应体 `{"code":"ingest_rate_limited","error":"project ingest rate limit exceeded"}`。
 - **OTLP/gRPC 摄入服务**：复用同一限流器实例，超限时返回 gRPC `codes.ResourceExhausted` 并附带 `google.rpc.RetryInfo`（`retry_delay` 为正整数秒）。
 - 不同项目的令牌桶严格隔离，单个项目触发限速不影响其他项目。
+- **单副本语义**：阈值由每个应用副本各自独立执行，不访问 Redis。多副本 HA 下单个项目的有效上限约为 `单副本阈值 × 应用副本数`；如需跨副本的严格全局配额，请在网关前端的反向代理、Ingress 或负载均衡器上实施。
+
+#### 端点级反滥用配额
+
+在 `ingest_rate_limit` 之外，网关对公开或大载荷摄入端点始终开启内置反滥用配额。每项配额都是单个应用副本进程内、按分钟固定窗口计数、键集合有界的本地限流，从不访问 Redis，Redis 故障不会使摄入返回 `503`：
+
+| 端点 | 请求体上限 | 单副本配额 |
+|---|---|---|
+| `POST /api/replay/segments` | 单段 5 MiB | 每项目 600/min、每客户端 IP 300/min、每 session 120/min |
+| `POST /api/profiles` | 剖析文件 10 MiB，另加 1 MiB multipart 余量 | 每项目 120/min、每客户端 IP 240/min |
+| `POST /api/v1/write`（Prometheus Remote Write） | 解压后 8 MiB | 并发 16、每项目 600/min |
+
+被拒请求返回 `429 Too Many Requests`、`Retry-After: <正整数秒>`（距当前窗口重置的秒数，下限 `1` 秒；Remote Write 并发超限固定为 `1`）与 JSON 响应体 `{"error":"<原因>"}`。客户端 IP 按 `security.trusted_proxies` 解析。
 
 #### 自身 `/metrics` 端点鉴权与低基数契约
 

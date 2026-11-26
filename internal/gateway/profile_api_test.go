@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -661,11 +662,16 @@ func TestProfileIngestFutureClampMetadataBoundsAndRateLimit(t *testing.T) {
 	}
 	badLbl.Body.Close()
 
-	// Rate limit enforced with 429 + Retry-After.
-	denyApp := newMetadataTestGateway(store, Config{
-		Tokens: store, Store: store, Profiles: store, Blobs: blobs,
-		Limits: fixedAllowLimiter{allowed: false},
-	}).App()
+	// Per-replica local project quota enforced with 429 + Retry-After even while
+	// the shared Redis limiter is down; ingest never consults it (ADR 0020).
+	shared := &unavailableSharedLimiter{}
+	denyGW := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs, Limits: shared,
+		Now: func() time.Time { return fixedNow },
+	})
+	denyGW.profileGuard.project = newLocalIngestWindow(1, denyGW.now)
+	denyApp := denyGW.App()
+	uploadProfileFixture(t, denyApp, token, "svc", "cpu", data, http.StatusCreated).Body.Close()
 	var rlBody bytes.Buffer
 	w := multipart.NewWriter(&rlBody)
 	part, _ := w.CreateFormFile("profile", "profile.pb.gz")
@@ -678,19 +684,25 @@ func TestProfileIngestFutureClampMetadataBoundsAndRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rlResp.StatusCode != http.StatusTooManyRequests || rlResp.Header.Get("Retry-After") == "" {
+	// fixedNow never advances, so the window resets 60s after the first admission.
+	if rlResp.StatusCode != http.StatusTooManyRequests || rlResp.Header.Get("Retry-After") != "60" {
 		t.Fatalf("rate limit status=%d retry=%q", rlResp.StatusCode, rlResp.Header.Get("Retry-After"))
 	}
 	rlResp.Body.Close()
+	if n := shared.calls.Load(); n != 0 {
+		t.Fatalf("profile ingest consulted shared Redis limiter %d times", n)
+	}
 }
 
-type fixedAllowLimiter struct {
-	allowed bool
-	err     error
+// unavailableSharedLimiter models an unreachable Redis behind g.limits.
+// Telemetry ingest admission must never consult it (ADR 0020).
+type unavailableSharedLimiter struct {
+	calls atomic.Int64
 }
 
-func (l fixedAllowLimiter) Allow(context.Context, string, int, time.Duration) (bool, error) {
-	return l.allowed, l.err
+func (l *unavailableSharedLimiter) Allow(context.Context, string, int, time.Duration) (bool, error) {
+	l.calls.Add(1)
+	return false, errors.New("redis unavailable")
 }
 
 func TestProfileFlamegraphWindowBoundsHeterogeneousAndSnapshotAverage(t *testing.T) {
@@ -878,23 +890,6 @@ func TestDeleteProjectCleansProfileAndReplayBlobs(t *testing.T) {
 	}
 }
 
-type keyMatchLimiter struct {
-	denyPrefix string
-	errPrefix  string
-	seenKeys   []string
-}
-
-func (l *keyMatchLimiter) Allow(_ context.Context, key string, _ int, _ time.Duration) (bool, error) {
-	l.seenKeys = append(l.seenKeys, key)
-	if l.errPrefix != "" && strings.HasPrefix(key, l.errPrefix) {
-		return false, errors.New("limiter backend unavailable")
-	}
-	if l.denyPrefix != "" && strings.HasPrefix(key, l.denyPrefix) {
-		return false, nil
-	}
-	return true, nil
-}
-
 type failingCreateProfileStore struct {
 	ProfileStore
 	err error
@@ -953,36 +948,26 @@ func TestProfileIngestSampleTypeIPLimitAndRollback(t *testing.T) {
 		http.StatusUnprocessableEntity,
 	).Body.Close()
 
-	// 2. Per-IP rate limit enforced via unified publicIngestAdmission guard.
-	ipLimiter := &keyMatchLimiter{denyPrefix: "profile:ingest:ip:"}
-	ipApp := newMetadataTestGateway(store, Config{
-		Tokens: store, Store: store, Profiles: store, Blobs: blobs, Limits: ipLimiter,
-	}).App()
+	// 2. Per-IP local quota enforced by publicIngestAdmission while the shared
+	// Redis limiter is down: no fail-closed 503 and no shared-limiter calls.
+	shared := &unavailableSharedLimiter{}
+	ipGW := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Profiles: store, Blobs: blobs, Limits: shared,
+	})
+	ipGW.profileGuard.ip = newLocalIngestWindow(1, ipGW.now)
+	ipApp := ipGW.App()
 	validData := writeProfile(t, syntheticProfile(11, "main.work", "main.main"))
+	uploadProfileFixture(t, ipApp, token, "svc", "cpu", validData, http.StatusCreated).Body.Close()
 	ipResp := uploadProfileFixture(t, ipApp, token, "svc", "cpu", validData, http.StatusTooManyRequests)
 	if ipResp.Header.Get("Retry-After") == "" {
 		t.Fatalf("expected Retry-After header on IP rate limit")
 	}
-	ipResp.Body.Close()
-	sawProject, sawIP := false, false
-	for _, k := range ipLimiter.seenKeys {
-		if strings.HasPrefix(k, "profile:ingest:project:") {
-			sawProject = true
-		}
-		if strings.HasPrefix(k, "profile:ingest:ip:") {
-			sawIP = true
-		}
+	if body := readBody(ipResp); !strings.Contains(string(body), "profile ingest rate limit exceeded") {
+		t.Fatalf("IP rate limit body=%s", body)
 	}
-	if !sawProject || !sawIP {
-		t.Fatalf("expected both project and IP limiter checks, got keys=%v", ipLimiter.seenKeys)
+	if n := shared.calls.Load(); n != 0 {
+		t.Fatalf("profile ingest consulted shared Redis limiter %d times", n)
 	}
-
-	// 3. Limiter backend failure fails closed with 503.
-	errApp := newMetadataTestGateway(store, Config{
-		Tokens: store, Store: store, Profiles: store, Blobs: blobs,
-		Limits: &keyMatchLimiter{errPrefix: "profile:ingest:ip:"},
-	}).App()
-	uploadProfileFixture(t, errApp, token, "svc", "cpu", validData, http.StatusServiceUnavailable).Body.Close()
 
 	// 4. DB metadata failure rolls back the uploaded profile blob so no orphan remains.
 	failApp := newMetadataTestGateway(store, Config{

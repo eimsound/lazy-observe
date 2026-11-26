@@ -52,12 +52,7 @@ const userLocal = "lazy-observe.user"
 // amount of memory one request may claim.
 const maxDecodedRequestBody = 52 << 20
 
-const (
-	maxRemoteWriteDecodedBody     = storagepkg.DefaultRemoteWriteMaxDecodedBytes
-	defaultRemoteWriteConcurrency = 16
-	defaultRemoteWriteRateLimit   = 600
-	defaultRemoteWriteRateWindow  = time.Minute
-)
+const maxRemoteWriteDecodedBody = storagepkg.DefaultRemoteWriteMaxDecodedBytes
 
 const (
 	defaultReadTimeout     = 60 * time.Second
@@ -318,21 +313,26 @@ type Gateway struct {
 	domainStores
 	gatewayAI
 
-	proxy                *storageProxy
-	client               *http.Client
-	storage              storagepkg.SignalBackend
-	gzipPassthrough      gzipPassthroughPolicy
-	metrics              *storagepkg.MetricsClient
-	querier              *query.StorageQuerier
-	mcpBaseURL           string
-	webUI                fs.FS
-	instrumentation      fiber.Handler
-	meterProvider        metric.MeterProvider
-	ingestLimiter        *ingestlimit.Limiter
-	selfMetrics          *selfmetrics.Registry
-	metricsEndpoint      metricsEndpointState
-	remoteWriteSem       chan struct{}
-	remoteWriteRateLimit int
+	proxy           *storageProxy
+	client          *http.Client
+	storage         storagepkg.SignalBackend
+	gzipPassthrough gzipPassthroughPolicy
+	metrics         *storagepkg.MetricsClient
+	querier         *query.StorageQuerier
+	mcpBaseURL      string
+	webUI           fs.FS
+	instrumentation fiber.Handler
+	meterProvider   metric.MeterProvider
+	ingestLimiter   *ingestlimit.Limiter
+	selfMetrics     *selfmetrics.Registry
+	metricsEndpoint metricsEndpointState
+	remoteWriteSem  chan struct{}
+
+	// Process-local endpoint anti-abuse limiters (ADR 0020); never Redis-backed.
+	replayGuard        *publicIngestGuard
+	replaySessionLimit *ingestlimit.Window
+	profileGuard       *publicIngestGuard
+	remoteWriteLimit   *ingestlimit.Window
 
 	registeredRoutes []registeredRoute
 	registeredIndex  map[string]routePolicy
@@ -539,15 +539,19 @@ func New(cfg Config) *Gateway {
 			MaxBytes:       metricsInstantQueryMaxBytes,
 			BodyDrainLimit: metricsBodyDrainLimit,
 		}),
-		mcpBaseURL:           cfg.MCPBaseURL,
-		webUI:                cfg.WebUI,
-		instrumentation:      cfg.Instrumentation,
-		meterProvider:        cfg.MeterProvider,
-		ingestLimiter:        cfg.IngestLimiter,
-		selfMetrics:          cfg.SelfMetrics,
-		metricsEndpoint:      newMetricsEndpointState(cfg.MetricsEndpoint),
-		remoteWriteSem:       make(chan struct{}, defaultRemoteWriteConcurrency),
-		remoteWriteRateLimit: defaultRemoteWriteRateLimit,
+		mcpBaseURL:      cfg.MCPBaseURL,
+		webUI:           cfg.WebUI,
+		instrumentation: cfg.Instrumentation,
+		meterProvider:   cfg.MeterProvider,
+		ingestLimiter:   cfg.IngestLimiter,
+		selfMetrics:     cfg.SelfMetrics,
+		metricsEndpoint: newMetricsEndpointState(cfg.MetricsEndpoint),
+		remoteWriteSem:  make(chan struct{}, defaultRemoteWriteConcurrency),
+
+		replayGuard:        newPublicIngestGuard(replayIngestPolicy, cfg.Now),
+		replaySessionLimit: newLocalIngestWindow(replaySessionRateLimit, cfg.Now),
+		profileGuard:       newPublicIngestGuard(profileIngestPolicy, cfg.Now),
+		remoteWriteLimit:   newProjectIngestWindow(defaultRemoteWriteRateLimit, cfg.Now),
 	}
 	g.querier = query.NewStorageQuerier(query.StorageQuerierConfig{
 		Backend:        g.storage,
@@ -922,14 +926,14 @@ func (g *Gateway) registerTelemetryRoutes() {
 		fiber.MethodPost,
 		"/api/replay/segments",
 		browserIngestPolicy(selfmetrics.SignalReplay),
-		g.publicIngestAdmission(replayIngestPolicy),
+		publicIngestAdmission(g.replayGuard),
 		g.replayIngest,
 	)
 	g.route(
 		fiber.MethodPost,
 		"/api/profiles",
 		projectIngestPolicy(selfmetrics.SignalProfiles),
-		g.publicIngestAdmission(profileIngestPolicy),
+		publicIngestAdmission(g.profileGuard),
 		g.profileIngest,
 	)
 	g.route(fiber.MethodGet, "/api/profiles/services", projectQuery, g.listProfileServices)
@@ -1464,23 +1468,8 @@ func (g *Gateway) metricsRemoteWrite(c fiber.Ctx) error {
 		}
 	}
 	p := currentProject(c)
-	if g.limits != nil && g.remoteWriteRateLimit > 0 {
-		allowed, limitErr := g.limits.Allow(
-			c.Context(),
-			"remote-write:project:"+strconv.Itoa(p.ID),
-			g.remoteWriteRateLimit,
-			defaultRemoteWriteRateWindow,
-		)
-		if limitErr != nil {
-			g.logger.Warn("remote-write rate limit check failed", "project", p.Slug, "error", limitErr)
-			return c.Status(fiber.StatusServiceUnavailable).
-				JSON(fiber.Map{"error": "rate limiter temporarily unavailable"})
-		}
-		if !allowed {
-			c.Set(fiber.HeaderRetryAfter, "1")
-			return c.Status(fiber.StatusTooManyRequests).
-				JSON(fiber.Map{"error": "remote-write rate limit exceeded"})
-		}
+	if ok, err := admitLocalIngest(c, g.remoteWriteLimit, strconv.Itoa(p.ID), "remote-write rate limit exceeded"); !ok {
+		return err
 	}
 	raw := requestBody(c)
 	if len(raw) > maxRemoteWriteDecodedBody {

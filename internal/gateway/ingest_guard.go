@@ -8,8 +8,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/gofiber/fiber/v3"
+
+	"github.com/eimsound/lazy-observe/internal/ingestlimit"
 )
 
+// Endpoint anti-abuse guardrails (ADR 0020). Every quota below is enforced in
+// process by one application replica; it never touches Redis, so the effective
+// HA ceiling scales with the replica count.
 const (
 	maxIngestClockSkew = 5 * time.Minute
 
@@ -20,13 +25,17 @@ const (
 	replayProjectRateLimit = 600
 	replayIPRateLimit      = 300
 	replaySessionRateLimit = 120
+
+	defaultRemoteWriteConcurrency = 16
+	defaultRemoteWriteRateLimit   = 600
+
+	localIngestRateWindow = time.Minute
 )
 
 var (
 	minIngestTimestamp = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	profileIngestPolicy = publicIngestPolicy{
-		Scope:               "profile",
 		MaxBodyBytes:        maxProfileSize + maxProfileMultipartOverhead,
 		ProjectPerMinute:    profileProjectRateLimit,
 		IPPerMinute:         profileIPRateLimit,
@@ -35,7 +44,6 @@ var (
 	}
 
 	replayIngestPolicy = publicIngestPolicy{
-		Scope:               "replay",
 		MaxBodyBytes:        maxReplaySegment,
 		ProjectPerMinute:    replayProjectRateLimit,
 		IPPerMinute:         replayIPRateLimit,
@@ -47,7 +55,6 @@ var (
 // publicIngestPolicy defines the unified admission bounds for public
 // project-token ingest endpoints (profiling and browser replay).
 type publicIngestPolicy struct {
-	Scope               string
 	MaxBodyBytes        int
 	ProjectPerMinute    int
 	IPPerMinute         int
@@ -55,9 +62,44 @@ type publicIngestPolicy struct {
 	BodyTooLargeMessage string
 }
 
-// publicIngestAdmission enforces single-request byte quotas plus per-project
-// and per-IP rate limits backed by g.limits before a handler parses payloads.
-func (g *Gateway) publicIngestAdmission(policy publicIngestPolicy) fiber.Handler {
+// publicIngestGuard binds a policy to this gateway's process-local limiters.
+// Each dimension owns a separate bounded limiter so churn in one key space
+// (for example many client IPs) cannot evict counters of another.
+type publicIngestGuard struct {
+	policy  publicIngestPolicy
+	project *ingestlimit.Window
+	ip      *ingestlimit.Window
+}
+
+func newPublicIngestGuard(policy publicIngestPolicy, now func() time.Time) *publicIngestGuard {
+	return &publicIngestGuard{
+		policy:  policy,
+		project: newProjectIngestWindow(policy.ProjectPerMinute, now),
+		ip:      newLocalIngestWindow(policy.IPPerMinute, now),
+	}
+}
+
+// newLocalIngestWindow builds a per-minute limiter for high-cardinality keys
+// (client IPs, replay sessions), bounded by ingestlimit.DefaultMaxWindowKeys.
+func newLocalIngestWindow(perMinute int, now func() time.Time) *ingestlimit.Window {
+	return ingestlimit.NewWindow(ingestlimit.WindowConfig{Limit: perMinute, Window: localIngestRateWindow, Now: now})
+}
+
+// newProjectIngestWindow builds a per-minute limiter keyed by project ID,
+// bounded like ingest_rate_limit's default max_tracked_projects.
+func newProjectIngestWindow(perMinute int, now func() time.Time) *ingestlimit.Window {
+	return ingestlimit.NewWindow(ingestlimit.WindowConfig{
+		Limit:   perMinute,
+		Window:  localIngestRateWindow,
+		MaxKeys: ingestlimit.DefaultMaxTrackedProjects,
+		Now:     now,
+	})
+}
+
+// publicIngestAdmission enforces the single-request byte quota plus per-project
+// and per-IP local rate limits before a handler parses payloads.
+func publicIngestAdmission(guard *publicIngestGuard) fiber.Handler {
+	policy := guard.policy
 	return func(c fiber.Ctx) error {
 		if policy.MaxBodyBytes > 0 && ingestPayloadBytes(c) > int64(policy.MaxBodyBytes) {
 			msg := policy.BodyTooLargeMessage
@@ -66,50 +108,31 @@ func (g *Gateway) publicIngestAdmission(policy publicIngestPolicy) fiber.Handler
 			}
 			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": msg})
 		}
-		if g.limits != nil {
-			project := currentProject(c)
-			if policy.ProjectPerMinute > 0 && project.ID > 0 {
-				if allowed, err := g.allowIngestRate(
-					c,
-					policy.Scope+":ingest:project:"+strconv.Itoa(project.ID),
-					policy.ProjectPerMinute,
-					policy.RateLimitMessage,
-				); !allowed {
-					return err
-				}
+		if project := currentProject(c); project.ID > 0 {
+			if ok, err := admitLocalIngest(c, guard.project, strconv.Itoa(project.ID), policy.RateLimitMessage); !ok {
+				return err
 			}
-			if policy.IPPerMinute > 0 {
-				if ip := strings.TrimSpace(c.IP()); ip != "" {
-					if allowed, err := g.allowIngestRate(
-						c,
-						policy.Scope+":ingest:ip:"+ip,
-						policy.IPPerMinute,
-						policy.RateLimitMessage,
-					); !allowed {
-						return err
-					}
-				}
+		}
+		if ip := strings.TrimSpace(c.IP()); ip != "" {
+			if ok, err := admitLocalIngest(c, guard.ip, ip, policy.RateLimitMessage); !ok {
+				return err
 			}
 		}
 		return c.Next()
 	}
 }
 
-func (g *Gateway) allowIngestRate(c fiber.Ctx, key string, limit int, message string) (bool, error) {
-	if g.limits == nil || limit <= 0 {
+// admitLocalIngest is the single admission point for endpoint anti-abuse
+// quotas. It reports true when admitted; otherwise it writes 429 with a
+// Retry-After header set to the seconds until the key's window resets, and
+// the caller must stop the handler chain by returning the accompanying error.
+func admitLocalIngest(c fiber.Ctx, limiter *ingestlimit.Window, key, message string) (bool, error) {
+	decision := limiter.Allow(key)
+	if decision.Allowed {
 		return true, nil
 	}
-	allowed, err := g.limits.Allow(c.Context(), key, limit, time.Minute)
-	if err != nil {
-		g.logger.Warn("ingest rate limiter error", "key", key, "error", err)
-		return false, c.Status(http.StatusServiceUnavailable).
-			JSON(fiber.Map{"error": "rate limiter temporarily unavailable"})
-	}
-	if !allowed {
-		c.Set(fiber.HeaderRetryAfter, "60")
-		return false, c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": message})
-	}
-	return true, nil
+	c.Set(fiber.HeaderRetryAfter, strconv.FormatInt(ingestlimit.RetryAfterSeconds(decision.RetryAfter), 10))
+	return false, c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": message})
 }
 
 // clampIngestTimestamp clamps client-supplied timestamps to [1970-01-01Z, now+5m]

@@ -840,11 +840,16 @@ func TestReplayIngestAndReadDecoupledFromBlobListAndGuardLimits(t *testing.T) {
 		t, app, token, "many-events", 0, []byte(hugeEvents.String()), false, http.StatusRequestEntityTooLarge,
 	)
 
-	// 4. Unified publicIngestAdmission enforces per-IP rate limit (429 + Retry-After) and fail-closed 503.
-	ipLimiter := &keyMatchLimiter{denyPrefix: "replay:ingest:ip:"}
-	ipApp := newMetadataTestGateway(store, Config{
-		Tokens: store, Store: store, Replays: store, Blobs: localBlobs, Limits: ipLimiter,
-	}).App()
+	// 4. publicIngestAdmission enforces the per-replica local per-IP quota
+	// (429 + Retry-After + CORS) while the shared Redis limiter is down: no
+	// fail-closed 503 and no shared-limiter calls (ADR 0020).
+	shared := &unavailableSharedLimiter{}
+	ipGW := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: localBlobs, Limits: shared,
+	})
+	ipGW.replayGuard.ip = newLocalIngestWindow(1, ipGW.now)
+	ipApp := ipGW.App()
+	uploadReplay(t, ipApp, token, "rl-ip-first", 0, seg0, false, http.StatusAccepted)
 	req := httptest.NewRequest(http.MethodPost, "/api/replay/segments?session_id=rl-ip&seq=0", bytes.NewReader(seg0))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Origin", "https://app.example.test")
@@ -861,11 +866,19 @@ func TestReplayIngestAndReadDecoupledFromBlobListAndGuardLimits(t *testing.T) {
 	}
 	rlResp.Body.Close()
 
-	errApp := newMetadataTestGateway(store, Config{
-		Tokens: store, Store: store, Replays: store, Blobs: localBlobs,
-		Limits: &keyMatchLimiter{errPrefix: "replay:ingest:project:"},
-	}).App()
-	uploadReplay(t, errApp, token, "rl-err", 0, seg0, false, http.StatusServiceUnavailable)
+	// 5. Per-session local quota: the same session is throttled while a new
+	// session from the same project and IP is still admitted.
+	sessionGW := newMetadataTestGateway(store, Config{
+		Tokens: store, Store: store, Replays: store, Blobs: localBlobs, Limits: shared,
+	})
+	sessionGW.replaySessionLimit = newLocalIngestWindow(1, sessionGW.now)
+	sessionApp := sessionGW.App()
+	uploadReplay(t, sessionApp, token, "rl-session", 0, seg0, false, http.StatusAccepted)
+	uploadReplay(t, sessionApp, token, "rl-session", 1, seg0, false, http.StatusTooManyRequests)
+	uploadReplay(t, sessionApp, token, "rl-session-other", 0, seg0, false, http.StatusAccepted)
+	if n := shared.calls.Load(); n != 0 {
+		t.Fatalf("replay ingest consulted shared Redis limiter %d times", n)
+	}
 }
 
 func gzipWithComment(t *testing.T, data []byte, comment string, level int) []byte {
