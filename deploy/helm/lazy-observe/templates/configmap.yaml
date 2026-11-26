@@ -42,6 +42,10 @@ data:
       startup_timeout: {{ .Values.process.startupTimeout }}
       shutdown_timeout: {{ .Values.process.shutdownTimeout }}
       drain_timeout: {{ .Values.process.drainTimeout }}
+    {{- with (.Values.errorInbox | default dict).receiptRetention }}
+    error_inbox:
+      receipt_retention: {{ . | quote }}
+    {{- end }}
     {{- $keyMounted := include "lazy-observe.encryptionKey.mounted" . }}
     {{- $adminMounted := include "lazy-observe.adminPassword.mounted" . }}
     security:

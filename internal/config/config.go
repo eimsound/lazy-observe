@@ -264,6 +264,21 @@ type ErrorInbox struct {
 	MaxBytes       int64 `yaml:"max_bytes"`
 	ReadinessItems int64 `yaml:"readiness_items"`
 	ReadinessBytes int64 `yaml:"readiness_bytes"`
+	// ReceiptRetention bounds how long completed error-processing receipts are
+	// kept for at-least-once deduplication. Zero (omitted) inherits
+	// retention.logs; standalone/HA deployments should match it to the external
+	// VictoriaLogs retention because retention.logs only drives embedded storage.
+	ReceiptRetention Duration `yaml:"receipt_retention"`
+}
+
+// EffectiveErrorInboxReceiptRetention returns the completed error-receipt
+// retention, falling back to retention.logs when error_inbox.receipt_retention
+// is unset.
+func (c Config) EffectiveErrorInboxReceiptRetention() time.Duration {
+	if c.ErrorInbox.ReceiptRetention > 0 {
+		return c.ErrorInbox.ReceiptRetention.Value()
+	}
+	return c.Retention.Logs.Value()
 }
 
 // Process groups runtime-tuning knobs for the embedded storage supervisor.
@@ -545,6 +560,11 @@ func bindFlags(fs *pflag.FlagSet, cfg *Config, configPath *string) {
 		"error-inbox-readiness-bytes",
 		cfg.ErrorInbox.ReadinessBytes,
 		"durable error Inbox byte readiness threshold",
+	)
+	fs.Var(
+		&cfg.ErrorInbox.ReceiptRetention,
+		"error-inbox-receipt-retention",
+		"completed error receipt deduplication retention (0 inherits logs retention)",
 	)
 	fs.Var(&cfg.Process.StartupTimeout, "storage-startup-timeout", "per-component startup deadline")
 	fs.Var(&cfg.Process.ShutdownTimeout, "storage-shutdown-timeout", "component shutdown deadline")
@@ -889,20 +909,21 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		}
 	}
 	canonicalDurations := map[string]*Duration{
-		"LO_META_MIGRATION_LOCK_TIMEOUT": &c.Meta.MigrationLockTimeout,
-		"LO_RETENTION_METRICS":           &c.Retention.Metrics,
-		"LO_RETENTION_LOGS":              &c.Retention.Logs,
-		"LO_RETENTION_TRACES":            &c.Retention.Traces,
-		"LO_RETENTION_REPLAY":            &c.Retention.Replay,
-		"LO_RETENTION_SOURCEMAPS":        &c.Retention.SourceMaps,
-		"LO_RETENTION_ALERT_EVENTS":      &c.Retention.AlertEvents,
-		"LO_RETENTION_PROFILES":          &c.Retention.Profiles,
-		"LO_PROCESS_STARTUP_TIMEOUT":     &c.Process.StartupTimeout,
-		"LO_PROCESS_SHUTDOWN_TIMEOUT":    &c.Process.ShutdownTimeout,
-		"LO_PROCESS_RESTART_INITIAL":     &c.Process.RestartInitial,
-		"LO_PROCESS_RESTART_MAX":         &c.Process.RestartMax,
-		"LO_PROCESS_DRAIN_TIMEOUT":       &c.Process.DrainTimeout,
-		"LO_SECURITY_AUDIT_RETENTION":    &c.Security.AuditRetention,
+		"LO_META_MIGRATION_LOCK_TIMEOUT":   &c.Meta.MigrationLockTimeout,
+		"LO_RETENTION_METRICS":             &c.Retention.Metrics,
+		"LO_RETENTION_LOGS":                &c.Retention.Logs,
+		"LO_RETENTION_TRACES":              &c.Retention.Traces,
+		"LO_RETENTION_REPLAY":              &c.Retention.Replay,
+		"LO_RETENTION_SOURCEMAPS":          &c.Retention.SourceMaps,
+		"LO_RETENTION_ALERT_EVENTS":        &c.Retention.AlertEvents,
+		"LO_RETENTION_PROFILES":            &c.Retention.Profiles,
+		"LO_ERROR_INBOX_RECEIPT_RETENTION": &c.ErrorInbox.ReceiptRetention,
+		"LO_PROCESS_STARTUP_TIMEOUT":       &c.Process.StartupTimeout,
+		"LO_PROCESS_SHUTDOWN_TIMEOUT":      &c.Process.ShutdownTimeout,
+		"LO_PROCESS_RESTART_INITIAL":       &c.Process.RestartInitial,
+		"LO_PROCESS_RESTART_MAX":           &c.Process.RestartMax,
+		"LO_PROCESS_DRAIN_TIMEOUT":         &c.Process.DrainTimeout,
+		"LO_SECURITY_AUDIT_RETENTION":      &c.Security.AuditRetention,
 	}
 	for name, dst := range canonicalDurations {
 		if v, ok := lookup(name); ok {
@@ -1146,6 +1167,9 @@ func (c Config) Validate() error {
 		c.ErrorInbox.ReadinessBytes <= 0 || c.ErrorInbox.ReadinessItems > c.ErrorInbox.MaxItems ||
 		c.ErrorInbox.ReadinessBytes > c.ErrorInbox.MaxBytes {
 		return errors.New("error Inbox capacity and readiness thresholds are invalid")
+	}
+	if c.ErrorInbox.ReceiptRetention < 0 {
+		return errors.New("error_inbox.receipt_retention must be positive (omit or set 0 to inherit retention.logs)")
 	}
 	if c.Retention.Metrics <= 0 || c.Retention.Logs <= 0 || c.Retention.Traces <= 0 || c.Retention.Replay <= 0 ||
 		c.Retention.SourceMaps <= 0 ||

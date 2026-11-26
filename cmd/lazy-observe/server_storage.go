@@ -145,13 +145,19 @@ func signalStorageEndpoints(
 			IngestURL: cfg.Storage.Traces.IngestURL,
 		}
 		logger.Warn(
-			"signal retention settings ignored in standalone mode; external storage owns retention",
+			"retention.{metrics,logs,traces} apply only to embedded storage and are ignored in standalone mode; "+
+				"external storage owns signal retention, while the gateway still prunes completed error receipts "+
+				"after error_inbox.receipt_retention, which should match the external VictoriaLogs retention",
 			"metrics",
 			cfg.Retention.Metrics,
 			"logs",
 			cfg.Retention.Logs,
 			"traces",
 			cfg.Retention.Traces,
+			"error_inbox_receipt_retention",
+			cfg.EffectiveErrorInboxReceiptRetention(),
+			"error_inbox_receipt_retention_inherited",
+			cfg.ErrorInbox.ReceiptRetention == 0,
 		)
 	}
 	return queryURL, ingestURL, logsEndpoint, tracesEndpoint

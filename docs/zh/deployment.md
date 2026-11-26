@@ -145,6 +145,7 @@ cp config.example.yaml config.yaml
 | `error_inbox.max_bytes` | `1073741824` | 持久化错误 Inbox 字节上限（1 GiB），超出后返回 `503` 与 `Retry-After` |
 | `error_inbox.readiness_items` | `80000` | 触发就绪探针降级的错误 Inbox 条目阈值 |
 | `error_inbox.readiness_bytes` | `838860800` | 触发就绪探针降级的错误 Inbox 字节阈值（800 MiB） |
+| `error_inbox.receipt_retention` | 空（继承 `retention.logs`） | 已完成错误回执的保留时长，用于对至少一次重投做去重；显式设置时必须为正。Standalone/HA 模式下应与外部 VictoriaLogs 保留期一致 |
 | `process.startup_timeout` | `20s` | 单个受管子进程启动健康检查超时 |
 | `process.shutdown_timeout` | `15s` | 受管子进程关停超时 |
 | `process.restart_initial` | `1s` | 受管子进程重启退避初始间隔（抖动前） |
@@ -327,7 +328,7 @@ Jaeger API 没有单次请求开关。对接外部 VictoriaTraces 时，链路�
 
 VictoriaLogs 与 VictoriaTraces 请求沿用官方文档定义的单节点路径，网关会在读写两侧把客户端传入的 `AccountID`/`ProjectID` 请求头替换为鉴权后的项目租户标识。
 
-Standalone 模式下，指标、日志与链路的保留周期由外部存储自行管理；平台保留策略继续负责清理会话回放、Source Map、告警事件、性能剖析与已关闭 Issue。
+Standalone 模式下，指标、日志与链路的保留周期由外部存储自行管理，`retention.metrics`、`retention.logs`、`retention.traces` 只作用于内嵌存储，此时会被忽略；平台保留策略继续负责清理会话回放、Source Map、告警事件、性能剖析与已关闭 Issue。网关还会按 `error_inbox.receipt_retention`（默认继承 `retention.logs`）清理已完成的错误回执，请将其设为与外部 VictoriaLogs `-retentionPeriod` 相同的值，使错误去重窗口与原始错误事件的可查询时长一致。启动日志会以告警形式打印实际生效值。
 
 ## 查询 API、MCP 与 Grafana
 
@@ -508,7 +509,7 @@ blob:
 
 ## 数据保留策略
 
-保留时长按信号全局生效，不按项目区分。单机嵌入式（All-in-One）模式下，三项 Victoria 保留时长会作为启动参数传给对应子进程。平台内置的 1 小时清理任务会删除过期的平台元数据与 Blob。开启 `retention.issues_closed` 时，已关闭 Issue 的保留期固定为 90 天。
+保留时长按信号全局生效，不按项目区分。单机嵌入式（All-in-One）模式下，三项 Victoria 保留时长会作为启动参数传给对应子进程。平台内置的 1 小时清理任务会删除过期的平台元数据与 Blob。开启 `retention.issues_closed` 时，已关闭 Issue 的保留期固定为 90 天。已完成的错误回执用于对至少一次重投做去重，按 `error_inbox.receipt_retention` 清理；未设置时继承 `retention.logs`，All-in-One 行为保持不变。
 
 调短保留时长会让更早的数据进入引擎或清理器删除范围；若历史数据仍有用，请先备份。
 

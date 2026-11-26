@@ -222,7 +222,7 @@ func buildRetentionJanitor(
 	)
 	retentionJanitor.Register(
 		"error_receipts",
-		cfg.Retention.Logs.Value(),
+		cfg.EffectiveErrorInboxReceiptRetention(),
 		janitor.ErrorReceipts{Metadata: metadata.store},
 	)
 	retentionJanitor.Register(

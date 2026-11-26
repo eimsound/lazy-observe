@@ -205,3 +205,19 @@ func TestJanitorPerTaskTimeoutAndPanicRecovery(t *testing.T) {
 		t.Fatalf("coordinator lock releases=%d want 1", coord.releases.Load())
 	}
 }
+
+func TestRetentionReportsRegisteredTaskPeriod(t *testing.T) {
+	j := New(slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour)
+	j.Register("receipts", 30*24*time.Hour, &recordingTask{})
+	j.Register("skipped", 0, &recordingTask{})
+
+	if got, ok := j.Retention("receipts"); !ok || got != 30*24*time.Hour {
+		t.Fatalf("Retention(receipts)=%v,%v want 720h,true", got, ok)
+	}
+	if got, ok := j.Retention("skipped"); ok {
+		t.Fatalf("non-positive retention must not register a task, got %v", got)
+	}
+	if _, ok := j.Retention("missing"); ok {
+		t.Fatal("unknown task must report ok=false")
+	}
+}

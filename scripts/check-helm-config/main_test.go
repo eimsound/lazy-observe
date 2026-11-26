@@ -177,3 +177,23 @@ func TestValidateManifestBytesRejectsMissingConfigMap(t *testing.T) {
 		t.Fatal("expected manifest without ConfigMap to fail")
 	}
 }
+
+func TestValidateManifestBytesErrorInboxReceiptRetention(t *testing.T) {
+	withReceipt := strings.Replace(
+		validStandaloneManifest,
+		"      drain_timeout: 25s\n",
+		"      drain_timeout: 25s\n    error_inbox:\n      receipt_retention: \"30d\"\n",
+		1,
+	)
+	if withReceipt == validStandaloneManifest {
+		t.Fatal("fixture replacement did not apply")
+	}
+	if err := validateManifestBytes("receipt.yaml", []byte(withReceipt)); err != nil {
+		t.Fatalf("expected error_inbox.receipt_retention to pass config.Load, got: %v", err)
+	}
+	negative := strings.Replace(withReceipt, `receipt_retention: "30d"`, `receipt_retention: "-1h"`, 1)
+	err := validateManifestBytes("receipt-negative.yaml", []byte(negative))
+	if err == nil || !strings.Contains(err.Error(), "error_inbox.receipt_retention") {
+		t.Fatalf("expected negative error_inbox.receipt_retention to fail Validate(), got: %v", err)
+	}
+}

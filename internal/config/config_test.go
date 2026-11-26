@@ -1225,3 +1225,78 @@ func TestExternalURLPrecedenceAndValidation(t *testing.T) {
 		t.Fatal("invalid external_url with subpath should fail validation")
 	}
 }
+
+func TestErrorInboxReceiptRetentionInheritsLogsAndOverrides(t *testing.T) {
+	defaults := Defaults()
+	if defaults.ErrorInbox.ReceiptRetention != 0 {
+		t.Fatalf("receipt retention must default to unset, got %v", defaults.ErrorInbox.ReceiptRetention)
+	}
+	if got := defaults.EffectiveErrorInboxReceiptRetention(); got != 14*24*time.Hour {
+		t.Fatalf("default effective receipt retention=%v want retention.logs 336h", got)
+	}
+
+	inherited, _, err := Load([]string{"--logs-retention", "21d"}, mapLookup(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := inherited.EffectiveErrorInboxReceiptRetention(); got != 21*24*time.Hour {
+		t.Fatalf("unset receipt retention must inherit retention.logs, got %v", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(
+		path,
+		[]byte("retention:\n  logs: 7d\nerror_inbox:\n  receipt_retention: 30d\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	fromYAML, _, err := Load([]string{"--config", path}, mapLookup(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromYAML.Retention.Logs.Value() != 7*24*time.Hour ||
+		fromYAML.EffectiveErrorInboxReceiptRetention() != 30*24*time.Hour {
+		t.Fatalf("explicit YAML receipt retention must not follow retention.logs: logs=%v receipts=%v",
+			fromYAML.Retention.Logs, fromYAML.EffectiveErrorInboxReceiptRetention())
+	}
+
+	env := map[string]string{"LO_ERROR_INBOX_RECEIPT_RETENTION": "45d"}
+	fromEnv, _, err := Load([]string{"--config", path}, mapLookup(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fromEnv.EffectiveErrorInboxReceiptRetention(); got != 45*24*time.Hour {
+		t.Fatalf("env receipt retention=%v want 1080h", got)
+	}
+	fromFlag, _, err := Load(
+		[]string{"--config", path, "--error-inbox-receipt-retention", "60d"},
+		mapLookup(env),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fromFlag.EffectiveErrorInboxReceiptRetention(); got != 60*24*time.Hour {
+		t.Fatalf("flag receipt retention=%v want 1440h", got)
+	}
+
+	explicitZero, _, err := Load(nil, mapLookup(map[string]string{"LO_ERROR_INBOX_RECEIPT_RETENTION": "0s"}))
+	if err != nil {
+		t.Fatalf("explicit zero must mean inherit: %v", err)
+	}
+	if got := explicitZero.EffectiveErrorInboxReceiptRetention(); got != explicitZero.Retention.Logs.Value() {
+		t.Fatalf("explicit zero receipt retention=%v want retention.logs %v", got, explicitZero.Retention.Logs)
+	}
+}
+
+func TestErrorInboxReceiptRetentionRejectsNegative(t *testing.T) {
+	for _, raw := range []string{"-1h", "-1d"} {
+		_, _, err := Load(nil, mapLookup(map[string]string{"LO_ERROR_INBOX_RECEIPT_RETENTION": raw}))
+		if err == nil || !strings.Contains(err.Error(), "error_inbox.receipt_retention") {
+			t.Fatalf("negative receipt retention %q err=%v", raw, err)
+		}
+	}
+	if _, _, err := Load(nil, mapLookup(map[string]string{"LO_ERROR_INBOX_RECEIPT_RETENTION": "soon"})); err == nil {
+		t.Fatal("malformed receipt retention accepted")
+	}
+}
