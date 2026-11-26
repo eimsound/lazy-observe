@@ -75,10 +75,7 @@ export function IssueAiAnalysisCard({ issueId }: { issueId: string }) {
             <div className="flex size-7 items-center justify-center rounded-md bg-primary/10 text-primary">
               <Sparkles className="size-4" />
             </div>
-            <div>
-              <h3 className="text-sm font-semibold">{t("aiAnalysis.title")}</h3>
-              <p className="text-xs text-muted-foreground">{t("aiAnalysis.subtitle")}</p>
-            </div>
+            <h3 className="text-sm font-semibold">{t("aiAnalysis.title")}</h3>
           </div>
           {analysis && (
             <RefreshButton

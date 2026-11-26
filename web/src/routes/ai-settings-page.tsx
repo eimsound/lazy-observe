@@ -4,7 +4,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   CheckCircle2,
-  Info,
   KeyRound,
   Loader2,
   Lock,
@@ -37,6 +36,7 @@ import {
 } from "./ai-settings-state";
 import { PageContainer } from "@/components/layout/page";
 import { EmptyState } from "@/components/common/empty-state";
+import { HelpTip } from "@/components/common/help-tip";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import {
@@ -177,7 +177,6 @@ export function AiSettingsPage() {
             <Sparkles className="size-4" />
             {t("aiSettings.statusSection")}
           </CardTitle>
-          <CardDescription>{t("aiSettings.subtitle")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {statusState === "stale" && (
@@ -269,7 +268,6 @@ export function AiSettingsPage() {
             <KeyRound className="size-4" />
             {t("aiSettings.configSection")}
           </CardTitle>
-          <CardDescription>{t("aiSettings.configDesc")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {settingsState === "stale" && (
@@ -294,9 +292,9 @@ export function AiSettingsPage() {
           ) : draft ? (
             <>
               <div className="flex items-center justify-between gap-4">
-                <div className="space-y-1">
+                <div className="flex items-center gap-1.5">
                   <Label htmlFor="ai-enabled">{t("aiSettings.enableLabel")}</Label>
-                  <p className="text-xs text-muted-foreground">{t("aiSettings.enableHint")}</p>
+                  <HelpTip content={t("aiSettings.privacyNote")} />
                 </div>
                 <Switch
                   id="ai-enabled"
@@ -333,14 +331,16 @@ export function AiSettingsPage() {
               </div>
 
               <div className="space-y-1">
-                <Label htmlFor="ai-base-url">{t("aiSettings.baseUrl")}</Label>
+                <div className="flex items-center gap-1.5">
+                  <Label htmlFor="ai-base-url">{t("aiSettings.baseUrl")}</Label>
+                  <HelpTip content={t("aiSettings.baseUrlHint")} />
+                </div>
                 <Input
                   id="ai-base-url"
                   value={draft.base_url}
                   placeholder={providerDefaultBaseUrl(draft.provider) || "https://…"}
                   onChange={(e) => updateForm((prev) => patchAiDraft(prev, { base_url: e.target.value }))}
                 />
-                <p className="text-xs text-muted-foreground">{t("aiSettings.baseUrlHint")}</p>
               </div>
 
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -418,27 +418,7 @@ export function AiSettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Disabled guidance */}
-      {statusState !== "pending" && !enabled && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Info className="size-4" />
-              {t("aiSettings.disabledTitle")}
-            </CardTitle>
-            <CardDescription>{t("aiSettings.disabledDesc")}</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3 text-sm text-foreground/90">
-            <p>{t("aiSettings.enableSteps")}</p>
-            <p className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-              <Lock className="mt-0.5 size-3.5 shrink-0" />
-              {t("aiSettings.privacyNote")}
-            </p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Mock-only note (acceptance testing of the disabled guidance) */}
+      {/* Mock-only note */}
       {IS_MOCK && (
         <Card>
           <CardHeader>

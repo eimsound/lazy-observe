@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import {
   BarChart3,
   Check,
@@ -28,6 +28,7 @@ import {
   MAX_LOGS_LIMIT,
   type LogsGraphMode,
 } from "@/lib/logs-explorer";
+import { HelpTip } from "@/components/common/help-tip";
 import { MetricsTimeRangePicker } from "@/components/metrics/metrics-time-range-picker";
 import { Button } from "@/components/ui/button";
 import {
@@ -261,6 +262,7 @@ export function LogsChartOptions({
   onChange: (patch: Partial<LogsChartOptionsValue>) => void;
 }) {
   const { t } = useTranslation();
+  const chartModeId = useId();
   const stepInvalid = Boolean(value.step && parsePrometheusDuration(value.step) === null);
   return (
     <Popover>
@@ -276,12 +278,16 @@ export function LogsChartOptions({
           <span className="text-sm font-semibold">{t("logs.chartSettings")}</span>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <ControlLabel label={t("logs.chartMode")}>
+          <ControlLabel
+            label={t("logs.chartMode")}
+            hint={t("logs.statsModeHint")}
+            htmlFor={chartModeId}
+          >
             <Select
               value={value.graphMode}
               onValueChange={(graphMode) => onChange({ graphMode: graphMode as LogsGraphMode })}
             >
-              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectTrigger id={chartModeId}><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="hits">{t("logs.hitsMode")}</SelectItem>
                 <SelectItem value="stats">{t("logs.statsMode")}</SelectItem>
@@ -328,9 +334,6 @@ export function LogsChartOptions({
             />
           </ControlLabel>
         </div>
-        {value.graphMode === "stats" && (
-          <p className="text-xs text-muted-foreground">{t("logs.statsModeHint")}</p>
-        )}
         <ToggleRow
           label={t("logs.stacked")}
           checked={value.stacked}
@@ -357,11 +360,28 @@ export function LogsChartOptions({
 
 function ControlLabel({
   label,
+  hint,
+  htmlFor,
   children,
 }: {
   label: string;
+  hint?: string;
+  htmlFor?: string;
   children: React.ReactNode;
 }) {
+  if (hint) {
+    return (
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-1">
+          <Label htmlFor={htmlFor} className="text-xs font-normal text-muted-foreground">
+            {label}
+          </Label>
+          <HelpTip content={hint} />
+        </div>
+        {children}
+      </div>
+    );
+  }
   return (
     <Label className="space-y-1.5 text-xs font-normal text-muted-foreground">
       <span>{label}</span>

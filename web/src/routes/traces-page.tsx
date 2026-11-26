@@ -7,6 +7,7 @@ import {
   Database,
   Loader2,
   Search,
+  SearchX,
   Waypoints,
 } from "lucide-react";
 import {
@@ -321,7 +322,7 @@ export function TracesPage() {
                 ) : (
                   <Search className="size-4" />
                 )}
-                <span className="hidden sm:inline">{t("traces.search")}</span>
+                <span className="optical-center hidden sm:inline">{t("traces.search")}</span>
               </Button>
             </div>
           </div>
@@ -367,8 +368,7 @@ function TraceSearchResults({
     return (
       <TracesEmptyState
         icon={<Search className="size-6" />}
-        title={t("traces.initialTitle")}
-        desc={t("traces.initialDesc")}
+        title={t("common.waitingForQuery")}
       />
     );
   }
@@ -407,9 +407,8 @@ function TraceSearchResults({
   if (viewState === "empty") {
     return (
       <TracesEmptyState
-        icon={<Database className="size-6" />}
-        title={t("traces.emptyTitle")}
-        desc={t("traces.emptyDesc")}
+        icon={<SearchX className="size-6" />}
+        title={t("common.noData")}
       />
     );
   }
@@ -501,7 +500,7 @@ function TracesEmptyState({
 }: {
   icon: React.ReactNode;
   title: string;
-  desc: string;
+  desc?: string;
   action?: React.ReactNode;
 }) {
   return (
@@ -511,7 +510,7 @@ function TracesEmptyState({
           {icon}
         </div>
         <div className="text-base font-medium">{title}</div>
-        <p className="max-w-md break-words text-sm text-muted-foreground">{desc}</p>
+        {desc && <p className="max-w-md break-words text-sm text-muted-foreground">{desc}</p>}
         {action}
       </CardContent>
     </Card>

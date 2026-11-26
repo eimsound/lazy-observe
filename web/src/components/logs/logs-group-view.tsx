@@ -258,7 +258,7 @@ export function LogsGroupView({
               }
             >
               <ListTree />
-              <span className="hidden sm:inline">{t("logs.expandAll")}</span>
+              <span className="optical-center hidden sm:inline">{t("logs.expandAll")}</span>
             </Button>
             <Button
               type="button"
@@ -268,7 +268,7 @@ export function LogsGroupView({
               onClick={() => setExpandedGroups(new Set())}
             >
               <ListCollapse />
-              <span className="hidden sm:inline">{t("logs.collapseAll")}</span>
+              <span className="optical-center hidden sm:inline">{t("logs.collapseAll")}</span>
             </Button>
           </div>
         )}

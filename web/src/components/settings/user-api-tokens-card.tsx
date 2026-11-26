@@ -16,14 +16,14 @@ import {
   grafanaDataSourceUrl,
   grafanaHeaderBlock,
   mcpCommand,
-  readProjectSlug,
 } from "@/lib/tokens/token-usage";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { HelpTip } from "@/components/common/help-tip";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { SnippetBlock } from "@/components/common/snippet-block";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -83,8 +83,20 @@ export function UserAPITokensCard() {
         <CardTitle className="flex items-center gap-2">
           <KeyRound className="size-4" />
           {t("userTokens.title")}
+          <HelpTip
+            scopeTitle={t("common.applicableScope")}
+            scope={[
+              {
+                text: t("userTokens.scopeReadTitle"),
+                children: [
+                  t("userTokens.scopeQueryApi"),
+                  t("userTokens.scopeMcp"),
+                  t("userTokens.scopeGrafana"),
+                ],
+              },
+            ]}
+          />
         </CardTitle>
-        <CardDescription>{t("userTokens.description")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         {created && (
@@ -93,7 +105,7 @@ export function UserAPITokensCard() {
               <Check className="size-4 text-primary" />
               {t("userTokens.createdTitle")}
             </div>
-            <p className="text-xs text-muted-foreground">{t("userTokens.createdDescription")}</p>
+            <p className="text-xs text-muted-foreground">{t("common.tokenCopyOnce")}</p>
             <div className="flex items-center gap-2">
               <code className="flex-1 truncate rounded border border-border bg-background px-2 py-1.5 font-mono text-xs">
                 {created.value}
@@ -110,19 +122,16 @@ export function UserAPITokensCard() {
               <SnippetBlock
                 label={t("userTokens.mcpLabel")}
                 value={mcpCommand(origin, currentSlug, created.value)}
-                hint={t("userTokens.mcpHint", { slug: readProjectSlug(currentSlug) })}
               />
               <div className="space-y-2">
                 <p className="text-xs font-medium">{t("userTokens.grafanaTitle")}</p>
                 <SnippetBlock
                   label={t("userTokens.grafanaUrlLabel")}
                   value={grafanaDataSourceUrl(origin)}
-                  hint={t("userTokens.grafanaUrlHint")}
                 />
                 <SnippetBlock
                   label={t("userTokens.grafanaHeadersLabel")}
                   value={grafanaHeaderBlock(created.value, currentSlug)}
-                  hint={t("userTokens.grafanaHeadersHint")}
                 />
               </div>
             </div>

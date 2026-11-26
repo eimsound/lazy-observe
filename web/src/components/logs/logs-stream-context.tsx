@@ -13,7 +13,6 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -174,10 +173,9 @@ export function LogsStreamContextDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-5xl">
+      <DialogContent className="max-w-5xl" aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>{t("logs.contextTitle")}</DialogTitle>
-          <DialogDescription>{t("logs.contextDescription")}</DialogDescription>
         </DialogHeader>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <code className="max-w-3xl truncate rounded bg-muted px-2 py-1 text-xs">

@@ -1,4 +1,4 @@
-import { BarChart3, Database, Eye } from "lucide-react";
+import { BarChart3, Eye, Search, SearchX } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { formatPrometheusDuration } from "@/lib/metrics-query";
 import {
@@ -103,9 +103,8 @@ export function LogsChartPanel({
       <CardContent className="p-4 pt-2">
         {!hasExecuted ? (
           <ExplorerMessage
-            icon={<BarChart3 />}
-            title={t("logs.initialChartTitle")}
-            description={t("logs.initialChartDesc")}
+            icon={<Search />}
+            title={t("common.waitingForQuery")}
           />
         ) : chartViewState === "pending" ? (
           <Skeleton className="h-[280px] w-full" />
@@ -116,9 +115,8 @@ export function LogsChartPanel({
           />
         ) : chartViewState === "empty" ? (
           <ExplorerMessage
-            icon={<Database />}
-            title={t("logs.emptyChart")}
-            description={t("logs.emptyChartDesc")}
+            icon={<SearchX />}
+            title={t("common.noData")}
           />
         ) : (
           <>

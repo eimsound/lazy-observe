@@ -285,7 +285,7 @@ test("4. 真实遥测写入网关并在 Logs / Metrics / Traces / Issues 页面�
 
   // Verify project scope isolation: switching to default must not expose real-e2e project's logs.
   await switchProjectViaSidebar(page, "default");
-  await expect(page.getByText("无匹配日志")).toBeVisible();
+  await expect(page.getByText("无数据").first()).toBeVisible();
   await switchProjectViaSidebar(page, projectSlug);
   await expect(page.getByText(logMarker).first()).toBeVisible();
 

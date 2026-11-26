@@ -5,7 +5,7 @@ import { Loader2, Mail, Save, UserRound } from "lucide-react";
 import { updateMe } from "@/lib/api/auth";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
@@ -38,7 +38,6 @@ export function ProfileCard() {
           <UserRound className="size-4" />
           {t("profile.title")}
         </CardTitle>
-        <CardDescription>{t("profile.description")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-1.5">

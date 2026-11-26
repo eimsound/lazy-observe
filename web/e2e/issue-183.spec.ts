@@ -76,7 +76,15 @@ test("角色隔离：viewer 不可见受限告警管理页且直达显式提示�
   await expect(page.getByRole("button", { name: "解决", exact: true })).toHaveCount(0);
 
   await page.goto("/settings");
-  await expect(page.getByText("只读模式：修改项目告警配置需要成员或管理员权限。")).toBeVisible();
+  await expect(page.locator("#ac-new-issue")).toBeDisabled();
+  await expect(page.locator("#ac-regression")).toBeDisabled();
+  await expect(page.locator("#ac-threshold")).toBeDisabled();
+  const saveButton = page.getByRole("button", { name: "保存", exact: true });
+  await expect(saveButton).toBeDisabled();
+  await saveButton.locator("..").hover();
+  await expect(page.getByRole("tooltip").first()).toContainText(
+    "只读模式：修改项目告警配置需要成员或管理员权限。",
+  );
 });
 
 test("性能：点击刷新推进后端接口查询时间窗", async ({ page }) => {

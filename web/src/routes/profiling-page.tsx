@@ -231,7 +231,7 @@ export function ProfilingPage() {
               disabled={!service}
             >
               <Layers className="size-4" />
-              <span className="hidden sm:inline">{t("profiling.profileList")}</span>
+              <span className="optical-center hidden sm:inline">{t("profiling.profileList")}</span>
             </Button>
             <Button variant="ghost" size="icon" onClick={refresh} aria-label={t("common.refresh")}>
               <RefreshCw className={cn("size-4", flameQuery.isFetching && "animate-spin")} />
@@ -346,7 +346,6 @@ function FlamegraphSection({
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
         <span>{t("profiling.totalSamples", { count: tree.value })}</span>
         <span>{t("profiling.nodeCount", { count: countNodes(tree) })}</span>
-        <span className="text-muted-foreground/60">{t("profiling.zoomHint")}</span>
       </div>
 
       {truncated && (

@@ -42,6 +42,11 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { queryViewState } from "./query-view-state";
 
 const STATUS_DOT: Record<TargetHealthStatus, string> = {
@@ -110,7 +115,7 @@ export function ScrapeTargetsPage() {
           {targets.isFetching ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
           {t("common.refresh")}
         </Button>
-        {canManage && (
+        {canManage ? (
           <Button
             onClick={() => {
               setEditing(null);
@@ -121,6 +126,18 @@ export function ScrapeTargetsPage() {
             <Plus className="size-4" />
             {t("scrapeTargets.newTarget")}
           </Button>
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex cursor-not-allowed">
+                <Button disabled className="gap-1.5">
+                  <Plus className="size-4" />
+                  {t("scrapeTargets.newTarget")}
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>{t("scrapeTargets.readOnlyHint")}</TooltipContent>
+          </Tooltip>
         )}
       </PageActions>
 
@@ -235,10 +252,6 @@ export function ScrapeTargetsPage() {
           )}
         </CardContent>
       </Card>
-
-      {!canManage && (
-        <p className="mt-3 text-xs text-muted-foreground">{t("scrapeTargets.readOnlyHint")}</p>
-      )}
 
       {formOpen && (
         <TargetFormDialog

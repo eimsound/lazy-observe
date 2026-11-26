@@ -303,6 +303,32 @@
   background: var(--card);
 }
 
+/*
+ * ── Optical vertical centering for single-line control text ──
+ * `items-center` centres the whole line box, and the font reserves descender
+ * space below the baseline, so text without descenders ("frontend", "HTTP 200")
+ * sits above the icon midline. This trims the line box to cap-height → baseline
+ * (the part the eye reads as the text's body) and pads it back to exactly 1lh,
+ * so layout height is unchanged and the cap band lands on the parent's midline.
+ * The padding also keeps descenders and CJK glyphs inside the padding box, so it
+ * is safe together with `truncate` / `overflow: hidden`.
+ *
+ * Put it on the element that directly holds the text (a span that is a flex
+ * item or block), never on the flex container itself (text-box-trim does not
+ * reach anonymous flex items), never on <input>/<textarea>/CodeMirror, and only
+ * for inline content: a block or flex child leaves nothing to trim, and the
+ * padding would then add height. Primitives in components/ui apply it through
+ * withOpticalText(); see DESIGN.md §Typography. Browsers without text-box-trim
+ * keep the plain line box.
+ */
+@utility optical-center {
+  @supports (text-box-trim: trim-both) {
+    text-box-trim: trim-both;
+    text-box-edge: cap alphabetic;
+    padding-block: calc((1lh - 1cap) / 2);
+  }
+}
+
 @layer base {
   * {
     border-color: var(--border);

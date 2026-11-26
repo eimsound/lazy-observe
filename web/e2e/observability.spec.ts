@@ -94,7 +94,7 @@ test("日志工作区：draft、loading 与重置遵循执行快照", async ({ p
   await page.getByRole("button", { name: "重置", exact: true }).click();
   await expect(page).not.toHaveURL(/[?&]q=/);
   await expect(page).not.toHaveURL(/[?&]run=/);
-  await expect(page.getByText("开始查询日志")).toBeVisible();
+  await expect(page.getByText("等待查询").first()).toBeVisible();
 });
 
 test("日志工作区：查询内时间范围解析期间展示 loading", async ({ page }) => {
@@ -191,7 +191,7 @@ test("日志工作区：外部导航和自动刷新不会形成 URL 循环", asy
 
   await page.goto("/logs?q=error&run=0&view=table");
   await expect(page.getByLabel("LogsQL 表达式")).toContainText("error");
-  await expect(page.getByText("开始查询日志")).toBeVisible();
+  await expect(page.getByText("等待查询").first()).toBeVisible();
   await page.goBack();
   await expect(page).not.toHaveURL(/[?&]q=/);
   await expect(page).toHaveURL(/run=1/);
@@ -253,7 +253,7 @@ test("链路：检索 trace 并进入瀑布详情", async ({ page }) => {
   await page.locator('main [role="button"][tabindex="0"]').first().click();
   await expect(page).toHaveURL(/\/traces\/[a-f0-9]{32}$/);
   await expect(page.locator("main")).toContainText(/Trace ID:[a-f0-9]{32}/);
-  await expect(page.getByText("悬停查看时长与占比")).toBeVisible();
+  await expect(page.getByText("根操作", { exact: true })).toBeVisible();
 
   // 验证瀑布图折叠/展开与点击选中 Span 详情抽屉联动正常
   const waterfallRows = page.locator('[data-virtualized] [role="button"][tabindex="0"]');
@@ -318,7 +318,7 @@ test("日志 JSON 视图：支持虚拟滚动、单行展开/收起与复制", a
   await editor.press("Control+A");
   await editor.pressSequentially("__empty");
   await page.getByRole("button", { name: "查询", exact: true }).click();
-  await expect(page.getByText("无匹配日志")).toBeVisible();
+  await expect(page.getByText("无数据").first()).toBeVisible();
 
   await editor.click();
   await editor.press("Control+A");
@@ -451,7 +451,7 @@ test("持续剖析：渲染火焰图、搜索函数并打开剖析记录", async
   await expect(page.getByText("1 处匹配")).toBeVisible();
 
   await page.getByRole("button", { name: "剖析记录" }).click();
-  await expect(page.getByText("当前时间窗口内采集的原始剖析文件，可下载 pprof。")).toBeVisible();
+  await expect(page.getByRole("dialog").getByRole("heading", { name: "剖析记录" })).toBeVisible();
   await expect(page.getByRole("link", { name: "下载" }).first()).toBeVisible();
 });
 
