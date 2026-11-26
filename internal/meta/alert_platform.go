@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"entgo.io/ent/dialect"
@@ -140,6 +141,31 @@ func alignPlatformErrorBucket(t time.Time) int64 {
 	return (sec / platformErrorRateBucketSeconds) * platformErrorRateBucketSeconds
 }
 
+// PlatformErrorRateBatch is one project's share of a completed error-inbox
+// batch: every occurrence the batch committed for ProjectID, evaluated against
+// that project's error_rate_spike threshold.
+type PlatformErrorRateBatch struct {
+	ProjectID       int
+	ThresholdPerMin int
+	OccurredAt      []time.Time
+}
+
+// PlatformErrorRateBatchResult reports how one project's durable
+// error_rate_spike state moved while its batch was applied.
+//
+// Transitions lists every firing/resolved step in the order N sequential
+// single-event records would have produced them (at most a resolved followed
+// by a re-fire of the next cycle). Status, Cycle and StartsAt describe the
+// final durable state; Count is the sliding-window total after the batch.
+type PlatformErrorRateBatchResult struct {
+	ProjectID   int
+	Count       int
+	Status      string
+	Cycle       int64
+	StartsAt    time.Time
+	Transitions []PlatformErrorSpikeTransition
+}
+
 // RecordPlatformErrorRate persists one error occurrence into a 10-second bucket
 // for projectID, prunes expired buckets outside window, and advances durable
 // platform_alert_states for error_rate_spike when crossing the threshold.
@@ -153,40 +179,174 @@ func (s *Store) RecordPlatformErrorRate(
 	if projectID <= 0 || window <= 0 {
 		return PlatformErrorSpikeTransition{}, errors.New("platform error rate requires project and positive window")
 	}
-	now = now.UTC()
-	occurredAt = occurredAt.UTC()
-	cutoff := now.Add(-window)
-	if occurredAt.IsZero() || occurredAt.Before(cutoff) {
-		return PlatformErrorSpikeTransition{}, nil
+	results, err := s.RecordPlatformErrorRates(ctx, now, window, []PlatformErrorRateBatch{{
+		ProjectID:       projectID,
+		ThresholdPerMin: thresholdPerMin,
+		OccurredAt:      []time.Time{occurredAt},
+	}})
+	if err != nil || len(results) == 0 {
+		return PlatformErrorSpikeTransition{}, err
 	}
-	bucket := alignPlatformErrorBucket(occurredAt)
+	res := results[0]
+	if len(res.Transitions) > 0 {
+		return res.Transitions[len(res.Transitions)-1], nil
+	}
+	out := PlatformErrorSpikeTransition{Count: res.Count}
+	if res.Status == platformAlertStatusFiring {
+		out.Cycle = res.Cycle
+		out.StartsAt = res.StartsAt
+	}
+	return out, nil
+}
+
+// RecordPlatformErrorRates applies a whole batch of error occurrences in one
+// metadata write transaction, so an error storm costs one SQLite writer-lock
+// acquisition per inbox batch instead of one per event (issue #375).
+//
+// Per project it prunes buckets older than window, upserts the in-window
+// occurrences aggregated by (project_id, bucket_epoch), and replays the
+// single-event threshold rule in memory with a running window count, so the
+// returned transitions and the durable platform_alert_states row are exactly
+// what len(OccurredAt) sequential RecordPlatformErrorRate calls at now would
+// have produced; only the final state row is written. Occurrences that are
+// zero or older than now-window are ignored, and a project with none left is
+// not touched. Projects are processed in ascending project_id order and
+// buckets in ascending bucket_epoch order so concurrent PostgreSQL writers
+// lock rows in one global order. Results are ordered by project_id.
+//
+// Each project runs under its own savepoint: a project whose accounting fails
+// is rolled back alone and reported in the joined error, while the results
+// returned alongside that error are committed and must still be acted on.
+func (s *Store) RecordPlatformErrorRates(
+	ctx context.Context,
+	now time.Time,
+	window time.Duration,
+	batches []PlatformErrorRateBatch,
+) ([]PlatformErrorRateBatchResult, error) {
+	if window <= 0 {
+		return nil, errors.New("platform error rate requires positive window")
+	}
+	now = now.UTC()
+	cutoff := now.Add(-window)
+	type projectBatch struct {
+		threshold int
+		events    int
+		buckets   map[int64]int
+	}
+	byProject := make(map[int]*projectBatch, len(batches))
+	for _, batch := range batches {
+		if batch.ProjectID <= 0 {
+			return nil, errors.New("platform error rate requires project and positive window")
+		}
+		pb := byProject[batch.ProjectID]
+		if pb == nil {
+			pb = &projectBatch{threshold: batch.ThresholdPerMin, buckets: make(map[int64]int)}
+			byProject[batch.ProjectID] = pb
+		}
+		for _, occurredAt := range batch.OccurredAt {
+			occurredAt = occurredAt.UTC()
+			if occurredAt.IsZero() || occurredAt.Before(cutoff) {
+				continue
+			}
+			pb.buckets[alignPlatformErrorBucket(occurredAt)]++
+			pb.events++
+		}
+	}
+	projectIDs := make([]int, 0, len(byProject))
+	for projectID, pb := range byProject {
+		if pb.events > 0 {
+			projectIDs = append(projectIDs, projectID)
+		}
+	}
+	if len(projectIDs) == 0 {
+		return nil, nil
+	}
+	slices.Sort(projectIDs)
 	cutoffBucket := alignPlatformErrorBucket(cutoff)
 
+	s.platformErrorRateTxs.Add(1)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return PlatformErrorSpikeTransition{}, fmt.Errorf("begin platform error rate record: %w", err)
+		return nil, fmt.Errorf("begin platform error rate record: %w", err)
 	}
 	defer tx.Rollback()
 
+	results := make([]PlatformErrorRateBatchResult, 0, len(projectIDs))
+	var projectErrs []error
+	for _, projectID := range projectIDs {
+		pb := byProject[projectID]
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT `+platformErrorRateSavepoint); err != nil {
+			return nil, fmt.Errorf("open platform error rate savepoint: %w", err)
+		}
+		res, err := s.recordProjectErrorRate(ctx, tx, projectID, pb.threshold, pb.events, pb.buckets, cutoffBucket,
+			now, window)
+		if err != nil {
+			// Isolate the failing project (for example one deleted mid-batch, whose
+			// bucket insert violates the projects foreign key) so it cannot void
+			// the accounting of every other project in the batch.
+			if _, rbErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT `+platformErrorRateSavepoint); rbErr != nil {
+				return nil, errors.Join(
+					fmt.Errorf("project %d: %w", projectID, err),
+					fmt.Errorf("roll back platform error rate savepoint: %w", rbErr),
+				)
+			}
+			projectErrs = append(projectErrs, fmt.Errorf("project %d: %w", projectID, err))
+		} else {
+			results = append(results, res)
+		}
+		if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT `+platformErrorRateSavepoint); err != nil {
+			return nil, fmt.Errorf("release platform error rate savepoint: %w", err)
+		}
+	}
+	if len(results) == 0 {
+		return nil, errors.Join(projectErrs...)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, errors.Join(append(projectErrs, fmt.Errorf("commit platform error rate record: %w", err))...)
+	}
+	return results, errors.Join(projectErrs...)
+}
+
+// platformErrorRateSavepoint scopes one project's accounting inside the batch
+// transaction; SQLite and PostgreSQL share the SAVEPOINT syntax.
+const platformErrorRateSavepoint = "platform_error_rate_project"
+
+const (
+	platformAlertStatusFiring   = "firing"
+	platformAlertStatusResolved = "resolved"
+)
+
+func (s *Store) recordProjectErrorRate(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID, thresholdPerMin, events int,
+	buckets map[int64]int,
+	cutoffBucket int64,
+	now time.Time,
+	window time.Duration,
+) (PlatformErrorRateBatchResult, error) {
 	if _, err := tx.ExecContext(
 		ctx,
 		bind(s.dialect, `DELETE FROM platform_error_rate_buckets WHERE project_id = ? AND bucket_epoch < ?`),
 		projectID,
 		cutoffBucket,
 	); err != nil {
-		return PlatformErrorSpikeTransition{}, fmt.Errorf("prune expired platform error rate buckets: %w", err)
+		return PlatformErrorRateBatchResult{}, fmt.Errorf("prune expired platform error rate buckets: %w", err)
 	}
-	if _, err := tx.ExecContext(
-		ctx,
-		bind(
-			s.dialect,
-			`INSERT INTO platform_error_rate_buckets(project_id, bucket_epoch, count) VALUES (?, ?, 1)
-			 ON CONFLICT(project_id, bucket_epoch) DO UPDATE SET count = platform_error_rate_buckets.count + 1`,
-		),
-		projectID,
-		bucket,
-	); err != nil {
-		return PlatformErrorSpikeTransition{}, fmt.Errorf("record platform error rate bucket: %w", err)
+	epochs := make([]int64, 0, len(buckets))
+	for epoch := range buckets {
+		epochs = append(epochs, epoch)
+	}
+	slices.Sort(epochs)
+	upsert := bind(
+		s.dialect,
+		`INSERT INTO platform_error_rate_buckets(project_id, bucket_epoch, count) VALUES (?, ?, ?)
+		 ON CONFLICT(project_id, bucket_epoch) DO UPDATE SET count = platform_error_rate_buckets.count + excluded.count`,
+	)
+	for _, epoch := range epochs {
+		if _, err := tx.ExecContext(ctx, upsert, projectID, epoch, buckets[epoch]); err != nil {
+			return PlatformErrorRateBatchResult{}, fmt.Errorf("record platform error rate bucket: %w", err)
+		}
 	}
 
 	var totalCount int
@@ -199,71 +359,82 @@ func (s *Store) RecordPlatformErrorRate(
 		projectID,
 		cutoffBucket,
 	).Scan(&totalCount); err != nil {
-		return PlatformErrorSpikeTransition{}, fmt.Errorf("sum platform error rate buckets: %w", err)
+		return PlatformErrorRateBatchResult{}, fmt.Errorf("sum platform error rate buckets: %w", err)
 	}
-
-	limit := thresholdPerMin * int(window/time.Minute)
-	spike := thresholdPerMin > 0 && totalCount > limit
 
 	selectState := `SELECT status, active_cycle, starts_at FROM platform_alert_states WHERE project_id = ? AND kind = ?`
 	if s.dialect == dialect.Postgres {
 		selectState += ` FOR UPDATE`
 	}
 	var (
-		prevStatus string
-		prevCycle  int64
-		prevStart  sql.NullTime
+		status    string
+		cycle     int64
+		prevStart sql.NullTime
 	)
 	stateErr := tx.QueryRowContext(ctx, bind(s.dialect, selectState), projectID, platformAlertKindErrorRateSpike).
-		Scan(&prevStatus, &prevCycle, &prevStart)
-	hasState := true
+		Scan(&status, &cycle, &prevStart)
+	hadState := true
 	if errors.Is(stateErr, sql.ErrNoRows) {
-		hasState = false
+		hadState = false
 	} else if stateErr != nil {
-		return PlatformErrorSpikeTransition{}, fmt.Errorf("read platform alert state: %w", stateErr)
+		return PlatformErrorRateBatchResult{}, fmt.Errorf("read platform alert state: %w", stateErr)
+	}
+	var startsAt time.Time
+	if prevStart.Valid {
+		startsAt = prevStart.Time.UTC()
 	}
 
-	result := PlatformErrorSpikeTransition{Count: totalCount}
-	if spike {
-		if !hasState {
-			const firstCycle int64 = 1
-			if _, err := tx.ExecContext(
-				ctx,
-				bind(
-					s.dialect,
-					`INSERT INTO platform_alert_states(project_id, kind, status, active_cycle, starts_at, ends_at, updated_at)
-					 VALUES (?, ?, 'firing', ?, ?, NULL, ?)`,
-				),
-				projectID, platformAlertKindErrorRateSpike, firstCycle, now, now,
-			); err != nil {
-				return PlatformErrorSpikeTransition{}, fmt.Errorf("insert firing platform alert state: %w", err)
-			}
-			result.Transition = "firing"
-			result.Cycle = firstCycle
-			result.StartsAt = now
-		} else if prevStatus != "firing" {
-			nextCycle := prevCycle + 1
-			if _, err := tx.ExecContext(
-				ctx,
-				bind(
-					s.dialect,
-					`UPDATE platform_alert_states SET status = 'firing', active_cycle = ?, starts_at = ?, ends_at = NULL, updated_at = ?
-					 WHERE project_id = ? AND kind = ?`,
-				),
-				nextCycle, now, now, projectID, platformAlertKindErrorRateSpike,
-			); err != nil {
-				return PlatformErrorSpikeTransition{}, fmt.Errorf("activate firing platform alert state: %w", err)
-			}
-			result.Transition = "firing"
-			result.Cycle = nextCycle
-			result.StartsAt = now
-		} else {
-			result.Cycle = prevCycle
-			if prevStart.Valid {
-				result.StartsAt = prevStart.Time.UTC()
-			}
+	// Replay the single-event rule once per in-window occurrence: the window
+	// count after the k-th occurrence is the pre-batch total plus k.
+	limit := thresholdPerMin * int(window/time.Minute)
+	hasState := hadState
+	var transitions []PlatformErrorSpikeTransition
+	for count := totalCount - events + 1; count <= totalCount; count++ {
+		spike := thresholdPerMin > 0 && count > limit
+		switch {
+		case spike && !hasState:
+			hasState, status, cycle, startsAt = true, platformAlertStatusFiring, 1, now
+		case spike && status != platformAlertStatusFiring:
+			status, cycle, startsAt = platformAlertStatusFiring, cycle+1, now
+		case !spike && hasState && status == platformAlertStatusFiring:
+			status = platformAlertStatusResolved
+		default:
+			continue
 		}
-	} else if hasState && prevStatus == "firing" {
+		tr := PlatformErrorSpikeTransition{Transition: status, Cycle: cycle, StartsAt: startsAt, Count: count}
+		if status == platformAlertStatusResolved {
+			tr.EndsAt = now
+		}
+		transitions = append(transitions, tr)
+	}
+
+	switch {
+	case len(transitions) == 0:
+	case !hadState:
+		if _, err := tx.ExecContext(
+			ctx,
+			bind(
+				s.dialect,
+				`INSERT INTO platform_alert_states(project_id, kind, status, active_cycle, starts_at, ends_at, updated_at)
+				 VALUES (?, ?, 'firing', ?, ?, NULL, ?)`,
+			),
+			projectID, platformAlertKindErrorRateSpike, cycle, startsAt, now,
+		); err != nil {
+			return PlatformErrorRateBatchResult{}, fmt.Errorf("insert firing platform alert state: %w", err)
+		}
+	case status == platformAlertStatusFiring:
+		if _, err := tx.ExecContext(
+			ctx,
+			bind(
+				s.dialect,
+				`UPDATE platform_alert_states SET status = 'firing', active_cycle = ?, starts_at = ?, ends_at = NULL, updated_at = ?
+				 WHERE project_id = ? AND kind = ?`,
+			),
+			cycle, startsAt, now, projectID, platformAlertKindErrorRateSpike,
+		); err != nil {
+			return PlatformErrorRateBatchResult{}, fmt.Errorf("activate firing platform alert state: %w", err)
+		}
+	default:
 		if _, err := tx.ExecContext(
 			ctx,
 			bind(
@@ -273,20 +444,17 @@ func (s *Store) RecordPlatformErrorRate(
 			),
 			now, now, projectID, platformAlertKindErrorRateSpike,
 		); err != nil {
-			return PlatformErrorSpikeTransition{}, fmt.Errorf("resolve platform alert state: %w", err)
+			return PlatformErrorRateBatchResult{}, fmt.Errorf("resolve platform alert state: %w", err)
 		}
-		result.Transition = "resolved"
-		result.Cycle = prevCycle
-		if prevStart.Valid {
-			result.StartsAt = prevStart.Time.UTC()
-		}
-		result.EndsAt = now
 	}
-
-	if err := tx.Commit(); err != nil {
-		return PlatformErrorSpikeTransition{}, fmt.Errorf("commit platform error rate record: %w", err)
-	}
-	return result, nil
+	return PlatformErrorRateBatchResult{
+		ProjectID:   projectID,
+		Count:       totalCount,
+		Status:      status,
+		Cycle:       cycle,
+		StartsAt:    startsAt,
+		Transitions: transitions,
+	}, nil
 }
 
 type platformErrorSpikeCandidate struct {

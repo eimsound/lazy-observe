@@ -272,7 +272,7 @@ func startGateway(
 		},
 		Workers:      errorInboxWorkerCount(metadata.store.IsClustered()),
 		Symbolicator: symbolicate.New(metadata.blobs, 128), OnChange: gw.HandleIssueChange,
-		OnEvent: gw.HandleErrorEvent,
+		OnEvents: gw.HandleErrorEvents,
 	}
 	if monitoring.client != nil {
 		inboxOptions.MeterProvider = monitoring.client.MeterProvider()

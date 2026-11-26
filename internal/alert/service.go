@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1276,41 +1277,82 @@ func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.Issue
 // signal, and a transition whose enqueue was lost to a crash or a failed write
 // is replayed by CheckErrorRateRecoveries on any replica.
 func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredAt time.Time) error {
-	cfg, p, err := s.cachedPlatformConfig(ctx, projectID)
-	if err != nil {
-		return err
-	}
-	if cfg.ErrorRateThresholdPerMinute == 0 {
+	return s.RecordErrorEvents(ctx, []errortrack.ErrorOccurrence{{ProjectID: projectID, OccurredAt: occurredAt}})
+}
+
+// RecordErrorEvents applies the RecordErrorEvent rule to a whole completed
+// error-inbox batch with a single metadata write transaction (issue #375).
+// Occurrences are grouped by project; projects whose threshold is zero are
+// skipped. Every firing/resolved transition is enqueued in the order the
+// equivalent sequence of single-event records would have produced it. A
+// per-project config failure skips only that project; all failures are joined
+// into the returned error so the caller can log them.
+func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrack.ErrorOccurrence) error {
+	if len(occurrences) == 0 {
 		return nil
 	}
-	now := s.now().UTC()
-	transition, err := s.store.RecordPlatformErrorRate(
-		ctx,
-		projectID,
-		occurredAt,
-		now,
-		errorRateWindow,
-		cfg.ErrorRateThresholdPerMinute,
-	)
+	byProject := make(map[int][]time.Time)
+	for _, occurrence := range occurrences {
+		byProject[occurrence.ProjectID] = append(byProject[occurrence.ProjectID], occurrence.OccurredAt)
+	}
+	projectIDs := make([]int, 0, len(byProject))
+	for projectID := range byProject {
+		projectIDs = append(projectIDs, projectID)
+	}
+	slices.Sort(projectIDs)
+
+	type projectAlertContext struct {
+		slug      string
+		threshold int
+	}
+	var errs []error
+	projects := make(map[int]projectAlertContext, len(projectIDs))
+	batches := make([]meta.PlatformErrorRateBatch, 0, len(projectIDs))
+	for _, projectID := range projectIDs {
+		cfg, p, err := s.cachedPlatformConfig(ctx, projectID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("load error_rate_spike config for project %d: %w", projectID, err))
+			continue
+		}
+		if cfg.ErrorRateThresholdPerMinute == 0 {
+			continue
+		}
+		projects[projectID] = projectAlertContext{slug: p.Slug, threshold: cfg.ErrorRateThresholdPerMinute}
+		batches = append(batches, meta.PlatformErrorRateBatch{
+			ProjectID:       projectID,
+			ThresholdPerMin: cfg.ErrorRateThresholdPerMinute,
+			OccurredAt:      byProject[projectID],
+		})
+	}
+	if len(batches) == 0 {
+		return errors.Join(errs...)
+	}
+	// Results returned next to an error are committed (only the failing projects
+	// were rolled back), so their transitions are still enqueued below.
+	results, err := s.store.RecordPlatformErrorRates(ctx, s.now().UTC(), errorRateWindow, batches)
 	if err != nil {
-		return err
+		errs = append(errs, fmt.Errorf("record error_rate_spike window: %w", err))
 	}
-	rate := float64(transition.Count) / errorRateWindow.Minutes()
-	switch transition.Transition {
-	case "firing":
-		return s.notifyErrorRateTransition(ctx, projectID, p.Slug, transition, errorRateAnnotations(
-			fmt.Sprintf("Error rate spike: %.1f events/min", rate),
-			cfg.ErrorRateThresholdPerMinute,
-			transition.Cycle,
-		))
-	case "resolved":
-		return s.notifyErrorRateTransition(ctx, projectID, p.Slug, transition, errorRateAnnotations(
-			fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
-			cfg.ErrorRateThresholdPerMinute,
-			transition.Cycle,
-		))
+	for _, res := range results {
+		project := projects[res.ProjectID]
+		for _, transition := range res.Transitions {
+			rate := float64(transition.Count) / errorRateWindow.Minutes()
+			summary := fmt.Sprintf("Error rate spike: %.1f events/min", rate)
+			if transition.Transition == "resolved" {
+				summary = fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate)
+			}
+			if notifyErr := s.notifyErrorRateTransition(
+				ctx,
+				res.ProjectID,
+				project.slug,
+				transition,
+				errorRateAnnotations(summary, project.threshold, transition.Cycle),
+			); notifyErr != nil {
+				errs = append(errs, notifyErr)
+			}
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // CheckErrorRateRecoveries first replays every firing (and recently resolved)
@@ -1445,8 +1487,8 @@ func errorRateAnnotations(summary string, threshold int, cycle int64) map[string
 
 // notifyErrorRateTransition plans one committed error_rate_spike transition
 // through the shared policy planner (silence, inhibition, storm) and writes the
-// result to notification_outbox. Enqueue failures are logged here because the
-// error-inbox caller discards the returned error; the recovery loop replays
+// result to notification_outbox. Enqueue failures are logged here with the
+// project, status and cycle before being returned; the recovery loop replays
 // the transition.
 func (s *Service) notifyErrorRateTransition(
 	ctx context.Context,

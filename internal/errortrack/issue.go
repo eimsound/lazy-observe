@@ -38,7 +38,10 @@ type ErrorOccurrence struct {
 	AcceptedAt time.Time
 }
 
-type ErrorOccurrenceFunc func(context.Context, ErrorOccurrence) error
+// ErrorOccurrencesFunc receives every error event one Inbox batch completed,
+// in batch order, so error-rate accounting can be applied in one metadata
+// write transaction per batch instead of one per event.
+type ErrorOccurrencesFunc func(context.Context, []ErrorOccurrence) error
 
 func sessionBit(sessionID string) uint64 {
 	if sessionID == "" {
