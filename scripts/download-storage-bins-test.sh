@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# scripts/download-storage-bins.sh 的离线自测，守三条：
+# scripts/download-storage-bins.sh 的离线自测，守四条：
 # - 当前平台 4 个归档全部 SHA-256 校验通过后，保留当前 4 个归档并清理同平台 .archives/$platform 下残留的旧归档（含符号链接）；
 # - 绝不触碰其它平台目录（例如 .archives/linux-arm64），保证双架构交叉构建互不误删；
-# - 任意归档 SHA-256 校验失败时 fail-closed 退出非零，且不提前清理旧归档；二进制已安装快路径也会执行旧归档清理。
+# - 任意归档 SHA-256 校验失败时 fail-closed 退出非零，且不提前清理旧归档；二进制已安装快路径也会执行旧归档清理；
+# - LO_STORAGE_ARCHIVE_DIR 共享归档目录（#378）：跨平台布局（bin_dir=<root>/<platform>）与单平台布局（bin_dir=<root>）
+#   共用 <root>/.archives/<platform> 不重复下载；冷缓存独立创建 bin_dir（不创建 bin_dir/.archives）；
+#   旧布局 <root>/<platform>/.archives/<platform> 的当前归档挪进共享目录，其余在校验通过后清掉并删除空目录，
+#   校验失败时原样保留，且不跨符号链接挪动或清理外部目录。
 
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 script=$root/scripts/download-storage-bins.sh
@@ -107,13 +111,14 @@ CURL
 chmod 0755 "$fakebin/curl"
 
 run_downloader() {
-  local bin_dir=$1 stdout_file=$2 stderr_file=$3 curl_log=${4:-}
+  local bin_dir=$1 stdout_file=$2 stderr_file=$3 curl_log=${4:-} archive_root=${5:-}
   local rc=0
   env -i \
     PATH="$fakebin:/usr/bin:/bin" \
     GOOS=linux \
     GOARCH=amd64 \
     LO_STORAGE_BIN_DIR="$bin_dir" \
+    LO_STORAGE_ARCHIVE_DIR="$archive_root" \
     FAKE_STORAGE_PAYLOADS="$payloads" \
     CURL_CALL_LOG="$curl_log" \
     "$bash_bin" "$test_script" >"$stdout_file" 2>"$stderr_file" || rc=$?
@@ -209,8 +214,197 @@ fi
 [[ -f "$bad_arm64/arm64-keep.tar.gz" ]] ||
   fail "case 3: linux-arm64 archive was touched on failure"
 
+count_curl() {
+  grep -c '^---$' "$1" || true
+}
+count_entries() {
+  find "$1" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' '
+}
+
+# 4. 共享归档目录 + 旧布局迁移：跨平台布局 bin_dir=<root>/linux-amd64、LO_STORAGE_ARCHIVE_DIR=<root>/.archives。
+#    共享目录已有 metrics；旧布局有 metrics 副本、vmutils、logs、旧归档与符号链接；traces 两边都没有，只下载这 1 个。
+cache_root=$work/storage-bin
+shared_amd64=$cache_root/.archives/linux-amd64
+cross_amd64=$cache_root/linux-amd64
+legacy_parent=$cross_amd64/.archives
+legacy_amd64=$legacy_parent/linux-amd64
+legacy_arm64=$cache_root/linux-arm64/.archives/linux-arm64
+mkdir -p "$shared_amd64" "$legacy_amd64" "$legacy_arm64"
+cp "$payloads/$metrics_asset" "$shared_amd64/$metrics_asset"
+cp "$payloads/$metrics_asset" "$legacy_amd64/$metrics_asset"
+cp "$payloads/$vmutils_asset" "$legacy_amd64/$vmutils_asset"
+cp "$payloads/$logs_asset" "$legacy_amd64/$logs_asset"
+printf 'legacy-stale\n' >"$legacy_amd64/victoria-metrics-linux-amd64-v1.147.0.tar.gz"
+ln -s "$vmutils_asset" "$legacy_amd64/legacy-symlink.tar.gz"
+printf 'arm64-legacy-keep\n' >"$legacy_arm64/victoria-metrics-linux-arm64-v1.156.0.tar.gz"
+
+shared_curl_log=$work/shared.curl.log
+: >"$shared_curl_log"
+rc=0
+run_downloader "$cross_amd64" "$work/shared.out" "$work/shared.err" "$shared_curl_log" "$cache_root/.archives" || rc=$?
+if ((rc != 0)); then
+  fail "case 4: expected exit 0, got $rc; stderr: $(cat "$work/shared.err")"
+fi
+if (($(count_curl "$shared_curl_log") != 1)); then
+  fail "case 4: expected 1 curl call (only traces missing), got $(count_curl "$shared_curl_log")"
+fi
+if (($(grep -c '^moved legacy archive ' "$work/shared.out" || true) != 2)); then
+  fail "case 4: expected vmutils and logs to be moved from the legacy layout; stdout: $(cat "$work/shared.out")"
+fi
+for asset in "${assets[@]}"; do
+  [[ -f "$shared_amd64/$asset" ]] || fail "case 4: missing shared archive $asset"
+done
+if (($(count_entries "$shared_amd64") != 4)); then
+  fail "case 4: expected exactly 4 archives in shared linux-amd64, got $(count_entries "$shared_amd64")"
+fi
+[[ ! -e $legacy_amd64 && ! -e $legacy_parent ]] ||
+  fail "case 4: legacy archive layout under $cross_amd64/.archives was not removed"
+[[ "$(cat "$legacy_arm64/victoria-metrics-linux-arm64-v1.156.0.tar.gz")" == "arm64-legacy-keep" ]] ||
+  fail "case 4: linux-arm64 legacy archive was touched by a linux-amd64 run"
+for binary in victoria-metrics-prod victoria-logs-prod victoria-traces-prod vmagent-prod; do
+  [[ -x "$cross_amd64/$binary" ]] || fail "case 4: missing executable binary $binary in $cross_amd64"
+done
+
+# 5. 单平台布局（bin_dir=<root>，不设 LO_STORAGE_ARCHIVE_DIR）复用同一共享目录，零下载；
+#    随后跨平台布局走已安装快路径，仍清理共享目录里后来带入的旧归档，且不重建旧布局目录。
+native_curl_log=$work/native.curl.log
+: >"$native_curl_log"
+rc=0
+run_downloader "$cache_root" "$work/native.out" "$work/native.err" "$native_curl_log" || rc=$?
+if ((rc != 0)); then
+  fail "case 5: single-platform run failed with exit $rc; stderr: $(cat "$work/native.err")"
+fi
+if (($(count_curl "$native_curl_log") != 0)); then
+  fail "case 5: single-platform layout re-downloaded $(count_curl "$native_curl_log") archive(s) despite the shared cache"
+fi
+for binary in victoria-metrics-prod victoria-logs-prod victoria-traces-prod vmagent-prod; do
+  [[ -x "$cache_root/$binary" ]] || fail "case 5: missing executable binary $binary in $cache_root"
+done
+
+printf 'stale-shared\n' >"$shared_amd64/victoria-logs-linux-amd64-v1.53.0.tar.gz"
+fast_shared_curl_log=$work/fast-shared.curl.log
+: >"$fast_shared_curl_log"
+rc=0
+run_downloader "$cross_amd64" "$work/fast-shared.out" "$work/fast-shared.err" "$fast_shared_curl_log" \
+  "$cache_root/.archives" || rc=$?
+if ((rc != 0)); then
+  fail "case 5: shared fast-path run failed with exit $rc; stderr: $(cat "$work/fast-shared.err")"
+fi
+if (($(count_curl "$fast_shared_curl_log") != 0)); then
+  fail "case 5: shared fast-path downloaded $(count_curl "$fast_shared_curl_log") archive(s)"
+fi
+grep -Fq 'storage binaries are already installed' "$work/fast-shared.out" ||
+  fail "case 5: expected the already-installed fast path; stdout: $(cat "$work/fast-shared.out")"
+[[ ! -e "$shared_amd64/victoria-logs-linux-amd64-v1.53.0.tar.gz" ]] ||
+  fail "case 5: shared fast-path did not prune stale archive"
+if (($(count_entries "$shared_amd64") != 4)); then
+  fail "case 5: expected 4 archives in shared linux-amd64, got $(count_entries "$shared_amd64")"
+fi
+[[ ! -e $legacy_parent ]] || fail "case 5: shared fast-path recreated $legacy_parent"
+
+# 6. 共享目录下校验失败同样 fail-closed：非零退出，旧布局归档原样保留。
+bad_root=$work/storage-bin-bad
+bad_shared=$bad_root/.archives/linux-amd64
+bad_legacy=$bad_root/linux-amd64/.archives/linux-amd64
+mkdir -p "$bad_shared" "$bad_legacy"
+cp "$payloads/$metrics_asset" "$bad_shared/$metrics_asset"
+cp "$payloads/$vmutils_asset" "$bad_shared/$vmutils_asset"
+cp "$payloads/$logs_asset" "$bad_shared/$logs_asset"
+printf 'corrupted-traces-tarball\n' >"$bad_shared/$traces_asset"
+printf 'legacy-must-stay\n' >"$bad_legacy/legacy-must-stay.tar.gz"
+rc=0
+run_downloader "$bad_root/linux-amd64" "$work/bad-shared.out" "$work/bad-shared.err" "" "$bad_root/.archives" || rc=$?
+if ((rc == 0)); then
+  fail "case 6: expected non-zero exit on checksum mismatch in the shared archive dir, got 0"
+fi
+[[ -f "$bad_legacy/legacy-must-stay.tar.gz" ]] ||
+  fail "case 6: legacy archive was removed even though checksum verification failed"
+
+# 7. 冷缓存：bin_dir 与外部 LO_STORAGE_ARCHIVE_DIR 均不存在，且无旧布局 .archives 目录。
+#    应独立创建 bin_dir 并安装全部二进制，同时不创建多余的 bin_dir/.archives。
+fresh_root=$work/storage-bin-fresh
+fresh_bin=$fresh_root/linux-amd64
+fresh_archive_root=$fresh_root/.archives
+fresh_shared=$fresh_archive_root/linux-amd64
+fresh_curl_log=$work/fresh.curl.log
+: >"$fresh_curl_log"
+rc=0
+run_downloader "$fresh_bin" "$work/fresh.out" "$work/fresh.err" "$fresh_curl_log" "$fresh_archive_root" || rc=$?
+if ((rc != 0)); then
+  fail "case 7: cold cache with external LO_STORAGE_ARCHIVE_DIR failed with exit $rc; stderr: $(cat "$work/fresh.err")"
+fi
+if (($(count_curl "$fresh_curl_log") != 4)); then
+  fail "case 7: expected 4 curl calls on cold cache, got $(count_curl "$fresh_curl_log")"
+fi
+for binary in victoria-metrics-prod victoria-logs-prod victoria-traces-prod vmagent-prod; do
+  [[ -x "$fresh_bin/$binary" ]] || fail "case 7: missing executable binary $binary in $fresh_bin"
+done
+[[ -f "$fresh_bin/.manifest" ]] || fail "case 7: missing .manifest in $fresh_bin"
+for asset in "${assets[@]}"; do
+  [[ -f "$fresh_shared/$asset" ]] || fail "case 7: missing shared archive $asset in $fresh_shared"
+done
+if [[ -d "$fresh_shared" ]]; then
+  if (($(count_entries "$fresh_shared") != 4)); then
+    fail "case 7: expected 4 archives in $fresh_shared, got $(count_entries "$fresh_shared")"
+  fi
+fi
+[[ ! -e "$fresh_bin/.archives" && ! -L "$fresh_bin/.archives" ]] ||
+  fail "case 7: unexpected $fresh_bin/.archives created when LO_STORAGE_ARCHIVE_DIR is external"
+
+# 8. 旧布局路径含符号链接时，不得跨符号链接挪动或删除外部目录中的文件。
+sym_root=$work/storage-bin-symlink
+sym_archive_root=$sym_root/.archives
+sym_shared=$sym_archive_root/linux-amd64
+mkdir -p "$sym_shared"
+cp "$payloads/$metrics_asset" "$sym_shared/$metrics_asset"
+cp "$payloads/$vmutils_asset" "$sym_shared/$vmutils_asset"
+cp "$payloads/$logs_asset" "$sym_shared/$logs_asset"
+
+# 8a. $bin_dir/.archives/$platform 是指向外部目录的符号链接。
+sym_bin_platform=$sym_root/linux-amd64-sym-platform
+ext_platform=$work/external-platform-dir
+mkdir -p "$sym_bin_platform/.archives" "$ext_platform"
+cp "$payloads/$traces_asset" "$ext_platform/$traces_asset"
+printf 'external-platform-keep\n' >"$ext_platform/external-stale.tar.gz"
+ln -s "$ext_platform" "$sym_bin_platform/.archives/linux-amd64"
+
+rc=0
+run_downloader "$sym_bin_platform" "$work/sym-plat.out" "$work/sym-plat.err" "" "$sym_archive_root" || rc=$?
+if ((rc != 0)); then
+  fail "case 8a: expected exit 0 when legacy platform dir is a symlink, got $rc; stderr: $(cat "$work/sym-plat.err")"
+fi
+[[ -L "$sym_bin_platform/.archives/linux-amd64" ]] ||
+  fail "case 8a: symlink $sym_bin_platform/.archives/linux-amd64 was removed"
+[[ -f "$ext_platform/$traces_asset" ]] ||
+  fail "case 8a: current archive was moved out of external symlink target $ext_platform"
+[[ -f "$ext_platform/external-stale.tar.gz" && "$(cat "$ext_platform/external-stale.tar.gz")" == "external-platform-keep" ]] ||
+  fail "case 8a: external file inside symlinked legacy platform dir was modified or deleted"
+for binary in victoria-metrics-prod victoria-logs-prod victoria-traces-prod vmagent-prod; do
+  [[ -x "$sym_bin_platform/$binary" ]] || fail "case 8a: missing executable binary $binary in $sym_bin_platform"
+done
+
+# 8b. $bin_dir/.archives 本身是指向外部目录的符号链接。
+sym_bin_root=$sym_root/linux-amd64-sym-root
+ext_root=$work/external-root-dir
+mkdir -p "$sym_bin_root" "$ext_root/linux-amd64"
+printf 'external-root-keep\n' >"$ext_root/linux-amd64/external-stale.tar.gz"
+ln -s "$ext_root" "$sym_bin_root/.archives"
+
+rc=0
+run_downloader "$sym_bin_root" "$work/sym-root.out" "$work/sym-root.err" "" "$sym_archive_root" || rc=$?
+if ((rc != 0)); then
+  fail "case 8b: expected exit 0 when legacy archive root is a symlink, got $rc; stderr: $(cat "$work/sym-root.err")"
+fi
+[[ -L "$sym_bin_root/.archives" ]] ||
+  fail "case 8b: symlink $sym_bin_root/.archives was removed"
+[[ -f "$ext_root/linux-amd64/external-stale.tar.gz" && "$(cat "$ext_root/linux-amd64/external-stale.tar.gz")" == "external-root-keep" ]] ||
+  fail "case 8b: external file inside symlinked legacy archive root was modified or deleted"
+for binary in victoria-metrics-prod victoria-logs-prod victoria-traces-prod vmagent-prod; do
+  [[ -x "$sym_bin_root/$binary" ]] || fail "case 8b: missing executable binary $binary in $sym_bin_root"
+done
+
 if ((failures > 0)); then
   printf 'download-storage-bins test: %d failure(s)\n' "$failures" >&2
   exit 1
 fi
-printf 'PASS: download-storage-bins keeps current 4 archives, prunes stale platform archives after SHA-256 verification, and preserves other platforms\n'
+printf 'PASS: download-storage-bins keeps current 4 archives, prunes stale platform archives after SHA-256 verification, preserves other platforms, and shares LO_STORAGE_ARCHIVE_DIR across layouts\n'
