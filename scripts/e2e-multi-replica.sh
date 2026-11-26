@@ -22,7 +22,7 @@ SEAWEED_IMAGE=${LO_E2E_SEAWEED_IMAGE:-chrislusf/seaweedfs:4.54@sha256:4b42c21254
 # Valkey is Redis-protocol compatible and BSD-3-Clause. Keep both the version
 # and multi-platform manifest digest fixed so this gate cannot drift to a
 # differently licensed Redis release through a floating image tag.
-VALKEY_IMAGE=${LO_E2E_VALKEY_IMAGE:-valkey/valkey:8.1.11-trixie@sha256:8f836008e0986c36adf50da714c7060cf689dbb335f61fe077939d90fa650809}
+VALKEY_IMAGE=${LO_E2E_VALKEY_IMAGE:-valkey/valkey:8.1.12-trixie@sha256:5032c4dd7abe08d6fd9382054608183e2bf1f7e3895ef619b8784698454325f7}
 POSTGRES_IMAGE=${LO_E2E_POSTGRES_IMAGE:-postgres:16.16-trixie@sha256:dd2bf3ce2dc83a81674cf7f217fcfd8a5009a4b325dda5b843bfee82a06cff6f}
 
 # 网络：脚本自建一个 Docker bridge 网络，依赖容器之间用容器名互访；lazy-observe replica
