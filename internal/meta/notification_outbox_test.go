@@ -382,15 +382,7 @@ func TestRecentPlatformAlertStates(t *testing.T) {
 		if err != nil || len(blocked) != 0 {
 			t.Fatalf("states with pending transitions=%#v err=%v want none", blocked, err)
 		}
-		pending, err := store.PendingPlatformAlertTransitions(ctx, 0, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, tr := range pending {
-			if err := store.AckPlatformAlertTransition(ctx, tr.ID); err != nil {
-				t.Fatal(err)
-			}
-		}
+		commitAllTransitions(t, store, 0)
 
 		got, err := store.RecentPlatformAlertStates(ctx, platformAlertKindErrorRateSpike, resolvedBoundary, 0)
 		if err != nil {

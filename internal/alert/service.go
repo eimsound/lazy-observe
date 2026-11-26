@@ -1573,14 +1573,17 @@ func (s *Service) platformTransitionTTL() time.Duration {
 // policy state, and atomically deletes the transition row while inserting its
 // notification_outbox entries under the claim fence.
 //
-// Because each stream's head row is leased to at most one caller at a time
-// (via ClaimPlatformAlertTransitions) and successors stay blocked behind it
-// until CommitPlatformAlertTransition deletes the head row under claim_token,
-// two concurrent replicas cannot plan different transitions of the same stream
-// against diverging policy snapshots or enqueue outbox rows out of commit
-// order. If a worker pauses past its claim TTL and another replica steals the
-// lease, the paused worker's CommitPlatformAlertTransition fails with
-// meta.ErrStalePlatformTransitionClaim and writes zero outbox rows.
+// Because ClaimPlatformAlertTransitions leases each stream's head row using
+// the shared database millisecond clock (ADR 0011), at most one caller holds a
+// given stream's head row at a time without cross-replica clock skew, and
+// successors stay blocked behind it until CommitPlatformAlertTransition deletes
+// the head row under claim_token. Consequently, two concurrent replicas cannot
+// plan different transitions of the same stream against diverging policy
+// snapshots or enqueue outbox rows out of commit order. If a worker pauses
+// past its claim TTL and another replica takes over the lease, both head-row
+// exclusion and claim_token fencing hold: the paused worker's
+// CommitPlatformAlertTransition fails with meta.ErrStalePlatformTransitionClaim
+// and writes zero outbox rows.
 //
 // Rows whose planning fails during a pass stay claimed briefly so the pass
 // does not spin on the same failing stream; a defer releases them cleanly once
@@ -1617,12 +1620,10 @@ func (s *Service) drainPlatformAlertTransitions(ctx context.Context, onlyProject
 	remaining := platformTransitionDrainLimit
 	var errs []error
 	for remaining > 0 {
-		now := s.now().UTC()
 		claimed, err := s.store.ClaimPlatformAlertTransitions(
 			ctx,
 			onlyProjectID,
 			s.nextPlatformTransitionClaimToken(),
-			now,
 			s.platformTransitionTTL(),
 			remaining,
 		)

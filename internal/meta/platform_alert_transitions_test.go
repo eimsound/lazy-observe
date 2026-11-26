@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -40,15 +41,27 @@ func pendingTransitions(t *testing.T, store *Store, projectID int) []loggedTrans
 	return out
 }
 
-func ackAllTransitions(t *testing.T, store *Store, projectID int) {
+func commitAllTransitions(t *testing.T, store *Store, projectID int) {
 	t.Helper()
-	rows, err := store.PendingPlatformAlertTransitions(context.Background(), projectID, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, row := range rows {
-		if err := store.AckPlatformAlertTransition(context.Background(), row.ID); err != nil {
+	ctx := context.Background()
+	for pass := 0; ; pass++ {
+		claimed, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			projectID,
+			fmt.Sprintf("test-drain-%d", pass),
+			time.Minute,
+			100,
+		)
+		if err != nil {
 			t.Fatal(err)
+		}
+		if len(claimed) == 0 {
+			return
+		}
+		for _, row := range claimed {
+			if _, err := store.CommitPlatformAlertTransition(ctx, row.ID, row.ClaimToken, nil); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 }
@@ -113,7 +126,7 @@ func TestPlatformAlertTransitionsLogEveryStateChange(t *testing.T) {
 		}) {
 			t.Fatalf("after intra-batch resolve and re-fire=%#v", got)
 		}
-		ackAllTransitions(t, store, project.ID)
+		commitAllTransitions(t, store, project.ID)
 
 		recoveries, err := store.CheckPlatformErrorRateRecoveries(ctx, late.Add(6*time.Minute), window)
 		if err != nil || len(recoveries) != 1 {
@@ -124,7 +137,7 @@ func TestPlatformAlertTransitionsLogEveryStateChange(t *testing.T) {
 		}) {
 			t.Fatalf("after recovery=%#v", got)
 		}
-		ackAllTransitions(t, store, project.ID)
+		commitAllTransitions(t, store, project.ID)
 
 		if _, err := store.PutProjectAlertConfig(ctx, project.ID, ProjectAlertConfigUpdate{
 			ErrorRateThresholdPerMinute: 3,
@@ -155,16 +168,19 @@ func TestPlatformAlertTransitionsLogEveryStateChange(t *testing.T) {
 		if got := pendingTransitions(t, store, project.ID); len(got) != 2 {
 			t.Fatalf("second clear logged a transition: %#v", got)
 		}
-		// Acknowledging twice is harmless, and project deletion drops the log.
-		rows, err := store.PendingPlatformAlertTransitions(ctx, project.ID, 0)
-		if err != nil {
+		// Duplicate fenced commit returns ErrStalePlatformTransitionClaim, and project deletion drops remaining rows.
+		claimed, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "log-test", time.Minute, 10)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claimed=%#v err=%v", claimed, err)
+		}
+		if _, err := store.CommitPlatformAlertTransition(ctx, claimed[0].ID, claimed[0].ClaimToken, nil); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.AckPlatformAlertTransition(ctx, rows[0].ID); err != nil {
-			t.Fatal(err)
-		}
-		if err := store.AckPlatformAlertTransition(ctx, rows[0].ID); err != nil {
-			t.Fatal(err)
+		if _, err := store.CommitPlatformAlertTransition(ctx, claimed[0].ID, claimed[0].ClaimToken, nil); !errors.Is(
+			err,
+			ErrStalePlatformTransitionClaim,
+		) {
+			t.Fatalf("duplicate commit err=%v want ErrStalePlatformTransitionClaim", err)
 		}
 		if err := store.DeleteProject(ctx, project.ID); err != nil {
 			t.Fatal(err)
@@ -219,21 +235,20 @@ func TestPlatformAlertTransitionsExclusiveHeadClaim(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "", late, time.Minute, 10); err == nil {
+		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "", time.Minute, 10); err == nil {
 			t.Fatal("expected error for empty claim token")
 		}
-		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "tok", time.Time{}, time.Minute, 10); err == nil {
-			t.Fatal("expected error for zero timestamp")
+		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "tok", 0, 10); err == nil {
+			t.Fatal("expected error for zero TTL")
 		}
-		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "tok", late, 0, 10); err == nil {
-			t.Fatal("expected error for non-positive TTL")
+		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "tok", -time.Second, 10); err == nil {
+			t.Fatal("expected error for negative TTL")
 		}
 
 		claimedP1, err := store.ClaimPlatformAlertTransitions(
 			ctx,
 			p1.ID,
 			"tok-a",
-			late.Add(time.Second),
 			30*time.Second,
 			10,
 		)
@@ -251,7 +266,6 @@ func TestPlatformAlertTransitionsExclusiveHeadClaim(t *testing.T) {
 			ctx,
 			0,
 			"tok-b",
-			late.Add(2*time.Second),
 			30*time.Second,
 			10,
 		)
@@ -263,7 +277,6 @@ func TestPlatformAlertTransitionsExclusiveHeadClaim(t *testing.T) {
 			ctx,
 			0,
 			"tok-c",
-			late.Add(3*time.Second),
 			30*time.Second,
 			10,
 		); err != nil ||
@@ -301,7 +314,6 @@ func TestPlatformAlertTransitionsExclusiveHeadClaim(t *testing.T) {
 			ctx,
 			p1.ID,
 			"tok-d",
-			late.Add(4*time.Second),
 			30*time.Second,
 			10,
 		)
@@ -318,7 +330,6 @@ func TestPlatformAlertTransitionsExclusiveHeadClaim(t *testing.T) {
 			ctx,
 			p1.ID,
 			"tok-e",
-			late.Add(5*time.Second),
 			30*time.Second,
 			10,
 		)
@@ -332,7 +343,6 @@ func TestPlatformAlertTransitionsExclusiveHeadClaim(t *testing.T) {
 			ctx,
 			p1.ID,
 			"tok-f",
-			late.Add(6*time.Second),
 			30*time.Second,
 			10,
 		); err != nil ||
@@ -371,27 +381,43 @@ func TestPlatformAlertTransitionsExpiredLeaseTakeoverAndFencing(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		claimAt := now.Add(time.Second)
-		ttl := 30 * time.Second
-		first, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "worker-a", claimAt, ttl, 10)
-		if err != nil || len(first) != 1 {
-			t.Fatalf("first claim=%#v err=%v", first, err)
+		active, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "worker-active", 30*time.Second, 10)
+		if err != nil || len(active) != 1 {
+			t.Fatalf("active claim=%#v err=%v", active, err)
 		}
 		if beforeExpiry, err := store.ClaimPlatformAlertTransitions(
 			ctx,
 			project.ID,
 			"worker-b",
-			claimAt.Add(29*time.Second),
-			ttl,
+			30*time.Second,
 			10,
 		); err != nil ||
 			len(beforeExpiry) != 0 {
 			t.Fatalf("expected lease active before expiry, got=%#v err=%v", beforeExpiry, err)
 		}
+		if err := store.ReleasePlatformAlertTransition(ctx, active[0].ID, "worker-active"); err != nil {
+			t.Fatal(err)
+		}
 
-		takeover, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "worker-b", claimAt.Add(ttl), ttl, 10)
-		if err != nil || len(takeover) != 1 || takeover[0].ID != first[0].ID || takeover[0].ClaimToken != "worker-b" {
-			t.Fatalf("takeover claim=%#v err=%v", takeover, err)
+		const shortTTL = 25 * time.Millisecond
+		first, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "worker-a", shortTTL, 10)
+		if err != nil || len(first) != 1 {
+			t.Fatalf("first claim=%#v err=%v", first, err)
+		}
+		var takeover []PlatformAlertTransition
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			takeover, err = store.ClaimPlatformAlertTransitions(ctx, project.ID, "worker-b", 30*time.Second, 10)
+			if err != nil {
+				t.Fatalf("takeover poll err=%v", err)
+			}
+			if len(takeover) > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if len(takeover) != 1 || takeover[0].ID != first[0].ID || takeover[0].ClaimToken != "worker-b" {
+			t.Fatalf("takeover claim=%#v want row %d owned by worker-b", takeover, first[0].ID)
 		}
 
 		staleEntry := NotificationOutboxEnqueue{
@@ -485,7 +511,7 @@ func TestPlatformAlertTransitionsReleaseRequiresMatchingToken(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		claimed, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "owner-1", now, 30*time.Second, 10)
+		claimed, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "owner-1", 30*time.Second, 10)
 		if err != nil || len(claimed) != 1 {
 			t.Fatalf("claimed=%#v err=%v", claimed, err)
 		}
@@ -496,7 +522,6 @@ func TestPlatformAlertTransitionsReleaseRequiresMatchingToken(t *testing.T) {
 			ctx,
 			project.ID,
 			"owner-2",
-			now.Add(5*time.Second),
 			30*time.Second,
 			10,
 		); err != nil ||
@@ -510,7 +535,6 @@ func TestPlatformAlertTransitionsReleaseRequiresMatchingToken(t *testing.T) {
 			ctx,
 			project.ID,
 			"owner-2",
-			now.Add(5*time.Second),
 			30*time.Second,
 			10,
 		)

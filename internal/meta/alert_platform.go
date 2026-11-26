@@ -833,11 +833,10 @@ type PlatformAlertTransition struct {
 	ClaimToken      string
 }
 
-const platformAlertTransitionClaimable = `(tr.claim_until IS NULL OR tr.claim_until <= ?)
-	AND NOT EXISTS (
-		SELECT 1 FROM platform_alert_transitions AS prior
-		WHERE prior.project_id = tr.project_id AND prior.kind = tr.kind AND prior.id < tr.id
-	)`
+const platformAlertTransitionIsStreamHead = `NOT EXISTS (
+	SELECT 1 FROM platform_alert_transitions AS prior
+	WHERE prior.project_id = tr.project_id AND prior.kind = tr.kind AND prior.id < tr.id
+)`
 
 func (s *Store) insertPlatformAlertTransition(
 	ctx context.Context,
@@ -957,57 +956,59 @@ func scanPlatformAlertTransitions(rows *sql.Rows) ([]PlatformAlertTransition, er
 }
 
 // ClaimPlatformAlertTransitions exclusively leases at most the oldest
-// unacknowledged transition row per (project_id, kind) stream, preventing
-// concurrent replicas from planning different transitions of the same stream
-// against diverging policy snapshots. A leased head row blocks its successors
-// until it is committed via CommitPlatformAlertTransition, released, or its
-// claim_until expires. projectID > 0 restricts claiming to that project.
+// unacknowledged transition row per (project_id, kind) stream using the shared
+// database millisecond clock (ADR 0011), preventing concurrent replicas from
+// planning different transitions of the same stream against diverging policy
+// snapshots. A leased head row blocks its successors until it is committed via
+// CommitPlatformAlertTransition, released, or its claim_until expires.
+// projectID > 0 restricts claiming to that project.
 func (s *Store) ClaimPlatformAlertTransitions(
 	ctx context.Context,
 	projectID int,
 	claimToken string,
-	now time.Time,
 	ttl time.Duration,
 	limit int,
 ) ([]PlatformAlertTransition, error) {
-	if claimToken == "" || now.IsZero() || ttl <= 0 {
-		return nil, errors.New("platform alert transition claim requires token, timestamp, and positive TTL")
+	if claimToken == "" || ttl <= 0 {
+		return nil, errors.New("platform alert transition claim requires token and positive TTL")
+	}
+	if ttl < time.Millisecond {
+		ttl = time.Millisecond
 	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	now = now.UTC()
-	claimUntil := now.Add(ttl)
 	if s.dialect == dialect.Postgres {
-		return s.claimPostgresPlatformAlertTransitions(ctx, projectID, claimToken, now, claimUntil, limit)
+		return s.claimPostgresPlatformAlertTransitions(ctx, projectID, claimToken, ttl, limit)
 	}
-	return s.claimSQLitePlatformAlertTransitions(ctx, projectID, claimToken, now, claimUntil, limit)
+	return s.claimSQLitePlatformAlertTransitions(ctx, projectID, claimToken, ttl, limit)
 }
 
 func (s *Store) claimPostgresPlatformAlertTransitions(
 	ctx context.Context,
 	projectID int,
 	claimToken string,
-	now time.Time,
-	claimUntil time.Time,
+	ttl time.Duration,
 	limit int,
 ) ([]PlatformAlertTransition, error) {
-	where := platformAlertTransitionClaimable
-	args := []any{now}
+	expiry, expiryArg := s.alertLeaseExpiry(ttl)
+	projectFilter := ""
+	var args []any
 	if projectID > 0 {
-		where += ` AND tr.project_id = ?`
+		projectFilter = ` AND tr.project_id = ?`
 		args = append(args, projectID)
 	}
-	args = append(args, limit, claimToken, claimUntil)
+	args = append(args, limit, claimToken, expiryArg)
 	query := `WITH picked AS (
 		SELECT id FROM platform_alert_transitions AS tr
-		WHERE ` + where + `
+		WHERE (tr.claim_until IS NULL OR tr.claim_until <= CURRENT_TIMESTAMP)
+			AND ` + platformAlertTransitionIsStreamHead + projectFilter + `
 		ORDER BY tr.project_id, tr.kind, tr.id
 		FOR UPDATE SKIP LOCKED
 		LIMIT ?
 	), updated AS (
 		UPDATE platform_alert_transitions AS tr
-		SET claim_token = ?, claim_until = ?
+		SET claim_token = ?, claim_until = ` + expiry + `
 		FROM picked
 		WHERE tr.id = picked.id
 		RETURNING tr.id, tr.project_id, tr.kind, tr.status, tr.cycle, tr.starts_at, tr.ends_at,
@@ -1019,7 +1020,7 @@ func (s *Store) claimPostgresPlatformAlertTransitions(
 	FROM updated
 	JOIN projects AS p ON p.id = updated.project_id
 	ORDER BY updated.project_id, updated.kind, updated.id`
-	rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), args...)
+	rows, err := s.db.QueryContext(ctx, s.alertClockSQL(query), args...)
 	if err != nil {
 		return nil, fmt.Errorf("claim PostgreSQL platform alert transitions: %w", err)
 	}
@@ -1027,22 +1028,23 @@ func (s *Store) claimPostgresPlatformAlertTransitions(
 	return scanPlatformAlertTransitions(rows)
 }
 
-func selectClaimableSQLitePlatformTransitionIDsTx(
+func (s *Store) selectClaimableSQLitePlatformTransitionIDsTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	projectID int,
-	now time.Time,
 	limit int,
 ) ([]int64, error) {
-	query := `SELECT id FROM platform_alert_transitions AS tr WHERE ` + platformAlertTransitionClaimable
-	args := []any{now}
+	query := `SELECT id FROM platform_alert_transitions AS tr
+		WHERE (tr.claim_until IS NULL OR tr.claim_until <= CURRENT_TIMESTAMP)
+			AND ` + platformAlertTransitionIsStreamHead
+	var args []any
 	if projectID > 0 {
 		query += ` AND tr.project_id = ?`
 		args = append(args, projectID)
 	}
 	query += ` ORDER BY tr.project_id, tr.kind, tr.id LIMIT ?`
 	args = append(args, limit)
-	rows, err := tx.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, s.alertClockSQL(query), args...)
 	if err != nil {
 		return nil, fmt.Errorf("select SQLite platform alert transitions: %w", err)
 	}
@@ -1065,8 +1067,7 @@ func (s *Store) claimSQLitePlatformAlertTransitions(
 	ctx context.Context,
 	projectID int,
 	claimToken string,
-	now time.Time,
-	claimUntil time.Time,
+	ttl time.Duration,
 	limit int,
 ) ([]PlatformAlertTransition, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1074,7 +1075,7 @@ func (s *Store) claimSQLitePlatformAlertTransitions(
 		return nil, fmt.Errorf("begin SQLite platform alert transition claim: %w", err)
 	}
 	defer tx.Rollback()
-	ids, err := selectClaimableSQLitePlatformTransitionIDsTx(ctx, tx, projectID, now, limit)
+	ids, err := s.selectClaimableSQLitePlatformTransitionIDsTx(ctx, tx, projectID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1083,14 +1084,19 @@ func (s *Store) claimSQLitePlatformAlertTransitions(
 	}
 	claimed := make([]PlatformAlertTransition, 0, len(ids))
 	slugs := make(map[int]string)
-	updateQuery := `UPDATE platform_alert_transitions AS tr
-		SET claim_token = ?, claim_until = ?
-		WHERE tr.id = ? AND ` + platformAlertTransitionClaimable + `
+	expiry, expiryArg := s.alertLeaseExpiry(ttl)
+	updateQuery := s.alertClockSQL(
+		`UPDATE platform_alert_transitions AS tr
+		SET claim_token = ?, claim_until = ` + expiry + `
+		WHERE tr.id = ?
+			AND (tr.claim_until IS NULL OR tr.claim_until <= CURRENT_TIMESTAMP)
+			AND ` + platformAlertTransitionIsStreamHead + `
 		RETURNING id, project_id, kind, status, cycle, starts_at, ends_at,
-			window_count, threshold_per_min, recorded_at, claim_token`
+			window_count, threshold_per_min, recorded_at, claim_token`,
+	)
 	for _, id := range ids {
 		tr, err := scanPlatformAlertTransitionRow(
-			tx.QueryRowContext(ctx, updateQuery, claimToken, claimUntil, id, now),
+			tx.QueryRowContext(ctx, updateQuery, claimToken, expiryArg, id),
 			"_pending_",
 		)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1191,20 +1197,6 @@ func (s *Store) ReleasePlatformAlertTransition(ctx context.Context, id int64, cl
 		claimToken,
 	); err != nil {
 		return fmt.Errorf("release platform alert transition %d: %w", id, err)
-	}
-	return nil
-}
-
-// AckPlatformAlertTransition removes a transition once its notification_outbox
-// rows are written (or it was deliberately dropped). Acknowledging a row that
-// another notifier already removed is not an error.
-func (s *Store) AckPlatformAlertTransition(ctx context.Context, id int64) error {
-	if _, err := s.db.ExecContext(
-		ctx,
-		bind(s.dialect, `DELETE FROM platform_alert_transitions WHERE id = ?`),
-		id,
-	); err != nil {
-		return fmt.Errorf("acknowledge platform alert transition %d: %w", id, err)
 	}
 	return nil
 }

@@ -815,7 +815,7 @@ func TestErrorRateSpikeSilenceBoundaryStaleClaimFenced(t *testing.T) {
 	ctx := context.Background()
 	svcA := h.service("silence-fence-a")
 	svcB := h.service("silence-fence-b")
-	svcB.transitionClaimTTL = 10 * time.Second
+	svcB.transitionClaimTTL = 25 * time.Millisecond
 
 	if _, err := svcA.CreateSilence(ctx, SilenceInput{
 		Project:  h.project.Slug,
@@ -858,6 +858,22 @@ func TestErrorRateSpikeSilenceBoundaryStaleClaimFenced(t *testing.T) {
 		t.Fatalf("precondition outbox rows=%#v", rows)
 	}
 
+	// While an active lease holds t1, replica A cannot steal or bypass it.
+	held, err := h.store.ClaimPlatformAlertTransitions(ctx, h.project.ID, "active-holder", 30*time.Second, 10)
+	if err != nil || len(held) != 1 {
+		t.Fatalf("active holder claim=%#v err=%v", held, err)
+	}
+	h.set(h.base.Add(6*time.Minute + 15*time.Second))
+	if err := svcA.drainPlatformAlertTransitions(ctx, h.project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0); err != nil || len(pending) != 3 {
+		t.Fatalf("pending while leased=%#v err=%v", pending, err)
+	}
+	if err := h.store.ReleasePlatformAlertTransition(ctx, held[0].ID, held[0].ClaimToken); err != nil {
+		t.Fatal(err)
+	}
+
 	h.set(h.base.Add(6*time.Minute + 10*time.Second))
 	bClaimed := make(chan meta.PlatformAlertTransition, 1)
 	releaseB := make(chan struct{})
@@ -891,25 +907,30 @@ func TestErrorRateSpikeSilenceBoundaryStaleClaimFenced(t *testing.T) {
 		t.Fatalf("replica B claimed=%#v want firing cycle 1", trB)
 	}
 
-	// While B's lease is active, A cannot steal or bypass t1.
-	h.set(h.base.Add(6*time.Minute + 15*time.Second))
-	if err := svcA.drainPlatformAlertTransitions(ctx, h.project.ID); err != nil {
-		t.Fatal(err)
-	}
-	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0); err != nil || len(pending) != 3 {
-		t.Fatalf("pending while leased=%#v err=%v", pending, err)
-	}
-
-	// Advance past B's 10s lease while the silence is still active, then advance
-	// past silence expiry as soon as A claims t3=firing(2).
+	// Poll until B's short DB lease expires while the silence is still active,
+	// then advance the fake clock past silence expiry as soon as A claims t3=firing(2).
 	h.set(h.base.Add(6*time.Minute + 30*time.Second))
 	svcA.onTransitionClaimed = func(tr meta.PlatformAlertTransition) {
 		if tr.Status == "firing" && tr.Cycle == 2 {
 			h.set(h.base.Add(7*time.Minute + 5*time.Second))
 		}
 	}
-	if err := svcA.drainPlatformAlertTransitions(ctx, h.project.ID); err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := svcA.drainPlatformAlertTransitions(ctx, h.project.ID); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 0 {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out waiting for replica A to take over and drain transitions, remaining=%#v", pending)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	h.expectRows(PlatformStateRef{Cycle: 2, Status: "firing"})
 	h.waitDelivered("firing", "2")
