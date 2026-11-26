@@ -473,9 +473,14 @@ func BuildOutboxEntriesWithLifecycle(
 	repeatInterval time.Duration,
 ) []meta.NotificationOutboxEnqueue {
 	now = now.UTC()
+	orderingKey := ""
+	if ruleID != nil && lifecycleID == 0 {
+		orderingKey = nativeOrderingKey(*ruleID)
+	}
 	return buildOutboxEntries(
 		projectID,
 		ruleID,
+		orderingKey,
 		channelIDs,
 		notifications,
 		func(n Notification, payload []byte) []byte {
@@ -512,6 +517,7 @@ func BuildRuleOutboxEntries(
 	return buildOutboxEntries(
 		projectID,
 		&ruleID,
+		nativeOrderingKey(ruleID),
 		channelIDs,
 		notifications,
 		func(n Notification, payload []byte) []byte {
@@ -536,6 +542,20 @@ type PlatformStateRef struct {
 	Kind      string
 	Cycle     int64
 	Status    string
+}
+
+// nativeOrderingKey is the notification_outbox causal stream of one native
+// rule: per channel, its firing, repeat and resolved notifications are
+// delivered in the order the fenced rule evaluations committed them.
+func nativeOrderingKey(ruleID int) string {
+	return "rule:" + strconv.Itoa(ruleID)
+}
+
+// platformStateOrderingKey is the notification_outbox causal stream of one
+// durable platform alert, so per channel firing(C) precedes resolved(C),
+// which precedes firing(C+1).
+func platformStateOrderingKey(projectID int, kind string) string {
+	return "platform-state:" + strconv.Itoa(projectID) + ":" + kind
 }
 
 func platformStateKeyPayload(ref PlatformStateRef) []byte {
@@ -563,14 +583,21 @@ func BuildPlatformStateOutboxEntries(
 	notifications []Notification,
 ) []meta.NotificationOutboxEnqueue {
 	keyPayload := platformStateKeyPayload(ref)
-	return buildOutboxEntries(ref.ProjectID, nil, channelIDs, notifications, func(Notification, []byte) []byte {
-		return keyPayload
-	})
+	return buildOutboxEntries(
+		ref.ProjectID,
+		nil,
+		platformStateOrderingKey(ref.ProjectID, ref.Kind),
+		channelIDs,
+		notifications,
+		func(Notification, []byte) []byte {
+			return keyPayload
+		})
 }
 
 func buildOutboxEntries(
 	projectID int,
 	ruleID *int,
+	orderingKey string,
 	channelIDs []int,
 	notifications []Notification,
 	keyPayloadFor func(Notification, []byte) []byte,
@@ -589,6 +616,11 @@ func buildOutboxEntries(
 		if notification.Status == "resolved" {
 			priority = 100
 		}
+		// A storm summary stands for many groups, so it joins no per-alert stream.
+		streamKey := orderingKey
+		if notification.Storm != nil {
+			streamKey = ""
+		}
 		for _, channelID := range channelIDs {
 			var entryRuleID *int
 			if ruleID != nil {
@@ -602,6 +634,7 @@ func buildOutboxEntries(
 				ChannelID:      channelID,
 				Payload:        payload,
 				Priority:       priority,
+				OrderingKey:    streamKey,
 			})
 		}
 	}

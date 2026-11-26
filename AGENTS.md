@@ -17,7 +17,7 @@
 - `internal/db/ent` 是生成代码并纳入 git：改 `internal/db/schema` 后运行 `mise run ent-generate`，与 schema 一并提交，不手改。
 - fencing/租约被拒（如 `meta.ErrStaleRuleFence`）不得静默丢弃：放弃结果的调用方至少 `slog.Warn`，带规则、成员和纪元；
   `errors.Is` 命中后直接 `return`/`continue` 不留日志算缺陷。
-- `alert_engine_members`、`alert_rule_leases`、`source_map_upload_pins` 读数据库时间只走 `alertClockSQL`/`alertLeaseExpiry`（ADR 0011）。
+- `alert_engine_members`、`alert_rule_leases`、`source_map_upload_pins`、`platform_alert_transitions` 读数据库时间只走 `alertClockSQL`/`alertLeaseExpiry`（ADR 0011）。
 
 ## 工作流
 

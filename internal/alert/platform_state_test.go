@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,12 +29,9 @@ type spikeHarness struct {
 	project  *meta.Project
 	channel  int
 	received chan Notification
-	// pending holds deliveries already read from received but not yet matched
-	// by waitDelivered, so concurrent out-of-order deliveries are not lost.
-	pending []Notification
-	clock   *atomic.Int64
-	base    time.Time
-	client  *http.Client
+	clock    *atomic.Int64
+	base     time.Time
+	client   *http.Client
 }
 
 func newSpikeHarness(t *testing.T, slug string) *spikeHarness {
@@ -159,66 +157,31 @@ func (h *spikeHarness) expectRows(want ...PlatformStateRef) []spikeOutboxRow {
 	return rows
 }
 
-// waitDelivered waits for the error_rate_spike delivery of (status, cycle).
-// OutboxWorker.drain delivers a claimed batch concurrently (delivery order is
-// tracked in #386), so deliveries that do not match are kept in pending for
-// later waits instead of being dropped; consecutive calls match in any order.
+// waitDelivered waits for the next error_rate_spike delivery and fails unless
+// it is (status, cycle). The outbox claims one alert's transitions per channel
+// strictly in causal order (issue #386), so consecutive calls also assert the
+// delivery order even though OutboxWorker.drain delivers batches concurrently.
 func (h *spikeHarness) waitDelivered(status, cycle string) {
 	h.t.Helper()
-	matches := func(n Notification) bool {
-		return n.Rule == "error_rate_spike" && n.Status == status && len(n.Alerts) == 1 &&
-			n.Alerts[0].Annotations["cycle"] == cycle
-	}
-	if i := slices.IndexFunc(h.pending, matches); i >= 0 {
-		h.pending = slices.Delete(h.pending, i, i+1)
-		return
-	}
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case n := <-h.received:
-			if matches(n) {
-				return
-			}
-			h.pending = append(h.pending, n)
-		case <-deadline:
-			h.t.Fatalf(
-				"timeout waiting for %s notification cycle %s; unmatched deliveries=%#v",
-				status,
-				cycle,
-				h.pending,
-			)
-			return
+	select {
+	case n := <-h.received:
+		if n.Rule != "error_rate_spike" || n.Status != status || len(n.Alerts) != 1 ||
+			n.Alerts[0].Annotations["cycle"] != cycle {
+			h.t.Fatalf("next delivery=%#v want %s notification cycle %s", n, status, cycle)
 		}
+	case <-time.After(2 * time.Second):
+		h.t.Fatalf("timeout waiting for %s notification cycle %s", status, cycle)
 	}
 }
 
-// expectNoDelivery fails if any delivery is pending or arrives within d.
+// expectNoDelivery fails if any delivery arrives within d.
 func (h *spikeHarness) expectNoDelivery(d time.Duration) {
 	h.t.Helper()
-	if len(h.pending) > 0 {
-		h.t.Fatalf("unexpected delivery: %#v", h.pending)
-	}
 	select {
 	case n := <-h.received:
 		h.t.Fatalf("unexpected delivery: %#v", n)
 	case <-time.After(d):
 	}
-}
-
-// OutboxWorker.drain delivers one claimed batch concurrently, so a later
-// transition may reach the webhook first. waitDelivered must keep it for the
-// next wait instead of discarding it (issue #394).
-func TestSpikeHarnessWaitDeliveredToleratesOutOfOrderDelivery(t *testing.T) {
-	h := newSpikeHarness(t, "spike-wait-order")
-	delivered := func(status, cycle string) Notification {
-		return Notification{Rule: "error_rate_spike", Status: status,
-			Alerts: []Alert{{Annotations: map[string]string{"cycle": cycle}}}}
-	}
-	h.received <- delivered("firing", "2")
-	h.received <- delivered("resolved", "1")
-	h.waitDelivered("resolved", "1")
-	h.waitDelivered("firing", "2")
 }
 
 func TestBuildPlatformStateOutboxEntriesKeyIgnoresPayloadAndPinsTransition(t *testing.T) {
@@ -738,4 +701,340 @@ func TestErrorRateSpikeInhibitionRuleHooksReplayImmediately(t *testing.T) {
 		PlatformStateRef{Cycle: 2, Status: "firing"},
 	)
 	hInhib.waitDelivered("firing", "2")
+}
+
+// Issue #386 (intra-batch crash window): a batch whose accounting commits
+// resolved(C) and then firing(C+1) leaves only the firing(C+1) state row. If
+// the process dies before enqueueing, the logged transitions still deliver
+// resolved(C) and firing(C+1), in that order, from any replica.
+func TestErrorRateSpikeIntraBatchCrashDeliversResolvedBeforeRefire(t *testing.T) {
+	h := newSpikeHarness(t, "spike-batch-crash")
+	ctx := context.Background()
+	svc := h.service("batch-crash")
+	h.spike(svc, h.base)
+	h.waitDelivered("firing", "1")
+
+	late := h.base.Add(6 * time.Minute)
+	events := make([]time.Time, 7)
+	for i := range events {
+		events[i] = late.Add(-20*time.Second + time.Duration(i)*time.Second)
+	}
+	// The crashed replica: one batch committed resolved(1) then firing(2), but
+	// nothing reached notification_outbox.
+	results, err := h.store.RecordPlatformErrorRates(ctx, late, errorRateWindow, []meta.PlatformErrorRateBatch{
+		{ProjectID: h.project.ID, ThresholdPerMin: 1, OccurredAt: events},
+	})
+	if err != nil || len(results) != 1 || len(results[0].Transitions) != 2 {
+		t.Fatalf("crashed batch results=%#v err=%v", results, err)
+	}
+	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
+
+	h.set(late.Add(5 * time.Second))
+	restarted := h.service("batch-restarted")
+	if err := restarted.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows := h.expectRows(
+		PlatformStateRef{Cycle: 1, Status: "firing"},
+		PlatformStateRef{Cycle: 1, Status: "resolved"},
+		PlatformStateRef{Cycle: 2, Status: "firing"},
+	)
+	if got := rows[1].Notification.Alerts[0].Annotations["summary"]; got != "Error rate spike recovered: 0.2 events/min" {
+		t.Fatalf("resolved summary=%q", got)
+	}
+	h.waitDelivered("resolved", "1")
+	h.waitDelivered("firing", "2")
+	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, 0, 0); err != nil || len(pending) != 0 {
+		t.Fatalf("transitions left after drain=%#v err=%v", pending, err)
+	}
+}
+
+// Issue #386 (fast-resolve crash window): replica A commits firing(1) and
+// dies before enqueueing; before any recovery tick, replica B's ingest path
+// resolves the cycle. B's drain must enqueue the logged firing(1) ahead of
+// resolved(1) instead of dropping both (the resolved as an orphan).
+func TestErrorRateSpikeCrashedFiringSurvivesIngestResolve(t *testing.T) {
+	h := newSpikeHarness(t, "spike-fast-resolve")
+	ctx := context.Background()
+	for i := range 6 {
+		ts := h.base.Add(time.Duration(i) * time.Second)
+		if _, err := h.store.RecordPlatformErrorRate(ctx, h.project.ID, ts, ts, errorRateWindow, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("precondition: outbox rows=%#v", rows)
+	}
+	b := h.service("fast-resolve-b")
+	resolveAt := h.base.Add(6 * time.Minute)
+	h.set(resolveAt)
+	if err := b.RecordErrorEvent(ctx, h.project.ID, resolveAt); err != nil {
+		t.Fatal(err)
+	}
+	rows := h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+	if rows[0].ID >= rows[1].ID {
+		t.Fatalf("firing outbox id %d not before resolved id %d", rows[0].ID, rows[1].ID)
+	}
+	h.waitDelivered("firing", "1")
+	h.waitDelivered("resolved", "1")
+}
+
+// A configuration reset that resolves an open cycle is logged with the
+// resolution, so its notification carries the reset summary and the new
+// threshold.
+func TestErrorRateSpikeConfigResetResolvesThroughTransitionLog(t *testing.T) {
+	h := newSpikeHarness(t, "spike-reset")
+	ctx := context.Background()
+	svc := h.service("reset")
+	h.spike(svc, h.base)
+	h.waitDelivered("firing", "1")
+	if _, err := svc.PutProjectAlertConfig(ctx, h.project.ID, ProjectAlertConfigInput{
+		ErrorRateThresholdPerMinute: 4,
+		ChannelIDs:                  []int{h.channel},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows := h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+	annotations := rows[1].Notification.Alerts[0].Annotations
+	if annotations["summary"] != "Error rate spike state reset after alert configuration change" ||
+		annotations["threshold_per_min"] != "4" {
+		t.Fatalf("reset annotations=%#v", annotations)
+	}
+	h.waitDelivered("resolved", "1")
+}
+
+// Regression test for exclusive transition-stream claiming and fencing across a
+// silence expiry boundary: replica B claims t1=firing(1) while silenced and
+// pauses before commit; after its lease expires, replica A steals t1 (still
+// silenced -> 0 rows), drains t2=resolved(1) (no prior firing -> 0 rows), then
+// crosses silence expiry before draining t3=firing(2). When replica B resumes
+// after silence expiry and tries to commit its stale t1 claim, it is fenced out
+// with zero outbox rows written, leaving strictly [firing(2)] delivered.
+func TestErrorRateSpikeSilenceBoundaryStaleClaimFenced(t *testing.T) {
+	h := newSpikeHarness(t, "spike-silence-fence")
+	ctx := context.Background()
+	svcA := h.service("silence-fence-a")
+	svcB := h.service("silence-fence-b")
+	svcB.transitionClaimTTL = 25 * time.Millisecond
+
+	if _, err := svcA.CreateSilence(ctx, SilenceInput{
+		Project:  h.project.Slug,
+		Matchers: []Matcher{{Name: "alertname", Op: "=", Value: "error_rate_spike"}},
+		StartsAt: h.base.Add(-time.Minute),
+		EndsAt:   h.base.Add(7 * time.Minute),
+		Creator:  "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	firstSpike := make([]time.Time, 6)
+	for i := range firstSpike {
+		firstSpike[i] = h.base.Add(time.Duration(i) * time.Second)
+	}
+	if _, err := h.store.RecordPlatformErrorRates(
+		ctx,
+		h.base.Add(10*time.Second),
+		errorRateWindow,
+		[]meta.PlatformErrorRateBatch{
+			{ProjectID: h.project.ID, ThresholdPerMin: 1, OccurredAt: firstSpike},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	late := h.base.Add(6 * time.Minute)
+	secondBatch := make([]time.Time, 7)
+	for i := range secondBatch {
+		secondBatch[i] = late.Add(-20*time.Second + time.Duration(i)*time.Second)
+	}
+	if _, err := h.store.RecordPlatformErrorRates(ctx, late, errorRateWindow, []meta.PlatformErrorRateBatch{
+		{ProjectID: h.project.ID, ThresholdPerMin: 1, OccurredAt: secondBatch},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0); err != nil || len(pending) != 3 {
+		t.Fatalf("seeded pending transitions=%#v err=%v", pending, err)
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("precondition outbox rows=%#v", rows)
+	}
+
+	// While an active lease holds t1, replica A cannot steal or bypass it.
+	held, err := h.store.ClaimPlatformAlertTransitions(ctx, h.project.ID, "active-holder", 30*time.Second, 10)
+	if err != nil || len(held) != 1 {
+		t.Fatalf("active holder claim=%#v err=%v", held, err)
+	}
+	h.set(h.base.Add(6*time.Minute + 15*time.Second))
+	if err := svcA.drainPlatformAlertTransitions(ctx, h.project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0); err != nil || len(pending) != 3 {
+		t.Fatalf("pending while leased=%#v err=%v", pending, err)
+	}
+	if err := h.store.ReleasePlatformAlertTransition(ctx, held[0].ID, held[0].ClaimToken); err != nil {
+		t.Fatal(err)
+	}
+
+	h.set(h.base.Add(6*time.Minute + 10*time.Second))
+	bClaimed := make(chan meta.PlatformAlertTransition, 1)
+	releaseB := make(chan struct{})
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(releaseB)
+		}
+	})
+	var bOnce sync.Once
+	svcB.onTransitionClaimed = func(tr meta.PlatformAlertTransition) {
+		bOnce.Do(func() {
+			bClaimed <- tr
+			<-releaseB
+		})
+	}
+	bDone := make(chan error, 1)
+	go func() {
+		bDone <- svcB.drainPlatformAlertTransitions(ctx, h.project.ID)
+	}()
+
+	var trB meta.PlatformAlertTransition
+	select {
+	case trB = <-bClaimed:
+	case err := <-bDone:
+		t.Fatalf("replica B exited before claiming: err=%v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for replica B to claim t1")
+	}
+	if trB.Status != "firing" || trB.Cycle != 1 {
+		t.Fatalf("replica B claimed=%#v want firing cycle 1", trB)
+	}
+
+	// Poll until B's short DB lease expires while the silence is still active,
+	// then advance the fake clock past silence expiry as soon as A claims t3=firing(2).
+	h.set(h.base.Add(6*time.Minute + 30*time.Second))
+	svcA.onTransitionClaimed = func(tr meta.PlatformAlertTransition) {
+		if tr.Status == "firing" && tr.Cycle == 2 {
+			h.set(h.base.Add(7*time.Minute + 5*time.Second))
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := svcA.drainPlatformAlertTransitions(ctx, h.project.ID); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 0 {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out waiting for replica A to take over and drain transitions, remaining=%#v", pending)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.expectRows(PlatformStateRef{Cycle: 2, Status: "firing"})
+	h.waitDelivered("firing", "2")
+
+	// Resume B now that the silence has expired: B plans firing(1) but must be
+	// fenced out cleanly with zero outbox rows written.
+	close(releaseB)
+	released = true
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("replica B drain err=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for replica B drain to finish")
+	}
+	h.expectRows(PlatformStateRef{Cycle: 2, Status: "firing"})
+	h.expectNoDelivery(100 * time.Millisecond)
+	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after fenced drain=%#v err=%v", pending, err)
+	}
+}
+
+// Concurrent drains from two Service replicas over [firing(1), resolved(1),
+// firing(2)] must enqueue and deliver strictly in causal order without races.
+func TestErrorRateSpikeConcurrentServicesDrainInCausalOrder(t *testing.T) {
+	h := newSpikeHarness(t, "spike-concurrent-drain")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	firstSpike := make([]time.Time, 6)
+	for i := range firstSpike {
+		firstSpike[i] = h.base.Add(time.Duration(i) * time.Second)
+	}
+	if _, err := h.store.RecordPlatformErrorRates(
+		ctx,
+		h.base.Add(10*time.Second),
+		errorRateWindow,
+		[]meta.PlatformErrorRateBatch{
+			{ProjectID: h.project.ID, ThresholdPerMin: 1, OccurredAt: firstSpike},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	late := h.base.Add(6 * time.Minute)
+	secondBatch := make([]time.Time, 7)
+	for i := range secondBatch {
+		secondBatch[i] = late.Add(-20*time.Second + time.Duration(i)*time.Second)
+	}
+	if _, err := h.store.RecordPlatformErrorRates(ctx, late, errorRateWindow, []meta.PlatformErrorRateBatch{
+		{ProjectID: h.project.ID, ThresholdPerMin: 1, OccurredAt: secondBatch},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.set(h.base.Add(6*time.Minute + 5*time.Second))
+
+	svcA := h.service("concurrent-drain-a")
+	svcB := h.service("concurrent-drain-b")
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, svc := range []*Service{svcA, svcB} {
+		wg.Add(1)
+		go func(s *Service) {
+			defer wg.Done()
+			<-start
+			for {
+				if err := s.drainPlatformAlertTransitions(ctx, h.project.ID); err != nil {
+					errs <- err
+					return
+				}
+				pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if len(pending) == 0 {
+					return
+				}
+			}
+		}(svc)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent drain err=%v", err)
+		}
+	}
+
+	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, h.project.ID, 0); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after concurrent drain=%#v err=%v", pending, err)
+	}
+	rows := h.expectRows(
+		PlatformStateRef{Cycle: 1, Status: "firing"},
+		PlatformStateRef{Cycle: 1, Status: "resolved"},
+		PlatformStateRef{Cycle: 2, Status: "firing"},
+	)
+	if !(rows[0].ID < rows[1].ID && rows[1].ID < rows[2].ID) {
+		t.Fatalf("outbox rows out of causal ID order: %#v", rows)
+	}
+	h.waitDelivered("firing", "1")
+	h.waitDelivered("resolved", "1")
+	h.waitDelivered("firing", "2")
+	h.expectNoDelivery(100 * time.Millisecond)
 }

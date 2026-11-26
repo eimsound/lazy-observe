@@ -422,8 +422,8 @@ func (s *Store) UpdateAlertRule(
 							bind(
 								s.dialect,
 								`INSERT INTO notification_outbox(idempotency_key, project_id, rule_id, channel_id, payload, priority,
-									status, available_at, created_at, updated_at)
-								 VALUES (?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+									ordering_key, status, available_at, created_at, updated_at)
+								 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 								 ON CONFLICT(idempotency_key) DO NOTHING`,
 							),
 							notification.IdempotencyKey,
@@ -432,6 +432,7 @@ func (s *Store) UpdateAlertRule(
 							notification.ChannelID,
 							string(notification.Payload),
 							notification.Priority,
+							nullableOutboxOrderingKey(notification.OrderingKey),
 						); err != nil {
 							return AlertRuleView{}, fmt.Errorf("enqueue rule update resolve notification: %w", err)
 						}

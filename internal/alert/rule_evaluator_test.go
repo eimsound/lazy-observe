@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -972,6 +973,22 @@ func TestUpdateAlertRuleExpressionAndDisableDeliverResolvedOnce(t *testing.T) {
 	case extra := <-received:
 		t.Fatalf("duplicate notification after disable: %#v", extra)
 	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Evaluator commits and rule-update resolutions join the rule's causal
+	// delivery stream (issue #386).
+	views, err := store.ListNotificationOutbox(ctx, meta.NotificationOutboxListOptions{ProjectID: project.ID})
+	if err != nil || len(views) != 4 {
+		t.Fatalf("outbox rows=%d err=%v want 2 firing + 2 resolved", len(views), err)
+	}
+	for _, view := range views {
+		item, itemErr := store.NotificationOutboxItem(ctx, view.ID)
+		if itemErr != nil {
+			t.Fatal(itemErr)
+		}
+		if want := "rule:" + strconv.Itoa(rule.ID); item.OrderingKey != want {
+			t.Fatalf("outbox row %d ordering key=%q want %q", item.ID, item.OrderingKey, want)
+		}
 	}
 }
 

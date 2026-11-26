@@ -424,6 +424,7 @@ CREATE TABLE notification_outbox (
     channel_id INTEGER NOT NULL,
     payload JSON NOT NULL,
     priority INTEGER NOT NULL DEFAULT 0,
+    ordering_key TEXT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'delivered', 'dead')),
     available_at TIMESTAMP NOT NULL,
     claim_owner TEXT NULL,
@@ -444,6 +445,8 @@ CREATE INDEX notification_outbox_due
     ON notification_outbox (status, available_at, priority DESC, id);
 CREATE INDEX notification_outbox_claim_until ON notification_outbox (claim_until);
 CREATE INDEX notification_outbox_status_updated ON notification_outbox (status, updated_at);
+CREATE INDEX notification_outbox_ordering
+    ON notification_outbox (ordering_key, channel_id, status, id);
 
 CREATE TABLE audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -510,6 +513,24 @@ CREATE TABLE platform_alert_states (
         FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
 );
 CREATE INDEX platform_alert_states_kind_status ON platform_alert_states (kind, status);
+
+CREATE TABLE platform_alert_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('firing', 'resolved')),
+    cycle INTEGER NOT NULL CHECK (cycle > 0),
+    starts_at TIMESTAMP NULL,
+    ends_at TIMESTAMP NULL,
+    window_count INTEGER NULL,
+    threshold_per_min INTEGER NOT NULL DEFAULT 0,
+    recorded_at TIMESTAMP NOT NULL,
+    claim_token TEXT NULL,
+    claim_until TIMESTAMP NULL,
+    CONSTRAINT platform_alert_transitions_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+CREATE INDEX platform_alert_transitions_stream ON platform_alert_transitions (project_id, kind, id);
 
 CREATE TABLE deleted_project_slugs (
     slug TEXT PRIMARY KEY,

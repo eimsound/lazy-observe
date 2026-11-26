@@ -37,7 +37,7 @@ lazy-observe 的目标不是超大规模多租户 SaaS 或替代 Grafana 的大�
 ### 1.4 单主租约告警引擎、持久化 Outbox 与开箱即用国内 IM 渠道
 
 - **内置原生评估器（[ADR 0001](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0001-nightingale-style-alert-engine.md)、[ADR 0011](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0011-sqlite-alert-lease-millisecond-clock.md)）**：不要求部署或维护 `vmalert` 与 Alertmanager。引擎在网关进程内统一评估 PromQL/MetricsQL 规则、LogsQL 阈值规则以及新 Issue / 回归等平台事件。多副本 HA 下，通过 Rendezvous 一致性哈希与带单调递增隔离纪元（fencing epoch）的 PostgreSQL 规则租约，保证每条规则同一时间最多只有一个合法提交者；租约过期判定统一基于数据库时钟（SQLite 下经毫秒时钟入口修正整秒截断）。
-- **持久化通知 Outbox**：状态推进与通知入队在同一数据库事务内原子提交。分发 Worker 通过数据库行锁（PostgreSQL `FOR UPDATE SKIP LOCKED`）领取到期任务，支持过期 claim 接管、有界指数退避重试、死信保留及 HTTP `Idempotency-Key`，提供持久化至少一次投递（at-least-once）；即便 Redis 故障或副本重启，告警状态与未发送通知仍保持正确。
+- **持久化通知 Outbox**：状态推进与通知入队在同一数据库事务内原子提交。分发 Worker 通过数据库行锁（PostgreSQL `FOR UPDATE SKIP LOCKED`）领取到期任务，支持过期 claim 接管、有界指数退避重试、死信保留及 HTTP `Idempotency-Key`，提供持久化至少一次投递（at-least-once）；同一渠道内，同一告警的通知按因果顺序投递：firing 尚未投递或仍在重试时，其后的 resolved 会等它投递成功或进入死信后再投递；即便 Redis 故障或副本重启，告警状态与未发送通知仍保持正确。
 - **降噪与国内 IM 原生支持**：支持分组等待（`group_wait`）、重复间隔（`repeat_interval`）、风暴阈值汇总（`storm_threshold`）、静默（Silence）、抑制规则（Inhibition）与渠道限流。通知渠道内置飞书（Feishu/Lark，交互卡片）、钉钉（DingTalk，Markdown）、企业微信（WeCom，Markdown）、Slack（Blocks）、Webhook（JSON + 自定义请求头 + `Idempotency-Key`）与 SMTP / Email（STARTTLS / 隐式 TLS），并对飞书、钉钉、企业微信在 HTTP 200 下返回的业务错误码（`code` / `StatusCode` / `errcode`）做显式校验。
 
 ### 1.5 统一四信号 + Error Tracking / Session Replay / Continuous Profiling / 四端 SDK

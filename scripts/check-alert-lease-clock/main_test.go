@@ -70,6 +70,20 @@ func TestCheckFile(t *testing.T) {
 			body: "db.Exec(bind(d, `SELECT sha256 FROM source_map_upload_pins WHERE expires_at > CURRENT_TIMESTAMP`))",
 			want: []string{"reads CURRENT_TIMESTAMP without alertClockSQL"},
 		},
+		{
+			name: "platform_alert_transitions wrapped by clock helper",
+			body: "db.Exec(s.alertClockSQL(`SELECT id FROM platform_alert_transitions AS tr WHERE tr.claim_until <= CURRENT_TIMESTAMP`))",
+		},
+		{
+			name: "platform_alert_transitions without clock helper",
+			body: "db.Exec(bind(d, `SELECT id FROM platform_alert_transitions AS tr WHERE tr.claim_until <= CURRENT_TIMESTAMP`))",
+			want: []string{"reads CURRENT_TIMESTAMP without alertClockSQL"},
+		},
+		{
+			name: "platform_alert_transitions second precision expiry",
+			body: "db.Exec(s.alertClockSQL(`UPDATE platform_alert_transitions SET claim_until = datetime('now', ?) WHERE id = ?`))",
+			want: []string{"second-precision datetime('now', ...)"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

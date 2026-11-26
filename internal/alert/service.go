@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eimsound/lazy-observe/internal/alert/matcher"
@@ -77,17 +78,21 @@ type Config struct {
 }
 
 type Service struct {
-	store          *meta.Store
-	sender         *Sender
-	now            func() time.Time
-	repeatInterval time.Duration
-	stormThreshold int
-	cfgCacheMu     sync.RWMutex
-	cfgCache       map[int]cachedPlatformConfig
-	outbox         *OutboxWorker
-	evaluator      *RuleEvaluator
-	monitorCancel  context.CancelFunc
-	monitorWG      sync.WaitGroup
+	store                 *meta.Store
+	sender                *Sender
+	now                   func() time.Time
+	repeatInterval        time.Duration
+	stormThreshold        int
+	transitionClaimPrefix string
+	transitionClaimSeq    atomic.Uint64
+	transitionClaimTTL    time.Duration
+	onTransitionClaimed   func(meta.PlatformAlertTransition)
+	cfgCacheMu            sync.RWMutex
+	cfgCache              map[int]cachedPlatformConfig
+	outbox                *OutboxWorker
+	evaluator             *RuleEvaluator
+	monitorCancel         context.CancelFunc
+	monitorWG             sync.WaitGroup
 }
 
 func NewService(cfg Config) *Service {
@@ -113,12 +118,14 @@ func NewService(cfg Config) *Service {
 		stormThreshold = defaultEvaluatorStormThreshold
 	}
 	s := &Service{
-		store:          cfg.Store,
-		sender:         cfg.Sender,
-		now:            cfg.Now,
-		repeatInterval: cfg.RepeatInterval,
-		stormThreshold: stormThreshold,
-		cfgCache:       make(map[int]cachedPlatformConfig),
+		store:                 cfg.Store,
+		sender:                cfg.Sender,
+		now:                   cfg.Now,
+		repeatInterval:        cfg.RepeatInterval,
+		stormThreshold:        stormThreshold,
+		transitionClaimPrefix: "platform-transition-" + strings.TrimPrefix(randomOutboxWorkerID(), "outbox-"),
+		transitionClaimTTL:    platformTransitionClaimTTL,
+		cfgCache:              make(map[int]cachedPlatformConfig),
 	}
 	cfg.Outbox.Store = cfg.Store
 	cfg.Outbox.Sender = cfg.Sender
@@ -1289,10 +1296,10 @@ func (s *Service) enqueueOutboxEntries(ctx context.Context, entries []meta.Notif
 	return errors.Join(errs...)
 }
 
-func (s *Service) notifyStorm(ctx context.Context, n Notification) error {
+func (s *Service) planStormEntries(ctx context.Context, n Notification) ([]meta.NotificationOutboxEnqueue, error) {
 	channels, projectInfo, err := s.store.StormNotificationChannels(ctx, n.Project)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	channelIDs := make([]int, 0, len(channels))
 	for _, ch := range channels {
@@ -1300,14 +1307,21 @@ func (s *Service) notifyStorm(ctx context.Context, n Notification) error {
 			channelIDs = append(channelIDs, ch.ID)
 		}
 	}
-	entries := BuildOutboxEntries(
+	return BuildOutboxEntries(
 		projectInfo.ID,
 		nil,
 		channelIDs,
 		[]Notification{n},
 		s.now().UTC(),
 		s.repeatInterval,
-	)
+	), nil
+}
+
+func (s *Service) notifyStorm(ctx context.Context, n Notification) error {
+	entries, err := s.planStormEntries(ctx, n)
+	if err != nil {
+		return err
+	}
 	return s.enqueueOutboxEntries(ctx, entries)
 }
 
@@ -1350,12 +1364,15 @@ func (s *Service) PutProjectAlertConfig(
 	} else if transition.Transition == "resolved" {
 		// Close the open cycle durably so receivers are not left with a dangling
 		// firing incident; a disabled threshold suppresses it in
-		// enqueuePlatformNotification. Failures are replayed by the recovery loop.
-		_ = s.notifyErrorRateTransition(ctx, projectID, "", transition, errorRateAnnotations(
-			"Error rate spike state reset after alert configuration change",
-			cfg.ErrorRateThresholdPerMinute,
-			transition.Cycle,
-		))
+		// planPlatformNotificationEntries. The resolution is logged durably with the
+		// state change, so a failed drain is retried by the recovery loop.
+		if drainErr := s.drainPlatformAlertTransitions(ctx, projectID); drainErr != nil {
+			slog.Warn(
+				"drain platform alert transitions after config update",
+				"project_id", projectID,
+				"error", drainErr,
+			)
+		}
 	}
 	return cfg, nil
 }
@@ -1428,12 +1445,14 @@ func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.Issue
 // configured absolute per-minute threshold, and resolves when it falls back to
 // or below the threshold. Threshold zero disables this event type.
 //
-// A committed firing or resolved transition on platform_alert_states is planned
-// and written to notification_outbox before returning, keyed by
-// project_id + error_rate_spike + cycle + status (ADR 0001). There is no
-// in-process group_wait timer: the five-minute window already debounces the
-// signal, and a transition whose enqueue was lost to a crash or a failed write
-// is replayed by CheckErrorRateRecoveries on any replica.
+// A firing or resolved transition commits to platform_alert_states together
+// with a platform_alert_transitions row, and is planned and written to
+// notification_outbox before returning, keyed by project_id + error_rate_spike
+// + cycle + status (ADR 0001). There is no in-process group_wait timer: the
+// five-minute window already debounces the signal, and a transition whose
+// enqueue was lost to a crash or a failed write stays logged and is drained by
+// CheckErrorRateRecoveries on any replica, even if the state has since moved
+// on (issue #386).
 func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredAt time.Time) error {
 	return s.RecordErrorEvents(ctx, []errortrack.ErrorOccurrence{{ProjectID: projectID, OccurredAt: occurredAt}})
 }
@@ -1441,10 +1460,12 @@ func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredA
 // RecordErrorEvents applies the RecordErrorEvent rule to a whole completed
 // error-inbox batch with a single metadata write transaction (issue #375).
 // Occurrences are grouped by project; projects whose threshold is zero are
-// skipped. Every firing/resolved transition is enqueued in the order the
-// equivalent sequence of single-event records would have produced it. A
-// per-project config failure skips only that project; all failures are joined
-// into the returned error so the caller can log them.
+// skipped. The store logs every firing/resolved transition in
+// platform_alert_transitions inside that transaction, in the order the
+// equivalent sequence of single-event records would have produced them, and
+// each project that moved then has its transition log drained into
+// notification_outbox. A per-project config failure skips only that project;
+// all failures are joined into the returned error so the caller can log them.
 func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrack.ErrorOccurrence) error {
 	if len(occurrences) == 0 {
 		return nil
@@ -1459,15 +1480,10 @@ func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrac
 	}
 	slices.Sort(projectIDs)
 
-	type projectAlertContext struct {
-		slug      string
-		threshold int
-	}
 	var errs []error
-	projects := make(map[int]projectAlertContext, len(projectIDs))
 	batches := make([]meta.PlatformErrorRateBatch, 0, len(projectIDs))
 	for _, projectID := range projectIDs {
-		cfg, p, err := s.cachedPlatformConfig(ctx, projectID)
+		cfg, _, err := s.cachedPlatformConfig(ctx, projectID)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("load error_rate_spike config for project %d: %w", projectID, err))
 			continue
@@ -1475,7 +1491,6 @@ func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrac
 		if cfg.ErrorRateThresholdPerMinute == 0 {
 			continue
 		}
-		projects[projectID] = projectAlertContext{slug: p.Slug, threshold: cfg.ErrorRateThresholdPerMinute}
 		batches = append(batches, meta.PlatformErrorRateBatch{
 			ProjectID:       projectID,
 			ThresholdPerMin: cfg.ErrorRateThresholdPerMinute,
@@ -1486,39 +1501,30 @@ func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrac
 		return errors.Join(errs...)
 	}
 	// Results returned next to an error are committed (only the failing projects
-	// were rolled back), so their transitions are still enqueued below.
+	// were rolled back), so their transitions are still drained below.
 	results, err := s.store.RecordPlatformErrorRates(ctx, s.now().UTC(), errorRateWindow, batches)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("record error_rate_spike window: %w", err))
 	}
 	for _, res := range results {
-		project := projects[res.ProjectID]
-		for _, transition := range res.Transitions {
-			rate := float64(transition.Count) / errorRateWindow.Minutes()
-			summary := fmt.Sprintf("Error rate spike: %.1f events/min", rate)
-			if transition.Transition == "resolved" {
-				summary = fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate)
-			}
-			if notifyErr := s.notifyErrorRateTransition(
-				ctx,
-				res.ProjectID,
-				project.slug,
-				transition,
-				errorRateAnnotations(summary, project.threshold, transition.Cycle),
-			); notifyErr != nil {
-				errs = append(errs, notifyErr)
-			}
+		if len(res.Transitions) == 0 {
+			continue
+		}
+		if drainErr := s.drainPlatformAlertTransitions(ctx, res.ProjectID); drainErr != nil {
+			errs = append(errs, drainErr)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// CheckErrorRateRecoveries first replays every firing (and recently resolved)
-// durable error_rate_spike state into notification_outbox, then resolves
-// states whose 5-minute window dropped back within threshold and enqueues their
-// resolved notifications. Replaying before resolving keeps a firing transition
-// that was committed by a crashed replica ahead of its own resolution, and the
-// deterministic idempotency keys make the replay a no-op once enqueued.
+// CheckErrorRateRecoveries first drains every unacknowledged
+// platform_alert_transitions row and replays every firing (and recently
+// resolved) durable error_rate_spike state into notification_outbox, then
+// resolves states whose 5-minute window dropped back within threshold and
+// drains the resolved transitions that logged. Draining before resolving keeps
+// a firing transition committed by a crashed replica ahead of its own
+// resolution, and the deterministic idempotency keys make a repeated drain or
+// replay a no-op once enqueued.
 func (s *Service) CheckErrorRateRecoveries(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
@@ -1532,24 +1538,207 @@ func (s *Service) CheckErrorRateRecoveries(ctx context.Context) error {
 		return errors.Join(append(errs, err)...)
 	}
 	for _, rec := range recoveries {
-		rate := float64(rec.Count) / errorRateWindow.Minutes()
-		transition := meta.PlatformErrorSpikeTransition{
-			Transition: "resolved",
-			Cycle:      rec.Cycle,
-			StartsAt:   rec.StartsAt,
-			EndsAt:     rec.EndsAt,
-			Count:      rec.Count,
-		}
-		if notifyErr := s.notifyErrorRateTransition(ctx, rec.ProjectID, rec.ProjectSlug, transition,
-			errorRateAnnotations(
-				fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
-				rec.Threshold,
-				rec.Cycle,
-			)); notifyErr != nil {
-			errs = append(errs, notifyErr)
+		if drainErr := s.drainPlatformAlertTransitions(ctx, rec.ProjectID); drainErr != nil {
+			errs = append(errs, drainErr)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+const (
+	// platformTransitionDrainLimit bounds one drain pass; the recovery loop picks
+	// up any remainder on its next tick.
+	platformTransitionDrainLimit = 500
+	platformTransitionClaimTTL   = 30 * time.Second
+)
+
+func (s *Service) nextPlatformTransitionClaimToken() string {
+	prefix := s.transitionClaimPrefix
+	if prefix == "" {
+		prefix = "platform-transition-" + strings.TrimPrefix(randomOutboxWorkerID(), "outbox-")
+	}
+	return fmt.Sprintf("%s-%d", prefix, s.transitionClaimSeq.Add(1))
+}
+
+func (s *Service) platformTransitionTTL() time.Duration {
+	if s.transitionClaimTTL > 0 {
+		return s.transitionClaimTTL
+	}
+	return platformTransitionClaimTTL
+}
+
+// drainPlatformAlertTransitions exclusively claims the head unacknowledged
+// platform_alert_transitions row of each (project, kind) stream (filtered to
+// one project when onlyProjectID > 0), plans its notifications against live
+// policy state, and atomically deletes the transition row while inserting its
+// notification_outbox entries under the claim fence.
+//
+// Because ClaimPlatformAlertTransitions leases each stream's head row using
+// the shared database millisecond clock (ADR 0011), at most one caller holds a
+// given stream's head row at a time without cross-replica clock skew, and
+// successors stay blocked behind it until CommitPlatformAlertTransition deletes
+// the head row under claim_token. Consequently, two concurrent replicas cannot
+// plan different transitions of the same stream against diverging policy
+// snapshots or enqueue outbox rows out of commit order. If a worker pauses
+// past its claim TTL and another replica takes over the lease, both head-row
+// exclusion and claim_token fencing hold: the paused worker's
+// CommitPlatformAlertTransition fails with meta.ErrStalePlatformTransitionClaim
+// and writes zero outbox rows.
+//
+// Rows whose planning fails during a pass stay claimed briefly so the pass
+// does not spin on the same failing stream; a defer releases them cleanly once
+// the pass returns so the next recovery tick can retry without waiting for
+// the full TTL.
+//
+// Rows recorded longer than platformResolvedReplayHorizon ago are dropped with
+// a warning instead of delivered, matching the state replay horizon: a long
+// outage cannot flood receivers with stale transitions. A firing state that is
+// still active is redelivered by the state replay regardless.
+func (s *Service) drainPlatformAlertTransitions(ctx context.Context, onlyProjectID int) error {
+	var deferredReleases []meta.PlatformAlertTransition
+	defer func() {
+		if len(deferredReleases) == 0 {
+			return
+		}
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		for _, tr := range deferredReleases {
+			if err := s.store.ReleasePlatformAlertTransition(releaseCtx, tr.ID, tr.ClaimToken); err != nil {
+				slog.Warn(
+					"release platform alert transition claim",
+					"project_id", tr.ProjectID,
+					"kind", tr.Kind,
+					"transition_id", tr.ID,
+					"cycle", tr.Cycle,
+					"claim_token", tr.ClaimToken,
+					"error", err,
+				)
+			}
+		}
+	}()
+
+	remaining := platformTransitionDrainLimit
+	var errs []error
+	for remaining > 0 {
+		claimed, err := s.store.ClaimPlatformAlertTransitions(
+			ctx,
+			onlyProjectID,
+			s.nextPlatformTransitionClaimToken(),
+			s.platformTransitionTTL(),
+			remaining,
+		)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("claim platform alert transitions: %w", err))
+			break
+		}
+		if len(claimed) == 0 {
+			break
+		}
+		remaining -= len(claimed)
+		progressed := false
+		for _, tr := range claimed {
+			if s.onTransitionClaimed != nil {
+				s.onTransitionClaimed(tr)
+			}
+			staleBefore := s.now().UTC().Add(-platformResolvedReplayHorizon)
+			var entries []meta.NotificationOutboxEnqueue
+			if tr.RecordedAt.Before(staleBefore) {
+				slog.Warn(
+					"drop stale platform alert transition",
+					"project_id", tr.ProjectID,
+					"kind", tr.Kind,
+					"transition_id", tr.ID,
+					"status", tr.Status,
+					"cycle", tr.Cycle,
+					"recorded_at", tr.RecordedAt,
+				)
+			} else {
+				var planErr error
+				entries, planErr = s.planPlatformTransitionEntries(ctx, tr)
+				if planErr != nil {
+					deferredReleases = append(deferredReleases, tr)
+					errs = append(errs, planErr)
+					continue
+				}
+			}
+			inserted, commitErr := s.store.CommitPlatformAlertTransition(ctx, tr.ID, tr.ClaimToken, entries)
+			if errors.Is(commitErr, meta.ErrStalePlatformTransitionClaim) {
+				slog.Warn(
+					"stale platform alert transition claim",
+					"project_id", tr.ProjectID,
+					"kind", tr.Kind,
+					"transition_id", tr.ID,
+					"cycle", tr.Cycle,
+					"claim_token", tr.ClaimToken,
+				)
+				continue
+			}
+			if commitErr != nil {
+				deferredReleases = append(deferredReleases, tr)
+				errs = append(errs, commitErr)
+				continue
+			}
+			progressed = true
+			if inserted > 0 {
+				s.WakeOutbox()
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// planPlatformTransitionEntries renders one logged transition and plans its
+// notification_outbox entries without writing them yet.
+func (s *Service) planPlatformTransitionEntries(
+	ctx context.Context,
+	tr meta.PlatformAlertTransition,
+) ([]meta.NotificationOutboxEnqueue, error) {
+	if tr.Kind != platformErrorRateKind {
+		return nil, nil
+	}
+	transition := meta.PlatformErrorSpikeTransition{
+		Transition: tr.Status,
+		Cycle:      tr.Cycle,
+		StartsAt:   tr.StartsAt,
+	}
+	if tr.EndsAt != nil {
+		transition.EndsAt = *tr.EndsAt
+	}
+	var summary string
+	switch {
+	case tr.WindowCount == nil:
+		summary = "Error rate spike state reset after alert configuration change"
+	case tr.Status == "resolved":
+		transition.Count = *tr.WindowCount
+		summary = fmt.Sprintf(
+			"Error rate spike recovered: %.1f events/min",
+			float64(*tr.WindowCount)/errorRateWindow.Minutes(),
+		)
+	default:
+		transition.Count = *tr.WindowCount
+		summary = fmt.Sprintf("Error rate spike: %.1f events/min", float64(*tr.WindowCount)/errorRateWindow.Minutes())
+	}
+	entries, err := s.planPlatformStateEntries(
+		ctx,
+		tr.ProjectID,
+		tr.ProjectSlug,
+		platformErrorRateKind,
+		transition,
+		errorRateAnnotations(summary, tr.ThresholdPerMin, tr.Cycle),
+	)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		slog.Warn(
+			"plan error_rate_spike notification",
+			"project_id", tr.ProjectID,
+			"status", transition.Transition,
+			"cycle", transition.Cycle,
+			"error", err,
+		)
+	}
+	return entries, err
 }
 
 // platformResolvedReplayHorizon bounds how long after a resolved transition
@@ -1576,8 +1765,17 @@ const platformResolvedReplayHorizon = 2 * errorRateWindow
 // Resolved states are replayed within platformResolvedReplayHorizon only for
 // channels whose same-cycle firing key already exists in notification_outbox,
 // preventing orphan recovery notifications after a silence or inhibition lifts.
+//
+// The transition log is drained first, and states whose stream still has
+// unacknowledged transitions (a drain that failed part-way) are skipped by
+// RecentPlatformAlertStates, so the state replay never enqueues a later
+// cycle ahead of an earlier logged transition.
 // onlyProjectID > 0 filters the query to one project in SQL.
 func (s *Service) replayPlatformAlertStates(ctx context.Context, onlyProjectID int) error {
+	var errs []error
+	if err := s.drainPlatformAlertTransitions(ctx, onlyProjectID); err != nil {
+		errs = append(errs, err)
+	}
 	now := s.now().UTC()
 	states, err := s.store.RecentPlatformAlertStates(
 		ctx,
@@ -1586,9 +1784,8 @@ func (s *Service) replayPlatformAlertStates(ctx context.Context, onlyProjectID i
 		onlyProjectID,
 	)
 	if err != nil {
-		return err
+		return errors.Join(append(errs, err)...)
 	}
-	var errs []error
 	for _, st := range states {
 		transition := meta.PlatformErrorSpikeTransition{
 			Transition: st.Status,
@@ -1671,18 +1868,21 @@ func (s *Service) notifyErrorRateTransition(
 	return err
 }
 
-func (s *Service) notifyPlatformState(
+func (s *Service) planPlatformStateEntries(
 	ctx context.Context,
 	projectID int,
 	projectSlug string,
 	kind string,
 	transition meta.PlatformErrorSpikeTransition,
 	annotations map[string]string,
-) error {
+) ([]meta.NotificationOutboxEnqueue, error) {
+	if transition.Transition != "firing" && transition.Transition != "resolved" {
+		return nil, nil
+	}
 	if projectSlug == "" {
 		_, p, err := s.cachedPlatformConfig(ctx, projectID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		projectSlug = p.Slug
 	}
@@ -1701,7 +1901,7 @@ func (s *Service) notifyPlatformState(
 	groupKey := platformGroupKey(kind)
 	compiledPolicy, err := s.platformPolicy(ctx, projectSlug, now, nil, nil, groupKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	plan := PlanNotifications(PlanConfig{
 		ProjectSlug:    projectSlug,
@@ -1713,15 +1913,17 @@ func (s *Service) notifyPlatformState(
 		Now:            now,
 	}, compiledPolicy, []AlertCandidate{{Alert: alertItem, DueOverride: true}})
 	ref := PlatformStateRef{ProjectID: projectID, Kind: kind, Cycle: transition.Cycle, Status: transition.Transition}
-	var errs []error
+	var entries []meta.NotificationOutboxEnqueue
 	for _, notification := range plan.Notifications {
 		if notification.Storm != nil {
-			if stormErr := s.notifyStorm(ctx, notification); stormErr != nil {
-				errs = append(errs, stormErr)
+			planned, stormErr := s.planStormEntries(ctx, notification)
+			if stormErr != nil {
+				return nil, stormErr
 			}
+			entries = append(entries, planned...)
 			continue
 		}
-		if notifyErr := s.enqueuePlatformNotification(
+		planned, planErr := s.planPlatformNotificationEntries(
 			ctx,
 			notification,
 			func(_ int, channelIDs []int, n Notification) ([]meta.NotificationOutboxEnqueue, error) {
@@ -1735,11 +1937,28 @@ func (s *Service) notifyPlatformState(
 				}
 				return BuildPlatformStateOutboxEntries(ref, targetChannels, []Notification{n}), nil
 			},
-		); notifyErr != nil {
-			errs = append(errs, notifyErr)
+		)
+		if planErr != nil {
+			return nil, planErr
 		}
+		entries = append(entries, planned...)
 	}
-	return errors.Join(errs...)
+	return entries, nil
+}
+
+func (s *Service) notifyPlatformState(
+	ctx context.Context,
+	projectID int,
+	projectSlug string,
+	kind string,
+	transition meta.PlatformErrorSpikeTransition,
+	annotations map[string]string,
+) error {
+	entries, err := s.planPlatformStateEntries(ctx, projectID, projectSlug, kind, transition, annotations)
+	if err != nil {
+		return err
+	}
+	return s.enqueueOutboxEntries(ctx, entries)
 }
 
 // channelsWithPriorFiring filters channelIDs to channels whose notification_outbox
@@ -1859,22 +2078,23 @@ func (s *Service) notifyPlatformLifecycle(ctx context.Context, n Notification, l
 	)
 }
 
-// enqueuePlatformNotification re-reads the project's platform alert config,
-// drops kinds that are disabled, attaches optional Issue AI analysis, and
-// writes the outbox rows produced by buildEntries for every enabled channel.
-func (s *Service) enqueuePlatformNotification(
+// planPlatformNotificationEntries re-reads the project's platform alert
+// config, drops kinds that are disabled, attaches optional Issue AI analysis,
+// and returns the outbox rows produced by buildEntries for every enabled
+// channel without writing them yet.
+func (s *Service) planPlatformNotificationEntries(
 	ctx context.Context,
 	n Notification,
 	buildEntries func(projectID int, channelIDs []int, n Notification) ([]meta.NotificationOutboxEnqueue, error),
-) error {
+) ([]meta.NotificationOutboxEnqueue, error) {
 	cfg, _, err := s.store.ProjectAlertPolicyBySlug(ctx, n.Project)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	kind := n.Rule
 	if (kind == "new_issue" && !cfg.NewIssue) || (kind == "regression" && !cfg.Regression) ||
 		(kind == platformErrorRateKind && cfg.ErrorRateThresholdPerMinute == 0) {
-		return nil
+		return nil, nil
 	}
 	n = s.attachIssueAIAnalysis(ctx, n)
 	channelIDs := make([]int, 0, len(cfg.Channels))
@@ -1883,7 +2103,18 @@ func (s *Service) enqueuePlatformNotification(
 			channelIDs = append(channelIDs, ch.ID)
 		}
 	}
-	entries, err := buildEntries(cfg.ProjectID, channelIDs, n)
+	return buildEntries(cfg.ProjectID, channelIDs, n)
+}
+
+// enqueuePlatformNotification re-reads the project's platform alert config,
+// drops kinds that are disabled, attaches optional Issue AI analysis, and
+// writes the outbox rows produced by buildEntries for every enabled channel.
+func (s *Service) enqueuePlatformNotification(
+	ctx context.Context,
+	n Notification,
+	buildEntries func(projectID int, channelIDs []int, n Notification) ([]meta.NotificationOutboxEnqueue, error),
+) error {
+	entries, err := s.planPlatformNotificationEntries(ctx, n, buildEntries)
 	if err != nil {
 		return err
 	}

@@ -21,6 +21,11 @@ type NotificationOutboxEnqueue struct {
 	ChannelID      int
 	Payload        json.RawMessage
 	Priority       int
+	// OrderingKey names the causal delivery stream of the row. Rows sharing an
+	// OrderingKey and ChannelID are claimed strictly in id order: a row is not
+	// claimable while an earlier row of its stream is pending or processing.
+	// Empty means the row is unordered.
+	OrderingKey string
 }
 
 type NotificationOutboxItem struct {
@@ -31,6 +36,7 @@ type NotificationOutboxItem struct {
 	ChannelID      int
 	Payload        json.RawMessage
 	Priority       int
+	OrderingKey    string
 	Status         string
 	AvailableAt    time.Time
 	ClaimOwner     string
@@ -42,9 +48,32 @@ type NotificationOutboxItem struct {
 	DeliveredAt    *time.Time
 }
 
+// notificationOutboxClaimable is the claim predicate over a notification_outbox
+// row aliased item: the row is due (pending past available_at, or processing
+// with an expired claim) and, when it carries an ordering_key, no earlier row
+// of the same (ordering_key, channel_id) stream is still pending or
+// processing. Delivered and dead predecessors release their successors, so a
+// firing notification that exhausted its retries cannot block its resolved
+// notification forever (issue #386). Because a blocked row is not claimable
+// while its predecessor is, one claim batch never holds two rows of a stream
+// and OutboxWorker.drain may deliver a batch concurrently.
+const notificationOutboxClaimable = `((item.status = 'pending' AND item.available_at <= CURRENT_TIMESTAMP)
+		OR (item.status = 'processing' AND item.claim_until <= CURRENT_TIMESTAMP))
+	AND (item.ordering_key IS NULL OR NOT EXISTS (
+		SELECT 1 FROM notification_outbox AS prior
+		WHERE prior.ordering_key = item.ordering_key AND prior.channel_id = item.channel_id
+			AND prior.status IN ('pending', 'processing') AND prior.id < item.id))`
+
+func nullableOutboxOrderingKey(key string) any {
+	if key == "" {
+		return nil
+	}
+	return key
+}
+
 func (s *Store) NotificationOutboxItem(ctx context.Context, id int64) (NotificationOutboxItem, error) {
 	var item NotificationOutboxItem
-	query := `SELECT id, idempotency_key, project_id, rule_id, channel_id, payload, priority, status,
+	query := `SELECT id, idempotency_key, project_id, rule_id, channel_id, payload, priority, ordering_key, status,
 		available_at, claim_owner, claim_until, attempts, last_error, created_at, updated_at, delivered_at
 		FROM notification_outbox WHERE id = ?`
 	if err := scanNotificationOutbox(s.db.QueryRowContext(ctx, bind(s.dialect, query), id), &item); err != nil {
@@ -53,28 +82,61 @@ func (s *Store) NotificationOutboxItem(ctx context.Context, id int64) (Notificat
 	return item, nil
 }
 
-func (s *Store) EnqueueNotification(
-	ctx context.Context,
-	input NotificationOutboxEnqueue,
-) (id int64, inserted bool, err error) {
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+const insertNotificationOutboxSQL = `INSERT INTO notification_outbox(idempotency_key, project_id, rule_id, channel_id, payload, priority, ordering_key, status, available_at, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`
+
+func validateNotificationOutboxEnqueue(input NotificationOutboxEnqueue) error {
 	if input.IdempotencyKey == "" || input.ProjectID <= 0 || input.ChannelID <= 0 || !json.Valid(input.Payload) {
-		return 0, false, errors.New(
+		return errors.New(
 			"notification outbox requires idempotency key, project, channel, and valid JSON payload",
 		)
 	}
 	if input.RuleID != nil && *input.RuleID <= 0 {
-		return 0, false, errors.New("notification outbox rule ID must be positive when present")
+		return errors.New("notification outbox rule ID must be positive when present")
 	}
-	query := `INSERT INTO notification_outbox(idempotency_key, project_id, rule_id, channel_id, payload, priority, status, available_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-		ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`
-	err = s.db.QueryRowContext(ctx, bind(s.dialect, query), input.IdempotencyKey, input.ProjectID, input.RuleID, input.ChannelID, string(input.Payload), input.Priority).
-		Scan(&id)
+	return nil
+}
+
+func (s *Store) insertNotificationOutbox(
+	ctx context.Context,
+	qr rowQuerier,
+	input NotificationOutboxEnqueue,
+) (id int64, inserted bool, err error) {
+	err = qr.QueryRowContext(
+		ctx,
+		bind(s.dialect, insertNotificationOutboxSQL),
+		input.IdempotencyKey,
+		input.ProjectID,
+		input.RuleID,
+		input.ChannelID,
+		string(input.Payload),
+		input.Priority,
+		nullableOutboxOrderingKey(input.OrderingKey),
+	).Scan(&id)
 	if err == nil {
 		return id, true, nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, fmt.Errorf("enqueue notification outbox: %w", err)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	return 0, false, fmt.Errorf("enqueue notification outbox: %w", err)
+}
+
+func (s *Store) EnqueueNotification(
+	ctx context.Context,
+	input NotificationOutboxEnqueue,
+) (id int64, inserted bool, err error) {
+	if err := validateNotificationOutboxEnqueue(input); err != nil {
+		return 0, false, err
+	}
+	id, inserted, err = s.insertNotificationOutbox(ctx, s.db, input)
+	if err != nil || inserted {
+		return id, inserted, err
 	}
 	if err := s.db.QueryRowContext(ctx, bind(s.dialect, `SELECT id FROM notification_outbox WHERE idempotency_key = ?`), input.IdempotencyKey).
 		Scan(&id); err != nil {
@@ -108,9 +170,8 @@ func (s *Store) claimPostgresNotifications(
 	ttl time.Duration,
 ) ([]NotificationOutboxItem, error) {
 	query := `WITH picked AS (
-		SELECT id FROM notification_outbox
-		WHERE (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
-		   OR (status = 'processing' AND claim_until <= CURRENT_TIMESTAMP)
+		SELECT id FROM notification_outbox AS item
+		WHERE ` + notificationOutboxClaimable + `
 		ORDER BY priority DESC, available_at, id
 		FOR UPDATE SKIP LOCKED
 		LIMIT ?
@@ -120,7 +181,7 @@ func (s *Store) claimPostgresNotifications(
 		attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
 	FROM picked WHERE item.id = picked.id
 	RETURNING item.id, item.idempotency_key, item.project_id, item.rule_id, item.channel_id, item.payload,
-		item.priority, item.status, item.available_at, item.claim_owner, item.claim_until, item.attempts,
+		item.priority, item.ordering_key, item.status, item.available_at, item.claim_owner, item.claim_until, item.attempts,
 		item.last_error, item.created_at, item.updated_at, item.delivered_at`
 	rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), limit, owner, ttl.Milliseconds())
 	if err != nil {
@@ -131,9 +192,8 @@ func (s *Store) claimPostgresNotifications(
 }
 
 func selectClaimableSQLiteNotificationIDsTx(ctx context.Context, tx *sql.Tx, limit int) ([]int64, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM notification_outbox
-		WHERE (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
-		   OR (status = 'processing' AND claim_until <= CURRENT_TIMESTAMP)
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM notification_outbox AS item
+		WHERE `+notificationOutboxClaimable+`
 		ORDER BY priority DESC, available_at, id LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("select SQLite notification outbox: %w", err)
@@ -171,11 +231,10 @@ func (s *Store) claimSQLiteNotifications(
 	var items []NotificationOutboxItem
 	for _, id := range ids {
 		var item NotificationOutboxItem
-		query := `UPDATE notification_outbox SET status = 'processing', claim_owner = ?,
+		query := `UPDATE notification_outbox AS item SET status = 'processing', claim_owner = ?,
 			claim_until = datetime('now', ?), attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
-			WHERE id = ? AND ((status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
-				OR (status = 'processing' AND claim_until <= CURRENT_TIMESTAMP))
-			RETURNING id, idempotency_key, project_id, rule_id, channel_id, payload, priority, status,
+			WHERE id = ? AND ` + notificationOutboxClaimable + `
+			RETURNING id, idempotency_key, project_id, rule_id, channel_id, payload, priority, ordering_key, status,
 				available_at, claim_owner, claim_until, attempts, last_error, created_at, updated_at, delivered_at`
 		expiry := fmt.Sprintf("+%.6f seconds", ttl.Seconds())
 		if err := scanNotificationOutbox(
@@ -282,12 +341,12 @@ type rowScanner interface {
 
 func scanNotificationOutbox(scanner rowScanner, item *NotificationOutboxItem) error {
 	var ruleID sql.NullInt64
-	var claimOwner, lastError sql.NullString
+	var claimOwner, lastError, orderingKey sql.NullString
 	var claimUntil, deliveredAt sql.NullTime
 	var payload []byte
 	if err := scanner.Scan(
 		&item.ID, &item.IdempotencyKey, &item.ProjectID, &ruleID, &item.ChannelID, &payload,
-		&item.Priority, &item.Status, &item.AvailableAt, &claimOwner, &claimUntil, &item.Attempts,
+		&item.Priority, &orderingKey, &item.Status, &item.AvailableAt, &claimOwner, &claimUntil, &item.Attempts,
 		&lastError, &item.CreatedAt, &item.UpdatedAt, &deliveredAt,
 	); err != nil {
 		return err
@@ -298,6 +357,7 @@ func scanNotificationOutbox(scanner rowScanner, item *NotificationOutboxItem) er
 	}
 	item.Payload = append(item.Payload[:0], payload...)
 	item.ClaimOwner = claimOwner.String
+	item.OrderingKey = orderingKey.String
 	item.LastError = lastError.String
 	if claimUntil.Valid {
 		item.ClaimUntil = &claimUntil.Time
@@ -418,6 +478,10 @@ func (s *Store) ListNotificationOutbox(
 // clock is used so eligibility matches ClaimNotifications across SQLite and PG.
 // Only dead rows of the project are requeued; the returned bool reports
 // whether one row changed.
+//
+// Note: manually requeuing a dead row that carries an OrderingKey restores it
+// to pending, so it can deliver after successors of the same stream that were
+// already released when it became dead.
 func (s *Store) RequeueNotification(ctx context.Context, id int64, projectID int) (bool, error) {
 	result, err := s.db.ExecContext(
 		ctx,
@@ -457,9 +521,8 @@ func (s *Store) NotificationOutboxDepth(ctx context.Context) (NotificationOutbox
 		COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN (status = 'pending' AND available_at <= CURRENT_TIMESTAMP)
-			OR (status = 'processing' AND claim_until <= CURRENT_TIMESTAMP) THEN 1 ELSE 0 END), 0)
-		FROM notification_outbox`
+		COALESCE(SUM(CASE WHEN ` + notificationOutboxClaimable + ` THEN 1 ELSE 0 END), 0)
+		FROM notification_outbox AS item`
 	if err := s.db.QueryRowContext(ctx, bind(s.dialect, query)).
 		Scan(&depth.Pending, &depth.Processing, &depth.Dead, &depth.Due); err != nil {
 		return NotificationOutboxDepth{}, fmt.Errorf("query notification outbox depth: %w", err)
