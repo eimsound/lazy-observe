@@ -79,9 +79,9 @@ The example configuration lists canonical path-shaped environment variable names
 | `otlp_grpc.enabled` | `false` | Enable native OTLP/gRPC ingest for traces, metrics, and logs |
 | `otlp_grpc.listen` | `:4317` | Native OTLP/gRPC listen address when enabled |
 | `otlp_grpc.max_recv_bytes` | `54525952` | Maximum decoded OTLP/gRPC message size in bytes (52 MiB) |
-| `ingest_rate_limit.enabled` | `false` | Enable per-project token-bucket ingest rate limiting for HTTP and OTLP/gRPC |
-| `ingest_rate_limit.requests_per_second` | `500` | Per-project ingest request rate limit |
-| `ingest_rate_limit.burst` | `1000` | Per-project ingest burst size |
+| `ingest_rate_limit.enabled` | `false` | Enable per-project token-bucket ingest rate limiting for HTTP and OTLP/gRPC. Every threshold below applies per application replica and never uses Redis (see [version matrix](version-matrix.md)) |
+| `ingest_rate_limit.requests_per_second` | `500` | Per-project ingest request rate limit on each replica |
+| `ingest_rate_limit.burst` | `1000` | Per-project ingest burst size on each replica |
 | `ingest_rate_limit.bytes_per_second` | `0` | Optional per-project byte throughput cap in bytes per second (`0` disables byte limiting) |
 | `ingest_rate_limit.max_tracked_projects` | `4096` | Upper bound on per-project limiter buckets held in memory |
 | `metrics_endpoint.enabled` | `false` | Expose Prometheus text exposition at `/metrics` for gateway operational metrics |
@@ -106,7 +106,7 @@ The example configuration lists canonical path-shaped environment variable names
 | `storage.traces.url` | empty | Required standalone VictoriaTraces base URL unless both split URLs are set |
 | `storage.traces.query_url` | empty | Optional `vtselect` query override; falls back to `storage.traces.url` |
 | `storage.traces.ingest_url` | empty | Optional `vtinsert` ingest override; falls back to `storage.traces.url` |
-| `redis.enabled` | `false` | Enable Redis-backed shared sessions and rate limits |
+| `redis.enabled` | `false` | Enable Redis-backed shared sessions and login, notification, and AI rate limits (telemetry ingest limits stay per replica) |
 | `redis.addr` | `127.0.0.1:6379` | Redis address used when enabled |
 | `redis.password` | empty | Optional Redis password; supply through a secret in production |
 | `redis.db` | `0` | Redis logical database number |
@@ -483,7 +483,7 @@ meta:
   migration_lock_timeout: 60s
 ```
 
-On an empty database, the server creates the schema from one embedded PostgreSQL baseline. Use a dedicated database and credential. Running multiple application replicas also requires Redis for shared sessions and rate limits. Issue batches stay process-local while pending and merge atomically in PostgreSQL on flush.
+On an empty database, the server creates the schema from one embedded PostgreSQL baseline. Use a dedicated database and credential. Running multiple application replicas also requires Redis for shared sessions and rate limits. Telemetry ingest limits (`ingest_rate_limit` and the built-in endpoint anti-abuse quotas) stay process-local on each replica and never call Redis, so a project's effective ceiling grows with the replica count. Enforce strict global ingest quotas at the reverse proxy, Ingress, or load balancer. Issue batches stay process-local while pending and merge atomically in PostgreSQL on flush.
 
 Startup coordinates schema initialization using a PostgreSQL advisory lock, bounded waiting, a post-lock re-read, and a checksummed baseline marker. Lock timeout, connection loss, unlock failure, checksum drift, or baseline creation failure aborts startup before readiness becomes `200`. This coordination makes concurrent first starts safe but does not perform version-to-version schema upgrades.
 

@@ -79,9 +79,9 @@ cp config.example.yaml config.yaml
 | `otlp_grpc.enabled` | `false` | 开启原生 OTLP/gRPC 上报（链路、指标、日志） |
 | `otlp_grpc.listen` | `:4317` | 原生 OTLP/gRPC 监听地址（开启后生效） |
 | `otlp_grpc.max_recv_bytes` | `54525952` | OTLP/gRPC 单条解码后消息大小上限（字节，默认 52 MiB） |
-| `ingest_rate_limit.enabled` | `false` | 为 HTTP 与 OTLP/gRPC 上报开启按项目隔离的令牌桶限流 |
-| `ingest_rate_limit.requests_per_second` | `500` | 单项目每秒上报请求数上限 |
-| `ingest_rate_limit.burst` | `1000` | 单项目上报突发请求配额 |
+| `ingest_rate_limit.enabled` | `false` | 为 HTTP 与 OTLP/gRPC 上报开启按项目隔离的令牌桶限流；下列阈值均为单应用副本限额，不访问 Redis（见[版本矩阵](version-matrix.md)） |
+| `ingest_rate_limit.requests_per_second` | `500` | 单副本内单项目每秒上报请求数上限 |
+| `ingest_rate_limit.burst` | `1000` | 单副本内单项目上报突发请求配额 |
 | `ingest_rate_limit.bytes_per_second` | `0` | 可选单项目每秒字节吞吐上限（`0` 表示不限制字节数） |
 | `ingest_rate_limit.max_tracked_projects` | `4096` | 内存中同时跟踪的项目限流桶上限 |
 | `metrics_endpoint.enabled` | `false` | 暴露网关自身运行指标的 Prometheus 文本端点（`/metrics`） |
@@ -106,7 +106,7 @@ cp config.example.yaml config.yaml
 | `storage.traces.url` | 空 | standalone 模式下 VictoriaTraces 根地址（未同时配置分拆读写地址时必填） |
 | `storage.traces.query_url` | 空 | 可选 `vtselect` 查询地址覆写；留空回退至 `storage.traces.url` |
 | `storage.traces.ingest_url` | 空 | 可选 `vtinsert` 写入地址覆写；留空回退至 `storage.traces.url` |
-| `redis.enabled` | `false` | 启用基于 Redis 的共享会话与限流 |
+| `redis.enabled` | `false` | 启用基于 Redis 的共享会话以及登录、通知与 AI 限流（遥测摄取限流始终为单副本本地执行） |
 | `redis.addr` | `127.0.0.1:6379` | 启用 Redis 时的连接地址 |
 | `redis.password` | 空 | 可选 Redis 密码；生产环境应通过 Secret 注入 |
 | `redis.db` | `0` | Redis 逻辑库编号 |
@@ -483,7 +483,7 @@ meta:
   migration_lock_timeout: 60s
 ```
 
-面对空库时，服务端会通过内置的单一 PostgreSQL 基线建表。请为 lazy-observe 分配独立数据库与账号。部署多个应用副本时，还必须配合 Redis 提供共享会话与限流。Issue 批次在缓冲期间保留在各进程内存，落库时在 PostgreSQL 中原子合并。
+面对空库时，服务端会通过内置的单一 PostgreSQL 基线建表。请为 lazy-observe 分配独立数据库与账号。部署多个应用副本时，还必须配合 Redis 提供共享会话与限流。遥测摄取限流（`ingest_rate_limit` 与内置端点反滥用配额）始终在各副本进程内执行、不访问 Redis，单个项目的有效上限随副本数增长；如需严格的全局摄取配额，请在反向代理、Ingress 或负载均衡器上实施。Issue 批次在缓冲期间保留在各进程内存，落库时在 PostgreSQL 中原子合并。
 
 启动路径通过 PostgreSQL 咨询锁、有界等待、加锁后重读与带校验和的基线标记来协调建表。出现锁超时、连接中断、解锁失败、校验和漂移或建表失败时，实例会在就绪前中止启动。这套机制确保多副本首次并发启动安全，但不承担跨版本数据库升级。
 

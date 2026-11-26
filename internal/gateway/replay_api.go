@@ -132,12 +132,12 @@ func (g *Gateway) replayIngest(c fiber.Ctx) error {
 		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "replay session quota exceeded"})
 	}
 	p := currentProject(c)
-	if allowed, err := g.allowIngestRate(
+	if ok, err := admitLocalIngest(
 		c,
-		"replay:ingest:session:"+strconv.Itoa(p.ID)+":"+sessionID,
-		replaySessionRateLimit,
+		g.replaySessionLimit,
+		strconv.Itoa(p.ID)+":"+sessionID,
 		"replay session rate limit exceeded",
-	); !allowed {
+	); !ok {
 		return err
 	}
 

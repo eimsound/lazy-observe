@@ -20,7 +20,7 @@ Before backing up a deployment, separate authoritative persistent state from art
 | Signal storage | `<data_dir>/storage/{metrics,logs,traces}` (and `storage/scrape`) | External VictoriaMetrics, VictoriaLogs, and VictoriaTraces clusters | Based on retention needs | Metrics, logs (including raw error events), and trace data |
 | Platform encryption key | `<data_dir>/secret.key` (or `security.secret_key_file`) | Shared read-only key file (`security.secret_key_file`) | Critical | 256-bit AES-256-GCM key (32 bytes as standard base64); seals AI provider API keys and derives the self-monitoring token. Old ciphertext cannot be recovered if lost |
 | Configuration and initial password files | `config.yaml` and `security.admin_password_file` | ConfigMap, Secret, `config.yaml`, and `security.admin_password_file` | Yes | Excludes `<data_dir>/initial-admin-password`, which the gateway deletes after the admin replaces the generated first password |
-| Shared sessions and rate limits | In-process memory or SQLite | Redis or Valkey (`redis.enabled: true`) | No (volatile) | Stores login sessions, rate limits, and login lockout counters; users sign in again if lost |
+| Shared sessions and rate limits | In-process memory or SQLite | Redis or Valkey (`redis.enabled: true`) | No (volatile) | Stores login sessions, login, notification, and AI rate limits, and login lockout counters; users sign in again if lost. Telemetry ingest rate limits are per-replica process memory and never stored in Redis |
 | Extracted embedded storage binaries | `<data_dir>/bin/` | `<data_dir>/bin/` (only when `vmagent` is enabled) | No | Verified and atomically rebuilt from the `lazy-observe` binary at startup |
 
 ## 2. Backup procedures
@@ -140,7 +140,7 @@ In HA mode, each replica's `<data_dir>` is an ephemeral scratch directory used t
 
 5. Skip Redis or Valkey for consistent backups:
 
-   - Redis stores only login sessions, rate-limit windows, failed-login lockouts, and cross-replica auth cache invalidation messages. That state is volatile and rebuilds on demand.
+   - Redis stores only login sessions, non-ingest rate-limit windows (login, notification, AI), failed-login lockouts, and cross-replica auth cache invalidation messages. That state is volatile and rebuilds on demand.
 
 ## 3. Restore and verification
 

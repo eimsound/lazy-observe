@@ -46,7 +46,7 @@
 
 ## 7. 存储高基数、大对象界限与可观测查询（`#171`、`#173`、`#175`、`#177`）
 
-- **公开写入面准入边界**：面向公开项目 API Token 的 Remote Write、Vitals、Replay、Profile 接口均实施按项目/IP 限流、批条数与展开体积上限及标签规范化（如 `vitalsIngest` 规范化 `page` 去除随机查询串），防范高基数与空对象内存放大。
+- **公开写入面准入边界**：面向公开项目 API Token 的 Remote Write、Vitals、Replay、Profile 接口均实施按项目/IP 限流、批条数与展开体积上限及标签规范化（如 `vitalsIngest` 规范化 `page` 去除随机查询串），防范高基数与空对象内存放大。遥测摄取限流只用进程内有界限流器（`internal/ingestlimit`），不得在摄取热路径调用 `g.limits`（Redis）或因限流器故障返回 `503`（ADR 0020）。
 - **查询投影、排序与数值安全**：LLM/Logs/Profiling/Replay 查询下推字段投影（如 VLogs `| fields`）、先排序再截断并限定时间窗，避免无序 `limit` 丢最新记录或响应超限返 502；聚合指标防 `NaN`/除零与时间窗溢出（如 `step=1s` 放大查询）；所有上游探测与代理请求设超时、校验状态码并 drain body。
 - **编码与成本核算契约**：内部转发 Trace ID 等路径参数只执行一次 URL 编码；尊重客户端压缩头（如 `X-LO-Replay-Compression: identity`）；LLM 定价配置确保 `ai.pricing_file` 生效，精准匹配模型前缀并计入缓存 token，避免开源或商用模型静默记 `$0`。
 - **背压与指标协议契约（`#260`、`#272`）**：gRPC 瞬态背压返回 `codes.ResourceExhausted` 时附带 `google.rpc.RetryInfo`，防标准 OTel SDK 直接丢批；手写 Prometheus 0.0.4 标签仅转义 `\`、`"`、`\n`，禁用 Go `%q` 防控制字符/非 ASCII 破坏整页 `/metrics` 解析。

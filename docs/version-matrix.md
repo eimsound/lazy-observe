@@ -99,6 +99,19 @@ The gateway can enforce per-project (`project.ID`) token-bucket rate limiting th
 - **HTTP ingest routes.** Requests over the limit fail before reaching upstream storage with `429 Too Many Requests`, a `Retry-After: <positive integer seconds>` header (minimum `1` second, maximum `300` seconds), and the sanitized JSON body `{"code":"ingest_rate_limited","error":"project ingest rate limit exceeded"}`.
 - **OTLP/gRPC ingest service.** Shares the same rate limiter instance and returns gRPC `codes.ResourceExhausted` with `google.rpc.RetryInfo` (`retry_delay` set to a positive integer number of seconds).
 - **Project isolation.** Each project has an isolated token bucket, so rate limiting one project does not affect any other project.
+- **Per-replica scope.** Thresholds apply to each application replica independently and never use Redis. In multi-replica HA, a project's effective ceiling is roughly `per-replica threshold × application replica count`. For a strict global quota across replicas, enforce it at the reverse proxy, Ingress, or load balancer in front of the gateway.
+
+#### Endpoint anti-abuse quotas
+
+Independently of `ingest_rate_limit`, the gateway always enforces built-in anti-abuse quotas on public or large-payload ingest endpoints. Each quota is a process-local fixed one-minute window per application replica, with a bounded key set. These quotas never call Redis, so a Redis outage never turns ingest into `503`:
+
+| Endpoint | Body limit | Per-replica quotas |
+|---|---|---|
+| `POST /api/replay/segments` | 5 MiB per segment | 600/min per project, 300/min per client IP, 120/min per session |
+| `POST /api/profiles` | 10 MiB profile plus 1 MiB multipart overhead | 120/min per project, 240/min per client IP |
+| `POST /api/v1/write` (Prometheus Remote Write) | 8 MiB decoded | 16 concurrent requests, 600/min per project |
+
+Rejected requests return `429 Too Many Requests` with `Retry-After: <positive integer seconds>` (the time until the window resets, at least `1` second; `1` for the Remote Write concurrency limit) and a JSON body `{"error":"<reason>"}`. Client IPs follow `security.trusted_proxies`.
 
 #### Self-monitoring `/metrics` authentication and low-cardinality contract
 

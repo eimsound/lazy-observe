@@ -149,12 +149,16 @@ func TestRemoteWriteDecodedLimitConcurrencyAndRateLimit(t *testing.T) {
 	}))
 	defer upstream.Close()
 
+	// The shared Redis limiter is down; remote-write admission must stay
+	// process-local and never consult it (ADR 0020).
+	shared := &unavailableSharedLimiter{}
 	gw := newTestGateway(Config{
 		Tokens:  &fakeTokens{project: meta.ProjectInfo{ID: 9, Slug: "alpha"}},
 		Metrics: upstream.URL,
+		Limits:  shared,
 	})
 	gw.remoteWriteSem = make(chan struct{}, 1)
-	gw.remoteWriteRateLimit = 2
+	gw.remoteWriteLimit = newLocalIngestWindow(2, gw.now)
 	app := gw.App()
 
 	// Oversized declared snappy payload (> 8 MiB remote-write limit, below 52 MiB global limit) must be 413.
@@ -212,8 +216,15 @@ func TestRemoteWriteDecodedLimitConcurrencyAndRateLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	rateResp.Body.Close()
-	if rateResp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("rate-limited remote-write status=%d want=429", rateResp.StatusCode)
+	if rateResp.StatusCode != http.StatusTooManyRequests || rateResp.Header.Get("Retry-After") == "" {
+		t.Fatalf(
+			"rate-limited remote-write status=%d retry=%q want=429 with Retry-After",
+			rateResp.StatusCode,
+			rateResp.Header.Get("Retry-After"),
+		)
+	}
+	if n := shared.calls.Load(); n != 0 {
+		t.Fatalf("remote-write consulted shared Redis limiter %d times", n)
 	}
 }
 

@@ -20,7 +20,7 @@
 | 信号存储 | `<data_dir>/storage/{metrics,logs,traces}`（及 `storage/scrape`） | 外部 VictoriaMetrics / VictoriaLogs / VictoriaTraces 集群 | 视保留需求 | 指标、日志（含原始错误事件）、链路数据 |
 | 平台加密密钥 | `<data_dir>/secret.key`（或 `security.secret_key_file`） | 共享只读密钥文件（`security.secret_key_file`） | 极高 | 256-bit AES-256-GCM 密钥（32 字节标准 base64），加密 AI Provider API Key 并派生自监控 Token；丢失后旧密文不可恢复 |
 | 配置文件与初始密码文件 | `config.yaml` / `security.admin_password_file` | ConfigMap / Secret / `config.yaml` / `security.admin_password_file` | 是 | 不含 `<data_dir>/initial-admin-password`（随机生成的首次密码在管理员首次改密后由网关自动删除） |
-| 共享会话与限流 | 进程内内存 / SQLite | Redis / Valkey（`redis.enabled: true`） | 否（易失） | 仅存登录会话、限流与登录锁定计数；丢失后用户重新登录即可 |
+| 共享会话与限流 | 进程内内存 / SQLite | Redis / Valkey（`redis.enabled: true`） | 否（易失） | 仅存登录会话、登录/通知/AI 限流与登录锁定计数；丢失后用户重新登录即可。遥测摄取限流只在各副本进程内存中执行，不写入 Redis |
 | 解压的嵌入存储二进制 | `<data_dir>/bin/` | `<data_dir>/bin/`（仅启用 `vmagent` 时解压） | 否 | 启动时从 `lazy-observe` 二进制校验并原子重建 |
 
 ## 2. 备份流程
@@ -140,7 +140,7 @@ HA 模式下每个应用副本的 `<data_dir>` 都是临时工作目录（用于
 
 5. Redis / Valkey：
 
-   - 仅存登录会话、限流窗口、登录失败锁定和跨副本认证缓存失效通知，属于可重建易失状态，无需纳入强一致备份。
+   - 仅存登录会话、非摄取限流窗口（登录、通知、AI）、登录失败锁定和跨副本认证缓存失效通知，属于可重建易失状态，无需纳入强一致备份。
 
 ## 3. 恢复与自检校验
 

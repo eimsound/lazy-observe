@@ -1,5 +1,8 @@
-// Package ingestlimit provides a unified, bounded, concurrency-safe per-project
-// token-bucket rate limiter shared by HTTP and OTLP/gRPC ingest entrypoints.
+// Package ingestlimit provides process-local, bounded, concurrency-safe ingest
+// rate limiters: a per-project token bucket shared by HTTP and OTLP/gRPC ingest
+// entrypoints (ingest_rate_limit) and a per-key fixed window used by endpoint
+// anti-abuse guardrails. Neither performs network I/O; every limit applies per
+// application replica (ADR 0020).
 package ingestlimit
 
 import (
