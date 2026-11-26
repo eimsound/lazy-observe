@@ -45,6 +45,8 @@ type PlatformAlertState struct {
 	UpdatedAt   time.Time
 }
 
+const platformAlertStateColumns = `st.project_id, p.slug, st.kind, st.status, st.active_cycle, st.starts_at, st.ends_at, st.updated_at`
+
 // ProjectFiringPlatformAlertStates lists active firing durable platform alerts
 // for projectID so native and platform policy planners share a single view of
 // active inhibition sources and storm groups across replicas.
@@ -53,7 +55,7 @@ func (s *Store) ProjectFiringPlatformAlertStates(ctx context.Context, projectID 
 		ctx,
 		bind(
 			s.dialect,
-			`SELECT st.project_id, p.slug, st.kind, st.status, st.active_cycle, st.starts_at, st.ends_at, st.updated_at
+			`SELECT `+platformAlertStateColumns+`
 			 FROM platform_alert_states AS st
 			 JOIN projects AS p ON p.id = st.project_id
 			 WHERE st.project_id = ? AND st.status = 'firing'
@@ -64,6 +66,39 @@ func (s *Store) ProjectFiringPlatformAlertStates(ctx context.Context, projectID 
 	if err != nil {
 		return nil, fmt.Errorf("list firing platform alert states: %w", err)
 	}
+	return scanPlatformAlertStates(rows)
+}
+
+// RecentPlatformAlertStates lists every firing platform alert state of kind
+// plus resolved ones whose ends_at is at or after resolvedSince. When
+// projectID > 0, results are filtered to that project in SQL. Platform alert
+// notifiers replay these durable transitions into notification_outbox with
+// deterministic idempotency keys, so a transition committed by a replica that
+// crashed before enqueueing is still delivered by any surviving replica.
+func (s *Store) RecentPlatformAlertStates(
+	ctx context.Context,
+	kind string,
+	resolvedSince time.Time,
+	projectID int,
+) ([]PlatformAlertState, error) {
+	query := `SELECT ` + platformAlertStateColumns + `
+		 FROM platform_alert_states AS st
+		 JOIN projects AS p ON p.id = st.project_id
+		 WHERE st.kind = ? AND (st.status = 'firing' OR (st.status = 'resolved' AND st.ends_at >= ?))`
+	args := []any{kind, resolvedSince.UTC()}
+	if projectID > 0 {
+		query += ` AND st.project_id = ?`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY st.project_id`
+	rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list recent platform alert states: %w", err)
+	}
+	return scanPlatformAlertStates(rows)
+}
+
+func scanPlatformAlertStates(rows *sql.Rows) ([]PlatformAlertState, error) {
 	defer rows.Close()
 	var states []PlatformAlertState
 	for rows.Next() {
@@ -82,7 +117,7 @@ func (s *Store) ProjectFiringPlatformAlertStates(ctx context.Context, projectID 
 			&endsAt,
 			&st.UpdatedAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan firing platform alert state: %w", err)
+			return nil, fmt.Errorf("scan platform alert state: %w", err)
 		}
 		if startsAt.Valid {
 			st.StartsAt = startsAt.Time.UTC()
@@ -95,7 +130,7 @@ func (s *Store) ProjectFiringPlatformAlertStates(ctx context.Context, projectID 
 		states = append(states, st)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate firing platform alert states: %w", err)
+		return nil, fmt.Errorf("iterate platform alert states: %w", err)
 	}
 	return states, nil
 }

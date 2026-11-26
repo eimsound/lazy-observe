@@ -138,7 +138,7 @@ cp config.example.yaml config.yaml
 | `blob.s3.access_key` | 空 | 可选静态凭据，须与 `blob.s3.secret_key` 成对配置 |
 | `blob.s3.secret_key` | 空 | 可选静态凭据，须与 `blob.s3.access_key` 成对配置 |
 | `alert.storm_threshold` | `10` | 同一告警分组触发风暴抑制前的告警数量阈值 |
-| `alert.group_wait` | `30s` | 分组首次聚合等待时长 |
+| `alert.group_wait` | `30s` | 原生告警规则的分组首次聚合等待时长；平台告警（`new_issue`、`regression`、`error_rate_spike`）在持久状态跃迁时直接入队，不受其影响 |
 | `alert.repeat_interval` | `4h` | 重复告警通知间隔 |
 | `scrape.mode` | `auto` | 内嵌 `vmagent` 抓取模式：`auto`（单节点直接运行，HA 模式通过 PostgreSQL 选主）或 `disabled` |
 | `error_inbox.max_items` | `100000` | 持久化错误 Inbox 条目上限，超出后返回 `503` 与 `Retry-After` |

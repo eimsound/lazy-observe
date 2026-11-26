@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"entgo.io/ent/dialect"
@@ -464,4 +465,77 @@ func (s *Store) NotificationOutboxDepth(ctx context.Context) (NotificationOutbox
 		return NotificationOutboxDepth{}, fmt.Errorf("query notification outbox depth: %w", err)
 	}
 	return depth, nil
+}
+
+const notificationOutboxKeyLookupChunkSize = 500
+
+// NotificationOutboxExistingKeys returns the subset of keys that already exist
+// in notification_outbox regardless of row status. Callers use it to verify
+// that a prior transition (such as a cycle's firing alert) was enqueued before
+// enqueueing a follow-up resolved notification.
+func (s *Store) NotificationOutboxExistingKeys(
+	ctx context.Context,
+	keys []string,
+) (map[string]struct{}, error) {
+	existing := make(map[string]struct{})
+	if len(keys) == 0 {
+		return existing, nil
+	}
+	unique := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, key)
+	}
+	if len(unique) == 0 {
+		return existing, nil
+	}
+	for start := 0; start < len(unique); start += notificationOutboxKeyLookupChunkSize {
+		end := start + notificationOutboxKeyLookupChunkSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		if err := s.readExistingNotificationOutboxKeysChunk(ctx, unique[start:end], existing); err != nil {
+			return nil, err
+		}
+	}
+	return existing, nil
+}
+
+func (s *Store) readExistingNotificationOutboxKeysChunk(
+	ctx context.Context,
+	chunk []string,
+	existing map[string]struct{},
+) error {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+	args := make([]any, len(chunk))
+	for i, key := range chunk {
+		args[i] = key
+	}
+	query := bind(
+		s.dialect,
+		`SELECT idempotency_key FROM notification_outbox WHERE idempotency_key IN (`+placeholders+`)`,
+	)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("check existing notification outbox keys: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return fmt.Errorf("scan existing notification outbox key: %w", err)
+		}
+		existing[key] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate existing notification outbox keys: %w", err)
+	}
+	return nil
 }

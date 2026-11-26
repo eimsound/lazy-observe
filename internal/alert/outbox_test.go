@@ -283,8 +283,8 @@ func TestPlatformNotificationsUseOneOutboxItemAcrossReplicas(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := service.notifyPlatform(ctx, n); err != nil {
-				t.Errorf("notifyPlatform: %v", err)
+			if err := service.notifyPlatformLifecycle(ctx, n, 0); err != nil {
+				t.Errorf("notifyPlatformLifecycle: %v", err)
 			}
 		}()
 	}
