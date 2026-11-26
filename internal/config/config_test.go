@@ -1300,3 +1300,48 @@ func TestErrorInboxReceiptRetentionRejectsNegative(t *testing.T) {
 		t.Fatal("malformed receipt retention accepted")
 	}
 }
+
+func TestAlertRepeatIntervalDefaultAndOverrides(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Alert.RepeatInterval.Value() != time.Hour {
+		t.Fatalf("alert.repeat_interval default=%s want 1h", cfg.Alert.RepeatInterval)
+	}
+	if cfg.Alert.GroupWait.Value() != 30*time.Second {
+		t.Fatalf("alert.group_wait default=%s want 30s", cfg.Alert.GroupWait)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("alert:\n  repeat_interval: 4h\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fromFile, _, err := Load([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromFile.Alert.RepeatInterval.Value() != 4*time.Hour {
+		t.Fatalf("file alert.repeat_interval=%s want 4h", fromFile.Alert.RepeatInterval)
+	}
+
+	env := map[string]string{"LO_ALERT_REPEAT_INTERVAL": "2d"}
+	fromEnv, _, err := Load(
+		[]string{"--config", path},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromEnv.Alert.RepeatInterval.Value() != 48*time.Hour {
+		t.Fatalf("env alert.repeat_interval=%s want 48h", fromEnv.Alert.RepeatInterval)
+	}
+
+	fromFlag, _, err := Load(
+		[]string{"--config", path, "--alert-repeat-interval", "15m"},
+		func(key string) (string, bool) { v, ok := env[key]; return v, ok },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromFlag.Alert.RepeatInterval.Value() != 15*time.Minute {
+		t.Fatalf("flag alert.repeat_interval=%s want 15m", fromFlag.Alert.RepeatInterval)
+	}
+}

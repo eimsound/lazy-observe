@@ -10,7 +10,7 @@ import type {
   Silence,
   SilenceInput,
 } from "./alerts";
-import { DEFAULT_EVALUATION_INTERVAL } from "./alerts-contract";
+import { DEFAULT_EVALUATION_INTERVAL, DEFAULT_REPEAT_INTERVAL } from "./alerts-contract";
 import { hexId } from "./mock-random";
 import dayjs from "../dayjs.ts";
 
@@ -70,6 +70,8 @@ export const mockRules: AlertRule[] = [
     for: "5m",
     evaluation_interval: "",
     effective_evaluation_interval: "5s",
+    repeat_interval: "30m",
+    effective_repeat_interval: "30m",
     severity: "critical",
     labels: { team: "platform" },
     annotations: {
@@ -90,6 +92,8 @@ export const mockRules: AlertRule[] = [
     for: "10m",
     evaluation_interval: "30s",
     effective_evaluation_interval: "30s",
+    repeat_interval: "",
+    effective_repeat_interval: "1h",
     severity: "warning",
     labels: { team: "platform" },
     annotations: { summary: "P95 时延超过 500ms" },
@@ -107,6 +111,8 @@ export const mockRules: AlertRule[] = [
     for: "15m",
     evaluation_interval: "1m",
     effective_evaluation_interval: "1m",
+    repeat_interval: "1d",
+    effective_repeat_interval: "1d",
     severity: "warning",
     labels: { team: "infra" },
     annotations: { summary: "磁盘可用空间低于 10%" },
@@ -124,6 +130,8 @@ export const mockRules: AlertRule[] = [
     for: "2m",
     evaluation_interval: "",
     effective_evaluation_interval: "5s",
+    repeat_interval: "",
+    effective_repeat_interval: "1h",
     severity: "critical",
     labels: { team: "infra" },
     annotations: { summary: "监控目标不可达" },
@@ -185,6 +193,8 @@ export const mockInhibitionRules: InhibitionRule[] = [
 
 const effectiveInterval = (input: AlertRuleInput) =>
   input.evaluation_interval || DEFAULT_EVALUATION_INTERVAL[input.signal];
+const effectiveRepeatInterval = (input: AlertRuleInput) =>
+  input.repeat_interval || DEFAULT_REPEAT_INTERVAL;
 
 export function createMockRule(input: AlertRuleInput): AlertRule {
   const now = dayjs().toISOString();
@@ -192,6 +202,7 @@ export function createMockRule(input: AlertRuleInput): AlertRule {
     id: nextId("rule"),
     ...input,
     effective_evaluation_interval: effectiveInterval(input),
+    effective_repeat_interval: effectiveRepeatInterval(input),
     evaluation_engine: input.evaluation_engine ?? "native",
     created_at: now,
     updated_at: now,
@@ -207,6 +218,7 @@ export function updateMockRule(id: string, input: AlertRuleInput): AlertRule {
     id,
     ...input,
     effective_evaluation_interval: effectiveInterval(input),
+    effective_repeat_interval: effectiveRepeatInterval(input),
     evaluation_engine: input.evaluation_engine ?? mockRules[idx].evaluation_engine,
     created_at: mockRules[idx].created_at,
     updated_at: dayjs().toISOString(),

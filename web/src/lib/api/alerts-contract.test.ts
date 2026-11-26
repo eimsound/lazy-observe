@@ -3,6 +3,7 @@ import { afterEach, test, vi } from "vitest";
 
 import {
   evaluationIntervalProblem,
+  repeatIntervalProblem,
   normalizeAlertEventList,
   normalizeAlertRuleList,
   parsePromDurationMs,
@@ -453,4 +454,48 @@ test("evaluation interval pre-check mirrors the server bounds in internal/alert"
   assert.equal(evaluationIntervalProblem("logs", "25s"), "range");
   assert.equal(evaluationIntervalProblem("logs", "30s"), null);
   assert.equal(evaluationIntervalProblem("logs", "1m30s"), null);
+});
+
+test("alert rules carry repeat_interval and the read-only effective_repeat_interval", () => {
+  const base = {
+    id: "9",
+    name: "DiskFull",
+    signal: "metrics",
+    evaluation_engine: "native",
+    expr: "up == 0",
+    for: "5m",
+    severity: "warning",
+    labels: {},
+    annotations: {},
+    enabled: true,
+    channel_ids: [],
+  };
+  const [custom, inherited, legacy] = normalizeAlertRuleList([
+    { ...base, repeat_interval: "15m", effective_repeat_interval: "15m" },
+    { ...base, id: "10", repeat_interval: "", effective_repeat_interval: "4h" },
+    // Older servers omit both fields: treat as inheriting the documented default.
+    { ...base, id: "11" },
+  ]);
+  assert.equal(custom.repeat_interval, "15m");
+  assert.equal(custom.effective_repeat_interval, "15m");
+  assert.equal(inherited.repeat_interval, "");
+  assert.equal(inherited.effective_repeat_interval, "4h");
+  assert.equal(legacy.repeat_interval, "");
+  assert.equal(legacy.effective_repeat_interval, "1h");
+  assert.throws(
+    () => normalizeAlertRuleList([{ ...base, repeat_interval: 60 }]),
+    /alert rule\.repeat_interval/,
+  );
+});
+
+test("repeatIntervalProblem mirrors the server's 1m–7d whole-second bounds", () => {
+  for (const ok of ["", "  ", "1m", "60s", "1h", "90m", "1d", "7d", "168h", "1w"]) {
+    assert.equal(repeatIntervalProblem(ok), null, ok);
+  }
+  for (const bad of ["soon", "1 h", "-1h", "1.5h"]) {
+    assert.equal(repeatIntervalProblem(bad), "format", bad);
+  }
+  for (const out of ["0s", "59s", "7d1s", "8d", "1m500ms"]) {
+    assert.equal(repeatIntervalProblem(out), "range", out);
+  }
 });

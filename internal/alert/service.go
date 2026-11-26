@@ -37,6 +37,13 @@ const (
 	MinLogsEvaluationInterval    = 30 * time.Second
 	MaxEvaluationInterval        = time.Hour
 	EvaluationIntervalStep       = 5 * time.Second
+
+	// DefaultRepeatInterval is the global alert.repeat_interval fallback used
+	// when the server config leaves it unset. Native rules may override it per
+	// rule within [MinRepeatInterval, MaxRepeatInterval].
+	DefaultRepeatInterval = time.Hour
+	MinRepeatInterval     = time.Minute
+	MaxRepeatInterval     = 7 * 24 * time.Hour
 )
 
 type cachedPlatformConfig struct {
@@ -99,7 +106,7 @@ func NewService(cfg Config) *Service {
 		cfg.Now = time.Now
 	}
 	if cfg.RepeatInterval <= 0 {
-		cfg.RepeatInterval = 4 * time.Hour
+		cfg.RepeatInterval = DefaultRepeatInterval
 	}
 	stormThreshold := cfg.StormThreshold
 	if stormThreshold <= 0 {
@@ -222,6 +229,7 @@ type RuleInput struct {
 	Expr               string            `json:"expr"`
 	For                string            `json:"for"`
 	EvaluationInterval *string           `json:"evaluation_interval"`
+	RepeatInterval     *string           `json:"repeat_interval"`
 	Severity           string            `json:"severity"`
 	Labels             map[string]string `json:"labels"`
 	Annotations        map[string]string `json:"annotations"`
@@ -272,6 +280,90 @@ func NormalizeRuleEvaluationInterval(signal, raw string) (string, error) {
 		return "", fmt.Errorf("%w: alert evaluation_interval %q must be a multiple of 5s", ErrInvalidInput, trimmed)
 	}
 	return prommodel.Duration(d).String(), nil
+}
+
+// NormalizeRuleRepeatInterval validates and canonicalizes a per-rule
+// repeat_interval. Empty/whitespace input returns "" so the rule inherits the
+// global alert.repeat_interval. Accepted values are whole-second Prometheus
+// durations within [MinRepeatInterval, MaxRepeatInterval]; the canonical form
+// uses d/h/m/s units only (for example "60m" -> "1h", "168h" -> "7d").
+func NormalizeRuleRepeatInterval(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	parsed, err := prommodel.ParseDuration(trimmed)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%w: invalid alert repeat_interval %q: must be a duration such as 30m, 1h or 1d",
+			ErrInvalidInput,
+			trimmed,
+		)
+	}
+	d := time.Duration(parsed)
+	if d < MinRepeatInterval || d > MaxRepeatInterval {
+		return "", fmt.Errorf(
+			"%w: alert repeat_interval must be between %s and %s",
+			ErrInvalidInput,
+			FormatRepeatInterval(MinRepeatInterval),
+			FormatRepeatInterval(MaxRepeatInterval),
+		)
+	}
+	if d%time.Second != 0 {
+		return "", fmt.Errorf(
+			"%w: alert repeat_interval %q must be a whole number of seconds",
+			ErrInvalidInput,
+			trimmed,
+		)
+	}
+	return FormatRepeatInterval(d), nil
+}
+
+// FormatRepeatInterval renders d as a Prometheus-compatible duration using
+// only d/h/m/s units so repeat intervals never surface as weeks (e.g. "1w").
+func FormatRepeatInterval(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	var b strings.Builder
+	for _, unit := range []struct {
+		suffix string
+		size   time.Duration
+	}{
+		{"d", 24 * time.Hour},
+		{"h", time.Hour},
+		{"m", time.Minute},
+		{"s", time.Second},
+	} {
+		if n := d / unit.size; n > 0 {
+			b.WriteString(strconv.FormatInt(int64(n), 10))
+			b.WriteString(unit.suffix)
+			d %= unit.size
+		}
+	}
+	if d >= time.Millisecond {
+		b.WriteString(strconv.FormatInt(d.Milliseconds(), 10))
+		b.WriteString("ms")
+	}
+	if b.Len() == 0 {
+		return "0s"
+	}
+	return b.String()
+}
+
+// effectiveRuleRepeatInterval returns the per-rule repeat override when raw is
+// a valid positive duration, or fallback otherwise. invalid reports whether a
+// non-empty raw value failed to parse.
+func effectiveRuleRepeatInterval(raw string, fallback time.Duration) (d time.Duration, invalid bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fallback, false
+	}
+	parsed, err := prommodel.ParseDuration(trimmed)
+	if err != nil || time.Duration(parsed) <= 0 {
+		return fallback, true
+	}
+	return time.Duration(parsed), false
 }
 
 // ValidateRuleFor validates a Prometheus-style duration string for a rule's
@@ -403,6 +495,18 @@ func (s *Service) EffectiveEvaluationInterval(rule meta.AlertRuleView) string {
 	return prommodel.Duration(eval.ruleInterval(&rule)).String()
 }
 
+// EffectiveRepeatInterval returns the repeat_interval the native rule evaluator
+// applies to rule: its per-rule override, or the global alert.repeat_interval
+// when the override is empty.
+func (s *Service) EffectiveRepeatInterval(rule meta.AlertRuleView) string {
+	fallback := DefaultRepeatInterval
+	if s != nil && s.repeatInterval > 0 {
+		fallback = s.repeatInterval
+	}
+	d, _ := effectiveRuleRepeatInterval(rule.RepeatInterval, fallback)
+	return FormatRepeatInterval(d)
+}
+
 func (s *Service) ListRules(ctx context.Context, slug string) ([]meta.AlertRuleView, error) {
 	return s.store.ListAlertRules(ctx, slug)
 }
@@ -439,6 +543,14 @@ func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleV
 			return meta.AlertRuleView{}, normErr
 		}
 	}
+	repeatInterval := ""
+	if in.RepeatInterval != nil {
+		var normErr error
+		repeatInterval, normErr = NormalizeRuleRepeatInterval(*in.RepeatInterval)
+		if normErr != nil {
+			return meta.AlertRuleView{}, normErr
+		}
+	}
 	if err := ValidateRuleLabels(in.Labels); err != nil {
 		return meta.AlertRuleView{}, err
 	}
@@ -456,6 +568,7 @@ func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleV
 		Expression:         expr,
 		For:                forDuration,
 		EvaluationInterval: evaluationInterval,
+		RepeatInterval:     repeatInterval,
 		Severity:           severity,
 		Labels:             nonNilMap(in.Labels),
 		Annotations:        nonNilMap(in.Annotations),
@@ -498,6 +611,16 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 			return meta.AlertRuleView{}, err
 		}
 		updatedSeverity = &severity
+	}
+	// repeat_interval only changes notification cadence: like evaluation_interval
+	// it never resets firing state, so the next evaluation applies it at once.
+	var normalizedRepeatInterval *string
+	if in.RepeatInterval != nil {
+		norm, normErr := NormalizeRuleRepeatInterval(*in.RepeatInterval)
+		if normErr != nil {
+			return meta.AlertRuleView{}, normErr
+		}
+		normalizedRepeatInterval = &norm
 	}
 	if in.Name != "" && strings.TrimSpace(in.Name) == "" {
 		return meta.AlertRuleView{}, fmt.Errorf("%w: alert rule name must not be blank", ErrInvalidInput)
@@ -604,6 +727,7 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 	if normalizedEvalInterval != nil {
 		update.EvaluationInterval = normalizedEvalInterval
 	}
+	update.RepeatInterval = normalizedRepeatInterval
 	update.Severity = updatedSeverity
 	if in.ChannelIDs != nil {
 		update.ChannelIDs = &in.ChannelIDs

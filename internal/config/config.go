@@ -327,7 +327,7 @@ func Defaults() Config {
 		Alert: Alert{
 			StormThreshold: 10,
 			GroupWait:      Duration(30 * time.Second),
-			RepeatInterval: Duration(4 * time.Hour),
+			RepeatInterval: Duration(time.Hour),
 		},
 		Scrape: Scrape{Mode: ScrapeModeAuto},
 		ErrorInbox: ErrorInbox{

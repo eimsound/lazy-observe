@@ -27,6 +27,8 @@ const (
 	FieldFor = "for"
 	// FieldEvaluationInterval holds the string denoting the evaluation_interval field in the database.
 	FieldEvaluationInterval = "evaluation_interval"
+	// FieldRepeatInterval holds the string denoting the repeat_interval field in the database.
+	FieldRepeatInterval = "repeat_interval"
 	// FieldSeverity holds the string denoting the severity field in the database.
 	FieldSeverity = "severity"
 	// FieldLabels holds the string denoting the labels field in the database.
@@ -79,6 +81,7 @@ var Columns = []string{
 	FieldExpr,
 	FieldFor,
 	FieldEvaluationInterval,
+	FieldRepeatInterval,
 	FieldSeverity,
 	FieldLabels,
 	FieldAnnotations,
@@ -113,6 +116,8 @@ var (
 	DefaultFor string
 	// DefaultEvaluationInterval holds the default value on creation for the "evaluation_interval" field.
 	DefaultEvaluationInterval string
+	// DefaultRepeatInterval holds the default value on creation for the "repeat_interval" field.
+	DefaultRepeatInterval string
 	// DefaultSeverity holds the default value on creation for the "severity" field.
 	DefaultSeverity string
 	// DefaultLabels holds the default value on creation for the "labels" field.
@@ -217,6 +222,11 @@ func ByFor(opts ...sql.OrderTermOption) OrderOption {
 // ByEvaluationInterval orders the results by the evaluation_interval field.
 func ByEvaluationInterval(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldEvaluationInterval, opts...).ToFunc()
+}
+
+// ByRepeatInterval orders the results by the repeat_interval field.
+func ByRepeatInterval(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldRepeatInterval, opts...).ToFunc()
 }
 
 // BySeverity orders the results by the severity field.

@@ -195,7 +195,12 @@ func TestBuildOutboxEntriesUnchangedWithEmptyURLFields(t *testing.T) {
 	if strings.Contains(string(entries[0].Payload), `"url"`) {
 		t.Fatalf("native payload unexpectedly contains url key: %s", entries[0].Payload)
 	}
-	wantNativeKey := notificationOutboxKey(4, append([]byte(wantNativePayload), []byte("\x007\x000")...))
+	// Native firing keys carry rule ID, repeat generation, and the effective
+	// repeat_interval in nanoseconds (3600000000000 = 1h).
+	wantNativeKey := notificationOutboxKey(
+		4,
+		append([]byte(wantNativePayload), []byte("\x007\x000\x003600000000000")...),
+	)
 	if entries[0].IdempotencyKey != wantNativeKey {
 		t.Fatalf("native idempotency key = %q, want %q", entries[0].IdempotencyKey, wantNativeKey)
 	}

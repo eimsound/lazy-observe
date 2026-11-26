@@ -5,6 +5,9 @@ import {
   DEFAULT_EVALUATION_INTERVAL,
   EVALUATION_INTERVAL_BOUNDS,
   evaluationIntervalProblem,
+  DEFAULT_REPEAT_INTERVAL,
+  REPEAT_INTERVAL_BOUNDS,
+  repeatIntervalProblem,
   SEVERITIES,
   normalizeAlertEventList,
   normalizeAlertRule,
@@ -44,6 +47,9 @@ export {
   EVALUATION_INTERVAL_BOUNDS,
   SEVERITIES,
   evaluationIntervalProblem,
+  DEFAULT_REPEAT_INTERVAL,
+  REPEAT_INTERVAL_BOUNDS,
+  repeatIntervalProblem,
 };
 export type {
   AlertEvent,

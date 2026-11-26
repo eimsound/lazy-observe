@@ -479,7 +479,52 @@ func BuildOutboxEntriesWithLifecycle(
 		channelIDs,
 		notifications,
 		func(n Notification, payload []byte) []byte {
-			return outboxIdempotencyPayload(projectID, ruleID, lifecycleID, n, payload, now, repeatInterval)
+			return outboxIdempotencyPayload(
+				projectID,
+				ruleID,
+				lifecycleID,
+				n,
+				payload,
+				now,
+				repeatInterval,
+				repeatInterval,
+			)
+		},
+	)
+}
+
+// BuildRuleOutboxEntries constructs notification_outbox rows for one native
+// rule pass. stormRepeatInterval (the global alert.repeat_interval) buckets
+// project-wide storm summaries so native and platform storms share one key per
+// bucket, while ruleRepeatInterval (the rule's effective repeat_interval)
+// derives the firing repeat generation. The firing key also carries
+// ruleRepeatInterval so editing the interval mid-incident cannot reproduce a
+// generation number already delivered under a different interval.
+func BuildRuleOutboxEntries(
+	projectID int,
+	ruleID int,
+	channelIDs []int,
+	notifications []Notification,
+	now time.Time,
+	stormRepeatInterval, ruleRepeatInterval time.Duration,
+) []meta.NotificationOutboxEnqueue {
+	now = now.UTC()
+	return buildOutboxEntries(
+		projectID,
+		&ruleID,
+		channelIDs,
+		notifications,
+		func(n Notification, payload []byte) []byte {
+			return outboxIdempotencyPayload(
+				projectID,
+				&ruleID,
+				0,
+				n,
+				payload,
+				now,
+				stormRepeatInterval,
+				ruleRepeatInterval,
+			)
 		},
 	)
 }
@@ -570,7 +615,7 @@ func outboxIdempotencyPayload(
 	notification Notification,
 	payload []byte,
 	now time.Time,
-	repeatInterval time.Duration,
+	repeatInterval, ruleRepeatInterval time.Duration,
 ) []byte {
 	if notification.Storm != nil {
 		bucket := now.UnixNano()
@@ -580,11 +625,17 @@ func outboxIdempotencyPayload(
 		return []byte(fmt.Sprintf("storm\x00%d\x00%d", projectID, bucket))
 	}
 	if ruleID != nil {
-		generation := now.UnixNano()
-		if notification.Status == "firing" && repeatInterval > 0 && len(notification.Alerts) > 0 {
-			generation = now.Sub(notification.Alerts[0].StartsAt).Nanoseconds() / repeatInterval.Nanoseconds()
+		if ruleRepeatInterval <= 0 {
+			ruleRepeatInterval = repeatInterval
 		}
-		return append(slices.Clone(payload), []byte(fmt.Sprintf("\x00%d\x00%d", *ruleID, generation))...)
+		if notification.Status == "firing" && ruleRepeatInterval > 0 && len(notification.Alerts) > 0 {
+			generation := now.Sub(notification.Alerts[0].StartsAt).Nanoseconds() / ruleRepeatInterval.Nanoseconds()
+			return append(
+				slices.Clone(payload),
+				[]byte(fmt.Sprintf("\x00%d\x00%d\x00%d", *ruleID, generation, ruleRepeatInterval.Nanoseconds()))...,
+			)
+		}
+		return append(slices.Clone(payload), []byte(fmt.Sprintf("\x00%d\x00%d", *ruleID, now.UnixNano()))...)
 	}
 	if lifecycleID > 0 {
 		// Pin durable issue_lifecycle_events deliveries to their committed row ID

@@ -115,6 +115,20 @@ func (_u *AlertRuleUpdate) SetNillableEvaluationInterval(v *string) *AlertRuleUp
 	return _u
 }
 
+// SetRepeatInterval sets the "repeat_interval" field.
+func (_u *AlertRuleUpdate) SetRepeatInterval(v string) *AlertRuleUpdate {
+	_u.mutation.SetRepeatInterval(v)
+	return _u
+}
+
+// SetNillableRepeatInterval sets the "repeat_interval" field if the given value is not nil.
+func (_u *AlertRuleUpdate) SetNillableRepeatInterval(v *string) *AlertRuleUpdate {
+	if v != nil {
+		_u.SetRepeatInterval(*v)
+	}
+	return _u
+}
+
 // SetSeverity sets the "severity" field.
 func (_u *AlertRuleUpdate) SetSeverity(v string) *AlertRuleUpdate {
 	_u.mutation.SetSeverity(v)
@@ -357,6 +371,9 @@ func (_u *AlertRuleUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.EvaluationInterval(); ok {
 		_spec.SetField(alertrule.FieldEvaluationInterval, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.RepeatInterval(); ok {
+		_spec.SetField(alertrule.FieldRepeatInterval, field.TypeString, value)
+	}
 	if value, ok := _u.mutation.Severity(); ok {
 		_spec.SetField(alertrule.FieldSeverity, field.TypeString, value)
 	}
@@ -591,6 +608,20 @@ func (_u *AlertRuleUpdateOne) SetEvaluationInterval(v string) *AlertRuleUpdateOn
 func (_u *AlertRuleUpdateOne) SetNillableEvaluationInterval(v *string) *AlertRuleUpdateOne {
 	if v != nil {
 		_u.SetEvaluationInterval(*v)
+	}
+	return _u
+}
+
+// SetRepeatInterval sets the "repeat_interval" field.
+func (_u *AlertRuleUpdateOne) SetRepeatInterval(v string) *AlertRuleUpdateOne {
+	_u.mutation.SetRepeatInterval(v)
+	return _u
+}
+
+// SetNillableRepeatInterval sets the "repeat_interval" field if the given value is not nil.
+func (_u *AlertRuleUpdateOne) SetNillableRepeatInterval(v *string) *AlertRuleUpdateOne {
+	if v != nil {
+		_u.SetRepeatInterval(*v)
 	}
 	return _u
 }
@@ -866,6 +897,9 @@ func (_u *AlertRuleUpdateOne) sqlSave(ctx context.Context) (_node *AlertRule, er
 	}
 	if value, ok := _u.mutation.EvaluationInterval(); ok {
 		_spec.SetField(alertrule.FieldEvaluationInterval, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.RepeatInterval(); ok {
+		_spec.SetField(alertrule.FieldRepeatInterval, field.TypeString, value)
 	}
 	if value, ok := _u.mutation.Severity(); ok {
 		_spec.SetField(alertrule.FieldSeverity, field.TypeString, value)

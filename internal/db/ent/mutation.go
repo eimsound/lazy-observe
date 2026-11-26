@@ -1741,6 +1741,7 @@ type AlertRuleMutation struct {
 	expr                *string
 	_for                *string
 	evaluation_interval *string
+	repeat_interval     *string
 	severity            *string
 	labels              *map[string]string
 	annotations         *map[string]string
@@ -2073,6 +2074,42 @@ func (m *AlertRuleMutation) OldEvaluationInterval(ctx context.Context) (v string
 // ResetEvaluationInterval resets all changes to the "evaluation_interval" field.
 func (m *AlertRuleMutation) ResetEvaluationInterval() {
 	m.evaluation_interval = nil
+}
+
+// SetRepeatInterval sets the "repeat_interval" field.
+func (m *AlertRuleMutation) SetRepeatInterval(s string) {
+	m.repeat_interval = &s
+}
+
+// RepeatInterval returns the value of the "repeat_interval" field in the mutation.
+func (m *AlertRuleMutation) RepeatInterval() (r string, exists bool) {
+	v := m.repeat_interval
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldRepeatInterval returns the old "repeat_interval" field's value of the AlertRule entity.
+// If the AlertRule object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *AlertRuleMutation) OldRepeatInterval(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldRepeatInterval is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldRepeatInterval requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldRepeatInterval: %w", err)
+	}
+	return oldValue.RepeatInterval, nil
+}
+
+// ResetRepeatInterval resets all changes to the "repeat_interval" field.
+func (m *AlertRuleMutation) ResetRepeatInterval() {
+	m.repeat_interval = nil
 }
 
 // SetSeverity sets the "severity" field.
@@ -2496,7 +2533,7 @@ func (m *AlertRuleMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *AlertRuleMutation) Fields() []string {
-	fields := make([]string, 0, 13)
+	fields := make([]string, 0, 14)
 	if m.name != nil {
 		fields = append(fields, alertrule.FieldName)
 	}
@@ -2514,6 +2551,9 @@ func (m *AlertRuleMutation) Fields() []string {
 	}
 	if m.evaluation_interval != nil {
 		fields = append(fields, alertrule.FieldEvaluationInterval)
+	}
+	if m.repeat_interval != nil {
+		fields = append(fields, alertrule.FieldRepeatInterval)
 	}
 	if m.severity != nil {
 		fields = append(fields, alertrule.FieldSeverity)
@@ -2556,6 +2596,8 @@ func (m *AlertRuleMutation) Field(name string) (ent.Value, bool) {
 		return m.For()
 	case alertrule.FieldEvaluationInterval:
 		return m.EvaluationInterval()
+	case alertrule.FieldRepeatInterval:
+		return m.RepeatInterval()
 	case alertrule.FieldSeverity:
 		return m.Severity()
 	case alertrule.FieldLabels:
@@ -2591,6 +2633,8 @@ func (m *AlertRuleMutation) OldField(ctx context.Context, name string) (ent.Valu
 		return m.OldFor(ctx)
 	case alertrule.FieldEvaluationInterval:
 		return m.OldEvaluationInterval(ctx)
+	case alertrule.FieldRepeatInterval:
+		return m.OldRepeatInterval(ctx)
 	case alertrule.FieldSeverity:
 		return m.OldSeverity(ctx)
 	case alertrule.FieldLabels:
@@ -2655,6 +2699,13 @@ func (m *AlertRuleMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetEvaluationInterval(v)
+		return nil
+	case alertrule.FieldRepeatInterval:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetRepeatInterval(v)
 		return nil
 	case alertrule.FieldSeverity:
 		v, ok := value.(string)
@@ -2774,6 +2825,9 @@ func (m *AlertRuleMutation) ResetField(name string) error {
 		return nil
 	case alertrule.FieldEvaluationInterval:
 		m.ResetEvaluationInterval()
+		return nil
+	case alertrule.FieldRepeatInterval:
+		m.ResetRepeatInterval()
 		return nil
 	case alertrule.FieldSeverity:
 		m.ResetSeverity()

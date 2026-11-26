@@ -31,6 +31,8 @@ type AlertRule struct {
 	For string `json:"for,omitempty"`
 	// EvaluationInterval holds the value of the "evaluation_interval" field.
 	EvaluationInterval string `json:"evaluation_interval,omitempty"`
+	// RepeatInterval holds the value of the "repeat_interval" field.
+	RepeatInterval string `json:"repeat_interval,omitempty"`
 	// Severity holds the value of the "severity" field.
 	Severity string `json:"severity,omitempty"`
 	// Labels holds the value of the "labels" field.
@@ -104,7 +106,7 @@ func (*AlertRule) scanValues(columns []string) ([]any, error) {
 			values[i] = new(sql.NullBool)
 		case alertrule.FieldID, alertrule.FieldProjectID:
 			values[i] = new(sql.NullInt64)
-		case alertrule.FieldName, alertrule.FieldSignal, alertrule.FieldEvaluationEngine, alertrule.FieldExpr, alertrule.FieldFor, alertrule.FieldEvaluationInterval, alertrule.FieldSeverity:
+		case alertrule.FieldName, alertrule.FieldSignal, alertrule.FieldEvaluationEngine, alertrule.FieldExpr, alertrule.FieldFor, alertrule.FieldEvaluationInterval, alertrule.FieldRepeatInterval, alertrule.FieldSeverity:
 			values[i] = new(sql.NullString)
 		case alertrule.FieldCreatedAt, alertrule.FieldUpdatedAt:
 			values[i] = new(sql.NullTime)
@@ -164,6 +166,12 @@ func (_m *AlertRule) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field evaluation_interval", values[i])
 			} else if value.Valid {
 				_m.EvaluationInterval = value.String
+			}
+		case alertrule.FieldRepeatInterval:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field repeat_interval", values[i])
+			} else if value.Valid {
+				_m.RepeatInterval = value.String
 			}
 		case alertrule.FieldSeverity:
 			if value, ok := values[i].(*sql.NullString); !ok {
@@ -279,6 +287,9 @@ func (_m *AlertRule) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("evaluation_interval=")
 	builder.WriteString(_m.EvaluationInterval)
+	builder.WriteString(", ")
+	builder.WriteString("repeat_interval=")
+	builder.WriteString(_m.RepeatInterval)
 	builder.WriteString(", ")
 	builder.WriteString("severity=")
 	builder.WriteString(_m.Severity)
