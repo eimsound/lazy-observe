@@ -316,6 +316,21 @@ const (
 	platformAlertStatusResolved = "resolved"
 )
 
+// platformErrorSpikeStateAttempts bounds how often one project's accounting
+// reads and writes its error_rate_spike state: the first insert of a missing
+// state row may lose to a concurrent PostgreSQL writer once, after which the
+// row exists and is locked by this transaction.
+const platformErrorSpikeStateAttempts = 2
+
+// platformErrorSpikeState is a project's durable error_rate_spike state as
+// read (and, on PostgreSQL, row-locked) inside the accounting transaction.
+type platformErrorSpikeState struct {
+	exists   bool
+	status   string
+	cycle    int64
+	startsAt time.Time
+}
+
 func (s *Store) recordProjectErrorRate(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -349,80 +364,151 @@ func (s *Store) recordProjectErrorRate(
 		}
 	}
 
-	var totalCount int
-	if err := tx.QueryRowContext(
-		ctx,
-		bind(
-			s.dialect,
-			`SELECT COALESCE(SUM(count), 0) FROM platform_error_rate_buckets WHERE project_id = ? AND bucket_epoch >= ?`,
-		),
-		projectID,
-		cutoffBucket,
-	).Scan(&totalCount); err != nil {
-		return PlatformErrorRateBatchResult{}, fmt.Errorf("sum platform error rate buckets: %w", err)
+	// The buckets above are written exactly once; only the state read, window
+	// sum and replay below repeat. The state row is locked before the window is
+	// summed, so on PostgreSQL the sum includes every writer that committed
+	// ahead of this one on the row and a stale count cannot resolve a spike a
+	// concurrent writer just fired. A missing row takes no lock: concurrent
+	// first spikes race on the insert, and the loser (issue #387) re-reads the
+	// committed winner row under its lock and replays its own occurrences on
+	// top of it instead of failing with 23505.
+	for range platformErrorSpikeStateAttempts {
+		state, err := s.lockPlatformErrorSpikeState(ctx, tx, projectID)
+		if err != nil {
+			return PlatformErrorRateBatchResult{}, err
+		}
+		var totalCount int
+		if err := tx.QueryRowContext(
+			ctx,
+			bind(
+				s.dialect,
+				`SELECT COALESCE(SUM(count), 0) FROM platform_error_rate_buckets WHERE project_id = ? AND bucket_epoch >= ?`,
+			),
+			projectID,
+			cutoffBucket,
+		).Scan(&totalCount); err != nil {
+			return PlatformErrorRateBatchResult{}, fmt.Errorf("sum platform error rate buckets: %w", err)
+		}
+		final, transitions := replayPlatformErrorSpike(state, thresholdPerMin, events, totalCount, now, window)
+		written, err := s.writePlatformErrorSpikeState(ctx, tx, projectID, state.exists, final, transitions, now)
+		if err != nil {
+			return PlatformErrorRateBatchResult{}, err
+		}
+		if written {
+			return PlatformErrorRateBatchResult{
+				ProjectID:   projectID,
+				Count:       totalCount,
+				Status:      final.status,
+				Cycle:       final.cycle,
+				StartsAt:    final.startsAt,
+				Transitions: transitions,
+			}, nil
+		}
 	}
+	return PlatformErrorRateBatchResult{}, errors.New("insert platform alert state: concurrent insert conflicted again")
+}
 
-	selectState := `SELECT status, active_cycle, starts_at FROM platform_alert_states WHERE project_id = ? AND kind = ?`
+func (s *Store) lockPlatformErrorSpikeState(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int,
+) (platformErrorSpikeState, error) {
+	query := `SELECT status, active_cycle, starts_at FROM platform_alert_states WHERE project_id = ? AND kind = ?`
 	if s.dialect == dialect.Postgres {
-		selectState += ` FOR UPDATE`
+		query += ` FOR UPDATE`
 	}
 	var (
-		status    string
-		cycle     int64
+		state     platformErrorSpikeState
 		prevStart sql.NullTime
 	)
-	stateErr := tx.QueryRowContext(ctx, bind(s.dialect, selectState), projectID, platformAlertKindErrorRateSpike).
-		Scan(&status, &cycle, &prevStart)
-	hadState := true
-	if errors.Is(stateErr, sql.ErrNoRows) {
-		hadState = false
-	} else if stateErr != nil {
-		return PlatformErrorRateBatchResult{}, fmt.Errorf("read platform alert state: %w", stateErr)
+	err := tx.QueryRowContext(ctx, bind(s.dialect, query), projectID, platformAlertKindErrorRateSpike).
+		Scan(&state.status, &state.cycle, &prevStart)
+	if errors.Is(err, sql.ErrNoRows) {
+		return platformErrorSpikeState{}, nil
 	}
-	var startsAt time.Time
+	if err != nil {
+		return platformErrorSpikeState{}, fmt.Errorf("read platform alert state: %w", err)
+	}
+	state.exists = true
 	if prevStart.Valid {
-		startsAt = prevStart.Time.UTC()
+		state.startsAt = prevStart.Time.UTC()
 	}
+	return state, nil
+}
 
-	// Replay the single-event rule once per in-window occurrence: the window
-	// count after the k-th occurrence is the pre-batch total plus k.
+// replayPlatformErrorSpike applies the single-event threshold rule once per
+// in-window occurrence of the batch, starting from state: the window count
+// after the k-th occurrence is the pre-batch total plus k.
+func replayPlatformErrorSpike(
+	state platformErrorSpikeState,
+	thresholdPerMin, events, totalCount int,
+	now time.Time,
+	window time.Duration,
+) (platformErrorSpikeState, []PlatformErrorSpikeTransition) {
 	limit := thresholdPerMin * int(window/time.Minute)
-	hasState := hadState
 	var transitions []PlatformErrorSpikeTransition
 	for count := totalCount - events + 1; count <= totalCount; count++ {
 		spike := thresholdPerMin > 0 && count > limit
 		switch {
-		case spike && !hasState:
-			hasState, status, cycle, startsAt = true, platformAlertStatusFiring, 1, now
-		case spike && status != platformAlertStatusFiring:
-			status, cycle, startsAt = platformAlertStatusFiring, cycle+1, now
-		case !spike && hasState && status == platformAlertStatusFiring:
-			status = platformAlertStatusResolved
+		case spike && !state.exists:
+			state = platformErrorSpikeState{exists: true, status: platformAlertStatusFiring, cycle: 1, startsAt: now}
+		case spike && state.status != platformAlertStatusFiring:
+			state.status, state.cycle, state.startsAt = platformAlertStatusFiring, state.cycle+1, now
+		case !spike && state.exists && state.status == platformAlertStatusFiring:
+			state.status = platformAlertStatusResolved
 		default:
 			continue
 		}
-		tr := PlatformErrorSpikeTransition{Transition: status, Cycle: cycle, StartsAt: startsAt, Count: count}
-		if status == platformAlertStatusResolved {
+		tr := PlatformErrorSpikeTransition{
+			Transition: state.status,
+			Cycle:      state.cycle,
+			StartsAt:   state.startsAt,
+			Count:      count,
+		}
+		if state.status == platformAlertStatusResolved {
 			tr.EndsAt = now
 		}
 		transitions = append(transitions, tr)
 	}
+	return state, transitions
+}
 
+// writePlatformErrorSpikeState persists the replayed final state. It reports
+// false only when the row was missing when read and a concurrent transaction
+// inserted it first; nothing was written and the caller must re-read it.
+func (s *Store) writePlatformErrorSpikeState(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int,
+	hadState bool,
+	final platformErrorSpikeState,
+	transitions []PlatformErrorSpikeTransition,
+	now time.Time,
+) (bool, error) {
 	switch {
 	case len(transitions) == 0:
 	case !hadState:
-		if _, err := tx.ExecContext(
+		// On PostgreSQL an insert racing an uncommitted insert of the same key
+		// waits for that transaction and, once it commits, does nothing.
+		res, err := tx.ExecContext(
 			ctx,
 			bind(
 				s.dialect,
 				`INSERT INTO platform_alert_states(project_id, kind, status, active_cycle, starts_at, ends_at, updated_at)
-				 VALUES (?, ?, 'firing', ?, ?, NULL, ?)`,
+				 VALUES (?, ?, 'firing', ?, ?, NULL, ?)
+				 ON CONFLICT(project_id, kind) DO NOTHING`,
 			),
-			projectID, platformAlertKindErrorRateSpike, cycle, startsAt, now,
-		); err != nil {
-			return PlatformErrorRateBatchResult{}, fmt.Errorf("insert firing platform alert state: %w", err)
+			projectID, platformAlertKindErrorRateSpike, final.cycle, final.startsAt, now,
+		)
+		if err != nil {
+			return false, fmt.Errorf("insert firing platform alert state: %w", err)
 		}
-	case status == platformAlertStatusFiring:
+		inserted, err := res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("read inserted platform alert state: %w", err)
+		}
+		return inserted > 0, nil
+	case final.status == platformAlertStatusFiring:
 		if _, err := tx.ExecContext(
 			ctx,
 			bind(
@@ -430,9 +516,9 @@ func (s *Store) recordProjectErrorRate(
 				`UPDATE platform_alert_states SET status = 'firing', active_cycle = ?, starts_at = ?, ends_at = NULL, updated_at = ?
 				 WHERE project_id = ? AND kind = ?`,
 			),
-			cycle, startsAt, now, projectID, platformAlertKindErrorRateSpike,
+			final.cycle, final.startsAt, now, projectID, platformAlertKindErrorRateSpike,
 		); err != nil {
-			return PlatformErrorRateBatchResult{}, fmt.Errorf("activate firing platform alert state: %w", err)
+			return false, fmt.Errorf("activate firing platform alert state: %w", err)
 		}
 	default:
 		if _, err := tx.ExecContext(
@@ -444,17 +530,10 @@ func (s *Store) recordProjectErrorRate(
 			),
 			now, now, projectID, platformAlertKindErrorRateSpike,
 		); err != nil {
-			return PlatformErrorRateBatchResult{}, fmt.Errorf("resolve platform alert state: %w", err)
+			return false, fmt.Errorf("resolve platform alert state: %w", err)
 		}
 	}
-	return PlatformErrorRateBatchResult{
-		ProjectID:   projectID,
-		Count:       totalCount,
-		Status:      status,
-		Cycle:       cycle,
-		StartsAt:    startsAt,
-		Transitions: transitions,
-	}, nil
+	return true, nil
 }
 
 type platformErrorSpikeCandidate struct {
