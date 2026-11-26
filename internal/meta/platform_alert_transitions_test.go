@@ -2,6 +2,9 @@ package meta
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -168,6 +171,351 @@ func TestPlatformAlertTransitionsLogEveryStateChange(t *testing.T) {
 		}
 		if got, err := store.PendingPlatformAlertTransitions(ctx, 0, 0); err != nil || len(got) != 0 {
 			t.Fatalf("transitions after project delete=%#v err=%v", got, err)
+		}
+	})
+}
+
+// Exclusive head claiming yields at most one transition (the oldest) per
+// (project, kind) stream, keeps successors blocked until the head commits, and
+// leaves ClaimToken populated only on leased rows.
+func TestPlatformAlertTransitionsExclusiveHeadClaim(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		window := 5 * time.Minute
+		t0 := time.Date(2026, 8, 1, 13, 0, 0, 0, time.UTC)
+		p1, err := store.CreateProject(ctx, "Claim P1", "claim-p1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p2, err := store.CreateProject(ctx, "Claim P2", "claim-p2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := store.CreateNotificationChannel(ctx, NotificationChannelCreate{
+			Type:   "webhook",
+			Name:   "claim-hook",
+			Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		spike := func(start time.Time, n int) []time.Time {
+			out := make([]time.Time, n)
+			for i := range out {
+				out[i] = start.Add(time.Duration(i) * time.Second)
+			}
+			return out
+		}
+		if _, err := store.RecordPlatformErrorRates(ctx, t0.Add(10*time.Second), window, []PlatformErrorRateBatch{
+			{ProjectID: p1.ID, ThresholdPerMin: 1, OccurredAt: spike(t0, 6)},
+			{ProjectID: p2.ID, ThresholdPerMin: 1, OccurredAt: spike(t0, 6)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		late := t0.Add(6 * time.Minute)
+		if _, err := store.RecordPlatformErrorRates(ctx, late, window, []PlatformErrorRateBatch{
+			{ProjectID: p1.ID, ThresholdPerMin: 1, OccurredAt: spike(late.Add(-20*time.Second), 7)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "", late, time.Minute, 10); err == nil {
+			t.Fatal("expected error for empty claim token")
+		}
+		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "tok", time.Time{}, time.Minute, 10); err == nil {
+			t.Fatal("expected error for zero timestamp")
+		}
+		if _, err := store.ClaimPlatformAlertTransitions(ctx, 0, "tok", late, 0, 10); err == nil {
+			t.Fatal("expected error for non-positive TTL")
+		}
+
+		claimedP1, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			p1.ID,
+			"tok-a",
+			late.Add(time.Second),
+			30*time.Second,
+			10,
+		)
+		if err != nil || len(claimedP1) != 1 {
+			t.Fatalf("claimedP1=%#v err=%v", claimedP1, err)
+		}
+		if claimedP1[0].ProjectID != p1.ID || claimedP1[0].ProjectSlug != "claim-p1" ||
+			claimedP1[0].Status != "firing" || claimedP1[0].Cycle != 1 || claimedP1[0].ClaimToken != "tok-a" {
+			t.Fatalf("unexpected claimedP1[0]=%#v", claimedP1[0])
+		}
+
+		// Concurrent claim across all projects skips leased p1 (and keeps its successors
+		// blocked), claiming only p2's head row.
+		claimedAll, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			0,
+			"tok-b",
+			late.Add(2*time.Second),
+			30*time.Second,
+			10,
+		)
+		if err != nil || len(claimedAll) != 1 || claimedAll[0].ProjectID != p2.ID ||
+			claimedAll[0].ClaimToken != "tok-b" {
+			t.Fatalf("claimedAll=%#v err=%v want only p2", claimedAll, err)
+		}
+		if none, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			0,
+			"tok-c",
+			late.Add(3*time.Second),
+			30*time.Second,
+			10,
+		); err != nil ||
+			len(none) != 0 {
+			t.Fatalf("expected empty claim while both heads leased, got=%#v err=%v", none, err)
+		}
+
+		// Invalid entry must fail validation before deleting the transition row.
+		if _, err := store.CommitPlatformAlertTransition(ctx, claimedP1[0].ID, "tok-a", []NotificationOutboxEnqueue{{
+			ProjectID: p1.ID,
+			ChannelID: ch.ID,
+			Payload:   json.RawMessage(`{"status":"firing"}`),
+		}}); err == nil {
+			t.Fatal("expected commit validation error for empty idempotency key")
+		}
+
+		inserted, err := store.CommitPlatformAlertTransition(
+			ctx,
+			claimedP1[0].ID,
+			"tok-a",
+			[]NotificationOutboxEnqueue{{
+				IdempotencyKey: "claim-p1-firing-1",
+				ProjectID:      p1.ID,
+				ChannelID:      ch.ID,
+				Payload:        json.RawMessage(`{"status":"firing","cycle":1}`),
+				OrderingKey:    "platform-state:claim-p1:error_rate_spike",
+			}},
+		)
+		if err != nil || inserted != 1 {
+			t.Fatalf("commit p1 head inserted=%d err=%v", inserted, err)
+		}
+
+		// Committing p1's firing(1) releases resolved(1) as the new head.
+		claimedR1, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			p1.ID,
+			"tok-d",
+			late.Add(4*time.Second),
+			30*time.Second,
+			10,
+		)
+		if err != nil || len(claimedR1) != 1 || claimedR1[0].Status != "resolved" || claimedR1[0].Cycle != 1 {
+			t.Fatalf("claimedR1=%#v err=%v", claimedR1, err)
+		}
+		// Zero-entry commit (e.g. silenced/suppressed transition) still deletes the transition row.
+		inserted, err = store.CommitPlatformAlertTransition(ctx, claimedR1[0].ID, "tok-d", nil)
+		if err != nil || inserted != 0 {
+			t.Fatalf("commit zero-entry resolved inserted=%d err=%v", inserted, err)
+		}
+
+		claimedF2, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			p1.ID,
+			"tok-e",
+			late.Add(5*time.Second),
+			30*time.Second,
+			10,
+		)
+		if err != nil || len(claimedF2) != 1 || claimedF2[0].Status != "firing" || claimedF2[0].Cycle != 2 {
+			t.Fatalf("claimedF2=%#v err=%v", claimedF2, err)
+		}
+		if _, err := store.CommitPlatformAlertTransition(ctx, claimedF2[0].ID, "tok-e", nil); err != nil {
+			t.Fatal(err)
+		}
+		if done, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			p1.ID,
+			"tok-f",
+			late.Add(6*time.Second),
+			30*time.Second,
+			10,
+		); err != nil ||
+			len(done) != 0 {
+			t.Fatalf("expected p1 drained, got=%#v err=%v", done, err)
+		}
+	})
+}
+
+// Expired leases are taken over by a new claim token, and any delayed commit
+// using the superseded token is fenced out with ErrStalePlatformTransitionClaim
+// and writes zero outbox rows.
+func TestPlatformAlertTransitionsExpiredLeaseTakeoverAndFencing(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 13, 30, 0, 0, time.UTC)
+		project, err := store.CreateProject(ctx, "Fence Project", "fence-project")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := store.CreateNotificationChannel(ctx, NotificationChannelCreate{
+			Type:   "webhook",
+			Name:   "fence-hook",
+			Config: map[string]any{"url": "https://example.invalid/hook"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := make([]time.Time, 6)
+		for i := range events {
+			events[i] = now.Add(-time.Duration(i+1) * time.Second)
+		}
+		if _, err := store.RecordPlatformErrorRates(ctx, now, 5*time.Minute, []PlatformErrorRateBatch{
+			{ProjectID: project.ID, ThresholdPerMin: 1, OccurredAt: events},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		claimAt := now.Add(time.Second)
+		ttl := 30 * time.Second
+		first, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "worker-a", claimAt, ttl, 10)
+		if err != nil || len(first) != 1 {
+			t.Fatalf("first claim=%#v err=%v", first, err)
+		}
+		if beforeExpiry, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			project.ID,
+			"worker-b",
+			claimAt.Add(29*time.Second),
+			ttl,
+			10,
+		); err != nil ||
+			len(beforeExpiry) != 0 {
+			t.Fatalf("expected lease active before expiry, got=%#v err=%v", beforeExpiry, err)
+		}
+
+		takeover, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "worker-b", claimAt.Add(ttl), ttl, 10)
+		if err != nil || len(takeover) != 1 || takeover[0].ID != first[0].ID || takeover[0].ClaimToken != "worker-b" {
+			t.Fatalf("takeover claim=%#v err=%v", takeover, err)
+		}
+
+		staleEntry := NotificationOutboxEnqueue{
+			IdempotencyKey: "stale-worker-a-key",
+			ProjectID:      project.ID,
+			ChannelID:      ch.ID,
+			Payload:        json.RawMessage(`{"from":"worker-a"}`),
+			OrderingKey:    "platform-state:fence-project:error_rate_spike",
+		}
+		if inserted, err := store.CommitPlatformAlertTransition(
+			ctx,
+			first[0].ID,
+			"worker-a",
+			[]NotificationOutboxEnqueue{staleEntry},
+		); !errors.Is(
+			err,
+			ErrStalePlatformTransitionClaim,
+		) ||
+			inserted != 0 {
+			t.Fatalf("stale commit inserted=%d err=%v want ErrStalePlatformTransitionClaim", inserted, err)
+		}
+		if existing, err := store.NotificationOutboxExistingKeys(
+			ctx,
+			[]string{staleEntry.IdempotencyKey},
+		); err != nil ||
+			len(existing) != 0 {
+			t.Fatalf("stale commit leaked outbox rows: existing=%#v err=%v", existing, err)
+		}
+		if pending, err := store.PendingPlatformAlertTransitions(ctx, project.ID, 0); err != nil || len(pending) != 1 ||
+			pending[0].ClaimToken != "worker-b" {
+			t.Fatalf("pending after stale commit=%#v err=%v", pending, err)
+		}
+
+		winnerEntry := NotificationOutboxEnqueue{
+			IdempotencyKey: "winner-worker-b-key",
+			ProjectID:      project.ID,
+			ChannelID:      ch.ID,
+			Payload:        json.RawMessage(`{"from":"worker-b"}`),
+			OrderingKey:    "platform-state:fence-project:error_rate_spike",
+		}
+		inserted, err := store.CommitPlatformAlertTransition(
+			ctx,
+			takeover[0].ID,
+			"worker-b",
+			[]NotificationOutboxEnqueue{winnerEntry},
+		)
+		if err != nil || inserted != 1 {
+			t.Fatalf("winner commit inserted=%d err=%v", inserted, err)
+		}
+		if existing, err := store.NotificationOutboxExistingKeys(
+			ctx,
+			[]string{staleEntry.IdempotencyKey, winnerEntry.IdempotencyKey},
+		); err != nil ||
+			!slices.Equal(sortedKeys(existing), []string{winnerEntry.IdempotencyKey}) {
+			t.Fatalf("outbox keys=%#v err=%v", existing, err)
+		}
+		if _, err := store.CommitPlatformAlertTransition(ctx, takeover[0].ID, "worker-b", nil); !errors.Is(
+			err,
+			ErrStalePlatformTransitionClaim,
+		) {
+			t.Fatalf("duplicate commit err=%v want ErrStalePlatformTransitionClaim", err)
+		}
+	})
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// ReleasePlatformAlertTransition clears a lease only when claimToken matches.
+func TestPlatformAlertTransitionsReleaseRequiresMatchingToken(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 13, 45, 0, 0, time.UTC)
+		project, err := store.CreateProject(ctx, "Release Project", "release-project")
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := make([]time.Time, 6)
+		for i := range events {
+			events[i] = now.Add(-time.Duration(i+1) * time.Second)
+		}
+		if _, err := store.RecordPlatformErrorRates(ctx, now, 5*time.Minute, []PlatformErrorRateBatch{
+			{ProjectID: project.ID, ThresholdPerMin: 1, OccurredAt: events},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		claimed, err := store.ClaimPlatformAlertTransitions(ctx, project.ID, "owner-1", now, 30*time.Second, 10)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claimed=%#v err=%v", claimed, err)
+		}
+		if err := store.ReleasePlatformAlertTransition(ctx, claimed[0].ID, "wrong-owner"); err != nil {
+			t.Fatal(err)
+		}
+		if blocked, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			project.ID,
+			"owner-2",
+			now.Add(5*time.Second),
+			30*time.Second,
+			10,
+		); err != nil ||
+			len(blocked) != 0 {
+			t.Fatalf("wrong token released claim: %#v err=%v", blocked, err)
+		}
+		if err := store.ReleasePlatformAlertTransition(ctx, claimed[0].ID, "owner-1"); err != nil {
+			t.Fatal(err)
+		}
+		reclaimed, err := store.ClaimPlatformAlertTransitions(
+			ctx,
+			project.ID,
+			"owner-2",
+			now.Add(5*time.Second),
+			30*time.Second,
+			10,
+		)
+		if err != nil || len(reclaimed) != 1 || reclaimed[0].ClaimToken != "owner-2" {
+			t.Fatalf("reclaim after release=%#v err=%v", reclaimed, err)
 		}
 	})
 }

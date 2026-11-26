@@ -525,6 +525,8 @@ CREATE TABLE platform_alert_transitions (
     window_count INTEGER NULL,
     threshold_per_min INTEGER NOT NULL DEFAULT 0,
     recorded_at TIMESTAMP NOT NULL,
+    claim_token TEXT NULL,
+    claim_until TIMESTAMP NULL,
     CONSTRAINT platform_alert_transitions_project
         FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
 );

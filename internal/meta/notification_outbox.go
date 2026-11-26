@@ -82,28 +82,61 @@ func (s *Store) NotificationOutboxItem(ctx context.Context, id int64) (Notificat
 	return item, nil
 }
 
-func (s *Store) EnqueueNotification(
-	ctx context.Context,
-	input NotificationOutboxEnqueue,
-) (id int64, inserted bool, err error) {
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+const insertNotificationOutboxSQL = `INSERT INTO notification_outbox(idempotency_key, project_id, rule_id, channel_id, payload, priority, ordering_key, status, available_at, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`
+
+func validateNotificationOutboxEnqueue(input NotificationOutboxEnqueue) error {
 	if input.IdempotencyKey == "" || input.ProjectID <= 0 || input.ChannelID <= 0 || !json.Valid(input.Payload) {
-		return 0, false, errors.New(
+		return errors.New(
 			"notification outbox requires idempotency key, project, channel, and valid JSON payload",
 		)
 	}
 	if input.RuleID != nil && *input.RuleID <= 0 {
-		return 0, false, errors.New("notification outbox rule ID must be positive when present")
+		return errors.New("notification outbox rule ID must be positive when present")
 	}
-	query := `INSERT INTO notification_outbox(idempotency_key, project_id, rule_id, channel_id, payload, priority, ordering_key, status, available_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-		ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`
-	err = s.db.QueryRowContext(ctx, bind(s.dialect, query), input.IdempotencyKey, input.ProjectID, input.RuleID, input.ChannelID, string(input.Payload), input.Priority, nullableOutboxOrderingKey(input.OrderingKey)).
-		Scan(&id)
+	return nil
+}
+
+func (s *Store) insertNotificationOutbox(
+	ctx context.Context,
+	qr rowQuerier,
+	input NotificationOutboxEnqueue,
+) (id int64, inserted bool, err error) {
+	err = qr.QueryRowContext(
+		ctx,
+		bind(s.dialect, insertNotificationOutboxSQL),
+		input.IdempotencyKey,
+		input.ProjectID,
+		input.RuleID,
+		input.ChannelID,
+		string(input.Payload),
+		input.Priority,
+		nullableOutboxOrderingKey(input.OrderingKey),
+	).Scan(&id)
 	if err == nil {
 		return id, true, nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, fmt.Errorf("enqueue notification outbox: %w", err)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	return 0, false, fmt.Errorf("enqueue notification outbox: %w", err)
+}
+
+func (s *Store) EnqueueNotification(
+	ctx context.Context,
+	input NotificationOutboxEnqueue,
+) (id int64, inserted bool, err error) {
+	if err := validateNotificationOutboxEnqueue(input); err != nil {
+		return 0, false, err
+	}
+	id, inserted, err = s.insertNotificationOutbox(ctx, s.db, input)
+	if err != nil || inserted {
+		return id, inserted, err
 	}
 	if err := s.db.QueryRowContext(ctx, bind(s.dialect, `SELECT id FROM notification_outbox WHERE idempotency_key = ?`), input.IdempotencyKey).
 		Scan(&id); err != nil {
@@ -445,6 +478,10 @@ func (s *Store) ListNotificationOutbox(
 // clock is used so eligibility matches ClaimNotifications across SQLite and PG.
 // Only dead rows of the project are requeued; the returned bool reports
 // whether one row changed.
+//
+// Note: manually requeuing a dead row that carries an OrderingKey restores it
+// to pending, so it can deliver after successors of the same stream that were
+// already released when it became dead.
 func (s *Store) RequeueNotification(ctx context.Context, id int64, projectID int) (bool, error) {
 	result, err := s.db.ExecContext(
 		ctx,
