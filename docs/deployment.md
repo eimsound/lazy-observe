@@ -253,7 +253,7 @@ A fingerprint mismatch means the configured key differs from the key this deploy
 
    `kubectl run` with the same `--env` and `--overrides` volume mounts works as well, provided the pod can reach the metadata database and read the key file.
 
-Key rotation does not re-encrypt existing ciphertext, so values sealed with the previous key remain unreadable. Re-enter the AI provider API key in **Settings > AI** to seal it under the new key. A new key also derives a new self-monitoring project token on the next startup. The previous derived credential stays in metadata and remains a valid ingest credential for the self-monitoring project; revoke it from that project's token list if the old key was exposed.
+Key rotation does not re-encrypt existing ciphertext, so values sealed with the previous key remain unreadable. Re-enter the AI provider API key in **Settings > AI** to seal it under the new key. A new key also derives a new self-monitoring project token on the next startup, and that startup automatically revokes the `self-monitoring` token derived from the previous key, so the old credential stops authenticating ingest immediately.
 
 Back up the key with the same care as the metadata database, because losing it makes sealed values unrecoverable. Because the `platform_key_fingerprints` table is part of the metadata baseline, a SQLite or PostgreSQL database created by an earlier commit refuses to start with `metadata migration 1 checksum mismatch` before the fingerprint check runs. Recreate the development database per [ADR 0003](https://github.com/eimsound/lazy-observe/blob/main/.agents/docs/adr/0003-pre-release-single-database-baseline.md) while keeping the same key file so the first startup records the matching fingerprint.
 

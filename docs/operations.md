@@ -318,7 +318,7 @@ At startup, lazy-observe computes the 128-bit fingerprint of `security.secret_ke
 4. Restart all replicas. In HA mode, run `lazy-observe doctor --ha` first.
 5. Complete the post-rotation cleanup:
    - Sign in to the web UI, open **Settings > AI**, and re-enter and save the AI provider API key so it seals under the new key.
-   - The next startup derives new self-monitoring project tokens (`self-monitoring` and, when `self_monitoring.web` is enabled, `self-monitoring-web`) from the new key. Previous `self-monitoring-web` tokens are automatically revoked when starting with the new key or with `self_monitoring.web: false`, while the backend `self-monitoring` project token is retained and cannot be manually revoked through the management API because the built-in self-monitoring project is protected (`protected_project`).
+   - The next startup derives new self-monitoring project tokens (`self-monitoring` and, when `self_monitoring.web` is enabled, `self-monitoring-web`) from the new key. Startup bootstrap automatically revokes the backend `self-monitoring` token derived from the previous key, and revokes previous `self-monitoring-web` tokens when starting with the new key or with `self_monitoring.web: false`. No manual revocation is needed (or possible through the management API, because the built-in self-monitoring project is protected by `protected_project`).
 
 ### 5.2 Emergency password reset and lockout clearing (`admin reset-password`)
 

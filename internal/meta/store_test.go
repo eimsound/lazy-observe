@@ -177,6 +177,103 @@ func TestBootstrapSelfMonitoringIsIdempotentAndSecret(t *testing.T) {
 	}
 }
 
+// Rotating the platform key changes the derived backend token; bootstrap must
+// revoke the token derived from the previous key instead of leaving it active.
+func TestBootstrapSelfMonitoringRevokesTokenFromRotatedKey(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, store *Store) {
+		ctx := context.Background()
+		oldDerived := "lo_" + strings.Repeat("o", 48)
+		newDerived := "lo_" + strings.Repeat("n", 48)
+		webDerived := "lo_" + strings.Repeat("w", 48)
+
+		selfProject, _, err := store.BootstrapSelfMonitoring(ctx, oldDerived)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.BootstrapSelfMonitoringWebToken(ctx, selfProject.ID, webDerived); err != nil {
+			t.Fatal(err)
+		}
+		// A same-named token on another project is out of scope and must survive.
+		other, err := store.CreateProject(ctx, "Other", "other-project")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, otherToken, err := store.CreateNamedProjectAPIToken(ctx, other.ID, SelfMonitoringTokenName)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		project, token, err := store.BootstrapSelfMonitoring(ctx, newDerived)
+		if err != nil || token != newDerived || project.ID != selfProject.ID {
+			t.Fatalf("rotated bootstrap project=%+v token=%q err=%v", project, token, err)
+		}
+		if _, err := store.AuthenticateProjectAPIToken(ctx, oldDerived); !errors.Is(err, ErrInvalidProjectAPIToken) {
+			t.Fatalf("stale self-monitoring token auth err=%v, want ErrInvalidProjectAPIToken", err)
+		}
+		for name, value := range map[string]string{"rotated backend": newDerived, "web": webDerived} {
+			if got, err := store.AuthenticateProjectAPIToken(ctx, value); err != nil || got.ID != selfProject.ID {
+				t.Fatalf("%s token auth project=%+v err=%v", name, got, err)
+			}
+		}
+		if got, err := store.AuthenticateProjectAPIToken(ctx, otherToken); err != nil || got.ID != other.ID {
+			t.Fatalf("other project token auth project=%+v err=%v", got, err)
+		}
+
+		// Upgrading from a build that left a previous key's token active next to
+		// the current one: the current token already exists, so only the
+		// revocation may advance the auth revision that invalidates caches.
+		if _, err := store.createProjectAPITokenValue(
+			ctx,
+			selfProject.ID,
+			SelfMonitoringTokenName,
+			oldDerived+"-legacy",
+		); err != nil {
+			t.Fatal(err)
+		}
+		before := store.Revision()
+		if _, token, err := store.BootstrapSelfMonitoring(ctx, newDerived); err != nil || token != newDerived {
+			t.Fatalf("upgrade bootstrap token=%q err=%v", token, err)
+		}
+		if store.Revision() == before {
+			t.Fatal("revoking a stale self-monitoring token did not advance the auth revision")
+		}
+		if _, err := store.AuthenticateProjectAPIToken(
+			ctx,
+			oldDerived+"-legacy",
+		); !errors.Is(err, ErrInvalidProjectAPIToken) {
+			t.Fatalf("legacy self-monitoring token auth err=%v, want ErrInvalidProjectAPIToken", err)
+		}
+
+		// Re-running bootstrap with the same key is idempotent: nothing new is
+		// created or revoked, so the auth revision stays put.
+		settled := store.Revision()
+		if _, token, err := store.BootstrapSelfMonitoring(ctx, newDerived); err != nil || token != newDerived {
+			t.Fatalf("repeated bootstrap token=%q err=%v", token, err)
+		}
+		if store.Revision() != settled {
+			t.Fatalf("repeated bootstrap advanced revision %d -> %d", settled, store.Revision())
+		}
+		tokens, err := store.ListProjectAPITokens(ctx, selfProject.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var active, revoked int
+		for _, tok := range tokens {
+			if tok.Name != SelfMonitoringTokenName {
+				continue
+			}
+			if tok.Revoked {
+				revoked++
+			} else {
+				active++
+			}
+		}
+		if active != 1 || revoked != 2 {
+			t.Fatalf("self-monitoring tokens active=%d revoked=%d want 1/2: %#v", active, revoked, tokens)
+		}
+	})
+}
+
 func TestBootstrapSelfMonitoringWebTokenLifecycle(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenStore(ctx, filepath.Join(t.TempDir(), "meta.db"))
