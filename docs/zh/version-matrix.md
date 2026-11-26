@@ -60,6 +60,11 @@
 - 取值范围：须为 `5s`（评估主循环 tick）的整数倍，`metrics` 规则 `5s`–`1h`，`logs` 规则 `30s`–`1h`；越界值，以及切换信号后已存覆盖值超出新信号范围的更新，返回 `400`。
 - 响应：`evaluation_interval` 为已存的覆盖值（`""` 表示信号默认），只读的 `effective_evaluation_interval` 为评估器实际使用的间隔（未覆盖时 `metrics` 为 `5s`，`logs` 为 `1m`）。
 
+告警规则的 `severity` 与 `annotations`（收紧校验，协议版本仍为 **v0**）：
+
+- `severity` 仅允许 `critical`、`warning`、`info`。`POST` 留空默认 `warning`；`PATCH`/`PUT` 留空保持原值；其他取值返回 `400`。校验上线前已存的规则在下次修改级别前保持原值。
+- `annotations` 的每个值都是 Go `text/template`，预置 `$labels`（告警标签 map，如 `{{$labels.instance}}`）与 `$value`（样本值，浮点数，如 `{{printf "%.0f" $value}}`），缺失的标签渲染为空串。`POST`/`PATCH`/`PUT` 遇到模板语法错误返回 `400`；不含 `{{` 的值按原文存储与展示。`annotations.summary` 是告警标题模板；`name` 仍是稳定的规则标识，用于 `alertname` 匹配与 `/alerts?rule=<name>`。
+
 服务端不认识的新增枚举值不会导致整批拒绝，详见 §2.3 与 §5。
 
 后端三端 SDK（Go / Node / Python）的 OTLP/HTTP 载荷压缩默认保持 `"none"`，可通过显式 `Compression` / `compression` 配置或标准 `OTEL_EXPORTER_OTLP_COMPRESSION`、`OTEL_EXPORTER_OTLP_<SIGNAL>_COMPRESSION` 环境变量按信号启用 `"gzip"`（优先级：显式配置 > 信号级环境变量 > 全局环境变量 > `"none"`）。网关对未压缩、池化解压与流式透传三种路径统一强制 52 MiB 解压体上限，并统一按解压后的明文字节数计入 `ingest_rate_limit`。
@@ -70,6 +75,9 @@
 
 - **Webhook JSON**：顶层可选字符串字段 `url` 与每条告警可选字符串字段 `alerts[].url`（未配置 `external_url` 时省略；风暴与渠道测试通知不填 `alerts[].url`）。Issue 告警既有的相对路径字段 `annotations.link` 与 `annotations.issue` 保持不变。
 - **Email（`smtp`）**：邮件正文为缩进 JSON 载荷，编码时不做 HTML 转义（`&`、`<`、`>` 保持原样）。存在顶层 `url` 时，正文首行为 `View in lazy-observe: <url>`，随后接 `\r\n\r\n` 与 JSON。
+- **渲染后的注解**：原生规则告警携带评估期渲染后的注解（渲染失败时为模板原文），Webhook `alerts[].annotations`、SMTP JSON 正文、IM 渠道与控制台告警事件看到的是同一份结果。`resolved` 告警复用最后一次 firing 评估时渲染的注解。
+- **Issue AI 分析**：自动 Issue AI 分析已完成时，`new_issue` 告警可携带 `annotations.ai_summary`（单行，最多 500 字符）。不再输出 `ai_probable_causes` 与 `ai_suggested_actions`，`regression` 告警不带任何 AI 注解；完整分析仍在控制台的 Issue 详情中展示。
+- **邮件主题**：`Subject` 与 IM 渠道使用同一标题（如 `[FIRING][CRITICAL] <project> / <summary> (+2 more)`），含非 ASCII 字符时按 RFC 2047 编码。
 - **控制台深链查询参数**：控制台链接基于 `<external_url>` 构造，任意控制台路由均支持 `project=<slug>`，`/alerts` 页面还支持 `fingerprint`、`rule` 与 `status` 查询参数（例如 `/alerts?fingerprint=<fp>&project=<slug>`、`/alerts?project=<slug>&rule=<rule>`、`/alerts?project=<slug>&status=firing`、`/issues/<id>?project=<slug>`、`/issues?project=<slug>` 与 `/alerts/channels`）。当前登录用户无法打开链接中的 `project`（已删除、已改名或无权限）时，控制台显示错误页，不会回落到其他项目。
 
 ### 2.2 DSN 格式

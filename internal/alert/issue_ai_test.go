@@ -49,34 +49,49 @@ func TestIssueAIAnalysisIsAttachedToPlatformNotification(t *testing.T) {
 	}}}
 	attached := service.attachIssueAIAnalysis(ctx, n)
 	annotations := attached.Alerts[0].Annotations
-	for _, want := range []string{"database latency likely caused checkout failures", "database latency", "inspect database latency"} {
-		joined := annotations["ai_summary"] + annotations["ai_probable_causes"] + annotations["ai_suggested_actions"]
-		if !bytes.Contains([]byte(joined), []byte(want)) {
-			t.Fatalf("AI notification annotations missing %q: %#v", want, annotations)
+	if annotations["ai_summary"] != "database latency likely caused checkout failures" {
+		t.Fatalf("ai_summary = %q", annotations["ai_summary"])
+	}
+	for _, key := range []string{"ai_probable_causes", "ai_suggested_actions"} {
+		if _, leaked := annotations[key]; leaked {
+			t.Fatalf("notification must carry only ai_summary, got %q: %#v", key, annotations)
 		}
 	}
 	if n.Alerts[0].Annotations["ai_summary"] != "" {
 		t.Fatal("attachment mutated the engine-owned annotation map")
 	}
+
+	// A regression must not reuse the analysis captured for the original
+	// issue: it may no longer describe the new failure.
+	regression := n
+	regression.Rule = "regression"
+	if got := service.attachIssueAIAnalysis(ctx, regression).Alerts[0].Annotations; got["ai_summary"] != "" {
+		t.Fatalf("regression notification carried stale AI analysis: %#v", got)
+	}
 }
 
-func TestChannelPayloadIncludesIssueAIAnalysis(t *testing.T) {
+func TestChannelPayloadIncludesOnlyIssueAISummary(t *testing.T) {
 	n := Notification{Project: "alpha", Rule: "new_issue", Status: "firing", Alerts: []Alert{{
-		Labels: map[string]string{"source": "platform", "issue_id": "1"},
+		Labels: map[string]string{"source": "platform", "kind": "new_issue", "issue_id": "1", "level": "error"},
 		Annotations: map[string]string{
-			"ai_summary":           "checkout database timeout",
+			"summary":    "CheckoutError",
+			"ai_summary": "checkout database timeout",
+			// Legacy outbox rows may still carry these; IM channels ignore them.
 			"ai_probable_causes":   `[{"cause":"database latency"}]`,
 			"ai_suggested_actions": `["inspect database"]`,
 		},
 	}}}
-	for _, kind := range []string{"webhook", "feishu", "dingtalk", "wecom"} {
+	for _, kind := range []string{"feishu", "dingtalk", "wecom", "slack"} {
 		payload, err := ChannelPayload(kind, n)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range [][]byte{[]byte("checkout database timeout"), []byte("database latency"), []byte("inspect database")} {
-			if !bytes.Contains(payload, want) {
-				t.Errorf("%s payload missing %q: %s", kind, want, payload)
+		if !bytes.Contains(payload, []byte("AI analysis: checkout database timeout")) {
+			t.Errorf("%s payload missing AI summary: %s", kind, payload)
+		}
+		for _, unwanted := range [][]byte{[]byte("database latency"), []byte("inspect database"), []byte("issue_id")} {
+			if bytes.Contains(payload, unwanted) {
+				t.Errorf("%s payload leaked %q: %s", kind, unwanted, payload)
 			}
 		}
 	}

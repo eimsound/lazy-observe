@@ -187,6 +187,16 @@ func TestAlertAPIUsesStableWireContract(t *testing.T) {
 	request(http.MethodPost, "/api/alert-rules", map[string]any{
 		"name": "BadSignal", "signal": "traces", "expr": "vector(1)",
 	}, http.StatusBadRequest)
+	request(http.MethodPost, "/api/alert-rules", map[string]any{
+		"name": "BadSeverity", "expr": "vector(1)", "severity": "page",
+	}, http.StatusBadRequest)
+	request(http.MethodPost, "/api/alert-rules", map[string]any{
+		"name": "BadTemplate", "expr": "vector(1)", "annotations": map[string]string{"summary": "{{$labels.x"},
+	}, http.StatusBadRequest)
+	request(http.MethodPatch, "/api/alert-rules/"+ruleID, map[string]any{"severity": "error"}, http.StatusBadRequest)
+	request(http.MethodPatch, "/api/alert-rules/"+ruleID, map[string]any{
+		"annotations": map[string]string{"summary": "{{end}}"},
+	}, http.StatusBadRequest)
 
 	numericRuleID, err := strconv.Atoi(ruleID)
 	if err != nil {

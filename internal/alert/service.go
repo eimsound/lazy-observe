@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -325,6 +324,24 @@ func ValidateRuleLabels(labels map[string]string) error {
 	return nil
 }
 
+// NormalizeRuleSeverity validates a native rule severity against the
+// critical/warning/info enum shared with the Web console. Empty or
+// whitespace-only input defaults to warning.
+func NormalizeRuleSeverity(raw string) (string, error) {
+	switch severity := strings.TrimSpace(raw); severity {
+	case "":
+		return "warning", nil
+	case "critical", "warning", "info":
+		return severity, nil
+	default:
+		return "", fmt.Errorf(
+			"%w: unsupported alert severity %q: must be critical, warning or info",
+			ErrInvalidInput,
+			raw,
+		)
+	}
+}
+
 // ValidateChannelType verifies that kind (or its canonical alias) is a
 // supported notification channel type.
 func ValidateChannelType(kind string) error {
@@ -424,6 +441,13 @@ func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleV
 	if err := ValidateRuleLabels(in.Labels); err != nil {
 		return meta.AlertRuleView{}, err
 	}
+	severity, err := NormalizeRuleSeverity(in.Severity)
+	if err != nil {
+		return meta.AlertRuleView{}, err
+	}
+	if err := ValidateRuleAnnotations(in.Annotations); err != nil {
+		return meta.AlertRuleView{}, err
+	}
 	return s.store.CreateAlertRule(ctx, meta.AlertRuleCreate{
 		ProjectSlug:        in.Project,
 		Name:               name,
@@ -431,7 +455,7 @@ func (s *Service) CreateRule(ctx context.Context, in RuleInput) (meta.AlertRuleV
 		Expression:         expr,
 		For:                forDuration,
 		EvaluationInterval: evaluationInterval,
-		Severity:           defaultString(strings.TrimSpace(in.Severity), "warning"),
+		Severity:           severity,
 		Labels:             nonNilMap(in.Labels),
 		Annotations:        nonNilMap(in.Annotations),
 		Enabled:            in.Enabled,
@@ -460,6 +484,19 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 		if err := ValidateRuleLabels(in.Labels); err != nil {
 			return meta.AlertRuleView{}, err
 		}
+	}
+	if err := ValidateRuleAnnotations(in.Annotations); err != nil {
+		return meta.AlertRuleView{}, err
+	}
+	// Severity is a plain string, so "" (or whitespace) means "keep the current
+	// value" on update; only Create applies the warning default.
+	var updatedSeverity *string
+	if strings.TrimSpace(in.Severity) != "" {
+		severity, err := NormalizeRuleSeverity(in.Severity)
+		if err != nil {
+			return meta.AlertRuleView{}, err
+		}
+		updatedSeverity = &severity
 	}
 	if in.Name != "" && strings.TrimSpace(in.Name) == "" {
 		return meta.AlertRuleView{}, fmt.Errorf("%w: alert rule name must not be blank", ErrInvalidInput)
@@ -566,10 +603,7 @@ func (s *Service) UpdateRule(ctx context.Context, id int, in RuleInput) (meta.Al
 	if normalizedEvalInterval != nil {
 		update.EvaluationInterval = normalizedEvalInterval
 	}
-	if in.Severity != "" {
-		trimmedSeverity := strings.TrimSpace(in.Severity)
-		update.Severity = &trimmedSeverity
-	}
+	update.Severity = updatedSeverity
 	if in.ChannelIDs != nil {
 		update.ChannelIDs = &in.ChannelIDs
 	}
@@ -1691,10 +1725,17 @@ func (s *Service) enqueuePlatformNotification(
 }
 
 // attachIssueAIAnalysis is intentionally read-only and best-effort. Automatic
-// Issue analysis runs beside the ingest path; when it finishes within the
-// alert grouping window, the structured result is added to the notification.
+// Issue analysis runs beside the ingest path; when it has already finished for
+// a new_issue notification, only its one-line summary is attached as the
+// `ai_summary` annotation. Probable causes and suggested actions stay in
+// issues.ai_analysis for the Web console and are never copied into
+// notification payloads. Regression notifications carry no AI annotation
+// because the stored analysis predates the regression and may be stale.
 // Missing or failed AI must never delay or suppress the core alert.
 func (s *Service) attachIssueAIAnalysis(ctx context.Context, n Notification) Notification {
+	if n.Rule != "new_issue" {
+		return n
+	}
 	p, err := s.store.ProjectBySlug(ctx, n.Project)
 	if err != nil {
 		return n
@@ -1709,23 +1750,16 @@ func (s *Service) attachIssueAIAnalysis(ctx context.Context, n Notification) Not
 		if getErr != nil || row.AIAnalysisAt == nil || row.AIAnalysis == nil {
 			continue
 		}
-		summary, _ := row.AIAnalysis["summary"].(string)
+		rawSummary, _ := row.AIAnalysis["summary"].(string)
+		summary := singleLine(rawSummary, maxNotificationAISummaryRunes)
 		if summary == "" {
 			continue
 		}
-		annotations := make(map[string]string, len(n.Alerts[i].Annotations)+3)
+		annotations := make(map[string]string, len(n.Alerts[i].Annotations)+1)
 		for key, value := range n.Alerts[i].Annotations {
 			annotations[key] = value
 		}
 		annotations["ai_summary"] = summary
-		for source, target := range map[string]string{"probable_causes": "ai_probable_causes", "suggested_actions": "ai_suggested_actions"} {
-			if encoded, marshalErr := json.Marshal(
-				row.AIAnalysis[source],
-			); marshalErr == nil &&
-				string(encoded) != "null" {
-				annotations[target] = clipNotificationText(string(encoded), 2000)
-			}
-		}
 		n.Alerts[i].Annotations = annotations
 	}
 	return n

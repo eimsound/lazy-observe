@@ -1,1 +1,1 @@
-{"markdown":{"text":"[FIRING] alpha / DiskFull\n{\"alertname\":\"DiskFull\",\"instance\":\"node-1\",\"project_id\":\"alpha\"}","title":"[FIRING] alpha / DiskFull"},"msgtype":"markdown"}
+{"markdown":{"text":"[FIRING][CRITICAL] alpha / node-1 磁盘使用率 95% (+2 more)","title":"[FIRING][CRITICAL] alpha / node-1 磁盘使用率 95% (+2 more)"},"msgtype":"markdown"}

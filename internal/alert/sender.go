@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/smtp"
@@ -176,10 +177,7 @@ func checkChannelResponse(kind string, body []byte) error {
 	return nil
 }
 
-const (
-	consoleLinkCTA   = "View in lazy-observe"
-	perAlertLinkText = "View"
-)
+const consoleLinkCTA = "View in lazy-observe"
 
 var (
 	mdURLReplacer = strings.NewReplacer("(", "%28", ")", "%29", " ", "%20")
@@ -198,72 +196,40 @@ func slackLink(rawURL, text string) string {
 	return "<" + slackEscape(rawURL) + "|" + slackEscape(text) + ">"
 }
 
-func buildNotificationText(
-	title string,
-	n Notification,
-	formatAlertLink func(string) string,
-	doubleNewlineBeforeAlertLink bool,
-) string {
-	lines := []string{title}
-	if n.Storm != nil {
-		lines = append(lines,
-			fmt.Sprintf("Active alert groups: %d", n.Storm.GroupCount),
-			"Top severities: "+formatCounts(n.Storm.Severities),
-			"Top rules: "+formatCounts(n.Storm.Rules),
-		)
+// buildNotificationBody returns the concise body lines of view, each passed
+// through the channel-specific escape.
+func buildNotificationBody(view notificationView, escape func(string) string) []string {
+	lines := make([]string, 0, len(view.Lines))
+	for _, line := range view.Lines {
+		lines = append(lines, escape(line))
 	}
-	showPerAlert := len(n.Alerts) > 1
-	for _, a := range n.Alerts {
-		lines = append(lines, formatLabels(a.Labels))
-		for _, field := range []struct{ key, label string }{
-			{"ai_summary", "AI analysis"},
-			{"ai_probable_causes", "AI probable causes"},
-			{"ai_suggested_actions", "AI suggested actions"},
-		} {
-			if value := strings.TrimSpace(a.Annotations[field.key]); value != "" {
-				lines = append(lines, field.label+": "+value)
-			}
-		}
-		if showPerAlert && a.URL != "" && formatAlertLink != nil {
-			link := formatAlertLink(a.URL)
-			if doubleNewlineBeforeAlertLink {
-				lines = append(lines, "\n"+link)
-			} else {
-				lines = append(lines, link)
-			}
-		}
-	}
-	return strings.Join(lines, "\n")
+	return lines
 }
 
-func buildMarkdownNotificationText(title string, n Notification) string {
-	text := buildNotificationText(
-		title,
-		n,
-		func(u string) string { return "[" + perAlertLinkText + "](" + mdURL(u) + ")" },
-		true,
-	)
+func buildMarkdownNotificationText(view notificationView, n Notification) string {
+	text := strings.Join(append([]string{view.Title}, buildNotificationBody(view, identity)...), "\n")
 	if n.URL != "" {
 		text += "\n\n[" + consoleLinkCTA + "](" + mdURL(n.URL) + ")"
 	}
 	return text
 }
 
+func identity(s string) string { return s }
+
 func ChannelPayload(kind string, n Notification) ([]byte, error) {
-	title := fmt.Sprintf("[%s] %s / %s", strings.ToUpper(n.Status), n.Project, n.Rule)
+	view := buildNotificationView(n)
+	title := view.Title
 	var payload any
 	switch kind {
 	case "webhook":
 		payload = n
 	case "feishu":
-		text := buildNotificationText(
-			title,
-			n,
-			func(u string) string { return "[" + perAlertLinkText + "](" + mdURL(u) + ")" },
-			false,
-		)
-		elements := []any{
-			map[string]any{"tag": "div", "text": map[string]string{"tag": "lark_md", "content": text}},
+		elements := []any{}
+		if body := buildNotificationBody(view, identity); len(body) > 0 {
+			elements = append(elements, map[string]any{
+				"tag":  "div",
+				"text": map[string]string{"tag": "lark_md", "content": strings.Join(body, "\n")},
+			})
 		}
 		if n.URL != "" {
 			elements = append(elements, map[string]any{
@@ -278,56 +244,55 @@ func ChannelPayload(kind string, n Notification) ([]byte, error) {
 				},
 			})
 		}
+		if len(elements) == 0 {
+			// Feishu rejects interactive cards whose elements array is empty.
+			fallback := n.Rule
+			if strings.TrimSpace(fallback) == "" {
+				fallback = title
+			}
+			elements = append(elements, map[string]any{
+				"tag":  "div",
+				"text": map[string]string{"tag": "plain_text", "content": fallback},
+			})
+		}
 		payload = map[string]any{
 			"msg_type": "interactive",
 			"card": map[string]any{
-				"header":   map[string]any{"title": map[string]string{"tag": "plain_text", "content": title}},
+				"header": map[string]any{
+					"template": feishuHeaderTemplate(n, view.Severity),
+					"title":    map[string]string{"tag": "plain_text", "content": title},
+				},
 				"elements": elements,
 			},
 		}
 	case "dingtalk":
 		payload = map[string]any{
 			"msgtype":  "markdown",
-			"markdown": map[string]string{"title": title, "text": buildMarkdownNotificationText(title, n)},
+			"markdown": map[string]string{"title": title, "text": buildMarkdownNotificationText(view, n)},
 		}
 	case "wecom":
 		payload = map[string]any{
 			"msgtype":  "markdown",
-			"markdown": map[string]string{"content": buildMarkdownNotificationText(title, n)},
+			"markdown": map[string]string{"content": buildMarkdownNotificationText(view, n)},
 		}
 	case "slack":
-		text := buildNotificationText(
-			title,
-			n,
-			func(u string) string { return slackLink(u, perAlertLinkText) },
-			false,
-		)
+		text := "*" + slackEscape(title) + "*"
+		if body := buildNotificationBody(view, slackEscape); len(body) > 0 {
+			text += "\n" + strings.Join(body, "\n")
+		}
 		if n.URL != "" {
 			text += "\n\n" + slackLink(n.URL, consoleLinkCTA)
 		}
-		payload = map[string]any{"text": title, "blocks": []any{
+		payload = map[string]any{"text": slackEscape(title), "blocks": []any{
 			map[string]any{
 				"type": "section",
-				"text": map[string]string{"type": "mrkdwn", "text": "*" + title + "*\n" + text},
+				"text": map[string]string{"type": "mrkdwn", "text": text},
 			},
 		}}
 	default:
 		return nil, fmt.Errorf("unsupported channel type %q", kind)
 	}
 	return json.Marshal(payload)
-}
-
-func formatCounts(counts []Count) string {
-	parts := make([]string, 0, len(counts))
-	for _, item := range counts {
-		parts = append(parts, fmt.Sprintf("%s=%d", item.Name, item.Count))
-	}
-	return strings.Join(parts, ", ")
-}
-
-func formatLabels(labels map[string]string) string {
-	data, _ := json.Marshal(labels)
-	return string(data)
 }
 
 func (s *Sender) sendSMTP(ctx context.Context, cfg map[string]any, n Notification) error {
@@ -460,7 +425,9 @@ func EmailPayload(from string, to []string, n Notification) []byte {
 	for _, recipient := range to {
 		safeTo = append(safeTo, sanitizeEmailHeader(recipient))
 	}
-	title := sanitizeEmailHeader(fmt.Sprintf("[%s] %s / %s", strings.ToUpper(n.Status), n.Project, n.Rule))
+	// Rendered titles are often non-ASCII; RFC 2047 encode them (a no-op for
+	// plain ASCII) so 7-bit MTAs do not mangle the Subject header.
+	title := mime.QEncoding.Encode("utf-8", sanitizeEmailHeader(buildNotificationView(n).Title))
 	var jsonBuf bytes.Buffer
 	enc := json.NewEncoder(&jsonBuf)
 	enc.SetEscapeHTML(false)

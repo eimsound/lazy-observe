@@ -278,11 +278,18 @@ AI 功能默认关闭，仅管理员可在 **Settings > AI** 中配置 Provider�
 
 各渠道渲染形式：
 
-- **飞书（Feishu）**：卡片底部主按钮（`View in lazy-observe`），多条告警聚合时每条附带 `lark_md` 链接（`View`）。
-- **钉钉（DingTalk）与企业微信（WeCom）**：Markdown 链接（`[View in lazy-observe](...)`，多条聚合时每条附带 `[View](...)`）。
-- **Slack**：`mrkdwn` 链接（`<url|View in lazy-observe>`，多条聚合时每条附带 `<url|View>`）。
+- **飞书（Feishu）**：卡片底部主按钮（`View in lazy-observe`）。
+- **钉钉（DingTalk）与企业微信（WeCom）**：Markdown 链接 `[View in lazy-observe](...)`。
+- **Slack**：`mrkdwn` 链接 `<url|View in lazy-observe>`。
 - **邮件（`smtp`）**：正文首行显示 `View in lazy-observe: <url>`，随后附 JSON 载荷。
 - **Webhook**：JSON 载荷附带可选字段 `url` 与 `alerts[].url`。
+
+IM 消息（飞书、钉钉、企业微信、Slack）保持精简。聚合通知只展示 1 条代表告警并附 `(+N more)`。代表告警按级别（`critical`/`fatal` > `error` > `warning` > `info`）、持续时间最久、指纹最小依次选出；其余告警通过控制台链接查看。
+
+- 规则配置了 `annotations.summary` 时，渲染后的摘要直接作为标题，如 `[FIRING][CRITICAL] prod / node-1 磁盘使用率 95% (+11 more)` 或 `[RESOLVED] prod / node-1 磁盘使用率 95%`，正文不再列出标签。
+- 未配置摘要时，标题回退为规则名，如 `[FIRING][WARNING] prod / DiskFull (+11 more)`，正文为代表告警的一行 `k=v` 标签；已体现在标题里的标签（`alertname`、`project`、`project_id`、`source`、`kind` 与级别）不再重复。
+- Issue 告警标题为 `new_issue: <Issue 标题>` 或 `regression: <Issue 标题>`；自动 Issue AI 分析已完成时，新 Issue 告警附一行 `AI analysis:` 摘要。
+- 飞书卡片头按状态着色：恢复为绿色，`critical`、`error` 与告警风暴为红色，`warning` 为橙色，`info` 为蓝色。
 
 打开链接时，浏览器标签页会切换到链接所指项目；项目不存在或无权访问时，控制台显示错误页，不会展示其他项目的数据。
 

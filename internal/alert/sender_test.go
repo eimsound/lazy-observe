@@ -20,18 +20,28 @@ import (
 )
 
 func TestChannelPayloadGolden(t *testing.T) {
+	// Three aggregated alerts with rendered summaries: the representative is
+	// the earliest critical one (node-1), not the smallest fingerprint ("a").
+	ts := time.Date(2026, 7, 17, 1, 2, 3, 0, time.UTC)
+	diskAlert := func(severity, instance, usage, fingerprint string, startsAt time.Time) Alert {
+		return Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "DiskFull", "instance": instance, "project_id": "alpha", "severity": severity,
+			},
+			Annotations: map[string]string{"summary": instance + " 磁盘使用率 " + usage},
+			StartsAt:    startsAt,
+			Fingerprint: fingerprint,
+		}
+	}
 	n := Notification{
 		Project: "alpha",
 		Rule:    "DiskFull",
 		Status:  "firing",
 		Alerts: []Alert{
-			{
-				Status:      "firing",
-				Labels:      map[string]string{"alertname": "DiskFull", "instance": "node-1", "project_id": "alpha"},
-				Annotations: map[string]string{"summary": "disk full"},
-				StartsAt:    time.Date(2026, 7, 17, 1, 2, 3, 0, time.UTC),
-				Fingerprint: "abc",
-			},
+			diskAlert("warning", "node-2", "81%", "b", ts),
+			diskAlert("critical", "node-1", "95%", "c", ts.Add(time.Minute)),
+			diskAlert("critical", "node-3", "97%", "a", ts.Add(2*time.Minute)),
 		},
 	}
 	for _, kind := range []string{"webhook", "feishu", "dingtalk", "wecom", "slack"} {
@@ -383,16 +393,12 @@ func TestChannelPayloadWithConsoleLinks(t *testing.T) {
 		if err := json.Unmarshal(feishuRaw, &feishuGot); err != nil {
 			t.Fatal(err)
 		}
-		if len(feishuGot.Card.Elements) != 2 {
-			t.Fatalf("feishu elements len = %d, want 2: %s", len(feishuGot.Card.Elements), feishuRaw)
+		// The only label is alertname (already in the title), so the body is
+		// empty and the card carries just the CTA button.
+		if len(feishuGot.Card.Elements) != 1 {
+			t.Fatalf("feishu elements len = %d, want 1: %s", len(feishuGot.Card.Elements), feishuRaw)
 		}
-		if strings.Contains(feishuGot.Card.Elements[0].Text.Content, "[View](") {
-			t.Fatalf(
-				"single alert feishu should not include per-alert View link: %q",
-				feishuGot.Card.Elements[0].Text.Content,
-			)
-		}
-		action := feishuGot.Card.Elements[1]
+		action := feishuGot.Card.Elements[0]
 		if action.Tag != "action" || len(action.Actions) != 1 ||
 			action.Actions[0].Tag != "button" ||
 			action.Actions[0].Type != "primary" ||
@@ -506,9 +512,11 @@ func TestChannelPayloadWithConsoleLinks(t *testing.T) {
 		if err := json.Unmarshal(feishuRaw, &feishuGot); err != nil {
 			t.Fatal(err)
 		}
+		// Aggregated messages show only the representative alert, so there are
+		// no per-alert links; the CTA opens the rule-filtered alert list.
 		feishuText := feishuGot.Card.Elements[0].Text.Content
-		if !strings.Contains(feishuText, "[View]("+wantA1+")") || !strings.Contains(feishuText, "[View]("+wantA2+")") {
-			t.Fatalf("feishu missing per-alert links: %q", feishuText)
+		if feishuText != "instance=n1" || strings.Contains(string(feishuRaw), wantA2) {
+			t.Fatalf("feishu body = %q, want representative labels only: %s", feishuText, feishuRaw)
 		}
 		if feishuGot.Card.Elements[1].Actions[0].URL != wantTop {
 			t.Fatalf("feishu button url = %q, want %q", feishuGot.Card.Elements[1].Actions[0].URL, wantTop)
@@ -532,14 +540,12 @@ func TestChannelPayloadWithConsoleLinks(t *testing.T) {
 			if kind == "wecom" {
 				body = decoded.Markdown.Content
 			}
-			for _, want := range []string{
-				"\n\n[View](" + wantA1 + ")",
-				"\n\n[View](" + wantA2 + ")",
-				"\n\n[View in lazy-observe](" + wantTop + ")",
-			} {
-				if !strings.Contains(body, want) {
-					t.Fatalf("%s missing %q in %q", kind, want, body)
-				}
+			want := "[FIRING] alpha / DiskFull (+1 more)\ninstance=n1\n\n[View in lazy-observe](" + wantTop + ")"
+			if body != want {
+				t.Fatalf("%s body = %q, want %q", kind, body, want)
+			}
+			if strings.Contains(body, wantA1) || strings.Contains(body, wantA2) {
+				t.Fatalf("%s should not include per-alert links: %q", kind, body)
 			}
 		}
 
@@ -558,14 +564,10 @@ func TestChannelPayloadWithConsoleLinks(t *testing.T) {
 			t.Fatal(err)
 		}
 		slackText := slackGot.Blocks[0].Text.Text
-		for _, want := range []string{
-			"<https://observe.example.com/alerts?fingerprint=fp-1&amp;project=alpha|View>",
-			"<https://observe.example.com/alerts?fingerprint=fp-2&amp;project=alpha|View>",
-			"\n\n<https://observe.example.com/alerts?project=alpha&amp;rule=DiskFull|View in lazy-observe>",
-		} {
-			if !strings.Contains(slackText, want) {
-				t.Fatalf("slack missing %q in %q", want, slackText)
-			}
+		wantSlack := "*[FIRING] alpha / DiskFull (+1 more)*\ninstance=n1\n\n" +
+			"<https://observe.example.com/alerts?project=alpha&amp;rule=DiskFull|View in lazy-observe>"
+		if slackText != wantSlack {
+			t.Fatalf("slack text = %q, want %q", slackText, wantSlack)
 		}
 	})
 
