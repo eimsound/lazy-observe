@@ -72,6 +72,8 @@ func TestRecordErrorEventsBatchMatchesPerEventOutbox(t *testing.T) {
 	if got := rows[1].Notification.Alerts[0].Annotations["summary"]; got != "Error rate spike recovered: 0.2 events/min" {
 		t.Fatalf("resolved summary=%q", got)
 	}
+	// Both rows can be claimed in one drain and delivered concurrently, so
+	// these waits must not assume an arrival order (issue #394).
 	batch.waitDelivered("resolved", "1")
 	batch.waitDelivered("firing", "2")
 }

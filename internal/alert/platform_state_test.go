@@ -28,9 +28,12 @@ type spikeHarness struct {
 	project  *meta.Project
 	channel  int
 	received chan Notification
-	clock    *atomic.Int64
-	base     time.Time
-	client   *http.Client
+	// pending holds deliveries already read from received but not yet matched
+	// by waitDelivered, so concurrent out-of-order deliveries are not lost.
+	pending []Notification
+	clock   *atomic.Int64
+	base    time.Time
+	client  *http.Client
 }
 
 func newSpikeHarness(t *testing.T, slug string) *spikeHarness {
@@ -156,12 +159,66 @@ func (h *spikeHarness) expectRows(want ...PlatformStateRef) []spikeOutboxRow {
 	return rows
 }
 
+// waitDelivered waits for the error_rate_spike delivery of (status, cycle).
+// OutboxWorker.drain delivers a claimed batch concurrently (delivery order is
+// tracked in #386), so deliveries that do not match are kept in pending for
+// later waits instead of being dropped; consecutive calls match in any order.
 func (h *spikeHarness) waitDelivered(status, cycle string) {
 	h.t.Helper()
-	n := waitNotificationStatus(h.t, h.received, status)
-	if n.Rule != "error_rate_spike" || n.Alerts[0].Annotations["cycle"] != cycle {
-		h.t.Fatalf("delivered %s notification=%#v want cycle %s", status, n, cycle)
+	matches := func(n Notification) bool {
+		return n.Rule == "error_rate_spike" && n.Status == status && len(n.Alerts) == 1 &&
+			n.Alerts[0].Annotations["cycle"] == cycle
 	}
+	if i := slices.IndexFunc(h.pending, matches); i >= 0 {
+		h.pending = slices.Delete(h.pending, i, i+1)
+		return
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case n := <-h.received:
+			if matches(n) {
+				return
+			}
+			h.pending = append(h.pending, n)
+		case <-deadline:
+			h.t.Fatalf(
+				"timeout waiting for %s notification cycle %s; unmatched deliveries=%#v",
+				status,
+				cycle,
+				h.pending,
+			)
+			return
+		}
+	}
+}
+
+// expectNoDelivery fails if any delivery is pending or arrives within d.
+func (h *spikeHarness) expectNoDelivery(d time.Duration) {
+	h.t.Helper()
+	if len(h.pending) > 0 {
+		h.t.Fatalf("unexpected delivery: %#v", h.pending)
+	}
+	select {
+	case n := <-h.received:
+		h.t.Fatalf("unexpected delivery: %#v", n)
+	case <-time.After(d):
+	}
+}
+
+// OutboxWorker.drain delivers one claimed batch concurrently, so a later
+// transition may reach the webhook first. waitDelivered must keep it for the
+// next wait instead of discarding it (issue #394).
+func TestSpikeHarnessWaitDeliveredToleratesOutOfOrderDelivery(t *testing.T) {
+	h := newSpikeHarness(t, "spike-wait-order")
+	delivered := func(status, cycle string) Notification {
+		return Notification{Rule: "error_rate_spike", Status: status,
+			Alerts: []Alert{{Annotations: map[string]string{"cycle": cycle}}}}
+	}
+	h.received <- delivered("firing", "2")
+	h.received <- delivered("resolved", "1")
+	h.waitDelivered("resolved", "1")
+	h.waitDelivered("firing", "2")
 }
 
 func TestBuildPlatformStateOutboxEntriesKeyIgnoresPayloadAndPinsTransition(t *testing.T) {
@@ -241,11 +298,7 @@ func TestErrorRateSpikeReplayDeduplicatesAcrossReplicas(t *testing.T) {
 	}
 	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
 	h.waitDelivered("firing", "1")
-	select {
-	case dup := <-h.received:
-		t.Fatalf("duplicate delivery: %#v", dup)
-	case <-time.After(80 * time.Millisecond):
-	}
+	h.expectNoDelivery(80 * time.Millisecond)
 
 	// A cycle notifies firing once, like the removed Engine: replays after the
 	// repeat interval elapses must not re-enqueue the still-firing spike.
