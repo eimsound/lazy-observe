@@ -232,6 +232,17 @@ lazy-observe 是给开发者和运维看的自托管可观测性控制台：日�
 全部尺寸用 `rem`。根字号由 `--font-scale`（0.9375 / 1 / 1.0625）缩放，所以任何写死 `px` 的字号或高度都会在字号切换时
 与周围脱节。同一工具栏内不混用 `text-sm` 与 `text-xs`。
 
+**单行控件文字光学居中**：`items-center` 居中的是整个行盒，字体在基线下给下伸字母留了空间，
+所以 `frontend`、`HTTP 200` 这类文字会比旁边的图标中线偏上 1–2px。`globals.css` 的 `optical-center` 工具类用
+`text-box-trim` 把行盒裁到「大写字母顶 → 基线」，再用 `padding-block: (1lh − 1cap) / 2` 补回原行高：布局高度不变，
+大写字母带落在父容器中线上，下伸字母和中文落在内边距里，与 `truncate` 同用不切字。不支持 `text-box-trim` 的浏览器保持原样。
+
+- `Button`、`Badge`、`TabsTrigger`、`DropdownMenuItem`、`DropdownMenuCheckboxItem` 会把裸文本（含 `asChild` 子元素里的裸文本）
+  自动包进 `optical-center` span；`SelectTrigger` 的值和 `SelectItem` 的文本由原语样式覆盖。业务代码照常传文字即可。
+- 自己包了 span 的控件文字（如 `<span className="hidden sm:inline">`、侧栏导航项）手动加 `optical-center`。
+- 只加在直接承载单行文字、且是 flex 项或块级的元素上；不要加在 flex 容器本身（裸文本是匿名 flex 项，裁不到）、
+  内容含块级或 flex 子元素的元素（无行可裁，只会多出内边距）、`<input>`/`<textarea>`/CodeMirror 和多行正文上。
+
 ## Layout
 
 整体是**固定侧栏 + 56px（`h-14`）顶栏 + 可滚动内容区**（`web/src/components/layout/app-shell.tsx`）。
@@ -331,6 +342,7 @@ lazy-observe 是给开发者和运维看的自托管可观测性控制台：日�
 
 - Do：同一工具栏只用一个高度档，默认 `h-8`。
 - Do：控件文字用 `text-xs`，图标用 `size-3.5`，容器用 `inline-flex items-center`。
+- Do：控件里自己包的单行文字 span 加 `optical-center`，与图标中线对齐（见 Typography）。
 - Do：所有尺寸用 `rem` 工具类，让字号主题轴整体生效。
 - Do：颜色、圆角只走语义工具类或 `var(--token)`。
 - Do：单行查询编辑器与相邻按钮同高、首行文字与按钮文字同一中线。

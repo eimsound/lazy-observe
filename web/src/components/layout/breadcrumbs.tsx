@@ -19,13 +19,13 @@ export function Breadcrumbs() {
 
   return (
     <nav aria-label={t("common.breadcrumb")} className="flex items-center gap-1.5 text-sm">
-      <span className="text-muted-foreground">{t("common.appName")}</span>
+      <span className="optical-center text-muted-foreground">{t("common.appName")}</span>
       {current && (
         <>
           <ChevronRight className="size-3.5 text-muted-foreground/60" />
           <span
             className={
-              leaf ? "text-muted-foreground" : "font-medium text-foreground"
+              leaf ? "optical-center text-muted-foreground" : "optical-center font-medium text-foreground"
             }
           >
             {t(current.labelKey)}
@@ -35,7 +35,7 @@ export function Breadcrumbs() {
       {leaf && (
         <>
           <ChevronRight className="size-3.5 text-muted-foreground/60" />
-          <span className="font-mono font-medium text-foreground">{leaf}</span>
+          <span className="optical-center font-mono font-medium text-foreground">{leaf}</span>
         </>
       )}
     </nav>

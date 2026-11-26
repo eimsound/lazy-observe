@@ -132,9 +132,6 @@ export function TraceWaterfall({
             {svc}
           </span>
         ))}
-        <span className="ml-auto text-xs text-muted-foreground/70">
-          {t("traces.waterfallHint")}
-        </span>
       </div>
 
       {/* Ruler */}

@@ -7,7 +7,6 @@ import {
   FolderKanban,
   KeyRound,
   Loader2,
-  Lock,
   Pencil,
   Plus,
   Trash2,
@@ -33,6 +32,7 @@ import { EmptyState } from "@/components/common/empty-state";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { HelpTip } from "@/components/common/help-tip";
 import { SnippetBlock } from "@/components/common/snippet-block";
 import { SourceMapUploadTokens } from "@/components/projects/source-map-upload-tokens";
 import { projectDsn } from "@/lib/tokens/token-usage";
@@ -258,7 +258,10 @@ function UpdateProjectDialog({
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="edit-p-slug">{t("projects.slug")}</Label>
+            <div className="flex items-center gap-1.5">
+              <Label htmlFor="edit-p-slug">{t("projects.slug")}</Label>
+              <HelpTip content={t("projects.slugImmutable")} />
+            </div>
             <Input
               id="edit-p-slug"
               value={slug}
@@ -266,7 +269,6 @@ function UpdateProjectDialog({
               spellCheck={false}
               disabled
             />
-            <p className="text-xs text-muted-foreground">{t("projects.slugImmutable")}</p>
           </div>
           {error && (
             <p className="text-sm text-destructive" role="alert">
@@ -351,7 +353,10 @@ function CreateProjectDialog({
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="p-slug">{t("projects.slug")}</Label>
+            <div className="flex items-center gap-1.5">
+              <Label htmlFor="p-slug">{t("projects.slug")}</Label>
+              <HelpTip content={t("projects.slugHint")} />
+            </div>
             <Input
               id="p-slug"
               value={slug}
@@ -360,7 +365,6 @@ function CreateProjectDialog({
               className="font-mono text-sm"
               spellCheck={false}
             />
-            <p className="text-xs text-muted-foreground">{t("projects.slugHint")}</p>
           </div>
           {error && (
             <p className="text-sm text-destructive" role="alert">
@@ -446,19 +450,26 @@ function TokensDialog({
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
+      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto" aria-describedby={undefined}>
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
+          <DialogTitle className="flex flex-wrap items-center gap-2 pr-6">
             <KeyRound className="size-4" />
             {t("projects.tokensFor", { name: project.name })}
+            <HelpTip
+              scopeTitle={t("common.applicableScope")}
+              scope={[
+                {
+                  text: t("projects.ingestScopeTitle"),
+                  children: [
+                    t("projects.ingestScopeSdk"),
+                    t("projects.ingestScopeOtel"),
+                    t("projects.ingestScopeRemoteWrite"),
+                  ],
+                },
+              ]}
+            />
           </DialogTitle>
         </DialogHeader>
-
-        {/* ADR 0010: a project API token is ingest-only; reads need a user token. */}
-        <div className="rounded-lg border border-border bg-muted/40 p-3 text-xs">
-          <p className="font-medium text-foreground">{t("projects.ingestOnlyTitle")}</p>
-          <p className="mt-1 text-muted-foreground">{t("projects.ingestOnlyDesc")}</p>
-        </div>
 
         {/* Freshly-created secret (shown once) */}
         {createdToken && (
@@ -467,7 +478,7 @@ function TokensDialog({
               <Check className="size-4 text-primary" />
               {t("projects.createdTitle")}
             </div>
-            <p className="text-xs text-muted-foreground">{t("projects.createdDesc")}</p>
+            <p className="text-xs text-muted-foreground">{t("common.tokenCopyOnce")}</p>
             <div className="flex items-center gap-2">
               <code className="flex-1 truncate rounded border border-border bg-background px-2 py-1.5 font-mono text-xs">
                 {createdToken.value}
@@ -477,11 +488,9 @@ function TokensDialog({
                 {copied ? t("common.copied") : t("common.copy")}
               </Button>
             </div>
-            <p className="text-[11px] text-muted-foreground">{t("projects.copyWarning")}</p>
             <SnippetBlock
               label={t("projects.dsnLabel")}
               value={projectDsn(window.location.origin, project.slug, createdToken.value)}
-              hint={t("projects.dsnHint")}
             />
           </div>
         )}
@@ -585,13 +594,6 @@ function TokensDialog({
         </div>
 
         {canManage && <SourceMapUploadTokens key={project.id} project={project} />}
-
-        {!canManage && (
-          <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Lock className="size-3.5" />
-            {t("projects.adminOnly")}
-          </p>
-        )}
       </DialogContent>
 
       {revoking && (

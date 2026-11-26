@@ -440,9 +440,7 @@ export function PromQLBuilderView({
           </Button>
         </div>
 
-        {draft.filters.length === 0 ? (
-          <p className="text-xs text-muted-foreground">{t("metrics.builder.noFiltersHint")}</p>
-        ) : (
+        {draft.filters.length > 0 && (
           <div className="space-y-2">
             {draft.filters.map((filter) => (
               <div

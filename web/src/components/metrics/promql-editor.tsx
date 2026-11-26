@@ -33,6 +33,7 @@ import {
 } from "@codemirror/language";
 import {
   Annotation,
+  Compartment,
   EditorSelection,
   EditorState,
   Prec,
@@ -40,6 +41,7 @@ import {
 import {
   EditorView,
   keymap,
+  placeholder,
   type ViewUpdate,
 } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
@@ -68,6 +70,7 @@ interface PromQLEditorProps {
   id: string;
   value: string;
   range: ResolvedMetricsRange;
+  placeholderText?: string;
   actions?: ReactNode;
   onChange: (value: string) => void;
   onRun: () => void;
@@ -121,6 +124,7 @@ const editorTheme = EditorView.theme({
   },
   ".cm-line": { padding: "0" },
   ".cm-cursor": { borderLeftColor: "var(--foreground)" },
+  ".cm-placeholder": { color: "var(--muted-foreground)" },
   ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": {
     backgroundColor: "var(--accent) !important",
   },
@@ -250,6 +254,7 @@ export const PromQLEditor = forwardRef<PromQLEditorHandle, PromQLEditorProps>(fu
   id,
   value,
   range,
+  placeholderText,
   actions,
   onChange,
   onRun,
@@ -259,23 +264,28 @@ export const PromQLEditor = forwardRef<PromQLEditorHandle, PromQLEditorProps>(fu
   const { currentSlug: project } = useProject();
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const placeholderCompartment = useRef(new Compartment());
   const onChangeRef = useRef(onChange);
   const onRunRef = useRef(onRun);
   const rangeRef = useRef(range);
   const projectRef = useRef(project);
   const queryClientRef = useRef(queryClient);
+  const placeholderTextRef = useRef(placeholderText);
   const tRef = useRef(t);
   // The editor is created once per id; later value changes are synced by the
   // effect below, so creation reads the latest value through a ref.
   const valueRef = useRef(value);
 
-  onChangeRef.current = onChange;
-  onRunRef.current = onRun;
-  rangeRef.current = range;
-  projectRef.current = project;
-  queryClientRef.current = queryClient;
-  tRef.current = t;
-  valueRef.current = value;
+  useEffect(() => {
+    onChangeRef.current = onChange;
+    onRunRef.current = onRun;
+    rangeRef.current = range;
+    projectRef.current = project;
+    queryClientRef.current = queryClient;
+    placeholderTextRef.current = placeholderText;
+    tRef.current = t;
+    valueRef.current = value;
+  });
 
   useEffect(() => {
     const view = viewRef.current;
@@ -356,6 +366,9 @@ export const PromQLEditor = forwardRef<PromQLEditorHandle, PromQLEditorProps>(fu
         bracketMatching(),
         closeBrackets(),
         EditorView.lineWrapping,
+        placeholderCompartment.current.of(
+          placeholderTextRef.current ? placeholder(placeholderTextRef.current) : [],
+        ),
         EditorView.contentAttributes.of({
           "aria-label": tRef.current("metrics.queryLabel"),
           "aria-autocomplete": "list",
@@ -420,6 +433,16 @@ export const PromQLEditor = forwardRef<PromQLEditorHandle, PromQLEditorProps>(fu
       annotations: externalValue.of(true),
     });
   }, [value]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: placeholderCompartment.current.reconfigure(
+        placeholderText ? placeholder(placeholderText) : [],
+      ),
+    });
+  }, [placeholderText]);
 
   useEffect(() => {
     viewRef.current?.contentDOM.setAttribute("aria-label", t("metrics.queryLabel"));

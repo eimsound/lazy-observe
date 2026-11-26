@@ -69,7 +69,7 @@ export function Topbar() {
           onClick={() => setPaletteOpen(true)}
         >
           <Search className="size-4" />
-          <span className="flex-1 text-left">{t("common.search")}</span>
+          <span className="optical-center flex-1 text-left">{t("common.search")}</span>
           <kbd className="pointer-events-none rounded border border-border bg-background px-1.5 font-mono text-[10px]">
             ⌘K
           </kbd>
@@ -83,7 +83,7 @@ export function Topbar() {
           onClick={() => setAssistantOpen(true)}
         >
           <Sparkles className="size-3.5 text-primary" />
-          <span className="hidden sm:inline">{t("topbar.assistant")}</span>
+          <span className="optical-center hidden sm:inline">{t("topbar.assistant")}</span>
         </Button>
 
         <Separator orientation="vertical" className="h-6" />

@@ -30,6 +30,7 @@ import { isForbiddenError } from "@/lib/api/errors";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { HelpTip } from "@/components/common/help-tip";
 import { SeverityBadge } from "@/components/alerts/severity";
 import { KvEditor } from "@/components/common/kv-editor";
 import { pairsToRecord, recordToPairs, type Pair } from "@/components/common/kv-pairs";
@@ -55,7 +56,6 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -395,7 +395,7 @@ function RuleFormDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-2xl" aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>{editing ? t("alerts.editRule") : t("alerts.newRule")}</DialogTitle>
         </DialogHeader>
@@ -475,15 +475,21 @@ function RuleFormDialog({
           </div>
 
           <div className="space-y-1.5">
-            <Label>
-              {t(signal === "logs" ? "alerts.exprLogs" : "alerts.exprMetrics")}
-            </Label>
+            <div className="flex items-center gap-1.5">
+              <Label>
+                {t(signal === "logs" ? "alerts.exprLogs" : "alerts.exprMetrics")}
+              </Label>
+              <HelpTip
+                content={t(signal === "logs" ? "alerts.exprLogsHint" : "alerts.exprMetricsHint")}
+              />
+            </div>
             {/* Query-language input uses the shared CodeMirror editors (AGENTS.md). */}
             {signal === "logs" ? (
               <LogsQLEditor
                 key="logs"
                 id="alert-rule-logsql"
                 value={expr}
+                placeholderText={t("alerts.exprLogsPlaceholder")}
                 onChange={setExpr}
                 onRun={() => undefined}
                 autocompleteEnabled={false}
@@ -494,16 +500,11 @@ function RuleFormDialog({
                 id="alert-rule-promql"
                 value={expr}
                 range={autocompleteRange}
+                placeholderText={t("alerts.exprMetricsPlaceholder")}
                 onChange={setExpr}
                 onRun={() => undefined}
               />
             )}
-            <p className="font-mono text-xs text-muted-foreground">
-              {t(signal === "logs" ? "alerts.exprLogsPlaceholder" : "alerts.exprMetricsPlaceholder")}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {t(signal === "logs" ? "alerts.exprLogsHint" : "alerts.exprMetricsHint")}
-            </p>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
@@ -590,7 +591,6 @@ function RuleFormDialog({
           )}
         </div>
 
-        <DialogDescription className="sr-only">{t("alerts.rulesSubtitle")}</DialogDescription>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={mutation.isPending}>
             {t("common.cancel")}

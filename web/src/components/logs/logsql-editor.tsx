@@ -15,7 +15,7 @@ import {
   insertNewlineAndIndent,
 } from "@codemirror/commands";
 import { bracketMatching } from "@codemirror/language";
-import { Annotation, EditorSelection, EditorState, Prec } from "@codemirror/state";
+import { Annotation, Compartment, EditorSelection, EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap, placeholder, type ViewUpdate } from "@codemirror/view";
 import { Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -36,6 +36,7 @@ export interface LogsQLEditorSuggestion {
 interface LogsQLEditorProps {
   id: string;
   value: string;
+  placeholderText?: string;
   onChange: (value: string) => void;
   onRun: () => void;
   autocompleteEnabled?: boolean;
@@ -123,6 +124,7 @@ function toCompletion(suggestion: LogsQLEditorSuggestion): Completion {
 export function LogsQLEditor({
   id,
   value,
+  placeholderText,
   onChange,
   onRun,
   autocompleteEnabled = true,
@@ -133,12 +135,14 @@ export function LogsQLEditor({
   const { t, i18n } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const placeholderCompartment = useRef(new Compartment());
   const onChangeRef = useRef(onChange);
   const onRunRef = useRef(onRun);
   const onCompleteRef = useRef(onComplete);
   const onHistoryPreviousRef = useRef(onHistoryPrevious);
   const onHistoryNextRef = useRef(onHistoryNext);
   const autocompleteEnabledRef = useRef(autocompleteEnabled);
+  const placeholderTextRef = useRef(placeholderText);
   const tRef = useRef(t);
   // The editor is created once per id; later value changes are synced by the
   // effect below, so creation reads the latest value through a ref.
@@ -151,6 +155,7 @@ export function LogsQLEditor({
     onHistoryPreviousRef.current = onHistoryPrevious;
     onHistoryNextRef.current = onHistoryNext;
     autocompleteEnabledRef.current = autocompleteEnabled;
+    placeholderTextRef.current = placeholderText;
     tRef.current = t;
     valueRef.current = value;
   });
@@ -166,7 +171,9 @@ export function LogsQLEditor({
         bracketMatching(),
         closeBrackets(),
         EditorView.lineWrapping,
-        placeholder(tRef.current("logs.queryPlaceholder")),
+        placeholderCompartment.current.of(
+          placeholder(placeholderTextRef.current ?? tRef.current("logs.queryPlaceholder")),
+        ),
         autocompletion({
           activateOnTyping: true,
           maxRenderedOptions: 80,
@@ -271,6 +278,16 @@ export function LogsQLEditor({
       annotations: externalValue.of(true),
     });
   }, [value]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: placeholderCompartment.current.reconfigure(
+        placeholder(placeholderText ?? t("logs.queryPlaceholder")),
+      ),
+    });
+  }, [i18n.language, placeholderText, t]);
 
   useEffect(() => {
     viewRef.current?.contentDOM.setAttribute("aria-label", t("logs.queryLabel"));

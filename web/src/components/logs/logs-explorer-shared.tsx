@@ -77,7 +77,7 @@ export function PaginationControls({
         {t("logs.paginationStatus", { from, to, total })}
       </span>
       <div className="flex items-center gap-2">
-        <span className="hidden sm:inline">
+        <span className="optical-center hidden sm:inline">
           {pageSizeLabel ?? t("logs.rowsPerPage")}
         </span>
         <Select
@@ -134,7 +134,7 @@ export function EmptyLogs() {
   const { t } = useTranslation();
   return (
     <div className="flex min-h-40 items-center justify-center px-4 text-center text-sm text-muted-foreground">
-      {t("logs.emptyTitle")}
+      {t("common.noData")}
     </div>
   );
 }
@@ -146,7 +146,7 @@ export function ExplorerMessage({
 }: {
   icon: ReactNode;
   title: string;
-  description: string;
+  description?: string;
 }) {
   return (
     <div className="flex min-h-40 flex-col items-center justify-center gap-2 px-4 text-center">
@@ -154,7 +154,9 @@ export function ExplorerMessage({
         {icon}
       </div>
       <div className="text-sm font-medium">{title}</div>
-      <p className="max-w-lg text-xs text-muted-foreground">{description}</p>
+      {description && (
+        <p className="max-w-lg text-xs text-muted-foreground">{description}</p>
+      )}
     </div>
   );
 }

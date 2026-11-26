@@ -8,8 +8,6 @@ interface SnippetBlockProps {
   label?: string;
   /** The text to show and copy verbatim. */
   value: string;
-  /** One line of context under the snippet. */
-  hint?: string;
 }
 
 /**
@@ -17,7 +15,7 @@ interface SnippetBlockProps {
  * shown once (ADR 0010): the operator copies the exact DSN, MCP command or
  * Grafana header pair instead of assembling it by hand.
  */
-export function SnippetBlock({ label, value, hint }: SnippetBlockProps) {
+export function SnippetBlock({ label, value }: SnippetBlockProps) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -38,7 +36,7 @@ export function SnippetBlock({ label, value, hint }: SnippetBlockProps) {
     <div className="space-y-1">
       <div className="flex items-center justify-between gap-2">
         {label ? (
-          <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+          <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
             {label}
           </span>
         ) : (
@@ -59,11 +57,10 @@ export function SnippetBlock({ label, value, hint }: SnippetBlockProps) {
         {value}
       </pre>
       {error && (
-        <p className="text-[11px] text-destructive" role="alert">
+        <p className="text-xs text-destructive" role="alert">
           {error}
         </p>
       )}
-      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
     </div>
   );
 }

@@ -293,8 +293,10 @@ function LogVolumeCard({ project, window }: { project: string; window: ResolvedT
             <ScrollText className="size-4" />
           </span>
           {t("overview.cardLogVolume")}
+          <span className="ml-auto text-xs font-normal text-muted-foreground">
+            {t("overview.lastHour")}
+          </span>
         </CardTitle>
-        <p className="text-xs text-muted-foreground">{t("overview.logVolumeSubtitle")}</p>
       </CardHeader>
       <CardContent className="p-2 pt-1">
         {viewState === "stale" && (

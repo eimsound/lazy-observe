@@ -85,10 +85,7 @@ export function AssistantPanel() {
             <div className="flex size-7 items-center justify-center rounded-md bg-primary/10 text-primary">
               <Sparkles className="size-4" />
             </div>
-            <div>
-              <h2 className="text-sm font-semibold tracking-tight">{t("assistant.title")}</h2>
-              <p className="text-xs text-muted-foreground">{t("assistant.subtitle")}</p>
-            </div>
+            <h2 className="text-sm font-semibold tracking-tight">{t("assistant.title")}</h2>
           </div>
           <div className="flex items-center gap-1">
             {turns.length > 0 && (
@@ -124,7 +121,6 @@ export function AssistantPanel() {
               className="py-20"
               icon={<Bot className="size-6" />}
               title={t("assistant.emptyTitle")}
-              desc={t("assistant.emptyDesc")}
             />
           ) : (
             turns.map((turn) => <TurnView key={turn.id} turn={turn} onClose={() => setOpen(false)} />)

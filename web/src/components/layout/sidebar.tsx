@@ -132,7 +132,7 @@ export function Sidebar() {
                       )}
                     >
                       <Icon className="size-4 shrink-0" />
-                      {!collapsed && <span className="truncate">{t(item.labelKey)}</span>}
+                      {!collapsed && <span className="optical-center truncate">{t(item.labelKey)}</span>}
                       {!collapsed && item.placeholder && (
                         <span className="ml-auto size-1.5 rounded-full bg-muted-foreground/40" />
                       )}
@@ -171,7 +171,7 @@ export function Sidebar() {
           ) : (
             <>
               <PanelLeftClose className="size-4" />
-              <span>{t("nav.collapse")}</span>
+              <span className="optical-center">{t("nav.collapse")}</span>
             </>
           )}
         </button>

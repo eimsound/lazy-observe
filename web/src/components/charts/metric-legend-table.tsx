@@ -172,10 +172,6 @@ export function MetricLegendTable({
     ];
   }, [i18n.language, labelNames, series.length, t, tableMode]);
 
-  const modifier = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform)
-    ? "⌘"
-    : "Ctrl";
-
   return (
     <div className="mt-3">
       <DataTable
@@ -196,9 +192,6 @@ export function MetricLegendTable({
         minWidth={960}
         className="max-h-80"
       />
-      <p className="mt-2 text-left text-[11px] text-muted-foreground">
-        {t("metrics.legendHint", { modifier })}
-      </p>
     </div>
   );
 }

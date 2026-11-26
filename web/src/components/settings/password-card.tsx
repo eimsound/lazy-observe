@@ -4,7 +4,7 @@ import { useMutation } from "@tanstack/react-query";
 import { KeyRound, Loader2 } from "lucide-react";
 import { changePassword } from "@/lib/api/auth";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
@@ -40,7 +40,6 @@ export function PasswordCard({ onChanged }: { onChanged?: () => void | Promise<v
           <KeyRound className="size-4" />
           {t("password.title")}
         </CardTitle>
-        <CardDescription>{t("password.description")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-1.5">

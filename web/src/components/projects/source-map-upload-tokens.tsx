@@ -14,6 +14,7 @@ import { formatDateTime } from "@/lib/format";
 import dayjs from "@/lib/dayjs";
 import { projectDsn } from "@/lib/tokens/token-usage";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
+import { HelpTip } from "@/components/common/help-tip";
 import { QueryErrorState } from "@/components/common/query-error-state";
 import { QueryStaleNotice } from "@/components/common/query-stale-notice";
 import { SnippetBlock } from "@/components/common/snippet-block";
@@ -79,9 +80,12 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
 
   return (
     <section className="space-y-3" aria-label={t("projects.smUploadTitle")}>
-      <div className="rounded-lg border border-border bg-muted/40 p-3 text-xs">
-        <p className="font-medium text-foreground">{t("projects.smUploadTitle")}</p>
-        <p className="mt-1 text-muted-foreground">{t("projects.smUploadDesc")}</p>
+      <div className="flex items-center gap-1.5 border-t border-border pt-4">
+        <h3 className="text-sm font-medium text-foreground">{t("projects.smUploadTitle")}</h3>
+        <HelpTip
+          scopeTitle={t("common.applicableScope")}
+          scope={[{ text: t("projects.smUploadScopeTitle") }]}
+        />
       </div>
 
       {created && (
@@ -90,7 +94,7 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
             <Check className="size-4 text-primary" />
             {t("projects.smUploadCreatedTitle")}
           </div>
-          <p className="text-xs text-muted-foreground">{t("projects.smUploadCreatedDesc")}</p>
+          <p className="text-xs text-muted-foreground">{t("common.tokenCopyOnce")}</p>
           <div className="flex items-center gap-2">
             <code className="flex-1 truncate rounded border border-border bg-background px-2 py-1.5 font-mono text-xs">
               {created.value}
@@ -100,11 +104,9 @@ export function SourceMapUploadTokens({ project }: { project: Project }) {
               {copied ? t("common.copied") : t("common.copy")}
             </Button>
           </div>
-          <p className="text-[11px] text-muted-foreground">{t("projects.copyWarning")}</p>
           <SnippetBlock
             label={t("projects.smUploadDsnLabel")}
             value={projectDsn(window.location.origin, project.slug, created.value)}
-            hint={t("projects.smUploadDsnHint")}
           />
         </div>
       )}
