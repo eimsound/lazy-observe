@@ -376,6 +376,22 @@ func TestRecentPlatformAlertStates(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// States whose stream still has unacknowledged transitions are left to
+		// the transition drain, so the state replay cannot overtake them.
+		blocked, err := store.RecentPlatformAlertStates(ctx, platformAlertKindErrorRateSpike, resolvedBoundary, 0)
+		if err != nil || len(blocked) != 0 {
+			t.Fatalf("states with pending transitions=%#v err=%v want none", blocked, err)
+		}
+		pending, err := store.PendingPlatformAlertTransitions(ctx, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tr := range pending {
+			if err := store.AckPlatformAlertTransition(ctx, tr.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+
 		got, err := store.RecentPlatformAlertStates(ctx, platformAlertKindErrorRateSpike, resolvedBoundary, 0)
 		if err != nil {
 			t.Fatal(err)

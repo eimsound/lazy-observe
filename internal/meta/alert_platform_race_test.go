@@ -227,6 +227,17 @@ func TestRecordPlatformErrorRateLosesFirstStateInsert(t *testing.T) {
 				if !reflect.DeepEqual(got.results, want) {
 					t.Fatalf("loser results=%#v want %#v", got.results, want)
 				}
+				// The lost first insert attempt logs nothing; only the retry's
+				// transitions reach platform_alert_transitions (issue #386).
+				logged := pendingTransitions(t, store, project.ID)
+				if len(logged) != len(tc.wantTransitions) {
+					t.Fatalf("logged transitions=%#v want %#v", logged, tc.wantTransitions)
+				}
+				for i, tr := range tc.wantTransitions {
+					if logged[i].Status != tr.Transition || logged[i].Cycle != tr.Cycle || logged[i].Count != tr.Count {
+						t.Fatalf("logged transition %d=%#v want %#v", i, logged[i], tr)
+					}
+				}
 				for _, row := range platformBucketRows(t, store, project.ID) {
 					want := tc.winnerEvents
 					if row.Epoch != winnerBucket {

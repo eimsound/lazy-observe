@@ -1350,12 +1350,15 @@ func (s *Service) PutProjectAlertConfig(
 	} else if transition.Transition == "resolved" {
 		// Close the open cycle durably so receivers are not left with a dangling
 		// firing incident; a disabled threshold suppresses it in
-		// enqueuePlatformNotification. Failures are replayed by the recovery loop.
-		_ = s.notifyErrorRateTransition(ctx, projectID, "", transition, errorRateAnnotations(
-			"Error rate spike state reset after alert configuration change",
-			cfg.ErrorRateThresholdPerMinute,
-			transition.Cycle,
-		))
+		// enqueuePlatformNotification. The resolution is logged durably with the
+		// state change, so a failed drain is retried by the recovery loop.
+		if drainErr := s.drainPlatformAlertTransitions(ctx, projectID); drainErr != nil {
+			slog.Warn(
+				"drain platform alert transitions after config update",
+				"project_id", projectID,
+				"error", drainErr,
+			)
+		}
 	}
 	return cfg, nil
 }
@@ -1428,12 +1431,14 @@ func (s *Service) HandleIssueChange(ctx context.Context, change errortrack.Issue
 // configured absolute per-minute threshold, and resolves when it falls back to
 // or below the threshold. Threshold zero disables this event type.
 //
-// A committed firing or resolved transition on platform_alert_states is planned
-// and written to notification_outbox before returning, keyed by
-// project_id + error_rate_spike + cycle + status (ADR 0001). There is no
-// in-process group_wait timer: the five-minute window already debounces the
-// signal, and a transition whose enqueue was lost to a crash or a failed write
-// is replayed by CheckErrorRateRecoveries on any replica.
+// A firing or resolved transition commits to platform_alert_states together
+// with a platform_alert_transitions row, and is planned and written to
+// notification_outbox before returning, keyed by project_id + error_rate_spike
+// + cycle + status (ADR 0001). There is no in-process group_wait timer: the
+// five-minute window already debounces the signal, and a transition whose
+// enqueue was lost to a crash or a failed write stays logged and is drained by
+// CheckErrorRateRecoveries on any replica, even if the state has since moved
+// on (issue #386).
 func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredAt time.Time) error {
 	return s.RecordErrorEvents(ctx, []errortrack.ErrorOccurrence{{ProjectID: projectID, OccurredAt: occurredAt}})
 }
@@ -1441,10 +1446,12 @@ func (s *Service) RecordErrorEvent(ctx context.Context, projectID int, occurredA
 // RecordErrorEvents applies the RecordErrorEvent rule to a whole completed
 // error-inbox batch with a single metadata write transaction (issue #375).
 // Occurrences are grouped by project; projects whose threshold is zero are
-// skipped. Every firing/resolved transition is enqueued in the order the
-// equivalent sequence of single-event records would have produced it. A
-// per-project config failure skips only that project; all failures are joined
-// into the returned error so the caller can log them.
+// skipped. The store logs every firing/resolved transition in
+// platform_alert_transitions inside that transaction, in the order the
+// equivalent sequence of single-event records would have produced them, and
+// each project that moved then has its transition log drained into
+// notification_outbox. A per-project config failure skips only that project;
+// all failures are joined into the returned error so the caller can log them.
 func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrack.ErrorOccurrence) error {
 	if len(occurrences) == 0 {
 		return nil
@@ -1459,15 +1466,10 @@ func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrac
 	}
 	slices.Sort(projectIDs)
 
-	type projectAlertContext struct {
-		slug      string
-		threshold int
-	}
 	var errs []error
-	projects := make(map[int]projectAlertContext, len(projectIDs))
 	batches := make([]meta.PlatformErrorRateBatch, 0, len(projectIDs))
 	for _, projectID := range projectIDs {
-		cfg, p, err := s.cachedPlatformConfig(ctx, projectID)
+		cfg, _, err := s.cachedPlatformConfig(ctx, projectID)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("load error_rate_spike config for project %d: %w", projectID, err))
 			continue
@@ -1475,7 +1477,6 @@ func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrac
 		if cfg.ErrorRateThresholdPerMinute == 0 {
 			continue
 		}
-		projects[projectID] = projectAlertContext{slug: p.Slug, threshold: cfg.ErrorRateThresholdPerMinute}
 		batches = append(batches, meta.PlatformErrorRateBatch{
 			ProjectID:       projectID,
 			ThresholdPerMin: cfg.ErrorRateThresholdPerMinute,
@@ -1486,39 +1487,30 @@ func (s *Service) RecordErrorEvents(ctx context.Context, occurrences []errortrac
 		return errors.Join(errs...)
 	}
 	// Results returned next to an error are committed (only the failing projects
-	// were rolled back), so their transitions are still enqueued below.
+	// were rolled back), so their transitions are still drained below.
 	results, err := s.store.RecordPlatformErrorRates(ctx, s.now().UTC(), errorRateWindow, batches)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("record error_rate_spike window: %w", err))
 	}
 	for _, res := range results {
-		project := projects[res.ProjectID]
-		for _, transition := range res.Transitions {
-			rate := float64(transition.Count) / errorRateWindow.Minutes()
-			summary := fmt.Sprintf("Error rate spike: %.1f events/min", rate)
-			if transition.Transition == "resolved" {
-				summary = fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate)
-			}
-			if notifyErr := s.notifyErrorRateTransition(
-				ctx,
-				res.ProjectID,
-				project.slug,
-				transition,
-				errorRateAnnotations(summary, project.threshold, transition.Cycle),
-			); notifyErr != nil {
-				errs = append(errs, notifyErr)
-			}
+		if len(res.Transitions) == 0 {
+			continue
+		}
+		if drainErr := s.drainPlatformAlertTransitions(ctx, res.ProjectID); drainErr != nil {
+			errs = append(errs, drainErr)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// CheckErrorRateRecoveries first replays every firing (and recently resolved)
-// durable error_rate_spike state into notification_outbox, then resolves
-// states whose 5-minute window dropped back within threshold and enqueues their
-// resolved notifications. Replaying before resolving keeps a firing transition
-// that was committed by a crashed replica ahead of its own resolution, and the
-// deterministic idempotency keys make the replay a no-op once enqueued.
+// CheckErrorRateRecoveries first drains every unacknowledged
+// platform_alert_transitions row and replays every firing (and recently
+// resolved) durable error_rate_spike state into notification_outbox, then
+// resolves states whose 5-minute window dropped back within threshold and
+// drains the resolved transitions that logged. Draining before resolving keeps
+// a firing transition committed by a crashed replica ahead of its own
+// resolution, and the deterministic idempotency keys make a repeated drain or
+// replay a no-op once enqueued.
 func (s *Service) CheckErrorRateRecoveries(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
@@ -1532,24 +1524,110 @@ func (s *Service) CheckErrorRateRecoveries(ctx context.Context) error {
 		return errors.Join(append(errs, err)...)
 	}
 	for _, rec := range recoveries {
-		rate := float64(rec.Count) / errorRateWindow.Minutes()
-		transition := meta.PlatformErrorSpikeTransition{
-			Transition: "resolved",
-			Cycle:      rec.Cycle,
-			StartsAt:   rec.StartsAt,
-			EndsAt:     rec.EndsAt,
-			Count:      rec.Count,
-		}
-		if notifyErr := s.notifyErrorRateTransition(ctx, rec.ProjectID, rec.ProjectSlug, transition,
-			errorRateAnnotations(
-				fmt.Sprintf("Error rate spike recovered: %.1f events/min", rate),
-				rec.Threshold,
-				rec.Cycle,
-			)); notifyErr != nil {
-			errs = append(errs, notifyErr)
+		if drainErr := s.drainPlatformAlertTransitions(ctx, rec.ProjectID); drainErr != nil {
+			errs = append(errs, drainErr)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// platformTransitionDrainLimit bounds one drain pass; the recovery loop picks
+// up any remainder on its next tick.
+const platformTransitionDrainLimit = 500
+
+// drainPlatformAlertTransitions plans unacknowledged platform_alert_transitions
+// rows (onlyProjectID > 0 filters to one project) into notification_outbox and
+// acknowledges each one after its outbox rows are written. Each (project, kind)
+// stream is processed from its oldest row in commit order and stops at its
+// first failure, so a firing(C) is always enqueued before resolved(C) is
+// planned (whose prior-firing check then sees it) and resolved(C) before
+// firing(C+1); the failed row and its successors stay for the next pass.
+//
+// Concurrent drains of one stream (the ingest path and any replica's recovery
+// loop) are safe without a claim: each re-plans the stream from its oldest
+// unacknowledged row, a row is acknowledged only after its outbox rows commit,
+// and the platform-state idempotency keys turn duplicate enqueues into no-ops,
+// so every drain observes the predecessors of a row already in
+// notification_outbox before it enqueues that row.
+//
+// Rows recorded longer than platformResolvedReplayHorizon ago are dropped with
+// a warning instead of delivered, matching the state replay horizon: a long
+// outage cannot flood receivers with stale transitions. A firing state that is
+// still active is redelivered by the state replay regardless.
+func (s *Service) drainPlatformAlertTransitions(ctx context.Context, onlyProjectID int) error {
+	pending, err := s.store.PendingPlatformAlertTransitions(ctx, onlyProjectID, platformTransitionDrainLimit)
+	if err != nil {
+		return fmt.Errorf("list pending platform alert transitions: %w", err)
+	}
+	type stream struct {
+		projectID int
+		kind      string
+	}
+	blocked := make(map[stream]struct{})
+	staleBefore := s.now().UTC().Add(-platformResolvedReplayHorizon)
+	var errs []error
+	for _, tr := range pending {
+		key := stream{projectID: tr.ProjectID, kind: tr.Kind}
+		if _, stop := blocked[key]; stop {
+			continue
+		}
+		if tr.RecordedAt.Before(staleBefore) {
+			slog.Warn(
+				"drop stale platform alert transition",
+				"project_id", tr.ProjectID,
+				"kind", tr.Kind,
+				"status", tr.Status,
+				"cycle", tr.Cycle,
+				"recorded_at", tr.RecordedAt,
+			)
+		} else if notifyErr := s.notifyPlatformTransition(ctx, tr); notifyErr != nil {
+			blocked[key] = struct{}{}
+			errs = append(errs, notifyErr)
+			continue
+		}
+		if ackErr := s.store.AckPlatformAlertTransition(ctx, tr.ID); ackErr != nil {
+			blocked[key] = struct{}{}
+			errs = append(errs, ackErr)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// notifyPlatformTransition renders one logged transition and plans it through
+// notifyErrorRateTransition.
+func (s *Service) notifyPlatformTransition(ctx context.Context, tr meta.PlatformAlertTransition) error {
+	if tr.Kind != platformErrorRateKind {
+		return nil
+	}
+	transition := meta.PlatformErrorSpikeTransition{
+		Transition: tr.Status,
+		Cycle:      tr.Cycle,
+		StartsAt:   tr.StartsAt,
+	}
+	if tr.EndsAt != nil {
+		transition.EndsAt = *tr.EndsAt
+	}
+	var summary string
+	switch {
+	case tr.WindowCount == nil:
+		summary = "Error rate spike state reset after alert configuration change"
+	case tr.Status == "resolved":
+		transition.Count = *tr.WindowCount
+		summary = fmt.Sprintf(
+			"Error rate spike recovered: %.1f events/min",
+			float64(*tr.WindowCount)/errorRateWindow.Minutes(),
+		)
+	default:
+		transition.Count = *tr.WindowCount
+		summary = fmt.Sprintf("Error rate spike: %.1f events/min", float64(*tr.WindowCount)/errorRateWindow.Minutes())
+	}
+	return s.notifyErrorRateTransition(
+		ctx,
+		tr.ProjectID,
+		tr.ProjectSlug,
+		transition,
+		errorRateAnnotations(summary, tr.ThresholdPerMin, tr.Cycle),
+	)
 }
 
 // platformResolvedReplayHorizon bounds how long after a resolved transition
@@ -1576,8 +1654,17 @@ const platformResolvedReplayHorizon = 2 * errorRateWindow
 // Resolved states are replayed within platformResolvedReplayHorizon only for
 // channels whose same-cycle firing key already exists in notification_outbox,
 // preventing orphan recovery notifications after a silence or inhibition lifts.
+//
+// The transition log is drained first, and states whose stream still has
+// unacknowledged transitions (a drain that failed part-way) are skipped by
+// RecentPlatformAlertStates, so the state replay never enqueues a later
+// cycle ahead of an earlier logged transition.
 // onlyProjectID > 0 filters the query to one project in SQL.
 func (s *Service) replayPlatformAlertStates(ctx context.Context, onlyProjectID int) error {
+	var errs []error
+	if err := s.drainPlatformAlertTransitions(ctx, onlyProjectID); err != nil {
+		errs = append(errs, err)
+	}
 	now := s.now().UTC()
 	states, err := s.store.RecentPlatformAlertStates(
 		ctx,
@@ -1586,9 +1673,8 @@ func (s *Service) replayPlatformAlertStates(ctx context.Context, onlyProjectID i
 		onlyProjectID,
 	)
 	if err != nil {
-		return err
+		return errors.Join(append(errs, err)...)
 	}
-	var errs []error
 	for _, st := range states {
 		transition := meta.PlatformErrorSpikeTransition{
 			Transition: st.Status,

@@ -76,6 +76,12 @@ func (s *Store) ProjectFiringPlatformAlertStates(ctx context.Context, projectID 
 // notifiers replay these durable transitions into notification_outbox with
 // deterministic idempotency keys, so a transition committed by a replica that
 // crashed before enqueueing is still delivered by any surviving replica.
+//
+// A state whose stream still has unacknowledged platform_alert_transitions is
+// left out: those rows must be planned first, in order, or replaying the
+// final state could enqueue firing(C+1) ahead of an earlier resolved(C). The
+// state row and its transition rows commit together, so one statement sees
+// both or neither.
 func (s *Store) RecentPlatformAlertStates(
 	ctx context.Context,
 	kind string,
@@ -85,7 +91,10 @@ func (s *Store) RecentPlatformAlertStates(
 	query := `SELECT ` + platformAlertStateColumns + `
 		 FROM platform_alert_states AS st
 		 JOIN projects AS p ON p.id = st.project_id
-		 WHERE st.kind = ? AND (st.status = 'firing' OR (st.status = 'resolved' AND st.ends_at >= ?))`
+		 WHERE st.kind = ? AND (st.status = 'firing' OR (st.status = 'resolved' AND st.ends_at >= ?))
+		 AND NOT EXISTS (
+			SELECT 1 FROM platform_alert_transitions AS tr WHERE tr.project_id = st.project_id AND tr.kind = st.kind
+		 )`
 	args := []any{kind, resolvedSince.UTC()}
 	if projectID > 0 {
 		query += ` AND st.project_id = ?`
@@ -208,9 +217,13 @@ func (s *Store) RecordPlatformErrorRate(
 // single-event threshold rule in memory with a running window count, so the
 // returned transitions and the durable platform_alert_states row are exactly
 // what len(OccurredAt) sequential RecordPlatformErrorRate calls at now would
-// have produced; only the final state row is written. Occurrences that are
-// zero or older than now-window are ignored, and a project with none left is
-// not touched. Projects are processed in ascending project_id order and
+// have produced; only the final state row is written. Every one of those
+// transitions is also logged in platform_alert_transitions in the same
+// transaction (see PendingPlatformAlertTransitions), so an intermediate
+// resolved(C) of a resolved(C) -> firing(C+1) batch survives a crash before
+// the outbox enqueue even though the state row only keeps cycle C+1.
+// Occurrences that are zero or older than now-window are ignored, and a
+// project with none left is not touched. Projects are processed in ascending project_id order and
 // buckets in ascending bucket_epoch order so concurrent PostgreSQL writers
 // lock rows in one global order. Results are ordered by project_id.
 //
@@ -395,6 +408,20 @@ func (s *Store) recordProjectErrorRate(
 			return PlatformErrorRateBatchResult{}, err
 		}
 		if written {
+			for _, tr := range transitions {
+				count := tr.Count
+				if err := s.insertPlatformAlertTransition(
+					ctx,
+					tx,
+					projectID,
+					tr,
+					&count,
+					thresholdPerMin,
+					now,
+				); err != nil {
+					return PlatformErrorRateBatchResult{}, err
+				}
+			}
 			return PlatformErrorRateBatchResult{
 				ProjectID:   projectID,
 				Count:       totalCount,
@@ -583,7 +610,8 @@ func (s *Store) listFiringErrorSpikeCandidates(ctx context.Context) ([]platformE
 // CheckPlatformErrorRateRecoveries inspects all projects with a firing
 // error_rate_spike state and transitions any whose sliding-window error count
 // has fallen at or below threshold (or whose threshold was disabled) to
-// resolved.
+// resolved. Each resolution is logged in platform_alert_transitions in the
+// transaction that resolves it.
 func (s *Store) CheckPlatformErrorRateRecoveries(
 	ctx context.Context,
 	now time.Time,
@@ -684,6 +712,15 @@ func (s *Store) recoverPlatformErrorSpike(
 	if affected == 0 {
 		return PlatformErrorSpikeRecovery{}, false, nil
 	}
+	if err := s.insertPlatformAlertTransition(ctx, tx, c.projectID, PlatformErrorSpikeTransition{
+		Transition: platformAlertStatusResolved,
+		Cycle:      c.cycle,
+		StartsAt:   state.startsAt,
+		EndsAt:     now,
+		Count:      totalCount,
+	}, &totalCount, c.threshold, now); err != nil {
+		return PlatformErrorSpikeRecovery{}, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return PlatformErrorSpikeRecovery{}, false, fmt.Errorf("commit platform spike recovery: %w", err)
 	}
@@ -699,7 +736,11 @@ func (s *Store) recoverPlatformErrorSpike(
 }
 
 // ClearPlatformErrorRateState resets a project's error-rate buckets and, if an
-// error_rate_spike alert is currently firing, transitions it to resolved.
+// error_rate_spike alert is currently firing, transitions it to resolved. The
+// resolution is logged in platform_alert_transitions in the same transaction
+// with no window count, which marks it as a configuration reset. The state
+// row is locked after the buckets are cleared, keeping the buckets-then-state
+// lock order of recordProjectErrorRate.
 func (s *Store) ClearPlatformErrorRateState(
 	ctx context.Context,
 	projectID int,
@@ -720,45 +761,178 @@ func (s *Store) ClearPlatformErrorRateState(
 		return PlatformErrorSpikeTransition{}, fmt.Errorf("clear platform error rate buckets: %w", err)
 	}
 
-	var (
-		prevStatus string
-		prevCycle  int64
-		prevStart  sql.NullTime
-	)
+	state, err := s.lockPlatformErrorSpikeState(ctx, tx, projectID)
+	if err != nil {
+		return PlatformErrorSpikeTransition{}, err
+	}
 	var transition PlatformErrorSpikeTransition
-	err = tx.QueryRowContext(
-		ctx,
-		bind(
-			s.dialect,
-			`SELECT status, active_cycle, starts_at FROM platform_alert_states WHERE project_id = ? AND kind = ?`,
-		),
-		projectID,
-		platformAlertKindErrorRateSpike,
-	).Scan(&prevStatus, &prevCycle, &prevStart)
-	if err == nil && prevStatus == "firing" {
+	if state.exists && state.status == platformAlertStatusFiring {
 		if _, err := tx.ExecContext(
 			ctx,
 			bind(
 				s.dialect,
 				`UPDATE platform_alert_states SET status = 'resolved', ends_at = ?, updated_at = ?
-				 WHERE project_id = ? AND kind = ? AND status = 'firing'`,
+				 WHERE project_id = ? AND kind = ? AND status = 'firing' AND active_cycle = ?`,
 			),
-			now, now, projectID, platformAlertKindErrorRateSpike,
+			now, now, projectID, platformAlertKindErrorRateSpike, state.cycle,
 		); err != nil {
 			return PlatformErrorSpikeTransition{}, fmt.Errorf("resolve cleared platform alert state: %w", err)
 		}
-		transition.Transition = "resolved"
-		transition.Cycle = prevCycle
-		if prevStart.Valid {
-			transition.StartsAt = prevStart.Time.UTC()
+		transition = PlatformErrorSpikeTransition{
+			Transition: platformAlertStatusResolved,
+			Cycle:      state.cycle,
+			StartsAt:   state.startsAt,
+			EndsAt:     now,
 		}
-		transition.EndsAt = now
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return PlatformErrorSpikeTransition{}, fmt.Errorf("read platform alert state for clear: %w", err)
+		var threshold int
+		if err := tx.QueryRowContext(
+			ctx,
+			bind(
+				s.dialect,
+				`SELECT COALESCE(MAX(error_rate_threshold_per_min), 0) FROM project_alert_configs WHERE project_id = ?`,
+			),
+			projectID,
+		).Scan(&threshold); err != nil {
+			return PlatformErrorSpikeTransition{}, fmt.Errorf("read platform alert threshold for clear: %w", err)
+		}
+		if err := s.insertPlatformAlertTransition(ctx, tx, projectID, transition, nil, threshold, now); err != nil {
+			return PlatformErrorSpikeTransition{}, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return PlatformErrorSpikeTransition{}, fmt.Errorf("commit clear platform error rate state: %w", err)
 	}
 	return transition, nil
+}
+
+// PlatformAlertTransition is one durable platform_alert_transitions row: a
+// firing or resolved step of a platform alert, recorded in the same
+// transaction that moved platform_alert_states. The row stays until a
+// notifier has written its notification_outbox rows and acknowledged it, so a
+// crash between the state commit and the outbox enqueue cannot lose the
+// transition, even when the state row has since moved to a later cycle
+// (issue #386).
+type PlatformAlertTransition struct {
+	ID              int64
+	ProjectID       int
+	ProjectSlug     string
+	Kind            string
+	Status          string
+	Cycle           int64
+	StartsAt        time.Time
+	EndsAt          *time.Time
+	WindowCount     *int // nil when a configuration reset resolved the alert
+	ThresholdPerMin int
+	RecordedAt      time.Time
+}
+
+func (s *Store) insertPlatformAlertTransition(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int,
+	tr PlatformErrorSpikeTransition,
+	windowCount *int,
+	thresholdPerMin int,
+	now time.Time,
+) error {
+	var startsAt, endsAt any
+	if !tr.StartsAt.IsZero() {
+		startsAt = tr.StartsAt.UTC()
+	}
+	if tr.Transition == platformAlertStatusResolved && !tr.EndsAt.IsZero() {
+		endsAt = tr.EndsAt.UTC()
+	}
+	var count any
+	if windowCount != nil {
+		count = *windowCount
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		bind(
+			s.dialect,
+			`INSERT INTO platform_alert_transitions(project_id, kind, status, cycle, starts_at, ends_at, window_count,
+				threshold_per_min, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		),
+		projectID, platformAlertKindErrorRateSpike, tr.Transition, tr.Cycle, startsAt, endsAt, count,
+		thresholdPerMin, now.UTC(),
+	); err != nil {
+		return fmt.Errorf("record platform alert transition: %w", err)
+	}
+	return nil
+}
+
+// PendingPlatformAlertTransitions lists unacknowledged platform alert
+// transitions in commit order per stream: ordered by project, kind and id.
+// projectID > 0 filters to one project. Notifiers must process each
+// (project, kind) stream from its first row and stop at the first failure, so
+// a transition is never planned before the ones committed ahead of it.
+func (s *Store) PendingPlatformAlertTransitions(
+	ctx context.Context,
+	projectID int,
+	limit int,
+) ([]PlatformAlertTransition, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	query := `SELECT tr.id, tr.project_id, p.slug, tr.kind, tr.status, tr.cycle, tr.starts_at, tr.ends_at,
+		tr.window_count, tr.threshold_per_min, tr.recorded_at
+		FROM platform_alert_transitions AS tr
+		JOIN projects AS p ON p.id = tr.project_id`
+	var args []any
+	if projectID > 0 {
+		query += ` WHERE tr.project_id = ?`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY tr.project_id, tr.kind, tr.id LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, bind(s.dialect, query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list pending platform alert transitions: %w", err)
+	}
+	defer rows.Close()
+	var out []PlatformAlertTransition
+	for rows.Next() {
+		var (
+			tr       PlatformAlertTransition
+			startsAt sql.NullTime
+			endsAt   sql.NullTime
+			count    sql.NullInt64
+		)
+		if err := rows.Scan(&tr.ID, &tr.ProjectID, &tr.ProjectSlug, &tr.Kind, &tr.Status, &tr.Cycle, &startsAt,
+			&endsAt, &count, &tr.ThresholdPerMin, &tr.RecordedAt); err != nil {
+			return nil, fmt.Errorf("scan platform alert transition: %w", err)
+		}
+		if startsAt.Valid {
+			tr.StartsAt = startsAt.Time.UTC()
+		}
+		if endsAt.Valid {
+			ts := endsAt.Time.UTC()
+			tr.EndsAt = &ts
+		}
+		if count.Valid {
+			value := int(count.Int64)
+			tr.WindowCount = &value
+		}
+		tr.RecordedAt = tr.RecordedAt.UTC()
+		out = append(out, tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate platform alert transitions: %w", err)
+	}
+	return out, nil
+}
+
+// AckPlatformAlertTransition removes a transition once its notification_outbox
+// rows are written (or it was deliberately dropped). Acknowledging a row that
+// another notifier already removed is not an error.
+func (s *Store) AckPlatformAlertTransition(ctx context.Context, id int64) error {
+	if _, err := s.db.ExecContext(
+		ctx,
+		bind(s.dialect, `DELETE FROM platform_alert_transitions WHERE id = ?`),
+		id,
+	); err != nil {
+		return fmt.Errorf("acknowledge platform alert transition %d: %w", id, err)
+	}
+	return nil
 }

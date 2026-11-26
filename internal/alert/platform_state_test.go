@@ -28,12 +28,9 @@ type spikeHarness struct {
 	project  *meta.Project
 	channel  int
 	received chan Notification
-	// pending holds deliveries already read from received but not yet matched
-	// by waitDelivered, so concurrent out-of-order deliveries are not lost.
-	pending []Notification
-	clock   *atomic.Int64
-	base    time.Time
-	client  *http.Client
+	clock    *atomic.Int64
+	base     time.Time
+	client   *http.Client
 }
 
 func newSpikeHarness(t *testing.T, slug string) *spikeHarness {
@@ -159,66 +156,31 @@ func (h *spikeHarness) expectRows(want ...PlatformStateRef) []spikeOutboxRow {
 	return rows
 }
 
-// waitDelivered waits for the error_rate_spike delivery of (status, cycle).
-// OutboxWorker.drain delivers a claimed batch concurrently (delivery order is
-// tracked in #386), so deliveries that do not match are kept in pending for
-// later waits instead of being dropped; consecutive calls match in any order.
+// waitDelivered waits for the next error_rate_spike delivery and fails unless
+// it is (status, cycle). The outbox claims one alert's transitions per channel
+// strictly in causal order (issue #386), so consecutive calls also assert the
+// delivery order even though OutboxWorker.drain delivers batches concurrently.
 func (h *spikeHarness) waitDelivered(status, cycle string) {
 	h.t.Helper()
-	matches := func(n Notification) bool {
-		return n.Rule == "error_rate_spike" && n.Status == status && len(n.Alerts) == 1 &&
-			n.Alerts[0].Annotations["cycle"] == cycle
-	}
-	if i := slices.IndexFunc(h.pending, matches); i >= 0 {
-		h.pending = slices.Delete(h.pending, i, i+1)
-		return
-	}
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case n := <-h.received:
-			if matches(n) {
-				return
-			}
-			h.pending = append(h.pending, n)
-		case <-deadline:
-			h.t.Fatalf(
-				"timeout waiting for %s notification cycle %s; unmatched deliveries=%#v",
-				status,
-				cycle,
-				h.pending,
-			)
-			return
+	select {
+	case n := <-h.received:
+		if n.Rule != "error_rate_spike" || n.Status != status || len(n.Alerts) != 1 ||
+			n.Alerts[0].Annotations["cycle"] != cycle {
+			h.t.Fatalf("next delivery=%#v want %s notification cycle %s", n, status, cycle)
 		}
+	case <-time.After(2 * time.Second):
+		h.t.Fatalf("timeout waiting for %s notification cycle %s", status, cycle)
 	}
 }
 
-// expectNoDelivery fails if any delivery is pending or arrives within d.
+// expectNoDelivery fails if any delivery arrives within d.
 func (h *spikeHarness) expectNoDelivery(d time.Duration) {
 	h.t.Helper()
-	if len(h.pending) > 0 {
-		h.t.Fatalf("unexpected delivery: %#v", h.pending)
-	}
 	select {
 	case n := <-h.received:
 		h.t.Fatalf("unexpected delivery: %#v", n)
 	case <-time.After(d):
 	}
-}
-
-// OutboxWorker.drain delivers one claimed batch concurrently, so a later
-// transition may reach the webhook first. waitDelivered must keep it for the
-// next wait instead of discarding it (issue #394).
-func TestSpikeHarnessWaitDeliveredToleratesOutOfOrderDelivery(t *testing.T) {
-	h := newSpikeHarness(t, "spike-wait-order")
-	delivered := func(status, cycle string) Notification {
-		return Notification{Rule: "error_rate_spike", Status: status,
-			Alerts: []Alert{{Annotations: map[string]string{"cycle": cycle}}}}
-	}
-	h.received <- delivered("firing", "2")
-	h.received <- delivered("resolved", "1")
-	h.waitDelivered("resolved", "1")
-	h.waitDelivered("firing", "2")
 }
 
 func TestBuildPlatformStateOutboxEntriesKeyIgnoresPayloadAndPinsTransition(t *testing.T) {
@@ -738,4 +700,104 @@ func TestErrorRateSpikeInhibitionRuleHooksReplayImmediately(t *testing.T) {
 		PlatformStateRef{Cycle: 2, Status: "firing"},
 	)
 	hInhib.waitDelivered("firing", "2")
+}
+
+// Issue #386 (intra-batch crash window): a batch whose accounting commits
+// resolved(C) and then firing(C+1) leaves only the firing(C+1) state row. If
+// the process dies before enqueueing, the logged transitions still deliver
+// resolved(C) and firing(C+1), in that order, from any replica.
+func TestErrorRateSpikeIntraBatchCrashDeliversResolvedBeforeRefire(t *testing.T) {
+	h := newSpikeHarness(t, "spike-batch-crash")
+	ctx := context.Background()
+	svc := h.service("batch-crash")
+	h.spike(svc, h.base)
+	h.waitDelivered("firing", "1")
+
+	late := h.base.Add(6 * time.Minute)
+	events := make([]time.Time, 7)
+	for i := range events {
+		events[i] = late.Add(-20*time.Second + time.Duration(i)*time.Second)
+	}
+	// The crashed replica: one batch committed resolved(1) then firing(2), but
+	// nothing reached notification_outbox.
+	results, err := h.store.RecordPlatformErrorRates(ctx, late, errorRateWindow, []meta.PlatformErrorRateBatch{
+		{ProjectID: h.project.ID, ThresholdPerMin: 1, OccurredAt: events},
+	})
+	if err != nil || len(results) != 1 || len(results[0].Transitions) != 2 {
+		t.Fatalf("crashed batch results=%#v err=%v", results, err)
+	}
+	h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"})
+
+	h.set(late.Add(5 * time.Second))
+	restarted := h.service("batch-restarted")
+	if err := restarted.CheckErrorRateRecoveries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows := h.expectRows(
+		PlatformStateRef{Cycle: 1, Status: "firing"},
+		PlatformStateRef{Cycle: 1, Status: "resolved"},
+		PlatformStateRef{Cycle: 2, Status: "firing"},
+	)
+	if got := rows[1].Notification.Alerts[0].Annotations["summary"]; got != "Error rate spike recovered: 0.2 events/min" {
+		t.Fatalf("resolved summary=%q", got)
+	}
+	h.waitDelivered("resolved", "1")
+	h.waitDelivered("firing", "2")
+	if pending, err := h.store.PendingPlatformAlertTransitions(ctx, 0, 0); err != nil || len(pending) != 0 {
+		t.Fatalf("transitions left after drain=%#v err=%v", pending, err)
+	}
+}
+
+// Issue #386 (fast-resolve crash window): replica A commits firing(1) and
+// dies before enqueueing; before any recovery tick, replica B's ingest path
+// resolves the cycle. B's drain must enqueue the logged firing(1) ahead of
+// resolved(1) instead of dropping both (the resolved as an orphan).
+func TestErrorRateSpikeCrashedFiringSurvivesIngestResolve(t *testing.T) {
+	h := newSpikeHarness(t, "spike-fast-resolve")
+	ctx := context.Background()
+	for i := range 6 {
+		ts := h.base.Add(time.Duration(i) * time.Second)
+		if _, err := h.store.RecordPlatformErrorRate(ctx, h.project.ID, ts, ts, errorRateWindow, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Fatalf("precondition: outbox rows=%#v", rows)
+	}
+	b := h.service("fast-resolve-b")
+	resolveAt := h.base.Add(6 * time.Minute)
+	h.set(resolveAt)
+	if err := b.RecordErrorEvent(ctx, h.project.ID, resolveAt); err != nil {
+		t.Fatal(err)
+	}
+	rows := h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+	if rows[0].ID >= rows[1].ID {
+		t.Fatalf("firing outbox id %d not before resolved id %d", rows[0].ID, rows[1].ID)
+	}
+	h.waitDelivered("firing", "1")
+	h.waitDelivered("resolved", "1")
+}
+
+// A configuration reset that resolves an open cycle is logged with the
+// resolution, so its notification carries the reset summary and the new
+// threshold.
+func TestErrorRateSpikeConfigResetResolvesThroughTransitionLog(t *testing.T) {
+	h := newSpikeHarness(t, "spike-reset")
+	ctx := context.Background()
+	svc := h.service("reset")
+	h.spike(svc, h.base)
+	h.waitDelivered("firing", "1")
+	if _, err := svc.PutProjectAlertConfig(ctx, h.project.ID, ProjectAlertConfigInput{
+		ErrorRateThresholdPerMinute: 4,
+		ChannelIDs:                  []int{h.channel},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows := h.expectRows(PlatformStateRef{Cycle: 1, Status: "firing"}, PlatformStateRef{Cycle: 1, Status: "resolved"})
+	annotations := rows[1].Notification.Alerts[0].Annotations
+	if annotations["summary"] != "Error rate spike state reset after alert configuration change" ||
+		annotations["threshold_per_min"] != "4" {
+		t.Fatalf("reset annotations=%#v", annotations)
+	}
+	h.waitDelivered("resolved", "1")
 }

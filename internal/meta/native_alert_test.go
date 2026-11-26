@@ -60,6 +60,7 @@ func TestCommitNativeAlertEvaluationIsAtomicAndFenced(t *testing.T) {
 			RuleID:         &ruleID,
 			ChannelID:      channel.ID,
 			Payload:        payload,
+			OrderingKey:    "rule:native",
 		}
 		if err := store.CommitNativeAlertEvaluation(
 			ctx,
@@ -84,6 +85,9 @@ func TestCommitNativeAlertEvaluationIsAtomicAndFenced(t *testing.T) {
 		id, inserted, err := store.EnqueueNotification(ctx, input)
 		if err != nil || inserted || id == 0 {
 			t.Fatalf("committed outbox id=%d inserted=%v err=%v", id, inserted, err)
+		}
+		if item, err := store.NotificationOutboxItem(ctx, id); err != nil || item.OrderingKey != "rule:native" {
+			t.Fatalf("committed ordering key=%q err=%v", item.OrderingKey, err)
 		}
 		if err := store.PauseAlertRuleEvaluation(ctx, rule.ID); err != nil {
 			t.Fatal(err)

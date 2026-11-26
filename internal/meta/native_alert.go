@@ -159,7 +159,7 @@ func (s *Store) CommitNativeAlertEvaluation(ctx context.Context, evaluation Nati
 			return errors.New("native alert notification is invalid or belongs to another rule")
 		}
 		query := `INSERT INTO notification_outbox(idempotency_key, project_id, rule_id, channel_id, payload, priority,
-			status, available_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			ordering_key, status, available_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 			ON CONFLICT(idempotency_key) DO NOTHING`
 		if _, err := tx.ExecContext(
 			ctx,
@@ -170,6 +170,7 @@ func (s *Store) CommitNativeAlertEvaluation(ctx context.Context, evaluation Nati
 			notification.ChannelID,
 			string(notification.Payload),
 			notification.Priority,
+			nullableOutboxOrderingKey(notification.OrderingKey),
 		); err != nil {
 			return fmt.Errorf("enqueue native alert notification: %w", err)
 		}
